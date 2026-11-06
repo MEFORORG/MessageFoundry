@@ -76,7 +76,7 @@ async def test_a_lasting_partial_outage_pages_once_and_a_full_answer_resolves_it
                 "reason": "directory_partly_unavailable",
                 "unreached": 1,
                 "asked": 2,
-                "passes": threshold,
+                "probes": threshold,
             }
         ]
 
@@ -115,8 +115,8 @@ async def test_a_fully_answered_pass_restarts_the_partial_run() -> None:
 
 
 async def test_whole_and_partial_passes_in_turn_still_page() -> None:
-    """A whole pass extends the partial run, so a directory that alternates whole and partial
-    passes pages, on the first partial pass once the run is long enough. A partial pass ends the
+    """A whole pass extends each account's run, so a directory that alternates whole and partial
+    passes, never answering ``alice``, pages once her run is long enough. A partial pass ends the
     whole run, as before, so the whole outage itself never pages here.
 
     RED when: either kind of pass ends the other's run, so alternating passes page nobody."""
@@ -131,8 +131,9 @@ async def test_whole_and_partial_passes_in_turn_still_page() -> None:
             plans.append(await _pass(service, sink))
         assert [p.partial_outage_passes for p in plans] == [1, 2, 3, 4]
         assert [p.outage_passes for p in plans] == [1, 0, 1, 0]
-        # The third pass is whole: it reaches the run's length, and it pages as no partial outage.
-        assert [p.partial_outage_page for p in plans] == [False, False, False, True]
+        # The third pass is whole, but alice's own run reaches the length there, and the whole
+        # outage is not paging, so the partial outage pages on it.
+        assert [p.partial_outage_page for p in plans] == [False, False, True, False]
         assert len(_pages(sink, _PARTIAL_OUTAGE_ALERT_SOURCE)) == 1
         assert _pages(sink, _OUTAGE_ALERT_SOURCE) == []
     finally:
@@ -294,6 +295,35 @@ async def test_a_pass_that_judged_nothing_but_reached_the_directory_still_pages(
         assert first.aborted is not None and first.judged_nothing
         assert not first.partial_outage_page and second.partial_outage_page
         assert len(_pages(sink, _PARTIAL_OUTAGE_ALERT_SOURCE)) == 1
-        assert [r["passes"] for r in await _rows(store)] == [2]
+        assert [r["probes"] for r in await _rows(store)] == [2]
+    finally:
+        await store.close()
+
+
+async def test_a_full_recovery_under_a_probe_budget_raises_no_partial_page() -> None:
+    """Review round 2. Under a budget of one probe a pass, a whole outage leaves both accounts a
+    long run, and pages as a whole outage. When the directory comes back, the first pass probes
+    one account and the other's run still stands, unprobed. That pass found nothing unanswered,
+    so it must not page a partial outage; the next pass ends the last run.
+
+    RED when: a standing run of an account this pass did not probe pages on a healthy pass."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(
+            store, ad_reconcile_outage_passes=2, ad_session_recheck_max_users=1
+        )
+        sink = _InverseSink()
+        ldap.unreachable = set(_BOTH)
+        for _ in range(4):
+            assert (await _pass(service, sink)).directory_outage
+        assert len(_pages(sink, _OUTAGE_ALERT_SOURCE)) == 1
+        ldap.unreachable = set()
+        back = await _pass(service, sink)
+        assert back.outage_clear and back.unreached == 0 and back.partial_outage_passes == 2
+        assert not back.partial_outage_page
+        last = await _pass(service, sink)
+        assert last.partial_outage_passes == 0
+        assert _events(sink, _PARTIAL_OUTAGE_ALERT_SOURCE) == []
+        assert await _rows(store) == []
     finally:
         await store.close()

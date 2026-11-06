@@ -784,8 +784,9 @@ class AlertSink(Protocol):
         ``"directory-reconciler-referral"`` for the referral's, and ``"directory-reconciler-outage"``
         for a lasting outage's, on a pass that reached the directory after a run that paged
         (``AuthService._note_directory_outage``, BACKLOG #3709), and
-        ``"directory-reconciler-partial-outage"`` for a partial one's, on a pass whose every probe
-        was answered after a run that paged (``AuthService._note_partial_outage``). Raised on every such pass, except where
+        ``"directory-reconciler-partial-outage"`` for a partial one's, on a pass after a page once
+        no signed-in account's run of unanswered probes is that long, because each was answered
+        since or left with its sessions (``AuthService._note_partial_outage``). Raised on every such pass, except where
         ``api/app.py::_is_sole_reconciler`` says another reconciler may run, at least on a
         ``[cluster]`` node or in an engine that runs more than one engine shard
         (``api/app.py::_without_clears`` says why), and while the open instance is one an earlier

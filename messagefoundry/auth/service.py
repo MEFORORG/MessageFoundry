@@ -8213,25 +8213,39 @@ class AuthService:
         waited its passes. The whole outage's own run, page and resolve are unchanged
         (:meth:`_note_directory_outage`).
 
-        **Its own page.** While some account's streak is at least
-        ``[auth].ad_reconcile_outage_passes``, the first pass that asked the directory and is not
-        a whole outage pages once, latched only once the pass's rows are written
-        (:meth:`_latch_outage_page`). A whole outage pass never raises it, so one pass never
-        raises both pages, and a whole outage that comes back in part swaps one page for the
-        other. Once no streak is that long, the condition ends, and once one here has paged every
-        such pass marks ``partial_outage_clear``, as the outage clear is raised. Process-local,
-        as the whole run is."""
+        **Its own page.** A pass pages once when it finds unanswered an account whose streak
+        has reached ``[auth].ad_reconcile_outage_passes``, so a pass that asked only accounts the
+        directory answered never pages, even while an unprobed account's streak stands. It does
+        not page while the whole outage's page is raised or standing in its run, so one pass never
+        raises both; once a pass reaches part of the directory and ends that run, the next pass
+        that finds such an account unanswered pages as a partial outage. With a probe budget
+        smaller than the estate an account's streak grows only on the passes that probe it, so
+        that page can come several passes after the whole outage's resolves. The page is latched
+        only once the pass's rows are written (:meth:`_latch_outage_page`).
+
+        **Its clear.** Once no account's streak is that long, because each has been answered since
+        or has left with its sessions, the condition ends, and once one here has paged every such
+        pass marks ``partial_outage_clear``, a whole outage pass included, as the outage clear is
+        raised. Process-local, as the whole run is.
+
+        "Unanswered" here is :attr:`~reconcile.Probe.unreached`. It is not
+        ``_reconcile_unanswered`` (BACKLOG #3844), which holds the REFERRED, FAULT and MISCONFIGURED
+        outcomes: those are answers the directory gave, and each ends a streak here."""
         streaks = self._reconcile_unreached
+        threshold = self._settings.ad_reconcile_outage_passes
+        hit = False
         for probe in probes:
             if probe.unreached:
                 streaks[probe.user_id] = streaks.get(probe.user_id, 0) + 1
+                hit = hit or streaks[probe.user_id] >= threshold
             elif probe.outcome is not reconcile.ProbeOutcome.UNKEYED:  # UNKEYED was never asked
                 streaks.pop(probe.user_id, None)
         longest = max(streaks.values(), default=0)
-        if longest >= self._settings.ad_reconcile_outage_passes:
+        if longest >= threshold:
             page = (
-                plan.asked > 0
-                and not plan.directory_outage
+                hit
+                and not plan.outage_page
+                and not self._reconcile_outage_run_paged
                 and not self._reconcile_partial_run_paged
             )
             return replace(plan, partial_outage_passes=longest, partial_outage_page=page)
@@ -8284,7 +8298,8 @@ class AuthService:
                     "reason": reconcile.PARTIAL_OUTAGE_REASON,
                     "unreached": plan.unreached,
                     "asked": plan.asked,
-                    "passes": plan.partial_outage_passes,
+                    # One account's probes, not passes: under a probe budget they differ.
+                    "probes": plan.partial_outage_passes,
                 }
             ),
         )

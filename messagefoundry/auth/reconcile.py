@@ -171,7 +171,7 @@ class Probe:
     def unreached(self) -> bool:
         """True when the directory left this probe unanswered (BACKLOG #3709 step 1): UNAVAILABLE
         for any reason but the engine's own paging bound, which the directory answered and which
-        pages on its own (vault BACKLOG #3696). The one test of which UNAVAILABLE probe is which."""
+        pages on its own (vault BACKLOG #3696). The partial outage counts by this test."""
         return self.outcome is ProbeOutcome.UNAVAILABLE and self.detail not in _PAGING_CAUSES
 
 
@@ -373,11 +373,13 @@ class ReconcilePlan:
     #: process. 0 when no account's last probe went unanswered. ``AuthService._note_partial_outage``
     #: keeps it.
     partial_outage_passes: int = 0
-    #: Whether the lifespan task pages for a lasting PARTIAL outage on this pass: the run above
-    #: has reached ``[auth].ad_reconcile_outage_passes``, this pass asked the directory and is not
-    #: a whole outage, and no partial page is recorded for the standing condition yet.
+    #: Whether the lifespan task pages for a lasting PARTIAL outage on this pass: this pass found
+    #: unanswered an account whose run has reached ``[auth].ad_reconcile_outage_passes``, the whole
+    #: outage is not paging in its run, and no partial page is recorded for the standing condition
+    #: yet.
     partial_outage_page: bool = False
-    #: Whether no account's run is that long any more, after a partial page in this process. The
+    #: Whether no account's run is that long any more, because each was answered since or left
+    #: with its sessions, after a partial page in this process. Set on a whole outage pass too. The
     #: caller resolves the partial outage's instance on it.
     partial_outage_clear: bool = False
 

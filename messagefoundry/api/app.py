@@ -11420,7 +11420,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``plan.partial_outage_clear``; see ``AuthService._mark_reconcile_clears``,
     ``AuthService._note_directory_outage`` and ``AuthService._note_partial_outage``), so
     the alert and the service read one predicate. An outage or a pass with no signed-in account
-    sets none. The inverse is raised on EVERY pass that sets its flag, not once per clear:
+    sets none of the others; a whole outage pass can set the partial outage's. The inverse is
+    raised on EVERY pass that sets its flag, not once per clear:
     resolving is an idempotent update, and a resolve the notifier failed to write is retried that
     way. A process clears only what it watched open, so a fresh process resolves no alert an
     earlier run left open (:func:`_without_inherited_clears` drops that clear);
@@ -11438,9 +11439,13 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
                 probed=plan.asked,
                 detail=_OUTAGE_ALERT_TEXT.format(passes=plan.outage_passes),
             )
+        # An outage-shaped pass of a probe budget smaller than the estate can be the one that
+        # finds a long-unanswered account (BACKLOG #3709 step 1); it never pages beside the above.
+        _alert_partial_outage(plan, sink)
         if plan.partial_outage_clear:
-            # BACKLOG #3709 step 1. An outage pass whose every probe was refused for the engine's
-            # own paging bound was answered, so it can end a partial outage. Last, as below.
+            # BACKLOG #3709 step 1. An outage pass can end a partial outage: its every probe was
+            # refused for the engine's own paging bound, which the directory answered, or the
+            # account behind the page left with its sessions. Last, as below.
             sink.ad_reconcile_breaker_cleared(_PARTIAL_OUTAGE_ALERT_SOURCE)
         return
     if plan.aborted is not None and not plan.judged_nothing:
@@ -11458,16 +11463,7 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     # After the breaker and the revocations, which do not recur either, and before the referral,
     # the fault and the hold, which page again on the next pass (vault BACKLOG #3696).
     _alert_paging_refusals(plan, sink)
-    if plan.partial_outage_page:
-        # BACKLOG #3709 step 1. Once per run, so with the other pages that do not recur.
-        sink.ad_reconcile_aborted(
-            _PARTIAL_OUTAGE_ALERT_SOURCE,
-            reason=PARTIAL_OUTAGE_REASON,
-            probed=plan.asked,
-            detail=_PARTIAL_OUTAGE_ALERT_TEXT.format(
-                passes=plan.partial_outage_passes, unreached=plan.unreached, asked=plan.asked
-            ),
-        )
+    _alert_partial_outage(plan, sink)  # once per run, with the other pages that do not recur
     if plan.referred:
         # BACKLOG #2538. After the breaker and the revocations, matching the service's order.
         sink.ad_reconcile_aborted(
@@ -11513,6 +11509,21 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_breaker_cleared(_OUTAGE_ALERT_SOURCE)
     if plan.partial_outage_clear:
         sink.ad_reconcile_breaker_cleared(_PARTIAL_OUTAGE_ALERT_SOURCE)
+
+
+def _alert_partial_outage(plan: ReconcilePlan, sink: AlertSink) -> None:
+    """Page a lasting partial outage on the pass the auth service says pages it (BACKLOG #3709
+    step 1; ``AuthService._note_partial_outage`` says when), matching its
+    ``auth.ad_reconcile_partial_outage`` row."""
+    if plan.partial_outage_page:
+        sink.ad_reconcile_aborted(
+            _PARTIAL_OUTAGE_ALERT_SOURCE,
+            reason=PARTIAL_OUTAGE_REASON,
+            probed=plan.asked,
+            detail=_PARTIAL_OUTAGE_ALERT_TEXT.format(
+                passes=plan.partial_outage_passes, unreached=plan.unreached, asked=plan.asked
+            ),
+        )
 
 
 def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:

@@ -9608,8 +9608,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"the directory reconciler runs every {interval} s, less often than the "
                     f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}. The "
                     f"interval also delays the page about a directory outage, which comes after "
-                    f"{floor}, and the page about a partial one, which waits as many probes of "
-                    "one account",
+                    f"{floor}, and the page about a partial one, which waits for as many probes "
+                    "of one account",
                 )
             )
         if run > _auth_default("ad_reconcile_outage_passes"):
@@ -9644,7 +9644,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "a reconciler pass probes fewer accounts than the default of "
                     f"{_auth_default('ad_session_recheck_max_users')}, so a larger estate takes "
                     f"more passes to cover, and {late}. The smaller sample is also the breaker's "
-                    "denominator, so a smaller wave of revocations aborts the pass",
+                    "denominator, so a smaller wave of revocations aborts the pass. The page "
+                    "about a partial directory outage counts one account's probes, so it comes "
+                    "that many more passes later too",
                 )
             )
         brake = (
