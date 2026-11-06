@@ -485,7 +485,7 @@ def main() -> int:
     stdout = sys.stdout.buffer
     # Sequenced deliberately: AFTER the frame writer captures its raw handle (at module scope the
     # capture above would resolve to fd 2 and send every frame to the wrong pipe) and BEFORE the boot
-    # frame read below, whose reply path runs ``load_config()`` -- the earliest untrusted code.
+    # frame read below, whose reply path runs ``load_snapshot()`` -- the earliest untrusted code.
     _redirect_stdout_to_stderr()
 
     frame = _read_frame_bytes(stdin)

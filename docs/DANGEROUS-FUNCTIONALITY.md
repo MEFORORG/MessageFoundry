@@ -371,8 +371,8 @@ and the builders, and a test checks that each module named calls each builder na
   through either.
   No other variable reaches these starts.
 - The sandbox worker, in `pipeline/sandbox.py`, gets an allowlist (`worker_environment`): the
-  platform's start-up names, the interpreter's own variables, the engine switches its own code
-  reads, and the names `[sandbox].pass_environment` lists. No other inherited variable crosses. On
+  platform's start-up names, the interpreter's own variables, and the names
+  `[sandbox].pass_environment` lists. No other inherited variable crosses, and no `MEFOR_*` one. On
   Linux with `[sandbox].mem_mb` set, the engine also sets `MALLOC_ARENA_MAX=2` where the operator
   passed none.
 - The disaster-recovery hook, in `pipeline/dr.py`, gets an allowlist (`hook_environment`), which

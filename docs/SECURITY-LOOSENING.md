@@ -1631,9 +1631,9 @@ count is above `0` (vault BACKLOG #2613).
 > same environment. Under `enforce` it is inert: a safe config directory loads as usual, and an
 > unsafe one is refused with an error that names the variable.
 > **`warn` set only in the settings file does not unlock it.** The check runs in every process that
-> loads config, and some of those read no settings file: at least the sandbox worker, and the
-> offline commands that load config before any settings. So the dial has to sit where the escape
-> does.
+> loads config, and some of those read no settings file: at least the offline commands that load
+> config before any settings. So the dial has to sit where the escape does. The sandbox worker is
+> not one of them: it runs the config its parent read and checked, and neither variable reaches it.
 > **The dial in the environment is the instance's dial, not a switch for this check alone.** A
 > `messagefoundry check` run with both variables judges every posture gate at `warn`. To check a
 > config at `enforce`, lock its directory instead.

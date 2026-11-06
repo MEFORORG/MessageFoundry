@@ -799,7 +799,7 @@ class SandboxSession:
         # BOTH drains start before anything that can raise between here and the boot frame write. For
         # fd 1 that ordering is pre-existing; for fd 2 it is a REQUIREMENT this change creates. A PIPE
         # nobody drains blocks its writer once the fixed OS buffer fills (tens of KiB), and the boot frame
-        # below triggers ``load_config()`` -- top-level admin config, the earliest untrusted code and
+        # below triggers ``load_snapshot()`` -- top-level admin config, the earliest untrusted code and
         # the first thing that can print. Undrained, every spawn would hang to ``startup_seconds`` and
         # report a startup timeout naming the wrong cause. Starting them before the job assignment also
         # closes the window in which that assignment raising would leave a live child with an undrained
@@ -824,7 +824,7 @@ class SandboxSession:
         for thread in self._threads:
             thread.start()
         # Assign the Windows kill-on-close job BEFORE the boot frame. The boot frame triggers
-        # ``load_config()``, which runs top-level admin config — the earliest untrusted code and the
+        # ``load_snapshot()``, which runs top-level admin config — the earliest untrusted code and the
         # first chance to spawn a grandchild. Until then the worker parks on its first stdin read, so
         # assigning here is race-free: any process the worker later spawns is already in the job. The
         # drains above do not disturb that argument, which turns on the CHILD's first stdin read and

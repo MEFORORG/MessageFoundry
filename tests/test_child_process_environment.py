@@ -237,9 +237,10 @@ def test_the_sandbox_hands_its_worker_no_engine_variable(
     with pytest.raises(_Stop):
         _session(config_dir, inbound="IB_ENV", policy=policy)._spawn()
 
+    assert captured["env"][_ORDINARY] == _MARKER
+    assert captured["env"]
     engine_names = {n for n in captured["env"] if n.upper().startswith(childenv.ENGINE_ENV_PREFIX)}
     assert engine_names == set()
-    assert captured["env"][_ORDINARY] == _MARKER
     # One thread arena at most on Linux, so threads cannot spend [sandbox].mem_mb (vault BACKLOG
     # #3133). Elsewhere the cap is not RLIMIT_DATA, so the worker's allocator is left alone.
     expected = "2" if sys.platform.startswith("linux") else None
@@ -549,6 +550,49 @@ def test_the_auditor_takes_the_lower_case_proxy_names_as_the_platform_reads_them
         dict(parent) if sys.platform == "win32" else {k: parent[k] for k in parent if "proxy" in k}
     )
     assert env == expected
+
+
+def test_a_name_the_auditor_is_passed_crosses_and_an_engine_name_is_refused() -> None:
+    """The auditor's ``--pass-environment``, for a keyring backend's variable."""
+    parent = _parent_environment()
+    env = childenv.auditor_environment(parent, extra_names=(_ORDINARY,))
+    assert env[_ORDINARY] == _MARKER
+    assert _ORDINARY not in childenv.auditor_environment(parent)
+    for name in (*sorted(_SECRET_NAMES), "mefor_store_password"):
+        with pytest.raises(ValueError, match="engine's own variable"):
+            childenv.auditor_environment(parent, extra_names=(name,))
+    with pytest.raises(TypeError):
+        childenv.auditor_environment(parent, extra_names=_ORDINARY)
+
+
+def test_only_the_dependency_auditor_calls_its_builder() -> None:
+    """``auditor_environment`` hands its child every ``PIP_*`` variable, and an index URL there can
+    carry a credential, so the spawn guard's trust in it is pinned to its one caller. The control
+    plants a second caller."""
+    sources = _scanned_sources()
+    target = "messagefoundry.childenv.auditor_environment"
+
+    def refers(source: str) -> bool:
+        # Any reference, called or not, through any import alias, as the spawn guard resolves them.
+        tree = ast.parse(source)
+        aliases = _aliases(tree)
+        return any(
+            _dotted(node, aliases) == target
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name | ast.Attribute)
+        )
+
+    def callers(tree: Mapping[str, str]) -> set[str]:
+        return {module for module, source in tree.items() if refers(source)}
+
+    assert callers(sources) == {"security/audit_all_platforms.py"}
+    planted = {
+        **sources,
+        "pipeline/a.py": "from messagefoundry.childenv import auditor_environment as e\nenv = e()\n",
+        "pipeline/b.py": "from messagefoundry import childenv\nenv = childenv.auditor_environment()\n",
+    }
+    expected = {"security/audit_all_platforms.py", "pipeline/a.py", "pipeline/b.py"}
+    assert callers(planted) == expected
 
 
 def test_a_name_that_only_starts_like_pips_does_not_reach_the_auditor() -> None:

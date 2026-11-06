@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.childenv import python_module_argv
+from messagefoundry.security import audit_all_platforms as audit_module
 from messagefoundry.security.audit_all_platforms import (
     PUBLISHED_DISTRIBUTIONS,
     _run,
@@ -320,6 +321,58 @@ def test_only_what_pip_reads_reaches_pip_or_pip_audit(monkeypatch: pytest.Monkey
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
     monkeypatch.setenv("ORDINARY_RUNNER_VARIABLE", "marker-not-a-secret")
     assert _run([sys.executable, "-c", _ENV_PROBE]) == 0
+
+
+def test_a_name_the_caller_passes_reaches_pip_and_pip_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--pass-environment`` is how a keyring backend's variable reaches them. The control is the
+    same run without it, where the same variable does not arrive."""
+    monkeypatch.setenv("ORDINARY_RUNNER_VARIABLE", "marker-not-a-secret")
+    probe = "import os, sys; sys.exit('ORDINARY_RUNNER_VARIABLE' not in os.environ)"
+    assert _run([sys.executable, "-c", probe], pass_environment=("ORDINARY_RUNNER_VARIABLE",)) == 0
+    assert _run([sys.executable, "-c", probe]) == 1
+
+
+def test_main_hands_each_pass_environment_name_to_both_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no runner given, ``main`` starts the install check and the audit with the names."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    seen: list[tuple[str, ...]] = []
+
+    def fake_run(cmd: list[str], *, pass_environment: tuple[str, ...] = ()) -> int:
+        seen.append(pass_environment)
+        return 0
+
+    monkeypatch.setattr(audit_module, "_run", fake_run)
+    names = ["--pass-environment", "KEYRING_A", "--pass-environment", "KEYRING_B"]
+    assert main([*names, str(src)]) == 0
+    assert seen == [("KEYRING_A", "KEYRING_B")] * 2
+
+
+@pytest.mark.parametrize("name", ["MEFOR_STORE_KEY", "mefor_store_password", "VAULT_TOKEN"])
+def test_a_pass_environment_naming_an_engine_variable_is_refused(
+    name: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main(["--pass-environment", name, str(src)], run=run) == 2
+    assert not ran
+    assert name in capsys.readouterr().err
+
+
+def test_a_pass_environment_after_the_lock_is_refused_by_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main([str(src), "--pass-environment", "KEYRING_A"], run=run) == 2
+    assert not ran
+    assert "goes before the lock" in capsys.readouterr().err
 
 
 def test_a_relative_pythonpath_entry_does_not_reach_pip_or_pip_audit(

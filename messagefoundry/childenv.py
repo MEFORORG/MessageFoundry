@@ -417,6 +417,17 @@ def worker_environment(
     return env
 
 
+def _outside_engine_keys(extra_names: Collection[str]) -> frozenset[str]:
+    """:func:`_extra_keys`, refusing a name of the engine's own namespace with
+    :class:`ValueError`. It checks the keys it returns, so a one-shot iterable cannot slip a name
+    past it."""
+    extras = _extra_keys(extra_names)
+    for key in extras:
+        if not outside_engine_namespace(key):
+            raise ValueError(f"extra_names may not name the engine's own variable {key!r}")
+    return extras
+
+
 def _ordinary_key(name: str, argument: str) -> str:
     """``name`` as :func:`_key` compares it. A name of the engine's namespace or of the
     interpreter is refused, since a value a builder sets for it would bypass that builder's own
@@ -469,17 +480,15 @@ def hook_environment(
     that starts an interpreter needing it still starts. An extra in the engine's own namespace
     raises :class:`ValueError`. Settings load refuses one first, so this is the last check, not
     the first."""
-    extras = _extra_keys(extra_names)
-    for key in extras:
-        if not outside_engine_namespace(key):
-            raise ValueError(f"extra_names may not name the engine's own variable {key!r}")
-    names = _platform_names() | extras
+    names = _platform_names() | _outside_engine_keys(extra_names)
     if sys.platform == "win32":
         names |= _WINDOWS_SHELL_NAMES
     return {n: v for n, v in _source(environ).items() if _key(n) in names}
 
 
-def auditor_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+def auditor_environment(
+    environ: Mapping[str, str] | None = None, *, extra_names: Collection[str] = ()
+) -> dict[str, str]:
     """The environment for the dependency auditor's ``pip`` and ``pip-audit``: an allowlist over
     ``environ`` (default :data:`os.environ`).
 
@@ -489,14 +498,17 @@ def auditor_environment(environ: Mapping[str, str] | None = None) -> dict[str, s
     :data:`_PIP_PREFIX` name, so an index, a proxy or a certificate the runner configures still
     reaches them. Nothing else crosses: no ``MEFOR_*`` variable, no name in
     :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`, and no CI token. A variable a pip setup needs beyond
-    these, such as a keyring backend's, does not cross either.
+    these, such as a keyring backend's, crosses only when the caller names it in ``extra_names``,
+    which is the auditor's ``--pass-environment``. An extra in the engine's own namespace raises
+    :class:`ValueError`.
 
     Built through :func:`worker_environment`, so the two cannot drift apart. That builder's
     "never a secret" rule is for code the engine does not trust; ``pip`` is a tool the auditor
     names, and a ``PIP_INDEX_URL`` that carries an index credential is meant for it."""
+    extras = _outside_engine_keys(extra_names)
     source = _source(environ)
     pip_names = {name for name in source if _key(name).startswith(_PIP_PREFIX)}
-    return worker_environment(source, extra_names=_AUDITOR_NAMES | pip_names)
+    return worker_environment(source, extra_names=_AUDITOR_NAMES | pip_names | extras)
 
 
 def engine_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:

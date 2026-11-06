@@ -49,6 +49,11 @@ downloadable from the index pip is configured with. Past refusing the engine and
 packages this release knows to be published, nothing checks that the named package is in fact
 private: like ``--ignore-vuln``, it is the adopter's recorded decision.
 
+``--pass-environment <name>``, also given BEFORE the lock and repeatable, hands pip and pip-audit
+one more environment variable than their allowlist holds, such as one a keyring backend or a cloud
+credential helper reads to reach a private index (vault BACKLOG #2587). It refuses an engine
+variable, a ``MEFOR_*`` name or one of the few secrets the engine knows outside that prefix.
+
 WHY STRIPPING IS SOUND HERE. Every pin in a uv export is a version that uv resolved for some
 environment. The engine sets no ``[tool.uv] environments``, so that includes environments nobody
 supports (PyPy, cygwin, macOS). Auditing those pins too is accepted: an advisory against one fails
@@ -68,7 +73,8 @@ a requirement that continues onto a line other than a hash, option or comment, w
 would stay in place; and a ``--skip-private`` that names the engine or another published
 MessageFoundry package, a package the lock does not pin, or every pin, or that comes after the lock
 as a word of its own (the ``=`` form or an abbreviation there reaches pip-audit, which fails on it
-as an unknown option). It does not judge
+as an unknown option); and a ``--pass-environment`` that names an engine variable, or that comes
+after the lock as a word of its own. It does not judge
 whether a non-empty lock is complete; released-line-audit carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
@@ -78,8 +84,8 @@ UTF-8, UTF-16 or UTF-32 byte-order mark is honoured, as pip honours it.
 Both subprocesses start through ``messagefoundry.childenv.python_module_argv``, so with ``-P``
 (the checked-out tree, the current directory, is not on their ``sys.path`` and cannot shadow a
 module the auditor imports) and the engine's other child-interpreter flags. Their environment is
-``messagefoundry.childenv.auditor_environment``, an allowlist: a variable it does not name, a CI
-token or an engine secret among them, does not reach them.
+``messagefoundry.childenv.auditor_environment``, an allowlist, plus the ``--pass-environment``
+names: a variable neither names, a CI token or an engine secret among them, does not reach them.
 
 WHAT IT DOES NOT HANDLE, stated rather than papered over. If a lock ever pins ONE name at two
 versions under two markers (a resolver fork), the copy carries both and pip-audit refuses it with
@@ -91,6 +97,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import functools
 import io
 import os
 import re
@@ -100,7 +107,11 @@ import tempfile
 from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 
-from messagefoundry.childenv import auditor_environment, python_module_argv
+from messagefoundry.childenv import (
+    auditor_environment,
+    outside_engine_namespace,
+    python_module_argv,
+)
 
 
 def is_requirement_line(line: str) -> bool:
@@ -259,9 +270,18 @@ def _skip_private_refusal(private: Collection[str], pip_audit_args: Sequence[str
     )
 
 
-def _run(cmd: list[str]) -> int:
-    # An allowlist (vault BACKLOG #2587); its docstring says what crosses.
-    env = auditor_environment()
+def _pass_environment_refusal(names: Sequence[str], pip_audit_args: Sequence[str]) -> str | None:
+    """Why a ``--pass-environment`` request is refused, or ``None``."""
+    if "--pass-environment" in pip_audit_args:
+        return "--pass-environment goes before the lock, not after it"
+    engine = sorted(name for name in names if not outside_engine_namespace(name))
+    return f"--pass-environment may not name an engine variable: {engine}" if engine else None
+
+
+def _run(cmd: list[str], *, pass_environment: Sequence[str] = ()) -> int:
+    # An allowlist (vault BACKLOG #2587), plus what the caller named; its docstring says what
+    # crosses.
+    env = auditor_environment(extra_names=pass_environment)
     # The argv is a list and no shell reads it, but it is not all fixed. Written in this module:
     # the module name (pip or pip_audit) and each flag main() writes. From python_module_argv: the
     # interpreter and its child flags, some fixed and some repeated from this process's own flags
@@ -273,7 +293,7 @@ def _run(cmd: list[str]) -> int:
     return subprocess.run(cmd, check=False, env=env).returncode  # nosec B603 - argv list, no shell
 
 
-def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _run) -> int:
+def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument(
         "--skip-private",
@@ -282,6 +302,14 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         metavar="NAME",
         help="leave this pin out of the audit, for a package no advisory database can look up; "
         "repeatable, and given before the lock",
+    )
+    parser.add_argument(
+        "--pass-environment",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="also hand pip and pip-audit this environment variable, such as one a keyring "
+        "backend reads; repeatable, and given before the lock",
     )
     parser.add_argument("lock", type=Path, help="the hashed lock to audit")
     parser.add_argument(
@@ -311,7 +339,9 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         )
         return 2
     private = {canonical_name(name) for name in args.skip_private}
-    refusal = _skip_private_refusal(private, args.pip_audit_args)
+    refusal = _skip_private_refusal(private, args.pip_audit_args) or _pass_environment_refusal(
+        args.pass_environment, args.pip_audit_args
+    )
     if refusal:
         print(f"::error::{args.lock}: {refusal}", file=sys.stderr)
         return 2
@@ -340,6 +370,8 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     for _, entry in skipped:
         print(f"  not audited, named by --skip-private: {entry}")
     sys.stdout.flush()
+    if run is None:
+        run = functools.partial(_run, pass_environment=tuple(args.pass_environment))
     pip_check = [*python_module_argv("pip"), "install", "--dry-run", "--ignore-installed"]
     status = run(
         [*pip_check, "--require-hashes", "--only-binary", ":all:", "--quiet", "-r", str(args.lock)]

@@ -521,9 +521,9 @@ def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = 
     ``MEFOR_ALLOW_INSECURE_TLS`` has its own clamp, honoured only on an instance at
     ``[security].enforcement = warn`` (:func:`weakened_tls_escape_permitted`).
 
-    **Why the dial is read from the environment and not from loaded settings.** The check runs inside
-    ``load_config``, in every process that reads a config directory: ``serve``, a reload, a sandbox
-    session that reads its own directory, and offline commands. At least ``check`` and ``dryrun``
+    **Why the dial is read from the environment and not from loaded settings.** The check runs in every
+    process that reads a config directory, through ``load_config`` or ``read_trusted_snapshot``:
+    ``serve``, a reload, a sandbox session that reads its own directory, and offline commands. At least ``check`` and ``dryrun``
     load config before they read any settings. A posture handed down by each caller would be missed
     by the caller nobody remembered (the lesson of vault BACKLOG #2354). The escape is an environment
     variable, so the dial that unlocks it is read from the same place, the same way in every one of

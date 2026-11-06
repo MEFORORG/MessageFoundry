@@ -1099,9 +1099,9 @@ def test_the_sandbox_worker_boot_load_honours_the_clamp(tmp_path: Path) -> None:
 @pytest.mark.usefixtures("escape_honoured")
 def test_the_sandbox_worker_decides_as_the_engine_did_at_warn(tmp_path: Path) -> None:
     """The parent reads the directory, with the clamp, and the worker loads those bytes, so a
-    worker boots over a really-writable directory the parent accepted at ``warn`` with neither
-    variable in its own environment (vault BACKLOG #2587). Through the real spawn. The test above
-    is the other arm."""
+    worker boots over a really-writable directory the parent accepted at ``warn``. Through the real
+    spawn. The test above is the other arm, and the dial-spelling test below shows neither variable
+    reaches the worker (vault BACKLOG #2587)."""
     _write_cfg(tmp_path)
     _grant_others_write(tmp_path)
     session = _worker_session(tmp_path)
@@ -1149,9 +1149,10 @@ def test_no_spelling_of_the_dial_reaches_the_worker_environment(
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     with pytest.raises(_Stop):
         _worker_session(tmp_path)._spawn()
-    crossed = {name: value for name, value in captured["env"].items() if name.startswith("MEFOR_")}
-    # Windows holds one variable under an upper-cased name, whichever spelling set it.
-    assert crossed == {}
+    # The control: the env read holds the worker's start-up names, so the absence below is not an
+    # empty read.
+    assert any(name.upper() == "PATH" for name in captured["env"])
+    assert [name for name in captured["env"] if name.upper().startswith("MEFOR_")] == []
 
 
 def test_the_loosening_page_lists_the_escape() -> None:
