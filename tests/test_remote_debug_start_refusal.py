@@ -26,13 +26,17 @@ from messagefoundry import __main__ as cli
 from messagefoundry.config.settings import SecuritySettings
 from messagefoundry.remotedebug import (
     REMOTE_DEBUG_ACCEPTANCE,
+    REMOTE_DEBUG_ACCEPTANCE_KEY,
+    REMOTE_DEBUG_ACCEPTANCE_LOOSENING,
     RemoteDebugPosture,
     remote_debug_refusal,
 )
 from messagefoundry.startupcode import InterpreterLaunch, StartupPosture
 from tests.test_isolated_launch import _needs_install
 
-# The suite stands this gate down for every other test (tests/conftest.py); these test it.
+# The suite keeps this gate from stopping every other in-process start (tests/conftest.py). The
+# `remote_debug_start_gate` fixture undoes that for this module, and each in-process start here,
+# through `_serve` or `_supervise`, then pins the reading it tests.
 pytestmark = pytest.mark.usefixtures("remote_debug_start_gate")
 
 _SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
@@ -131,14 +135,18 @@ def test_serve_does_not_stop_at_this_gate(
     assert "no MEFOR_STORE_ENCRYPTION_KEY" in err, err[-2000:]
 
 
-def _audit_lines(caplog: pytest.LogCaptureFixture, what: str) -> list[str]:
-    """The AUDIT lines the gate wrote where the acceptance lifted its refusal to ``what``."""
-    prefix = f"AUDIT: permitted to {what} under enforcement"
+def _cli_lines(caplog: pytest.LogCaptureFixture, prefix: str) -> list[str]:
+    """The lines the command line logged that start with ``prefix``."""
     return [
         r.getMessage()
         for r in caplog.records
         if r.name == cli.__name__ and r.getMessage().startswith(prefix)
     ]
+
+
+def _audit_lines(caplog: pytest.LogCaptureFixture, what: str) -> list[str]:
+    """The AUDIT lines the gate wrote where the acceptance lifted its refusal to ``what``."""
+    return _cli_lines(caplog, f"AUDIT: permitted to {what} under enforcement")
 
 
 @pytest.mark.parametrize(
@@ -233,6 +241,7 @@ def _supervise(
     monkeypatch: pytest.MonkeyPatch,
     posture: RemoteDebugPosture,
     *,
+    warn: bool = False,
     accept: bool = False,
 ) -> tuple[int, list[str]]:
     """``_supervise`` with the fleet stubbed out, as tests/test_startup_code_inventory.py does."""
@@ -244,7 +253,7 @@ def _supervise(
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
-    _environment(monkeypatch, warn=False, accept=accept)
+    _environment(monkeypatch, warn=warn, accept=accept)
     monkeypatch.setattr(cli, "remote_debug_posture", lambda: posture)
     monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", fake_supervise)
     monkeypatch.setattr(cli, "configure_logging", lambda *args, **kwargs: None)
@@ -324,6 +333,75 @@ def test_supervise_logs_the_audit_line_again_for_the_forwarder(
     relogged = "(Logged again for the off-box forwarder.)"
     assert not lines[0].endswith(relogged), lines
     assert [line.endswith(relogged) for line in lines[1:]] == ([True] if forwarder else []), lines
+    # In the off-box copy the remote-debugging lines keep the first pass's order: the AUDIT line,
+    # then the residual and the acceptance (vault BACKLOG #3795). Other readings, such as the
+    # unpinned service-environment one, may follow them.
+    again = [m for m in _cli_lines(caplog, "") if m.endswith(relogged)]
+    if not forwarder:
+        assert not again, again
+        return
+    assert again[0].startswith("AUDIT: "), again
+    assert [m.split(":", 1)[0] for m in again[1:3]] == [
+        "[security] remote_debug_enabled",
+        f"[security] {REMOTE_DEBUG_ACCEPTANCE_KEY}",
+    ], again
+
+
+def _residual_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The ``[security]`` start-up lines ``supervise`` writes for its own interface reading."""
+    return _cli_lines(caplog, "[security] remote_debug_")
+
+
+def test_supervise_refuses_before_it_reports_the_reading_as_a_residual(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3795 item 8: under ``enforce`` the refusal comes first, so a refused fleet
+    does not first log the reading as a residual it then refuses on."""
+    with caplog.at_level(logging.WARNING, logger=cli.__name__):
+        rc, spawned = _supervise(tmp_path, monkeypatch, _ON)
+        # The control in the same capture: a WARNING on this logger is recorded here.
+        logging.getLogger(cli.__name__).warning("[security] remote_debug_ control")
+    assert rc == 2 and not spawned and _REFUSAL in capsys.readouterr().err
+    assert _residual_lines(caplog) == ["[security] remote_debug_ control"]
+
+
+@pytest.mark.parametrize(
+    ("warn", "accept"), [(True, False), (False, True)], ids=["warn", "accepted"]
+)
+def test_supervise_reports_the_residual_once_past_this_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    warn: bool,
+    accept: bool,
+) -> None:
+    """The controls: where this gate lets the fleet through, the residual is still logged, once,
+    and after anything the gate wrote. It may stop at a later gate (no store key is set)."""
+    with caplog.at_level(logging.WARNING, logger=cli.__name__):
+        _supervise(tmp_path, monkeypatch, _ON, warn=warn, accept=accept)
+    residual = _residual_lines(caplog)
+    assert len(residual) == 1 and residual[0].startswith("[security] remote_debug_enabled: ")
+    messages = [r.getMessage() for r in caplog.records if r.name == cli.__name__]
+    audits = _audit_lines(caplog, "start the fleet")
+    assert len(audits) == int(accept), messages
+    assert all(messages.index(a) < messages.index(residual[0]) for a in audits), messages
+
+
+def test_the_acceptance_has_one_spelling() -> None:
+    """Vault BACKLOG #3795 item 7: the qualified name and the loosening name derive from the one
+    key, and that key is the settings field and its ``MEFOR_SECURITY_`` variable."""
+    from messagefoundry.config.settings import load_settings
+
+    assert REMOTE_DEBUG_ACCEPTANCE_KEY in SecuritySettings.model_fields
+    assert f"[security].{REMOTE_DEBUG_ACCEPTANCE_KEY}" == REMOTE_DEBUG_ACCEPTANCE
+    assert REMOTE_DEBUG_ACCEPTANCE_LOOSENING[0] == REMOTE_DEBUG_ACCEPTANCE_KEY
+    variable = f"MEFOR_SECURITY_{REMOTE_DEBUG_ACCEPTANCE_KEY.upper()}"
+    for text, accepted in (("true", True), ("false", False)):
+        settings = load_settings(environ={variable: text}, default_file=False)
+        assert settings.security.allow_remote_debugging is accepted
 
 
 # --- a real interpreter, started both ways ---------------------------------------------------------
