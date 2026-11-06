@@ -269,7 +269,8 @@ function Get-WorktreeOccupancy {
         [object[]]$Worktrees
     )
 
-    $worktrees = if ($PSBoundParameters.ContainsKey('Worktrees')) { @($Worktrees) } else { @(Get-RepoWorktrees $Repo) }
+    # The outer @() keeps a one-worktree list an array, which an `if` expression would unroll.
+    $worktrees = @(if ($PSBoundParameters.ContainsKey('Worktrees')) { $Worktrees | Where-Object { $_ } } else { Get-RepoWorktrees $Repo })
     if ($worktrees.Count -eq 0) {
         return [pscustomobject]@{
             RepoFound = $false; Available = $false; RegistryRead = $false

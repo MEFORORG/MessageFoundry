@@ -183,7 +183,7 @@ nothing prompts.
 | Route | Reaches | Refuses, before it removes anything |
 |---|---|---|
 | `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes (which `-Discard` parks instead), and the git repositories inside the tree listed in the next section. A detached HEAD no ref holds. An unlanded ledger number. A held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree, whatever `-Force` says. |
-| `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` | Everything `-Name` refuses, and the list in the next section. |
+| `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` (one above the primary does not count; see below) | Everything `-Name` refuses, and the list in the next section. |
 | `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
 
 ### `-Path` is the checked route, and a session may run it
@@ -240,7 +240,7 @@ is a copy for readers and can lag it.
   records it. That covers the primary, another repository's worktree, a plain directory, and a
   junction, `subst` or 8.3 spelling of a real worktree.
 - The tree you are standing in, and a tree that holds the copy of the script being run.
-- A tree under `.claude/worktrees`. The next section says why.
+- A tree under `.claude/worktrees`, other than a segment above the primary. The next section says why.
 - A tree that holds another registered worktree.
 - A tree git has locked.
 - A detached HEAD whose commit no ref holds.

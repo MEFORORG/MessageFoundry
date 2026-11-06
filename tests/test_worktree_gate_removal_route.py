@@ -38,8 +38,6 @@ import pytest
 
 from tests.test_worktree_gate import assert_denied, bash, run_gate
 from tests.test_worktree_gate_emitter import _outside_single_quotes
-
-# _ENV drops GIT_* and CLAUDE_CONFIG_DIR, so no child reads the real repository or session registry.
 from tests.test_worktree_remove_path import _ENV, REAL_SCRIPTS, settle_worktrees, write_registry
 
 pytestmark = pytest.mark.skipif(

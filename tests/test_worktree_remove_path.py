@@ -786,11 +786,16 @@ def test_a_session_on_the_callers_config_root_outside_userprofile_occupies_the_t
     assert "Target is occupied" in _out(proc), _out(proc)
     assert wt.exists() and rig.is_registered(wt)
 
-    # A root the registry's wildcard reads could misread refuses rather than be read.
-    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(rig.root / "cfg[1]")})
-    assert proc.returncode != 0, _out(proc)
-    assert "wildcard character" in _out(proc), _out(proc)
-    assert wt.exists()
+    # A root the registry's wildcard reads could misread, and a relative root that names no fixed
+    # directory, refuse rather than be read.
+    for value, needle in (
+        (str(rig.root / "cfg[1]"), "wildcard character"),
+        ("cfg", "relative path"),
+    ):
+        proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": value})
+        assert proc.returncode != 0, _out(proc)
+        assert needle in _out(proc), _out(proc)
+        assert wt.exists()
 
     # Control: a CLAUDE_CONFIG_DIR that IS one of the USERPROFILE roots, whose registry clears the
     # target, removes the tree. It does not tell a single read of that root from a double one.

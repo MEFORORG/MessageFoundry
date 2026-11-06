@@ -14,7 +14,8 @@
 
       -Name <n>   The sibling worktree new.ps1 made for <n>, at <repo>-<n> beside the checkout THIS
                   COPY lives in. Unchanged by the routes below. It can also delete the branch.
-      -Path <p>   Any registered linked worktree of this clone that is not under .claude/worktrees: a
+      -Path <p>   Any registered linked worktree of this clone that is not under .claude/worktrees (a
+                  segment above the primary does not count, as the list below says): a
                   harness scratchpad, a hand-made directory, a sibling. This is the CHECKED route, and
                   it is the one the worktree gate's rule 3d names (vault BACKLOG #1017). It removes
                   the directory and never the branch: it does not take -DeleteBranch.
@@ -45,7 +46,7 @@
         registry that was read and holds no record at all clears the target. The registry is every
         %USERPROFILE%\.claude* config root, and the caller's CLAUDE_CONFIG_DIR when it names another;
         a session on any other root is not seen. A record whose process still runs counts unless
-        that process started after the record was written. This fence sees only
+        that process started more than a minute after the record's startedAt. This fence sees only
         the directory a session was launched in, never where it writes, so on its own it is blind
         to a subagent's tree. The refusals in the next list are the signals that are not;
       * every refusal in the next list, which -Name shares.
@@ -264,18 +265,21 @@ $RepoName = Split-Path $RepoRoot -Leaf
 $transientRefExcludes = @('--exclude=refs/stash', '--exclude=refs/prefetch/*', '--exclude=refs/bisect/*',
     '--exclude=refs/rewritten/*', '--exclude=refs/original/*')
 
-# Whether a ConvertTo-Norm path is under a .claude/worktrees segment INSIDE this clone. prune-merged.ps1
-# excludes this population too, for the same reason; its own test needs a trailing slash and is asked
-# only of the primary's siblings, so the two are not the same expression. This one is the wider.
-# A segment that lies ABOVE the primary checkout does not count (vault BACKLOG #2985, item 3): a clone
-# made inside another checkout's .claude/worktrees would otherwise have every one of its trees refused.
-# No harness tree of THIS clone can sit in such a segment. The harness puts one under the checkout the
-# session was launched in, and a checkout of this clone holding the primary would have to be added
-# into a directory that already holds it, which `git worktree add` refuses. Every other segment
-# counts, including one under a directory git does not list, so this fails closed.
+# Whether a path is under a .claude/worktrees segment, other than one that lies ABOVE the primary
+# checkout. prune-merged.ps1 and the worktree gate exclude this population too, for the same reason,
+# but count a segment anywhere, so for a clone below one they exclude more than this does.
+# A segment above the primary does not count (vault BACKLOG #2985, item 3): a clone made inside
+# another checkout's .claude/worktrees would otherwise have every one of its trees refused. No harness
+# tree of THIS clone can sit in such a segment. The harness puts its trees under a checkout of this
+# clone (the "WHICH MECHANISM MADE THIS WORKTREE" block of scripts/hooks/worktree_gate.ps1 says which
+# one), and a checkout of this clone holding the primary would have to be added into a directory that
+# already holds it, which `git worktree add` refuses. Every other segment counts, including one under
+# a directory git does not list, so this fails closed.
 # ORDINAL, because the exemption ALLOWS: the culture comparison ignores a zero-width character or a
-# soft hyphen, so a primary differing by one from the segment's spelling would read as below it.
-function Test-UnderManagedSegment([string]$Norm) {
+# soft hyphen, so a primary differing by one from the segment's spelling would read as below it. The
+# path is normalised here, so a caller's spelling and case cannot skip the match.
+function Test-UnderManagedSegment([string]$Path) {
+    $Norm = ConvertTo-Norm $Path
     $primaryNorm = ConvertTo-Norm $PrimaryRoot
     foreach ($m in [regex]::Matches($Norm, '/\.claude/worktrees(?=/|\z)')) {
         $above = $Norm.Substring(0, $m.Index + $m.Length) + '/'
@@ -346,7 +350,7 @@ if ($listing) {
     Write-Host "Columns: class, route(s), -Name argument ('-' for none), branch, path."
     Write-Host ("sibling {0}, managed {1}, other {2}. -Name reaches {3} of {4} and -Path reaches {5}." -f
         $counts.sibling, $counts.managed, $counts.other, $counts.sibling, $linked.Count, $byPathCount)
-    Write-Host ("A 'managed' row is under .claude/worktrees. -Path never removes one; the header of this " +
+    Write-Host ("A 'managed' row is under .claude/worktrees, not counting a segment above the primary. -Path never removes one; the header of this " +
         "script says why.")
     return
 }
@@ -589,8 +593,8 @@ if ($byPath) {
     #
     # A RUNNING PROCESS THAT STARTED BEFORE ITS SESSION REGISTERED IS THAT SESSION (item 9). The
     # registry's default reads such a record as STALE, which vetoes nothing. A recycled pid belongs to
-    # a process started AFTER the record was written, since one pid is never held by two processes at
-    # once, so only the start-AFTER test can tell reuse. The skew is therefore unbounded here. The
+    # a process started AFTER the session registered (the record's startedAt), since one pid is never
+    # held by two processes at once, so only the start-AFTER test can tell reuse. The skew is therefore unbounded here. The
     # receipt also matches sessions against the worktree list read above, not a second read (item 5).
     $pinRoot = ''
     if ($env:CLAUDE_CONFIG_DIR) {
@@ -602,7 +606,8 @@ if ($byPath) {
         if ($env:CLAUDE_CONFIG_DIR -match '[\[\]*?]') {
             throw "CLAUDE_CONFIG_DIR '$env:CLAUDE_CONFIG_DIR' holds a wildcard character, which the session registry reads as a pattern. Occupancy unknown. Nothing was removed."
         }
-        $pin = [System.IO.Path]::GetFullPath($env:CLAUDE_CONFIG_DIR).TrimEnd('\', '/')
+        # TrimEndingDirectorySeparator keeps a drive root whole: `D:` alone would name D:'s cwd.
+        $pin = [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($env:CLAUDE_CONFIG_DIR))
         $underHome = $env:USERPROFILE -and ((Split-Path $pin -Leaf) -like '.claude*') -and
             ((ConvertTo-Norm (Split-Path $pin -Parent)) -eq (ConvertTo-Norm $env:USERPROFILE))
         if (-not $underHome -and (Test-PresentOrThrow (Join-Path $pin 'sessions') 'the session registry CLAUDE_CONFIG_DIR names')) {
