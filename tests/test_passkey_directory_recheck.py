@@ -872,18 +872,23 @@ async def test_every_sign_count_miss_is_a_clone_signal_naming_the_store_answer(c
         await store.close()
 
 
-async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question_raises() -> None:
+@pytest.mark.parametrize("raises", [False, True], ids=["refused", "propagates"])
+async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question_raises(
+    raises: bool,
+) -> None:
     """BACKLOG #3068, review of the merged head. The passkey question after a miss is two to four
     store reads, and a store error in any of them must not drop the clone row (ADR 0068 decision
-    4). RED when: no ``auth.webauthn_clone_suspected`` row is written, or the error propagates
-    rather than refusing as ``store_error`` (BACKLOG #3775: the set read's catch takes a
-    ``RuntimeError``)."""
+    4), whether it is refused or propagates. RED when: no ``auth.webauthn_clone_suspected`` row is
+    written; a ``RuntimeError`` propagates rather than refusing as ``store_error`` (BACKLOG #3775);
+    or ``sqlite3.InterfaceError``, which the set read's catch does not take, does not propagate."""
     store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
     try:
         service, token, response, user_id = await _local_assertion(store)
         real_update = store.update_webauthn_sign_count
 
         async def _store_error(*_args: Any) -> list[object]:
+            if raises:
+                raise sqlite3.InterfaceError("synthetic: the store read failed")
             raise RuntimeError("synthetic: the store read failed")
 
         async def _miss(*args: Any, **kwargs: Any) -> SignCountAnswer:
@@ -903,12 +908,15 @@ async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question
 
         store.update_webauthn_sign_count = _miss  # type: ignore[method-assign]
 
-        refused = await service.finish_webauthn_assertion(
-            token, response, rp_id=_RP, origin=_ORIGIN
-        )
-
-        assert refused.ok is False and refused.session_lost is False
-        assert {"reason": "store_error"} in await _audited_assertion_failures(store)
+        if raises:
+            with pytest.raises(sqlite3.InterfaceError, match="synthetic"):
+                await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+        else:
+            refused = await service.finish_webauthn_assertion(
+                token, response, rp_id=_RP, origin=_ORIGIN
+            )
+            assert refused.ok is False and refused.session_lost is False
+            assert {"reason": "store_error"} in await _audited_assertion_failures(store)
         assert await _clone_answers(store) == ["mismatch"]
         session = await store.get_session(hash_token(token))
         assert session is not None and session.mfa_verified_at is None
@@ -1314,33 +1322,37 @@ class _PyodbcError(Exception):
 
 
 @pytest.fixture
-def fake_pyodbc(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def fake_pyodbc() -> Iterator[None]:
     """A stand-in ``pyodbc`` module with its ``Error`` root, imported the way the store's guarded
     imports read it. The cached catch sets are cleared on the way in and out, so each is built once
-    against the stand-in and once without it."""
+    against the stand-in and once without it. Its own patch context, so the test's
+    ``monkeypatch.undo()`` in the read-fault helper does not take the stand-in away mid-test."""
     module = ModuleType("pyodbc")
     module.Error = _PyodbcError  # type: ignore[attr-defined]
     module.DatabaseError = type("DatabaseError", (_PyodbcError,), {})  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "pyodbc", module)
     caches = (
         store_call_errors,
         audit_write_errors,
         auth_service_module._session_write_errors,
         auth_service_module._passkey_read_errors,
     )
-    for cached in caches:
-        cached.cache_clear()
-    yield
-    for cached in caches:
-        cached.cache_clear()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(sys.modules, "pyodbc", module)
+        for cached in caches:
+            cached.cache_clear()
+        try:
+            yield
+        finally:
+            for cached in caches:
+                cached.cache_clear()
 
 
 #: Each case builds its fault in the test, so no instance (and its traceback) outlives a run.
 _READ_FAULTS: dict[str, Callable[[], Exception]] = {
     "call-runtime": lambda: RuntimeError("synthetic: an engine refusal"),
     "call-closed": lambda: ValueError("synthetic: no active connection"),
-    "connect-socket": lambda: OSError("synthetic: the connection was lost at the socket"),
-    "connect-acquire": lambda: StoreAcquireTimeout("synthetic: the pool borrow timed out"),
+    "lost-socket": lambda: OSError("synthetic: the connection was lost at the socket"),
+    "acquire-timeout": lambda: StoreAcquireTimeout("synthetic: the pool borrow timed out"),
 }
 
 
@@ -1362,17 +1374,18 @@ async def _assert_the_read_fault_refuses(
 
 
 @pytest.mark.parametrize("case", list(_READ_FAULTS))
-async def test_a_connect_class_read_fault_takes_the_call_class_path(
+async def test_a_store_call_read_fault_takes_the_refusal_path(
     case: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """BACKLOG #3775, vault BACKLOG #4728 finding 3. The passkey re-read after the sign-count write
-    catches ``store_call_errors()`` and ``store_connect_errors()``, so a store-call fault and a
-    connect fault take one path: a ``store_error`` refusal with its audit row, no clone row, the
-    factor unmarked. RED when: any of them raises past ``finish_webauthn_assertion`` (the
-    ``RuntimeError`` and ``ValueError`` cases did, under the narrower session-write catch), marks
-    the factor, or writes no ``store_error`` row."""
+    catches ``store_call_errors()`` and ``store_connect_errors()``, so each of these faults takes
+    one path: a ``store_error`` refusal with its audit row, no clone row, the factor unmarked. All
+    of these are in ``store_call_errors()``; the pyodbc test below covers what the connect half
+    adds. RED when: any of them raises past ``finish_webauthn_assertion`` (the ``RuntimeError`` and
+    ``ValueError`` cases did, under the narrower session-write catch), marks the factor, or writes
+    no ``store_error`` row."""
     await _assert_the_read_fault_refuses(_READ_FAULTS[case](), monkeypatch, caplog)
 
 

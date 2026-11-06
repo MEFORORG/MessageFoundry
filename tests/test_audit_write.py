@@ -292,7 +292,12 @@ def fake_pyodbc(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModuleType]:
     module.DatabaseError = _PyodbcDatabaseError  # type: ignore[attr-defined]
     module.InterfaceError = _PyodbcInterfaceError  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "pyodbc", module)
-    caches = (audit_write_errors, store_call_errors, auth_service_module._session_write_errors)
+    caches = (
+        audit_write_errors,
+        store_call_errors,
+        auth_service_module._session_write_errors,
+        auth_service_module._passkey_read_errors,
+    )
     for cached in caches:
         cached.cache_clear()
     yield module
