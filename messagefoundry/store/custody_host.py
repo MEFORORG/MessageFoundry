@@ -213,8 +213,9 @@ def foreign_custody_refusal(
         f"{' and '.join(found)} is in {directory}, but [store].key_provider is "
         f"{settings.key_provider!r}. A store with a host blob takes its key from that blob only: "
         "if it holds this store's key, set [store].key_provider = 'host' and remove every other "
-        "store key setting. The engine cannot tell whether it does, so it leaves the file in "
-        f"place. {keep_the_key_step(settings, new_store=False)}"
+        "store key setting, keeping a copy of each value first, since it may be the only copy of "
+        "a store key. The engine cannot tell whether the blob holds this store's key, so it "
+        f"leaves the file in place. {keep_the_key_step(settings, new_store=False)}"
     )
 
 
@@ -313,8 +314,9 @@ def _settle_left_handoff(handoff: Path, blob: HostBlob) -> None:
                 f"it names store id {left.store_id.hex()} and the host file names "
                 f"{blob.store_id.hex()}, or it holds another key, so it is not this store's. "
                 "It may be another store's only key, so keep the file: move it out of "
-                f"{handoff.parent} to a path outside that directory that does not exist yet, "
-                "then start again"
+                f"{handoff.parent} to a path outside that directory that does not exist yet, on "
+                "the same volume and in a directory readable by no one but administrators, so it "
+                "keeps its own access list, then run the command again"
             )
 
     try:
@@ -560,10 +562,12 @@ def keep_the_key_step(
     # can reach stderr, and CodeQL's name heuristic reads that constant as a secret (alert 315).
     text = (
         "To go on without it, give this store a custody directory of its own: a new directory, "
-        "named by MEFOR_SECRETS_DIRECTORY here and in this store's own service environment, never "
-        "in one that another store's service also reads, since that store would then look for its "
-        "key there. Copy into it every other secret file the current secrets directory holds, if "
-        "one is set, since the service reads its other secrets from there too"
+        "readable by no one but this service's account and administrators, as a secrets "
+        "directory must be, named by MEFOR_SECRETS_DIRECTORY here and in this store's own service "
+        "environment, never in one that another store's service also reads, since that store "
+        "would then look for its key there. Copy into it every secret file the current secrets "
+        f"directory holds other than {HOST_FILE_NAME} and {HANDOFF_FILE_NAME}, if one is set, "
+        "since the service reads its other secrets from there too"
     )
     if new_store:
         text += ". Point [store] at a store location of its own: " + (
@@ -577,7 +581,7 @@ def keep_the_key_step(
     if settings.key_provider == HOST_PROVIDER:
         command = "messagefoundry provision-admin"
         if service_account is not None:
-            command += f" --service-account {service_account}"
+            command += f' --service-account "{service_account}"'
         text += f". Then run `{command}`, which mints this store's key there"
         if service_account is None and sys.platform == "win32":
             text += (

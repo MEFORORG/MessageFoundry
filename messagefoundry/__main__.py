@@ -7097,12 +7097,14 @@ def _discard_minted_custody(path: Path, store: StoreSettings, failure: BaseExcep
     except FileNotFoundError:
         pass
     except OSError as exc:
+        # A new store location only where the pin refused: a store another key made is there.
+        step = keep_the_key_step(store, new_store=isinstance(failure, StoreIdPinRefusedBeforeWrite))
         print(
             f"WARNING: the store could not be created, and the store key minted for it in {path} "
             f"could not be removed ({exc.strerror or type(exc).__name__}). This run minted it and "
             "nothing was written under it, so it is no store's key and the recovery key shown "
-            "opens nothing; while it is there, a run here stops at it rather than mint over it. "
-            f"{keep_the_key_step(store, new_store=True)}",
+            f"opens nothing; while it is there, a run here stops at it rather than mint over it. "
+            f"{step}",
             file=sys.stderr,
         )
 

@@ -601,6 +601,8 @@ def test_the_crash_rule_refuses_a_handoff_naming_another_store(tmp_path: Path) -
     text = str(excinfo.value)
     move = f"move it out of {tmp_path} to a path outside that directory that does not exist yet"
     assert move in text and ".aside" not in text, text
+    # A move across volumes is a copy, which takes the destination's access list.
+    assert "on the same volume and in a directory readable by no one but administrators" in text
     assert not _advises_changing(text, allowed=(move,)), text
     assert not _leaks(str(excinfo.value), blob) and not _leaks(str(excinfo.value), other)
 
@@ -1160,7 +1162,7 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absen
         assert "run with the custody directory that holds the store's host blob" in flat, err
         # A server backend: the other secret files are carried over, and the external schema is
         # provisioned first.
-        assert "new, empty" not in flat and "Copy into it every other secret file" in flat, err
+        assert "new, empty" not in flat and "Copy into it every secret file" in flat, err
         assert "a new database, whose schema a DDL-capable login provisions first" in flat, err
     assert driver_text not in err
     assert list(secrets.iterdir()) == []  # no host blob, no handoff
@@ -1282,9 +1284,15 @@ def test_the_fallback_step_fits_the_backend_and_the_command(
     # command keeps --service-account, a Windows run is told about it, and the recovery key is
     # paired with its key file.
     settings = _settings(tmp_path).model_copy(update={"backend": backend})
-    step = custody_host.keep_the_key_step(settings, new_store=True, service_account="svc-mefor")
-    assert "empty" not in step and "Copy into it every other secret file" in step, step
-    assert "`messagefoundry provision-admin --service-account svc-mefor`" in step, step
+    step = custody_host.keep_the_key_step(
+        settings, new_store=True, service_account="NT SERVICE\\MessageFoundry"
+    )
+    assert "empty" not in step and "Copy into it every secret file" in step, step
+    # Quoted, since a service account name can hold a space.
+    command = '`messagefoundry provision-admin --service-account "NT SERVICE\\MessageFoundry"`'
+    assert command in step, step
+    assert "readable by no one but this service's account and administrators" in step, step
+    assert "other than master.key and handoff.key" in step, step
     assert "the recovery key shown when an existing key file was minted goes with that file" in step
     schema = "whose schema a DDL-capable login provisions first"
     assert (schema in step) is (backend is StoreBackend.POSTGRES), step
@@ -1308,7 +1316,7 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
     # at least the existing-store refusal, the pin refusal, the never-started refusal,
     # foreign_custody_refusal, mint_target's refusal and both failed-mint warnings. Not here: the
     # crash rule's handoff refusal, which its own Windows-only test checks, and the pin refusal's
-    # race backstop in _load_audit_chain, which prints the same _pin_needs_the_wrap text.
+    # race backstop in _load_audit_chain, which prints the same _PIN_NEEDS_THE_WRAP text.
     import asyncio
 
     from messagefoundry import __main__ as cli
@@ -1377,9 +1385,22 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
     assert all(text.count("WARNING:") == 1 for text in texts[-2:]), texts[-2:]
     offending = [text for text in texts if _advises_changing(text)]
     assert not offending, offending
-    # Every text names a way on: provision-admin, the fallback, or the re-run in place.
-    for text in texts:
-        assert "provision-admin" in text or "run the command again" in text, text
+    # Every text names its own way on, in the order rendered above. The existing-store text
+    # names provision-admin through the missing-key text it quotes, so its marker is the fallback.
+    fallback = "To go on without it"
+    markers = [
+        (fallback, "run with the custody directory that holds the store's host blob"),
+        ("which names the way on",),
+        (fallback,),
+        (fallback, "set [store].key_provider = 'host'"),
+        (fallback, "leaves it in place"),
+        ("Keep that file and run the command again",),
+        (fallback, "This run minted it and nothing was written under it"),
+    ]
+    assert len(markers) == len(texts)
+    for text, needed in zip(texts, markers, strict=True):
+        flat = " ".join(text.split())
+        assert all(marker in flat for marker in needed), (needed, text)
 
 
 async def _failed_create(
@@ -1639,7 +1660,7 @@ def test_a_minted_key_that_cannot_be_removed_is_named_as_this_runs_own(
     assert "This run minted it and nothing was written under it" in warning, warning
     assert "the recovery key shown opens nothing" in warning, warning
     assert "cannot tell whose key" not in warning and not _advises_changing(warning), warning
-    assert "Copy into it every other secret file" in " ".join(warning.split()), warning
+    assert "Copy into it every secret file" in " ".join(warning.split()), warning
 
 
 @host_file_platforms
