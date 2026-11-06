@@ -728,8 +728,22 @@ def test_the_bound_is_settled_only_AFTER_the_message_graph_has_quiesced() -> Non
     from messagefoundry.pipeline import engine as engine_mod
 
     def touches(method: object, attr: str) -> bool:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(method)))  # type: ignore[arg-type]
-        return any(isinstance(n, ast.Attribute) and n.attr == attr for n in ast.walk(tree))
+        """Whether the method, or an Engine method it reaches through ``self``, reads ``attr``."""
+        seen: set[str] = set()
+        todo = [method]
+        while todo:
+            tree = ast.parse(textwrap.dedent(inspect.getsource(todo.pop())))  # type: ignore[arg-type]
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Attribute):
+                    continue
+                if node.attr == attr:
+                    return True
+                callee = getattr(engine_mod.Engine, node.attr, None)
+                on_self = isinstance(node.value, ast.Name) and node.value.id == "self"
+                if on_self and node.attr not in seen and inspect.isfunction(callee):
+                    seen.add(node.attr)
+                    todo.append(callee)
+        return False
 
     # Engine.stop() runs its steps in the order _stop_steps() lists them (BACKLOG #3191). Building
     # the list calls nothing, so an engine that never ran __init__ is enough.

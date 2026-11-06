@@ -1105,6 +1105,30 @@ def test_stop_does_not_wait_for_a_hung_pass() -> None:
     assert asyncio.run(drive()) < 5
 
 
+def test_a_stop_timeout_shorter_than_the_runner_s_own_wait_wins() -> None:
+    """BACKLOG #3191: engine.stop() hands the runner a share of its budget, shorter than the
+    runner's own wait, and the hung pass is abandoned at that share."""
+    release = threading.Event()
+
+    def hung() -> None:
+        release.wait(10)
+
+    async def drive() -> float:
+        runner = CrlReloadRunner(
+            interval_seconds=0.01, reload=hung, stop_timeout_seconds=30.0, skip_when_idle=False
+        )
+        runner.start()
+        await asyncio.sleep(0.1)  # the pass is now blocked in its worker thread
+        started = time.monotonic()
+        try:
+            await runner.stop(timeout=0.1)
+            return time.monotonic() - started
+        finally:
+            release.set()  # so asyncio.run's executor shutdown does not wait on the thread
+
+    assert asyncio.run(drive()) < 5
+
+
 def test_the_cap_is_a_cert_monitor_setting() -> None:
     assert CertMonitorSettings().crl_max_reloads == MAX_RELOADS
     with pytest.raises(ValueError, match="crl_max_reloads"):

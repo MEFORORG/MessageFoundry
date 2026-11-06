@@ -280,9 +280,11 @@ _DEMOTE_BUDGET_CEILING = 10.0
 #: (BACKLOG #1987). Shared by both coordinators for the reason :func:`stepdown_pause_seconds` is.
 #: Picked, not derived. ``Engine.stop()`` stops the coordinator last, after the graph teardown has
 #: spent its own share of NSSM's ``AppStopMethodConsole`` budget in
-#: ``scripts/service/install-service.ps1``, so this keeps the coordinator's share small. What holds
-#: the whole shutdown to that budget is the budget Engine.stop() is handed, which cuts the
-#: coordinator's stop at its share (BACKLOG #3191).
+#: ``scripts/service/install-service.ps1``, so this keeps the coordinator's share small. Under the
+#: managed API lifespan Engine.stop() also cuts the coordinator's stop at its share (BACKLOG #3191),
+#: but a cut write can still hold its pool connection, and the store's close, which is never cut,
+#: waits for it. So this bound, not the cut, is what keeps that write's cost small, and it does not
+#: guarantee that the whole shutdown fits the window.
 #:
 #: **The bound is not the whole cost of a write that misses it.** The borrow and the statement share
 #: one deadline at the bound, and then the cancellation has to unwind through the driver:

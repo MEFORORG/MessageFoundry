@@ -3806,12 +3806,17 @@ class Engine:
         it. The store's close is never cut, since a store left open keeps a non-daemon worker thread
         alive (BACKLOG #2087). The cut graces are taken out of the budget first, so the whole stop
         ends within the larger of the budget and the floors plus those graces, plus whatever the
-        close takes past its floor. A cut leaves what that step was stopping as a crash would, so a
-        claimed row stays INFLIGHT for ``reset_stale_inflight`` at the next start, and a step that
-        raises no longer skips the store's close.
+        close takes past its floor. A cut leaves what that step was stopping to run beside the later
+        steps until the process exits, a claimed row stays INFLIGHT for ``reset_stale_inflight`` at
+        the next start, and a step that raises no longer skips the store's close. A graph that did
+        not stop keeps its intake gate, raises no graph-stopped clear and keeps its cluster lease
+        (:meth:`_graph_left_running`).
 
-        Without a budget every step runs to completion, in order, with its fixed waits, and the first
-        failure is raised, as before."""
+        Without a budget every step runs to completion, in order, with its fixed waits, and the
+        first failure is raised once its step ends. That much is as before. At least these differ:
+        the background runners stop concurrently, all joined before the first failure is raised; a
+        graph that did not stop is handled as above; and the pool warm-up is cancelled before the
+        coordinator stops."""
         log.info("engine stopping")
         steps = self._stop_steps()
         if budget_seconds is None:
@@ -3847,22 +3852,29 @@ class Engine:
             return
         self._graph_stop.set()
         # Paired with _graph_stop: the loop now waits on _graph_wake, so without this the
-        # supervisor would sit out its poll interval and be CANCELLED by the wait_for below
+        # supervisor would sit out its poll interval and be CANCELLED by the wait below
         # rather than exiting cooperatively.
         self._graph_wake.set()
         supervisor = self._graph_supervisor
         self._graph_supervisor = None
         wait = _within(bound, _GRAPH_SUPERVISOR_STOP_SECONDS)
+        # asyncio.wait, not wait_for, so an error the supervisor itself ended with, a TimeoutError
+        # among them, is not read as this wait running out. A cut of this step still cancels it.
         try:
-            await asyncio.wait_for(supervisor, timeout=wait)
-        except TimeoutError:
+            done, _ = await asyncio.wait({supervisor}, timeout=wait)
+        except asyncio.CancelledError:
+            supervisor.cancel()
+            raise
+        if not done:
             log.warning(
                 "engine stop: the graph supervisor did not exit within %.2fs; cancelled it, and the "
                 "graph's stop next tears down whatever its reconcile left",
                 wait,
             )
-            # wait_for already cancelled the task on timeout; absorb its cancellation.
+            supervisor.cancel()
             await asyncio.gather(supervisor, return_exceptions=True)
+        elif not supervisor.cancelled() and (error := supervisor.exception()) is not None:
+            log.warning("engine stop: the graph supervisor had ended with %s", safe_exc(error))
 
     async def _stop_background_runners(self, bound: float) -> None:
         # Concurrent, so one runner slow to stop, as a CRL pass hung on a share is, holds none of the
@@ -3899,11 +3911,11 @@ class Engine:
         )
         stopped = [r for r, result in zip(runners, results, strict=True) if result is None]
         # Forgotten only once stopped, so a stop() run again after a failure retries them, as before.
-        if crl is not None and crl in stopped:
+        if self._crl_reload_runner in stopped:
             self._crl_reload_runner = None
-        if self._log_forward_watch is not None and self._log_forward_watch in stopped:
+        if self._log_forward_watch in stopped:
             self._log_forward_watch = None
-        if self._state_convergence is not None and self._state_convergence in stopped:
+        if self._state_convergence in stopped:
             self._state_convergence = None
         failures = [result for result in results if isinstance(result, BaseException)]
         for failure in failures[1:]:
@@ -3915,12 +3927,25 @@ class Engine:
         if self._registry_runner is not None:
             await self._registry_runner.stop()
 
-    async def _stop_after_graph(self, bound: float) -> None:
-        # A graph's stop that was cut, or that failed, can leave listeners and workers live. Then
-        # neither the gate is opened nor the graph reported gone, since both would be false; the
-        # monitor's loop, left running, ends with the process (BACKLOG #3191).
+    def _graph_left_running(self) -> bool:
+        """Whether the graph's stop was cut, or failed, leaving listeners or workers that may be live
+        (BACKLOG #3191). The later steps then leave alone what would say the graph has gone."""
         runner = self._registry_runner
-        if runner is not None and runner.has_residual_state:
+        return runner is not None and runner.has_residual_state
+
+    async def _stop_after_graph(self, bound: float) -> None:
+        try:
+            await self._stop_after_graph_body(bound)
+        finally:
+            # Even when this step is cut: the cipher, shared with the uploaded-logs store, must not
+            # keep firing alerts into an engine that has stopped.
+            self._disarm_cipher_refusal_alert()
+
+    async def _stop_after_graph_body(self, bound: float) -> None:
+        # A graph left running keeps its intake gate and raises no graph-stopped clear, since
+        # opening the one and raising the other would both be false. The monitor's loop, left
+        # running, ends with the process, and so does any intake_paused alert it holds open.
+        if self._graph_left_running():
             log.error(
                 "engine stop: the graph did not stop, so the intake gate stays as it is and no "
                 "graph-stopped clear is raised; its claimed rows recover at the next start"
@@ -3956,7 +3981,6 @@ class Engine:
         if self._gcm_invocation_runner is not None:
             await self._gcm_invocation_runner.stop()
             self._gcm_invocation_runner = None
-        self._disarm_cipher_refusal_alert()
 
     async def _stop_coordinator(self, _bound: float) -> None:
         # Deregister cluster membership after the runner has quiesced but before the store closes (the
@@ -3974,6 +3998,15 @@ class Engine:
             self._warm_pool_task.cancel()
             await asyncio.gather(self._warm_pool_task, return_exceptions=True)
             self._warm_pool_task = None
+        # A graph left running may still be claiming and delivering. Releasing the lease now would
+        # let a standby promote and recover those rows under it, so the lease is held to its TTL,
+        # as a crash would hold it (BACKLOG #3191).
+        if self._graph_left_running():
+            log.error(
+                "engine stop: the graph did not stop, so this node keeps its cluster lease and "
+                "membership until they expire, as after a crash"
+            )
+            return
         await self._coordinator.stop()
 
     async def _drain_config_writes_at_stop(self, bound: float) -> None:

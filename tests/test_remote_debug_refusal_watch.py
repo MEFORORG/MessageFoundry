@@ -581,6 +581,26 @@ async def test_a_last_pass_that_hangs_is_cancelled(
     assert task.cancelled()
 
 
+async def test_a_stop_timeout_shorter_than_the_watch_s_own_wait_wins(
+    refuse: Callable[..., None],
+) -> None:
+    """BACKLOG #3191: engine.stop() hands the watch a share of its budget, shorter than
+    ``_STOP_SECONDS``, and the hung last pass is cancelled at that share."""
+
+    class _Hung(_RefusingStore):
+        async def record_audit(self, action: str, **_kw: Any) -> None:
+            await asyncio.Event().wait()
+
+    watch = _on(_Hung(), interval_seconds=3600.0)
+    refuse()
+    watch.start()
+    await asyncio.sleep(0)
+    task = watch._task
+    assert task is not None
+    await asyncio.wait_for(watch.stop(timeout=0.05), 2.0)
+    assert task.cancelled()
+
+
 async def test_a_pass_whose_cancel_hangs_too_does_not_hold_the_stop(
     refuse: Callable[..., None], monkeypatch: pytest.MonkeyPatch
 ) -> None:

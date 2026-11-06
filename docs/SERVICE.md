@@ -319,7 +319,10 @@ step left claimed is recovered at the next start, as after a crash. At least two
 cut: the reap of the lifespan's store-reading tasks, and the store's close. The figures are
 constants in `messagefoundry/__main__.py` (`_UVICORN_DRAIN_SECONDS`),
 `messagefoundry/api/app.py` (`_SHUTDOWN_BUDGET_SECONDS`, `_ENGINE_STOP_RESERVE_SECONDS`) and
-`messagefoundry/pipeline/teardown.py` (`CUT_GRACE_SECONDS`), with each step's floor beside it.
+`messagefoundry/pipeline/teardown.py` (`CUT_GRACE_SECONDS`); each lifespan step's floor is
+beside it in `api/app.py`, and `engine.stop()`'s in `Engine._stop_steps`
+(`messagefoundry/pipeline/engine.py`). A graph that did not stop also keeps its cluster lease
+until the lease expires, so no standby recovers its rows under it.
 `tests/test_lifespan_teardown.py` sums their worst case against the installer's value. What a
 step that is never cut takes past its floor, and work the interpreter joins as it exits, are not
 in that sum.

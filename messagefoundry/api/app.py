@@ -12665,8 +12665,8 @@ def create_managed_app(
             # closes both notifiers, and is re-raised once they have run. Without engine.stop()
             # the store's non-daemon worker keeps the process alive. The three store-reading tasks
             # are cancelled first, before any await, so no step can leave one running when
-            # engine.stop() closes the store. _SHUTDOWN_BUDGET_SECONDS bounds every step, engine.stop()
-            # through the budget it is handed, all but that store close.
+            # engine.stop() closes the store. _SHUTDOWN_BUDGET_SECONDS bounds the steps, engine.stop()
+            # through the budget it is handed; the steps never cut are named in TeardownStep.
             background = [t for t in (reconciler, reaper, credential_reminder) if t is not None]
             for task in background:
                 task.cancel()

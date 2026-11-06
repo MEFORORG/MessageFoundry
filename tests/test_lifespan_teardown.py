@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -878,6 +879,12 @@ async def test_a_hung_graph_stop_is_cut_and_the_later_steps_still_run(
     )
     engine.drain_config_writes = _drain  # type: ignore[method-assign]
     engine.on_graph_stopped = lambda: calls.append("graph-stopped clear")
+
+    async def _release_lease() -> None:
+        calls.append("lease released")
+
+    # Released, the lease would let a standby recover rows this graph may still be delivering.
+    engine._coordinator.stop = _release_lease  # type: ignore[method-assign]
     budget = app_module._ENGINE_STOP_RESERVE_SECONDS
     with caplog.at_level(logging.ERROR):
         began = time.monotonic()
@@ -889,20 +896,80 @@ async def test_a_hung_graph_stop_is_cut_and_the_later_steps_still_run(
     messages = [r.getMessage() for r in caplog.records]
     assert any("the graph's stop did not finish within" in m for m in messages), messages
     assert any("the graph did not stop" in m for m in messages), messages
+    assert any("keeps its cluster lease" in m for m in messages), messages
 
 
 async def test_a_graph_that_stopped_gets_its_graph_stopped_clear_under_a_budget(
     tmp_path: Path,
 ) -> None:
-    """The control for the test above: with the graph stopped, the clear is raised."""
+    """The control for the test above: with the graph stopped, the clear is raised and the lease
+    released."""
     engine = await _bare_engine(tmp_path / "stopped-graph.db")
     calls: list[str] = []
     _record_close(engine, calls)
     engine.on_graph_stopped = lambda: calls.append("graph-stopped clear")
+
+    async def _release_lease() -> None:
+        calls.append("lease released")
+
+    engine._coordinator.stop = _release_lease  # type: ignore[method-assign]
     await asyncio.wait_for(
         engine.stop(budget_seconds=app_module._ENGINE_STOP_RESERVE_SECONDS), _WAIT_S
     )
-    assert calls == ["graph-stopped clear", "close"]
+    assert calls == ["graph-stopped clear", "lease released", "close"]
+
+
+class _FakeRunner:
+    """A background runner's stop, recorded. ``fail`` makes it raise."""
+
+    def __init__(
+        self, name: str, calls: list[tuple[str, float | None]], *, fail: bool = False
+    ) -> None:
+        self.name, self.calls, self.fail = name, calls, fail
+
+    async def stop(self, timeout: float | None = None) -> None:
+        self.calls.append((self.name, timeout))
+        if self.fail:
+            raise RuntimeError(f"PROBE: {self.name} failed to stop")
+
+
+async def test_the_background_runners_all_stop_and_only_the_stopped_are_forgotten(
+    tmp_path: Path,
+) -> None:
+    """Every runner's stop runs, whichever fails, the first failure is raised once they all ran,
+    and a runner whose stop failed stays known, so the next stop() retries it. With no budget the
+    CRL runner keeps its own wait."""
+    engine = await _bare_engine(tmp_path / "runners.db")
+    calls: list[tuple[str, float | None]] = []
+    retention = _FakeRunner("retention", calls, fail=True)
+    crl = _FakeRunner("crl", calls)
+    forward = _FakeRunner("log forward", calls, fail=True)
+    engine._retention_runner = retention  # type: ignore[assignment]
+    engine._crl_reload_runner = crl  # type: ignore[assignment]
+    engine._log_forward_watch = forward  # type: ignore[assignment]
+    try:
+        with pytest.raises(RuntimeError, match="retention"):
+            await engine._stop_background_runners(math.inf)
+        assert sorted(name for name, _ in calls) == ["crl", "log forward", "retention"]
+        assert ("crl", math.inf) in calls
+        assert engine._crl_reload_runner is None
+        assert id(engine._log_forward_watch) == id(forward)
+    finally:
+        engine._retention_runner = engine._log_forward_watch = None
+        await engine.stop()
+
+
+async def test_under_a_budget_the_crl_runner_s_wait_is_a_share_of_its_step(
+    tmp_path: Path,
+) -> None:
+    engine = await _bare_engine(tmp_path / "crl-share.db")
+    calls: list[tuple[str, float | None]] = []
+    engine._crl_reload_runner = _FakeRunner("crl", calls)  # type: ignore[assignment]
+    budget = app_module._ENGINE_STOP_RESERVE_SECONDS
+    await asyncio.wait_for(engine.stop(budget_seconds=budget), _WAIT_S)
+    [(name, timeout)] = calls
+    assert name == "crl" and timeout is not None
+    assert timeout < budget
 
 
 async def test_engine_stop_with_no_budget_raises_the_first_failure_as_before(
