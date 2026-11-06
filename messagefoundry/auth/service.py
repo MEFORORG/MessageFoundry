@@ -1876,6 +1876,56 @@ class MfaReset:
     enrolment_code: IssuedEnrolmentCode | None = None
 
 
+# The issue's shared steps (ADR 0207 sections 4 and 6), module-level so the host command, which
+# builds no AuthService, issues and audits exactly as the route does.
+
+
+def enrolment_code_issue_refusal(user: UserRecord, *, holds_factor: bool) -> str | None:
+    """Why a code may not be issued for ``user``, as a key of :data:`ENROLMENT_CODE_ISSUE_REFUSALS`,
+    or ``None``. The store's conditional write judges the same rule again on the record it
+    replaces; this names the reason."""
+    if user.auth_provider != AuthProvider.AD.value:
+        return "local_account"
+    if user.disabled:
+        return "disabled"
+    if holds_factor:
+        return "factor_present"
+    return None
+
+
+async def write_enrolment_code(
+    store: Any, user: UserRecord, *, issuer_id: str | None
+) -> IssuedEnrolmentCode | None:
+    """Mint a code and write its digest, 24 hours of life and ``issuer_id`` in one conditional
+    sealed write. ``None`` when the write changed no row; nothing is shown then."""
+    code = mint_enrolment_code()
+    code_digest = enrolment_code_digest(code)
+    if code_digest is None:  # pragma: no cover - a minted code always normalises
+        raise RuntimeError("an enrolment code failed its own shape check")
+    now = time.time()
+    expires_at = now + ENROLMENT_CODE_LIFETIME_SECONDS
+    outcome = await store.issue_enrolment_code(
+        user.id, code_digest=code_digest, expires_at=expires_at, issuer_id=issuer_id, now=now
+    )
+    if outcome is None:
+        return None
+    return IssuedEnrolmentCode(code=code, expires_at=expires_at, replaced=outcome.replaced)
+
+
+def enrolment_code_issued_detail(user: UserRecord, issued: IssuedEnrolmentCode, *, via: str) -> str:
+    """The ``auth.enrolment_code_issued`` row's detail. Names neither the code nor its digest."""
+    return _json(
+        {
+            "user_id": user.id,
+            "username": user.username,
+            "expires_at": issued.expires_at,
+            "via": via,
+            "replaced": issued.replaced,
+            "bound": user.oidc_issuer is not None and user.oidc_subject is not None,
+        }
+    )
+
+
 class UsernameTaken(RuntimeError):
     """:meth:`AuthService.create_local_user` lost a concurrent create's race for its username
     (BACKLOG #1808). ``POST /users`` answers it 409, with its own pre-check's text.
@@ -13782,8 +13832,9 @@ class AuthService:
             if fresh is not None and (
                 fresh.has_passkeys or await self._store.has_webauthn_credentials(fresh.id)
             ):
-                await self.audit_mfa_denied(identity, "confirm_mfa_enrollment", client=client)
-                await self._audit_code_factor_present(identity, user, "totp", client=client)
+                await self._audit_factor_refusal(
+                    identity, user, op="confirm_mfa_enrollment", ceremony="totp", client=client
+                )
                 raise ValueError(self._TOTP_FACTOR_PRESENT)
         # ADR 0207, A3: the code is read here, after the lookup and the factor check, and before
         # the TOTP step is consumed, so a refused code costs the holder no step.
@@ -14983,57 +15034,30 @@ class AuthService:
         user = await self._load_user(user_id)
         if user is None:
             raise ValueError("no such user")
-        reason: str | None = None
-        if user.auth_provider != AuthProvider.AD.value:
-            reason = "local_account"
-        elif user.disabled:
-            reason = "disabled"
-        elif await self._second_factor_enrolled(user):
-            reason = "factor_present"
+        reason = enrolment_code_issue_refusal(
+            user, holds_factor=await self._second_factor_enrolled(user)
+        )
         if reason is not None:
             raise EnrolmentCodeIssueRefused(reason, ENROLMENT_CODE_ISSUE_REFUSALS[reason])
-        code = mint_enrolment_code()
-        code_digest = enrolment_code_digest(code)
-        if code_digest is None:  # pragma: no cover - a minted code always normalises
-            raise RuntimeError("an enrolment code failed its own shape check")
-        now = time.time()
-        expires_at = now + ENROLMENT_CODE_LIFETIME_SECONDS
-        outcome = await self._store.issue_enrolment_code(
-            user_id,
-            code_digest=code_digest,
-            expires_at=expires_at,
-            issuer_id=issuer_id,
-            now=now,
-        )
-        if outcome is None:
+        issued = await write_enrolment_code(self._store, user, issuer_id=issuer_id)
+        if issued is None:
             after = await self._load_user(user_id)
             if after is None:
                 raise ValueError("no such user")
-            if after.disabled:
-                reason = "disabled"
-            elif await self._second_factor_enrolled(after):
-                reason = "factor_present"
-            else:
-                reason = "changed"
+            reason = enrolment_code_issue_refusal(
+                after, holds_factor=await self._second_factor_enrolled(after)
+            )
+            reason = reason or "changed"
             raise EnrolmentCodeIssueRefused(reason, ENROLMENT_CODE_ISSUE_REFUSALS[reason])
         await self._audit(
             "auth.enrolment_code_issued",
             actor=actor,
-            detail=_json(
-                {
-                    "user_id": user_id,
-                    "username": user.username,
-                    "expires_at": expires_at,
-                    "via": via,
-                    "replaced": outcome.replaced,
-                    "bound": user.oidc_issuer is not None and user.oidc_subject is not None,
-                }
-            ),
+            detail=enrolment_code_issued_detail(user, issued, via=via),
         )
         await self._notify_security(
             ENROLMENT_CODE_ISSUED, username=user.username, email=user.notify_email
         )
-        return IssuedEnrolmentCode(code=code, expires_at=expires_at, replaced=outcome.replaced)
+        return issued
 
     async def revoke_enrolment_code(self, user_id: str, *, actor: str) -> bool:
         """Clear an account's outstanding enrolment code, for a handover that went wrong (ADR 0207
@@ -15066,6 +15090,8 @@ class AuthService:
         """Whether this session would be asked for an enrolment code to bind the account's first
         factor: a directory account holding no factor, on a session not stamped MFA-verified. For
         the status reply and the console pages; the binding steps decide for themselves."""
+        if identity.auth_provider is not AuthProvider.AD:
+            return False  # no store read for the common case, a local account
         user = await self._load_user(identity.user_id)
         if user is None or await self._second_factor_enrolled(user):
             return False
@@ -15114,13 +15140,15 @@ class AuthService:
         )
         raise EnrolmentCodeRefused()
 
-    async def _audit_code_factor_present(
-        self, identity: Identity, user: UserRecord, ceremony: str, *, client: str | None
+    async def _audit_factor_refusal(
+        self, identity: Identity, user: UserRecord, *, op: str, ceremony: str, client: str | None
     ) -> None:
-        """Beside the ``auth.mfa_denied`` row a factor refusal already writes, the
-        ``auth.enrolment_code_refused`` row with ``factor_present``, for a directory account only
-        (ADR 0207 Amendment A, A2). Every caller is on a session the factor-binding rule refused,
-        which is an unstamped one."""
+        """The rows a binding step's factor refusal writes: ``auth.mfa_denied`` for ``op``, and
+        beside it, for a directory account only, ``auth.enrolment_code_refused`` with
+        ``factor_present`` (ADR 0207 Amendment A, A2). One helper, so no refusal site writes one
+        without the other. Every caller is on a session the factor-binding rule refused, which is an
+        unstamped one."""
+        await self.audit_mfa_denied(identity, op, client=client)
         if user.auth_provider != AuthProvider.AD.value:
             return
         await self._audit(
@@ -15380,8 +15408,13 @@ class AuthService:
             token, STEP_UP_ACTION_WEBAUTHN_ENROLL
         ):
             self._webauthn_challenges.pop((hash_token(token), "register"))
-            await self.audit_mfa_denied(identity, "finish_webauthn_registration", client=client)
-            await self._audit_code_factor_present(identity, user, "webauthn", client=client)
+            await self._audit_factor_refusal(
+                identity,
+                user,
+                op="finish_webauthn_registration",
+                ceremony="webauthn",
+                client=client,
+            )
             raise ValueError(self._FACTOR_PRESENT)
         if await self._enrolment_too_early(
             token, user, arrived_at, event="auth.webauthn_failed", client=client
@@ -15419,8 +15452,13 @@ class AuthService:
             return Elevation(session_lost=True)
         if await self._factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
             self._webauthn_challenges.pop((hash_token(token), "register"))
-            await self.audit_mfa_denied(identity, "finish_webauthn_registration", client=client)
-            await self._audit_code_factor_present(identity, user, "webauthn", client=client)
+            await self._audit_factor_refusal(
+                identity,
+                user,
+                op="finish_webauthn_registration",
+                ceremony="webauthn",
+                client=client,
+            )
             raise ValueError(self._FACTOR_PRESENT)
         # ADR 0207, A3 step 7: the code read, before the pop, so a refused code leaves the
         # ceremony staged and costs no code.
@@ -15482,10 +15520,13 @@ class AuthService:
             if spent is None:
                 fresh = await self._load_user(user.id)
                 if fresh is not None and await self._second_factor_enrolled(fresh):
-                    await self.audit_mfa_denied(
-                        identity, "finish_webauthn_registration", client=client
+                    await self._audit_factor_refusal(
+                        identity,
+                        user,
+                        op="finish_webauthn_registration",
+                        ceremony="webauthn",
+                        client=client,
                     )
-                    await self._audit_code_factor_present(identity, user, "webauthn", client=client)
                     raise ValueError(self._FACTOR_PRESENT)
                 await self._refuse_enrolment_code(
                     identity, "code_refused", ceremony="webauthn", client=client
@@ -15544,8 +15585,13 @@ class AuthService:
                 return Elevation(session_lost=True)
             if await self._load_user(user.id) is None:
                 raise ValueError("no such user")
-            await self.audit_mfa_denied(identity, "finish_webauthn_registration", client=client)
-            await self._audit_code_factor_present(identity, user, "webauthn", client=client)
+            await self._audit_factor_refusal(
+                identity,
+                user,
+                op="finish_webauthn_registration",
+                ceremony="webauthn",
+                client=client,
+            )
             raise ValueError(self._FACTOR_PRESENT)
         if spent is not None:
             await self._record_code_spent(identity, spent, "webauthn", client=client)

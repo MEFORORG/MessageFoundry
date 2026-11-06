@@ -329,6 +329,19 @@ def _shown(text: str, what: str) -> str:
     return text if text.isprintable() else f"{what} that cannot be shown safely here"
 
 
+def _holder_lines(event: SecurityEvent) -> list[str]:
+    """The ``Account:`` line naming ``detail["holder"]``, the OTHER account a notice to an issuer is
+    about (BACKLOG #2007; ADR 0207 A5), or nothing. Printed only as one printable token, as the
+    #2019 address line is: a username carrying a line break could otherwise write its own lines
+    into this notice."""
+    holder = str(event.detail.get("holder") or "")
+    if not holder:
+        return []
+    if holder.isprintable() and not any(c.isspace() for c in holder):
+        return [f"Account: {holder}"]
+    return ["Account: (a username that cannot be shown safely here)"]
+
+
 def _build_body(event: SecurityEvent) -> str:
     """A short, PHI-free notice. The recipient is the account owner, so naming their own account /
     source IP / new email is appropriate; no message data or secrets ever appear here."""
@@ -374,13 +387,8 @@ def _build_body(event: SecurityEvent) -> str:
         lines.append(f"Failed attempts: {failed}")
     lines += lock_lines
     if event.event_type == ENROLMENT_CODE_SPENT:
-        # ADR 0207 Amendment A, A5: the issuer's notice names the account that spent the code, as
-        # one printable token for the reason the issuer reminder below gives.
-        spender = str(event.detail.get("holder") or "")
-        if spender.isprintable() and spender and not any(c.isspace() for c in spender):
-            lines.append(f"Account: {spender}")
-        elif spender:
-            lines.append("Account: (a username that cannot be shown safely here)")
+        # ADR 0207 Amendment A, A5: the issuer's notice names the account that spent the code.
+        lines += _holder_lines(event)
     if event.event_type in (
         PASSWORD_RESET,
         TEMPORARY_CREDENTIAL_EXPIRING,
@@ -392,13 +400,7 @@ def _build_body(event: SecurityEvent) -> str:
         stamp = event.detail.get("expires_at")
         expires = deadline_utc(stamp) if isinstance(stamp, (int, float)) else None
         if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER:
-            holder = str(event.detail.get("holder") or "")
-            # Printed only as one printable token, as the #2019 address line below is: a username
-            # carrying a line break could otherwise write its own lines into this notice.
-            if holder.isprintable() and holder and not any(c.isspace() for c in holder):
-                lines.append(f"Account: {holder}")
-            elif holder:
-                lines.append("Account: (a username that cannot be shown safely here)")
+            lines += _holder_lines(event)
             if expires is not None:
                 lines.append(
                     f"The temporary password stops working at {expires}. If the holder still needs "

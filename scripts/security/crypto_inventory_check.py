@@ -1063,12 +1063,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # BACKLOG #1719: cipher-audit decrypts the live store's sealed cells through the store
             # cipher, by cipher_cells' walk. It never encrypts.
             "cipher:via messagefoundry.store.cipher_cells",
-            # ADR 0207: issue-enrolment-code mints a directory account's enrolment code
-            # (tokens.mint_enrolment_code) and stores only its digest.
-            "csprng:via messagefoundry.auth.tokens",
+            # ADR 0207: issue-enrolment-code mints a directory account's enrolment code and stores
+            # only its digest, through the service's shared write_enrolment_code.
+            "csprng:via messagefoundry.auth.service",
             "csprng:via messagefoundry.auth.totp",
             "csprng:via messagefoundry.store.crypto",
             "hash:via messagefoundry.api.tls",
+            # ADR 0207: issue-enrolment-code's code digest, through write_enrolment_code.
+            "hash:via messagefoundry.auth.service",
             # BACKLOG #3778: admin-reset-totp pins the account's opened TOTP seed across the prompt
             # by its SHA-256 digest (auth.tokens.hash_token), compared in constant time.
             "hash:via messagefoundry.auth.tokens",

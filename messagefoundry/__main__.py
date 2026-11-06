@@ -6941,14 +6941,14 @@ def _issue_enrolment_code(args: argparse.Namespace) -> int:
     the route's ``auth.enrolment_code_issued`` row, with ``via`` ``host``, the actor naming the OS
     user, and no issuer, so a spend of it notifies nobody. Never logs the code; prints it once."""
     import getpass
-    import time
 
     from messagefoundry.auth.notifications import deadline_utc
     from messagefoundry.auth.service import (
         ENROLMENT_CODE_ISSUE_REFUSALS,
-        ENROLMENT_CODE_LIFETIME_SECONDS,
+        enrolment_code_issue_refusal,
+        enrolment_code_issued_detail,
+        write_enrolment_code,
     )
-    from messagefoundry.auth.tokens import enrolment_code_digest, mint_enrolment_code
     from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
@@ -6986,41 +6986,27 @@ def _issue_enrolment_code(args: argparse.Namespace) -> int:
             user = await store.get_user_by_username(args.username)
             if user is None:
                 return ("no-such-user", {})
-            if user.auth_provider != "ad":
-                return ("local_account", {})
-            if user.disabled:
-                return ("disabled", {})
-            if user.totp_enabled or await store.has_webauthn_credentials(user.id):
-                return ("factor_present", {})
-            _refuse_an_unauditable_write(store)  # before the issue's write, not after it
-            code = mint_enrolment_code()
-            code_digest = enrolment_code_digest(code)
-            if code_digest is None:  # pragma: no cover - a minted code always normalises
-                raise RuntimeError("an enrolment code failed its own shape check")
-            now = time.time()
-            expires_at = now + ENROLMENT_CODE_LIFETIME_SECONDS
-            outcome = await store.issue_enrolment_code(
-                user.id, code_digest=code_digest, expires_at=expires_at, issuer_id=None, now=now
+            # The sealed passkey digest first, then the table, as the service's own factor read.
+            holds_factor = (
+                user.totp_enabled
+                or (user.row is not None and user.row.cred_digest != "")
+                or await store.has_webauthn_credentials(user.id)
             )
-            if outcome is None:
+            reason = enrolment_code_issue_refusal(user, holds_factor=holds_factor)
+            if reason is not None:
+                return (reason, {})
+            _refuse_an_unauditable_write(store)  # before the issue's write, not after it
+            issued = await write_enrolment_code(store, user, issuer_id=None)
+            if issued is None:
                 return ("changed", {})
             await store.record_audit(
                 "auth.enrolment_code_issued",
                 actor=f"cli:{getpass.getuser()}",
-                detail=json.dumps(
-                    {
-                        "user_id": user.id,
-                        "username": user.username,
-                        "expires_at": expires_at,
-                        "via": "host",
-                        "replaced": outcome.replaced,
-                        "bound": user.oidc_issuer is not None and user.oidc_subject is not None,
-                    }
-                ),
+                detail=enrolment_code_issued_detail(user, issued, via="host"),
             )
             return (
                 "issued",
-                {"code": code, "expires_at": expires_at, "replaced": outcome.replaced},
+                {"code": issued.code, "expires_at": issued.expires_at, "replaced": issued.replaced},
             )
         finally:
             await store.close()

@@ -1029,10 +1029,12 @@ ENROLMENT_CODE_NOTICE = (
 )
 
 
-def enrolment_code_input() -> Markup:
+def enrolment_code_input(owed: bool = True) -> Markup:
     """The enrolment-code field a binding step's form carries when the session owes one (ADR
-    0207). Not a password field: the code is shown to the holder, and the browser must not offer
-    to save it, so it is a plain text field with autocomplete off."""
+    0207), or nothing when it does not. Not a password field: the code is shown to the holder, and
+    the browser must not offer to save it, so it is a plain text field with autocomplete off."""
+    if not owed:
+        return Markup("")
     return el(
         "label",
         "Enrolment code from your Administrator",
@@ -1065,7 +1067,7 @@ def mfa_enroll_page(secret: str, otpauth_uri: str, *, enrolment_code: bool = Fal
                 autofocus=True,
             ),
         ),
-        enrolment_code_input() if enrolment_code else Markup(""),
+        enrolment_code_input(enrolment_code),
         el("button", "Activate MFA", type="submit"),
         method="post",
         action="/ui/account/mfa/verify",
@@ -1108,7 +1110,7 @@ def webauthn_enroll_page(options_json: str, *, enrolment_code: bool = False) -> 
         el(
             "div",
             el("label", "Label", el("input", name="label", maxlength="100", value="")),
-            enrolment_code_input() if enrolment_code else Markup(""),
+            enrolment_code_input(enrolment_code),
             el(
                 "button",
                 "Create passkey",
@@ -1165,7 +1167,7 @@ def mfa_confirm_page(*, error: str | None = None, enrolment_code: bool = False) 
                 autofocus=True,
             ),
         ),
-        enrolment_code_input() if enrolment_code else Markup(""),
+        enrolment_code_input(enrolment_code),
         el("button", "Activate MFA", type="submit"),
         method="post",
         action="/ui/account/mfa/verify",
