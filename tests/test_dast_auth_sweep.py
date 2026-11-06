@@ -791,8 +791,9 @@ def test_a_refused_re_proof_is_a_finding_and_the_sweep_goes_on(
 ) -> None:
     """Vault BACKLOG #3241, added item 3. One refused re-proof used to end the whole sweep with
     exit 2, so every row after it went unmeasured. Now the sweep goes on: the refused rows are
-    listed and scored, every other action-bound row is still re-proved, and the run still fails.
-    RED when: a refused re-proof aborts the run, its rows are not listed, or the run exits 0."""
+    listed and scored, every other action-bound row is still re-proved, and the run still exits 2,
+    a could-not-measure. RED when: a refused re-proof aborts the run, its rows are not listed, or
+    the run exits other than 2."""
     import scripts.security.dast_auth_sweep as sweep
 
     real = dast_target
@@ -816,7 +817,7 @@ def test_a_refused_re_proof_is_a_finding_and_the_sweep_goes_on(
     code = main(["--policy", str(_POLICY), "--receipt", str(receipt_path)])
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
 
-    assert code == 1, f"a refused re-proof should be a finding, exit 1, not {code}"
+    assert code == 2, f"a refused re-proof is a could-not-measure, exit 2, not {code}"
     expected = {"POST /connections/{name}/purge"}
     assert _action_bound_rows()[("POST", "/connections/{name}/purge")] == refused_action
     assert set(receipt["step_up_reproof_refused_rows"]) == expected, receipt
@@ -837,7 +838,7 @@ def test_a_receipt_with_a_refused_re_proof_does_not_pass(
     code, errors = evaluate(
         {**clean, "step_up_reproof_refused_rows": ["POST /config/reload"]}, _policy()
     )
-    assert code == 1 and any("refused the action-bound re-proof" in e for e in errors), errors
+    assert code == 2 and any("refused the action-bound re-proof" in e for e in errors), errors
 
 
 # =====================================================================================================

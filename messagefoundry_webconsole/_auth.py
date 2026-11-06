@@ -1205,8 +1205,13 @@ class _IssuedContinuations:
         return entry if entry is not None and entry.deadline > time.monotonic() else None
 
     def put_back(self, session_hash: str, next_path: str, entry: _Entry) -> None:
-        """Return an entry :meth:`take` handed out, its deadline unchanged, unless it lapsed."""
-        if entry.deadline > time.monotonic():
+        """Return an entry :meth:`take` handed out, its deadline unchanged, unless it lapsed or the
+        gate issued ``next_path`` again meanwhile: the fresher issue stands."""
+        entries = self._sessions.get(session_hash)
+        current = entries.get(next_path) if entries is not None else None
+        if entry.deadline > time.monotonic() and (
+            current is None or current.deadline < entry.deadline
+        ):
             self._put(session_hash, next_path, entry)
 
     def rekey(self, old_token: str | None, new_token: str | None) -> None:
@@ -1278,9 +1283,26 @@ def claim_continuation(
     if not action.continues_only_when_issued:
         return ContinuationClaim(continues=True)
     entry = _ISSUED_CONTINUATIONS.take(token, next_path)
+    if entry is None and token:
+        # A federated start may still hold this issue for a flow that never came back (an
+        # abandoned IdP prompt, a refused or mismatched return that consumed nothing): a new
+        # re-auth takes it from there, so the retry such a page offers still continues.
+        entry = _take_flow_claim(hash_token(token), next_path)
     if entry is None or token is None:
         return ContinuationClaim(continues=False)
     return ContinuationClaim(True, hash_token(token), next_path, entry)
+
+
+def _take_flow_claim(session_hash: str, next_path: str) -> _Entry | None:
+    """Take back the live entry a held flow claim keeps for this session and ``next_path``."""
+    now = time.monotonic()
+    for flow_id, claim in list(_FLOW_CLAIMS.items()):
+        if (claim._session_hash, claim._next_path) == (session_hash, next_path):
+            del _FLOW_CLAIMS[flow_id]
+            entry, claim._entry = claim._entry, None
+            if entry is not None and entry.deadline > now:
+                return entry
+    return None
 
 
 #: The claims a federated step-up start leg holds for its staged flow, by flow id (vault BACKLOG
@@ -1367,9 +1389,7 @@ def _issue_continuation(request: Request, next_path: str) -> None:
         )
         and _request_is_same_origin(request)
     ):
-        _ISSUED_CONTINUATIONS.issue(
-            token, next_path, unlock=action is not None and action.binds_unlock_grant
-        )
+        _ISSUED_CONTINUATIONS.issue(token, next_path)
 
 
 def _reauth_redirect(request: Request, next_path: str | None = None) -> HTTPException:

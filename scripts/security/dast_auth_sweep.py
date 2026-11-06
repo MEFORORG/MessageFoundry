@@ -723,12 +723,13 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
             "kept dying cannot be credited."
         )
 
-    # Vault BACKLOG #3241, added item 3: a refused re-proof no longer ends the sweep, so it is an
-    # error here, whether or not its row is also allowlisted. The scan password re-proved nothing for
-    # that row, so the step-up wall in front of it was measured, not the route behind it.
+    # Vault BACKLOG #3241, added item 3: a refused re-proof no longer ends the sweep, so it is
+    # checked here, whether or not its row is also allowlisted. The scan password re-proved nothing
+    # for that row, so the step-up wall in front of it was measured, not the route behind it: a
+    # could-not-measure, exit 2, as the refusal was when it ended the sweep.
     refused_reproofs = receipt.get("step_up_reproof_refused_rows") or []
     if refused_reproofs:
-        errors.append(
+        fatal.append(
             f"the engine refused the action-bound re-proof for {len(refused_reproofs)} row(s): "
             f"{refused_reproofs}. Each was measured at its step-up wall, not behind it."
         )

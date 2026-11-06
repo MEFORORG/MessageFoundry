@@ -172,8 +172,10 @@ def _directory_refusal_error(elevation: Elevation) -> str | None:
 
 def _refusal_error(elevation: Elevation, fallback: str) -> str:
     """The words for a refused code or passkey: the directory's refusal, then a lock, then the leg's
-    own ``fallback`` for a wrong proof. The first two never checked the proof, so ``fallback``
-    would be false for them (BACKLOG #3061, #3810 finding 4). No leg sets both flags on one
+    own ``fallback`` for a wrong proof. Neither is a wrong proof: a lock, and a directory refusal on
+    a code leg, come before the proof is checked, and a directory refusal on the passkey assertion
+    leg comes after the assertion verified (BACKLOG #3068). So ``fallback`` would be false for them
+    (BACKLOG #3061, #3810 finding 4). No leg sets both flags on one
     answer, so the order between them decides nothing today."""
     directory = _directory_refusal_error(elevation)
     if directory is not None:
@@ -2184,8 +2186,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if elevation.session_lost:
             return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
         if elevation.token is None:
-            # BACKLOG #2239: the directory could not vouch for a directory account, so the
-            # assertion was never checked and "verification failed" would be false.
+            # BACKLOG #2239: the directory could not vouch for a directory account. The assertion
+            # verified first (BACKLOG #3068), so "verification failed" would be false.
             error = _directory_refusal_error(elevation) or "passkey verification failed"
             return JSONResponse({"ok": False, "error": error}, status_code=400)
         # The assertion re-keyed the session (ASVS 7.2.4). The new cookie rides this JSON response,

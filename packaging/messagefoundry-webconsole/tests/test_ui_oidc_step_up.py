@@ -663,22 +663,49 @@ async def test_a_refused_idp_step_up_gives_the_unlock_issue_back_for_the_retry(
         assert page.status_code == 200, page.headers
 
 
-async def test_two_idp_starts_racing_one_unlock_issue_mint_one_grant(
+async def test_a_retry_after_an_abandoned_idp_prompt_still_continues(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Item 9 on the federated leg: the first start takes the issue, so a second start for the same
-    page, from another tab, stages a flow that continues to nothing and mints no grant. RED when:
-    the second flow lands on the unlock page."""
+    """Item 7, the flow that never comes back. The operator leaves the IdP prompt, so no callback
+    resolves the flow that holds the issue, and starts again. The new start takes the issue back
+    from the abandoned flow, so the retry still lands on the unlock page. RED when: the abandoned
+    flow keeps the issue and the retry continues to nothing."""
     service = await _service(engine, _FakeLdap())
     async with _client(engine, service) as c:
         await _federated_sign_in(service, c, monkeypatch)
         issue_continuation(c, _UNLOCK)
+        abandoned = await _start_unlock_step_up(c)
+        assert abandoned.status_code == 303
+        retry = await _start_unlock_step_up(c)
+        assert retry.status_code == 303
+
+        landed = await _callback(c, retry.headers["location"])
+
+        assert landed.status_code == 200, landed.text
+        assert _UNLOCK in landed.text
+
+
+async def test_two_idp_starts_racing_one_unlock_issue_mint_one_grant(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 9 on the federated leg. A second start for the same page takes the issue from the first
+    flow, and its flow cookie replaces the first flow's in this browser, so only one of the two
+    flows can come back and mint. RED when: both returns land on the unlock page."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        await _federated_sign_in(service, c, monkeypatch)
+        issue_continuation(c, _UNLOCK)
+        session = c.cookies.get("mf_session")
         first = await _start_unlock_step_up(c)
         assert first.status_code == 303
         second = await _start_unlock_step_up(c)
         assert second.status_code == 303
 
+        stale = await _callback(c, first.headers["location"])
+        assert stale.status_code != 200 or _UNLOCK not in stale.text
+        assert session is not None
+        c.cookies.set("mf_session", session)
         landed = await _callback(c, second.headers["location"])
 
         assert landed.status_code == 200, landed.text
-        assert _UNLOCK not in landed.text
+        assert _UNLOCK in landed.text

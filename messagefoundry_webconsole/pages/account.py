@@ -580,8 +580,9 @@ def reauth_open_first(next_path: str, label: str) -> Markup:
         el("p", "Next: ", el("strong", label), class_="muted"),
         el(
             "p",
-            "This page was opened from outside the console, so the console asks you to open it from"
-            " here before you confirm it's you. Nothing has run.",
+            "The console has no request for this page from this session: it was opened from"
+            " outside the console, or its request expired. Open it from here, then confirm it's"
+            " you. Nothing has run.",
         ),
         el("p", el("a", f"Open: {label}", href=next_path, class_="btn-link")),
         class_="card",

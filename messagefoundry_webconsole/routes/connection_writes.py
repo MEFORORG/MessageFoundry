@@ -24,7 +24,7 @@ from messagefoundry.auth.service import STEP_UP_ACTION_CONNECTION_PURGE
 
 from .. import pages
 from .._auth import (
-    _REAUTH_NEXT_MAX,
+    _new_address_continuation,
     assert_same_origin,
     register_ui_action,
     require_ui,
@@ -97,14 +97,10 @@ _PURGE_CONFIRM = "/ui/connections/purge-confirm"
 
 def _purge_confirm_continuation(request: Request) -> str:
     """The confirm page with the selection the refused GET carried, or the bare page when the
-    query would not survive the re-auth: past ``GET /ui/reauth``'s cap on ``next``, or not ASCII
-    (the re-auth quotes ``next`` as UTF-8, so a raw byte would come back as different bytes).
-    The rule ``_new_address_continuation`` applies to a refused GET's query, plus a ``#`` check."""
-    query = request.scope.get("query_string", b"").decode("latin-1")
-    target = f"{_PURGE_CONFIRM}?{query}" if query else _PURGE_CONFIRM
-    if not query.isascii() or "#" in query or len(target) > _REAUTH_NEXT_MAX:
-        return _PURGE_CONFIRM
-    return target
+    query would not survive the re-auth. The rule a refused GET's continuation follows for a new
+    address (``_new_address_continuation``): within ``GET /ui/reauth``'s cap on ``next``, ASCII,
+    and a registered unlock page."""
+    return _new_address_continuation(request, landing=_PURGE_CONFIRM)
 
 
 register_ui_action(

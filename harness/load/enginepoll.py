@@ -778,7 +778,8 @@ class EnginePoller:
         # cap the reload goes unmeasured rather than evicting the sampler. Another rig component
         # signing in between this count and the sign-in below is not seen.
         try:
-            held = len(self._clients[0].list_sessions())
+            # Counted, as every poller request is, so the load report leaves its cost out.
+            held = len(self._counted(0, self._clients[0].list_sessions))
         except SIGN_IN_ERRORS as exc:
             _log.warning(
                 "reload probe: could not count the rig user's sessions: %s (HTTP %s)",
@@ -786,7 +787,8 @@ class EnginePoller:
                 getattr(exc, "status", None),
             )
             return None
-        if held >= self._session_cap:
+        # A cap of 0 or less is no cap at all to the engine, so it is none here either.
+        if 0 < self._session_cap <= held:
             _log.warning(
                 "reload probe: the rig user holds %d of %d sessions, so another would evict the "
                 "sampler's; the reload goes unmeasured",

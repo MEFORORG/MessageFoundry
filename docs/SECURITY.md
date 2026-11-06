@@ -3310,8 +3310,9 @@ failure audited `reason=expired`, and a response that does not verify against a 
 gets the leg's ordinary failure. The code leg does not gate this way: it asks the directory before
 it checks any code, so a session that has proved nothing can still read the directory refusal
 there, up to the route's rate limiter. After a confirmed lookup the leg reads the session, the
-account and its lock again. A refusal spends the challenge, since the assertion was checked, leaves
-the sign count alone, and charges nothing to the lockout; the next attempt stages a new ceremony.
+account and its lock again. A refusal puts the ceremony back in flight with its deadline unchanged,
+leaves the sign count alone, and charges nothing to the lockout, so the same assertion verifies once
+the directory confirms the account.
 It is audited as `auth.webauthn_failed` with `reason=directory_unconfirmed` and the lookup's
 outcome. For that refusal `POST /ui/reauth/webauthn` answers **400** with the same words the other
 legs use. A session or account gone after the lookup answers **401**.
@@ -3378,9 +3379,10 @@ name the account as the check began. The
 passkey leg re-reads whether or not its
 sign-count compare-and-set succeeded. It reads its passkey set again before that re-read, not after,
 so on both legs the session, account and lock re-read is the last read before the factor write and
-nothing else awaits between them (BACKLOG #3068). On a sealed store a passkey deleted during that
-re-read moves the account row's passkey digest, so the leg reads the set again and then the holder;
-a keyless store keeps no digest, so there a passkey deleted during the re-read is not seen. What a miss means is stated once, under
+nothing else awaits between them (BACKLOG #3068). Every store, sealed or not, rewrites the account
+row's passkey digest on each passkey write, so a passkey deleted during that re-read moves it and
+the leg reads the set again and then the holder. A set still moving after three such passes is
+refused `reason=factor_unverified`. What a miss means is stated once, under
 [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068).
 A session or account gone answers
 as gone on at least these surfaces: **401** on `POST /auth/mfa-verify` and

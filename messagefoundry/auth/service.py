@@ -3097,6 +3097,10 @@ def oidc_client_auth_from_settings(
 
 #: The audit action written when an authority row fails its integrity seal (BACKLOG #2592).
 AUTHORITY_SEAL_FAILED_ACTION: Final = "integrity.authority_seal_failed"
+#: How many times :meth:`AuthService.finish_webauthn_assertion` reads the passkey set and then the
+#: holder while the account's passkey digest keeps moving between the two, before it refuses the
+#: factor as unverifiable (BACKLOG #3068).
+_PASSKEY_SETTLE_PASSES: Final = 3
 #: How much of a session's token hash a log line, audit row or alert names. Twelve hex characters, as
 #: the ``auth.session_revoked`` rows already record.
 _SESSION_REF_LEN: Final = 12
@@ -14361,8 +14365,10 @@ class AuthService:
         :meth:`finish_webauthn_assertion` (BACKLOG #2239) each used to spell out (BACKLOG #3068).
         For an AD row it asks :meth:`_directory_step_up_refusal`. A refusal is audited as ``event``
         with ``reason=directory_unconfirmed`` and the lookup's outcome, and returns
-        ``directory_refusal``: nothing was checked or charged, and the token still
-        authenticates. A confirmed lookup was a network round trip, so the session, the account
+        ``directory_refusal``: nothing was charged, and the token still authenticates. The TOTP
+        legs and the enrolment legs call it before the proof is checked; the passkey assertion leg
+        calls it once the assertion has verified, so a caller that proved nothing never reads the
+        answer (BACKLOG #3068), and puts its ceremony back on a refusal. A confirmed lookup was a network round trip, so the session, the account
         and its second-step lock are then read again through :meth:`_factor_holder_current`.
 
         **Its callers.** :meth:`verify_mfa` and :meth:`finish_webauthn_assertion`, which prove an
@@ -14377,8 +14383,9 @@ class AuthService:
         ``enroll`` as their own wrong-proof rows carry it, is added to the ``directory_unconfirmed``
         and ``session_lost`` rows. It is not added to the lock row, whose detail is the shared
         constant an exclusion matches exactly (#1131). Call it before anything the refusal must not
-        spend (a challenge, a TOTP step, recovery codes, a stored credential), and after the cheap
-        local refusals, so a caller already refused costs no lookup. Note that the re-read refuses
+        spend (a TOTP step, recovery codes, a stored credential, a sign count; a challenge already
+        taken is put back), and after the cheap local refusals, so a caller already refused costs
+        no lookup. Note that the re-read refuses
         a second-step-locked account."""
         if not _is_directory_account(user):
             return user
@@ -15284,8 +15291,9 @@ class AuthService:
         (BACKLOG #2239), through the same :meth:`_directory_vouches_for_factor` :meth:`verify_mfa`
         calls. It is asked only once the assertion has verified against a staged ceremony, so a
         caller that has proved nothing causes no lookup and never reads the directory's answer
-        (BACKLOG #3068). A refusal returns ``directory_refusal``: the challenge is spent, the sign
-        count does not move, and nothing is charged. After the sign-count write the passkey set is
+        (BACKLOG #3068). A refusal returns ``directory_refusal``: the ceremony is put back in
+        flight, the sign count does not move, and nothing is charged, so the same assertion
+        verifies once the directory confirms the account. After the sign-count write the passkey set is
         read, then the session, the account and the lock, so the last read before the factor write
         is the holder re-read, with no other await between it and the write (BACKLOG #3068). A store
         fault in the passkey re-read refuses, audited with ``reason=store_error`` (BACKLOG
@@ -15350,12 +15358,16 @@ class AuthService:
         # disabled in the directory would clear the MFA gate with its passkey until the reconciler
         # revoked it. BACKLOG #3068: asked only now, once the assertion has verified, so a caller
         # that has proved nothing costs no lookup and is not told what the directory said. Before
-        # the sign count moves, so a refusal leaves it; the challenge is already spent, and
-        # assertion failures feed no lockout (ADR 0068). A local account is not asked.
+        # the sign count moves, so a refusal leaves it, and assertion failures feed no lockout (ADR
+        # 0068). A directory refusal puts the ceremony back, deadline unchanged, so the retry the
+        # refusal invites can post the same assertion: the refusal was the directory's, not the
+        # ceremony's. A lost session or a lock leaves it spent. A local account is not asked.
         current = await self._directory_vouches_for_factor(
             token, user, event="auth.webauthn_failed", client=client, report_lock=False
         )
         if isinstance(current, Elevation):
+            if current.directory_refusal is not None:
+                self._webauthn_challenges.restore(challenge_key, pending)
             return current
         user = current
         now = time.time()
@@ -15376,12 +15388,12 @@ class AuthService:
         # account and its lock were last read, so a revocation, a disable or a lock that landed in
         # between must stop the factor write, as on verify_mfa. This is the LAST read before the
         # write: nothing below awaits until the write, but the lapse check, which awaits only when
-        # it ends the session. On a sealed store the account row's digest covers its passkeys, so a
-        # row whose digest moved since the passkey read means the set changed: the set is asked
-        # again, then the holder, until a holder read finds the digest the set was judged against.
-        # A keyless store keeps no digest, so a passkey deleted during the last re-read is not seen
-        # there, as a delete landing just after the write would not be.
-        while True:
+        # it ends the session. Every store rewrites the account row's passkey digest on each
+        # passkey write, sealed or not, so a row whose digest moved since the passkey read means the
+        # set changed: the set is asked again, then the holder, until a holder read finds the digest
+        # the set was judged against. Bounded: a set still moving after the last pass is refused as
+        # unverifiable, the fail-closed answer.
+        for _ in range(_PASSKEY_SETTLE_PASSES):
             standing = await self._passkey_standing(user, cred, client)
             if standing is None:
                 return Elevation()
@@ -15398,6 +15410,8 @@ class AuthService:
             user = fresh
             if settled or standing != "held":
                 break
+        else:
+            return await self._assertion_refused(user, client, "factor_unverified")
         if standing == "account_gone":
             # Gone during the passkey read: the token no longer authenticates, so the answer is the
             # lost session the holder re-read gives, not a factor question.

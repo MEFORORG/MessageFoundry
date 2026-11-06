@@ -1134,16 +1134,18 @@ def test_a_reload_probe_at_the_session_cap_signs_nothing_in(
     assert asyncio.run(poller.reload_client()) is None
 
 
-def test_a_reload_probe_under_the_session_cap_signs_in() -> None:
-    """The control for the test above: one session of headroom, and the probe signs in."""
+@pytest.mark.parametrize(("held", "cap"), [(4, 5), (7, 0)], ids=["headroom", "uncapped"])
+def test_a_reload_probe_under_the_session_cap_signs_in(held: int, cap: int) -> None:
+    """The control for the test above: one session of headroom, or a cap of 0, which the engine
+    reads as no cap, and the probe signs in."""
     calls: list[str] = []
 
     def _sign_in(url: str, *_a: object, **_k: object) -> str:
         calls.append(url)
         raise rigadmin.RigAdminError("synthetic: stop after the sign-in was attempted")
 
-    poller = EnginePoller("https://127.0.0.1:1", RIG_SESSION, origin=0.0, session_cap=5)
-    poller._clients = [_SessionsClient(4)]  # type: ignore[list-item]
+    poller = EnginePoller("https://127.0.0.1:1", RIG_SESSION, origin=0.0, session_cap=cap)
+    poller._clients = [_SessionsClient(held)]  # type: ignore[list-item]
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(rigadmin, "sign_in", _sign_in)
         assert asyncio.run(poller.reload_client()) is None

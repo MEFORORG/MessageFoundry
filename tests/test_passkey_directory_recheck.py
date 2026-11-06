@@ -7,10 +7,10 @@ BACKLOG #2239. ``verify_mfa`` has asked since #2023 (``tests/test_mfa_directory_
 passkey leg did not, so an account disabled in the directory could clear the MFA gate with its
 passkey until the reconciliation pass revoked it.
 
-Each refusal asserts four things: the factor was not marked, the assertion verified before the
-directory was asked (BACKLOG #3068: a caller that has proved nothing is not told what the directory
-said), the sign count did not move, and nothing was charged to the lockout. A fresh ceremony
-verifies once the directory answers. A local account is the control that must never reach the directory. All directory
+Each refusal asserts four things: the factor was not marked, the ceremony is back in flight (the
+same assertion verifies once the directory answers), the sign count did not move, and nothing was
+charged to the lockout. The directory is asked only once the assertion has verified (BACKLOG
+#3068: a caller that has proved nothing is not told what the directory said). A local account is the control that must never reach the directory. All directory
 data here is synthetic.
 """
 
@@ -34,6 +34,7 @@ from messagefoundry.auth import reconcile  # noqa: E402
 from messagefoundry.auth.identity import SessionMechanism  # noqa: E402
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer  # noqa: E402
 from messagefoundry.auth.service import (  # noqa: E402
+    _PASSKEY_SETTLE_PASSES,
     DIRECTORY_OBJECT_ID_MISSING,
     DIRECTORY_ROLES_DEMOTED,
     DIRECTORY_UNCONFIRMED,
@@ -53,6 +54,7 @@ from messagefoundry.store.store import (  # noqa: E402
 from tests._admin_account import ADMIN_USERNAME, login_admin  # noqa: E402
 from tests._fake_directory import FakeDirectory as _Directory  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
+from tests._webauthn_store_contract import _cred  # noqa: E402
 
 _RP, _ORIGIN = "t", "http://t"
 
@@ -218,13 +220,12 @@ async def test_a_directory_the_account_is_not_confirmed_in_refuses_the_passkey(
     await _assert_refused_and_uncharged(p, outcome, before)
     assert p.directory.probes == [("kpark", _PRINCIPAL.directory_object_id)]  # by the immutable id
 
-    # The refused ceremony is spent (BACKLOG #3068) and the counter did not move, so a fresh one
-    # verifies once the directory confirms the account.
+    # The ceremony was put back and the counter did not move, so the SAME assertion verifies once
+    # the directory confirms the account.
     p.directory.answer = DirectoryAnswer.FOUND
     p.directory.unreachable = False
-    assert await _finish(p) == Elevation()  # the refused ceremony was spent
     served = await p.service.finish_webauthn_assertion(
-        p.token, await _staged_assertion(p.service, p.token, p.key), rp_id=_RP, origin=_ORIGIN
+        p.token, p.response, rp_id=_RP, origin=_ORIGIN
     )
     assert served.ok is True and served.token is not None
     assert await _sign_count(store, p.user_id) > before
@@ -300,9 +301,8 @@ async def test_a_directory_account_demoted_since_sign_in_is_refused_the_passkey(
     await _assert_refused_and_uncharged(p, DIRECTORY_ROLES_DEMOTED, before)
     assert set(await store.get_user_role_ids(p.user_id)) == {"operator", "viewer"}
 
-    # A fresh ceremony verifies once the groups are back.
+    # The ceremony is back in flight, so the SAME assertion verifies once the groups are back.
     p.directory.principal = replace(_PRINCIPAL, groups=frozenset({_OPERATORS, _VIEWERS}))
-    p.response = await _staged_assertion(p.service, p.token, p.key)
     served = await _finish(p)
     assert served.ok is True and served.token is not None
 
@@ -660,14 +660,16 @@ async def test_what_lands_during_the_passkey_re_read_is_honoured(
         assert user is not None and user.second_step_locked_until is not None  # not cleared
 
 
-async def test_a_passkey_deleted_during_the_holder_re_read_is_seen_on_a_sealed_store(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("keyed", [True, False], ids=["keyed", "keyless"])
+async def test_a_passkey_deleted_during_the_holder_re_read_is_seen(
+    monkeypatch: pytest.MonkeyPatch, keyed: bool
 ) -> None:
     """Item 2. The holder re-read is the last read before the factor write, so a passkey deleted
-    after the set was read is seen through the account row's passkey digest, which moves with the
-    set on a sealed store. RED when: the factor is marked although the passkey that signed is gone,
-    or the refusal is not audited ``factor_removed``."""
-    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    after the set was read is seen through the account row's passkey digest, which every store
+    rewrites on each passkey write, sealed or not. RED when: the factor is marked although the
+    passkey that signed is gone, or the refusal is not audited ``factor_removed``."""
+    cipher = make_cipher(generate_key()) if keyed else None
+    store = await MessageStore.open(":memory:", cipher=cipher)
     try:
         service, token, response, user_id = await _local_assertion(store)
         real_holder = service._factor_holder_current
@@ -691,6 +693,42 @@ async def test_a_passkey_deleted_during_the_holder_re_read_is_seen_on_a_sealed_s
         assert refused.ok is False and refused.session_lost is False
         assert calls["n"] == 2  # the moved digest sent it back to the set, then the holder
         assert {"reason": "factor_removed"} in await _audited_assertion_failures(store)
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
+    finally:
+        await store.close()
+
+
+async def test_a_passkey_set_that_keeps_moving_is_refused_as_unverifiable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 2, the settle loop's bound. A set whose digest moves before every holder re-read never
+    settles, so after its last pass the leg refuses the factor as unverifiable rather than reading
+    for ever. RED when: the loop is unbounded (the test hangs or reads more than the bound), or the
+    factor is marked."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response, user_id = await _local_assertion(store)
+        real_holder = service._factor_holder_current
+        calls = {"n": 0}
+
+        async def _another_passkey_lands_then_the_holder_is_read(*args: Any, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            extra = _cred(user_id, f"extra-{calls['n']}", id_hash=f"extra-hash-{calls['n']}")
+            assert await store.add_webauthn_credential(extra)
+            return await real_holder(*args, **kwargs)
+
+        monkeypatch.setattr(
+            service, "_factor_holder_current", _another_passkey_lands_then_the_holder_is_read
+        )
+
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+
+        assert refused.ok is False and refused.session_lost is False
+        assert calls["n"] == _PASSKEY_SETTLE_PASSES
+        assert {"reason": "factor_unverified"} in await _audited_assertion_failures(store)
         session = await store.get_session(hash_token(token))
         assert session is not None and session.mfa_verified_at is None
     finally:

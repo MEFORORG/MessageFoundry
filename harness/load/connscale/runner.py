@@ -568,7 +568,10 @@ async def _run_started_step(
     origin = time.perf_counter()
     # The cap the node's engine runs, so the reload probe keeps a session of headroom under it and
     # never evicts the sampler's session (vault BACKLOG #3241, added item 5).
-    session_cap = int(node_env.get(_SESSION_CAP_ENV, RIG_SESSION_CAP))
+    try:
+        session_cap = int(node_env.get(_SESSION_CAP_ENV, RIG_SESSION_CAP))
+    except ValueError:
+        session_cap = RIG_SESSION_CAP  # the engine refuses such a value at start anyway
     poller = EnginePoller(node.url, token=RIG_SESSION, origin=origin, session_cap=session_cap)
     # BACKLOG #1292: the per-message send ledger the intake audit reads. None disables the audit
     # wholesale (the sender's write path is then byte-identical to pre-#1292).

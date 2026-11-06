@@ -355,8 +355,8 @@ reach passes exempt is a row they never measure (vault BACKLOG #3241).
 carries the re-keyed token forward, and sends the probe once more. That is what the IDE and the
 harness do. A second refusal is scored like any other row. A refused re-proof is exit 2 (changed
 2026-11-05, vault BACKLOG #3241 added item 3: the sweep now lists the row as a refused re-proof,
-scores it as unreached, and goes on, and the receipt check makes any refused re-proof an error, so
-the run exits 1 or, where the lost rows breach a floor, 2). The BFLA
+scores it as unreached, and goes on, so every other row is still measured; the receipt check
+still makes any refused re-proof a could-not-measure, so the run still exits 2). The BFLA
 passes never re-prove, because a low-privilege caller must be refused before any step-up is asked.
 The receipt counts the re-proofs and lists their rows by method and path template. It never records
 the action, which is a header value.

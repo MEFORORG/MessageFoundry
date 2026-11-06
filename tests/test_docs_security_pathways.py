@@ -4969,7 +4969,7 @@ def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
         "`auth.webauthn_failed`",
         "`reason=directory_unconfirmed`",
         "only once the assertion has verified",
-        "spends the challenge",
+        "ceremony back in flight",
     ):
         assert token in paragraph, f"the passkey leg's directory paragraph must name {token}"
 
