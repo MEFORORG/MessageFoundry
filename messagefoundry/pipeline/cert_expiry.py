@@ -235,12 +235,10 @@ def certs_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
       refuses an expired pin only at store open, and a store opened before the pin expired keeps
       connecting after it, so watching it here is what warns ahead of that. A PostgreSQL
       ``ssl_root_cert`` is a CA bundle the driver validates itself, so it is not listed.
-    - ``auth.oidc_client_certificate``, the certificate whose ``x5t#S256`` thumbprint each OIDC
-      ``private_key_jwt`` client assertion carries (BACKLOG #296). The signer refuses it outside its
-      validity window only when the auth service is built at start, so a running engine keeps naming
-      it after it lapses, and an IdP that selects the key by certificate can then refuse every
-      federated sign-in. Watched whenever set, as the ``[auth]`` CRL knobs are. Inline PEM is not a
-      file, so only a path is listed; ``-----BEGIN`` is the signer's own test for inline PEM."""
+    - ``auth.oidc_client_certificate``, whose thumbprint each OIDC ``private_key_jwt`` client
+      assertion carries (BACKLOG #296). The signer checks its validity window only at start.
+      Watched whenever set, as the ``[auth]`` CRL knobs are. Inline PEM names no file, so only a
+      path is listed; ``-----BEGIN`` is the signer's own test for inline PEM."""
     certs: list[MonitoredCert] = []
     store, pin = settings.store, settings.store.ssl_root_cert
     # Only where the store sends it: an escaped weakened posture sends no pin.

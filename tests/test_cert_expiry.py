@@ -833,14 +833,11 @@ def test_the_oidc_client_certificate_rides_beside_the_store_pin(tmp_path: Path) 
     ]
 
 
-def test_an_inline_or_unset_oidc_client_certificate_adds_no_row(tmp_path: Path) -> None:
-    # POSITIVE CONTROL for the tests above: unset adds no row, and inline PEM, which names no file,
-    # is never handed to open() as a path.
-    cert = tmp_path / "oidc-client.pem"
-    _write_cert(cert, not_after=_REF + datetime.timedelta(days=10))
-    inline = cert.read_text(encoding="ascii")
-    assert "-----BEGIN" in inline
-    assert certs_from_settings(ServiceSettings(auth=AuthSettings())) == []
-    for value in (inline, "", "  "):
-        settings = ServiceSettings(auth=AuthSettings(oidc_client_certificate=value))
-        assert certs_from_settings(settings) == []
+@pytest.mark.parametrize(
+    "value", [None, "", "  ", "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"]
+)
+def test_an_inline_or_unset_oidc_client_certificate_adds_no_row(value: str | None) -> None:
+    # POSITIVE CONTROL for the tests above: unset or blank adds no row, and inline PEM, which names
+    # no file, is never handed to open() as a path.
+    settings = ServiceSettings(auth=AuthSettings(oidc_client_certificate=value))
+    assert certs_from_settings(settings) == []
