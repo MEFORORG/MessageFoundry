@@ -4,8 +4,8 @@
 
 The token tables (customer/partner names + estate-vendor tokens) are the owner-managed
 ``scripts/security/scan_forbidden.py`` set; this file **loads them from that guard by path at import**
-(the same way ``messagefoundry/anon/leak.py`` does) rather than vendoring a copy — so **no literal or
-fragmented customer/vendor token appears in this tracked, published file**, and there is nothing to
+(the same way ``messagefoundry_toolkit/anon/leak.py`` does) rather than vendoring a copy — so **no
+literal or fragmented customer/vendor token appears in this tracked, published file**, and there is nothing to
 drift (``test_anon_parity`` still pins the two equal). Loading by path keeps the tee ``messagefoundry``-free.
 
 The real tokens themselves are EXTERNALIZED out of the guard (a git-ignored token file /
@@ -17,7 +17,7 @@ literal default so the anonymizer's structural IP check still functions without 
 Returns **reasons only** (never the matched text), and the token denylist is the fail-closed
 *backstop*, not the primary control: it catches known *tokens*, not structural PHI (ADR 0030 §5). The
 structural PHI-shape detectors + unmapped-field coverage report below (BACKLOG #331) close that gap —
-they are held byte-for-byte identical with the engine copy so the two agree on every input. The
+they are held byte-for-byte identical with the toolkit copy so the two agree on every input. The
 dashed SSN and punctuated phone detectors also refuse such a shape that the message's own field
 separator cut across fields, when at least one of them is unmapped (BACKLOG #3465), and scan what
 a retarget of a default field left past its first component (:func:`retarget_residue_hits`,
@@ -46,7 +46,7 @@ def _load_publish_guard(_start: Path | None = None) -> object | None:
     origin = (_start if _start is not None else Path(__file__)).resolve()
     # ONE path, built and never searched for (BACKLOG #2344). parents[2] is the folder that holds the
     # tee package: the repository root in a checkout. Why that folder is the limit is stated once, for
-    # the engine copy, in docs/DANGEROUS-FUNCTIONALITY.md ("`anon/leak.py` loads one file by path").
+    # the toolkit copy, in docs/DANGEROUS-FUNCTIONALITY.md ("`anon/leak.py` loads one file by path").
     candidate = origin.parents[2] / "scripts" / "security" / "scan_forbidden.py"
     if candidate.is_file():
         spec = importlib.util.spec_from_file_location("tee_anon_publish_guard", candidate)
@@ -741,9 +741,9 @@ def leak_report(
 ) -> LeakReport:
     """The full :class:`LeakReport` for ``text`` using the tee's vendored token authority.
 
-    Behaviourally parallel to the engine's :func:`messagefoundry.anon.leak.leak_report`: the token
-    hits come from the tee's local :func:`scan_text` (and the field-anchored site-code check) rather
-    than the engine's ``_scanner()`` delegate, but the structural walk, coverage report, and
+    Behaviourally parallel to the toolkit's :func:`messagefoundry_toolkit.anon.leak.leak_report`: the
+    token hits come from the tee's local :func:`scan_text` (and the field-anchored site-code check)
+    rather than the toolkit's ``_scanner()`` delegate, but the structural walk, coverage report, and
     token-floor signal are the byte-identical shared logic above. Structural detection engages **only
     when ``rules`` is supplied**; a bare-string call is the legacy token-only behaviour.
 
