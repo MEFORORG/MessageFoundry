@@ -1449,6 +1449,39 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
         )
         self.assertIn("still bind", why, "the notice no longer says the usage controls bind")
 
+    #: What every spelling's notice must carry, matched lowercased over collapsed whitespace. It
+    #: follows korus PR 265 (`160a0865de`): the usage states and their stop moved to korus
+    #: `roles/COMMON.md`, *The three usage states*, and which seat may now say a HOLD is lifted is
+    #: an open owner question there.
+    CAVEAT = (
+        "still bind",
+        "roles/common.md",
+        "the three usage states",
+        "lifted",
+        "open owner question",
+    )
+
+    @classmethod
+    def _missing_caveat(cls, notice: str) -> list[str]:
+        flat = " ".join(notice.lower().split())
+        return [part for part in cls.CAVEAT if part not in flat]
+
+    def test_every_steward_spelling_carries_the_usage_caveat(self):
+        """A session that declares `stewart` reads only that entry, never the canonical one."""
+        retired = seats()["retired"]
+        gaps = {s: self._missing_caveat(retired.get(s, "")) for s in sorted(self.SPELLINGS)}
+        self.assertEqual(
+            {},
+            {s: m for s, m in gaps.items() if m},
+            "these Steward spellings resolve to a notice that never says the usage controls "
+            "still bind, so a reader can take the HOLD NEW WORK stop to have retired with the seat",
+        )
+
+    def test_the_caveat_scan_fires_on_a_bare_pointer(self):
+        """Positive control: the wording the spellings carried before this check existed."""
+        bare = "Retired, a spelling of 'steward'. See the 'steward' entry."
+        self.assertEqual(list(self.CAVEAT), self._missing_caveat(bare))
+
     #: The one date the notice may carry: the day the owner said the seat was gone. Any other date
     #: in it, ISO or a month name, is a retirement date the tree does not record. AT LEAST these two
     #: forms: a date in some other spelling still passes.
