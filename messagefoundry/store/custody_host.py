@@ -44,7 +44,7 @@ import base64
 import os
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple, Protocol
 
@@ -206,13 +206,17 @@ def foreign_custody_refusal(
         return None
     if directory is None:
         return None
-    found = [p.name for p in _custody_paths(directory) if os.path.lexists(p)]
+    found = [p for p in _custody_paths(directory) if os.path.lexists(p)]
     if not found:
         return None
+    # PR 2804 fourth hold: the file may be another store's only key, so the way on keeps it.
+    aside = " and ".join(f"{p}.aside" for p in found)
     return (
-        f"{' and '.join(found)} is in {directory}, but [store].key_provider is "
+        f"{' and '.join(p.name for p in found)} is in {directory}, but [store].key_provider is "
         f"{settings.key_provider!r}. A store with a host blob takes its key from that blob only: "
-        "set [store].key_provider = 'host' and remove every other store key, or remove the file"
+        "set [store].key_provider = 'host' and remove every other store key setting. The engine "
+        "cannot tell whose key the file holds, and it may be another store's only key, so keep "
+        f"it: if this store does not use it, move it to {aside}"
     )
 
 
@@ -309,8 +313,9 @@ def _settle_left_handoff(handoff: Path, blob: HostBlob) -> None:
         if left.store_id != blob.store_id or left.master_key != blob.master_key:
             raise CustodyError(
                 f"it names store id {left.store_id.hex()} and the host file names "
-                f"{blob.store_id.hex()}, or it holds another key, so it is not this store's; "
-                "remove it once you know why it is there"
+                f"{blob.store_id.hex()}, or it holds another key, so it is not this store's. It "
+                "may be another store's only key, so keep it: once you know why it is there, "
+                f"move it to {handoff}.aside"
             )
 
     try:
@@ -542,30 +547,35 @@ async def store_holds_data(store: Store) -> bool:
 # --- the mint -------------------------------------------------------------------------------------
 
 
-def keep_the_key_step(settings: StoreSettings, kept: str, *, store_file: bool) -> str:
+def keep_the_key_step(settings: StoreSettings, kept: Sequence[Path], *, store_file: bool) -> str:
     """The one way on for every path that meets a key file it cannot tie to this store (PR 2804
-    fourth hold): keep the file, which may be another store's only key, and give this store a
-    custody directory of its own. With ``store_file``, a SQLite store file moves aside too, since a
-    SQLite store with no key here is refused as one another key made. Advises removing nothing,
-    and names paths, never a key."""
+    fourth hold): keep each file, which may be another store's only key. Where no other store uses
+    it, move it aside to a named path; where one does, give this store a custody directory of its
+    own. With ``store_file``, a SQLite store file moves aside too, since a SQLite store with no key
+    here is refused as one another key made. Advises removing nothing, and names paths, never a
+    key."""
     from messagefoundry.config.settings import StoreBackend
 
+    names = " and ".join(str(path) for path in kept)
+    aside = " and ".join(f"{path}.aside" for path in kept)
     move = ""
     if store_file and settings.backend is StoreBackend.SQLITE and settings.path != ":memory:":
         db = Path(settings.path).resolve()
         # SQLite finds a WAL only under its database's own name, so the side files follow it.
         move = (
-            f"move the store file {db} aside under a new name, renaming any {db.name}-wal and "
-            f"{db.name}-shm beside it to the new name plus -wal and -shm, then "
+            f"move the store file {db} to {db}.aside, renaming any {db.name}-wal and "
+            f"{db.name}-shm beside it to {db.name}.aside-wal and {db.name}.aside-shm, and "
         )
     return (
-        f"The engine cannot tell whose key is in {kept}, and it may be another store's only key, "
-        f"so keep {kept} in place. To provision this store, {move}give it a custody directory of "
-        f"its own: set {SECRETS_DIRECTORY_VARIABLE} to a new, empty directory, here and in the "
-        "service's environment, and run the command again, which mints this store's key there. "
-        "A recovery key an earlier run showed is then void for this store: keep the one that run "
-        "shows. This suits only a store that holds nothing you need, since nothing is carried "
-        "over to the new key"
+        f"The engine cannot tell whose key is in {names}, and it may be another store's only key, "
+        f"so keep it. If no other store uses it, {move}move {names} to {aside}, then run the "
+        "command again, which mints this store's key. If another store uses it, leave it in "
+        "place and give this store a custody directory of its own instead: a SQLite data "
+        f"directory with no key file in it, or a secrets directory ({SECRETS_DIRECTORY_VARIABLE}),"
+        " which also holds the service's other secrets and must pass the same access check. "
+        f"The recovery key shown when {names} was minted goes with that file, not with a key "
+        "minted after it. Either way suits only a store that holds nothing you need, since "
+        "nothing is carried over to a new key"
     )
 
 
@@ -587,7 +597,7 @@ def mint_target(
         if os.path.lexists(path):
             raise FileExistsError(
                 f"{path} already exists, so a store key was already minted here; a second mint "
-                f"is never made over it. {keep_the_key_step(settings, str(path), store_file=False)}"
+                f"is never made over it. {keep_the_key_step(settings, [path], store_file=False)}"
             )
     if service_account is None:
         # What the write refuses for this account, asked now: the shared and non-local accounts

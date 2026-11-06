@@ -217,6 +217,9 @@ async def test_a_host_blob_refuses_every_other_key_provider(tmp_path: Path, name
     settings = _settings(tmp_path, key_provider="auto", encryption_key_file="k.bin")
     refusal = foreign_custody_refusal(settings, environ={})
     assert refusal is not None and name in refusal and "'auto'" in refusal
+    # PR 2804 fourth hold: the file may be another store's only key, so it is moved, never removed.
+    assert "remove the file" not in refusal and "cannot tell whose key" in refusal, refusal
+    assert f"move it to {tmp_path / name}.aside" in refusal, refusal
     with pytest.raises(HostCustodyRefused, match=name):
         await open_store(settings, create=True)
     assert not (tmp_path / "store.db").exists()
@@ -279,8 +282,9 @@ def test_a_second_mint_over_an_existing_file_is_file_exists(tmp_path: Path, name
         _mint(_settings(tmp_path), console)
     assert console.shown == []  # refused before anything was minted or shown
     # PR 2804 fourth hold, item 5: a way on that keeps the file, which may be another store's key.
-    assert "MEFOR_SECRETS_DIRECTORY" in str(refused.value)
-    assert "remove" not in str(refused.value).lower()
+    text = str(refused.value)
+    assert f"{tmp_path / name}.aside" in text and "MEFOR_SECRETS_DIRECTORY" in text, text
+    assert "remove" not in text.lower()
 
 
 @windows_only
@@ -588,6 +592,9 @@ def test_the_crash_rule_refuses_a_handoff_naming_another_store(tmp_path: Path) -
     with pytest.raises(HostCustodyRefused, match="not this store's") as excinfo:
         load_host_custody(_settings(tmp_path), enforcing=True, environ={})
     assert (tmp_path / "handoff.key").exists()
+    # PR 2804 fourth hold: another store's handoff may be its only key, so it is moved aside.
+    text = str(excinfo.value)
+    assert "remove" not in text.lower() and f"{tmp_path / 'handoff.key'}.aside" in text, text
     assert not _leaks(str(excinfo.value), blob) and not _leaks(str(excinfo.value), other)
 
 
@@ -1137,6 +1144,9 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absen
     err = capsys.readouterr().err
     assert probes == [True], err  # the server probe ran, under a read-only open
     assert refusal in err and "Traceback" not in err
+    if census == "connection event":
+        # PR 2804 fourth hold: nothing proves whose the store is, so the way on keeps it.
+        assert "remove" not in err.lower() and "point [store] at a new database" in err, err
     assert driver_text not in err
     assert list(secrets.iterdir()) == []  # no host blob, no handoff
 
@@ -1274,16 +1284,16 @@ def test_a_rerun_over_a_chain_never_started_keeps_the_key_file(
     assert "Traceback" not in err
     assert kept.exists()
     assert "remove" not in err.lower() and "delete" not in err.lower(), err
-    assert f"keep {kept}" in err and "cannot tell whose key" in err, err
-    assert "MEFOR_SECRETS_DIRECTORY" in err, err
+    assert "cannot tell whose key" in err and f"move {kept} to {kept}.aside" in err, err
     # A SQLite store with no key here reads as taken, so its file moves aside, its -wal file
     # renamed to match, or SQLite would not find it.
-    assert f"move the store file {store_path.resolve()}" in err, err
-    assert "the new name plus -wal and -shm" in err, err
-    # Which recovery key goes with the new key, and that the step suits only a store holding
-    # nothing the operator needs: nothing is carried over.
-    assert "recovery key" in err and "void" in err, err
-    assert "holds nothing you need" in err, err
+    db = store_path.resolve()
+    assert f"move the store file {db} to {db}.aside" in err, err
+    assert f"{db.name}.aside-wal" in err, err
+    # Which file a recovery key goes with, and that the step suits only a store holding nothing
+    # the operator needs: nothing is carried over.
+    assert "recovery key shown when" in err and "holds nothing you need" in err, err
+    assert "void" not in err, err  # an earlier recovery key may be another store's
 
 
 @host_file_platforms
@@ -1315,12 +1325,49 @@ def test_a_shared_secrets_directory_never_names_another_stores_key_for_removal(
     assert code == 2
     err = capsys.readouterr().err
     assert "remove" not in err.lower() and "delete" not in err.lower(), err
-    assert f"keep {kept}" in err and "MEFOR_SECRETS_DIRECTORY" in err, err
+    assert "If another store uses it, leave it in place" in err and str(kept) in err, err
+    assert "MEFOR_SECRETS_DIRECTORY" in err, err
+    # B's pre-check was refused before its first write, so nothing was bound under A's key.
+    import sqlite3
+
+    with sqlite3.connect(b_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM store_salt").fetchone() == (0,)
 
     async def _a_still_opens() -> None:
         await (await open_store(a_settings)).close()
 
     asyncio.run(_a_still_opens())
+
+
+@host_file_platforms
+def test_the_way_on_a_never_started_refusal_names_lets_the_mint_go_ahead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # PR 2804 fourth hold: follow the refusal's step where no other store uses the key, moving the
+    # SQLite store file and the key file to the named paths, and the re-run reaches the mint (here
+    # its terminal check, since no terminal is attached). Both moved files are still there.
+    import asyncio
+
+    settings = _settings(tmp_path)
+    store_path = Path(settings.path)
+
+    async def _unstarted() -> None:
+        await (await _keyless_store(store_path)).close()
+
+    asyncio.run(_unstarted())
+    _mint(settings)
+    kept = tmp_path / custody_host.HOST_FILE_NAME
+    assert _run_provision_admin(tmp_path, monkeypatch, store_path) == 2
+    assert f"move {kept} to {kept}.aside" in capsys.readouterr().err
+    store_path.rename(f"{store_path}.aside")
+    for suffix in ("-wal", "-shm"):
+        side = Path(f"{store_path}{suffix}")
+        if side.exists():
+            side.rename(f"{store_path}.aside{suffix}")
+    kept.rename(f"{kept}.aside")
+    assert _run_provision_admin(tmp_path, monkeypatch, store_path) != 0
+    assert "refusing to provision without a terminal" in capsys.readouterr().err
+    assert Path(f"{kept}.aside").exists() and Path(f"{store_path}.aside").exists()
 
 
 @host_file_platforms
@@ -1352,8 +1399,8 @@ async def test_a_pin_refusal_before_any_write_is_told_apart_from_one_after(
     stranger = HostBlob(blob.master_key, StoreId.mint(), (), blob.recovery_proved_at)
     with pytest.raises(StoreIdPinRefusedBeforeWrite) as refused:
         await open_store(settings, custody=stranger)
-    # Another store's blob is not a never-started chain, whose refusal tells the operator to
-    # remove the key file.
+    # Another store's blob is not a never-started chain, whose refusal keeps the key file and
+    # names the way on.
     assert not isinstance(refused.value, StoreChainNeverStarted)
 
 

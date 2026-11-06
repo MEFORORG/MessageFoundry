@@ -225,7 +225,8 @@ Vault and LDAP*.
 > the login that runs `provision-admin`, for example
 > `GRANT VIEW DEFINITION ON SCHEMA::[dbo] TO [CORP\some-operator];` when that schema is `dbo`.
 > Under `auth = "integrated"` that login is the Windows account that runs the command, which is
-> not the gMSA unless the command runs as it. The startup probe (§1.3) does not report it as excess.
+> not the gMSA unless the command runs as it. The startup probe (§1.3) does not report it as excess,
+> so where that login is the runtime login (`auth = "sql"`), revoke the grant once the mint is done.
 >
 > **`[store].schema_management = "auto"` puts the DDL back on the runtime login.** The engine then
 > builds and upgrades its own schema at open, and the gMSA also needs `db_ddladmin` as a standing

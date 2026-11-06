@@ -7098,8 +7098,8 @@ def _discard_minted_custody(path: Path, store: StoreSettings, failure: BaseExcep
     except OSError as exc:
         print(
             f"WARNING: the store could not be created, and the store key minted for it in {path} "
-            f"could not be removed ({exc.strerror or type(exc).__name__}). Remove it before "
-            "running provision-admin again",
+            f"could not be removed ({exc.strerror or type(exc).__name__}). Move it to "
+            f"{path}.aside before running provision-admin again",
             file=sys.stderr,
         )
 
@@ -8482,11 +8482,11 @@ def _never_started_refusal(store: StoreSettings) -> str:
     from messagefoundry.store.custody_host import check_host_custody_settings, keep_the_key_step
 
     paths = check_host_custody_settings(store)
-    present = [str(path) for path in paths if os.path.lexists(path)] or [str(paths[0])]
-    files = " and ".join(present)
+    present = [path for path in paths if os.path.lexists(path)] or [paths[0]]
     return (
-        f"the store's audit chain was never started, and only the run that minted its key may "
-        f"start it. {keep_the_key_step(store, files, store_file=True)}"
+        "the store's audit chain was never started, and only the run that minted this store's "
+        "key, holding its recovery wrap, may start it. "
+        f"{keep_the_key_step(store, present, store_file=True)}"
     )
 
 
@@ -8827,8 +8827,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
             ):
                 raise HostCustodyRefused(
                     f"the store already exists, and {missing}. A new key cannot open a store "
-                    "another key made: put back the host blob it was made with, or remove the "
-                    "store to provision a new one"
+                    "another key made: put back the host blob it was made with. The engine cannot "
+                    "tell whether the store holds anything you need, so keep it: to provision a "
+                    "new store instead, point [store] at a new database or file"
                 ) from missing
             absent, exists = True, None
         except StoreChainNeverStarted as unstarted:
