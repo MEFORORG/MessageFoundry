@@ -2184,13 +2184,16 @@ The check reads the path one name at a time, so a name ending in a space or a do
 name, counts only when every folder before it exists; a path that ends at a missing folder first
 is left to the driver, as a missing file is. A `subst` drive onto a share counts as leading to
 another host.
-When the check cannot finish, a WARNING names the kind of cause, never the path; the path is
-logged at DEBUG only. The value is judged as the text the build sends, so `0` is checked as the
-path `0`. On Windows each entry of an `SSLCAPATH` folder takes the same check, since the driver
-opens a `<hash>.0` entry there by name: an entry that leads to another host, or one the check
-cannot finish, refuses the value, and so does a folder the engine cannot list or one holding
-more entries than the cap `transports.database._MAX_CAPATH_ENTRIES` names. A missing folder, or a
-value that names a file, is left to the driver. The lane check runs this check again on all four
+When the check cannot finish, or finds that the path leads to another host, a WARNING names the
+kind of cause, never the path; the path is logged at DEBUG only. The value is judged as the text
+the build sends, so `0` is checked as the path `0`. On Windows each entry of an `SSLCAPATH` folder
+takes the same check, since the driver opens a `<hash>.0` entry there by name: an entry that leads
+to another host, or one the check cannot finish, refuses the value, and so does a folder the engine
+cannot list or one holding more entries than the cap `transports.database._MAX_CAPATH_ENTRIES`
+names. A missing folder, or a value that names a file, is left to the driver. When the engine
+builds the connection on its event loop, it lists the folder and checks its entries in a worker
+thread instead, when it starts the lane and before the driver first connects, so a refusal still
+fails the lane before it serves. The lane check runs this check again on all four
 keywords, and on Windows on the folder entries too, at least when the lane is built or an operator starts it and before a reload that builds it or keeps it
 running, so a path that leads to another host after the build is refused there as a setting.
 The check is defence in depth, not a guarantee. It misses at least: links to some object paths;
