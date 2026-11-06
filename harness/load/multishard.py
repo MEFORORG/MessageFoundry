@@ -7,8 +7,9 @@ sweeps ENGINE-PROCESS count against ONE shared store, to answer the pre-1500-con
 unified server DB hold when N engine processes commit concurrently, or is the shared store the aggregate
 ceiling at some N\\*?*
 
-This is emphatically **not** ``serve --shard`` / ``supervise`` (ADR 0037 L3): that gives each shard its
-OWN db file plus SHARED outbounds — the inverse of what this measures. Here every engine points at the
+This is emphatically **not** ``serve --shard`` / ``supervise`` (ADR 0037 L3). Engine shards also share
+ONE store (ADR 0063), but they run one config, split by inbound, with the outbounds SHARED across every
+engine shard; here each engine loads its own disjoint graph, outbounds included. Every engine points at the
 **same** ``MEFOR_STORE_*`` store, with **disjoint** inbound/sink/API ports AND **disjoint connection
 names** (a per-engine ``MEFOR_CONNSCALE_NAME_PREFIX``), so the N engines contend on the store's
 write/commit path while their FIFO lanes stay isolated (a same-named lane across engines would share
@@ -336,7 +337,8 @@ async def run_multishard(
     ``probe``, when given, runs once per step against the live fleet (:data:`FleetProbe`), before
     the hold. It is how a test asks one engine about a connection another engine owns, with the
     orchestrator's own start-up and teardown around it. Whatever it raises ends the run, and the
-    engines are still stopped.
+    engines are still stopped. Every step shares ``db_path``, so a probe that writes to the store, as
+    one that creates an account does, must tolerate what an earlier step left, or be given one step.
 
     ``engine_index_base`` offsets the per-engine lane index — engine ``k`` is tagged
     ``E{k + engine_index_base}`` (name prefix, node id, attribution) — so a SECOND concurrent

@@ -14,7 +14,7 @@ names (``MEFOR_CONNSCALE_NAME_PREFIX=E0``/``E1``). It drives a small, brief load
   is config-derived so it holds regardless of the write lock.
 
 A third test is SECURITY evidence, not a load smoke: docs/SECURITY.md cites
-``test_a_scoped_operator_asking_the_wrong_engine_shard_gets_the_403_and_a_denial_row`` for the case of
+``test_a_scoped_operator_asking_the_wrong_engine_gets_the_403_and_a_denial_row`` for the case of
 a channel-scoped operator asking one engine about an in-scope inbound another holds (BACKLOG #3031).
 
 End-to-end ZERO-LOSS is NOT asserted here. SQLite is single-writer: two ``serve`` processes writing one
@@ -33,8 +33,8 @@ import asyncio
 import contextlib
 import json
 import os
-import secrets
 import socket
+import ssl
 import tempfile
 import time
 from collections.abc import Sequence
@@ -47,9 +47,9 @@ from harness.load import rigadmin
 from harness.load.enginepoll import rig_client
 from harness.load.failover import EngineNode
 from harness.load.multishard import FleetProbe, MultiShardReport, run_multishard
-from harness.load.tlsmat import harness_ssl_context
 from messagefoundry.api.message_scope import CONNECTION_DENIED_DETAIL
 from messagefoundry.apiclient import EngineClient
+from messagefoundry.config.settings import AuthSettings
 
 pytestmark = pytest.mark.timeout(
     120
@@ -219,8 +219,7 @@ async def test_multishard_engine_index_base_offsets_lane_tags() -> None:
 # The two engines are plain `serve` processes standing in for two engine shards: a `serve --shard`
 # config of more than one engine shard needs a server-DB store (ADR 0063), and this leg runs SQLite.
 # That an engine shard's graph holds only its own inbounds is filter_registry_for_shard's job, pinned
-# by tests/test_sharding.py::test_filter_selects_only_that_shards_inbounds; this run pins what the API
-# answers given such a graph.
+# in tests/test_sharding.py; this run pins what the API answers given such a graph.
 
 _OPERATOR = "ms-scoped-operator"
 _E0_OWN = "IB_E0_CS_00000"  # held by engine E0, in the operator's scope
@@ -231,7 +230,7 @@ _E1_OWN = "IB_E1_CS_00000"  # held by engine E1 only, in the operator's scope
 def _api(node: EngineNode) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         base_url=node.url,
-        verify=harness_ssl_context(),  # the anchor EngineNode hands every rig engine
+        verify=ssl.create_default_context(cafile=node.cacert),  # what this node serves
         trust_env=False,  # loopback only, never through a proxy the runner's environment names
         timeout=10.0,
     )
@@ -244,11 +243,11 @@ def _scoped_operator_token(e0: EngineNode) -> str:
         created = admin.create_user(
             _OPERATOR, email="ms-scoped-operator@example.invalid", roles=["operator"]
         )
-        # The administrator-write floor (admin_write_min_interval_seconds, 0.15 s by default)
-        # answers a second write this soon with 429.
-        time.sleep(0.25)
+        # The administrator-write floor answers a second write sooner than this with 429. The rig
+        # engines run its shipped default.
+        time.sleep(AuthSettings().admin_write_min_interval_seconds + 0.1)
         admin.set_channel_scope(created.id, [_E0_OWN, _E1_OWN])
-    chosen = secrets.token_hex(24)  # rigadmin's draw, which the password policy cannot refuse
+    chosen = rigadmin._new_password()  # a draw the shipped password policy cannot refuse
     with EngineClient(e0.url, cacert=e0.cacert) as operator:
         assert operator.login(_OPERATOR, created.temp_password).must_change_password
         operator.change_password(created.temp_password, chosen)
@@ -257,7 +256,7 @@ def _scoped_operator_token(e0: EngineNode) -> str:
     return signed_in.token
 
 
-class _WrongEngineShardProbe:
+class _WrongEngineProbe:
     """Make five fixed asks of GET /connections/{name}/metadata across the two engines, as the scoped
     operator and as the unscoped rig Administrator, then read the denial rows back. It records each
     answer's status and raw body; the test asserts on them."""
@@ -294,11 +293,9 @@ class _WrongEngineShardProbe:
         self.denials = reply.json()["entries"]
 
 
-async def test_a_scoped_operator_asking_the_wrong_engine_shard_gets_the_403_and_a_denial_row() -> (
-    None
-):
+async def test_a_scoped_operator_asking_the_wrong_engine_gets_the_403_and_a_denial_row() -> None:
     # BACKLOG #3031 step 2: finding 2 RUN, not only read. docs/SECURITY.md cites this test for the case.
-    probe = _WrongEngineShardProbe()
+    probe = _WrongEngineProbe()
     report = await _run_once(probe=probe)
     assert {e.name_tag for e in report.records[0].per_engine} == {"E0", "E1"}
     a = probe.answers
