@@ -1990,7 +1990,16 @@ else would need its own authorization rule stated here.
    outside the browser issues nothing when the browser sends `Sec-Fetch-Site: none`. **A browser
    that sends no Fetch Metadata is judged only by the origin check, which accepts a top-level GET,
    so there a crafted link to the page itself still issues it and the re-auth mints the grant.**
-   The operator must still confirm on the page.
+   The operator must still confirm on the page. "Once" holds when two re-auths race one issue:
+   each leg takes the issue before its first await, so the second finds nothing and mints nothing,
+   and a re-auth that fails, a refused IdP prompt included, gives it back for the retry (vault
+   BACKLOG #3241, added items 7 and 9; [ADR 0065](adr/0065-web-ops-dashboard.md) change of
+   2026-11-05). Auto-retry actions and action-bound unlock pages each have their own per-session
+   cap of issues, so one kind cannot evict the other (added item 8). `GET /ui/reauth` toward an
+   action-bound unlock page this session was not issued shows a link to the page, not a password
+   form, so a bookmarked or typed link costs one re-auth rather than two: following the link is a
+   same-origin navigation, whose refusal issues the page (added item 2). The link reaches only a
+   registered unlock page, which still asks for the re-auth and its confirm.
 2. **The `/ui` write path charges the per-actor admin-write floor in `require_ui` itself**, because
    the console calls the JSON handlers in-process and their pacing `Depends` never runs (see *The
    `/ui` write path is paced* under [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
@@ -3234,7 +3243,11 @@ drops an edit the operator is about to type, and a refusal of the console's own 
 The purge and upload-resend confirm pages hold their proof the same way, so the window alone no
 longer opens a page whose POST then asks for a re-auth. The JSON export spends its proof after its
 own criteria check, so a malformed export costs no proof (owner ruling 2026-10-13, #3241 R2). The
-bulk purge confirm page still drops its selection across a re-auth, as before.
+bulk purge confirm page keeps its selection across a re-auth (vault BACKLOG #3241): its refusal
+carries the `dest` and `scope` query to `/ui/reauth`, which returns to the page with it, unless the
+query is past the 512-character cap on `next` or not ASCII, when the page opens with no selection as
+before. The page still re-derives each destination's eligibility from live quiescence, and the
+operator still submits the confirm form.
 A refusal the engine handler raises before its store write gives the proof back (owner ruling
 2026-10-13, #3241 R1; ADR 0197 Amendment C), so the operator resubmits without a new password. A
 refusal from the store call on keeps the spend, because the store may have committed: the next

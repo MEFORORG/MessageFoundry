@@ -69,6 +69,19 @@ this line.**
 
 ### Security
 
+- **One issued continuation mints one grant, even when two re-auths race it.** `POST /ui/reauth`
+  and the federated start `POST /ui/reauth/oidc` now take the issue before the password check or
+  the flow is staged, so a second tab re-authenticating toward the same confirm page meanwhile
+  mints nothing. A wrong password, or a refused IdP prompt, gives the issue back, so the retry still
+  continues. Auto-retry actions and action-bound confirm pages each have their own cap of eight
+  issues per session, so a run of confirm pages no longer evicts an action the operator is
+  confirming. (vault BACKLOG #3241, added items 7 to 9)
+- **A bookmarked confirm page costs one re-auth, not two.** A link to an action-bound confirm page
+  opened from outside the browser is not issued, so `GET /ui/reauth` toward it now shows a link to
+  the page instead of a password form whose re-auth would mint nothing. Following the link issues
+  the page, and the one re-auth then mints its grant. The bulk purge confirm page also keeps its
+  destination and scope selection across the re-auth, up to the 512-character cap on `next`.
+  (vault BACKLOG #3241, added item 2 and step 1)
 - **A channel-scoped caller's bad flag direction gets the audited 403.** `POST
   /ui/connections/{name}/flag` answered 404 for a direction other than `inbound` or `outbound`
   before the engine handler's scope check, so on a first deployment such a caller's probe there

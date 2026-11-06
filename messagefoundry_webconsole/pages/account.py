@@ -38,6 +38,7 @@ __all__ = [
     "reauth",
     "reauth_continue",
     "reauth_nothing_ran",
+    "reauth_open_first",
     "reauth_idp",
     "sessions_page",
     "sso_challenge",
@@ -561,6 +562,31 @@ def reauth_nothing_ran(label: str, landing: str) -> Markup:
         class_="card",
     )
     return page("Verified", body, nav=minimal_nav())
+
+
+def reauth_open_first(next_path: str, label: str) -> Markup:
+    """``GET /ui/reauth`` toward an action-bound unlock page this session was not issued (vault
+    BACKLOG #3241, added item 2): a link to the page instead of a password form.
+
+    A typed, bookmarked or emailed link to such a page arrives with ``Sec-Fetch-Site: none``, which
+    issues nothing (owner ruling 2026-10-13, #3241 R3), so a password typed here would mint no
+    grant and the page would ask again: two re-auths. Opening the page from this console page is a
+    same-origin navigation, whose refusal issues it, so the operator re-authenticates once. Nothing
+    has run and nothing is minted here. ``next_path`` has already been validated as a registered
+    unlock page, never an arbitrary URL."""
+    body = el(
+        "div",
+        el("h1", "Open this page from the console"),
+        el("p", "Next: ", el("strong", label), class_="muted"),
+        el(
+            "p",
+            "This page was opened from outside the console, so the console asks you to open it from"
+            " here before you confirm it's you. Nothing has run.",
+        ),
+        el("p", el("a", f"Open: {label}", href=next_path, class_="btn-link")),
+        class_="card",
+    )
+    return page("Confirm it's you", body, nav=minimal_nav())
 
 
 def reauth_continue(next_path: str, label: str) -> Markup:

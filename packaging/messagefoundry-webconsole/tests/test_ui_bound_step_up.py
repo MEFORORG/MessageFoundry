@@ -36,14 +36,17 @@ from fastapi import FastAPI
 from starlette.requests import Request
 
 from messagefoundry.auth import Role
+from messagefoundry.auth.service import Elevation
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole import _auth
 from messagefoundry_webconsole._auth import (
     _ISSUED_CONTINUATIONS,
     _issue_continuation,
     continuation_issued,
     lookup_ui_action,
 )
+from messagefoundry_webconsole.routes.connection_writes import _purge_confirm_continuation
 
 NO_SUCH = "0" * 32
 EDITED = ADT.replace("DOE^JANE", "DOE^JOHN")
@@ -534,29 +537,112 @@ async def test_an_auto_retry_issued_during_a_crafted_reauth_is_not_submitted(
         assert other.status_code == 200 and "Nothing ran" not in other.text  # the auto-submit
 
 
-async def test_an_auto_retry_entry_that_lapses_during_the_reauth_leaves_no_armed_grant(
+async def test_an_auto_retry_issue_is_taken_before_the_password_check(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An issued auto-retry action whose entry lapses while the password check runs mints a grant
-    and then ends on "nothing ran". That exit spends the grant, so the next submit asks again."""
+    """Vault BACKLOG #3241, added item 9. The re-auth takes the issue before the password check's
+    await, so nothing that touches the table during the check can spend it: the re-auth
+    auto-submits once, and a second re-auth with no new refusal in between ends on "nothing ran".
+    RED when: the issue is still in the table while the password is checked."""
     service = await auth_service(engine)
     await provision(service, "adm", [Role.ADMINISTRATOR.value])
     action = "/ui/config/reload"
     real_reauth = service.reauth
+    seen: list[bool] = []
 
-    async def reauth_while_the_entry_lapses(*args: Any, **kwargs: Any) -> Any:
-        _ISSUED_CONTINUATIONS.consume(kwargs["token"], action)
+    async def reauth_seeing_the_table(*args: Any, **kwargs: Any) -> Any:
+        seen.append(continuation_issued(kwargs["token"], action))
         return await real_reauth(*args, **kwargs)
 
     async with ui_client(engine, service) as c:
         await cookie_login(c, "adm")
         assert _reauth_next(await c.post(action, headers=SAME_ORIGIN)) == action  # issued
-        monkeypatch.setattr(service, "reauth", reauth_while_the_entry_lapses)
-        lapsed = await c.post(
+        monkeypatch.setattr(service, "reauth", reauth_seeing_the_table)
+        first = await c.post(
             "/ui/reauth", data={"next": action, "password": PW}, headers=SAME_ORIGIN
         )
-        assert lapsed.status_code == 200 and "Nothing ran" in lapsed.text
-        assert _reauth_next(await c.post(action, headers=SAME_ORIGIN)) == action
+        assert first.status_code == 200 and "Nothing ran" not in first.text  # the auto-submit
+        assert seen == [False]
+        again = await c.post(
+            "/ui/reauth", data={"next": action, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert again.status_code == 200 and "Nothing ran" in again.text
+
+
+async def test_two_reauths_racing_one_unlock_issue_mint_one_grant(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3241, added item 9. Two tabs re-authenticate toward one issued unlock page at
+    once. The first takes the issue before its password check; the second, arriving during that
+    check, finds nothing and so asks for no grant. RED when: both re-auths ask ``reauth`` for the
+    page's action grant."""
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    page = "/ui/connections/purge-confirm"
+    real_reauth = service.reauth
+    purposes: list[str | None] = []
+    second: list[httpx.Response] = []
+
+    async with ui_client(engine, service) as c:
+
+        async def reauth_while_another_tab_reauths(*args: Any, **kwargs: Any) -> Any:
+            purposes.append(kwargs.get("purpose"))
+            if len(purposes) > 1:
+                # The other tab's password check is still running when this one ends; answering
+                # it refused keeps its rotation from retiring the first tab's token.
+                return Elevation()
+            second.append(
+                await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
+            )
+            return await real_reauth(*args, **kwargs)
+
+        await cookie_login(c, "op")
+        _issue_continuation(_get_request(page, c.cookies["mf_session"]), page)
+        monkeypatch.setattr(service, "reauth", reauth_while_another_tab_reauths)
+        first = await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
+
+    bound = lookup_ui_action(page)
+    assert bound is not None and bound.action is not None
+    assert purposes == [bound.action, None], purposes
+    assert first.status_code == 303 and first.headers["location"] == page
+    assert second[0].status_code == 200 and "Incorrect password." in second[0].text
+
+
+async def test_a_wrong_password_gives_the_unlock_issue_back(engine: Engine) -> None:
+    """Vault BACKLOG #3241, added item 9. The issue is taken before the password check, so a wrong
+    password must put it back: the next, correct re-auth still mints and returns to the page. RED
+    when: the wrong password strands the issue and the retry ends on "nothing ran"."""
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    page = "/ui/connections/purge-confirm"
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        assert _reauth_next(await c.get(page, headers={"Sec-Fetch-Site": "same-origin"})) == page
+        wrong = await c.post(
+            "/ui/reauth", data={"next": page, "password": "not-it"}, headers=SAME_ORIGIN
+        )
+        assert wrong.status_code == 200 and "Incorrect password." in wrong.text
+        assert continuation_issued(c.cookies["mf_session"], page)
+        right = await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
+        assert right.status_code == 303 and right.headers["location"] == page
+
+
+def test_unlock_issues_do_not_evict_a_pending_auto_retry_issue() -> None:
+    """Vault BACKLOG #3241, added item 8. Each kind has its own per-session cap, so a run of
+    action-bound unlock pages cannot push out an auto-retry action the operator is confirming.
+    CONTROL: auto-retry issues past the cap still drop the oldest of their own kind."""
+    table = _auth._IssuedContinuations()
+    cap = _auth._REAUTH_CONTINUATIONS_PER_SESSION
+    table.issue("tok", "/ui/config/reload", unlock=False)
+    for n in range(cap + 3):
+        table.issue("tok", f"/ui/unlock/{n}", unlock=True)
+    assert table.issued("tok", "/ui/config/reload")
+    assert not table.issued("tok", "/ui/unlock/0")  # the oldest unlock page went
+    assert table.issued("tok", f"/ui/unlock/{cap + 2}")
+    for n in range(cap):
+        table.issue("tok", f"/ui/messages/{n}/replay", unlock=False)
+    assert not table.issued("tok", "/ui/config/reload")  # its own kind pushed it out
+    assert table.issued("tok", f"/ui/unlock/{cap + 2}")
 
 
 def _get_request(path: str, token: str) -> Request:
@@ -598,6 +684,59 @@ async def test_a_link_opened_from_outside_the_browser_issues_nothing(engine: Eng
         r = await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
         assert r.status_code == 303 and r.headers["location"] == page
         assert (await c.get(page)).status_code == 200
+
+
+async def test_a_link_opened_from_outside_the_browser_costs_one_reauth(engine: Engine) -> None:
+    """Vault BACKLOG #3241, added item 2. A bookmarked or typed link to an action-bound unlock page
+    issues nothing, so the re-auth page it lands on must not take a password that mints nothing:
+    it links to the page instead, and opening the page from there issues it, so the operator
+    re-authenticates once. RED when: the re-auth page asks for a password toward a page it was not
+    issued, so a second re-auth is needed."""
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    page = "/ui/connections/purge-confirm"
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        outside = await c.get(page, headers={"Sec-Fetch-Site": "none"})
+        assert _reauth_next(outside) == page
+        form = await c.get("/ui/reauth", params={"next": page}, headers={"Sec-Fetch-Site": "none"})
+        assert form.status_code == 200
+        assert 'name="password"' not in form.text and f'href="{page}"' in form.text
+        # The operator follows the link: a same-origin navigation, so the refusal issues the page.
+        inside = await c.get(page, headers={"Sec-Fetch-Site": "same-origin"})
+        assert _reauth_next(inside) == page
+        issued = await c.get("/ui/reauth", params={"next": page}, headers=SAME_ORIGIN)
+        assert 'name="password"' in issued.text
+        r = await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
+        assert r.status_code == 303 and r.headers["location"] == page
+        assert (await c.get(page)).status_code == 200
+
+
+async def test_the_purge_selection_survives_the_reauth(engine: Engine) -> None:
+    """Vault BACKLOG #3241, step 1 (the purge-selection item engine PR 2142 left unruled). The bulk
+    purge confirm page's refusal carries its ``dest`` and ``scope`` query to the re-auth, which
+    returns to the page with it, so the operator does not select again. CONTROL: a selection past
+    the re-auth's cap on ``next`` is dropped, as before, rather than refused. RED when: the query is
+    lost across the re-auth."""
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    page = "/ui/connections/purge-confirm"
+    selected = f"{page}?dest=OB_A&dest=OB_B&scope=top"
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        refused = await c.get(selected, headers={"Sec-Fetch-Site": "same-origin"})
+        assert _reauth_next(refused) == selected
+        r = await c.post("/ui/reauth", data={"next": selected, "password": PW}, headers=SAME_ORIGIN)
+        assert r.status_code == 303 and r.headers["location"] == selected
+        assert (await c.get(selected)).status_code == 200
+    long_query = "&".join(f"dest=OB_{n:04d}" for n in range(60)).encode()
+    assert len(page) + 1 + len(long_query) > 512
+    request = _get_request(page, "t" * 43)
+    assert _purge_confirm_continuation(request) == page  # no query: the bare page
+    request.scope["query_string"] = long_query
+    assert _purge_confirm_continuation(request) == page  # too long to ride: dropped
+    request.scope["query_string"] = b"dest=OB_A&scope=top"
+    assert _purge_confirm_continuation(request) == f"{page}?dest=OB_A&scope=top"
 
 
 def test_a_window_only_unlock_page_is_never_issued() -> None:

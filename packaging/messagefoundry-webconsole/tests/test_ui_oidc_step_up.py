@@ -30,6 +30,7 @@ from messagefoundry.auth.oidc import FederatedPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole._auth import continuation_issued
 from messagefoundry_webconsole.routes.oidc import _step_up_return_key
 
 _SUB = "S-1-5-21-fed"
@@ -610,3 +611,74 @@ async def test_spent_audit_and_sign_in_budgets_do_not_refuse_an_idp_step_up_retu
         assert r.status_code == 200, r.text
         new = c.cookies.get("mf_session")
         assert new and new != old and await service.has_recent_step_up(new)
+
+
+# --- vault BACKLOG #3241, added items 7 and 9: an action-bound unlock page on the federated leg ---
+
+_UNLOCK = "/ui/connections/purge-confirm"
+
+
+async def _start_unlock_step_up(c: httpx.AsyncClient) -> httpx.Response:
+    return await c.post(
+        "/ui/reauth/oidc", data={"next": _UNLOCK}, headers=_SAME, follow_redirects=False
+    )
+
+
+async def test_a_refused_idp_step_up_gives_the_unlock_issue_back_for_the_retry(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 7: the refusal page offers a retry, and the retry must still continue to the unlock
+    page and mint its grant. The start leg holds the issue for its flow, the refusal puts it back,
+    and the retry's success drops it. RED when: the refusal strands the issue, so the retry lands on
+    the console instead of the page, or the held issue is still readable while the flow is out."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        session = await _federated_sign_in(service, c, monkeypatch)
+        issue_continuation(c, _UNLOCK)
+        start = await _start_unlock_step_up(c)
+        assert start.status_code == 303
+        assert not continuation_issued(session, _UNLOCK)  # held for the flow, not in the table
+        state = dict(parse_qsl(urlsplit(start.headers["location"]).query))["state"]
+        c.cookies.delete("mf_session")
+        refused = await c.get(
+            "/ui/oidc/callback",
+            params={"error": "access_denied", "state": state},
+            headers=_CROSS_SITE_NAV,
+            follow_redirects=False,
+        )
+        assert refused.status_code == 403
+        c.cookies.set("mf_session", session)
+        assert continuation_issued(session, _UNLOCK)  # given back for the retry
+
+        retry = await _start_unlock_step_up(c)
+        assert retry.status_code == 303
+        landed = await _callback(c, retry.headers["location"])
+
+        assert landed.status_code == 200, landed.text
+        assert _UNLOCK in landed.text  # the landing continues to the page
+        new = c.cookies.get("mf_session")
+        assert new and new != session
+        assert not continuation_issued(new, _UNLOCK)  # one issue, one grant
+        page = await c.get(_UNLOCK, headers=_SAME, follow_redirects=False)
+        assert page.status_code == 200, page.headers
+
+
+async def test_two_idp_starts_racing_one_unlock_issue_mint_one_grant(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 9 on the federated leg: the first start takes the issue, so a second start for the same
+    page, from another tab, stages a flow that continues to nothing and mints no grant. RED when:
+    the second flow lands on the unlock page."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        await _federated_sign_in(service, c, monkeypatch)
+        issue_continuation(c, _UNLOCK)
+        first = await _start_unlock_step_up(c)
+        assert first.status_code == 303
+        second = await _start_unlock_step_up(c)
+        assert second.status_code == 303
+
+        landed = await _callback(c, second.headers["location"])
+
+        assert landed.status_code == 200, landed.text
+        assert _UNLOCK not in landed.text

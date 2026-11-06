@@ -67,10 +67,10 @@ from .._auth import (
     allow_reauth_attempt,
     assert_not_cross_site,
     assert_same_origin,
+    claim_continuation,
     clear_passkey_sign_in_cookie,
     clear_session_cookie,
     confined_before_its_factor,
-    consume_continuation,
     continues_after_reauth,
     is_unlock_action,
     login_redirect_response,
@@ -1906,6 +1906,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse(
                 await must_change_target(auth, token, request=request), status_code=303
             )
+        if action.binds_unlock_grant and not continues:
+            # Vault BACKLOG #3241, added item 2: a link to this page from outside the browser issued
+            # nothing, so a re-auth here would mint no grant and the page would ask for a second
+            # one. A link to the page instead: opening it from here is a same-origin navigation,
+            # whose refusal issues it, so the operator re-authenticates once. On either leg.
+            return HTMLResponse(pages.reauth_open_first(next_, action.label))
         mfa = await auth.mfa_status(identity)
         if await auth.session_steps_up_at_idp(token):
             # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up at
@@ -2060,29 +2066,35 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Vault BACKLOG #2764: only for a continuation that will run. A `next` the console did not
         # issue to this session takes no grant, because ADR 0077 derives the grant's purpose from
         # `next` itself, and a forged one would otherwise bind the proof to the forged action.
-        # Read once, before the await: what follows keys on what was minted. An unlock entry that
-        # lapses or is evicted during the re-auth still redirects to the page its grant names. An
-        # auto-retry entry that lapses the same way ends on "nothing ran", and that exit discards the
-        # grant it minted, so no armed grant sits behind a page saying nothing ran.
-        continues = continues_after_reauth(action, token, next_)
+        # Vault BACKLOG #3241, added item 9: the issue is TAKEN here, before the await, so two tabs
+        # racing one issue cannot both mint its grant: the second finds nothing and mints nothing.
+        # Every exit below that mints nothing puts it back, so a wrong password does not strand it.
+        claim = claim_continuation(action, token, next_)
+        continues = claim.continues
         pre_rotation = token
-        pw_elevation = await auth.reauth(
-            identity,
-            form.get("password", ""),
-            token=token,
-            client=client,
-            purpose=action.action if continues else None,
-        )
+        try:
+            pw_elevation = await auth.reauth(
+                identity,
+                form.get("password", ""),
+                token=token,
+                client=client,
+                purpose=action.action if continues else None,
+            )
+        except BaseException:
+            claim.restore()
+            raise
         if pw_elevation.session_lost:
             return login_redirect_response()
         if pw_elevation.idp_step_up_required:
             # BACKLOG #296. Unreachable while the early redirect above holds; kept so a reordering
             # sends the operator to the IdP leg instead of reporting a correct password as wrong.
+            claim.restore()
             return _keep_session(
                 RedirectResponse("/ui/reauth?" + urlencode({"next": next_}), status_code=303),
                 token,
             )
         if pw_elevation.token is None:
+            claim.restore()
             still_unsatisfied = not await auth.mfa_satisfied(token)
             wa_options, wa_notice = await _reauth_webauthn_state(
                 request, auth, token, mfa, not still_unsatisfied
@@ -2109,30 +2121,22 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         #    fresh window; the operator then submits the body-carrying POST (incl. a create-user
         #    password) once, never crossing /ui/reauth (the stateless confirm-after-step-up path).
         #  - a body-less POST action the console issued to this session: auto-retry it via the
-        #    same-origin submit form, spending the issue so it auto-submits once (#2764).
+        #    same-origin submit form; its issue was taken above, so it auto-submits once (#2764).
         #  - any other body-less POST action: a page that says nothing ran, so an operator whose
         #    entry lapsed (TTL, restart, eviction) does not read the landing as the action done.
-        # The issue is spent under the pre-rotation token, the key it still sits under, and then
-        # the session's OTHER issued entries follow the rotation -- before any branch returns, so
-        # an unlock re-auth in one tab does not strand an action another tab is confirming.
+        # The session's OTHER issued entries follow the rotation before any branch returns, so an
+        # unlock re-auth in one tab does not strand an action another tab is confirming.
         # An unlock page that binds an action continues only when it was issued (owner ruling
-        # 2026-10-13, #3241 R3), and spends the issue here, so one issue mints one grant. An
+        # 2026-10-13, #3241 R3), and its issue was taken above, so one issue mints one grant. An
         # unissued one ends on the page that says nothing ran, which is what the re-auth form told
         # the operator. A window-only unlock page always continues; it has no grant to pre-arm.
-        # A re-auth that minted nothing (`continues` false) spends no issue: another tab may have
-        # been issued the same `next` during the await, and its own re-auth needs it. The unlock
-        # branch follows `continues`; the auto-retry branch also needs the spend, so two tabs racing
-        # one issue auto-submit it once.
-        issued = continues and consume_continuation(pre_rotation, next_)
+        # A re-auth that took nothing (`continues` false) minted nothing, so an issue another tab
+        # got during the await is still there for that tab's own re-auth.
         rekey_continuations(pre_rotation, token)
         if is_unlock_action(next_) and continues:
             return _keep_session(RedirectResponse(next_, status_code=303), token)
-        if issued:
+        if continues:
             return _keep_session(HTMLResponse(pages.reauth_continue(next_, action.label)), token)
-        if continues and action.action is not None:
-            # The entry lapsed or a racing tab spent it during the await, so this page says nothing
-            # ran: spend the grant this re-auth minted, so none stays armed behind that page.
-            await auth.has_action_step_up(token, action.action)
         return _keep_session(
             HTMLResponse(pages.reauth_nothing_ran(action.label, reauth_landing(identity))), token
         )

@@ -398,3 +398,13 @@ what the re-auth form told the operator; a federated one lands on the console's 
 A GET with `Sec-Fetch-Site: none` issues nothing. A browser that sends no Fetch Metadata is
 judged only by the origin check, which accepts a top-level GET, so on such a browser a crafted
 link to the page itself still issues it. The operator must still confirm on the page.
+
+**Change of 2026-11-05 (vault BACKLOG #3241, added items 7 to 9).** "Once" now holds when two
+re-auths race one issue. Each re-auth leg, the password one and the federated start, takes the
+issue before its first await, so a second re-auth arriving meanwhile, from another tab or the other
+leg, finds nothing and mints nothing. A password re-auth that fails puts the issue back. The
+federated start holds an unlock page's issue for its flow: the callback puts it back when the flow
+ends refused, so the retry the IdP's refusal page offers still mints, and drops it when the flow
+mints. An auto-retry action's issue is still spent at the federated start, as before. Each kind of
+issue, auto-retry actions and action-bound unlock pages, now has its own per-session cap, so unlock
+pages cannot evict an auto-retry action the operator is confirming.

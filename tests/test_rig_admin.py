@@ -1101,6 +1101,55 @@ def test_a_token_poller_gets_no_reload_client() -> None:
     assert EnginePoller("https://127.0.0.1:1", RIG_SESSION, origin=0.0).holds_rig_session
 
 
+def test_the_rig_session_cap_is_the_engine_default() -> None:
+    """``RIG_SESSION_CAP`` is a copy of the engine's default, because the harness may not import the
+    engine's settings. RED when the engine default moves and the copy does not."""
+    from messagefoundry.config.settings import AuthSettings
+
+    assert AuthSettings().max_sessions_per_user == enginepoll.RIG_SESSION_CAP
+
+
+class _SessionsClient:
+    """The sampler's client as :meth:`EnginePoller._reload_client_sync` reads it: a session list."""
+
+    def __init__(self, held: int) -> None:
+        self.held = held
+
+    def list_sessions(self) -> list[object]:
+        return [object()] * self.held
+
+
+@pytest.mark.parametrize(("held", "cap"), [(5, 5), (6, 5), (9, 9)])
+def test_a_reload_probe_at_the_session_cap_signs_nothing_in(
+    monkeypatch: pytest.MonkeyPatch, held: int, cap: int
+) -> None:
+    """Vault BACKLOG #3241, added item 5. A sign-in past ``[auth].max_sessions_per_user`` ends the
+    rig user's oldest session, the sampler's. So at the cap the reload probe signs nothing in and
+    reports the reload unmeasured. RED when: it signs in at the cap."""
+    monkeypatch.setattr(
+        rigadmin, "sign_in", lambda *a, **k: pytest.fail("signed in at the session cap")
+    )
+    poller = EnginePoller("https://127.0.0.1:1", RIG_SESSION, origin=0.0, session_cap=cap)
+    poller._clients = [_SessionsClient(held)]  # type: ignore[list-item]
+    assert asyncio.run(poller.reload_client()) is None
+
+
+def test_a_reload_probe_under_the_session_cap_signs_in() -> None:
+    """The control for the test above: one session of headroom, and the probe signs in."""
+    calls: list[str] = []
+
+    def _sign_in(url: str, *_a: object, **_k: object) -> str:
+        calls.append(url)
+        raise rigadmin.RigAdminError("synthetic: stop after the sign-in was attempted")
+
+    poller = EnginePoller("https://127.0.0.1:1", RIG_SESSION, origin=0.0, session_cap=5)
+    poller._clients = [_SessionsClient(4)]  # type: ignore[list-item]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(rigadmin, "sign_in", _sign_in)
+        assert asyncio.run(poller.reload_client()) is None
+    assert calls == ["https://127.0.0.1:1"]
+
+
 def test_an_unreachable_engine_reads_as_an_api_error_and_a_refusal_does_not(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1144,7 +1144,7 @@ async def test_an_account_deleted_during_the_passkey_re_read_is_a_lost_session(k
             await store.delete_user(user_id)
             return await real_held(*args)
 
-        service._passkey_held = _the_account_goes_then_the_set_is_read  # type: ignore[method-assign]
+        service._passkey_held = _the_account_goes_then_the_set_is_read  # type: ignore[method-assign,assignment]
 
         refused = await service.finish_webauthn_assertion(
             token, response, rp_id=_RP, origin=_ORIGIN

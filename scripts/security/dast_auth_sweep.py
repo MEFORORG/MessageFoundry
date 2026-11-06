@@ -323,10 +323,13 @@ async def _write_pass(
     probed is one whose reach numbers cannot be credited, and grinding through a login per row would
     report a number built on an unstable target rather than refusing to report one.
     """
+    if (reproved is None) != (reproof_refused is None):
+        # Either both lists or neither: one without the other would drop refused re-proofs.
+        raise ValueError("reproved and reproof_refused are passed together")
     results: list[tuple[route_gates.RouteRow, int]] = []
     for row in rows:
         url = route_gates.concrete_path(row.path, placeholder)
-        if reproved is None:
+        if reproved is None or reproof_refused is None:
             status = await _probe(client, row.method, url, token)
         else:
             status, token = await _reach_probe(
@@ -336,7 +339,7 @@ async def _write_pass(
                 token,
                 target=target,
                 reproved=reproved,
-                reproof_refused=reproof_refused if reproof_refused is not None else [],
+                reproof_refused=reproof_refused,
             )
         results.append((row, status))
 

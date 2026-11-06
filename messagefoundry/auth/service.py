@@ -15372,9 +15372,6 @@ class AuthService:
         # passkey that signed may be gone. Asked BEFORE the holder re-read below (BACKLOG #3068), so
         # its awaits cannot sit between that re-read and the factor write. Asked whatever the write
         # answered, so a set that fails its seal is reported even when a holder refusal follows.
-        standing = await self._passkey_standing(user, cred, client)
-        if standing is None:
-            return Elevation()
         # BACKLOG #3068: the passkey reads and the sign-count write awaited since the session, the
         # account and its lock were last read, so a revocation, a disable or a lock that landed in
         # between must stop the factor write, as on verify_mfa. This is the LAST read before the
@@ -15385,6 +15382,9 @@ class AuthService:
         # A keyless store keeps no digest, so a passkey deleted during the last re-read is not seen
         # there, as a delete landing just after the write would not be.
         while True:
+            standing = await self._passkey_standing(user, cred, client)
+            if standing is None:
+                return Elevation()
             fresh = await self._factor_holder_current(
                 token,
                 actor=user.username,
@@ -15398,9 +15398,6 @@ class AuthService:
             user = fresh
             if settled or standing != "held":
                 break
-            standing = await self._passkey_standing(user, cred, client)
-            if standing is None:
-                return Elevation()
         if standing == "account_gone":
             # Gone during the passkey read: the token no longer authenticates, so the answer is the
             # lost session the holder re-read gives, not a factor question.

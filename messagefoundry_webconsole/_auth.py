@@ -58,9 +58,12 @@ __all__ = [
     "ENROL_FIRST_UI_ROUTES",
     "clear_session_cookie",
     "confined_before_its_factor",
-    "consume_continuation",
+    "ContinuationClaim",
+    "claim_continuation",
     "continues_after_reauth",
     "continuation_issued",
+    "hold_claim_for_flow",
+    "settle_flow_claim",
     "effective_https",
     "is_safe_ui_action",
     "is_unlock_action",
@@ -899,6 +902,20 @@ class UiWriteAction:
         if not self.label.strip():
             raise ValueError("a /ui action needs a label naming it on the re-auth page")
 
+    @property
+    def binds_unlock_grant(self) -> bool:
+        """Whether this is an unlock page whose re-auth mints an action grant (owner ruling
+        2026-10-13, #3241 R3): the one place the predicate is spelled (vault BACKLOG #3241, added
+        item 6)."""
+        return self.unlock and self.action is not None
+
+    @property
+    def continues_only_when_issued(self) -> bool:
+        """Whether a re-auth continues to this action only when a gate issued it to the session: an
+        auto-retry action (vault BACKLOG #2764) or an unlock page that binds a grant. A window-only
+        unlock page always continues; it has no grant to pre-arm."""
+        return not self.unlock or self.binds_unlock_grant
+
 
 # The write-action registry — the extensible replacement for the former single ``_SAFE_UI_ACTION_RE``
 # literal. A write-page lane registers its action (co-located with its route, or here) instead of editing
@@ -1085,12 +1102,23 @@ def reauth_landing(identity: Identity) -> str:
 #: to type a password and a code, or to complete the identity provider's prompt; short because an
 #: entry that lapses costs only the auto-submit: the re-auth ends on a page saying nothing ran.
 REAUTH_CONTINUATION_TTL_SECONDS = 300.0
-#: Bounds on the issued-continuation table. A session holds at most this many (its oldest is dropped),
-#: so a session that keeps getting refused cannot crowd out anyone else's; the table holds at most
-#: this many sessions (the least recently issued is dropped). Each drop is fail-safe for the same
-#: reason a lapse is: it costs the auto-submit and nothing else.
+#: Bounds on the issued-continuation table. A session holds at most this many entries OF EACH KIND,
+#: auto-retry actions and action-bound unlock pages (its oldest of that kind is dropped), so a
+#: session that keeps getting refused cannot crowd out anyone else's, and a run of unlock pages
+#: cannot evict a pending auto-retry issue (vault BACKLOG #3241, added item 8). The table holds at
+#: most this many sessions (the least recently issued is dropped). Each drop is fail-safe for the
+#: same reason a lapse is: it costs the auto-submit, or the unlock page's grant, and nothing else.
 _REAUTH_CONTINUATIONS_PER_SESSION = 8
 _REAUTH_CONTINUATION_SESSIONS_MAX = 4096
+
+
+@dataclass(frozen=True)
+class _Entry:
+    """One issued continuation: when it lapses, and whether it is an unlock page (the other kind is
+    an auto-retry action). The kind keeps each kind under its own per-session cap."""
+
+    deadline: float
+    unlock: bool
 
 
 class _IssuedContinuations:
@@ -1103,8 +1131,10 @@ class _IssuedContinuations:
     recorded that the server had asked for it, so a typed, bookmarked or clicked link to
     ``/ui/reauth?next=<a destructive action>`` turned a routine re-auth into that action. Now a
     step-up gate that refuses a request records the continuation it hands out
-    (:func:`_reauth_redirect`), and ``/ui/reauth`` auto-submits only an entry recorded for the
-    session presenting it, consuming it as it does (single use).
+    (:func:`_reauth_redirect`), and a re-auth continues only with an entry recorded for the session
+    presenting it, TAKING it before the re-proof's first await (:func:`claim_continuation`), so two
+    re-auths racing one entry cannot both mint its grant (vault BACKLOG #3241, added item 9). A
+    re-auth that fails puts its entry back.
 
     Keyed by ``hash_token(session token)`` and then ``next``, so the raw token is never held and a
     second session cannot consume another's entry. The console routes that rotate a session's token
@@ -1120,47 +1150,64 @@ class _IssuedContinuations:
     """
 
     def __init__(self) -> None:
-        self._sessions: OrderedDict[str, OrderedDict[str, float]] = OrderedDict()
+        self._sessions: OrderedDict[str, OrderedDict[str, _Entry]] = OrderedDict()
 
     def _prune(self, now: float) -> None:
-        """Drop every session whose newest entry (its last; entries are in issue order) lapsed."""
+        """Drop every session whose every entry lapsed."""
         lapsed = [
-            h for h, entries in self._sessions.items() if next(reversed(entries.values())) <= now
+            h
+            for h, entries in self._sessions.items()
+            if max(e.deadline for e in entries.values()) <= now
         ]
         for session_hash in lapsed:
             del self._sessions[session_hash]
 
-    def issue(self, token: str, next_path: str) -> None:
-        now = time.monotonic()
-        self._prune(now)
-        session_hash = hash_token(token)
+    def _put(self, session_hash: str, next_path: str, entry: _Entry) -> None:
+        """Record ``entry`` at the back of the session's entries, under both caps."""
+        self._prune(time.monotonic())
         entries = self._sessions.pop(session_hash, None) or OrderedDict()
         entries.pop(next_path, None)  # re-issuing refreshes the entry and moves it to the back
-        entries[next_path] = now + REAUTH_CONTINUATION_TTL_SECONDS
-        while len(entries) > _REAUTH_CONTINUATIONS_PER_SESSION:
-            entries.popitem(last=False)
+        entries[next_path] = entry
+        same_kind = [path for path, e in entries.items() if e.unlock == entry.unlock]
+        for path in same_kind[: max(0, len(same_kind) - _REAUTH_CONTINUATIONS_PER_SESSION)]:
+            del entries[path]
         self._sessions[session_hash] = entries
         while len(self._sessions) > _REAUTH_CONTINUATION_SESSIONS_MAX:
             self._sessions.popitem(last=False)
 
+    def issue(self, token: str, next_path: str, *, unlock: bool | None = None) -> None:
+        """Record ``next_path`` for this session. ``unlock`` is the entry's kind, read from the
+        registry when not given, by the rule :func:`_issue_continuation` passes it by (an
+        unregistered path counts as an auto-retry action)."""
+        if unlock is None:
+            action = lookup_ui_action(next_path)
+            unlock = action is not None and action.binds_unlock_grant
+        entry = _Entry(time.monotonic() + REAUTH_CONTINUATION_TTL_SECONDS, unlock)
+        self._put(hash_token(token), next_path, entry)
+
     def issued(self, token: str | None, next_path: str) -> bool:
         """Whether a live entry exists for this session and ``next_path``. Does not consume it."""
         entries = self._sessions.get(hash_token(token)) if token else None
-        deadline = entries.get(next_path) if entries else None
-        return deadline is not None and deadline > time.monotonic()
+        entry = entries.get(next_path) if entries else None
+        return entry is not None and entry.deadline > time.monotonic()
 
-    def consume(self, token: str | None, next_path: str) -> bool:
-        """Pop the entry for this session and ``next_path``; whether it was live (single use)."""
+    def take(self, token: str | None, next_path: str) -> _Entry | None:
+        """Pop the entry for this session and ``next_path``: the entry if it was live, else None."""
         if not token:
-            return False
+            return None
         session_hash = hash_token(token)
         entries = self._sessions.get(session_hash)
         if entries is None:
-            return False
-        deadline = entries.pop(next_path, None)
+            return None
+        entry = entries.pop(next_path, None)
         if not entries:
             del self._sessions[session_hash]
-        return deadline is not None and deadline > time.monotonic()
+        return entry if entry is not None and entry.deadline > time.monotonic() else None
+
+    def put_back(self, session_hash: str, next_path: str, entry: _Entry) -> None:
+        """Return an entry :meth:`take` handed out, its deadline unchanged, unless it lapsed."""
+        if entry.deadline > time.monotonic():
+            self._put(session_hash, next_path, entry)
 
     def rekey(self, old_token: str | None, new_token: str | None) -> None:
         """Carry this session's entries across a token rotation, deadlines unchanged."""
@@ -1179,25 +1226,90 @@ def continuation_issued(token: str | None, next_path: str) -> bool:
     return _ISSUED_CONTINUATIONS.issued(token, next_path)
 
 
-def consume_continuation(token: str | None, next_path: str) -> bool:
-    """Spend the continuation issued to this session for ``next_path``; True only once.
-
-    The password re-auth spends an unlock page's issue as it mints the grant, so one issue mints
-    one grant. The federated start leg does not call this for an unlock page; see the comment
-    there (owner ruling 2026-10-13, #3241 R3)."""
-    return _ISSUED_CONTINUATIONS.consume(token, next_path)
-
-
 def continues_after_reauth(action: UiWriteAction, token: str | None, next_path: str) -> bool:
-    """Whether a re-auth for ``next_path`` continues to it, and so mints the grant its action names:
-    when a gate issued it to this session, for an ``auto_retry`` action (vault BACKLOG #2764) and for
-    an ``unlock`` page that binds an action alike (owner ruling 2026-10-13, #3241 R3). A crafted
-    ``/ui/reauth?next=<that page>`` therefore mints nothing bound. An unlock page that binds no
-    action (a window-only form) still always continues: there is no grant to pre-arm, and the
-    re-auth only sends the browser back to it. Ask it of the CURRENT token; a ceremony rotates."""
-    if action.unlock and action.action is None:
+    """Whether a re-auth for ``next_path`` would continue to it, and so mint the grant its action
+    names: when a gate issued it to this session, for an ``auto_retry`` action (vault BACKLOG #2764)
+    and for an ``unlock`` page that binds an action alike (owner ruling 2026-10-13, #3241 R3). A
+    crafted ``/ui/reauth?next=<that page>`` therefore mints nothing bound. An unlock page that binds
+    no action (a window-only form) still always continues: there is no grant to pre-arm, and the
+    re-auth only sends the browser back to it. A READ, for rendering; a re-auth that mints takes the
+    entry with :func:`claim_continuation`. Ask it of the CURRENT token; a ceremony rotates."""
+    if not action.continues_only_when_issued:
         return True
     return continuation_issued(token, next_path)
+
+
+@dataclass
+class ContinuationClaim:
+    """What :func:`claim_continuation` took for one re-auth: whether it continues, and the entry it
+    holds, which :meth:`restore` puts back for a re-auth that ended without minting."""
+
+    continues: bool
+    _session_hash: str | None = None
+    _next_path: str = ""
+    _entry: _Entry | None = None
+
+    @property
+    def holds_entry(self) -> bool:
+        """Whether this claim took an entry that :meth:`restore` would give back."""
+        return self._entry is not None
+
+    def deadline(self) -> float:
+        """When the held entry lapses; ``0.0`` once nothing is held."""
+        return 0.0 if self._entry is None else self._entry.deadline
+
+    def restore(self) -> None:
+        """Give the taken entry back to its session, once, its deadline unchanged. Call it on every
+        exit that minted no grant, so a wrong password or a refused IdP prompt does not strand the
+        continuation the gate issued."""
+        entry, self._entry = self._entry, None
+        if entry is not None and self._session_hash is not None:  # both set together
+            _ISSUED_CONTINUATIONS.put_back(self._session_hash, self._next_path, entry)
+
+
+def claim_continuation(
+    action: UiWriteAction, token: str | None, next_path: str
+) -> ContinuationClaim:
+    """Take the continuation a re-auth for ``next_path`` may mint toward, BEFORE the re-proof's
+    first await (vault BACKLOG #3241, added item 9). It answers as :func:`continues_after_reauth`
+    does, and pops the entry in the same synchronous step, so of two re-auths racing one issue (two
+    tabs, or a password and a federated start) only the first continues and mints the grant; the
+    other mints nothing. A window-only unlock page takes nothing and always continues."""
+    if not action.continues_only_when_issued:
+        return ContinuationClaim(continues=True)
+    entry = _ISSUED_CONTINUATIONS.take(token, next_path)
+    if entry is None or token is None:
+        return ContinuationClaim(continues=False)
+    return ContinuationClaim(True, hash_token(token), next_path, entry)
+
+
+#: The claims a federated step-up start leg holds for its staged flow, by flow id (vault BACKLOG
+#: #3241, added items 7 and 9). The callback carries no session cookie, so the claim waits here
+#: until the flow resolves: a refusal puts the entry back, so the retry the IdP's refusal page offers
+#: still continues, and a success drops it. Bounded like the issued table; an entry for a flow that
+#: never returns lapses with the continuation's TTL, which costs only that continuation.
+_FLOW_CLAIMS: OrderedDict[str, ContinuationClaim] = OrderedDict()
+
+
+def hold_claim_for_flow(flow_id: str, claim: ContinuationClaim) -> None:
+    """Keep ``claim`` until the federated step-up flow ``flow_id`` resolves."""
+    if not claim.holds_entry:
+        return
+    now = time.monotonic()
+    for fid in [f for f, c in _FLOW_CLAIMS.items() if c.deadline() <= now]:
+        del _FLOW_CLAIMS[fid]
+    _FLOW_CLAIMS[flow_id] = claim
+    while len(_FLOW_CLAIMS) > _REAUTH_CONTINUATION_SESSIONS_MAX:
+        _FLOW_CLAIMS.popitem(last=False)
+
+
+def settle_flow_claim(flow_id: str | None, *, minted: bool) -> None:
+    """Resolve the claim held for ``flow_id``: put it back when the flow ended without minting,
+    drop it when it minted. Call it only once the flow is consumed: a return that consumed nothing
+    leaves the flow, and its claim, for the IdP's real return."""
+    claim = _FLOW_CLAIMS.pop(flow_id, None) if flow_id else None
+    if claim is not None and not minted:
+        claim.restore()
 
 
 def rekey_continuations(old_token: str | None, new_token: str | None) -> None:
@@ -1247,8 +1359,7 @@ def _issue_continuation(request: Request, next_path: str) -> None:
             (request.method == "POST" and is_safe_ui_action(next_path))
             or (
                 action is not None
-                and action.unlock
-                and action.action is not None
+                and action.binds_unlock_grant
                 and not (
                     request.method == "GET" and request.headers.get("sec-fetch-site") == "none"
                 )
@@ -1256,7 +1367,9 @@ def _issue_continuation(request: Request, next_path: str) -> None:
         )
         and _request_is_same_origin(request)
     ):
-        _ISSUED_CONTINUATIONS.issue(token, next_path)
+        _ISSUED_CONTINUATIONS.issue(
+            token, next_path, unlock=action is not None and action.binds_unlock_grant
+        )
 
 
 def _reauth_redirect(request: Request, next_path: str | None = None) -> HTTPException:
