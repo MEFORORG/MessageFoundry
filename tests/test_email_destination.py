@@ -1029,6 +1029,16 @@ async def test_a_421_during_rcpt_counts_only_the_replies_it_saw(wire: _WireCaptu
     assert_total_refusal(caught.value, f"Email 127.0.0.1:{wire.port}", wire, "421", seen=1)
 
 
+def test_a_421_after_a_550_still_says_the_session_closed() -> None:
+    """smtplib keeps both refusals, so the count equals the whole, and only the 421 says the
+    relay stopped answering rather than refusing every mailbox."""
+    refusal = _total_refusal("Email relay.example:587", 2, 2, [421, 550])
+    assert not isinstance(refusal, NegativeAckError)
+    assert str(refusal) == (
+        "Email relay.example:587: 2 of 2 recipients refused, then the session closed (421, 550)"
+    )
+
+
 def test_a_total_refusal_with_no_reply_code_is_retried() -> None:
     """SMTPRecipientsRefused({}) holds no code: nothing says the refusal is permanent."""
     refusal = _total_refusal("Email relay.example:587", 0, 0, [])

@@ -7,18 +7,6 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
-- **An over-granted or unreadable Vault token now raises a `vault_privilege_warning` alert at
-  start.** The Vault privilege preflight already logged and audited each finding. It now also fires
-  the alert through the configured notifier, keyed on `vault:store` or `vault:secrets`, before any
-  refusal, so a refused start still pages. An alert rule can match the new event type, and a later
-  start that reads that hop's token clean resolves the open alert. ADR 0216 Amendment A says what
-  the payload holds. (`BACKLOG #2903`)
-- **A mail relay that refuses every recipient with a `5xx` reply now fails the delivery for good.**
-  On the Email and Direct destinations the row dead-letters on its first attempt, as a partial
-  refusal already did, rather than being retried to the attempt ceiling. A refusal with any `4xx`
-  reply, such as greylisting, or with `552`, is still retried. The error names the relay, a count
-  and the reply codes, never an address or the relay's reply text, and the `[alerts]` mail logs it
-  the same way. (`BACKLOG #2924`, `#2884`)
 - **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
   engine's whole environment less the engine's own `MEFOR_*` names, so a secret kept under any
   other name reached it. Now a variable reaches a hook only if it is one a shell needs to start or

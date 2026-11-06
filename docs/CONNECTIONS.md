@@ -2977,7 +2977,7 @@ relay.example:587: all 2 recipients refused (550)"*), never an address or a repl
 those replies is a temporary `4xx`, such as greylisting, or `552`, which RFC 5321 tells a client to treat
 as temporary at `RCPT`, the next attempt may pass, so it is retried, with the same content-free text. A
 relay that drops the session with `421` part way through is retried too, and the text counts only the
-replies before it (*"1 of 2 recipients refused, then the session closed (421)"*). The relay took no
+refusals up to and including it (*"1 of 2 recipients refused, then the session closed (421)"*). The relay took no
 message in any of these cases, so nobody gets a duplicate. The Direct destination fails each refusal the
 same way, and the `[alerts]` mail logs each as a failed send.
 

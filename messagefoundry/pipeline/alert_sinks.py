@@ -860,9 +860,8 @@ def send_plain_email(
                     channel_encrypted=use_tls,
                     cell=ALERTS_SMTP_CELL,
                 )
-            # A partial RCPT refusal, or a refusal of every recipient, raises an error that names
-            # the cell and counts, never an address or a reply text (vault BACKLOG #2924, #2884):
-            # a permanent NegativeAckError, or for a 4xx refusal of every recipient a DeliveryError.
+            # A recipient refusal raises what CheckedEnvelope.send says: an error that names the
+            # cell and counts, never an address or a reply text (vault BACKLOG #2924, #2884).
             envelope.send(smtp, msg, cell=ALERTS_SMTP_CELL)
     except smtplib.SMTPException as exc:
         # A QUIT refused after a permanent refusal must not hide it; raised below, outside this

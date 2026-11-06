@@ -305,8 +305,9 @@ class CheckedEnvelope:
         temporary at ``RCPT``, it is a retried
         :class:`~messagefoundry.transports.base.DeliveryError`, since the next attempt may pass.
         Either way the relay took no message, so nobody gets a duplicate. smtplib also raises it
-        when a ``421`` closes the session during ``RCPT``, holding only the replies seen so far;
-        the text then gives that count out of the whole.
+        when a ``421`` closes the session during ``RCPT``, holding only the refusals up to and
+        including the ``421``; the text then gives that count out of the whole, and says the
+        session closed.
 
         The text is ``cell`` and counts, and for a total refusal the distinct reply codes. It holds
         no address and no reply text, because a reply text can echo the address, and the raise is
@@ -370,13 +371,13 @@ def _permanent_reply(code: int) -> bool:
 
 def _total_refusal(cell: str, seen: int, count: int, codes: list[int]) -> DeliveryError:
     """The error for a refusal of every recipient: permanent when there is a code and every one
-    is permanent. ``seen`` is how many replies smtplib kept, fewer than ``count`` when a ``421``
-    closed the session first."""
+    is permanent. ``seen`` is how many refusals smtplib kept; a ``421`` closed the session at the
+    last of them, so the recipients after it were never asked."""
     shown = ", ".join(map(str, codes))
-    if seen == count:
-        text = f"{cell}: all {count} recipients refused ({shown})"
-    else:
+    if 421 in codes:
         text = f"{cell}: {seen} of {count} recipients refused, then the session closed ({shown})"
+    else:
+        text = f"{cell}: all {count} recipients refused ({shown})"
     if codes and all(_permanent_reply(code) for code in codes):
         return _permanent_refusal(text, TOTAL_REFUSAL_CODE)
     return _TemporaryEnvelopeRefusal(text)

@@ -119,26 +119,23 @@ def vault_privilege_alert_subject(hop: HopPrivilege) -> str:
     return f"{VAULT_PRIVILEGE_ALERT_SUBJECT}:{hop.hop.removeprefix('vault.')}"
 
 
-#: The states that raise the warning, the ones
-#: :func:`~messagefoundry.privilege_check.vault_preflight_outcome` reads as a finding.
-_FINDINGS = frozenset({HopState.OVER_GRANTED, HopState.UNOBSERVABLE})
-
-
-def _alert(sink: VaultPrivilegeAlertSink, hop: HopPrivilege) -> None:
-    """Raise the hop's warning, or its clean inverse; any other state judged nothing, so it
-    raises neither. Best effort, like the audit row: a sink that raises is logged and never masks
-    the finding or the refusal."""
+def _alert(sink: VaultPrivilegeAlertSink, hop: HopPrivilege, outcome: PreflightOutcome) -> None:
+    """Raise the hop's warning when ``outcome`` (from
+    :func:`~messagefoundry.privilege_check.vault_preflight_outcome`) is a finding, or its clean
+    inverse when the hop read clean; any other state judged nothing, so it raises neither. Best
+    effort, like the audit row: a sink that raises is logged and never masks the finding or the
+    refusal."""
     subject = vault_privilege_alert_subject(hop)
     try:
-        if hop.state is HopState.CLEAN:
-            sink.vault_privilege_clean(subject)
-        elif hop.state in _FINDINGS:
+        if outcome is not PreflightOutcome.CLEAN:
             sink.vault_privilege_warning(
                 subject,
                 finding=hop.state.value,
                 refusing_count=len(hop.refusing),
                 detail=scrub_log_argument(hop.detail)[:_AUDIT_DETAIL_LIMIT],
             )
+        elif hop.state is HopState.CLEAN:
+            sink.vault_privilege_clean(subject)
     except Exception:  # noqa: BLE001 - alerting is best-effort; never mask the finding
         log.exception("vault privilege preflight: the alert sink raised")
 
@@ -223,7 +220,7 @@ async def run_vault_privilege_preflight(
                 VAULT_OVER_GRANT_OPT_OUT,
             )
         if alert_sink is not None:
-            _alert(alert_sink, hop)
+            _alert(alert_sink, hop, outcome)
         detail = {
             "hop": hop.hop,
             "state": hop.state.value,
