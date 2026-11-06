@@ -373,13 +373,9 @@ icacls "C:\ProgramData\MessageFoundry" /grant "NT SERVICE\MessageFoundry:(OI)(CI
 ```
 
 A domain **gMSA** or a dedicated local user works the same way (pass `-ServiceAccountPassword`
-for a password-based account — it's taken as a `SecureString`). In a data directory the installer
-hardened, the store shares its files with SYSTEM, Administrators and that account; see *A SQLite
-store in the data directory admits one named account*, below. Anywhere else, the engine tries at
-runtime to remove each store file's inherited entries and grant full control to the account the
-process environment names, normally `USERNAME`; other principals' explicit entries a file already
-carries are kept. Where it cannot, the file keeps its inherited entries and the engine logs a
-WARNING, so the directory's own ACL is the backstop.
+for a password-based account — it's taken as a `SecureString`). What the store files grant at
+runtime, and the fallback when the store refuses the data directory, are stated once, in ADR 0163,
+*Note (2026-11-05)*.
 
 **gMSA preflight + "Log on as a service" (#99).** When `-ServiceAccount` names a **gMSA** (a name ending
 in `$`, e.g. `CORP\mefor-svc$`), the installer runs `Test-ADServiceAccount` first (verifying the account
@@ -477,8 +473,8 @@ one account whose SID is machine- or domain-relative (`S-1-5-21-` plus three sub
 the RID) and that Windows resolves to a user account with a RID of 1000 or more. A local user you
 create for the service and name with `-ServiceAccount` is such an account; a built-in one, such as
 Administrator (RID 500), is not. A gMSA is admitted only if `LookupAccountSid` resolves
-it to a user account, which is unmeasured here. The directory must be owned by SYSTEM or
-Administrators, as the installer leaves it. The engine does not check that this account is the one
+it to a user account, which is unmeasured here. Who may own the directory is stated in ADR 0163,
+*Note (2026-11-05)*. The engine does not check that this account is the one
 the service runs as. It admits whichever user the directory grants, so grant the data
 directory to the service account only, as the installer does.
 
@@ -497,9 +493,8 @@ At least these are unmeasured:
 - **A start with no domain controller.** A gMSA resolves through a domain controller, or through
   the local lookup cache when no controller answers, and a slow or absent controller can delay
   the open or fail the lookup. A later start does not always repair what a failed lookup leaves.
-  Why a time-out can read as an account that does not exist, what the owner-only store leaves on
-  each file, and why an elevated open with the lookup working can be the only repair are stated
-  once, in ADR 0163, *Note (2026-11-05)*, *Left open*.
+  Why a time-out can read as an account that does not exist, and what the owner-only store leaves
+  on each file, are stated once, in ADR 0163, *Note (2026-11-05)*, *Left open*.
 
 The rule and its reasons are in ADR 0163, *Note (2026-11-05)*.
 
