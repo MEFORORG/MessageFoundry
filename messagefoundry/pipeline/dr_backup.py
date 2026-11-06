@@ -58,12 +58,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
+from messagefoundry import file_lock
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.controlchars import scrub_log_argument
-from messagefoundry.file_lock import lock_exclusive as _lock_exclusive
-from messagefoundry.file_lock import unlock
 from messagefoundry.last_resort import run_guarded
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, utc_or_unknown
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
@@ -2420,7 +2419,7 @@ def _unlock_and_close(fd: int) -> None:
     """Drop the lock and close the handle. Never raises."""
     # A failed unlock is harmless: closing the handle below drops the lock anyway.
     with contextlib.suppress(OSError):
-        unlock(fd)
+        file_lock.unlock(fd)
     with contextlib.suppress(OSError):
         os.close(fd)
 
@@ -2706,7 +2705,7 @@ def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
         _remove_tree(path)
         raise
     try:
-        _lock_exclusive(fd, wait=True)
+        file_lock.lock_exclusive(fd, wait=True)
     except OSError as exc:
         if exc.errno not in _LOCK_UNSUPPORTED:
             _unlock_and_close(fd)
@@ -3312,7 +3311,7 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
             )
             continue
         try:
-            if not _lock_exclusive(fd, wait=False):
+            if not file_lock.lock_exclusive(fd, wait=False):
                 continue  # a live run holds it
             if not os.path.lexists(path / _HELD_MARKER_NAME):
                 continue  # locked by nobody, but no marker: not proven abandoned

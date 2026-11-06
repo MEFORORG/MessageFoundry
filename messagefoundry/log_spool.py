@@ -67,8 +67,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
-from messagefoundry.file_lock import lock_exclusive
-from messagefoundry.file_lock import unlock as _unlock
+from messagefoundry import file_lock
 
 #: The on-disk format version written into every entry. A reader skips an entry of any other version
 #: (counted as unreadable) rather than guessing at its shape.
@@ -148,7 +147,7 @@ def _try_lock(fd: int) -> bool:
     other ``OSError`` reads as ``False`` too, as it always has here, so :meth:`LogSpool.open`
     reports it as the directory being in use and the process runs without a spool."""
     try:
-        return lock_exclusive(fd)
+        return file_lock.lock_exclusive(fd)
     except OSError:
         return False
 
@@ -263,7 +262,7 @@ class LogSpool:
         self._peeked = None
         if self._lock_fd is not None:
             with contextlib.suppress(OSError):
-                _unlock(self._lock_fd)
+                file_lock.unlock(self._lock_fd)
             with contextlib.suppress(OSError):
                 os.close(self._lock_fd)
             self._lock_fd = None

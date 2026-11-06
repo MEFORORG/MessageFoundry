@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -75,17 +76,22 @@ def test_the_spool_still_reads_any_lock_fault_as_not_ours(tmp_path: Path) -> Non
     assert log_spool._try_lock(fd) is False
 
 
-@pytest.mark.parametrize(
-    ("module", "name", "helper"),
-    [
-        (tls, "_try_lock", file_lock.lock_exclusive),
-        (tls, "_unlock", file_lock.unlock),
-        (atomic_edit, "_try_lock", file_lock.lock_exclusive),
-        (dr_backup, "_lock_exclusive", file_lock.lock_exclusive),
-        (log_spool, "_unlock", file_lock.unlock),
-    ],
-    ids=["tls-lock", "tls-unlock", "atomic-edit-lock", "dr-backup-lock", "log-spool-unlock"],
-)
-def test_every_caller_uses_the_shared_helper(module: object, name: str, helper: object) -> None:
-    # Read by name: the callers import these privately, under the names their tests patch.
-    assert getattr(module, name) is helper
+@pytest.mark.parametrize("module", [tls, atomic_edit], ids=["tls", "atomic-edit"])
+def test_the_patched_lock_names_are_the_shared_helper(module: ModuleType) -> None:
+    """These two keep a private alias because their tests patch ``_try_lock`` by name."""
+    assert module._try_lock is file_lock.lock_exclusive
+
+
+def test_the_dr_staging_lock_still_excludes_a_second_handle(tmp_path: Path) -> None:
+    """dr_backup's two lock calls now go through :mod:`file_lock`; its release still drops it."""
+    path = tmp_path / "staging.lock"
+    first = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    second = os.open(path, os.O_RDWR)
+    try:
+        assert file_lock.lock_exclusive(first, wait=True)
+        assert file_lock.lock_exclusive(second) is False
+        dr_backup._unlock_and_close(first)  # never raises, and closes the handle
+        assert file_lock.lock_exclusive(second) is True
+        file_lock.unlock(second)
+    finally:
+        os.close(second)
