@@ -2180,6 +2180,11 @@ _RELOAD_AUDIT_STEP = "audit"
 #: account to match.
 _CONVERGENCE_ACTOR = "system:cluster-convergence"
 _CONVERGENCE_INITIATOR = "cluster_convergence"
+#: The key on a convergence row's detail naming the digest the initiating node stored with the
+#: row's ``config_version``: its ``fingerprint``, ``scheme`` and any ``unreadable_files``, so a
+#: reader can compare it with the row's own ``fingerprint`` as a start compares two digests. Absent
+#: when that digest is not known (vault BACKLOG #3109).
+_INITIATOR_DIGEST = "initiator_digest"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2469,7 +2474,9 @@ async def _record_reload_audit(
 
     A reload passes its :class:`~messagefoundry.pipeline.ReloadOutcome`, and the row names what
     that reload loaded (vault BACKLOG #2257), with the shared cluster ``config_version`` it carries
-    when it has one (vault BACKLOG #3109). An operator reload and a convergence reload both do. The
+    when it has one (vault BACKLOG #3109). An operator reload and a convergence reload both do. A
+    convergence reload's also carries, as :data:`_INITIATOR_DIGEST`, the initiating node's digest
+    stored with that version, when it is known (vault BACKLOG #3109). The
     row is written after the swap, and nothing holds the graph still until
     then, so a second reload can move the engine on first. The row then
     still names this reload's config, but marks itself ``superseded`` and
@@ -2511,10 +2518,13 @@ async def _record_reload_audit(
         nonlocal detail
         superseded = False
         config_version: int | None = None
+        initiator_digest: Mapping[str, object] | None = None
         state: _LoadedConfig | None
         if isinstance(loaded, ReloadOutcome):
             state = _LoadedConfig.of(loaded)
+            # Read together, as the coordinator read them (vault BACKLOG #3109).
             config_version = loaded.config_version
+            initiator_digest = loaded.initiator_digest
             # Only a COMMITTED reload rebinds the loaded fingerprint. The graph
             # object is no test: a reload part way through its swap, which then fails and rolls back
             # to this graph, would mark a row that still names the running config.
@@ -2539,6 +2549,11 @@ async def _record_reload_audit(
                 **named,
                 "dry_run": False,
                 **({"config_version": config_version} if config_version is not None else {}),
+                **(
+                    {_INITIATOR_DIGEST: dict(initiator_digest)}
+                    if initiator_digest is not None
+                    else {}
+                ),
                 **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
                 **(extra or {}),
                 **({"superseded": True, _BASELINE_UNCHECKED: True} if superseded else {}),

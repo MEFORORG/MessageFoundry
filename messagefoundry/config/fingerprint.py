@@ -26,6 +26,7 @@ exactly like ``load_config`` itself.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import NamedTuple
@@ -39,6 +40,7 @@ from messagefoundry.config.snapshot import (
     value_file_rel,
 )
 from messagefoundry.credential import constant_time_equal
+from messagefoundry.redaction import json_loads_or_refusal
 
 __all__ = [
     "FINGERPRINT_SCHEME",
@@ -53,6 +55,8 @@ __all__ = [
     "is_missing_directory",
     "left_out_of",
     "same_digest",
+    "shared_digest_of",
+    "shared_digest_text",
     "snapshot_fingerprint",
     "value_file_material",
 ]
@@ -260,6 +264,48 @@ def describe_left_out(left_out: Iterable[str]) -> str:
     """``left_out`` for a log line, with ``.`` in words. Paths only, never content; a caller still
     scrubs it, since a file name is whatever the directory holds."""
     return ", ".join("the config directory" if rel == "." else rel for rel in left_out)
+
+
+#: The keys of a digest another node can compare its own with: the fold, the scheme it was taken
+#: under, and what it left out (:func:`same_digest` and the scheme check). ``files`` and ``git_head``
+#: are left out, as describing the initiator's checkout rather than the bytes (vault BACKLOG #3109).
+_SHARED_DIGEST_KEYS: frozenset[str] = frozenset({"fingerprint", "scheme", UNREADABLE_FILES_KEY})
+
+
+def shared_digest_text(detail: Mapping[str, object] | None) -> str | None:
+    """The text a cluster config-version bump stores beside the version it writes: the JSON of the
+    initiating node's digest, cut to :data:`_SHARED_DIGEST_KEYS` (vault BACKLOG #3109). ``None``
+    when ``detail`` holds no digest, or none under a named scheme; the bump then stores the
+    digest as unknown. :func:`shared_digest_of` reads it back."""
+    if detail is None or not _is_comparable_digest(detail):
+        return None
+    shared = {key: value for key, value in detail.items() if key in _SHARED_DIGEST_KEYS}
+    return json.dumps(shared, sort_keys=True, separators=(",", ":"))
+
+
+def _is_comparable_digest(detail: Mapping[str, object]) -> bool:
+    """Whether ``detail`` is a digest another node can compare with: a fold, a scheme, and a
+    well-formed list of what it left out. The writer and the reader apply this one rule, so the
+    writer never stores what the reader refuses."""
+    coverage = digest_coverage(detail)
+    return (
+        coverage is not None
+        and coverage.left_out != ("?",)
+        and isinstance(detail.get("scheme"), str)
+    )
+
+
+def shared_digest_of(text: str | None) -> dict[str, object] | None:
+    """The digest :func:`shared_digest_text` wrote, or ``None`` when ``text`` is ``None`` or is not
+    one: not JSON, not an object, a key outside :data:`_SHARED_DIGEST_KEYS`, no fold, no scheme, or
+    an ``unreadable_files`` that is not a list of strings. Another node wrote it, so it is read as
+    data and checked rather than trusted."""
+    if text is None:
+        return None
+    value, refusal = json_loads_or_refusal(text)
+    if refusal is not None or not isinstance(value, dict) or not set(value) <= _SHARED_DIGEST_KEYS:
+        return None
+    return value if _is_comparable_digest(value) else None
 
 
 def fingerprint_matches(current: object, loaded: str) -> bool:

@@ -193,6 +193,8 @@ class SqlServerCoordinator:
         # a superseded ex-leader (held >= leader_lease.leader_epoch).
         self._leader_epoch: int | None = None
         self._config_version: int = 0
+        # The initiator's digest read with _config_version and set with it (vault BACKLOG #3109).
+        self._config_digest: str | None = None
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -278,37 +280,50 @@ class SqlServerCoordinator:
     def config_version_cached(self) -> int:
         return self._config_version
 
+    def config_digest_cached(self, version: int) -> str | None:
+        # The digest read with the cached version, only while that is still the version asked about.
+        return self._config_digest if version == self._config_version else None
+
     # --- config version (cross-node convergence token) ----------------------
 
     async def config_version(self) -> int:
-        """Read (seeding to 0 if absent) and cache the cluster-wide config-reload version."""
+        """Read (seeding to 0 if absent) and cache the cluster-wide config-reload version, with the
+        initiator's digest from the same statement (vault BACKLOG #3109)."""
         row = await self._store._fetchone(
             "SET NOCOUNT ON;"
             " MERGE cluster_config WITH (HOLDLOCK) AS t USING (SELECT 1 AS id) AS s ON t.id = s.id"
             " WHEN MATCHED THEN UPDATE SET id = t.id"  # no-op update so OUTPUT yields the current row
             " WHEN NOT MATCHED THEN INSERT (id, config_version, updated_at) VALUES (1, 0, ?)"
-            " OUTPUT inserted.config_version AS config_version;",
+            " OUTPUT inserted.config_version AS config_version,"
+            " inserted.config_digest AS config_digest;",
             (time.time(),),
         )
         assert row is not None, "cluster_config upsert returned no row"
-        self._config_version = int(row["config_version"])
-        return self._config_version
+        return self._cache_config_row(row)
 
-    async def bump_config_version(self) -> int:
-        """Atomically increment + cache the cluster config version (operator reload on THIS node)."""
+    async def bump_config_version(self, *, digest: str | None) -> int:
+        """Atomically increment + cache the cluster config version (operator reload on THIS node).
+        ``digest`` replaces the stored one in the same statement (vault BACKLOG #3109)."""
         now = time.time()
         row = await self._store._fetchone(
             "SET NOCOUNT ON;"
             " MERGE cluster_config WITH (HOLDLOCK) AS t USING (SELECT 1 AS id) AS s ON t.id = s.id"
-            " WHEN MATCHED THEN UPDATE SET config_version = t.config_version + 1, updated_at = ?"
-            " WHEN NOT MATCHED THEN INSERT (id, config_version, updated_at) VALUES (1, 1, ?)"
-            " OUTPUT inserted.config_version AS config_version;",
-            (now, now),
+            " WHEN MATCHED THEN UPDATE SET config_version = t.config_version + 1,"
+            " config_digest = ?, updated_at = ?"
+            " WHEN NOT MATCHED THEN INSERT (id, config_version, config_digest, updated_at)"
+            " VALUES (1, 1, ?, ?)"
+            " OUTPUT inserted.config_version AS config_version,"
+            " inserted.config_digest AS config_digest;",
+            (digest, now, digest, now),
         )
         assert row is not None, "cluster_config upsert returned no row"
-        self._config_version = int(
-            row["config_version"]
-        )  # feedback-avoidance: see our own new value
+        # feedback-avoidance: see our own new value
+        return self._cache_config_row(row)
+
+    def _cache_config_row(self, row: dict[str, Any]) -> int:
+        """Cache a ``cluster_config`` row's version and digest together, and return the version."""
+        self._config_version = int(row["config_version"])
+        self._config_digest = row["config_digest"]
         return self._config_version
 
     # --- observability -------------------------------------------------------

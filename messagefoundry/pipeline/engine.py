@@ -398,6 +398,13 @@ class ReloadOutcome:
     ``None`` at least on a single node, on a dry run, when the bump failed, and on any
     ``propagate=False`` reload until :meth:`Engine._converge_reload` sets it.
 
+    ``initiator_digest`` is, on a convergence reload, the digest the initiating node stored with
+    ``config_version`` when it bumped it (:func:`~messagefoundry.config.fingerprint.shared_digest_of`
+    reads it), so the row can set the operator's bytes beside this node's own ``fingerprint`` (vault
+    BACKLOG #3109). It is read with the version, never separately, so the two are one pair. ``None``
+    when not known: on every other reload, when the initiator stored none, when the cache had
+    already moved on to a later bump, or when what was stored is not a digest.
+
     ``restart_required`` names each settings trust anchor the settings preflight found changed on
     disk since its consumer loaded it. The reload checked the new file but does not apply it, so
     those take a restart (BACKLOG #2185, #3015). ``None`` means not checked: a dry run skips the
@@ -411,6 +418,7 @@ class ReloadOutcome:
     failures: tuple[ReloadStepFailure, ...] = ()
     fingerprint: Mapping[str, object] | None = None
     config_version: int | None = None
+    initiator_digest: Mapping[str, object] | None = None
     restart_required: tuple[str, ...] | None = None
 
     @property
@@ -2574,7 +2582,22 @@ class Engine:
         later start compared against the wrong digest. A fault in that writer is logged and goes no
         further: the graph has swapped, and a raise would make the runner retry a reload that already
         ran. A reload that raises is passed to :attr:`convergence_reload_failed` with the rows
-        already written for ``version``, and then re-raised, so the runner still retries it."""
+        already written for ``version``, and then re-raised, so the runner still retries it.
+
+        The row also carries the initiating node's digest for ``version``, read from the
+        coordinator's cache before anything here awaits (vault BACKLOG #3109). The runner read
+        ``version`` from that cache with no await since, so the two come from one read of the
+        shared row; read after the reload, a refresh could have moved the cache to a later bump."""
+        from messagefoundry.config.fingerprint import shared_digest_of
+
+        stored = self._coordinator.config_digest_cached(version)
+        initiator_digest = shared_digest_of(stored)
+        if stored is not None and initiator_digest is None:
+            log.warning(
+                "cluster: what is stored with shared config version %d is not a digest, so its "
+                "convergence row names no initiator's digest",
+                version,
+            )
         try:
             outcome = await self.reload_detail(propagate=False)
         except Exception as exc:
@@ -2589,7 +2612,7 @@ class Engine:
             raise
         # A version that failed and then converged is reported again if it ever fails again.
         self._convergence_failures = None
-        outcome = replace(outcome, config_version=version)
+        outcome = replace(outcome, config_version=version, initiator_digest=initiator_digest)
         if self.convergence_reload_audit is None:
             return
         try:
@@ -3485,8 +3508,14 @@ class Engine:
         # leave the cluster converging on a graph the initiator never took.
         config_version: int | None = None
         if propagate and self._coordinator.is_clustered():
+            from messagefoundry.config.fingerprint import shared_digest_text
+
             try:
-                config_version = await self._coordinator.bump_config_version()
+                # The bump stores this node's digest with the new version, so a follower's
+                # convergence row can name the operator's bytes beside its own (vault BACKLOG #3109).
+                config_version = await self._coordinator.bump_config_version(
+                    digest=shared_digest_text(fingerprint)
+                )
                 self._applied_config_version = config_version
             except Exception as exc:
                 # This node IS running the new graph; only the cluster-wide announcement is missing, so

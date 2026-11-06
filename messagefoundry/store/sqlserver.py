@@ -1971,10 +1971,15 @@ CLUSTER_SCHEMA: tuple[str, ...] = (
     "IF COL_LENGTH(N'leader_lease', N'leader_epoch') IS NULL"
     " ALTER TABLE leader_lease ADD leader_epoch BIGINT NOT NULL"
     " CONSTRAINT DF_leader_lease_epoch DEFAULT 0;",
+    # config_digest is the initiating node's digest of what it applied, written by the same bump as
+    # the version, so a follower reads the two as one pair (vault BACKLOG #3109). NULL is unknown.
     "IF OBJECT_ID(N'cluster_config', N'U') IS NULL"
     " CREATE TABLE cluster_config ("
     " id INT NOT NULL PRIMARY KEY, config_version INT NOT NULL,"
+    " config_digest NVARCHAR(MAX) NULL,"
     " updated_at FLOAT NOT NULL);",
+    "IF COL_LENGTH(N'cluster_config', N'config_digest') IS NULL"
+    " ALTER TABLE cluster_config ADD config_digest NVARCHAR(MAX) NULL;",
 )
 _SCHEMA: list[str] = [
     # Single-row marker recording which shipped DDL batch was last applied (the sha256 of this very

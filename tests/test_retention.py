@@ -891,7 +891,7 @@ class _FollowerCoordinator(NullCoordinator):
     def config_version_cached(self) -> int:
         return 0
 
-    async def bump_config_version(self) -> int:
+    async def bump_config_version(self, *, digest: str | None) -> int:
         return 0
 
 

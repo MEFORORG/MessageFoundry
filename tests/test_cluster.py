@@ -22,6 +22,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from messagefoundry.config.fingerprint import (
+    FINGERPRINT_SCHEME,
+    config_fingerprint,
+    shared_digest_of,
+    shared_digest_text,
+)
 from messagefoundry.config.settings import ClusterSettings, EgressSettings, ReferenceSettings
 from messagefoundry.config.wiring import FileRef, ReferenceSpec, Registry, WiringError, load_config
 from messagefoundry.pipeline import wiring_runner
@@ -88,7 +94,10 @@ class _NotLeaderCoordinator:
     def config_version_cached(self) -> int:
         return 0
 
-    async def bump_config_version(self) -> int:
+    def config_digest_cached(self, version: int) -> str | None:
+        return None
+
+    async def bump_config_version(self, *, digest: str | None) -> int:
         return 0
 
     async def cluster_members(self) -> list[ClusterMember]:
@@ -842,8 +851,10 @@ async def test_null_coordinator_config_version_is_zero_and_bump_noop() -> None:
     coord = NullCoordinator()
     assert await coord.config_version() == 0
     assert coord.config_version_cached() == 0
-    assert await coord.bump_config_version() == 0  # no-op, still 0 (nothing to coordinate)
+    # no-op, still 0 (nothing to coordinate), and no digest is kept beside it (vault BACKLOG #3109)
+    assert await coord.bump_config_version(digest="d") == 0
     assert coord.config_version_cached() == 0
+    assert coord.config_digest_cached(0) is None
 
 
 def test_db_coordinator_is_clustered() -> None:
@@ -1136,13 +1147,19 @@ class _BumpRecordingCoordinator(_NotLeaderCoordinator):
         super().__init__()
         self.bumps = 0
         self._version = 0
+        # The digest stored with _version, as the shared row holds the pair (vault BACKLOG #3109).
+        self._digest: str | None = None
 
     async def config_version(self) -> int:
         return self._version
 
-    async def bump_config_version(self) -> int:
+    def config_digest_cached(self, version: int) -> str | None:
+        return self._digest if version == self._version else None
+
+    async def bump_config_version(self, *, digest: str | None) -> int:
         self.bumps += 1
         self._version += 1
+        self._digest = digest
         return self._version
 
 
@@ -1294,6 +1311,106 @@ class _SiblingBumpCoordinator(_BumpRecordingCoordinator):
 
     def config_version_cached(self) -> int:
         return self._version
+
+
+async def test_the_initiators_digest_rides_the_bump_to_a_followers_convergence_outcome(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """vault BACKLOG #3109 step 1: an operator reload stores its own digest with the version it
+    bumps, and a follower converging on that version hands its audit hook that digest beside its
+    own. The two nodes share one coordinator, as two nodes share the ``cluster_config`` row, and
+    load different bytes, so the pair is visibly two digests.
+
+    The digest is read with the version: once the shared row has moved on to a later bump, a
+    convergence on the earlier version names no initiator's digest rather than the later one's.
+    What is stored but is not a digest names none either, and is logged."""
+    coord = _SiblingBumpCoordinator()
+    engines: list[Engine] = []
+    for name in ("initiator", "follower"):
+        cfgdir = tmp_path / name
+        _minimal_config(cfgdir, tmp_path)
+        eng = await Engine.create(
+            tmp_path / f"{name}.db",
+            poll_interval=0.05,
+            config_dir=cfgdir,
+            coordinator=coord,
+            egress_settings=EgressSettings(deny_by_default=False),
+        )
+        eng.add_registry(load_config(cfgdir))
+        await eng.start()
+        engines.append(eng)
+    initiator, follower = engines
+    outcomes: list[ReloadOutcome] = []
+
+    async def _audit(outcome: ReloadOutcome) -> None:
+        outcomes.append(outcome)
+
+    follower.convergence_reload_audit = _audit
+    try:
+        bumped = await initiator.reload_detail(propagate=True)
+        assert bumped.config_version == 1 and bumped.initiator_digest is None
+        stored = coord.config_digest_cached(1)
+        assert stored == shared_digest_text(initiator.loaded_config_fingerprint)
+        initiator_digest = shared_digest_of(stored)
+        assert initiator_digest is not None
+        assert initiator_digest["fingerprint"] == config_fingerprint(tmp_path / "initiator")
+        assert initiator_digest["scheme"] == FINGERPRINT_SCHEME
+        assert set(initiator_digest) == {"fingerprint", "scheme"}, "no files count, no git head"
+
+        await follower._converge_reload(coord.config_version_cached())
+        (converged,) = outcomes
+        assert converged.config_version == 1
+        assert converged.initiator_digest == initiator_digest
+        own = (converged.fingerprint or {}).get("fingerprint")
+        assert own == config_fingerprint(tmp_path / "follower") != initiator_digest["fingerprint"]
+
+        # The row has moved on to version 2 before a convergence on 1 reads it: no digest, since
+        # the one stored now is version 2's.
+        await initiator.reload_detail(propagate=True)
+        assert coord.config_version_cached() == 2 and coord.config_digest_cached(2) is not None
+        await follower._converge_reload(1)
+        assert outcomes[-1].config_version == 1 and outcomes[-1].initiator_digest is None
+
+        coord._digest = '{"fingerprint": 7}'  # stored, but not a digest
+        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+            await follower._converge_reload(2)
+        assert outcomes[-1].initiator_digest is None
+        assert "is not a digest" in caplog.text
+    finally:
+        for eng in engines:
+            await eng.stop()
+
+
+def test_a_shared_digest_reads_back_only_as_a_digest() -> None:
+    """vault BACKLOG #3109: the text a bump stores keeps what a comparison needs and reads back as
+    that; another node wrote it, so anything else reads as no digest at all."""
+    detail: dict[str, object] = {
+        "fingerprint": "a" * 64,
+        "scheme": FINGERPRINT_SCHEME,
+        "files": 3,
+        "git_head": "b" * 40,
+        "unreadable_files": ["x.py"],
+    }
+    text = shared_digest_text(detail)
+    assert shared_digest_of(text) == {
+        "fingerprint": "a" * 64,
+        "scheme": FINGERPRINT_SCHEME,
+        "unreadable_files": ["x.py"],
+    }
+    assert shared_digest_text(None) is None
+    assert shared_digest_text({"scheme": FINGERPRINT_SCHEME, "files": 0}) is None, "no fold"
+    assert shared_digest_text({"fingerprint": "a" * 64}) is None, "no scheme: not comparable"
+    assert shared_digest_of(None) is None
+    for bad in (
+        "not json",
+        "[1]",
+        '{"fingerprint": "' + "a" * 64 + '"}',  # no scheme
+        '{"fingerprint": "", "scheme": "s"}',  # no fold
+        '{"fingerprint": "f", "scheme": "s", "unreadable_files": "x.py"}',  # not a list
+        '{"fingerprint": "f", "scheme": "s", "files": 1}',  # a key it never writes
+        "[" * 100_000,  # json's depth limit, which is no ValueError
+    ):
+        assert shared_digest_of(bad) is None, bad
 
 
 @pytest.mark.parametrize("seed_first", [True, False], ids=["seeded_before_load", "seeded_at_start"])
