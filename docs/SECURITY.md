@@ -4836,10 +4836,13 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   epoch raise, at least an administrator's revoke of a user's sessions, a role change and a
   password reset. So a rotation either commits before the
   sweep locks the account's row, and the sweep reads the new key, or waits until the sweep
-  commits and then finds the session ended. For the whole-account revokes that holds where the
-  account's record fails its seal too, because the raise reads the row under that lock before it
-  checks the seal, and they end the sessions anyway; a bind, an unbind or a TOTP re-enrolment of
-  such an account is refused and ends no session. Both were read from the code and not run. The
+  commits and then finds the session ended. Where the account's record fails its seal, an
+  administrator's revoke of a user's sessions and the every-account revoke still end its
+  sessions, and the order holds for them too, because the raise reads the row under that lock
+  before it checks the seal. That the order holds there was read from the code and not run;
+  `test_session_seal_contract`, in `tests/test_sqlserver_store.py`, runs the per-account revoke
+  ending such an account's sessions. At least a bind, an unbind, a TOTP re-enrolment, a role
+  change and a password reset of such an account end no session; that was read from the code. The
   every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) takes
   the row of each account its read of the account list returns before its table-wide sweep, so
   the same holds for those accounts. Its sweep also reaches the sessions of an account created
