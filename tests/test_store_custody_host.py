@@ -219,8 +219,9 @@ async def test_a_host_blob_refuses_every_other_key_provider(tmp_path: Path, name
     refusal = foreign_custody_refusal(settings, environ={})
     assert refusal is not None and name in refusal and "'auto'" in refusal
     # PR 2804 sixth hold: the setting-only fix first, then the fallback, which leaves the file.
-    assert "set [store].key_provider = 'host' and remove every other store key setting" in refusal
-    assert not _advises_changing(refusal), refusal
+    assert f"set [store].key_provider = 'host' and {_KEY_SETTINGS_OUT}" in refusal, refusal
+    assert "Keep a copy of each key setting's value first" in refusal, refusal
+    assert not _advises_changing(refusal, allowed=(_KEY_SETTINGS_OUT,)), refusal
     assert custody_host.keep_the_key_step(settings, new_store=False) in refusal, refusal
     assert "mints this store's key" not in refusal, refusal  # only the host provider mints
     with pytest.raises(HostCustodyRefused, match=name):
@@ -1251,10 +1252,10 @@ async def _never_started_pin_text(directory: Path) -> str:
 
 
 #: Phrases the guard takes out first: one reports what failed, and one changes only a setting.
-_NOT_CHANGING_WHAT_EXISTS = (
-    "could not be removed",
-    "remove every other store key setting",
-)
+_NOT_CHANGING_WHAT_EXISTS = ("could not be removed",)
+
+#: foreign_custody_refusal's own remedy, which changes settings only. Allowed for that text alone.
+_KEY_SETTINGS_OUT = "remove every other store key setting"
 
 
 def _advises_changing(text: str, *, allowed: tuple[str, ...] = ()) -> bool:
@@ -1287,13 +1288,18 @@ def test_the_fallback_step_fits_the_backend_and_the_command(
     step = custody_host.keep_the_key_step(
         settings, new_store=True, service_account="NT SERVICE\\MessageFoundry"
     )
-    assert "empty" not in step and "Copy into it every secret file" in step, step
+    assert "empty directory" not in step and "new, empty" not in step
+    assert "Copy into it every secret file" in step, step
     # Quoted, since a service account name can hold a space.
-    command = '`messagefoundry provision-admin --service-account "NT SERVICE\\MessageFoundry"`'
+    command = (
+        "run `messagefoundry provision-admin` again with the same arguments, "
+        '--service-account "NT SERVICE\\MessageFoundry" among them'
+    )
     assert command in step, step
-    assert "readable by no one but this service's account and administrators" in step, step
+    assert "restricted and writable by the service as a secrets directory must be" in step, step
+    assert "The new store starts empty" in step, step
     assert "other than master.key and handoff.key" in step, step
-    assert "the recovery key shown when an existing key file was minted goes with that file" in step
+    assert "recovery key shown when an existing key file was minted goes with that file" in step
     schema = "whose schema a DDL-capable login provisions first"
     assert (schema in step) is (backend is StoreBackend.POSTGRES), step
     assert ("a new database" in step) is (backend is StoreBackend.POSTGRES), step
@@ -1305,6 +1311,8 @@ def test_the_fallback_step_fits_the_backend_and_the_command(
         settings.model_copy(update={"key_provider": "auto"}), new_store=False
     )
     assert "provision-admin" not in auto and "run the command again" in auto, auto
+    # No key is minted there, so no new key or recovery key is spoken of.
+    assert "recovery key" not in auto and "new key" not in auto, auto
 
 
 @host_file_platforms
@@ -1383,7 +1391,11 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
     assert "cannot tell whose key" not in held, held
     texts.append(held)
     assert all(text.count("WARNING:") == 1 for text in texts[-2:]), texts[-2:]
-    offending = [text for text in texts if _advises_changing(text)]
+    offending = [
+        text
+        for text in texts
+        if _advises_changing(text, allowed=(_KEY_SETTINGS_OUT,) if text is foreign else ())
+    ]
     assert not offending, offending
     # Every text names its own way on, in the order rendered above. The existing-store text
     # names provision-admin through the missing-key text it quotes, so its marker is the fallback.

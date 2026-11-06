@@ -213,8 +213,10 @@ def foreign_custody_refusal(
         f"{' and '.join(found)} is in {directory}, but [store].key_provider is "
         f"{settings.key_provider!r}. A store with a host blob takes its key from that blob only: "
         "if it holds this store's key, set [store].key_provider = 'host' and remove every other "
-        "store key setting, keeping a copy of each value first, since it may be the only copy of "
-        "a store key. The engine cannot tell whether the blob holds this store's key, so it "
+        "store key setting, with [store].cipher_provider = 'aesgcm', which that provider needs. "
+        "Keep a copy of each key setting's value first, somewhere as protected as where it is "
+        "now, since it may be the only copy of a store key. The engine cannot tell whether the "
+        "blob holds this store's key, so it "
         f"leaves the file in place. {keep_the_key_step(settings, new_store=False)}"
     )
 
@@ -562,8 +564,8 @@ def keep_the_key_step(
     # can reach stderr, and CodeQL's name heuristic reads that constant as a secret (alert 315).
     text = (
         "To go on without it, give this store a custody directory of its own: a new directory, "
-        "readable by no one but this service's account and administrators, as a secrets "
-        "directory must be, named by MEFOR_SECRETS_DIRECTORY here and in this store's own service "
+        "restricted and writable by the service as a secrets directory must be, which the engine "
+        "checks at start, named by MEFOR_SECRETS_DIRECTORY here and in this store's own service "
         "environment, never in one that another store's service also reads, since that store "
         "would then look for its key there. Copy into it every secret file the current secrets "
         f"directory holds other than {HOST_FILE_NAME} and {HANDOFF_FILE_NAME}, if one is set, "
@@ -578,11 +580,12 @@ def keep_the_key_step(
                 ", whose schema a DDL-capable login provisions first ([store].schema_management "
                 "= 'external'; DEPLOY-SERVER-DB.md section 2)"
             )
-    if settings.key_provider == HOST_PROVIDER:
-        command = "messagefoundry provision-admin"
+    host = settings.key_provider == HOST_PROVIDER
+    if host:
+        text += ". Then run `messagefoundry provision-admin` again with the same arguments"
         if service_account is not None:
-            command += f' --service-account "{service_account}"'
-        text += f". Then run `{command}`, which mints this store's key there"
+            text += f', --service-account "{service_account}" among them'
+        text += ", which mints this store's key there"
         if service_account is None and sys.platform == "win32":
             text += (
                 "; to mint it for the service's account rather than your own, add "
@@ -590,10 +593,14 @@ def keep_the_key_step(
             )
     else:
         text += ". Then run the command again"
-    return (
-        f"{text}. Nothing is carried over to a new key, and the recovery key shown when an "
-        "existing key file was minted goes with that file, not with a key minted after it"
-    )
+    if new_store:
+        text += ". The new store starts empty: nothing in the one left in place is carried over"
+    if host:
+        text += (
+            ". The recovery key shown when an existing key file was minted goes with that file, "
+            "not with a key minted after it"
+        )
+    return text
 
 
 def mint_target(
