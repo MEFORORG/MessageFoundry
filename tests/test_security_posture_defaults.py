@@ -2820,9 +2820,9 @@ _POSSIBLY = "possibly: an env() value this reading could not resolve"
         ({"update_url_form": "path", "interaction": env("kind")}, True, _POSSIBLY),
         # A not-deployed connection with an env() form is never built, so it is skipped...
         ({}, False, None),
-        # ...and so is one with an env() interaction beside a literal path form...
-        ({"update_url_form": "path", "interaction": env("kind")}, False, None),
-        # ...while a not-deployed literal path form is still read, as before.
+        # ...but a literal path form is read with no values, so an env() beside it marks it possibly...
+        ({"update_url_form": "path", "interaction": env("kind")}, False, _POSSIBLY),
+        # ...and a not-deployed literal path form is still read, as before.
         ({"update_url_form": "path"}, False, ""),
         # The control: a literal transaction form is never named.
         ({"update_url_form": "transaction"}, True, None),
@@ -2861,8 +2861,21 @@ def test_the_path_form_reader_names_an_env_form(
         # The interaction resolves to a create, which the build refuses with the path form.
         ({"epic_form": "path", "kind": "create"}, {"interaction": "kind"}, False),
         ({"epic_form": "path", "kind": "update"}, {"interaction": "kind"}, True),
+        # A Bundle interaction rules the path form out whatever the conditional: the build refuses
+        # a conditional beside it, and a Bundle without one is not an update.
+        (
+            {"epic_form": "path", "kind": "transaction", "c": "if-match"},
+            {"interaction": "kind", "conditional": "c"},
+            False,
+        ),
     ],
-    ids=["resolves-path", "resolves-transaction", "resolves-create", "resolves-update"],
+    ids=[
+        "resolves-path",
+        "resolves-transaction",
+        "resolves-create",
+        "resolves-update",
+        "resolves-bundle",
+    ],
 )
 def test_the_path_form_reader_resolves_an_env_form_with_the_values(
     values: dict[str, str], over: dict[str, str], listed: bool

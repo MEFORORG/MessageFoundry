@@ -1928,11 +1928,14 @@ count is above `0` (vault BACKLOG #2613).
   `update_url_form`, `interaction` or `conditional` supplied through `env()` is read too. The
   posture route resolves it against the engine's current environment values, and names the
   connection plainly only if it resolves to the path form on an update. `check` resolves none, so
-  the two can name different sets. A value the reading cannot resolve is named and marked possibly,
-  never left off. At least these are not named: a connection whose known values rule the path form
-  out, such as a `create` or an `if-none-exist`, because the build refuses the path form there; and
-  a `deployed=False` connection with an `env()` in any of those three keys, because it is never
-  built.
+  the two can name different sets. A connection with a value the reading cannot resolve is named and
+  marked possibly, except in the two cases this sentence lists. The first is a connection whose
+  known values rule the path form out, because the build refuses the path form there: a form other
+  than `"path"`, a `transaction` or `batch` interaction, a conditional other than `if-match`, or an
+  interaction other than `update` with no conditional. The second is a `deployed=False` connection
+  whose `update_url_form` is an `env()` value, because it is never built and that value is never
+  read. A `deployed=False` connection with a literal `"path"` is named, marked possibly where its
+  interaction or conditional is an `env()` value.
 - **What it cannot do, and where it is NOT reported:** it is **advisory only**, on the precedent of
   `tls_allow_expired`, the other per-connection interoperability relaxation. No posture gate keys on it,
   and `[security].enforcement = enforce` does not refuse it. It is not in the

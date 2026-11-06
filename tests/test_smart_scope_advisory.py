@@ -340,3 +340,37 @@ def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_pat
     (cfg / "broken.py").write_text("this is not python(", encoding="utf-8")
     r = _result(run_checks(cfg, run_lint=False), "smart-scope")
     assert r.skipped and "config did not load" in r.detail
+
+
+def test_an_env_conditional_with_a_list_default_does_not_crash_the_advisory() -> None:
+    """Vault BACKLOG #2571: ``FHIR()`` takes an ``env()`` conditional. One whose default is a list
+    is unhashable, and the advisory looked it up in a dict. It is now read as a shape that
+    determines no letters, so it stays quiet. The literal-conditional connection beside it, which
+    the advisory grades, is the control that the reader still ran."""
+    from messagefoundry.config.wiring import (
+        FHIR,
+        Registry,
+        build_outbound_connection,
+        env,
+        overbroad_smart_scopes,
+    )
+    from messagefoundry.transports.smart import with_smart_backend
+
+    def smart(spec: object) -> object:
+        return with_smart_backend(
+            spec,  # type: ignore[arg-type]
+            token_url="https://auth.example.invalid/token",
+            client_id="cid",
+            private_key="env-placeholder-signing-material",
+            scope="system/Patient.cruds",
+        )
+
+    reg = Registry()
+    base = "https://fhir.example.invalid/fhir"
+    for name, conditional in (
+        ("OB_ENV", env("cond", default=["if-match"])),
+        ("OB_LITERAL", "if-match"),
+    ):
+        spec = FHIR(url=base, interaction="update", conditional=conditional)  # type: ignore[arg-type]
+        reg.add_outbound(build_outbound_connection(name, smart(spec)))  # type: ignore[arg-type]
+    assert [name for name, _ in overbroad_smart_scopes(reg)] == ["OB_LITERAL"]

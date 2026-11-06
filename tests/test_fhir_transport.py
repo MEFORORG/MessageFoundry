@@ -1959,6 +1959,21 @@ def test_a_known_non_update_conditional_rules_out_the_path_form_alone() -> None:
         )
 
 
+def test_a_bundle_interaction_rules_out_the_path_form_beside_an_env_conditional() -> None:
+    """A transaction or batch interaction is never an update: the build refuses a conditional
+    beside it, and without one it is not an update. So an env() conditional does not keep a literal
+    path form from being refused at load."""
+    for kind in ("transaction", "batch"):
+        with pytest.raises(ValueError, match="update_url_form='path' applies only"):
+            FHIR(
+                url=BASE,
+                interaction=kind,
+                update_url_form="path",
+                conditional=env("cond"),
+                allowed_entry_methods=["POST"],
+            )
+
+
 def test_literal_entry_items_are_checked_beside_an_env_interaction() -> None:
     """With the interaction known only at build, the lists' literal items are still checked at load.
     A valid list beside the same env() is the control."""

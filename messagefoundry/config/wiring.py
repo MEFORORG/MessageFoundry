@@ -3845,14 +3845,18 @@ def Rest(
 def _path_form_ruled_out(interaction: object, conditional: object) -> bool:
     """Whether a ``FHIR()`` connection's writes are known not to be updates, so the build refuses
     the path form there. A value that is :data:`_UNRESOLVED` rules nothing out, but a resolved
-    ``conditional`` other than ``if-match`` decides it alone, whatever the interaction.
+    ``conditional`` other than ``if-match`` decides it alone, whatever the interaction, and so does a
+    resolved ``transaction`` or ``batch`` interaction, whatever the conditional: the build refuses a
+    conditional beside a Bundle interaction, and a Bundle without one is not an update.
 
     The rule is the build's own ``transports.fhir.takes_update``, imported lazily for the one-way
     rule, so the factory, :func:`path_form_fhir_updates` and the build agree on which writes are
     updates. The build refuses other combinations too, which neither caller models."""
-    from messagefoundry.transports.fhir import takes_update
+    from messagefoundry.transports.fhir import _BUNDLE_INTERACTIONS, takes_update
 
     if conditional is not _UNRESOLVED and conditional and str(conditional) != "if-match":
+        return True
+    if interaction is not _UNRESOLVED and str(interaction) in _BUNDLE_INTERACTIONS:
         return True
     if interaction is _UNRESOLVED or conditional is _UNRESOLVED:
         return False
@@ -6948,9 +6952,6 @@ def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
 #: state the connection takes the path form.
 UNRESOLVED_UPDATE_URL_FORM = "possibly: an env() value this reading could not resolve"
 
-#: The settings :func:`path_form_fhir_updates` reads, and skips a not-deployed connection on.
-_PATH_FORM_KEYS = ("update_url_form", "interaction", "conditional")
-
 
 def path_form_fhir_updates(
     registry: Registry, *, env_values: Mapping[str, Any] | None = None
@@ -6975,8 +6976,10 @@ def path_form_fhir_updates(
     nobody can read in the config counts as a possible loosening, never as none. At least these are
     left off: a connection whose resolved values rule the path form out (another form, or writes
     that are not updates, which the build refuses with the path form), and a ``deployed=False``
-    connection with an ``env()`` in any of those three keys, as :func:`ech_cleartext_sidecar_hops`
-    skips one: its values are never resolved and it is never built (ADR 0111 AC-1).
+    connection whose ``update_url_form`` is an ``env()``, as :func:`ech_cleartext_sidecar_hops`
+    skips one: its values are never resolved and it is never built (ADR 0111 AC-1). A not-deployed
+    connection with a literal path form is read with no values, so an ``env()`` beside it marks it
+    possibly.
 
     Pure: it reads the loaded graph and touches nothing else."""
     out: list[tuple[str, str]] = []
@@ -6984,14 +6987,17 @@ def path_form_fhir_updates(
         if oc.spec.type != ConnectorType.FHIR:
             continue
         settings = oc.spec.settings
-        if not oc.deployed and any(isinstance(settings.get(k), EnvRef) for k in _PATH_FORM_KEYS):
+        if not oc.deployed and isinstance(settings.get("update_url_form"), EnvRef):
             continue
-        form = _db_setting(settings, "update_url_form", "transaction", env_values)
+        # A not-deployed connection's values are never resolved (ADR 0111 AC-1), so none are read
+        # for it: a literal path form beside an env() interaction or conditional is named possibly.
+        values = env_values if oc.deployed else None
+        form = _db_setting(settings, "update_url_form", "transaction", values)
         # FhirDestination's own read: an unset or empty value is the transaction form.
         if form is not _UNRESOLVED and str(form or "transaction") != "path":
             continue
-        kind = _db_setting(settings, "interaction", "create", env_values)
-        cond = _db_setting(settings, "conditional", None, env_values)
+        kind = _db_setting(settings, "interaction", "create", values)
+        cond = _db_setting(settings, "conditional", None, values)
         if _path_form_ruled_out(kind, cond):
             continue  # the build refuses the path form here, so no update is ever sent in it
         unresolved = any(value is _UNRESOLVED for value in (form, kind, cond))
@@ -7587,8 +7593,13 @@ def overbroad_smart_scopes(registry: Registry) -> list[tuple[str, str]]:
         if conn_type is None:  # a FhirLookup: structurally GET-only, so read and search
             allowed, shape = frozenset("rs"), "GET-only lookup"
         elif conn_type is ConnectorType.FHIR:
-            allowed = scope_letters_for_shape(
-                str(settings.get("interaction") or ""), settings.get("conditional")
+            conditional = settings.get("conditional")
+            # An env() conditional is unresolved here, and hashing one with a list or dict default
+            # raises TypeError, so it is read as a shape that determines no letters (quiet).
+            allowed = (
+                None
+                if isinstance(conditional, EnvRef)
+                else scope_letters_for_shape(str(settings.get("interaction") or ""), conditional)
             )
             shape = f"interaction={settings.get('interaction')!r}"
             if settings.get("conditional"):
