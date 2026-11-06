@@ -1418,10 +1418,10 @@ function Remove-ClaimsHeldBy {
 }
 
 # $false when the orphaned directory is there, $true only when it is CONFIRMED gone, a throw for
-# anything else. Confirmed gone: not found, and the nearest folder above it that IS there lists in full
-# without the next name down. So a fully deleted entry, its parent gone too, clears as it did under
-# Test-Path, while a not-found that a folder which cannot be listed, or a drive or share that cannot be
-# reached, could also produce stays a throw.
+# anything else. Confirmed gone: not found, and the nearest item above it that IS there lists, as a
+# folder, in full and without the next name down. So a fully deleted entry, its parent gone too, clears
+# as it did under Test-Path, while a not-found that an item which cannot be listed (a folder this user
+# may not list, a file), or a drive or share that cannot be reached, could also produce stays a throw.
 function Test-OrphanGoneOrThrow([string]$Path) {
     if (Get-ItemOrThrow $Path 'the orphaned directory') { return $false }
     $below = $Path.TrimEnd('\', '/')

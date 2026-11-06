@@ -347,7 +347,9 @@ function Test-RegistryPresentOrThrow([string]$Dir, [string]$What) {
 
 # The rule above without the registry's wording: $true present, $false absent under a parent folder
 # that is there, a throw for anything else. -Plain also requires each item read to be a plain directory.
-# The nightly removal reads its end state through this too, so "gone" means the same thing in both.
+# The nightly removal reads its end state through this too. prune-merged.ps1's orphan ledger asks
+# more of "gone" (Test-OrphanGoneOrThrow): it walks up past a parent that is gone too, and the folder
+# it stops at must list without the name.
 function Test-PresentUnderParentOrThrow([string]$Dir, [string]$What, [switch]$Plain) {
     $notPlain = "exists but is not a plain directory (a file or a link), so what it holds is unknown. Nothing was removed."
     $item = Get-ItemOrThrow $Dir $What

@@ -89,7 +89,8 @@
     rather than reading as empty. The registry and that folder must each be a plain directory, whether
     or not the registry exists yet: a file standing where the coordination folder should be, or a junction, refuses
     rather than reading as no records, and so does a linked folder anywhere below the allocation
-    registry, which the walk does not follow; a linked file there is read as a record, like any other. The
+    registry (any folder that is a reparse point), which the walk does not follow; a linked file there
+    is read as a record, like any other. The
     record parsing follows remove.ps1's rules, cannot-tell refusing, without sharing its code.
     THE END STATE IS READ FAIL-CLOSED: only a tree git no longer lists, whose directory is confirmed
     absent under a folder that is there, is REMOVED. A directory that is present or cannot be read is

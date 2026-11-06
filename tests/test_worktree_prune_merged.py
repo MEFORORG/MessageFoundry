@@ -1731,21 +1731,28 @@ def _write_orphan_ledger(fx: Fixture, *paths: Path) -> None:
 def test_a_fully_deleted_orphan_stops_being_reported(fx: Fixture, sleeper: int) -> None:
     """Red on engine PR 2803 at 210c9cb278: an entry whose directory AND parent are both gone threw
     out of the presence check, read as "not confirmed gone", and exited 3 every night with nothing a
-    human could clear. Absent under a folder that is there and lists is confirmed gone."""
+    human could clear. Absent under a folder that is there and lists is confirmed gone. The entry
+    still on disk is the control: it shows the ledger was read in the same run."""
     live_record(fx, sleeper, fx.primary)
     gone = fx.root / "wt" / "deleted-parent" / "repo-deleted"
+    kept = fx.root / "kept" / "repo-kept"
+    kept.mkdir(parents=True)
     assert not gone.parent.exists(), "CONTROL: the parent is gone too"
-    _write_orphan_ledger(fx, gone)
+    _write_orphan_ledger(fx, gone, kept)
     later = run(fx)
-    assert later["counts"]["orphansFromEarlierRuns"] == 0, later["orphansFromEarlierRuns"]
-    assert later["_exit"] == 0
+    assert [o["path"] for o in later["orphansFromEarlierRuns"]] == [str(kept)], later
+    assert later["_exit"] == 3, "CONTROL: the entry still on disk is reported"
+    shutil.rmtree(kept.parent)
+    assert run(fx)["_exit"] == 0
 
 
 @contextmanager
 def _unlistable(folder: Path) -> Iterator[None]:
     """Deny this user the right to list ``folder``, with the bypass privileges off, and give it back
-    afterwards. Skips when the deny does not bind, as ``test_worktree_remove_in_use`` does."""
-    from tests.test_worktree_remove_in_use import _privileges_disabled
+    afterwards. Skips when the deny does not bind. The probe and the privilege switch are
+    ``test_worktree_remove_in_use``'s, so only an access denial counts as the deny binding."""
+    from tests.test_worktree_remove_in_use import _privileges_disabled, _run_probe
+    from tests.test_worktree_remove_path import _out
 
     who = subprocess.run(
         ["whoami"], capture_output=True, text=True, check=False, timeout=30
@@ -1761,22 +1768,10 @@ def _unlistable(folder: Path) -> Iterator[None]:
         pytest.skip(f"could not deny access with icacls: {made.stdout} {made.stderr}")
     try:
         with _privileges_disabled():
-            probe = subprocess.run(
-                [
-                    "pwsh",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "$null = [System.IO.DirectoryInfo]::new($env:T_DIR).GetFileSystemInfos()",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=120,
-                env={**os.environ, "T_DIR": str(folder)},
-            )
+            probe = _run_probe(folder.parent, folder)
             if probe.returncode == 0:
-                pytest.skip(f"{who} can still list {folder} after the deny")
+                pytest.skip(f"{who} can still list {folder} after the deny.\n{_out(probe)}")
+            assert probe.returncode == 3, f"the probe did not see a denial:\n{_out(probe)}"
             yield
     finally:
         subprocess.run(
@@ -1787,16 +1782,20 @@ def _unlistable(folder: Path) -> Iterator[None]:
         )
 
 
+@pytest.mark.parametrize("depth", ["parent", "grandparent"])
 @pytest.mark.parametrize("ancestor", ["a-file", "denied"])
 def test_an_orphan_under_an_unreadable_ancestor_stays_reported(
-    fx: Fixture, sleeper: int, ancestor: str
+    fx: Fixture, sleeper: int, ancestor: str, depth: str
 ) -> None:
-    """The other side of the rule above: a not-found under a folder that is there but cannot be
+    """The other side of the rule above: a not-found under an item that is there but cannot be
     listed (a file standing where the folder should be, or a folder this user may not list) is not
-    confirmed gone, so the entry keeps being reported and the run exits 3."""
+    confirmed gone, so the entry keeps being reported and the run exits 3. The "parent" depth was
+    dropped as gone at 210c9cb278, which never listed the parent."""
     live_record(fx, sleeper, fx.primary)
     above = fx.root / "unreadable"
-    gone = above / "deleted-parent" / "repo-deleted"
+    gone = (
+        above / "repo-deleted" if depth == "parent" else above / "deleted-parent" / "repo-deleted"
+    )
     _write_orphan_ledger(fx, gone)
     if ancestor == "a-file":
         above.write_text("not a folder", encoding="utf-8")
