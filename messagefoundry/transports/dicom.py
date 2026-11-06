@@ -2668,18 +2668,18 @@ def _client_ssl_context(
     ``trust_anchor_policy`` (#190, ADR 0093) supplies the instance ``[tls]`` internal-CA fallback when
     the connection names no ``tls_ca_file`` of its own: an internal hop verifies against the org internal
     CA per the resolved anchor. ``None`` (a direct test build) keeps the historical
-    ``create_default_context(cafile=…)`` behaviour, byte-identical. It only selects WHICH roots verify the
+    ``create_default_context(cafile=…)`` trust store. It only selects WHICH roots verify the
     peer — verification is never disabled — so the internal CA never weakens a refusal."""
     refuse_an_unread_ca_pin(s, inbound=False, connector="DICOM destination")
     if not s.get("tls"):
         return None
     ca = s.get("tls_ca_file")
     # #190 (ADR 0093): the connection's own tls_ca_file wins verbatim, else the internal-CA anchor.
-    # No policy is the empty one, still through the anchor for the named refusal (vault BACKLOG #2370).
+    # No policy is the empty one, through the anchor for the named refusal (vault BACKLOG #2370).
     anchor = resolve_trust_anchor(
         connection_ca_file=str(ca) if ca else None,
         host=str(s.get("host", "")),
-        policy=trust_anchor_policy,
+        policy=trust_anchor_policy if trust_anchor_policy is not None else TrustAnchorPolicy(),
         connection=name or None,
     )
     ctx = build_verifying_client_context(anchor)

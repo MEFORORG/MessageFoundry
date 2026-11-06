@@ -486,18 +486,34 @@ _ARMS_WITHOUT_A_POLICY = [
 
 @pytest.mark.usefixtures("escape_at_warn")
 @pytest.mark.parametrize("build", _ARMS_WITHOUT_A_POLICY)
-def test_a_missing_ca_file_on_an_arm_without_a_policy_names_the_setting(
-    build: Callable[[str], object], tmp_path: Path
+@pytest.mark.parametrize(
+    ("junk", "problem", "cause"),
+    [
+        (False, "cannot be read", FileNotFoundError),
+        (True, "OpenSSL could not load as PEM certificates", ssl.SSLError),
+    ],
+    ids=["missing", "not-pem"],
+)
+def test_an_unreadable_ca_file_on_an_arm_without_a_policy_names_the_setting(
+    build: Callable[[str], object],
+    junk: bool,
+    problem: str,
+    cause: type[BaseException],
+    tmp_path: Path,
 ) -> None:
     """Vault BACKLOG #2370 step 2. These arms loaded the CA file with their own
-    ``create_default_context(cafile=...)``, so a missing file was a bare FileNotFoundError naming
-    nothing, while the policy arms beside them named the setting and the connection."""
+    ``create_default_context(cafile=...)``, so a missing file was a bare FileNotFoundError, and a
+    file with no usable PEM a raw SSLError, naming nothing, while the policy arms beside them named
+    the setting and the connection."""
+    ca = tmp_path / "gone.pem"
+    if junk:
+        ca.write_text("not a certificate", encoding="utf-8")
     with pytest.raises(CaFileUnreadable) as caught:
-        build(str(tmp_path / "gone.pem"))
+        build(str(ca))
     message = str(caught.value)
-    assert message.startswith("tls_ca_file of connection 'OB' names a CA file that cannot be read")
+    assert message.startswith(f"tls_ca_file of connection 'OB' names a CA file that {problem}")
     assert "gone.pem" not in message
-    assert isinstance(caught.value.__cause__, FileNotFoundError)
+    assert isinstance(caught.value.__cause__, cause)
 
 
 @pytest.mark.usefixtures("escape_at_warn")
@@ -511,6 +527,46 @@ def test_a_readable_ca_file_on_those_arms_is_still_the_only_root(
     ctx = build(_ca_pem(tmp_path, "arm-test-ca"))
     assert isinstance(ctx, ssl.SSLContext)
     assert _ca_subjects(ctx) == {"arm-test-ca"}
+
+
+@pytest.mark.usefixtures("escape_at_warn")
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(
+            lambda policy: build_smtp_tls_context(
+                host="smtp.internal.example.org",
+                cell="Email",
+                verify=False,
+                trust_anchor_policy=policy,
+                name="OB",
+            ),
+            id="smtp",
+        ),
+        pytest.param(
+            lambda policy: mllp._mllp_ssl_context(
+                {**_MLLP, "tls_verify": False}, server=False, trust_anchor_policy=policy, name="OB"
+            ),
+            id="mllp",
+        ),
+        pytest.param(
+            lambda policy: _ftps_ssl_context(
+                {**_FTPS, "tls_verify": False}, trust_anchor_policy=policy, name="OB"
+            ),
+            id="ftps",
+        ),
+    ],
+)
+def test_a_verify_off_arm_ignores_the_instance_policy(
+    build: Callable[[TrustAnchorPolicy], object], tmp_path: Path
+) -> None:
+    """The verify-off arms take the empty policy, as they did before they went through the anchor:
+    a CERT_NONE hop trusts nothing, so an instance CA it cannot read must not refuse it. A pinned
+    instance CA that does not exist would refuse on any arm that read the policy."""
+    policy = TrustAnchorPolicy(internal_ca_file=str(tmp_path / "gone.pem"), mode="pinned")
+    ctx = build(policy)
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.verify_mode == ssl.CERT_NONE
 
 
 def test_a_dicom_suite_refusal_names_the_connection() -> None:

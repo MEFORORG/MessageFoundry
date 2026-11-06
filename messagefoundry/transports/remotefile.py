@@ -778,7 +778,7 @@ def _ftps_ssl_context(
 
     ``trust_anchor_policy`` (#190, ADR 0093) supplies the instance ``[tls]`` internal-CA fallback when
     the connection names no ``tls_ca_file`` of its own (the verify path only; ``None`` = the historical
-    ``create_default_context(cafile=…)`` behaviour, byte-identical). It never disables verification, so
+    ``create_default_context(cafile=…)`` trust store). It never disables verification, so
     the internal CA never bypasses the ``tls_verify=false`` refusal above.
 
     ``name`` is the connection's, for the ``tls_check_hostname=false`` warning (ASVS 12.3.2). ``Ftp()``
@@ -825,12 +825,15 @@ def _ftps_ssl_context(
         )
     ca = settings.get("tls_ca_file")
     # #190 (ADR 0093): the connection's own tls_ca_file wins verbatim, else the internal-CA anchor
-    # for an internal hop. Only the VERIFY path uses the policy; the CERT_NONE branch is refused
-    # above. Every arm loads through the anchor for the named refusal (vault BACKLOG #2370).
+    # for an internal hop. Only the VERIFY path uses the policy; the CERT_NONE branch, reached only
+    # through the clamped escape above, takes the empty one. Every arm loads through the anchor for
+    # the named refusal (vault BACKLOG #2370).
     anchor = resolve_trust_anchor(
         connection_ca_file=str(ca) if ca else None,
         host=str(settings.get("host", "")),
-        policy=trust_anchor_policy if verify else None,
+        policy=trust_anchor_policy
+        if verify and trust_anchor_policy is not None
+        else TrustAnchorPolicy(),
         connection=name or None,
     )
     ctx = build_verifying_client_context(anchor)
