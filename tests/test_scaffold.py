@@ -674,6 +674,9 @@ def test_a_failed_auditor_install_is_the_one_failure_named(
     assert failed == [_INSTALL_AUDITOR] and not audited.exists()
 
 
+#: The adopter lock, plus a pin under a marker that holds on every host, for the range cases.
+_STALE_LOCK = _ADOPTER_LOCK + "pyyaml==6.0.3 ; python_version >= '3' \\\n    --hash=sha256:eeee\n"
+
 #: (requirements.txt, the ::error:: it must raise or None for a clean pass, a ::notice:: or None).
 #: The markers hold, or fail, on every host this suite runs on, as on the job's Windows runner.
 _STALE_CASES = [
@@ -695,10 +698,10 @@ _STALE_CASES = [
         "acme-hl7-utils is in requirements.txt but not in requirements.lock",
         None,
     ),
-    # A range must be met by the locked version. The engine's pin carries no marker, so these
-    # hold on every host; a marked pin is skipped wherever its marker is false.
-    ("messagefoundry>=0.5\n", None, None),
-    ("messagefoundry>=0.6\n", "requirements.txt asks for messagefoundry>=0.6", None),
+    # A range must be met by the locked version. pyyaml's lock pin is marked, under a marker that
+    # holds on every host, so a marked pin whose marker holds is counted wherever this runs.
+    ("messagefoundry==0.5.1\npyyaml>=6.0\n", None, None),
+    ("messagefoundry==0.5.1\npyyaml>=6.1\n", "requirements.txt asks for pyyaml>=6.1", None),
     # A marker that holds here is checked like any other requirement.
     (
         "messagefoundry==0.5.1\nuvloop==0.23.0 ; python_version >= '3'\n",
@@ -734,7 +737,7 @@ def test_a_stale_lock_fails_its_own_step_and_hides_no_audit(
     """Vault BACKLOG #3786 (R2-1): with a lock, nothing resolves requirements.txt, so a lock left
     behind by a change to it audited the old closure and nothing said so."""
     calls, audited, output, failed = _run_audit_job(
-        scaffolded_ci, tmp_path, _ADOPTER_LOCK, requirements=requirements
+        scaffolded_ci, tmp_path, _STALE_LOCK, requirements=requirements
     )
     assert failed == ([_STALE] if error else []), output
     if error:
