@@ -364,6 +364,33 @@ def test_a_pass_environment_naming_an_engine_variable_is_refused(
     assert name in capsys.readouterr().err
 
 
+def test_a_pass_environment_entry_that_is_not_a_name_is_refused_without_its_value(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``NAME=value`` typed by mistake would put the value in the job log (vault BACKLOG #2600)."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    for entry in ("MEFOR_STORE_KEY=marker-not-a-key", "KEYRING_A=marker-not-a-key", " KEYRING_A"):
+        assert main(["--pass-environment", entry, str(src)], run=run) == 2
+        err = capsys.readouterr().err
+        assert "not an environment variable name" in err
+        assert "marker-not-a-key" not in err
+    assert not ran
+
+
+def test_a_pass_environment_naming_a_console_variable_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A child started with ``PYTHONINSPECT`` waits at a prompt, so the audit would hang."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main(["--pass-environment", "PYTHONINSPECT", str(src)], run=run) == 2
+    assert not ran
+    assert "console or a debugger" in capsys.readouterr().err
+
+
 def test_a_pass_environment_after_the_lock_is_refused_by_name(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

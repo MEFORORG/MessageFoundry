@@ -238,12 +238,16 @@ that package's build code may run in CI:
     index that serves it. It refuses the engine's own name, and the name of each other MessageFoundry
     package your engine release records as published: at least `messagefoundry-webconsole`,
     `messagefoundry-harness` and `messagefoundry-toolkit`.
-  - pip and pip-audit get an allowlist environment, not the job's whole one: what Python needs to
-    start, pip's own `PIP_*` variables, and the proxy, certificate, `NETRC` and XDG folder variables.
-    A CI token the job sets does not reach them. If your index authenticates through a keyring
-    backend or a cloud credential helper that reads another variable, name it with
-    `--pass-environment <name>` before `requirements.lock`, once per variable, from the first engine
-    release after 0.5.2. It refuses an engine `MEFOR_*` variable.
+  - From the first engine release after 0.5.2, pip and pip-audit get an allowlist environment, not
+    the job's whole one: what Python needs to start, pip's own `PIP_*` variables, and the proxy,
+    certificate, `NETRC` and XDG folder variables. A CI token the job sets is then not in their
+    environment. That is not isolation: they run as the job's account and can still read the
+    auditor's process, so keep the job's token permissions minimal. 0.5.2 and earlier hand them
+    every variable outside the engine's `MEFOR_*` names. If your index authenticates through a
+    keyring backend or a cloud credential helper that reads another variable, name it with
+    `--pass-environment <name>` before `requirements.lock`, once per variable. It refuses at least
+    an entry that is not a name, an engine variable, `VAULT_TOKEN` and `PGPASSWORD` among them, and
+    `PYTHONINSPECT`.
   - It refuses a lock with pip option lines, such as an index URL, `--trusted-host` or `--find-links`.
     `uv pip compile --universal --generate-hashes requirements.txt -o requirements.lock` writes none
     by default and writes every platform's pins. `pip-compile` needs its `--no-emit-*` flags for each

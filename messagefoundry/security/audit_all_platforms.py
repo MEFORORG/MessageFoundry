@@ -51,8 +51,10 @@ private: like ``--ignore-vuln``, it is the adopter's recorded decision.
 
 ``--pass-environment <name>``, also given BEFORE the lock and repeatable, hands pip and pip-audit
 one more environment variable than their allowlist holds, such as one a keyring backend or a cloud
-credential helper reads to reach a private index (vault BACKLOG #2587). It refuses an engine
-variable, a ``MEFOR_*`` name or one of the few secrets the engine knows outside that prefix.
+credential helper reads to reach a private index (vault BACKLOG #2587). It refuses at least an
+entry that is not a variable name, an engine variable, and an interpreter variable that starts a
+console or a debugger (``childenv.pass_environment_refusal``). A caller that passes its own ``run``
+to :func:`main` gets the names checked but not forwarded: they reach only the default runner.
 
 WHY STRIPPING IS SOUND HERE. Every pin in a uv export is a version that uv resolved for some
 environment. The engine sets no ``[tool.uv] environments``, so that includes environments nobody
@@ -73,8 +75,8 @@ a requirement that continues onto a line other than a hash, option or comment, w
 would stay in place; and a ``--skip-private`` that names the engine or another published
 MessageFoundry package, a package the lock does not pin, or every pin, or that comes after the lock
 as a word of its own (the ``=`` form or an abbreviation there reaches pip-audit, which fails on it
-as an unknown option); and a ``--pass-environment`` that names an engine variable, or that comes
-after the lock as a word of its own. It does not judge
+as an unknown option); and a ``--pass-environment`` entry the paragraph above says it refuses, or
+one that comes after the lock as a word of its own. It does not judge
 whether a non-empty lock is complete; released-line-audit carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
@@ -85,7 +87,9 @@ Both subprocesses start through ``messagefoundry.childenv.python_module_argv``, 
 (the checked-out tree, the current directory, is not on their ``sys.path`` and cannot shadow a
 module the auditor imports) and the engine's other child-interpreter flags. Their environment is
 ``messagefoundry.childenv.auditor_environment``, an allowlist, plus the ``--pass-environment``
-names: a variable neither names, a CI token or an engine secret among them, does not reach them.
+names: a variable neither names, a CI token or an engine secret among them, is not in their
+environment. That is not isolation: they run as the auditor's own account, which can still read
+the auditor process.
 
 WHAT IT DOES NOT HANDLE, stated rather than papered over. If a lock ever pins ONE name at two
 versions under two markers (a resolver fork), the copy carries both and pip-audit refuses it with
@@ -109,7 +113,7 @@ from pathlib import Path
 
 from messagefoundry.childenv import (
     auditor_environment,
-    outside_engine_namespace,
+    pass_environment_refusal,
     python_module_argv,
 )
 
@@ -274,8 +278,9 @@ def _pass_environment_refusal(names: Sequence[str], pip_audit_args: Sequence[str
     """Why a ``--pass-environment`` request is refused, or ``None``."""
     if "--pass-environment" in pip_audit_args:
         return "--pass-environment goes before the lock, not after it"
-    engine = sorted(name for name in names if not outside_engine_namespace(name))
-    return f"--pass-environment may not name an engine variable: {engine}" if engine else None
+    refusals = (pass_environment_refusal(name) for name in names)
+    first = next((refusal for refusal in refusals if refusal), None)
+    return f"--pass-environment: {first}" if first else None
 
 
 def _run(cmd: list[str], *, pass_environment: Sequence[str] = ()) -> int:

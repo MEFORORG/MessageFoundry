@@ -58,6 +58,7 @@ __all__ = [
     "hook_environment",
     "inherited_interpreter_flags",
     "outside_engine_namespace",
+    "pass_environment_refusal",
     "python_child_argv",
     "python_module_argv",
     "system_tool_environment",
@@ -263,6 +264,29 @@ def outside_engine_namespace(name: str) -> bool:
     return (
         not upper.startswith(ENGINE_ENV_PREFIX) and upper not in ENGINE_SECRETS_OUTSIDE_THE_PREFIX
     )
+
+
+#: The interpreter variables :data:`_INTERPRETER_NAMES` leaves out because they hand control to a
+#: console or a debugger. :func:`pass_environment_refusal` refuses them: a child started with
+#: ``PYTHONINSPECT`` set waits at a prompt instead of exiting.
+_INTERPRETER_CONTROL_NAMES: Final = frozenset(
+    {"PYTHONSTARTUP", "PYTHONINSPECT", "PYTHONBREAKPOINT"}
+)
+
+
+def pass_environment_refusal(name: str) -> str | None:
+    """Why ``name`` may not be named as an extra variable for the dependency auditor's children,
+    or ``None``. Refused: an entry that is not a variable name, a name of the engine's namespace
+    (:func:`outside_engine_namespace`), and an interpreter variable that hands control to a console
+    or a debugger. The text never echoes an entry that is not a name, since ``NAME=value`` typed by
+    mistake would carry the value (vault BACKLOG #2600)."""
+    if not (name.isascii() and name.isidentifier()):
+        return "an entry is not an environment variable name; list names only, never NAME=value"
+    if not outside_engine_namespace(name):
+        return f"{name} is one of the engine's own variables"
+    if name.upper() in _INTERPRETER_CONTROL_NAMES:
+        return f"{name} hands the interpreter to a console or a debugger"
+    return None
 
 
 def inherited_interpreter_flags() -> tuple[str, ...]:
@@ -499,13 +523,17 @@ def auditor_environment(
     reaches them. Nothing else crosses: no ``MEFOR_*`` variable, no name in
     :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`, and no CI token. A variable a pip setup needs beyond
     these, such as a keyring backend's, crosses only when the caller names it in ``extra_names``,
-    which is the auditor's ``--pass-environment``. An extra in the engine's own namespace raises
-    :class:`ValueError`.
+    which is the auditor's ``--pass-environment``. An extra :func:`pass_environment_refusal`
+    refuses raises :class:`ValueError`.
 
     Built through :func:`worker_environment`, so the two cannot drift apart. That builder's
     "never a secret" rule is for code the engine does not trust; ``pip`` is a tool the auditor
     names, and a ``PIP_INDEX_URL`` that carries an index credential is meant for it."""
-    extras = _outside_engine_keys(extra_names)
+    extras = _extra_keys(extra_names)
+    for key in extras:
+        refusal = pass_environment_refusal(key)
+        if refusal:
+            raise ValueError(f"extra_names: {refusal}")
     source = _source(environ)
     pip_names = {name for name in source if _key(name).startswith(_PIP_PREFIX)}
     return worker_environment(source, extra_names=_AUDITOR_NAMES | pip_names | extras)

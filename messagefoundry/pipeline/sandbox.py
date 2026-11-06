@@ -195,7 +195,7 @@ class SandboxPolicy:
     CPU that admin code spends outside a call has no bound (ADR 0087, amendment of 2026-10-07).
     ``mem_mb`` adds a POSIX memory backstop *inside* the child where the ``resource`` module exists
     (a no-op on Windows). On Linux it is headroom above the loaded graph: ``RLIMIT_DATA`` at the
-    worker's ``VmData`` once ``load_config`` has run, plus ``mem_mb``. Elsewhere on POSIX it is an
+    worker's ``VmData`` once ``load_snapshot`` has run, plus ``mem_mb``. Elsewhere on POSIX it is an
     absolute ``RLIMIT_AS`` cap. A call that hits it is reported as the memory cap, and its worker is
     recycled (ADR 0087, amendment of 2026-10-11). ``startup_seconds`` bounds the one-time child
     bootstrap (config load)."""
@@ -390,7 +390,7 @@ class _StderrRelay:
     lives here rather than on the session: a respawn replaces the session's thread list and the stale
     relay goes with it, unable to write into the live generation's state -- the same stale-generation
     isolation the fresh :class:`queue.Queue` gives the frame reader. The notice budget therefore resets
-    on respawn; accepted, because a respawn costs a full ``load_config()``.
+    on respawn; accepted, because a respawn costs a full ``load_snapshot()``.
 
     PHI redaction is deliberately NOT re-implemented here. It is a property of the engine's log
     HANDLERS (:func:`~messagefoundry.logging_setup._install_phi_filters`), which this parent-side call

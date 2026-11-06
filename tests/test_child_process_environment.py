@@ -563,6 +563,9 @@ def test_a_name_the_auditor_is_passed_crosses_and_an_engine_name_is_refused() ->
             childenv.auditor_environment(parent, extra_names=(name,))
     with pytest.raises(TypeError):
         childenv.auditor_environment(parent, extra_names=_ORDINARY)
+    for refused in ("PYTHONINSPECT", "KEYRING_A=x"):
+        with pytest.raises(ValueError, match="extra_names"):
+            childenv.auditor_environment(parent, extra_names=(refused,))
 
 
 def test_only_the_dependency_auditor_calls_its_builder() -> None:

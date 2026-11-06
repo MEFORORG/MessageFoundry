@@ -1124,9 +1124,8 @@ def test_the_engine_refuses_the_same_directory_with_the_escape_alone(tmp_path: P
     assert INSECURE_CONFIG_SOURCE_ESCAPE_ENV in str(excinfo.value)
 
 
-@pytest.mark.parametrize("spelling", ["MEFOR_SECURITY_ENFORCEMENT", "MEFOR_SECURITY_enforcement"])
 def test_no_spelling_of_the_dial_reaches_the_worker_environment(
-    spelling: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The parent decides the config-source gate when it reads the snapshot the boot frame carries,
     and the worker runs no trust check of its own (vault BACKLOG #2596). So neither the escape nor
@@ -1144,7 +1143,9 @@ def test_no_spelling_of_the_dial_reaches_the_worker_environment(
 
     monkeypatch.delenv(SECURITY_ENFORCEMENT_ENV, raising=False)
     monkeypatch.setenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "1")
-    monkeypatch.setenv(spelling, "warn")
+    # Both spellings at once: two variables on POSIX, one on Windows.
+    for spelling in ("MEFOR_SECURITY_ENFORCEMENT", "MEFOR_SECURITY_enforcement"):
+        monkeypatch.setenv(spelling, "warn")
     monkeypatch.setenv("MEFOR_STORE_POOL_SIZE", "7")  # any other engine variable: must not cross
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     with pytest.raises(_Stop):

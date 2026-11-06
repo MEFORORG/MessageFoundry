@@ -391,8 +391,9 @@ and the builders, and a test checks that each module named calls each builder na
 - The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get an allowlist
   (`auditor_environment`): what a Python child needs to start, as the sandbox worker gets it, less
   any empty or relative `PYTHONPATH` entry; pip's own `PIP_*` variables; and the proxy,
-  certificate, `NETRC` and XDG folder variables that pip and pip-audit read to reach an index.
-  No other variable reaches them, a CI token or an engine secret among them.
+  certificate, `NETRC` and XDG folder variables that pip and pip-audit read to reach an index;
+  and each name the auditor's `--pass-environment` lists, which refuses an engine variable. No
+  other variable is in their environment, a CI token or an engine secret among them.
 
 At least these pass on the environment they run with, on purpose: `checks.py`, which adds one
 variable, and the tray's opens, where starting VS Code drops the two variables VS Code's own
