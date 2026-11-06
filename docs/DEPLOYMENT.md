@@ -863,11 +863,14 @@ loud warning):
 - Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Clamped, read directly
   rather than through the authority. CORRECTED 2026-10-13: this read *Not clamped*.)*
 - The non-connection cells that have nowhere to carry a per-hop declaration: the `[logging]` syslog/SIEM
-  forwarder and the API PHI-read serve hop, plus the webhook alert sink.
-  *(All clamped — the webhook sink since #329. A webhook URL can carry a path secret, and the
-  credential rule does not reach it yet. LDAPS was on this list until vault BACKLOG #3230 made
+  forwarder and the API PHI-read serve hop.
+  *(Both clamped. LDAPS was on this list until vault BACKLOG #3230 made
   `ad_tls_verify = false` a refusal with no escape. The AI-broker endpoint was on it until vault
-  BACKLOG #3533 did the same for its `http` endpoint, since every call sends `[ai].api_key`.)*
+  BACKLOG #3533 did the same for its `http` endpoint, since every call sends `[ai].api_key`. The
+  webhook alert sink was on it until vault BACKLOG #3533 item 5 did the same for an `http`
+  `[alerts].webhook_url`, since every POST carries the path token the webhook service issues. The
+  escape has no effect on the webhook: an `http` URL refuses the start in every posture when `serve`
+  builds the alert notifier, and no setting turns off the `https` webhook's peer verification.)*
 
 **Two limits worth stating plainly.** *(a)* Since [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
@@ -882,7 +885,7 @@ the opposite claim, "secure by other means", and ALLOWs the hop. It is reported 
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
 enforce`. That holds for the weakened-TLS / cleartext-escape cells that route through
 `weakened_tls_escape_permitted` — at least the store-TLS, MLLP and anonymous FTPS cells and, since #329,
-the SFTP host key of a key-only login and the webhook sink. That clamp once also required the
+the SFTP host key of a key-only login. That clamp once also required the
 instance to be PHI; by design every instance is now treated as carrying patient data (BACKLOG
 #1279), so that conjunct is gone. Either way, on the shipped posture those cells are inert;
 no bullet above is marked *not clamped* now. CORRECTED 2026-10-13: the Direct bullet was, and that was wrong.
