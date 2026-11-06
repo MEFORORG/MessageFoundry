@@ -351,7 +351,15 @@ release would have done to a first deployment's rows.
    key kind's scheme, or a malformed pair. A record that holds all its own fields but is otherwise
    malformed still reads as a record. That covers half a pair, a name that is not text, and a field
    beyond the pair. It names a scheme no release holds, so it is refused. Before this amendment the
-   range parser ignored an extra field.
+   range parser ignored an extra field. AMENDED 2026-11-04 (vault BACKLOG #3411): a genesis record
+   may also carry `store_id`, the lowercase hex of the 16-byte store id, as a label beside a named
+   scheme. The row MAC covers it and no key is derived from it. A malformed one, or one on a record
+   that names no scheme, is refused as a field beyond the pair is. The refusal names the missing
+   scheme first, then a refused scheme, then the store id, so a malformed label cannot hide a record
+   naming the keyless mode. A range record carrying `store_id` is refused the same way. That holds
+   until the key-custody restore slice lands, not as a rule about range records: that draft's rule 4
+   restore appends an `audit.key_epoch` range row that names the new store id, and that slice
+   amends this item for it.
 4. **No record may name the keyless store mode.** Its `mac` is `sha256` (`AUDIT_KEYLESS_MAC`), and a
    record naming it is refused whatever its `kdf` says, by a handle with or without a key. So a row
    cannot declare its chain keyless. A record naming an unknown scheme or the keyless mode still

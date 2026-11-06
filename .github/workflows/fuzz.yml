@@ -64,7 +64,7 @@
 # synthetic samples under `samples/messages/` plus small inline literals in `fuzz/targets.py` -- so
 # nothing derived from it is PHI. The hazard this note exists for is the obvious next step of seeding
 # from captured traffic. DO NOT: a real or captured corpus would put payload content into a public
-# CI log, into a crash artifact, and into THE JOB SUMMARY. De-identify first (messagefoundry/anon/,
+# CI log, into a crash artifact, and into THE JOB SUMMARY. De-identify first (messagefoundry_toolkit/anon/,
 # ADR 0030) and keep such a run local.
 #
 # THE JOB SUMMARY IS THE THIRD SINK AND IT IS NEW, so it is named rather than left to be inferred

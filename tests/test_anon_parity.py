@@ -11,10 +11,10 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.anon import DEFAULT_RULES
-from messagefoundry.anon import anonymize as engine_anonymize
-from messagefoundry.anon import leak as engine_leak
-from messagefoundry.generators import (
+from messagefoundry_toolkit.anon import DEFAULT_RULES
+from messagefoundry_toolkit.anon import anonymize as engine_anonymize
+from messagefoundry_toolkit.anon import leak as engine_leak
+from messagefoundry_toolkit.generators import (
     _core,
     _hl7data,
     all_types,  # noqa: F401  (registers message types)
@@ -93,15 +93,19 @@ def _load_scan_forbidden() -> object:
 
 def test_shared_logic_files_are_byte_identical() -> None:
     for name in _BYTE_IDENTICAL:
-        engine = (_ROOT / "messagefoundry" / "anon" / name).read_bytes()
+        engine = (_ROOT / "messagefoundry_toolkit" / "anon" / name).read_bytes()
         tee = (_ROOT / "tee" / "anon" / name).read_bytes()
-        assert engine == tee, f"{name} drifted — re-copy messagefoundry/anon/{name} to tee/anon/"
+        assert engine == tee, (
+            f"{name} drifted — re-copy messagefoundry_toolkit/anon/{name} to tee/anon/"
+        )
 
 
 def test_vendored_hl7data_matches_generator_source() -> None:
-    engine = (_ROOT / "messagefoundry" / "generators" / "_hl7data.py").read_bytes()
+    toolkit = (_ROOT / "messagefoundry_toolkit" / "generators" / "_hl7data.py").read_bytes()
     tee = (_ROOT / "tee" / "anon" / "_hl7data.py").read_bytes()
-    assert engine == tee, "tee/anon/_hl7data.py drifted from messagefoundry/generators/_hl7data.py"
+    assert toolkit == tee, (
+        "tee/anon/_hl7data.py drifted from messagefoundry_toolkit/generators/_hl7data.py"
+    )
 
 
 def test_leak_token_table_matches_publish_guard() -> None:
@@ -258,7 +262,7 @@ def test_anon_files_do_not_self_trip_the_publish_guard() -> None:
     # in a new (non-exempt) anon file would block the commit while pytest stayed green. Guard it here.
     sf = _load_scan_forbidden()
     files = [
-        *(_ROOT / "messagefoundry" / "anon").glob("*.py"),
+        *(_ROOT / "messagefoundry_toolkit" / "anon").glob("*.py"),
         *(_ROOT / "tee" / "anon").glob("*.py"),
     ]
     offenders = [hit for f in files for hit in sf.scan_file(f)]  # type: ignore[attr-defined]
