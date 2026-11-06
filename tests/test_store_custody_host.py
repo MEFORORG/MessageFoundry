@@ -35,6 +35,7 @@ from messagefoundry.store.custody import (
     RecoveryKey,
     StoreId,
     unwrap_master_key,
+    wrap_master_key,
 )
 from messagefoundry.store.custody_host import (
     HostCustodyMissing,
@@ -526,8 +527,13 @@ async def test_the_first_start_converts_the_handoff_and_deletes_it(
     caplog.set_level(logging.DEBUG)
     settings = _settings(tmp_path)
     blob = _proved_blob()
+    # provision-admin creates the store with the blob it minted, then writes the handoff.
+    _WRAPS[blob.store_id.value] = wrap_master_key(
+        blob.master_key, RecoveryKey.mint(), blob.store_id
+    )
+    await _create(settings, blob)
     _handoff(tmp_path / "handoff.key", blob)
-    store = await open_store(settings, create=True)
+    store = await open_store(settings)  # the service's first start
     await store.close()
     assert not (tmp_path / "handoff.key").exists()
     assert custody.read_host_file(tmp_path / "master.key") == blob
@@ -760,3 +766,122 @@ async def test_an_empty_store_file_is_built_under_the_host_provider(tmp_path: Pa
     blob = _mint(settings)
     await _create(settings, blob)
     assert await _genesis_store_id(settings, blob) == blob.store_id.value
+
+
+# --- held-PR repair round (PR 2804): unrepaired items 1, 2, 3, 9 and 10 ---------------------------
+
+
+@host_file_platforms
+async def test_a_chain_is_never_started_without_the_recovery_wrap(tmp_path: Path) -> None:
+    # Item 1: a store whose minting create-open failed before its genesis record would otherwise be
+    # started by the next open with no wrap, while the blob still says the recovery key is proved.
+    settings = _settings(tmp_path)
+    blob = _mint(settings)
+    with pytest.raises(StoreIdPinRefused, match="recovery wrap"):
+        await open_store(settings, create=True, custody=blob)  # no recovery_wrap
+    with pytest.raises(StoreIdPinRefused, match="recovery wrap"):
+        await open_store(settings)  # a later start, from the host file
+    # A read-only open writes nothing, so it may read the empty chain.
+    store = await open_store(settings, read_only=True)
+    try:
+        assert await store._audit_genesis_row() is None  # type: ignore[attr-defined]
+    finally:
+        await store.close()
+
+
+async def test_a_store_with_data_and_an_empty_chain_is_not_absent(tmp_path: Path) -> None:
+    # Item 2: provision-admin's server probe read an empty audit chain as no store at all.
+    from messagefoundry.store.custody_host import store_holds_data
+
+    settings = StoreSettings(path=str(tmp_path / "keyless.db"))
+    store = await open_store(settings, create=True, keyless_chain_refusal=None)
+    try:
+        assert not await store_holds_data(store)
+        await store.record_connection_event(
+            connection="IB_X", transport="mllp", direction="inbound", kind="established"
+        )
+        assert await store_holds_data(store)
+    finally:
+        await store.close()
+
+
+@host_file_platforms
+async def test_a_pin_refusal_before_any_write_is_told_apart_from_one_after(
+    tmp_path: Path,
+) -> None:
+    # Item 3: a refusal raised after the salt bind must not read as "nothing written".
+    from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
+
+    settings = _settings(tmp_path)
+    blob = _mint(settings)
+    await _create(settings, blob)
+    stranger = HostBlob(blob.master_key, StoreId.mint(), (), blob.recovery_proved_at)
+    with pytest.raises(StoreIdPinRefusedBeforeWrite):
+        await open_store(settings, custody=stranger)
+
+
+def test_a_minted_key_is_kept_when_the_pin_refused_after_a_write(tmp_path: Path) -> None:
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
+
+    server = StoreSettings(backend=StoreBackend.POSTGRES)
+    kept = tmp_path / "kept.key"
+    kept.write_bytes(b"k")
+    cli._discard_minted_custody(kept, server, StoreIdPinRefused("after the salt bind"))
+    assert kept.exists()
+    removed = tmp_path / "removed.key"
+    removed.write_bytes(b"k")
+    cli._discard_minted_custody(removed, server, StoreIdPinRefusedBeforeWrite("before"))
+    assert not removed.exists()
+
+
+@host_file_platforms
+def test_end_of_input_at_the_recovery_prompt_is_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Item 9: getpass raises EOFError at end of input (Ctrl-D, Ctrl-Z), which is not an OSError.
+    from messagefoundry import __main__ as cli
+    from messagefoundry.__main__ import main
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text('[store]\nkey_provider = "host"\n')
+    password = "a long and unremarkable passphrase 7"
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    queued = [password, password]
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: queued.pop(0))
+
+    class _Gone(_Console):
+        def read(self) -> str:
+            raise EOFError
+
+    monkeypatch.setattr(cli, "_RecoveryKeyConsole", _Gone)
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    assert main([*argv, "--db", str(tmp_path / "p.db")]) == 2
+    err = capsys.readouterr().err
+    assert "recovery key" in err and "Traceback" not in err
+    assert not (tmp_path / "master.key").exists() and not (tmp_path / "p.db").exists()
+
+
+@windows_only
+def test_a_cleanup_that_cannot_remove_the_host_file_keeps_the_original_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Item 10: the unlink in the conversion's cleanup replaced the read-back's own error.
+    _handoff(tmp_path / "handoff.key", _proved_blob())
+    calls: list[Path] = []
+
+    def _read(path: Path) -> HostBlob:
+        calls.append(path)
+        if len(calls) == 1:  # the open's first look finds no host file
+            raise FileNotFoundError(path)
+        raise custody.CustodyError("the read-back stand-in refusal")
+
+    def _no_unlink(self: Path, missing_ok: bool = False) -> None:
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(custody, "read_host_file", _read)
+    monkeypatch.setattr(Path, "unlink", _no_unlink)
+    with pytest.raises(HostCustodyRefused) as excinfo:
+        load_host_custody(_settings(tmp_path), enforcing=True, environ={})
+    text = str(excinfo.value)
+    assert "the read-back stand-in refusal" in text and "could not be removed" in text

@@ -5455,16 +5455,29 @@ def store_pin_problem(genesis: Mapping[str, Any] | None, pin: StorePin) -> str |
     )
 
 
+#: Why a writable open refuses to start an empty chain under a pin that carries no recovery wrap.
+_PIN_NEEDS_THE_WRAP: Final = (
+    "the store's audit chain was never started, and only the command that minted its key, which "
+    "holds its recovery wrap, may start it: a chain started without the recovery wrap would leave "
+    "the recovery key opening nothing kept in the store. Remove the store and its host blob, then "
+    "run `messagefoundry provision-admin` again"
+)
+
+
 async def _store_pin_refusal(
-    host: AuditRangeHost, first: Mapping[str, Any] | None, pin: StorePin
+    host: AuditRangeHost, first: Mapping[str, Any] | None, pin: StorePin, *, writable: bool
 ) -> str | None:
-    """Why the chain does not hold the store to ``pin``, or ``None``. An EMPTY chain passes: nothing
-    is pinned yet, and a writable open writes the genesis record with the pin before it asks. A
+    """Why the chain does not hold the store to ``pin``, or ``None``.
+
+    An EMPTY chain passes a read-only open, which writes nothing, and a writable open whose pin
+    carries the recovery wrap: the minting command's, which writes the genesis record with the pin
+    and the wrap before it asks again. A writable open whose pin carries no wrap is refused there,
+    so no chain under a host blob is ever started without the wrap its recovery key opens. A
     genesis record must name an id the pin accepts AND verify under a key this handle holds, which
     is derived from the host blob, so a database writer without the key cannot name the blob's id
     on another store's chain."""
     if first is None and not await host._audit_rows(limit=1):
-        return None
+        return _PIN_NEEDS_THE_WRAP if writable and not pin.recovery_wrap else None
     problem = store_pin_problem(first, pin)
     if problem is not None or first is None:
         return problem
@@ -5497,7 +5510,7 @@ async def check_open_store_pin(host: AuditRangeHost) -> None:
     pin = OPEN_STORE_PIN.get()
     if pin is None:
         return
-    problem = await _store_pin_refusal(host, await host._audit_genesis_row(), pin)
+    problem = await _store_pin_refusal(host, await host._audit_genesis_row(), pin, writable=True)
     if problem is not None:
         raise StoreIdPinRefused(f"refusing to open the store: {problem}")
 
@@ -6171,6 +6184,9 @@ async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
     pin = OPEN_STORE_PIN.get()
     first = await host._audit_genesis_row()
     if first is None and active_id is not None and not read_only:
+        if pin is not None and not pin.recovery_wrap:
+            # Vault BACKLOG #3411: never start a chain under a host blob without its recovery wrap.
+            raise StoreIdPinRefused(f"refusing to open the store: {_PIN_NEEDS_THE_WRAP}")
         # The append requires an EMPTY log, so it writes nothing when any row is there. Suppressed:
         # another process started the chain between the read and the append, or the log holds rows
         # and none at seq 1. The re-read below tells the two apart.
@@ -6186,7 +6202,11 @@ async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
                 expect_prev="",
             )
         first = await host._audit_genesis_row()
-    if pin is not None and (problem := await _store_pin_refusal(host, first, pin)) is not None:
+    if (
+        pin is not None
+        and (problem := await _store_pin_refusal(host, first, pin, writable=not read_only))
+        is not None
+    ):
         # Vault BACKLOG #3411: at EVERY open under the host key provider, the host blob's store id
         # must be the one the store was created under, or an earlier one of the same blob.
         raise StoreIdPinRefused(f"refusing to open the store: {problem}")
