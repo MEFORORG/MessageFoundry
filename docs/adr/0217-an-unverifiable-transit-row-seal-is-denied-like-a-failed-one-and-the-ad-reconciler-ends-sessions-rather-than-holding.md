@@ -3,11 +3,10 @@
 
 # 0217 -- An unverifiable Transit row seal is denied like a failed one, and the AD reconciler ends sessions rather than holding
 
-- **Status:** Proposed (2026-11-05) -- design only, no code. Every answer below marked
-  `CONTROL DECISION: yes` changes what a sign-in, a reconcile or a write refuses, pages or audits,
-  so this ADR is accepted only by an owner ruling, or by a decision recorded under the owner's
-  delegation and quoted on vault BACKLOG #4739. Nothing here is built until then. *Owner rulings asked*, below,
-  is the list the owner is asked.
+- **Status:** Accepted (2026-11-06, by owner ruling; *Owner rulings*, below, quotes it) -- design
+  only, no code yet. Every answer below marked `CONTROL DECISION: yes` changes what a sign-in, a
+  reconcile or a write refuses, pages or audits. *Owner rulings asked*, below, is the list the
+  owner was asked.
 - **Date:** 2026-11-05
 - **Related:** vault BACKLOG #4739 (this design), #2592 (its parent: identity and authorization
   row seals), #4350 and #6357 (the `vault_transit` seal gap; see *The duplicate question*), #3411
@@ -78,6 +77,23 @@ Each is a `CONTROL DECISION: yes` below. Confidence is in the recommendation.
    accounts lack a current digest (not yet probed by an untripped verified pass, or signed in
    while a map did not hold). Recommend: accept. Medium. Would change if the owner wants the
    rollback case closed before #2592 step 7.
+
+## Owner rulings
+
+The owner ruled on every entry on 2026-11-06, in the Manager's chat, on this ADR at
+`94b485c2e15f541a5177f6e2fe213140bcf0fff2`; the verbatim record is engine PR 2565 comment
+[6676450688](https://github.com/MEFORORG/MessageFoundry/pull/2565#issuecomment-6676450688). The
+selections, verbatim:
+
+- Rulings 1, 3 (core), 4, 5 and 6: **"Approve as recommended (Recommended)"**.
+- Ruling 2: **"Run step 2 (Recommended)"**.
+- Ruling 3, a narrowing write to an unverifiable user row: **"Refuse, end sessions (Recommended)"**.
+- Ruling 7: **"Accept as listed (Recommended)"**.
+
+Two later edits narrow what was ruled and change no selection. Ruling 4's owed raise no longer
+covers a global sign-out, which `main`'s global epoch covers, and a failing row is skipped as on
+`main`. Ruling 2 gained the ADR 0195 hold exclusion for failing rows, the verifier's confirmed
+defect, which the owner was told was being fixed.
 
 ## Context
 
