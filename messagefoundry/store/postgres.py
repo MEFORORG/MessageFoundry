@@ -3048,14 +3048,18 @@ class PostgresStore:
         ``rotate_session`` and ``revoke_user_sessions`` finish what an auth change started: a reset
         password, a disabled account, a changed role, a completed factor ceremony. By the time they
         run, that change is committed. Under ``[store].acquire_timeout`` a saturated pool would make
-        them raise after it, and nothing retries them: a reset password would leave every other
-        session live with no audit row, and a factor ceremony would leave the old token elevated and
-        unrotated. Waiting for a connection instead finishes the write once the pool frees, which is
-        what both did before BACKLOG #2283 moved them onto the bounded ``_execute``.
+        them raise after it: a reset password would leave every other session live, and a factor
+        ceremony would leave the old token elevated and unrotated. Waiting for a connection instead
+        finishes the write once the pool frees, which is what both did before BACKLOG #2283 moved
+        them onto the bounded ``_execute``.
 
-        This closes the gap at these two statements only. The same callers make other bounded
-        writes after their change commits, such as stamps and audit rows, and any of those can
-        still fail at the limit.
+        Waiting answers a pool shortage only. A statement timeout or a lost connection still fails
+        either write. The auth service runs a revoke that follows a committed change again, a
+        bounded number of times, and audits one refused every time
+        (``AuthService._revoke_after_commit``, vault BACKLOG #3023); a refused rotation is its
+        fail-closed branch. This closes the gap at these two statements only. The same callers make
+        other bounded writes after their change commits, such as stamps and audit rows, and any of
+        those can still fail at the limit.
 
         Not every caller has committed first. At least "sign out everywhere else", an
         administrator's force sign-out and the directory reconciler when it writes no roles have no

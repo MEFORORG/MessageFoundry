@@ -183,6 +183,7 @@ from messagefoundry.store.store import (
     LockoutIncrement,
     PasskeyCounts,
     PasskeyRowMalformed,
+    RevokeResult,
     RoleRow,
     SessionRecord,
     TotpState,
@@ -2828,6 +2829,19 @@ _REMINDER_MARK_PAGE: Final = 50
 #: session writes when it ends nothing, because the id names no session or another account's.
 #: One action for both, and the same detail, so the row cannot tell the two apart either.
 SESSION_REVOKE_MISSED_ACTION: Final = "auth.session_revoke_missed"
+#: Vault BACKLOG #3023: the row :meth:`AuthService._revoke_after_commit` writes when the store refused
+#: the whole-account revoke that follows a committed change on every attempt. The change stands; the
+#: account's other sessions stay live until they lapse, and this row is what says so. Not the row
+#: above, which records a self-service revoke that named no session.
+SESSIONS_REVOKE_FAILED_ACTION: Final = "auth.sessions_revoke_failed"
+#: How many times that revoke runs, and the pause before each re-run, times its number. The revoke
+#: is safe to repeat: it ends unrevoked rows and raises the account's session epoch, and a repeat
+#: does both again. Each attempt is one store borrow, so on SQL Server an attempt that waits out a
+#: pool shortage costs up to ``2 x acquire_timeout``; three of those outlast the API's request
+#: deadline, which then cancels the request before this records the miss (vault BACKLOG #3802
+#: holds the cancellation). A statement timeout or a lost connection fails fast and is re-run.
+_POST_COMMIT_REVOKE_ATTEMPTS: Final = 3
+_POST_COMMIT_REVOKE_BACKOFF_SECONDS: Final = 0.25
 #: What a session id can look like: a token hash, lower-case hex, cut to at most its full length.
 _SESSION_ID_SHAPE: Final = re.compile(r"[0-9a-f]{1,64}")
 
@@ -4236,7 +4250,9 @@ class AuthService:
             # Administrator session.
             await self._store.disable_totp(user_id)
             await self._store.delete_all_webauthn_credentials(user_id)
-            await self._store.revoke_user_sessions(user_id)
+            await self._revoke_after_commit(
+                user_id, change="first_administrator_repair", actor=actor
+            )
         else:
             user_id = uuid4().hex
             try:
@@ -4434,7 +4450,9 @@ class AuthService:
             if repaired:
                 # The repair branch's second revoke, as on success below, and ahead of the read
                 # below so a read that raises cannot skip it. Harmless if no role was written.
-                await self._store.revoke_user_sessions(user_id)
+                await self._revoke_after_commit(
+                    user_id, change="first_administrator_repair", actor=actor
+                )
             # Vault BACKLOG #3849 B2: the address clear runs once the role is written, as on success
             # below, so the row is read again first. Only a read of this very row without the role
             # shows the store wrote none and took nothing over, and leaves the record, as
@@ -4463,7 +4481,9 @@ class AuthService:
             # still worked until ``set_password`` above, so a sign-in in that window minted a session
             # the first revoke never saw, and roles are re-read on every request. Revoking once more
             # here ends it before it can act as an Administrator.
-            await self._store.revoke_user_sessions(user_id)
+            await self._revoke_after_commit(
+                user_id, change="first_administrator_repair", actor=actor
+            )
             # Vault BACKLOG #3849 B2: the addresses the earlier holder signed in from are theirs,
             # not the new Administrator's, so they go too, as after an administrator's reset
             # (#2946). Otherwise a sign-in from one of them would read as known and skip the
@@ -7218,7 +7238,9 @@ class AuthService:
             # Directory-side role change (often a downgrade): revoke the user's other live sessions
             # so stale elevated tokens don't linger until expiry (AUTH-AD-REVOKE). The new session
             # is issued below, after this, so the current login is unaffected.
-            await self._store.revoke_user_sessions(user.id)
+            await self._revoke_after_commit(
+                user.id, change="ad_roles_resynced", actor=user.username, client=client
+            )
             await self._audit(
                 "auth.ad_roles_resynced",
                 actor=user.username,
@@ -7418,7 +7440,9 @@ class AuthService:
             # have written the scope since ``user`` was read.
             if not await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope):
                 return await self._load_user(user.id) or user
-            await self._store.revoke_user_sessions(user.id)
+            await self._revoke_after_commit(
+                user.id, change="ad_scope_resynced", actor=user.username, client=client
+            )
             # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
             await self._audit(
                 "auth.ad_scope_resynced",
@@ -7434,7 +7458,9 @@ class AuthService:
         # moved -- the directory taking over an identical manual scope changes no decision, so
         # there is nothing stale to drop -- but that write is still audited below.
         if decision.changes:
-            await self._store.revoke_user_sessions(user.id)
+            await self._revoke_after_commit(
+                user.id, change="ad_scope_resynced", actor=user.username, client=client
+            )
         await self._audit(
             "auth.ad_scope_resynced",
             actor=user.username,
@@ -10384,6 +10410,64 @@ class AuthService:
         )
         return not refused
 
+    async def _revoke_after_commit(
+        self, user_id: str, *, change: str, actor: str | None = None, client: str | None = None
+    ) -> RevokeResult:
+        """Revoke every session of ``user_id`` after a ``change`` that has already committed, such
+        as a password change, a disable or a role change (vault BACKLOG #3023).
+
+        Nothing undoes the change if this fails, so a store refusal is run again, up to
+        :data:`_POST_COMMIT_REVOKE_ATTEMPTS` times: at least a pool shortage at the acquire limit, a
+        statement timeout and a lost connection. Before, one refusal ended the request with the
+        change committed, every other session live and nothing recorded. A refusal on every attempt
+        is logged at ERROR first, then written as :data:`SESSIONS_REVOKE_FAILED_ACTION`, naming the
+        account and the change, since the change's own audit row, which its caller writes after
+        this, is lost with the raise. The refusal is then raised, so the caller still fails: the
+        account's other sessions stay live until they lapse. That row's own write can be refused on
+        the same store; that is logged, and the ERROR line is then the only trace.
+
+        Any other exception is raised at once, unretried: it reads as a defect, not a fault. A
+        cancellation is not an ``Exception`` and skips the retry and the row, as it does in
+        :meth:`_rotate_session_hash` (vault BACKLOG #3802)."""
+        refused: Exception | None = None
+        for attempt in range(1, _POST_COMMIT_REVOKE_ATTEMPTS + 1):
+            try:
+                return await self._store.revoke_user_sessions(user_id)
+            except _session_write_errors() as exc:
+                refused = exc
+                if attempt < _POST_COMMIT_REVOKE_ATTEMPTS:
+                    await asyncio.sleep(_POST_COMMIT_REVOKE_BACKOFF_SECONDS * attempt)
+        assert refused is not None  # the loop returns, or ran every attempt and refused each
+        _log.error(
+            "auth: the session revoke after a committed %s was refused by the store %d times (%s);"
+            " the account's other sessions stay live until they lapse",
+            change,
+            _POST_COMMIT_REVOKE_ATTEMPTS,
+            type(refused).__name__,
+            exc_info=refused,
+        )
+        try:
+            await self._audit(
+                SESSIONS_REVOKE_FAILED_ACTION,
+                actor=actor,
+                detail=_json(
+                    {
+                        "user_id": user_id,
+                        "change": change,
+                        "attempts": _POST_COMMIT_REVOKE_ATTEMPTS,
+                        "error": type(refused).__name__,
+                    }
+                ),
+                client=client,
+            )
+        except audit_write_errors() as exc:
+            _log.error(
+                "auth: the %s row for that refused revoke was refused too (%s)",
+                SESSIONS_REVOKE_FAILED_ACTION,
+                type(exc).__name__,
+            )
+        raise refused
+
     async def _elevated(
         self,
         token: str,
@@ -13185,7 +13269,9 @@ class AuthService:
         )
         if not written and covered:
             raise FactorEnrolmentRequired()
-        await self._store.revoke_user_sessions(identity.user_id)
+        await self._revoke_after_commit(
+            identity.user_id, change="password_changed", actor=identity.username, client=client
+        )
         await self._audit("auth.password_changed", actor=identity.username, client=client)
         user = await self._load_user(identity.user_id)
         await self._notify_security(
@@ -14792,7 +14878,7 @@ class AuthService:
                     None if stamped is None else stamped.password_changed_at
                 ),
             )
-        await self._store.revoke_user_sessions(user_id)
+        await self._revoke_after_commit(user_id, change="mfa_reset", actor=actor)
         # Straight after the revoke, before the audit row, so a raise from the audit or a notice
         # cannot skip it. It never raises itself.
         await self._clear_login_addresses(user_id, username=user.username)
@@ -15920,7 +16006,7 @@ class AuthService:
                 user_id, AdminRemoval.DISABLE, admin_role_id=Role.ADMINISTRATOR.value
             )
             if not refused:
-                await self._store.revoke_user_sessions(user_id)
+                await self._revoke_after_commit(user_id, change="account_disabled", actor=actor)
                 # After the write, so a request that read the row before it predates the exit.
                 self._forget_cert_probe_fault(user_id)
         elif disabled is not None:
@@ -15998,7 +16084,8 @@ class AuthService:
             assigned_by=actor,
         ):
             raise LastAdministratorRefused("cannot remove the last administrator")
-        await self._store.revoke_user_sessions(user_id)  # re-resolve permissions on next login
+        # Re-resolve permissions on the next login.
+        await self._revoke_after_commit(user_id, change="roles_changed", actor=actor)
         await self._audit(
             "user.roles_changed",
             actor=actor,
@@ -16144,7 +16231,7 @@ class AuthService:
         reduction / role deletion re-resolves on their next request (ADR 0045 D3)."""
         # Sorted, so a revoke a store fault interrupts stops at a repeatable point.
         for user_id in sorted(await self.sessions_ended_by_custom_role_save(role_id)):
-            await self._store.revoke_user_sessions(user_id)
+            await self._revoke_after_commit(user_id, change="custom_role_saved")
 
     async def admin_reset_password(self, user_id: str, *, actor: str) -> IssuedCredential:
         """Admin-initiated password reset (ASVS 6.4.6 / WP-L3-12). Generate a CSPRNG one-time password
@@ -16177,7 +16264,8 @@ class AuthService:
             must_change_password=True,
             password_generated=True,
         )
-        await self._store.revoke_user_sessions(user_id)  # invalidate any live sessions on reset
+        # Invalidate any live sessions on reset.
+        await self._revoke_after_commit(user_id, change="password_reset", actor=actor)
         await self._clear_login_addresses(user_id, username=user.username)  # as in admin_reset_mfa
         await self._audit(
             "auth.password_reset",
@@ -16858,7 +16946,7 @@ class AuthService:
             raise ChannelScopeSourceConflict(
                 "this channel scope changed hands while the write ran; re-read the user and retry"
             )
-        await self._store.revoke_user_sessions(user_id)
+        await self._revoke_after_commit(user_id, change="channel_scope_changed", actor=actor)
         await self._audit(
             "user.channel_scope_changed",
             actor=actor,
@@ -17002,7 +17090,7 @@ class AuthService:
             # absolute lifetime it found none, and those rows would come back on the old mapping
             # once the clock was set right. ``revoke_user_sessions`` matches every unrevoked row,
             # whatever the clock says, and costs one statement where the read cost one too.
-            revoked += (await self._store.revoke_user_sessions(user_id)).count
+            revoked += (await self._revoke_after_commit(user_id, change="ad_map_saved")).count
         return revoked
 
     async def sessions_ended_by_ad_map_save(self) -> frozenset[str]:
