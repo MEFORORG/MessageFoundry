@@ -959,6 +959,75 @@ async def test_the_reset_list_names_an_account_the_requirement_does_not_lock(out
         await store.close()
 
 
+async def _directory_account_with_a_passkey(store: MessageStore) -> str:
+    """A directory account with a refused TOTP and a discoverable passkey under :data:`RP`: never
+    lockable, so read by the census for the reset list alone. Returns its username."""
+    from messagefoundry.auth.tokens import credential_id_hash
+    from tests._webauthn_store_contract import _cred
+
+    await store.create_user(
+        user_id="dir-u1",
+        username="dir-alice",
+        auth_provider="ad",
+        password_generated=False,
+        now=1.0,
+        audits=(),
+    )
+    await store.add_webauthn_credential(
+        _cred(
+            "dir-u1",
+            "resident",
+            id_hash=credential_id_hash(b"dir-resident"),
+            rp_id=RP,
+            discoverable=True,
+        )
+    )
+    await _enable_totp(store, "dir-u1", _REFUSED_TOTP)
+    return "dir-alice"
+
+
+async def test_the_reset_list_names_a_directory_account() -> None:
+    """BACKLOG #3948 finding 11: a directory account is never lockable, and ``reset-mfa`` still
+    removes its passkey, so the reset list names it and no lockable list does."""
+    store = await MessageStore.open(":memory:")
+    try:
+        username = await _directory_account_with_a_passkey(store)
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
+        assert census.undecryptable_totp == (username,)
+        assert census.passkey_only == () and census.no_way_past == ()
+        assert census.reset_would_remove_a_passkey == (username,)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("decodes", [False, True], ids=["undecodable", "control-other-error"])
+async def test_a_passkey_set_the_driver_cannot_decode_does_not_stop_the_census(
+    monkeypatch: pytest.MonkeyPatch, decodes: bool
+) -> None:
+    """A passkey cell the driver cannot decode while fetching (sqlite3's message-only
+    ``OperationalError``) counts that account's set for nothing, as a row that does not parse does,
+    so the census still reports every other account. The control: any other ``OperationalError``
+    still propagates, since it says nothing about that set."""
+    store = await MessageStore.open(":memory:")
+    try:
+        await _directory_account_with_a_passkey(store)
+        message = "disk I/O error" if decodes else "Could not decode to UTF-8 column 'label'"
+
+        async def undecodable(user_id: str) -> Any:
+            raise sqlite3.OperationalError(message)
+
+        monkeypatch.setattr(store, "list_webauthn_credentials", undecodable)
+        if decodes:
+            with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+                await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
+            return
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
+        assert census.undecryptable_totp == ("dir-alice",)
+        assert census.reset_would_remove_a_passkey == ()
+    finally:
+        await store.close()
+
+
 async def test_a_refused_totp_can_be_removed_to_enrol_again() -> None:
     """``disable_mfa``: a TOTP this release refuses is no way past, so the way-past refusal does not
     keep it; removing it is the first step of enrolling again. Beside a passkey that is not

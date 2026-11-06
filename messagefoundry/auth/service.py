@@ -24,6 +24,7 @@ import os
 import re
 import secrets
 import socket
+import sqlite3
 import time
 import unicodedata
 import urllib.error
@@ -194,6 +195,7 @@ from messagefoundry.store.store import (
     WebAuthnCredential,
     ad_map_seal_ok,
     judge_totp_cell,
+    passkey_cell_undecodable,
     passkey_digest,
     passkey_is_way_past,
     passkey_is_way_past_under,
@@ -2688,6 +2690,17 @@ async def lockable_account_census(
             creds = await store.list_webauthn_credentials(user.id) if any_passkeys else []
         except PasskeyRowMalformed as exc:
             _log.warning("a passkey row of user %s did not parse (%s)", user.id, exc)
+            creds = []
+        except (UnicodeDecodeError, sqlite3.OperationalError) as exc:
+            # A cell the driver cannot decode while fetching (escalation_passkeys names both), on
+            # an account this census may now read for the reset list alone: counted for nothing,
+            # as a row that does not parse is, rather than losing every other account's finding.
+            if not passkey_cell_undecodable(exc):
+                raise
+            # The class name only: a decode error's message quotes the cell.
+            _log.warning(
+                "the passkeys of user %s could not be read (%s)", user.id, type(exc).__name__
+            )
             creds = []
         digest = user.row.cred_digest if user.row is not None else ""
         # Two questions, two rules (BACKLOG #3937). Whether a reset would remove a passkey that
@@ -5374,7 +5387,7 @@ class AuthService:
     async def _register_failure(
         self, user: UserRecord, now: float, *, counter: LockoutCounter
     ) -> LockoutIncrement:
-        """Record a failed attempt on ``counter``; return ``(attempts, just_locked, cycles)``.
+        """Record a failed attempt on ``counter``; return its :class:`LockoutIncrement`.
         ``just_locked`` is True only on the attempt that sets that counter's lock, so it fires exactly
         one lockout notification per lock.
 
@@ -13190,8 +13203,9 @@ class AuthService:
         between this read and the write makes the write match no row, and the change is refused
         rather than landing on an account with no way past.
 
-        The TOTP cell is opened ONCE per change, by the store's conditional write (BACKLOG #3948
-        finding 13). The early refusal here opens none: it refuses an account with no TOTP on and no
+        This method opens the TOTP cell ONCE, in the store's conditional write (BACKLOG #3948
+        finding 13); a route that asks :meth:`must_enrol_before_rotating` first opens it once more
+        there, before the current password. The early refusal here opens none: it refuses an account with no TOTP on and no
         passkey that counts, as :meth:`_has_way_past` would, and leaves a TOTP that is on to the
         write's own judgement, which refuses a KNOWN refusal there.
         """
@@ -13248,8 +13262,8 @@ class AuthService:
         A passkey registered before wave 2, or one whose client reported it was not made
         discoverable, cannot be found by the usernameless ceremony, so it is a second factor
         everywhere else but no way past the lock (the amendment's fact 11). It answers for the
-        factor-drop gates, at least the rotation gate and its courtesy twin
-        :meth:`must_enrol_before_rotating`, so a passkey counts only under the configured relying
+        factor-drop gates, at least the rotation's courtesy check :meth:`must_enrol_before_rotating`
+        (the rotation's own write judges the TOTP itself, BACKLOG #3948 finding 13), so a passkey counts only under the configured relying
         party (:meth:`_gate_counts`, BACKLOG #3937)."""
         return await self._totp_way_past(user) or await self._holds_gate_passkey(user)
 
@@ -13267,8 +13281,9 @@ class AuthService:
         never pass a lock, and it is no way past (BACKLOG #3422). The cell is the one the checked
         record's seal covered, judged by the store's :func:`judge_totp_cell`, off the event loop:
         the same judgement the store's conditional writes and the lock escalation make on the cell
-        they lock (BACKLOG #3948 finding 17). The service's way-past decisions ask this: the
-        rotation and removal gates, the last-factor rule and the lock notice."""
+        they lock (BACKLOG #3948 finding 17). The service's way-past decisions ask this: at least
+        the rotation's courtesy check, the removal gates, the last-factor rule, and the lock notice
+        where the escalation judged nothing."""
         if not user.totp_enabled:
             return None
         if user.totp_secret_cell is None:
@@ -13478,9 +13493,9 @@ class AuthService:
         keep_passkey = census.reset_would_remove_a_passkey
         if keep_passkey:
             _log.warning(
-                "ADR 0197: %d of those also hold a discoverable passkey that still gets them past a "
-                "lock: %s. A factor reset (POST /users/{id}/reset-mfa) would also remove that "
-                "passkey. For a cell that does not open, fix the store key; for an enrolment this "
+                "ADR 0197: %d account(s) with a TOTP that is unusable or could not be checked also "
+                "hold a discoverable passkey that may still sign them in: %s. A factor reset "
+                "(POST /users/{id}/reset-mfa) would also remove that passkey. For a cell that does not open, fix the store key; for an enrolment this "
                 "release refuses, ask the holder to remove the authenticator app and enrol it again.",
                 len(keep_passkey),
                 ", ".join(keep_passkey),

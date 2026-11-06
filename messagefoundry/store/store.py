@@ -3300,6 +3300,15 @@ def sets_a_later_sign_in_lock(row: UserRecord | UserRow, threshold: int, now: fl
 _SQLITE_DECODE_FAILURE = "Could not decode to UTF-8 column"
 
 
+def passkey_cell_undecodable(exc: BaseException) -> bool:
+    """Whether ``exc`` is a driver failing to decode a passkey cell while fetching, before any row
+    is parsed: pyodbc's ``UnicodeDecodeError``, or sqlite3's ``OperationalError`` told apart only by
+    its message (:func:`escalation_passkeys`). A reader that counts such a set for nothing asks it."""
+    if isinstance(exc, UnicodeDecodeError):
+        return True
+    return isinstance(exc, sqlite3.OperationalError) and str(exc).startswith(_SQLITE_DECODE_FAILURE)
+
+
 async def escalation_passkeys(
     counter: LockoutCounter,
     *,
@@ -3333,10 +3342,10 @@ async def escalation_passkeys(
         return None
     try:
         return await read_passkeys()
-    except (PasskeyRowMalformed, UnicodeDecodeError) as exc:
+    except PasskeyRowMalformed as exc:
         failure = type(exc).__name__
-    except sqlite3.OperationalError as exc:
-        if not str(exc).startswith(_SQLITE_DECODE_FAILURE):
+    except (UnicodeDecodeError, sqlite3.OperationalError) as exc:
+        if not passkey_cell_undecodable(exc):
             raise
         failure = type(exc).__name__
     # The class name only: a decode error's message and arguments quote the cell.
@@ -3569,8 +3578,7 @@ def lockout_increment(
             escalate=lockout_escalates(
                 counter,
                 auth_provider=r.row.auth_provider,
-                totp_enabled=r.row.totp_enabled
-                and not (judged is not None and judged.state == "refused"),
+                totp_enabled=r.row.totp_enabled and not (judged is not None and judged.refuses(r)),
                 passkey_way_past=passkey_way_past(r),
             ),
             lockable=lockout_arms(counter, password_generated=r.row.password_generated),
@@ -8237,9 +8245,11 @@ class LockoutIncrement(NamedTuple):
     attempt set the lock, and the counter's cycle count after it (the notice reports it).
 
     ``totp_state`` is the TOTP verdict the SIGN-IN lock's escalation used (:func:`judge_totp`), on
-    the cell the locked row still holds, or ``None`` where the escalation used none: a first lock,
-    a failure that sets no later-cycle lock, the second-step counter, or a cell that moved since
-    the judgement. The lock notice reads it, so it tells the owner what the escalation decided on
+    the cell the locked row still holds, or ``None`` where it used none: at least the second-step
+    counter, a cell that moved since the judgement, and a failure whose pre-lock read said it sets
+    no later-cycle lock. The judgement runs on that pre-lock read, so a racing write can leave a
+    verdict on a failure that sets a first lock or none: read it beside ``just_locked``, never as
+    proof of a later-cycle lock. The lock notice reads it, so it tells the owner what the escalation decided on
     rather than judging the cell again (BACKLOG #3948 finding 16)."""
 
     attempts: int
