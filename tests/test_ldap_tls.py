@@ -8,6 +8,8 @@ server thread, so each claim is a handshake rather than an attribute read:
 
 * the anchored CA verifies, a foreign CA is refused, and ldap3's own host name check still runs
   after the handshake (and still does not run with verification off, as in ldap3);
+* a host name refusal closes the TLS socket it wrapped, where ldap3's own ``Tls``, the control,
+  leaves it to the collector (BACKLOG #3017);
 * the copy of ldap3's wrap step is pinned to the ldap3 source it was taken from;
 * on an interpreter with ``SSLContext.set_ciphersuites`` (CPython 3.15) the hop refuses a TLS 1.3
   peer offering only ``TLS_AES_128_GCM_SHA256``, while ldap3's own ``Tls`` accepts it as the
@@ -182,12 +184,11 @@ def test_ldap3s_host_name_check_still_runs_after_the_handshake(pki: _Pki) -> Non
         _bind(_tls(Path(pki.ca).read_text()), _server(pki), host="dc1.example.test")
 
 
-def test_a_host_name_refusal_closes_the_tls_socket_it_wrapped(pki: _Pki) -> None:
-    """A real host name mismatch after a completed handshake, against a TLS listener on localhost
-    whose leaf names ``localhost`` while the bind checks ``dc1.example.test``. The refusal is raised
-    and still held, so its traceback keeps every frame alive, and the domain controller must
-    still see the socket end. The rule this pins is stated once, in
-    :func:`messagefoundry.auth.ldap._close_without_sending` (BACKLOG #3017)."""
+def _dc_sees_the_end_of_a_host_name_refusal(tls: Any, pki: _Pki, wait: float) -> bool:
+    """Run ``tls.wrap_socket`` against a TLS listener on localhost whose leaf names ``localhost``
+    while the bind checks ``dc1.example.test``, so the handshake completes and the host name check
+    refuses. With the refusal still held, its traceback keeps every frame alive. Returns whether
+    the listener saw the connection end within ``wait`` seconds."""
     listener = socket.create_server(("127.0.0.1", 0))
     listener.settimeout(10)
     ended = threading.Event()
@@ -196,17 +197,16 @@ def test_a_host_name_refusal_closes_the_tls_socket_it_wrapped(pki: _Pki) -> None
     def serve() -> None:
         # The client may close before this side's handshake finishes, so an end read during the
         # handshake counts as well as one read after it. A timeout is not an end.
-        with contextlib.suppress(TimeoutError):
+        try:
             raw, _addr = listener.accept()
             raw.settimeout(10)
-            try:
-                with server.wrap_socket(raw, server_side=True) as wrapped:
-                    if wrapped.recv(1) == b"":
-                        ended.set()
-            except TimeoutError:
-                raise
-            except (ssl.SSLError, OSError):
-                ended.set()
+            with server.wrap_socket(raw, server_side=True) as wrapped:
+                if wrapped.recv(1) == b"":
+                    ended.set()
+        except TimeoutError:
+            pass
+        except OSError:
+            ended.set()
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
@@ -215,16 +215,41 @@ def test_a_host_name_refusal_closes_the_tls_socket_it_wrapped(pki: _Pki) -> None
     held: LDAPCertificateError | None = None
     try:
         try:
-            _tls(Path(pki.ca).read_text()).wrap_socket(conn, do_handshake=True)
+            tls.wrap_socket(conn, do_handshake=True)
         except LDAPCertificateError as refused:
             held = refused
         assert held is not None, "the host name check did not refuse"
-        assert ended.wait(timeout=5), "the domain controller never saw the TLS socket close"
+        return ended.wait(timeout=wait)
     finally:
+        # Close whatever TLS socket the refusing frame still holds, so a control that leaks it
+        # ends cleanly rather than at the collector.
+        tb = held.__traceback__ if held is not None else None
+        while tb is not None:
+            for leaked in list(tb.tb_frame.f_locals.values()):
+                if isinstance(leaked, ssl.SSLSocket):
+                    leaked.close()
+            tb = tb.tb_next
         held = None
+        conn.socket.close()
         client.close()
         listener.close()
         thread.join(10)
+
+
+def test_a_host_name_refusal_closes_the_tls_socket_it_wrapped(pki: _Pki) -> None:
+    """A real host name mismatch after a completed handshake: the engine's ``Tls`` closes the TLS
+    socket it wrapped, so the domain controller sees the end while the refusal is still held.
+    ldap3's own ``Tls`` is the control: it leaves that socket to the collector, so the same
+    instrument sees no end. The rule this pins is stated once, in
+    :func:`messagefoundry.auth.ldap._close_without_sending` (BACKLOG #3017)."""
+    ca = Path(pki.ca).read_text()
+    control = ldap3.Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=ca)
+    assert not _dc_sees_the_end_of_a_host_name_refusal(control, pki, wait=1), (
+        "the control saw an end, so the instrument cannot tell a closed socket from a leaked one"
+    )
+    assert _dc_sees_the_end_of_a_host_name_refusal(_tls(ca), pki, wait=5), (
+        "the domain controller never saw the TLS socket close"
+    )
 
 
 def test_a_dc_outside_the_anchor_is_refused(pki: _Pki, tmp_path: Path) -> None:

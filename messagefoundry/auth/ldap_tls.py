@@ -10,7 +10,9 @@ replaces the one method that builds the context. The context comes from
 
 **What is copied from ldap3, and why.** The wrap step below is ldap3's own, for the arguments the
 engine passes: wrap the socket client-side, then, on a handshake with verification on, run ldap3's
-host name check. That check is ldap3's function, called, not copied. The alternative was to patch
+host name check. That check is ldap3's function, called, not copied. **One deliberate difference:**
+when that check refuses, this copy closes the TLS socket before it re-raises, where ldap3 leaves it
+to the collector (BACKLOG #3017; keep it when re-deriving). The alternative was to patch
 ``ldap3.core.tls.create_default_context`` for the length of one call. That is a module global, and
 ``AuthService`` runs binds on worker threads, so two concurrent binds could each see the other's
 patch. ``tests/test_ldap_tls.py`` pins the source of ldap3's ``wrap_socket``, so an ldap3 that
@@ -128,7 +130,13 @@ class NarrowedTls(ldap3.Tls):  # type: ignore[misc]  # ldap3 ships no type infor
                 check_hostname(wrapped, connection.server.host, self.valid_names)
             except BaseException:
                 # ssl took the socket over, so ``connection.socket`` holds a detached one and no
-                # caller can reach ``wrapped``: close it here (``_close_without_sending``).
-                wrapped.close()
+                # caller can reach ``wrapped``: close it here (``_close_without_sending``). A close
+                # fault must not replace the refusal, so it is logged and dropped, as ssl does.
+                try:
+                    wrapped.close()
+                except OSError as failed:
+                    logger.debug(
+                        "LDAPS socket close after a host name refusal: %s", type(failed).__name__
+                    )
                 raise
         connection.socket = wrapped
