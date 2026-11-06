@@ -83,12 +83,12 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # check, and a drift arrives as a test diff on the engine or console side that the
         # tooling job's path gate would not see. Ambiguous, so it stays.
         "test_browser_standin_copies_agree.py",
-        # Reads messagefoundry/config/ai_policy.py, messagefoundry/anon/__init__.py and
+        # Reads messagefoundry/config/ai_policy.py, messagefoundry_toolkit/anon/__init__.py and
         # harness/load/corpus.py off disk (BACKLOG #2996). It fails when the ai_policy or corpus
         # docstring calls the anonymizer's output PHI-free again. Its anon/__init__.py arm is about
         # the "byte-identical tee/anon/" claim only: it fails when that docstring makes the claim
-        # again. Either change arrives as an ENGINE or harness diff, which does not trip the
-        # tooling path gate. Its other arms read docs/*.md, and they are not the reason it stays.
+        # again. Either change arrives as an ENGINE, toolkit or harness diff, which does not trip
+        # the tooling path gate. Its other arms read docs/*.md, and they are not the reason it stays.
         "test_anon_doc_claims.py",
         # Reads messagefoundry/config/settings.py off disk and parses the comment above
         # AuthSettings.require_mfa (vault BACKLOG #3474). It fails when that comment gives the old
