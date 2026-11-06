@@ -55,11 +55,13 @@ import json
 import logging
 import math
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, NoReturn
 from uuid import uuid4
 
+from messagefoundry.api.approval_models import OwnerLiveness
 from messagefoundry.api.models import ReleaseBlocked
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth.identity import Identity
@@ -80,7 +82,13 @@ from messagefoundry.store.row_seal import (
     RowSealError,
     SealFailureThrottle,
 )
-from messagefoundry.store.store import ApprovalRow, AuditAppend, approval_seal_ok
+from messagefoundry.store.store import (
+    ANY_CLAIM_OWNER,
+    ApprovalRow,
+    AuditAppend,
+    ClaimOwnerGuard,
+    approval_seal_ok,
+)
 
 log = logging.getLogger(__name__)
 
@@ -141,6 +149,54 @@ def named_requester(params: Mapping[str, Any]) -> str | None:
 #: store would share it; that layout is unsupported for other reasons too (``__main__`` says why).
 DEFAULT_CLAIM_OWNER = "engine"
 
+#: Whether cluster node ``node_id`` heartbeats (BACKLOG #1562): ``True`` for a fresh heartbeat,
+#: ``False`` for a lapsed one or no such node, ``None`` when this engine reads no cluster heartbeats
+#: at all. A raise is a failed read. The API wiring reads ``Engine.coordinator``; injected so this
+#: module never reaches the pipeline.
+NodeLiveness = Callable[[str], Awaitable[bool | None]]
+
+#: Each refused :data:`~messagefoundry.api.approval_models.OwnerLiveness`, with its status and why
+#: (BACKLOG #1562). A failed heartbeat read is a 503 to retry; the rest are 409s that no retry
+#: clears while they hold. :meth:`ApprovalGate.interrupt_stranded` has the three tiers.
+_INTERRUPT_REFUSED: Mapping[str, tuple[int, str]] = {
+    "releasing_here": (
+        409,
+        "this engine process is running this release now, so it records its own outcome",
+    ),
+    "owner_heartbeat_fresh": (
+        409,
+        "the cluster node that claimed this release still heartbeats, so it may be running it",
+    ),
+    "owner_heartbeat_unreadable": (
+        503,
+        "the cluster heartbeats could not be read, so the owner may be live; try again once the "
+        "store answers",
+    ),
+    "owner_heartbeat_unavailable": (
+        409,
+        "a cluster node claimed this release, and this engine reads no cluster heartbeats, so it "
+        "cannot tell whether that node is live; interrupt it from a cluster node",
+    ),
+}
+
+#: The outcome rows a release writes, each mapped to the status it records (BACKLOG #1562). The
+#: restart reconcile reads them: a release whose status write failed may still have its outcome
+#: row in the trail, and that row says what happened. ``approval.interrupted`` records an unknown
+#: outcome, so it maps to ``None``, as finding no row does.
+_OUTCOME_ROWS: Mapping[str, str | None] = {
+    "approval.approved": "approved",
+    "approval.failed": "failed",
+    "approval.interrupted": None,
+}
+
+#: How many rows of each outcome action the reconcile reads, newest first, back to just before the
+#: request. A read that fills it may have missed the row, so the outcome then counts as unknown.
+_OUTCOME_SCAN_LIMIT = 5000
+
+#: How far before a request's own time the outcome read starts. The outcome row is stamped by the
+#: store's clock after the claim, so this only absorbs a clock step back between the two.
+_OUTCOME_SCAN_SLACK_SECONDS = 300.0
+
 #: How many open requests :meth:`ApprovalGate.rejoin` reads, newest first. A repeat whose request
 #: sits further back is not found there and falls through to the proof and :meth:`ApprovalGate.guard`,
 #: whose own repeat rule still joins it; only the proof-free path is lost. A renamed requester's
@@ -199,6 +255,8 @@ class RestartReconciliation:
     unsettled: tuple[str, ...]
     #: Rows another claim owner holds. Left alone: the owner may be alive and running them.
     foreign: tuple[str, ...]
+    #: Rows this process had claimed whose outcome the audit trail records, now at that outcome.
+    settled: tuple[str, ...] = ()
 
 
 def _stored_params(
@@ -253,6 +311,48 @@ def _audit_detail(fields: Mapping[str, Any]) -> str:
             scrub_log_argument(", ".join(degraded)),
         )
         return json.dumps(safe, default=str)
+
+
+def _audited_id(detail: Any) -> str | None:
+    """The ``approval_id`` an approval audit row's JSON detail names, or ``None`` when the detail
+    is not a JSON object naming one (BACKLOG #1562)."""
+    parsed, refusal = json_loads_or_refusal(str(detail))
+    if refusal is not None or not isinstance(parsed, dict):
+        return None
+    found = parsed.get("approval_id")
+    return found if isinstance(found, str) else None
+
+
+def _claim_time(row: ApprovalRow, clock: Callable[[], float]) -> float:
+    """``row``'s claim time, which a move out of ``executing`` keeps in ``decided_at`` (BACKLOG
+    #1562); ``clock()`` only for a row that somehow has none."""
+    return clock() if row.decided_at is None else row.decided_at
+
+
+def _stranded_fields(row: ApprovalRow, reason: str, **extra: Any) -> dict[str, Any]:
+    """The detail of a row moved out of ``executing`` by a restart or by an operator (BACKLOG
+    #1562): the release, its claim owner and claim time, ``reason``, and ``extra``."""
+    return {
+        "approval_id": row.id,
+        "operation": row.operation,
+        "requester": row.requester,
+        "approver": row.approver,
+        "claim_owner": row.claim_owner,
+        "claimed_at": row.decided_at,
+        "reason": reason,
+        "recorded": True,
+        **extra,
+    }
+
+
+def _interrupt_verdict(
+    liveness: OwnerLiveness,
+) -> Literal["refused", "needs_attestation", "allowed"]:
+    """What :meth:`ApprovalGate.interrupt_stranded` does on ``liveness``: the one rule the listing
+    and the route both read (BACKLOG #1562)."""
+    if liveness in _INTERRUPT_REFUSED:
+        return "refused"
+    return "needs_attestation" if liveness == "attestation_required" else "allowed"
 
 
 def _encodable_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -391,6 +491,7 @@ class ApprovalGate:
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.time,
         claim_owner: str | Callable[[], str | None] = DEFAULT_CLAIM_OWNER,
+        node_liveness: NodeLiveness | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -404,6 +505,13 @@ class ApprovalGate:
         # (_owner_for_claim). Either way the owner never changes once a claim carries it.
         self._claim_owner_source = claim_owner
         self._claim_owner_value = claim_owner if isinstance(claim_owner, str) else None
+        # Read by interrupt_stranded on a release a cluster node claimed (BACKLOG #1562). With none,
+        # every such release reads owner_heartbeat_unavailable and is refused.
+        self._node_liveness = node_liveness
+        # The releases this gate is running, from before the claim until the outcome is written:
+        # interrupt_stranded refuses each, because this process records that outcome itself. The
+        # outcome write shows in _inflight.
+        self._releasing: Counter[str] = Counter()
         self._ops: dict[str, _Operation] = {}
         # Wall-clock seconds, injectable so a test can drive the expiry ceiling and the dwell floor.
         self._clock = clock
@@ -456,6 +564,13 @@ class ApprovalGate:
 
     def _forget(self, task: asyncio.Future[Any]) -> None:
         self._inflight.pop(task, None)
+
+    def _release_done(self, approval_id: str) -> None:
+        """One release of ``approval_id`` in this gate stopped running. Counted, so a second
+        approve of the same request, which loses the claim, cannot untrack the one that won."""
+        self._releasing[approval_id] -= 1
+        if self._releasing[approval_id] <= 0:
+            del self._releasing[approval_id]
 
     @property
     def claim_owner(self) -> str:
@@ -555,17 +670,21 @@ class ApprovalGate:
         row this process claimed in its previous life and never settled is a release whose outcome
         the gate never recorded. At least three things leave one: the process died mid-run, both of
         :meth:`_settle`'s writes failed (the operation ran), or a claim committed but its reply was
-        lost (nothing ran). The audit trail may say which; the status does not, so each such row
-        moves to ``interrupted``
-        with an ``approval.interrupted`` audit row in the SAME write (vault BACKLOG #2255), whose
-        ``reason`` is ``engine_restart``. Nothing re-runs: an operator records what happened through
+        lost (nothing ran). The status cannot say which, but the audit trail sometimes can, so it
+        is read first (:meth:`_recorded_outcome`). A row whose outcome row is there moves to the
+        status that row records, ``approved`` or ``failed``, with an ``approval.reconciled`` audit
+        row naming it. Every other row moves to ``interrupted`` with an ``approval.interrupted``
+        audit row. Each audit row is in the SAME write as its move (vault BACKLOG #2255), and its
+        ``reason`` is ``engine_restart``. The move keeps the row's ``decided_at``, the claim time.
+        Nothing re-runs: an operator records what happened to an ``interrupted`` row through
         :meth:`resolve_interrupted`, exactly as for a release cut off by a cancel.
 
         **Only this process's rows.** Engine shards and cluster nodes share one store, so an
         ``executing`` row may be a sibling's release still running. A row moves only when its
         ``claim_owner`` is this gate's. Any other row is left alone and logged at WARNING, with its
         owner and claim time. If that owner never comes back, the row stays ``executing``: the
-        gate cannot tell a dead owner from a slow one, so it does not guess on a timer.
+        gate cannot tell a dead owner from a slow one, so it does not guess on a timer. An operator
+        can move it through :meth:`interrupt_stranded`, which judges the owner first.
 
         **A row with no owner is treated as this process's.** Only a claim made before the
         ``claim_owner`` column existed has none. Nothing was deployed then (CLAUDE.md section 0),
@@ -590,6 +709,7 @@ class ApprovalGate:
         """The body of :meth:`reconcile_after_restart` under owner ``me``. With
         ``claimed_before``, a row claimed at or after that time is left alone: it is this life's."""
         interrupted: list[str] = []
+        settled: list[str] = []
         unsettled: list[str] = []
         # Filtered in SQL, so other owners' stranded rows cannot push ours past the read's cap.
         # A row that fails its seal is reported and left as it is: the store would refuse the move
@@ -600,29 +720,29 @@ class ApprovalGate:
             if claimed_before is not None and (row.decided_at or 0.0) >= claimed_before:
                 continue  # claimed by this process since it started, so not a leftover
             approval_id = row.id
-            approver = row.approver
-            detail = json.dumps(
-                {
-                    "approval_id": approval_id,
-                    "operation": row.operation,
-                    "requester": row.requester,
-                    "approver": approver,
-                    "claim_owner": row.claim_owner,
-                    "claimed_at": row.decided_at,
-                    "reason": "engine_restart",
-                    "recorded": True,
-                }
-            )
+            # A release whose status write failed may have written its outcome row anyway, and
+            # then the trail knows what the status does not. Only an unknown outcome is
+            # 'interrupted'; a known one is settled to what the trail says.
+            known = await self._recorded_outcome(row)
+            if known is None:
+                status, audit = "interrupted", "approval.interrupted"
+                fields = _stranded_fields(row, "engine_restart")
+            else:
+                status, audit = known[0], "approval.reconciled"
+                fields = _stranded_fields(
+                    row, "engine_restart", status=status, outcome_audit_id=known[1]
+                )
             try:
                 # Guarded on 'executing' and written back with the releasing approver, as the
-                # resolve path does: the column says who released the request.
+                # resolve path does: the column says who released the request. ``decided_at``
+                # keeps the claim time; the audit row's own time says when this ran.
                 moved = await self._store.decide_pending_approval(
                     approval_id,
-                    status="interrupted",
-                    approver=approver,
-                    decided_at=self._clock(),
+                    status=status,
+                    approver=row.approver,
+                    decided_at=_claim_time(row, self._clock),
                     from_status="executing",
-                    audit=AuditAppend("approval.interrupted", actor="system", detail=detail),
+                    audit=AuditAppend(audit, actor="system", detail=_audit_detail(fields)),
                 )
             except RowSealError:
                 # Changed outside the store between the read and the move. Nothing re-seals it,
@@ -631,14 +751,15 @@ class ApprovalGate:
                 continue
             except Exception:  # noqa: BLE001 - every store backend raises its own type
                 log.exception(
-                    "approval %s: could not mark this process's leftover 'executing' release "
-                    "interrupted; it stays 'executing' and the next start tries again",
+                    "approval %s: could not move this process's leftover 'executing' release to "
+                    "'%s'; it stays 'executing' and the next start tries again",
                     approval_id,
+                    status,
                 )
                 unsettled.append(approval_id)
                 continue
             if moved:
-                interrupted.append(approval_id)
+                (interrupted if known is None else settled).append(approval_id)
             else:
                 log.info(
                     "approval %s: settled by another caller between the read and the move",
@@ -646,18 +767,18 @@ class ApprovalGate:
                 )
         foreign: list[str] = []
         # Only logged, never acted on, so this read needs no seal check. Its values are scrubbed,
-        # since an unchecked row may carry anything.
-        for other in await self._store.list_executing_approvals():
-            owner = other["claim_owner"]
-            if owner is None or str(owner) == me:
-                continue  # a row of ours, already moved, logged or reported above
+        # since an unchecked row may carry anything. Filtered in SQL to other owners' rows, so
+        # rows of ours that stayed 'executing' cannot fill the cap and hide a sibling's.
+        for other in await self._store.list_executing_approvals(not_claimed_by=me):
             foreign.append(str(other["id"]))
             log.warning(
                 "approval %s: still 'executing' under claim owner %s since %s. This process is "
-                "%s, so it leaves the row alone; it moves to 'interrupted' only when an engine "
-                "with that owner starts, which an unpinned cluster node never does",
+                "%s, so it leaves the row alone. It moves to 'interrupted' when an engine with "
+                "that owner starts, which an unpinned cluster node never does, or when an "
+                "operator interrupts it through POST /approvals/{id}/interrupt once its owner "
+                "reads as stopped (GET /approvals/executing)",
                 scrub_log_argument(str(other["id"])),
-                scrub_log_argument(str(owner)),
+                scrub_log_argument(str(other["claim_owner"])),
                 scrub_log_argument(str(other["decided_at"])),
                 me,
             )
@@ -669,7 +790,61 @@ class ApprovalGate:
                 len(interrupted),
                 ", ".join(interrupted),
             )
-        return RestartReconciliation(tuple(interrupted), tuple(unsettled), tuple(foreign))
+        if settled:
+            log.warning(
+                "approvals: %d release(s) this process claimed before it restarted had an outcome "
+                "in the audit trail but not in their status, so they now read that outcome "
+                "(approval.reconciled); approval ids: %s",
+                len(settled),
+                ", ".join(settled),
+            )
+        return RestartReconciliation(
+            tuple(interrupted), tuple(unsettled), tuple(foreign), tuple(settled)
+        )
+
+    async def _recorded_outcome(self, row: ApprovalRow) -> tuple[str, int] | None:
+        """The status the audit trail records for release ``row``, with the id of the outcome row
+        that records it, or ``None`` when the outcome is unknown (BACKLOG #1562).
+
+        It reads each outcome action in :data:`_OUTCOME_ROWS` written by the approver who released
+        it, as every outcome row is, back to just before the claim, and keeps the rows naming this
+        request. Exactly one known outcome, and no ``approval.interrupted``, is a known outcome.
+        Anything else is unknown: no row, an ``approval.interrupted``, two outcomes that disagree,
+        a row with no approver, a read that fills :data:`_OUTCOME_SCAN_LIMIT`, or a read that
+        fails, which is logged. An unknown outcome is ``interrupted``, which claims nothing, so a
+        doubt here never records a release as run or as not run."""
+        if row.approver is None:
+            return None  # no approver to read the trail by; `actor=None` would read everyone's
+        since = row.requested_at if row.decided_at is None else row.decided_at
+        since -= _OUTCOME_SCAN_SLACK_SECONDS
+        found: dict[str | None, int] = {}
+        try:
+            for action, status in _OUTCOME_ROWS.items():
+                entries = await self._store.list_audit(
+                    action=action, actor=row.approver, since=since, limit=_OUTCOME_SCAN_LIMIT
+                )
+                if len(entries) >= _OUTCOME_SCAN_LIMIT:
+                    log.warning(
+                        "approval %s: the trail holds too many %s rows to read for its outcome, so "
+                        "it counts as unknown",
+                        row.id,
+                        action,
+                    )
+                    return None
+                for entry in entries:
+                    if _audited_id(entry["detail"]) == row.id:
+                        found.setdefault(status, int(entry["id"]))
+        except Exception:  # noqa: BLE001 - an unread trail leaves the outcome unknown, not an error
+            log.exception(
+                "approval %s: the audit trail could not be read for its outcome, so it counts as "
+                "unknown",
+                row.id,
+            )
+            return None
+        if len(found) != 1:
+            return None
+        [(status, audit_id)] = found.items()
+        return None if status is None else (status, audit_id)
 
     def register(
         self,
@@ -1492,6 +1667,11 @@ class ApprovalGate:
                 claim_owner=self._owner_for_claim(),
             )
         )
+        # Live from before the claim lands, so the row never reads 'executing' here untracked; a
+        # claim that did not land is untracked again in the `finally`, an executed one in the
+        # `finally` of the run below (BACKLOG #1562).
+        self._releasing[approval_id] += 1
+        claimed = False
         try:
             claimed = await _outlive_caller(claim)
         except RowSealError as exc:
@@ -1531,6 +1711,9 @@ class ApprovalGate:
                     "again once the store accepts writes"
                 ),
             ) from exc
+        finally:
+            if not claimed:
+                self._release_done(approval_id)
         if not claimed:
             raise ApprovalError(409, "request was already decided")
         try:
@@ -1596,6 +1779,8 @@ class ApprovalGate:
                 approval_id,
             )
         finally:
+            # The outcome is written, or its write is still running in _inflight.
+            self._release_done(approval_id)
             # After the transition, so only a release that really happened is flagged, and in a
             # `finally`, so the flag lands whether the executor succeeded, failed or was cancelled.
             # On success it now lands AFTER approval.approved (the settle is in `else`), so a
@@ -2355,6 +2540,167 @@ class ApprovalGate:
                 409, "request is no longer interrupted; another operator resolved it first"
             )
 
+    # --- stranded 'executing' releases (BACKLOG #1562) -----------------------------------------------
+
+    async def list_executing(self) -> list[dict[str, Any]]:
+        """Every release still claimed as ``executing``, oldest claim first, each with what
+        :meth:`interrupt_stranded` would judge of its owner now (BACKLOG #1562).
+
+        A release whose owner never returns stays ``executing``, and the restart reconcile only
+        ever moves a process's own rows, so this is where an operator finds one. Params are left
+        out: nothing here acts on them. A row that fails its seal is reported and left out, since
+        nothing could move it anyway. The verdict is a reading, not a promise: the owner can stop
+        or come back before an interrupt, which judges again."""
+        await self._catch_up_reconcile()
+        rows = await self._verified_rows(
+            await self._read(self._store.list_executing_approvals(), what="the executing releases")
+        )
+        me = self.claim_owner
+        heartbeats: dict[str, OwnerLiveness] = {}
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            liveness = await self._owner_liveness(row, heartbeats)
+            out.append(
+                {
+                    "id": row.id,
+                    "operation": row.operation,
+                    "operation_label": self._label(row.operation),
+                    "requester": row.requester,
+                    "approver": row.approver,
+                    "requested_at": row.requested_at,
+                    "claimed_at": row.decided_at,
+                    "claim_owner": row.claim_owner,
+                    "this_process": row.claim_owner == me,
+                    "liveness": liveness,
+                    "interrupt": _interrupt_verdict(liveness),
+                }
+            )
+        return out
+
+    async def interrupt_stranded(
+        self,
+        approval_id: str,
+        *,
+        actor: str,
+        attest_owner_stopped: bool = False,
+        client: str | None = None,
+    ) -> dict[str, Any]:
+        """Move a release stranded in ``executing`` to ``interrupted``, so it takes the ordinary
+        resolve path (BACKLOG #1562). The owner-delegated decision of 2026-10-29
+        (d20261029T205247402-81159c) rules what this does, in three tiers:
+
+        - a release THIS process is running, or whose outcome it is still writing, is refused, 409;
+        - a release a cluster node claimed (``node:<id>``) is refused while that node's heartbeat is
+          fresh, 409, and when the heartbeats cannot be read, 503, or are not read by this engine,
+          409. A lapsed heartbeat, or no such node, lets it move. A node whose ``node_id`` was not
+          pinned comes back under a new id, so its old claims read as lapsed here;
+        - any other owner, an engine shard (``shard:<id>``), a plain engine (``engine``), no owner
+          at all, or one this gate does not recognise, is a name no heartbeat covers. It moves only
+          on ``attest_owner_stopped``, the operator's word that the owning process is stopped,
+          which the audit row records; without it, 409.
+
+        It never runs the operation, and it moves only to ``interrupted``, never to an outcome:
+        what the release did is still for an operator to record through
+        :meth:`resolve_interrupted`. The move is guarded on ``executing`` and on the claim owner
+        it judged, and its ``approval.interrupted`` row, against the operator, is in the SAME
+        write, so a row that moved or changed owner since moves nothing and answers 409. A write
+        fault answers 503 and pages ``audit_write_failed``. ``decided_at`` keeps the claim time.
+        The route requires ``approvals:approve`` with a fresh step-up."""
+        row = await self._load(
+            approval_id,
+            status="executing",
+            wrong=lambda current: (
+                f"request is {current}; only an executing release can be interrupted here"
+            ),
+        )
+        liveness = await self._owner_liveness(row, {})
+        verdict = _interrupt_verdict(liveness)
+        if verdict == "refused":
+            raise ApprovalError(*_INTERRUPT_REFUSED[liveness])
+        if verdict == "needs_attestation" and not attest_owner_stopped:
+            raise ApprovalError(
+                409,
+                f"claim owner {scrub_log_argument(str(row.claim_owner))} has no heartbeat to "
+                "read, so only an operator can say it is stopped. Check that no engine process "
+                "under that name is running, then interrupt again with attest_owner_stopped",
+            )
+        detail = _audit_detail(
+            _stranded_fields(
+                row,
+                "operator_interrupt",
+                liveness=liveness,
+                owner_stopped_attested=attest_owner_stopped,
+            )
+        )
+        moved = await self._shielded(
+            self._decide_or_503(
+                approval_id,
+                what="interrupt",
+                retry="If the release still reads executing, interrupt it again",
+                status="interrupted",
+                approver=row.approver,
+                from_status="executing",
+                from_claim_owner=row.claim_owner,
+                decided_at=_claim_time(row, self._clock),
+                audit=AuditAppend(
+                    "approval.interrupted", actor=actor, detail=detail, client=client
+                ),
+            ),
+            approval_id,
+        )
+        if not moved:
+            raise ApprovalError(
+                409,
+                "the release is no longer executing under the owner judged; list it again",
+            )
+        log.warning(
+            "approval %s: interrupted by %s while 'executing' under claim owner %s (%s); it now "
+            "waits for a resolve",
+            approval_id,
+            scrub_log_argument(actor),
+            scrub_log_argument(str(row.claim_owner)),
+            liveness,
+        )
+        return {
+            "operation": row.operation,
+            "requested_by": row.requester,
+            "approved_by": row.approver,
+            "claim_owner": row.claim_owner,
+            "liveness": liveness,
+            "status": "interrupted",
+        }
+
+    async def _owner_liveness(
+        self, row: ApprovalRow, heartbeats: dict[str, OwnerLiveness]
+    ) -> OwnerLiveness:
+        """What :meth:`interrupt_stranded` judges of ``row``'s owner (its docstring has the
+        tiers). ``heartbeats`` caches each node's verdict across one listing."""
+        if row.id in self._releasing or row.id in self._inflight.values():
+            return "releasing_here"
+        prefix, _, node_id = (row.claim_owner or "").partition(":")
+        if prefix != "node" or not node_id:
+            return "attestation_required"
+        if node_id not in heartbeats:
+            heartbeats[node_id] = await self._node_heartbeat(node_id)
+        return heartbeats[node_id]
+
+    async def _node_heartbeat(self, node_id: str) -> OwnerLiveness:
+        """The heartbeat verdict on cluster node ``node_id``. A failed read is logged, throttled,
+        and reads as unreadable, which refuses: an unread heartbeat may be a live one."""
+        if self._node_liveness is None:
+            return "owner_heartbeat_unavailable"
+        try:
+            fresh = await self._node_liveness(node_id)
+        except _READ_DEFECTS:
+            raise  # a defect, not an outage
+        except Exception as exc:  # noqa: BLE001 - every coordinator backend raises its own type
+            if self._read_faults_reported.due("the cluster heartbeats"):
+                log.error("approvals: the cluster heartbeats could not be read", exc_info=exc)
+            return "owner_heartbeat_unreadable"
+        if fresh is None:
+            return "owner_heartbeat_unavailable"
+        return "owner_heartbeat_fresh" if fresh else "owner_heartbeat_lapsed"
+
     async def _decide_or_503(
         self,
         approval_id: str,
@@ -2365,19 +2711,23 @@ class ApprovalGate:
         approver: str | None,
         audit: AuditAppend,
         from_status: str = "pending",
+        from_claim_owner: ClaimOwnerGuard = ANY_CLAIM_OWNER,
+        decided_at: float | None = None,
     ) -> bool:
         """``decide_pending_approval`` with its audit row in the same write, and a fault answered
         as 503 rather than a raw 500 (vault BACKLOG #2255). Used where nothing has run yet, so a
         refusal is the right answer. ``what`` names the decision in the log and the detail;
-        ``retry`` tells the caller what to do once the store accepts writes."""
+        ``retry`` tells the caller what to do once the store accepts writes. ``decided_at``
+        defaults to now."""
         try:
             return await self._store.decide_pending_approval(
                 approval_id,
                 status=status,
                 approver=approver,
-                decided_at=self._clock(),
+                decided_at=self._clock() if decided_at is None else decided_at,
                 from_status=from_status,
                 audit=audit,
+                from_claim_owner=from_claim_owner,
             )
         except RowSealError as exc:
             # The row changed outside the store after it was read (BACKLOG #2592). The store wrote

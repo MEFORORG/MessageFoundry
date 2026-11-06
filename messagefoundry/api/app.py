@@ -73,6 +73,12 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from messagefoundry import __version__
 from messagefoundry.api._ui_seam import ENGINE_UI_SEAM, CoreHandlers, UiDeps
+from messagefoundry.api.approval_models import (
+    ApprovalInterruptRequest,
+    ApprovalInterruptResult,
+    ExecutingApprovalInfo,
+    ExecutingApprovalList,
+)
 from messagefoundry.api.approvals import (
     DEFAULT_CLAIM_OWNER,
     ApprovalError,
@@ -1719,12 +1725,21 @@ def _build_approval_gate(
             return None  # an engine shard whose graph has not loaded yet
         return DEFAULT_CLAIM_OWNER  # no engine shard and no cluster node
 
+    async def _node_liveness(node_id: str) -> bool | None:
+        # BACKLOG #1562: the interrupt route's heartbeat tier. The same `fresh` verdict the
+        # stepdown reads (BACKLOG #1509); a node no longer in the table has no fresh heartbeat.
+        coordinator = engine.coordinator
+        if not coordinator.is_clustered():
+            return None  # this engine reads no cluster heartbeats
+        return any(m.node_id == node_id and m.fresh for m in await coordinator.cluster_members())
+
     gate = ApprovalGate(
         engine.store,
         settings,
         resolve_identity=resolve_identity,
         alert_sink=alert_sink,
         claim_owner=_claim_owner,
+        node_liveness=_node_liveness,
     )
     # A released reload runs inside the approve request, so it outlives that request's deadline the
     # way the inline route's does (vault BACKLOG #2753). Required, so the lifespan's drain sees it.
@@ -7112,6 +7127,49 @@ def create_app(
         except ApprovalError as exc:
             raise HTTPException(exc.status, exc.detail) from exc
         return ApprovalResolveResult(**outcome)
+
+    @app.get("/approvals/executing", response_model=ExecutingApprovalList)
+    async def list_executing_approvals(
+        identity: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
+        gate: ApprovalGate | None = Depends(_get_gate),
+    ) -> ExecutingApprovalList:
+        """Releases still claimed as ``executing``, each with what an interrupt would judge of its
+        claim owner now (BACKLOG #1562). A release whose owner never returns stays here until an
+        operator interrupts it."""
+        if gate is None:
+            raise HTTPException(503, "approval workflow is not available")
+        try:
+            rows = await gate.list_executing()
+        except ApprovalError as exc:  # a store read that failed: 503
+            raise HTTPException(exc.status, exc.detail) from exc
+        return ExecutingApprovalList(approvals=[ExecutingApprovalInfo(**r) for r in rows])
+
+    @app.post("/approvals/{approval_id}/interrupt", response_model=ApprovalInterruptResult)
+    async def interrupt_stranded_approval(
+        approval_id: ResourceId,
+        request: Request,
+        body: ApprovalInterruptRequest | None = None,
+        # Owner-delegated decision d20261029T205247402-81159c: approvals:approve with a FRESH
+        # step-up, as the resolve it leads to asks.
+        identity: Identity = Depends(require_step_up(Permission.APPROVALS_APPROVE)),
+        gate: ApprovalGate | None = Depends(_get_gate),
+    ) -> ApprovalInterruptResult:
+        """Move a release stranded in ``executing`` to ``interrupted`` (BACKLOG #1562), so it can
+        be resolved. Refused while its owner may be live: this process runs it, or its cluster
+        node still heartbeats. An owner with no heartbeat to read needs ``attest_owner_stopped``.
+        Audited as ``approval.interrupted`` in the same write; the operation is never run."""
+        if gate is None:
+            raise HTTPException(503, "approval workflow is not available")
+        try:
+            outcome = await gate.interrupt_stranded(
+                approval_id,
+                actor=identity.username,
+                attest_owner_stopped=body is not None and body.attest_owner_stopped,
+                client=client_ip(request),
+            )
+        except ApprovalError as exc:
+            raise HTTPException(exc.status, exc.detail) from exc
+        return ApprovalInterruptResult(**outcome)
 
     # --- config promote / reload ---------------------------------------------
 

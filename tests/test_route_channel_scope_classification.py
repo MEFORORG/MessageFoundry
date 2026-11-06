@@ -182,6 +182,8 @@ ROUTES: dict[str, tuple[str, str]] = {
     "POST /approvals/{approval_id}/approve": (ADMINISTRATOR_ONLY, "approvals:approve"),
     "POST /approvals/{approval_id}/reject": (ADMINISTRATOR_ONLY, "approvals:approve"),
     "POST /approvals/{approval_id}/resolve": (ADMINISTRATOR_ONLY, "approvals:approve"),
+    "GET /approvals/executing": (ADMINISTRATOR_ONLY, "approvals:approve"),
+    "POST /approvals/{approval_id}/interrupt": (ADMINISTRATOR_ONLY, "approvals:approve"),
     # --- config ---------------------------------------------------------------------------------
     "POST /config/reload": (
         SCOPED,

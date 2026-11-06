@@ -110,9 +110,12 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # Vault BACKLOG #3373 added one /ui route and no JSON route: POST /ui/login/passkey, the passkey
 # sign-in's begin leg (ADR 0197 Amendment A wave 2), un-gated like the sign-in it serves.
 # BACKLOG #2614 added one JSON route: DELETE /sessions, users:manage.
-_ROUTES_DEFAULT = 117
-_ROUTES_WITH_DOCS = 121
-_ROUTES_WITH_UI = 245
+# BACKLOG #1562 added two JSON routes and no /ui route: GET /approvals/executing and POST
+# /approvals/{approval_id}/interrupt, approvals:approve, the operator's way out for a release
+# stranded in 'executing'.
+_ROUTES_DEFAULT = 119
+_ROUTES_WITH_DOCS = 123
+_ROUTES_WITH_UI = 247
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in (with its passkey begin leg),
 #: re-auth and second-factor entry points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -1318,6 +1321,9 @@ _JSON_STEP_UP_WITHOUT_CONSOLE = frozenset(
         # Ending every account's sessions is a JSON and host-CLI act; no console page offers it yet
         # (BACKLOG #2614).
         ("DELETE", "/sessions"),
+        # Interrupting a release stranded in 'executing' is a JSON act; the ruling that built it
+        # (decision d20261029T205247402-81159c) asks for no console page (BACKLOG #1562).
+        ("POST", "/approvals/{approval_id}/interrupt"),
     }
 )
 
@@ -2177,8 +2183,10 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     # 95 -> 96: BACKLOG #2345's GET /messages/{message_id}/raw, messages:view_raw.
     # 96 -> 97: BACKLOG #2331's GET /users/{user_id}/federated-identity, users:manage.
     # 97 -> 98: BACKLOG #2614's DELETE /sessions, users:manage.
-    assert len(gated) == 98, (
-        f"{len(gated)} permission-gated routes, not 98 — update the doc's totals."
+    # 98 -> 100: BACKLOG #1562's GET /approvals/executing and POST /approvals/{approval_id}/interrupt,
+    # approvals:approve.
+    assert len(gated) == 100, (
+        f"{len(gated)} permission-gated routes, not 100 — update the doc's totals."
     )
 
 
