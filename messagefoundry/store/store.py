@@ -7136,20 +7136,12 @@ def _lookup_sid_type(sid: str) -> tuple[int | None, int]:
     so the decision runs anywhere.
 
     A domain account's SID resolves through a domain controller, or through the LSA's lookup cache
-    when none answers. ERROR_NONE_MAPPED (1332) does not prove the SID names no account: Windows
-    documents that it also follows a network time-out that kept the lookup from finding the name,
-    so a controller that did not answer in time can read as 1332, and a slow domain controller can
-    send a start down the path below. Other failures report their own status (1722, say).
-
-    On every failure, 1332 included, the directory is refused as not hardened, so no trio DACL is
-    written, and each store file takes the existing owner-only fallback, :func:`_secure_file`
-    (decision d20261106T140017335-d24848). That fallback grants full control to the account
-    :func:`_current_user` names, read from the environment, and removes only inherited entries, so
-    a file that already carries explicit entries keeps them. A file SQLite creates at that start, a
-    ``-wal``, a ``-shm`` or a new store, carries none, so it is left to that account alone where
-    ``icacls`` succeeds. ADR 0163, *Note (2026-11-05)*, *Left open*, has the consequences. Nothing
-    is logged here: the status goes into the refusal, which the caller logs once, beside the
-    directory it refused."""
+    when none answers. On every failure the directory is refused as not hardened, and each store
+    file takes the owner-only fallback, :func:`_secure_file` (decision
+    d20261106T140017335-d24848). Why ERROR_NONE_MAPPED (1332) does not prove the SID names no
+    account, and what that fallback leaves on each file, are stated once, in ADR 0163,
+    *Note (2026-11-05)*, *Left open*. Nothing is logged here: the status goes into the refusal,
+    which the caller logs once, beside the directory it refused."""
     if sys.platform != "win32":
         return None, 0
     import ctypes

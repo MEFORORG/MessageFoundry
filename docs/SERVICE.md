@@ -375,8 +375,9 @@ icacls "C:\ProgramData\MessageFoundry" /grant "NT SERVICE\MessageFoundry:(OI)(CI
 A domain **gMSA** or a dedicated local user works the same way (pass `-ServiceAccountPassword`
 for a password-based account — it's taken as a `SecureString`). In a data directory the installer
 hardened, the store shares its files with SYSTEM, Administrators and that account; see *A SQLite
-store in the data directory admits one named account*, below. Anywhere else, the store file is
-restricted at runtime to the account that opens it.
+store in the data directory admits one named account*, below. Anywhere else, the engine removes
+each store file's inherited entries at runtime and grants full control to the account the
+environment names (`USERNAME`); explicit entries a file already carries are kept.
 
 **gMSA preflight + "Log on as a service" (#99).** When `-ServiceAccount` names a **gMSA** (a name ending
 in `$`, e.g. `CORP\mefor-svc$`), the installer runs `Test-ADServiceAccount` first (verifying the account
@@ -470,7 +471,8 @@ runner has one.
 between the service and the operator only when the data directory grants SYSTEM, Administrators
 and at most one run-as account, in the shape the installer writes. A `-AllowLocalSystem` install
 grants none. The run-as account is either a per-service virtual account, `NT SERVICE\<name>`, or
-one account that Windows resolves to a user account with a RID of 1000 or more. A local user you
+one account whose SID is machine- or domain-relative (`S-1-5-21-` plus three sub-authorities and
+the RID) and that Windows resolves to a user account with a RID of 1000 or more. A local user you
 create for the service and name with `-ServiceAccount` is such an account; a built-in one, such as
 Administrator (RID 500), is not. A gMSA is admitted only if `LookupAccountSid` resolves
 it to a user account, which is unmeasured here. The directory must be owned by SYSTEM or
@@ -491,15 +493,11 @@ At least these are unmeasured:
 - **What a gMSA resolves to.** A gMSA is a kind of computer account in Active Directory, so it is
   expected to resolve as a user. If it resolves as anything else, the WARNING names that type.
 - **A start with no domain controller.** A gMSA resolves through a domain controller, or through
-  the local lookup cache when no controller answers. The lookup has no timeout of its own, so a
-  slow controller delays the open. A network time-out inside the lookup can also fail it with
-  `ERROR_NONE_MAPPED` (1332), which reads as an account that does not exist, so a slow controller
-  can send a start to the owner-only store too. A start where no controller or cache answers gets
-  the owner-only store: the `-wal` and `-shm` files that start creates, and a new store, are then
-  the service's alone. A later start that resolves the account restores the shared store only if
-  it can still open the store and rewrite each file's DACL. The service cannot rewrite a file it
-  does not own, so a full-control entry an operator's start added there stays, with a WARNING at
-  each service start, until an elevated open with the lookup working. ADR 0163 has the detail.
+  the local lookup cache when no controller answers, and a slow or absent controller can delay
+  the open or fail the lookup. A failed lookup gives that start the owner-only store, with a
+  WARNING. Why a time-out can read as an account that does not exist, what the owner-only store
+  leaves on each file, and how a later start recovers are stated once, in ADR 0163,
+  *Note (2026-11-05)*, *Left open*.
 
 The rule and its reasons are in ADR 0163, *Note (2026-11-05)*.
 

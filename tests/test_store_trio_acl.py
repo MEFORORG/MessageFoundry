@@ -454,9 +454,10 @@ def test_a_real_python_temp_directory_is_not_warned_about(
 
 
 def test_the_installer_makes_administrators_the_data_directory_owner() -> None:
-    # The rule requires an owner of SYSTEM, Administrators or the service, and the installer is what
-    # must produce it. Static: this suite cannot run an elevated install; the hosted store-access arms
-    # run the real one. The call must follow the DACL lockdown of the same directory.
+    # The rule requires an owner of SYSTEM, Administrators or a per-service virtual run-as account
+    # (a named user run-as never qualifies), and the installer is what must produce it. Static:
+    # this suite cannot run an elevated install; the hosted store-access arms run the real one. The
+    # call must follow the DACL lockdown of the same directory.
     script = (
         Path(__file__).resolve().parents[1] / "scripts" / "service" / "install-service.ps1"
     ).read_text(encoding="utf-8")
