@@ -81,6 +81,7 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     hop_declarations_from_settings,
     http_family_trust_anchor,
+    is_proxy_tunnel_407,
     refuse_cleartext_credential_hop,
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
@@ -146,7 +147,8 @@ def request_token(
     still raises its own ``ValueError``, as it did before BACKLOG #2054. ``connector`` names the hop
     in a refusal of the reply body, and holds no URL (BACKLOG #2060). A web proxy's Digest challenge
     the engine will not answer raises the subclass ``rest.auth_challenge_refused`` builds, a
-    permanent configuration fault (BACKLOG #2989)."""
+    permanent configuration fault (BACKLOG #2989). So does the proxy's 407 to the ``CONNECT`` for an
+    ``https`` token endpoint, which urllib cannot answer at all."""
     body = _read_token_reply(opener, req, timeout=timeout, endpoint=endpoint, connector=connector)
     return _parse_token_reply(body, endpoint=endpoint)
 
@@ -171,6 +173,10 @@ def _read_token_reply(
     except urllib.error.HTTPError as exc:
         raise DeliveryError(f"{endpoint} returned HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
+        if is_proxy_tunnel_407(exc):
+            # BACKLOG #2989: an https:// token endpoint's proxy 407 arrives here, not in the
+            # HttpAuthError arm below; rest.is_proxy_tunnel_407 says why no retry can clear it.
+            raise auth_challenge_refused(endpoint) from exc
         raise DeliveryError(f"{endpoint} unreachable: {exc.reason}") from exc
     except (TimeoutError, OSError) as exc:
         raise DeliveryError(f"{endpoint} failed: {exc}") from exc
@@ -181,7 +187,7 @@ def _read_token_reply(
         # refusal names the peer's own algorithm token, which stays on the cause only.
         # BACKLOG #2989: the same classification the delivery hop gives this refusal. A plain
         # DeliveryError here retried a refusal that no retry can clear. Only an http:// token
-        # endpoint reaches this arm: through a CONNECT tunnel urllib raises the 407 as an OSError.
+        # endpoint reaches this arm; the https:// one's 407 is the URLError arm above.
         raise auth_challenge_refused(endpoint) from exc
     except EgressReplyError:
         # A bare CR in the reply head raises MalformedReplyHeadError, which is an HTTPException as

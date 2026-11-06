@@ -371,6 +371,30 @@ def auth_challenge_refused(label: str) -> NegativeAckError:
     )
 
 
+#: What ``http.client.HTTPConnection._tunnel`` raises, as a bare ``OSError``, when a web proxy
+#: answers the ``CONNECT`` for an ``https`` target with a 407. The status is parsed to an int
+#: before it is formatted, so the proxy's own bytes can only follow this prefix, never forge it.
+_TUNNEL_407_PREFIX = "Tunnel connection failed: 407 "
+
+
+def is_proxy_tunnel_407(exc: urllib.error.URLError) -> bool:
+    """Whether ``exc`` is a web proxy's 407 to the ``CONNECT`` that opens an ``https`` tunnel.
+
+    urllib cannot answer that challenge. ``_tunnel`` raises it before any handler sees a status,
+    and ``do_open`` wraps that ``OSError`` in a ``URLError``, so it once read as an unreachable
+    host and was retried (BACKLOG #2989, ADR 0095 Amendment B.1). Matched on the exact class and
+    the one-argument text ``_tunnel`` builds, so a socket error, which carries an errno, never
+    matches. ``tests/test_digest_refusal_classification.py`` pins the text on a real socket, so a
+    CPython that rewords it fails that test rather than silently retrying again."""
+    reason = exc.reason
+    return (
+        type(reason) is OSError
+        and len(reason.args) == 1
+        and isinstance(reason.args[0], str)
+        and reason.args[0].startswith(_TUNNEL_407_PREFIX)
+    )
+
+
 class _NoRedirectHandler(NoRedirectHandler):
     """Refuse to follow HTTP redirects (ASVS 15.3.2): a 3xx could divert a PHI-bearing POST to an
     unintended host. Returning ``None`` makes urllib raise the 3xx as an ``HTTPError`` instead of
