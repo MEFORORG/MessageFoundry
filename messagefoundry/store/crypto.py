@@ -623,6 +623,22 @@ class UnauthenticatedCipherError(CipherError):
     Transit cipher does not raise it; ``open_tagged_cell`` never reads a Transit failure as drift."""
 
 
+class CipherUnavailableError(CipherError):
+    """The service that holds the key gave no verdict on the value, so a later try may succeed
+    (BACKLOG #3734).
+
+    :class:`~messagefoundry.store.crypto_transit.TransitCipher` raises it from ``encrypt`` and
+    ``decrypt`` when Transit could not be reached or answered that it could not serve the request,
+    which :func:`~messagefoundry.store.keyprovider_vault.is_vault_unavailable` decides. Every other
+    Transit failure, a refused tag among them, stays plain :class:`CipherError`, so a value Transit
+    refused is never read as an outage.
+
+    It lives here rather than beside the Transit cipher so that ``uploads.py``, a leaf that imports
+    only this module, can tell it apart: the upload routes answer it 503 with ``Retry-After``, where
+    a refused value answers 423. Still a :class:`CipherError`, so every other caller handles it as
+    it did before."""
+
+
 class AuditKeyVersionRefusedError(CipherError):
     """Transit refused an audit MAC pinned to one key version, and still answers under the latest.
 

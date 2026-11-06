@@ -289,6 +289,50 @@ def is_vault_bad_request(exc: BaseException) -> bool:
     return isinstance(exc, InvalidRequest)
 
 
+def is_vault_unavailable(exc: BaseException) -> bool:
+    """Whether ``exc`` says Vault gave no verdict on the request, so a later try may succeed
+    (BACKLOG #3734). Shared with ``crypto_transit.py`` for the same reason as
+    :func:`is_vault_bad_request`.
+
+    True for a connection that failed or timed out, and for Vault's HTTP 429, 500, 502 and 503,
+    which hvac raises as ``RateLimitExceeded``, ``InternalServerError``, ``BadGateway`` and
+    ``VaultDown`` (a sealed or standby node answers 503). False for everything else, at least a 400
+    (a value whose tag Transit refused), a 403, a 404, a TLS failure, and a refusal of the hop or of
+    its reply, since each of those answers the same way when it is tried again. A connection error that
+    carries such a refusal in its chain is a refusal too: the strict reply adapter wraps a reply
+    head it would not read in one."""
+    try:
+        import requests  # noqa: PLC0415
+        from hvac.exceptions import (  # noqa: PLC0415
+            BadGateway,
+            InternalServerError,
+            RateLimitExceeded,
+            VaultDown,
+        )
+    except ImportError:  # no [vault] extra, so no hvac client raised it
+        return False
+    if isinstance(exc, (BadGateway, InternalServerError, RateLimitExceeded, VaultDown)):
+        return True
+    if not isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return False
+    if isinstance(exc, requests.exceptions.SSLError):
+        return False  # a certificate the hop refuses is refused again on the next try
+    from messagefoundry.exception_origin import (  # noqa: PLC0415
+        ExceptionChainTooLong,
+        exception_chain,
+    )
+    from messagefoundry.transports.bounded_read import EgressReplyError  # noqa: PLC0415
+
+    # Every link, its context too: a refusal anywhere keeps the 423 it had before, the safe side.
+    try:
+        return not any(
+            isinstance(link, (EgressReplyError, InsecureHopRefused))
+            for link in exception_chain(exc)
+        )
+    except ExceptionChainTooLong:
+        return False
+
+
 # --- Transit key-TYPE validation (BACKLOG #1166, owner ruling 2026-08-22, ASVS 11.2.3) -------------
 #
 # Every Vault Transit key this product uses is OPERATOR-CHOSEN by name, and the product read its type

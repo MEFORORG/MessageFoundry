@@ -57,6 +57,7 @@ from messagefoundry.store.crypto import (
     AesGcmCipher,
     Cipher,
     CipherError,
+    CipherUnavailableError,
     cell_aad,
 )
 
@@ -337,6 +338,14 @@ class UploadUnreadableError(UploadError, CipherError):
     API maps it to HTTP 423 without importing the cipher module. The message is the cipher's own,
     which names only the surface and the remedies it offers, or
     :data:`_REFUSED_NOT_UNSEALABLE` from :meth:`UploadStore.delete`, which names neither."""
+
+
+class UploadUnavailableError(UploadError, CipherError):
+    """The store cipher's key service gave no verdict on an uploaded file, so a later try may
+    succeed (BACKLOG #3734). Raised for :class:`~messagefoundry.store.crypto.CipherUnavailableError`
+    where :class:`UploadUnreadableError` would otherwise be, and from :meth:`UploadStore.save`. The
+    file is neither refused nor changed, and nothing was removed. The API answers it 503 with
+    ``Retry-After``. The message is the cipher's own, as :class:`UploadUnreadableError`'s is."""
 
 
 #: The text of the refusal :meth:`UploadStore.delete` raises when its caller's read was refused
@@ -1143,8 +1152,10 @@ class UploadStore:
         billing to nobody's quota, so an empty one is a programming error and is refused here.
 
         Raises :class:`UploadTooLargeError` if it exceeds ``max_bytes``, :class:`UploadContentError`
-        on a disallowed extension / content mismatch (ASVS 5.2.2), or :class:`UploadQuotaError` when
-        the uploader's file-count or aggregate-byte quota would be exceeded (ASVS 5.2.4).
+        on a disallowed extension / content mismatch (ASVS 5.2.2), :class:`UploadQuotaError` when
+        the uploader's file-count or aggregate-byte quota would be exceeded (ASVS 5.2.4), or
+        :class:`UploadUnavailableError` when the cipher's key service gave no verdict, before anything
+        is written (BACKLOG #3734).
 
         **A cancellation that reaches ``save`` after the pair landed removes it (BACKLOG #2262).**
         The caller writes ``upload.create`` only once this returns. A kept pair would be stored with
@@ -1213,8 +1224,11 @@ class UploadStore:
             )
             root = self._ensure_root()
             blob_path, meta_path = self._paths(file_id)
-            blob_ct = self._encrypt_blob(data, file_id)
-            meta_ct = self._encrypt_meta(meta)
+            try:
+                blob_ct = self._encrypt_blob(data, file_id)
+                meta_ct = self._encrypt_meta(meta)
+            except CipherUnavailableError as exc:
+                raise UploadUnavailableError(str(exc)) from exc
             # Atomic-ish write: tmp + os.replace so a reader never sees a half-written ciphertext.
             #
             # The two writes are ordered body-then-sidecar because the sidecar is the listing key, so
@@ -1990,6 +2004,8 @@ class UploadStore:
                 return self._decrypt_meta(meta_path.read_text(encoding="utf-8"), file_id)
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
+            except CipherUnavailableError as exc:
+                raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
 
@@ -2005,6 +2021,8 @@ class UploadStore:
                 return self._decrypt_blob(blob_path.read_text(encoding="utf-8"), file_id)
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
+            except CipherUnavailableError as exc:
+                raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
 
@@ -2017,7 +2035,9 @@ class UploadStore:
         An upload ``rotate-key`` cannot seal is deleted too, although its sidecar is refused
         (BACKLOG #2322). The metadata returned then carries only its id, its body's size on disk and
         its sidecar's mtime (:meth:`_UnsealableUpload.as_meta`). Any other refused upload still
-        raises :class:`UploadUnreadableError`, and nothing is removed.
+        raises :class:`UploadUnreadableError`, and nothing is removed. A sidecar the cipher's key
+        service gave no verdict on raises :class:`UploadUnavailableError`, and nothing is removed
+        (BACKLOG #3734).
 
         ``sidecar_refused`` says the caller's own :meth:`get_meta` was just refused. The sidecar is
         then not decrypted again, so one delete raises one cipher WARNING and one alert, not two.
@@ -2042,6 +2062,9 @@ class UploadStore:
                     meta = self._decrypt_meta(meta_path.read_text(encoding="utf-8"), file_id)
                 except FileNotFoundError as exc:
                     raise UploadNotFoundError(file_id) from exc
+                except CipherUnavailableError as exc:
+                    # No verdict on the sidecar, so it is not classed and nothing is removed.
+                    raise UploadUnavailableError(str(exc)) from exc
                 except CipherError as exc:
                     refusal = str(exc)
             if meta is None:
