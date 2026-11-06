@@ -22,9 +22,12 @@ Nothing here hands an encrypted block to a TLS library. Synthetic data only.
 
 from __future__ import annotations
 
+import errno
 import functools
 import os
 import re
+import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -296,7 +299,7 @@ def test_a_pgsslrootcert_with_an_encryption_header_is_refused(
     assert "AES-256-CBC" not in message and _body_of(text) not in message
 
 
-@pytest.mark.parametrize("sslmode", ["verify-full", "require", "prefer"])
+@pytest.mark.parametrize("sslmode", ["verify-full", "verify-ca", "require", "prefer", "allow"])
 def test_libpqs_default_root_certificate_with_an_encryption_header_is_refused(
     _no_libpq_root: Path, sslmode: str
 ) -> None:
@@ -347,10 +350,15 @@ def test_a_pgsslrootcert_on_another_host_is_refused_unread(
     assert "set PGSSLROOTCERT to a local path" in str(refused.value)
 
 
+@pytest.mark.parametrize("source", ["default", "PGSSLROOTCERT"])
 def test_libpqs_root_certificate_the_check_cannot_read_is_refused(
-    _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch
+    _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch, source: str
 ) -> None:
+    """A file libpq can ``stat`` but not open fails every connect in libpq too, where
+    ``SSL_CTX_load_verify_locations`` refuses it; the engine refuses it at build."""
     root = _write(_no_libpq_root, _certificate(), "root.crt")
+    if source == "PGSSLROOTCERT":
+        monkeypatch.setenv("PGSSLROOTCERT", root)
     real_open = os.open
 
     def unreadable(path: Any, *args: Any, **kwargs: Any) -> int:
@@ -383,6 +391,143 @@ def test_libpqs_home_on_windows_is_the_shell_roaming_folder(
     monkeypatch.delenv("APPDATA", raising=False)
     home = database._libpq_home()
     assert home is not None and home.endswith(os.sep + "postgresql")
+
+
+def _refuse_lookup() -> tuple[str, str] | None:
+    raise AssertionError("the root certificate was looked up")
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        pytest.param({}, id="no keyword"),
+        pytest.param({"port": "5432"}, id="no TLS keyword"),
+        pytest.param({"SSLmode": "disable"}, id="disable"),
+    ],
+)
+def test_libpqs_root_certificate_is_not_looked_up_when_psqlodbc_sends_disable(
+    monkeypatch: pytest.MonkeyPatch, params: dict[str, Any]
+) -> None:
+    """With no ``SSLmode`` psqlODBC sends ``disable`` to libpq (``DEFAULT_SSLMODE`` in its
+    ``dlg_specific.h``), so libpq attempts no TLS and loads no root certificate. Red before the
+    check keyed on the build's own ``sslmode``: an unset mode looked the file up."""
+    monkeypatch.setattr(database, "_libpq_root_cert", _refuse_lookup)
+    assert _build_generic("PostgreSQL Unicode", params).startswith("DRIVER={PostgreSQL Unicode};")
+
+
+class _ShareNotReached(FileNotFoundError):
+    """``ERROR_BAD_NETPATH``, as Windows reports a share it could not reach."""
+
+    winerror = 53
+
+
+@pytest.mark.parametrize("source", ["default", "PGSSLROOTCERT"])
+@pytest.mark.parametrize(
+    ("failure", "refused"),
+    [
+        pytest.param(PermissionError(errno.EACCES, "Permission denied"), False, id="EACCES"),
+        pytest.param(OSError(errno.ELOOP, "Too many levels of symbolic links"), False, id="ELOOP"),
+        pytest.param(_ShareNotReached(errno.ENOENT, "No network path"), True, id="share"),
+    ],
+)
+def test_a_root_certificate_the_engine_cannot_stat(
+    _no_libpq_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    failure: OSError,
+    refused: bool,
+) -> None:
+    """libpq 17's ``initialize_SSL`` loads the root file only when its ``stat`` succeeds; any
+    other ``stat`` result skips the file, or fails a ``verify`` connect, without loading it. So a
+    failed ``stat`` is left to libpq. Red before ``leave_unstatable``: the failure refused the
+    build. The one still refused is a share Windows could not reach, which a later connect may
+    reach and load, when the check does not run again."""
+    root = _write(_no_libpq_root, _headered(_certificate()), "root.crt")
+    if source == "PGSSLROOTCERT":
+        monkeypatch.setenv("PGSSLROOTCERT", root)
+    real_stat = os.stat
+
+    def unstatable(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if str(path) == root:
+            raise failure
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", unstatable)
+    if refused:
+        with pytest.raises(ValueError, match="root certificate file could not be read to check"):
+            _build_psql()
+    else:
+        assert "SSLmode=verify-full;" in _build_psql()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="libpq reads the password file off Windows")
+def test_libpqs_home_for_an_empty_password_file_home_is_the_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """libpq builds the path as ``'%s/%s'``, so an empty home names ``/.postgresql``
+    (``pqGetHomeDirectory``, libpq 17). Red when an empty home gave ``None``, which read nothing.
+    The control: no password-file entry names no home, as libpq names none."""
+    import pwd
+
+    monkeypatch.setenv("HOME", "")
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: types.SimpleNamespace(pw_dir=""))
+    assert database._libpq_home() == os.path.join(os.sep, ".postgresql")
+
+    def no_entry(uid: int) -> Any:
+        raise KeyError(uid)
+
+    monkeypatch.setattr(pwd, "getpwuid", no_entry)
+    assert database._libpq_home() is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the shell folder is read on Windows only")
+def test_libpqs_home_for_an_empty_shell_folder_is_the_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """libpq builds ``'%s/postgresql'``, so an empty folder names ``/postgresql`` on the current
+    drive (``pqGetHomeDirectory``, libpq 17). Red when an empty folder gave ``None``. The
+    control: a failed shell call names no home, as libpq names none."""
+    monkeypatch.setattr(database, "_windows_roaming_appdata", lambda: "")
+    assert database._libpq_home() == os.path.join(os.sep, "postgresql")
+    monkeypatch.setattr(database, "_windows_roaming_appdata", lambda: None)
+    assert database._libpq_home() is None
+
+
+def test_a_libpq_home_the_engine_cannot_name_refuses_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shell call the engine cannot make is a refusal that names the way out, never an
+    ``OSError`` out of the builder, and never a check that read nothing."""
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+
+    def unnamed() -> str | None:
+        raise OSError("synthetic: shell32 did not load")
+
+    monkeypatch.setattr(database, "_libpq_home", unnamed)
+    with pytest.raises(ValueError, match="root certificate: set PGSSLROOTCERT to a local path"):
+        _build_psql()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="shell32 is loaded on Windows only")
+@pytest.mark.parametrize("failure", ["load", "export"])
+def test_a_shell32_failure_is_an_oserror_the_build_refuses(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Red before the load was caught: ``WinDLL``'s ``OSError`` and a missing export's
+    ``AttributeError`` escaped the builder as themselves."""
+    import ctypes
+
+    def broken(name: str, *args: Any, **kwargs: Any) -> object:
+        if failure == "load":
+            raise OSError("synthetic: shell32 did not load")
+        return object()  # no SHGetFolderPathW on it
+
+    monkeypatch.setattr(ctypes, "WinDLL", broken)
+    with pytest.raises(OSError, match="SHGetFolderPathW could not be loaded"):
+        database._windows_roaming_appdata()
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+    with pytest.raises(ValueError, match="set PGSSLROOTCERT to a local path"):
+        _build_psql()
 
 
 @pytest.mark.parametrize("keyword", ["sslrootcert", "sslcrl", "sslcrldir", "ServerCertificate"])

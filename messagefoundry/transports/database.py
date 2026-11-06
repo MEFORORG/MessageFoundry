@@ -1289,10 +1289,15 @@ def _libpq_home() -> str | None:
     ``postgresql`` in the roaming application-data folder the shell names on Windows, and
     ``.postgresql`` in ``HOME``, or in the effective user's password-file home when ``HOME`` is
     unset or empty, elsewhere. libpq 14 and older read the password-file home only. ``None`` when
-    neither can be named."""
+    neither can be named, as libpq then reads no default file.
+
+    An empty folder or password-file home still names one: libpq joins it as ``'%s/%s'``, so it
+    reads ``/.postgresql/root.crt``, or ``/postgresql/root.crt`` on Windows (``pqGetHomeDirectory``
+    and ``initialize_SSL`` in libpq 17). Raises ``OSError`` when the Windows shell call cannot be
+    made (:func:`_windows_roaming_appdata`)."""
     if sys.platform == "win32":
         appdata = _windows_roaming_appdata()
-        return os.path.join(appdata, "postgresql") if appdata else None
+        return None if appdata is None else os.path.join(appdata or os.sep, "postgresql")
     home = os.environ.get("HOME")
     if not home:
         import pwd
@@ -1301,7 +1306,7 @@ def _libpq_home() -> str | None:
             home = pwd.getpwuid(os.geteuid()).pw_dir
         except KeyError:
             return None
-    return os.path.join(home, ".postgresql") if home else None
+    return os.path.join(home or os.sep, ".postgresql")
 
 
 #: ``CSIDL_APPDATA``: the roaming application-data folder libpq asks the Windows shell for.
@@ -1311,24 +1316,29 @@ _CSIDL_APPDATA = 0x1A
 def _windows_roaming_appdata() -> str | None:
     """``SHGetFolderPathW``'s ``CSIDL_APPDATA`` folder, the call libpq makes, rather than the
     ``APPDATA`` variable, which a service's environment may not carry. ``None`` when the call
-    fails. Raises ``OSError`` off Windows."""
+    reports a failure, as libpq then reads no default file, and possibly empty when it succeeds.
+    Raises ``OSError`` off Windows, and when ``shell32`` or its export cannot be loaded: then the
+    engine cannot say which folder libpq reads, so its caller refuses rather than read nothing."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the application-data folder is read only on Windows")
     import ctypes
 
-    shell32 = ctypes.WinDLL("shell32")
-    shell32.SHGetFolderPathW.argtypes = [
+    try:
+        get_folder = ctypes.WinDLL("shell32").SHGetFolderPathW
+    except (OSError, AttributeError) as exc:
+        raise OSError("SHGetFolderPathW could not be loaded from shell32") from exc
+    get_folder.argtypes = [
         ctypes.c_void_p,
         ctypes.c_int,
         ctypes.c_void_p,
         ctypes.c_uint32,
         ctypes.c_wchar_p,
     ]
-    shell32.SHGetFolderPathW.restype = ctypes.c_long
+    get_folder.restype = ctypes.c_long
     buf = ctypes.create_unicode_buffer(260)  # MAX_PATH, the size the call is documented to take
-    if shell32.SHGetFolderPathW(None, _CSIDL_APPDATA, None, 0, buf) != 0:
+    if get_folder(None, _CSIDL_APPDATA, None, 0, buf) != 0:
         return None
-    return buf.value or None
+    return buf.value
 
 
 def _refuse_encrypted_libpq_root_cert(
@@ -1339,37 +1349,52 @@ def _refuse_encrypted_libpq_root_cert(
     refuses an ``sslca``.
 
     psqlODBC hands libpq no ``sslrootcert``, since the generic dialect refuses that keyword and
-    ``pqopt``, so libpq takes the file :func:`_libpq_root_cert` names, at each connect. Its
-    documentation says a root file that exists makes ``require`` behave as ``verify-ca``, so the
-    file is loaded under at least ``require`` and both ``verify`` modes; this was read, not
-    measured. Erring wide, the check runs for the psqlODBC family unless ``sslmode`` turns TLS off
-    (:func:`generic_odbc_tls_off`), since ``allow`` and ``prefer`` may still go to TLS. The path
-    takes the remote-path check (:func:`names_another_host`) and :func:`_read_driver_file`'s read,
-    as an ``sslca`` does. At least: a path that names another host is refused unread, a missing
-    file or a directory is left to libpq, and a file the check cannot read, or one past
-    :data:`_MAX_DRIVER_CA_FILE_BYTES`, is refused. That holds for the
-    default path too, on a redirected profile folder say, whether or not a file is there; the
-    refusal names ``PGSSLROOTCERT`` as the way out. As for an ``sslca``, the trimmed spelling is
-    judged as well, though only the path as libpq reads it is read.
+    ``pqopt``, so libpq takes the file :func:`_libpq_root_cert` names. libpq 17's
+    ``initialize_SSL`` loads that file at every TLS attempt whose ``stat`` of it succeeds, whatever
+    the mode, and only a ``verify`` mode fails the connect when the ``stat`` fails. So the check
+    runs for the psqlODBC family whenever ``sslmode`` asks libpq for TLS, erring wide on ``allow``
+    and ``prefer``, which may not go to TLS. It reads nothing when ``sslmode`` is ``disable`` or
+    unset: psqlODBC sends ``disable`` to libpq when no mode is given (``DEFAULT_SSLMODE`` in its
+    ``dlg_specific.h``), and a DSN-less connection reads no registered DSN's mode.
+
+    A path that names another host (:func:`names_another_host`) is refused unread, with
+    ``PGSSLROOTCERT`` as the way out. A path the engine cannot ``stat`` is left to libpq, which
+    cannot load it either, except a share Windows could not reach, which a later connect might
+    reach, so that is refused. Past the ``stat``, the path takes :func:`_read_driver_file`'s read,
+    as an ``sslca`` does: a directory is left to libpq, and a file that cannot be opened or read,
+    or one past :data:`_MAX_DRIVER_CA_FILE_BYTES`, is refused, as libpq would fail the connect on
+    a file it cannot load.
 
     **It reads the environment of the process that builds the connection**, so ``messagefoundry
     check`` and a dry run judge their own machine's file, not the service's. **It runs when the
     connection is built, not at each connect**, as the ``sslca`` check does, and the file is no
     lane anchor: no ACL, change or audit check covers it. Nor is a ``sslrootcert`` read that a
     libpq service file, or a DSN registered with the driver manager, names."""
-    if family != "psqlodbc" or generic_odbc_tls_off({"dialect": "generic", "odbc_params": named}):
+    if (
+        family != "psqlodbc"
+        or "sslmode" not in named
+        or generic_odbc_tls_off({"dialect": "generic", "odbc_params": named})
+    ):
         return
-    found = _libpq_root_cert()
+    try:
+        found = _libpq_root_cert()
+    except OSError as exc:
+        raise ValueError(
+            f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: set "
+            "PGSSLROOTCERT to a local path; the folder libpq reads it from could not be named, so "
+            f"it was not read to check {_CA_CHECKED_FOR}"
+        ) from exc
     if found is None:
         return
     source, path = found
     setting = f"{hop_name_prefix(connection)}DATABASE {source}"
+    what = "root certificate file"
     if names_another_host(path):
         raise ValueError(
-            f"{setting}: the root certificate file is not a plain local path on this host, so it "
-            f"was not read to check {_CA_CHECKED_FOR}; set PGSSLROOTCERT to a local path"
+            f"{setting}: the {what} is not a plain local path on this host, so it was not read "
+            f"to check {_CA_CHECKED_FOR}; set PGSSLROOTCERT to a local path"
         )
-    data = _read_driver_file(path, setting, "root certificate file", _CA_CHECKED_FOR)
+    data = _read_driver_file(path, setting, what, _CA_CHECKED_FOR, leave_unstatable=True)
     if data is not None:
         _refuse_ca_content(
             setting, data, refusing="refusing to build a connection libpq loads it on"
@@ -1438,6 +1463,7 @@ def _read_driver_file(
     error: type[ValueError] = ValueError,
     leave_irregular: bool = True,
     leave_unreachable: bool = False,
+    leave_unstatable: bool = False,
 ) -> bytes | None:
     """The bytes of one spelling of a file a driver loads, for the engine to check first, or
     ``None`` when the file is left to the driver. ``what`` and ``checked_for`` word a refusal, and
@@ -1453,9 +1479,22 @@ def _read_driver_file(
     (:func:`_names_no_file`), unless ``leave_unreachable`` says the driver will not read the file
     either: then :class:`_UnreachedShare` is raised.
 
+    With ``leave_unstatable``, for a driver that loads a file only once its ``stat`` succeeds, as
+    libpq loads its root certificate, a path ``os.stat`` fails on is left to the driver too, except
+    a share Windows could not reach, which a later connect may reach. That costs a second ``stat``
+    of a path that passes, which :func:`read_if_regular` makes again.
+
     The file is read by :func:`~messagefoundry.auth.trust_anchors.read_if_regular`, which says
     how a device or pipe is judged without being read, or waited on."""
     try:
+        if leave_unstatable:
+            try:
+                os.stat(path)
+            except OSError as exc:
+                if getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
+                    raise
+                logger.debug("%s: the driver loads no file it cannot stat, so it is left", setting)
+                return None
         data = read_if_regular(path, _MAX_DRIVER_CA_FILE_BYTES + 1)
     except ValueError:
         # A path os.stat cannot take, such as one holding a NUL: the driver cannot load it either.

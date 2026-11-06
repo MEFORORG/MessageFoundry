@@ -2275,11 +2275,15 @@ Two limits follow from this:
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
   libpq still reads its CA from its default location or from the `PGSSLROOTCERT` environment
   variable of the service. The engine checks that file when it builds a psqlODBC connection
-  (BACKLOG #3090). It skips the check when `SSLmode` is `disable`. It checks the file as it checks
-  an `sslca`. So it refuses the build in at least these cases:
+  (BACKLOG #3090). It skips the check when `SSLmode` is `disable` or unset, because psqlODBC
+  then sends `disable` to libpq. It checks the file as it checks an `sslca`. So it refuses the
+  build in at least these cases:
   - the file holds an encryption header or a private key;
   - the path names another host;
-  - the file is there, but cannot be read or is over 1 MiB.
+  - the engine can `stat` the file, but cannot read it, or it is over 1 MiB.
+
+  A path the engine cannot `stat` is left to libpq, which loads no such file. A share Windows
+  could not reach is the exception, and is refused, since a later connect may reach it.
 
   The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
   application-data folder. Elsewhere it is under `~/.postgresql`. The engine finds this home as
