@@ -13,6 +13,7 @@ import base64
 import copy
 import hashlib
 import hmac as hmac_lib
+import logging
 import pickle
 import threading
 from typing import Any
@@ -187,7 +188,10 @@ async def test_a_version_transit_will_not_check_is_unverifiable(planted: str) ->
     with pytest.raises(TransitSealUnverifiableError) as caught:
         await sealer.verify_held_async(USER_KIND, FIELDS, stored)
     assert caught.value.args == (USER_KIND, int(planted), 1)
-    # Cached: the second check makes no Transit call and skips the probe, and still denies.
+    # The first probe recorded the version, which empties the cache, so that answer is not
+    # stored; the second is. Cached: the third makes no Transit call, skips the probe, denies.
+    with pytest.raises(TransitSealUnverifiableError):
+        await sealer.verify_held_async(USER_KIND, FIELDS, stored)
     calls = (backend.verify_calls, backend.probe_calls)
     with pytest.raises(TransitSealUnverifiableError):
         await sealer.verify_held_async(USER_KIND, FIELDS, stored)
@@ -390,6 +394,42 @@ async def test_re_storing_an_answer_does_not_evict_another(monkeypatch: pytest.M
     assert backend.verify_calls == calls + 2
 
 
+async def test_an_unverifiable_answer_is_cached_only_when_no_probe_moved_meanwhile() -> None:
+    backend = FakeBackend()
+    sealer = _sealer(backend)
+    planted = _with_version(await sealer.seal_async(USER_KIND, FIELDS), "5")
+    for expected_calls in (1, 2, 2):  # the first probe moved the version, so it is not stored
+        with pytest.raises(TransitSealUnverifiableError):
+            await sealer.verify_held_async(USER_KIND, FIELDS, planted)
+        assert backend.verify_calls == expected_calls
+
+
+def test_retired_key_names_refuses_a_bare_name() -> None:
+    with pytest.raises(TypeError):
+        _sealer(FakeBackend(), retired_key_names=RETIRED)
+    with pytest.raises(ValueError):
+        _sealer(FakeBackend(), retired_key_names=[""])
+
+
+async def test_each_outage_cause_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    backend = FakeBackend()
+    sealer = _sealer(backend)
+    stored = await sealer.seal_async(USER_KIND, FIELDS)
+    caplog.set_level(logging.ERROR, logger="messagefoundry.store.row_seal")
+    backend.down = True
+    for _ in range(2):
+        with pytest.raises(TransitSealUnavailableError):
+            await sealer.verify_held_async(USER_KIND, FIELDS, stored)
+    backend.down = False
+    backend.other_failure = True
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.verify_held_async(USER_KIND, FIELDS, stored)
+    lines = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(lines) == 2  # one per cause: the repeat inside the window is throttled
+    assert "synthetic outage" in lines[0] and "RuntimeError" in lines[1]
+    assert all("library failure" not in line and TOKEN_HASH not in line for line in lines)
+
+
 async def test_transit_receives_a_fixed_length_digest_and_runs_off_the_event_loop() -> None:
     backend = FakeBackend()
     sealer = _sealer(backend)
@@ -397,7 +437,6 @@ async def test_transit_receives_a_fixed_length_digest_and_runs_off_the_event_loo
     stored = await sealer.seal_async(USER_KIND, big)
     assert await sealer.verify_held_async(USER_KIND, big, stored)
     assert {len(i) for i in backend.inputs} == {32}
-    assert all(TOKEN_HASH.encode() not in i for i in backend.inputs)
     assert threading.get_ident() not in backend.threads
 
 
@@ -441,6 +480,8 @@ def test_the_refusal_types_are_siblings_and_carry_no_token_hash() -> None:
         ):
             assert TOKEN_HASH not in text
         assert pickle.loads(pickle.dumps(err)).subject == subject
+    # Control: the same instrument fires on an error that does carry the whole hash.
+    assert TOKEN_HASH in repr(RowSealError(SESSION_KIND, TOKEN_HASH))
     assert not issubclass(RowSealUnverifiableError, RowSealError)
     assert not issubclass(RowSealError, RowSealUnverifiableError)
     for cls2 in (TransitSealUnavailableError, TransitSealUnverifiableError):

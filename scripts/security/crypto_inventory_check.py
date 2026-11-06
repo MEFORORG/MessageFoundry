@@ -1578,7 +1578,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "compare:hmac.compare_digest",
             # ADR 0217: the Transit sealer's fixed-length input, its cache key and its key id are
-            # SHA-256 digests; no key, and nothing a seal's strength rests on beyond the HMAC.
+            # SHA-256 digests with no key. The input is load-bearing: Transit MACs that digest, not
+            # the row, so a seal also rests on SHA-256's collision resistance.
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",

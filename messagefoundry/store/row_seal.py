@@ -6,6 +6,11 @@ A **seal** is an HMAC-SHA256 over a typed encoding of one row, stored in the row
 
     mfseal:v1:<key id>:<hex mac>
 
+Under a ``vault_transit`` store the seal is instead Transit's own HMAC, under the audit key, of
+a SHA-256 digest of that encoding, stored as ``mfseal:v1:<key id>:vault:v<N>:<base64>`` with a key id
+derived from the key's mount and name (:class:`TransitRowSealer`, ADR 0217); no seal key enters the
+heap.
+
 It is a MAC, not a ciphertext. An ``mfenc:`` value is a sealed CELL (encrypted); an ``mfseal:`` value
 is a sealed ROW (authenticated). The row stays readable plaintext; the seal makes a change to it that
 was not made through the store's own write helper detectable by any process that holds the key.
@@ -298,15 +303,27 @@ class RowSealer:
         return self.seal(kind, fields)
 
     async def verify_async(
-        self, kind: str, fields: Iterable[tuple[str, object]], stored: str | None
+        self,
+        kind: str,
+        fields: Iterable[tuple[str, object]],
+        stored: str | None,
+        *,
+        fresh: bool = False,
     ) -> bool:
-        """:meth:`verify`, awaitable."""
+        """:meth:`verify`, awaitable. ``fresh`` is accepted so one call site serves both sealers;
+        this sealer keeps no cache, so every answer is already fresh."""
         return self.verify(kind, fields, stored)
 
     async def verify_held_async(
-        self, kind: str, fields: Iterable[tuple[str, object]], stored: str | None
+        self,
+        kind: str,
+        fields: Iterable[tuple[str, object]],
+        stored: str | None,
+        *,
+        fresh: bool = False,
     ) -> bool:
-        """:meth:`verify_held`, awaitable."""
+        """:meth:`verify_held`, awaitable. ``fresh`` is accepted so one call site serves both sealers;
+        this sealer keeps no cache, so every answer is already fresh."""
         return self.verify_held(kind, fields, stored)
 
     async def sealed_by_retired_key_async(
@@ -482,10 +499,15 @@ class TransitRowSealer:
         self,
         backend: TransitSealBackend,
         *,
-        retired_key_names: Iterable[str] = (),
+        retired_key_names: Iterable[str] = (),  # names, never a bare str
         store_id: bytes = NO_STORE_ID,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if isinstance(retired_key_names, str):
+            raise TypeError("retired_key_names is a collection of key names, not one name")
+        retired = list(retired_key_names)
+        if not all(isinstance(name, str) and name for name in retired):
+            raise ValueError("every retired Transit key name must be a non-empty string")
         self._backend = backend
         mount = backend.seal_mount
         #: The non-secret id every seal this sealer writes names.
@@ -493,7 +515,7 @@ class TransitRowSealer:
         # key id -> (key name, whether it is a retired key).
         self._keys: dict[str, tuple[str, bool]] = {
             transit_seal_key_id(mount, name): (name, True)
-            for name in retired_key_names
+            for name in retired
             if name != backend.seal_key_name
         }
         self._keys[self.key_id] = (backend.seal_key_name, False)
@@ -507,14 +529,15 @@ class TransitRowSealer:
     def _digest(self, kind: str, fields: Iterable[tuple[str, object]]) -> bytes:
         return hashlib.sha256(self._prefix + _part(seal_bytes(kind, fields))).digest()
 
-    def _outage(self, exc: BaseException | None = None) -> TransitSealUnavailableError:
-        # Throttled ERROR line. A CipherError's text is this package's own fixed wording, so it is
-        # logged; any other exception by TYPE only, since its text is not ours to vouch for.
-        if self._throttle.due("transit"):
+    def _outage(self, exc: BaseException) -> TransitSealUnavailableError:
+        # ERROR line, throttled per cause so a second cause inside the window is still logged. A
+        # CipherError's text is this package's own fixed wording; anything else by TYPE only.
+        cause = _failure_text(exc)
+        if self._throttle.due(f"outage:{cause}"):
             log.error(
-                "a row seal could not be made or checked through Vault transit (%s); the operation"
-                " was refused and no seal failure was recorded",
-                _failure_text(exc),
+                "a row seal could not be made or checked through Vault transit (%s): an outage,"
+                " not a seal failure",
+                cause,
             )
         return TransitSealUnavailableError()
 
@@ -579,7 +602,9 @@ class TransitRowSealer:
         self, kind: str, fields: Iterable[tuple[str, object]], stored: str | None
     ) -> bool:
         """Whether ``stored`` holds under a RETIRED key: a session the caller ends quietly rather
-        than reports. ``False`` for a seal under the active key or no held key."""
+        than reports. ``False`` for a seal under the active key or no held key. Unlike the local
+        form it can raise :class:`TransitSealUnverifiableError` or
+        :class:`TransitSealUnavailableError`, as any Transit check can."""
         parsed = self._parse(stored)
         if parsed is None or parsed[0] == self.key_id or parsed[0] not in self._keys:
             return False
@@ -631,8 +656,9 @@ class TransitRowSealer:
                 raise self._outage(
                     CipherError(f"Transit refused a seal check (HTTP {refused_status})")
                 )
-            probe_version, moved = await self._probe()
-            if moved or self._generation == generation:
+            probe_version = await self._probe()
+            if self._generation == generation:
+                # Not stored when anything, its own probe included, emptied the cache meanwhile.
                 self._remember(entry, _UNVERIFIABLE, stored_version, probe_version)
             raise TransitSealUnverifiableError(kind, stored_version, probe_version)
         if failure is not None:
@@ -646,9 +672,9 @@ class TransitRowSealer:
             self._remember(entry, _HOLDS if valid else _FORGED, 0, 0)
         return valid
 
-    async def _probe(self) -> tuple[int, bool]:
-        """``(version, moved)``: the latest version the active key's fixed-input probe names, and
-        whether this probe moved it, emptying both caches. Raises
+    async def _probe(self) -> int:
+        """The latest version the active key's fixed-input probe names, emptying both caches when
+        it moved. Raises
         :class:`TransitSealUnavailableError` when the probe fails or answers in an unexpected
         shape: then a refusal is an Outage, never Unverifiable."""
         failure: BaseException | None = None
@@ -660,18 +686,19 @@ class TransitRowSealer:
         version = transit_mac_version(answered) if isinstance(answered, str) else None
         if failure is not None or version is None:
             failure = failure or CipherError("Transit's key probe returned an unexpected shape")
-            log.warning(
-                "the Vault transit key probe failed (%s), so a refused row seal check counts as"
-                " an outage",
-                _failure_text(failure),
-            )
+            cause = _failure_text(failure)
+            if self._throttle.due(f"probe:{cause}"):
+                log.warning(
+                    "the Vault transit key probe failed (%s), so a refused row seal check counts"
+                    " as an outage",
+                    cause,
+                )
             raise self._outage(failure)
-        if version == self._probed_version:
-            return version, False
-        self._probed_version = version
-        self._cache.clear()
-        self._generation += 1
-        return version, True
+        if version != self._probed_version:
+            self._probed_version = version
+            self._cache.clear()
+            self._generation += 1
+        return version
 
     def _remember(self, entry: bytes, answer: str, stored_version: int, probe_version: int) -> None:
         self._cache.pop(entry, None)
@@ -681,7 +708,7 @@ class TransitRowSealer:
         self._cache[entry] = (expires, answer, stored_version, probe_version)
 
 
-def _failure_text(exc: BaseException | None) -> str:
+def _failure_text(exc: BaseException) -> str:
     """What a log line may say about a failed Transit call: a CipherError's own fixed text, any
     other exception's TYPE only, since Vault's or a library's text is not ours to vouch for."""
     if isinstance(exc, CipherError):
