@@ -5,4 +5,4 @@
   refused at any gate before that one under any enforcement setting, no longer logs that line. A
   fleet refused at a later gate has still logged it. Where the acceptance lifts the refusal, the
   line follows the remote-debugging `AUDIT:` line, and does so again in the off-box forwarder's
-  copy where a forwarder is installed. (`BACKLOG #3795`)
+  copy once the start goes on to install that forwarder. (`BACKLOG #3795`)

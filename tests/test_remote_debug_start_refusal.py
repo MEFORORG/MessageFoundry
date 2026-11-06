@@ -35,8 +35,8 @@ from messagefoundry.startupcode import InterpreterLaunch, StartupPosture
 from tests.test_isolated_launch import _needs_install
 
 # The suite keeps this gate from stopping every other in-process start (tests/conftest.py). The
-# fixture named on the next line undoes that for this module, and each in-process test here then
-# sets the reading it tests.
+# `remote_debug_start_gate` fixture undoes that for this module, and each in-process start here,
+# through `_serve` or `_supervise`, then pins the reading it tests.
 pytestmark = pytest.mark.usefixtures("remote_debug_start_gate")
 
 _SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
