@@ -312,7 +312,8 @@ The costs, at least these:
 - The `FhirLookup` read gets the new text and nothing else. A Handler that calls it behind a
   refusing web proxy would still fail each message in turn, as before.
 
-The fault is raised only where a Digest handler is on the opener and refuses. These unanswered
+The fault is raised only where a Digest handler is on the opener and refuses, and, since
+2026-11-06, on a web proxy's 407 to an `https://` token endpoint's `CONNECT` (B.1). These unanswered
 challenges do not raise it, at least: a Basic challenge (read as a plain 401 or 407, on purpose;
 see B.1), a 407 on a request that went direct rather than through the proxy (read as a plain 407,
 since BACKLOG #2989), and any challenge on a connection with no Digest set up. A Digest challenge
@@ -363,6 +364,16 @@ still a `DeliveryError`, so each caller's contract holds. This is narrower than 
 `https://` token endpoint is reached through a `CONNECT` tunnel, and urllib raises the proxy's 407
 there as an `OSError` before any handler sees it, so that case still reads as unreachable and is
 retried. That gap is left open.
+*Closed 2026-11-06 (vault BACKLOG #2989, #3532 item 1): `smart.request_token` now raises the same
+fault for the proxy's 407 to an `https://` token endpoint's `CONNECT`, which
+`rest.is_proxy_tunnel_407` recognises; any other `CONNECT` status still retries.* urllib answers
+no challenge to a `CONNECT`, so every such 407 is one the engine will not answer, a rejected
+pre-emptive Basic credential included: the error carries no challenge to tell them apart. This is
+the only case a real configuration reaches, since an `http://` token endpoint must be a loopback
+host (vault BACKLOG #3533 item 4) and no web proxy carries a loopback hop (vault BACKLOG #2579).
+The delivery hops did not change: an `https://` destination's own `CONNECT` 407 still retries, so
+on a bearer connection with a cached token the lane retries until the token lapses, then stops
+when the re-mint meets the 407.
 
 **A 407 on a request that went direct is not the proxy's.** The proxy Digest handler answered
 nothing on such a request, but it still screened the challenge, so an NTLM 407 from the origin or
