@@ -870,9 +870,15 @@ def test_both_wheel_smokes_compare_versions_not_strings() -> None:
     # versioned console) was added — a guard that must be edited whenever the thing it guards grows is
     # a guard that gets its number bumped without thought. The property worth pinning is "EVERY wheel
     # smoke normalises", so derive the expected set of smokes rather than a literal.
-    # The same predicate section (8) counts with, over executed shell: a bare `python -m build`
-    # (the engine's) produces a wheel too, so it owes a smoke like any other (BACKLOG #1583).
-    wheel_builds = _wheel_builds(_executed_shell(rel))
+    # The same count section (8) uses, over each step's raw `run:` text: a bare `python -m build`
+    # (the engine's) produces a wheel too, so it owes a smoke like any other (BACKLOG #1583). Per
+    # step, not over the whole file, so a step's `name:` or `with:` prose cannot demand a smoke.
+    wheel_builds = sum(
+        _wheel_builds(str(step.get("run") or ""))
+        for job in _jobs().values()
+        for step in (job.get("steps") or [])
+        if isinstance(step, dict)
+    )
     assert wheel_builds >= 4, (
         f"expected the engine, toolkit, console and harness wheel builds, found {wheel_builds}"
     )
@@ -1492,161 +1498,108 @@ _TOOLKIT_DIST = "messagefoundry-toolkit"
 #: The separately-versioned console distribution (ASVS 15.2.4).
 _WEBCONSOLE_DIST = "messagefoundry-webconsole"
 
-#: A ``python -m build`` call. ``python3`` and ``python3.14`` count too. Its flags run to the end of
-#: the line, the next call, or a :data:`_FLAGS_END`, whichever is first, so a second build chained on
-#: the same line is its own call and the first call's flags do not leak into it. This is a line scan,
-#: not a shell parser: a ``\`` continuation or a subshell still cuts or glues the flags.
+#: A ``python -m build`` call. ``python3`` and ``python3.14`` count too. Used only to COUNT calls,
+#: never to read their flags: see :func:`_wheel_builds` for why every call counts as a wheel build.
 _BUILD_CALL = re.compile(r"\bpython[0-9.]*\s+-m\s+build\b")
-
-#: Where a build's flags stop: ``&&``, ``||``, ``;``, or a lone ``|`` or ``&``. The ``&`` of a
-#: redirect (``2>&1``, ``>&2``, ``<&0``, ``&>log``) or of a ``|&`` pipe, and the ``|`` of ``>|``, are
-#: not, so ``2>&1`` keeps the flags after it.
-_FLAGS_END = re.compile(r"&&|\|\||;|(?<![<>])\|(?!\|)|(?<![<>|])&(?![>&])")
-
-
-def _lex_shell_line(line: str, *, cut_comment: bool) -> tuple[str, bool]:
-    """One line of :func:`_unquoted_code`, and whether it ends inside an open quote."""
-    out: list[str] = []
-    quote = ""
-    escaped = False
-    word_start = True
-    for ch in line:
-        if escaped:
-            escaped = False
-            word_start = False
-            if ch in "&|;":
-                ch = "_"
-        elif ch == "\\" and quote != "'":
-            escaped = True
-            word_start = False
-        elif quote:
-            if ch == quote:
-                quote = ""
-            elif ch in "&|;":
-                ch = "_"
-        elif ch in "'\"":
-            quote = ch
-            word_start = False
-        elif ch == "#" and word_start and cut_comment:
-            break
-        else:
-            word_start = ch in " \t;&|()"
-        out.append(ch)
-    return "".join(out), bool(quote)
-
-
-def _unquoted_code(shell: str) -> str:
-    """``shell`` with ``#`` comments cut and quoted or escaped ``&``, ``|`` and ``;`` blanked.
-
-    A ``#`` starts a comment only at the start of a word: at the start of a line, or after an
-    unescaped space, tab, ``;``, ``&``, ``|``, ``(`` or ``)``, and never inside quotes. So ``a#b``,
-    ``"x #"`` and a ``#`` after an escaped space keep the text after them, and ``a;#b`` does not.
-    Quote state stops at the end of each line. This is a line lexer, not a shell parser: a heredoc
-    body or a string spanning lines is lexed as if it were code. A line that, read whole, leaves a
-    quote open is one of those, so its quotes cannot be trusted and nothing on it is cut. A line
-    whose quotes pair up wrongly but evenly can still lose text after a ``#`` it misreads.
-    """
-    lines: list[str] = []
-    for line in shell.split("\n"):
-        whole, unbalanced = _lex_shell_line(line, cut_comment=False)
-        lines.append(whole if unbalanced else _lex_shell_line(line, cut_comment=True)[0])
-    return "\n".join(lines)
 
 
 def _wheel_builds(shell: str) -> int:
-    """How many ``python -m build`` calls in ``shell`` produce a wheel.
+    """How many wheel builds ``shell`` owes a smoke step for: every ``python -m build`` it names.
 
-    ``--wheel``/``-w`` does; so does a bare build, which makes an sdist AND a wheel. An
-    ``--sdist``/``-s`` call without a wheel flag makes none, so it owes no wheel smoke. Pass
-    EXECUTED shell (:func:`_executed_shell`), so a comment quoting a build command counts nothing.
-    Other front ends (``pyproject-build``, ``uv build``, ``hatch build``) are not recognised; the
-    release workflow runs none, and the floor in :func:`_wheel_smoke_steps` names every
+    NOT LEXED. Three line lexers in a row each left an input on which this counted FEWER builds
+    than main's ``count("python -m build --wheel")`` (at least ``x=$(pwd)#y; python -m build
+    --wheel``, a heredoc body line, and quote pairs split across lines). An undercount lets a wheel
+    ship with no smoke step, so this no longer parses shell at all. Per line it takes the larger of
+    the raw ``line.count("python -m build")`` and the matches of :data:`_BUILD_CALL`. The raw count
+    alone is at least main's count by construction, because every string main counted contains it
+    and occurrences cannot overlap; the regex adds ``python3 -m build``.
+
+    EVERY CALL IS A WHEEL BUILD. A bare build makes an sdist and a wheel, ``--wheel`` makes a wheel,
+    and the one call that makes none, ``--sdist`` alone, is not told apart by its flags. The release
+    workflow runs no sdist-only build; adding one reds the smoke-count check loudly, and that is
+    the moment to decide how to tell it apart.
+
+    It overcounts in at least these cases, all in the safe direction (a demand for a smoke step
+    nothing runs reds the test; it never lets a wheel through): a build named in a comment, a quoted
+    string, a heredoc body or a ``bash -c`` argument, and an sdist-only build. It undercounts in at
+    least one, which main's count shares: a build inside a shell loop runs many times and counts
+    once. Other front ends (``pyproject-build``, ``uv build``, ``hatch build``) are not recognised;
+    the release workflow runs none, and the floor in :func:`_wheel_smoke_steps` names every
     distribution it ships, so a wheel built another way still has to be added there.
+
+    Pass a step's RAW ``run`` text, never :func:`_executed_shell`'s, which drops comment lines main
+    counted. Pass one step's ``run``, not the whole workflow, so a step's ``name:`` or ``with:``
+    prose cannot demand a smoke step.
     """
-    code = _unquoted_code(shell)
-    calls = list(_BUILD_CALL.finditer(code))
-    count = 0
-    for i, call in enumerate(calls):
-        after = calls[i + 1].start() if i + 1 < len(calls) else len(code)
-        eol = code.find("\n", call.end(), after)
-        rest = _FLAGS_END.split(code[call.end() : after if eol < 0 else eol], maxsplit=1)[0]
-        flags = set(rest.split())
-        if flags & {"--wheel", "-w"} or not flags & {"--sdist", "-s"}:
-            count += 1
-    return count
+    return sum(
+        max(line.count("python -m build"), len(_BUILD_CALL.findall(line)))
+        for line in shell.split("\n")
+    )
 
 
-@pytest.mark.parametrize(
-    ("shell", "expected"),
-    [
-        ("python -m build --wheel a && python -m build --wheel b", 2),
-        ("python -m build --wheel a || python -m build --wheel b", 2),
-        ("python -m build --wheel a; python -m build --wheel b", 2),
-        # The first call's --sdist must not leak into the bare build after the separator.
-        ("python -m build --sdist && python -m build", 1),
-        # A redirect's `&` is not a separator: the --wheel after it still counts, and so does --sdist.
-        ("python -m build --sdist >log 2>&1 --wheel", 1),
-        ("python -m build 2>&1 --sdist", 0),
-        # A build quoted in a trailing comment runs nothing.
-        ("python -m build --wheel a  # x && python -m build --wheel b", 1),
-        # A lone `&` backgrounds the first build and starts the second; a lone `|` or `|&` pipes.
-        ("python -m build --wheel a & python -m build --wheel b", 2),
-        ("python -m build --wheel a | python -m build --wheel b", 2),
-        ("python -m build --wheel a |& python -m build --wheel b", 2),
-        # `&>` is a redirect, not a fresh command: the flags after it still belong to this call.
-        ("python -m build &>log --sdist", 0),
-        # A `#` inside a word, or inside quotes, starts no comment, so nothing after it is hidden.
-        ("python -m build --sdist x#y --wheel", 1),
-        ("python -m build --sdist a#b & python -m build --wheel c", 1),
-        ('python -m build --sdist "a #" && python -m build --wheel', 1),
-        # A comment after a separator runs nothing either.
-        ("python -m build --wheel a; # python -m build", 1),
-        ("python -m build --wheel a;#python -m build --wheel b", 1),
-        # A quoted or escaped `&`, `|`, space or `#` is part of a word: it ends no flags, starts no comment.
-        ('python -m build --sdist -C "k=a&b" --wheel', 1),
-        ("python -m build --sdist -C 'k=a|b' --wheel", 1),
-        ("python -m build --sdist --outdir a\\ #b && python -m build --wheel c", 1),
-        # Quote state stops at the end of a line, so a heredoc's apostrophe leaves later lines alone.
-        ("cat <<'EOF'\nthe engine's wheel\nEOF\ngrep -q 'x #y' n && python -m build --wheel b", 1),
-        # A line that closes a string opened on the line above leaves a quote open when lexed alone,
-        # so its quotes are not trusted and its `#` cuts nothing.
-        ("echo \"a\nit's\" 'x #' && python -m build --wheel", 1),
-        # `>|` is a redirect, not a pipe.
-        ("python -m build --sdist >|log --wheel", 1),
-    ],
-    ids=[
-        "and",
-        "or",
-        "semicolon",
-        "sdist-then-bare",
-        "redirect-wheel",
-        "redirect-sdist",
-        "comment",
-        "background",
-        "pipe",
-        "pipe-amp",
-        "redirect-amp-gt",
-        "hash-in-word",
-        "hash-in-word-hides-build",
-        "hash-in-quotes",
-        "comment-after-separator",
-        "hash-after-separator",
-        "quoted-amp",
-        "quoted-pipe",
-        "escaped-space-hash",
-        "heredoc-apostrophe",
-        "string-closed-on-next-line",
-        "noclobber-redirect",
-    ],
-)
+#: ``(shell, expected)`` for :func:`test_wheel_builds_counts_every_build_on_one_line`, by id.
+_WHEEL_BUILD_CASES = [
+    pytest.param("python -m build --wheel a && python -m build --wheel b", 2, id="and"),
+    pytest.param("python -m build --wheel a || python -m build --wheel b", 2, id="or"),
+    pytest.param("python -m build --wheel a; python -m build --wheel b", 2, id="semicolon"),
+    pytest.param("python -m build --wheel a & python -m build --wheel b", 2, id="background"),
+    pytest.param("python -m build --wheel a | python -m build --wheel b", 2, id="pipe"),
+    pytest.param("python -m build --wheel a |& python -m build --wheel b", 2, id="pipe-amp"),
+    # Lines are counted separately, and summed.
+    pytest.param("python -m build --wheel a\npython -m build --wheel b", 2, id="two-lines"),
+    # A bare build makes a wheel too, and so does every other call: flags are not read.
+    pytest.param("python -m build", 1, id="bare"),
+    pytest.param("python -m build --sdist && python -m build", 2, id="sdist-then-bare"),
+    # ``python3`` is a build main's substring never saw; the regex counts it.
+    pytest.param("python3 -m build --wheel a; python3.14 -m build b", 2, id="python3"),
+    pytest.param("python3 -m build a; python -m build --wheel b", 2, id="python3-and-python"),
+    # Overcounts, all the safe direction: each demands a smoke step, none lets a wheel through.
+    # The first two counted 1 each while this counter lexed comments out.
+    pytest.param("python -m build --wheel a  # x && python -m build --wheel b", 2, id="comment"),
+    pytest.param("python -m build --wheel a; # python -m build", 2, id="comment-after-separator"),
+    pytest.param("# python -m build --wheel", 1, id="comment-line"),
+    pytest.param("echo 'python -m build --wheel'", 1, id="quoted"),
+    pytest.param("cat <<'EOF'\npython -m build --wheel\nEOF", 1, id="heredoc-body"),
+    # A module whose name starts ``build`` matches the raw substring, so it counts: safe direction.
+    pytest.param("python -m builder", 1, id="build-prefixed-module"),
+    # Not a build call at all: no ``-m``.
+    pytest.param("python build --wheel", 0, id="not-a-build"),
+]
+
+
+@pytest.mark.parametrize(("shell", "expected"), _WHEEL_BUILD_CASES)
 def test_wheel_builds_counts_every_build_on_one_line(shell: str, expected: int) -> None:
     """Two builds chained on one line are two wheels, each owing a smoke step.
 
-    Negative control for :func:`_wheel_builds`: when the captured flags ran to the end of the line,
-    ``a && b`` counted once, so the per-job ``len(smoke) == builds`` check would have accepted a
-    second wheel with no smoke step.
+    Negative control for :func:`_wheel_builds`: when the count read one call per line, ``a && b``
+    counted once, so the per-job ``len(smoke) == builds`` check would have accepted a second wheel
+    with no smoke step.
     """
     assert _wheel_builds(shell) == expected
+
+
+#: Inputs on which an earlier, lexing version of :func:`_wheel_builds` counted FEWER builds than
+#: main's ``count("python -m build --wheel")``. Seen red at 1e637e1ee0 on the first three.
+_FLOOR_CASES = [
+    "x=$(pwd)#y; python -m build --wheel",
+    "cat <<EOF\na #b python -m build --wheel\nEOF",
+    "x=$((1&2)) #python -m build --wheel",
+    "python -m build --sdist $((1&2)) --wheel",
+    'echo "x\na" # python -m build --wheel',
+    "python -m build --wheelhouse --sdist",
+    "mypython -m build --wheel",
+    "python -m build --sdist && echo 'python -m build --wheel'",
+]
+
+
+@pytest.mark.parametrize("shell", [p.values[0] for p in _WHEEL_BUILD_CASES] + _FLOOR_CASES)
+def test_wheel_builds_never_counts_fewer_than_mains_substring_count(shell: str) -> None:
+    """The floor the Lander held this counter to: never fewer builds than main counted.
+
+    Main counted ``count("python -m build --wheel")`` over raw text. A count below that on any input
+    is a wheel main would have demanded a smoke step for and this would not.
+    """
+    assert _wheel_builds(shell) >= shell.count("python -m build --wheel")
 
 
 #: The harness distribution, which declares the toolkit beside the engine (ADR 0201 slice 7).
@@ -1669,8 +1622,9 @@ def _wheel_smoke_steps() -> dict[str, dict]:
 
     The engine job builds with a bare ``python -m build`` (sdist AND wheel). Until BACKLOG #1583 this
     predicate keyed on ``--wheel`` alone, which is how the engine smoke stayed outside the section;
-    a bare build produces a wheel too, so it counts. Counted over EXECUTED shell only, so a comment
-    quoting a build command cannot demand a smoke step nothing runs.
+    a bare build produces a wheel too, so it counts. Counted over each step's RAW ``run`` text,
+    comments included, so the count is never below main's; a comment quoting a build command now
+    demands a smoke step, which is the safe direction (:func:`_wheel_builds` says why).
 
     Cached: three ``@pytest.mark.parametrize`` decorators call this at COLLECTION time and every
     execution test calls it again, and it is a pure function of one file. Callers only read the
@@ -1684,7 +1638,7 @@ def _wheel_smoke_steps() -> dict[str, dict]:
     found: dict[str, dict] = {}
     for name, job in _jobs().items():
         steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)]
-        builds = sum(_wheel_builds(_executed_shell(str(s.get("run") or ""))) for s in steps)
+        builds = sum(_wheel_builds(str(s.get("run") or "")) for s in steps)
         if not builds:
             continue
         smoke = [
