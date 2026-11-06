@@ -115,6 +115,14 @@ the gate being keyed on configuration and not on the collector.
   2-second figure was costed against something else and does not apply to it.
 - Not built here: the shard supervisor and the sandbox child still have no forwarder path, and the
   collector-separation probe (every resolved address is this host's) stays unbuilt. #1199 names them.
+  **Note added 2026-11-06 (vault BACKLOG #2356 subject 3).** The sandbox child has no forwarder of its
+  own, and that is still true. Its stderr is piped to the engine process that spawned it, which
+  relays it (ADR 0176): content at `DEBUG` only, plus an attributed, rate-limited `WARNING` notice
+  carrying a line count and no content. That notice is an ordinary engine log record, so where the
+  parent's forwarder is installed it is forwarded off-box with the parent's other records. The owner
+  ruled on 2026-11-05 that this count notice is the off-box path for the child (*"Count notice is
+  enough"*). ADR 0176 keeps its rule that child stderr content never becomes a record above
+  `DEBUG`; `docs/PHI.md` section 7 states the relay and its residuals.
 
 ## Follow-ups (BACKLOG #2278, #2279), 2026-10-08
 

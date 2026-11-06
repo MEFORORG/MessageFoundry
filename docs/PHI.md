@@ -2123,6 +2123,14 @@ docstrings link here rather than restate it. Two independent mechanisms cover it
   rejected, not overlooked:** truncating an HL7 v2 message to its first N bytes keeps MSH and PID and
   discards the clinically bulky remainder, so it preserves precisely the most identifying part of the
   record (ADR 0176).
+- **Off-box (vault BACKLOG #2356 subject 3).** The child has **no off-box forwarder of its own**,
+  and the parent's relay is its only route to one. The `WARNING` count notice above is an ordinary
+  engine log record on stream 1, so where the parent's off-box forwarder is installed (stream 4,
+  `[logging].forward_*`, ADR 0200) the notice is forwarded off-box like any other record, through
+  the same filter chain. **The owner ruled on 2026-11-05 that this count notice is the off-box path
+  for the child's stderr** (*"Count notice is enough"*). ADR 0176's rule is unchanged: no call site
+  turns child stderr content into a record above `DEBUG`, so the content reaches the forwarder only
+  in a `DEBUG` run, which is the first residual above.
 
 ---
 
