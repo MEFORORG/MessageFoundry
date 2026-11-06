@@ -162,7 +162,9 @@ def _step_up_refusal(
     unlock page arrives here as return_to only when the start leg found it issued. That leg holds
     the issue for its flow, and the callback gives it back to the session when the flow ends
     refused (owner ruling 2026-10-13, #3241 R3; vault BACKLOG #3241, added items 7 and 9), so the
-    retry this page offers still continues to it.
+    retry this page offers continues to it while the issue has not lapsed. Once it has, the put-back
+    drops it and the retry continues to nothing, though this page still names the action as one
+    that runs.
     """
     next_ = _step_up_target(return_to)
     return reauth_idp_response(
@@ -481,8 +483,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # From here the single-use flow is the binding; the callback cannot read this session's
         # cookie. An auto-retry action's issue stays spent. An unlock page's issue is held for the
         # flow (owner ruling 2026-10-13, #3241 R3; vault BACKLOG #3241, added items 7 and 9): the
-        # callback puts it back when the flow ends refused, so the retry the IdP's refusal page
-        # offers still continues, and drops it on a success, so one issue mints one grant.
+        # callback puts it back when the flow ends refused, so the retry the refusal page offers
+        # continues while the issue has not lapsed, and drops it on a success, so one issue mints
+        # one grant.
         if action.unlock:
             hold_claim_for_flow(flow_id, claim)
         resp = RedirectResponse(authorization_url, status_code=303)
