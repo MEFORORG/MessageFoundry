@@ -11374,9 +11374,9 @@ class AuthService:
         **A sign-out that names no caller and ends nothing writes its row within a bound (BACKLOG
         #4735).** ``/ui/logout`` needs no credential, so any caller that reaches it could otherwise
         append such rows without limit. :meth:`_admit_logout_miss_row` holds the bound, and
-        :meth:`_count_unrecorded_logout_misses` writes the count of the misses past it. A sign-out
-        that ended a session, or that names its caller as ``POST /auth/logout`` does, always
-        writes its row: concurrent ``POST /auth/logout`` calls on one token each write one, all
+        :meth:`_count_unrecorded_logout_misses` writes the count of the misses past it. The bound
+        never stops the row of a sign-out that ended a session, or that names its caller as
+        ``POST /auth/logout`` does: concurrent ``POST /auth/logout`` calls on one token each write one, all
         but one ``nothing_to_revoke``, and that is kept on purpose.
 
         **A fault in the owner lookup or an audit write is logged, not raised (BACKLOG #3884 item
@@ -11531,6 +11531,7 @@ class AuthService:
         # Taken off before the await, so a second count row cannot start on these while this
         # write stalls; misses counted during the await stay for the next row.
         self._logout_misses_unrecorded -= count
+        written = False
         try:
             written = await write_audit_soft(
                 lambda: self._audit(
@@ -11543,11 +11544,11 @@ class AuthService:
                 # A raise would answer a sign-out the caller is owed with a failure (#3884).
                 defects=(),
             )
-        except BaseException:
-            self._logout_misses_unrecorded += count
-            raise
+        finally:
+            # One path for a refused write and a cancelled one: the count goes back.
+            if not written:
+                self._logout_misses_unrecorded += count
         if not written:
-            self._logout_misses_unrecorded += count
             return
         # The one operator signal, as often as the count row: the trail is being thinned.
         _log.warning(

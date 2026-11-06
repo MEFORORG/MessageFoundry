@@ -5786,8 +5786,9 @@ that window's one count row.
 
 At least these limits stay as well. Callers the engine sees under one folded address are one
 source: at least every caller behind one NAT or egress address, every caller behind a proxy whose
-forwarded address the engine does not trust, every loopback caller, and every caller with no
-address. Three misses from any of them then cost the rest their own rows for the window, and only
+forwarded address the engine does not trust, every loopback caller (so every caller of an engine
+on its default loopback bind), every caller with no address, and every caller whose forwarded
+address reads `unknown`, which shares the no-address source. Three misses from any of them then cost the rest their own rows for the window, and only
 the count records the others. The source is the whole address, so an IPv6 host that holds a /64 can
 be 40 sources by itself and fill the ceiling. The bound and the count are in-process, so each engine
 shard keeps its own. Nothing prunes `audit_log` (see [retention](CONFIGURATION.md#retention)), so the
@@ -5799,10 +5800,10 @@ SQLite its `UPDATE` takes the store's write lock even when it matches no row, an
 message ingress commits. Nothing in the engine bounds those requests, so treat `/ui/logout` as an
 unbounded store-write surface to any caller that can reach the console, on the engine's own host or
 beyond it. The sign-out itself is never refused, though one that writes a count row waits for that
-write too. A sign-out that ended a session always writes its row, and so does one that names its
-caller, as `POST /auth/logout` does: concurrent `POST /auth/logout` calls on one token each write a
-row, all but one `nothing_to_revoke`, and that is kept on purpose, because each is an authenticated
-request.
+write too. The bound never stops the row of a sign-out that ended a session, or of one that names its
+caller, as `POST /auth/logout` does, though a refused audit write still loses such a row with an
+ERROR line (above). Concurrent `POST /auth/logout` calls on one token each write a row, all but one
+`nothing_to_revoke`, and that is kept on purpose, because each is an authenticated request.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was

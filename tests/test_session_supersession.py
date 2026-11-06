@@ -762,9 +762,12 @@ async def test_a_cancelled_count_row_keeps_its_count_for_the_next_one(
     assert [n for _, _, n in await _counted(store)] == [1]
 
 
-async def test_a_sign_out_that_names_its_caller_is_never_bounded(store: MessageStore) -> None:
+async def test_a_sign_out_that_names_its_caller_is_never_bounded(
+    store: MessageStore, miss_clock: list[float]
+) -> None:
     """RED when: the bound drops a row of a sign-out that names its caller, as POST /auth/logout
-    does. Concurrent calls on one token write one such row each, kept on purpose (step 2)."""
+    does, or such sign-outs charge the caller-less budget. Every such sign-out writes its row, so
+    concurrent calls on one token write one each, kept on purpose (step 2)."""
     service = await _service(store)
     count = _LOGOUT_MISS_ROWS_ALL + 5
     for n in range(count):
@@ -775,6 +778,9 @@ async def test_a_sign_out_that_names_its_caller_is_never_bounded(store: MessageS
     rows = await logout_rows(store, limit=count * 2)
     assert rows == [("op", "203.0.113.9", "nothing_to_revoke")] * count
     assert await _counted(store) == []
+    # The budget is untouched: a caller-less miss from the same address still writes its row.
+    await _misses(service, 1, "203.0.113.9")
+    assert (await logout_rows(store, limit=1)) == [(None, "203.0.113.9", "nothing_to_revoke")]
 
 
 async def test_a_sign_out_that_ends_a_session_is_audited_past_the_bound(
