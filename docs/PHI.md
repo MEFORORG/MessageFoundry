@@ -807,7 +807,7 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    three built-in envs (`dev`/`staging`/`prod`) derive PHI**, so the default/CI path is key-required too — a
    key is required on **every** instance: [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) retired the synthetic declaration, so no
    box can opt out of this gate as a class. Two further explicit overrides:
-   `[store].require_encryption = true` forces the refusal past the audited opt-out below; `[security].allow_unencrypted_phi = true` is the loud, **audited** opt-out that
+   `[store].require_encryption = true` forces the refusal past the audited opt-out below; `[security].allow_unencrypted_phi = true`, or `[security].encrypt_stored_data = false`, which sets the same flag, is the loud, **audited** opt-out that
    lets a PHI instance start keyless anyway (it still emits the UNENCRYPTED-at-rest warning, and
    `require_encryption` wins over it) — and under **strict enforcement** (`[security].enforcement = enforce`,
    the default) keyless PHI additionally requires the second ack
@@ -1209,12 +1209,17 @@ route and transform it (BACKLOG #1174).
   transformation are the site's own Python ([ADR 0202](adr/0202-a-handler-receives-the-whole-decrypted-message-so-asvs-11-7-2-is-recorded-as-partial.md)).
   An earlier version of this bullet said routing reads only the fields a Router asks for; that was
   not what the code does (BACKLOG #1174).
-- **Re-encryption happens on write.** With a key set, the store cipher re-encrypts every PHI column the
-  moment it is written back ([store/crypto.py](../messagefoundry/store/crypto.py)). So the columns it
-  covers do not linger in plaintext at rest, and the staged queue carries the message forward rather
-  than holding it open. `[security].allow_unencrypted_phi` is the audited keyless opt-out. The
-  decrypted body in process memory is never re-encrypted. It lives in the engine's heap, and also in
-  a per-inbound worker's under `[sandbox].mode = "subprocess"`. It stays there as immutable Python
+- **Re-encryption happens on write.** With a key set, the store cipher re-encrypts each column it
+  covers the moment it is written back ([store/crypto.py](../messagefoundry/store/crypto.py)). So
+  those columns do not linger in plaintext at rest, and the staged queue carries the message forward
+  rather than holding it open. That is not every column that can hold PHI: at least `state.key` and
+  `reference.key` stay plaintext by construction, and
+  [section 2](#2-where-phi-lives--data-at-rest-inventory) says when they would carry an identifier.
+  The audited keyless opt-out is
+  `[security].allow_unencrypted_phi = true` or `[security].encrypt_stored_data = false`, either of
+  which sets it; [section 3](#3-encryption-at-rest) gives the rest of the rule. The decrypted body in
+  process memory is never re-encrypted. It lives at least in the engine's heap, and also in a
+  per-inbound worker's under `[sandbox].mode = "subprocess"`. It stays there as immutable Python
   strings, and so does every copy the Router's or Handler's own code makes. It is gone only when that
   code and the garbage collector let it go
   ([ADR 0202](adr/0202-a-handler-receives-the-whole-decrypted-message-so-asvs-11-7-2-is-recorded-as-partial.md)).

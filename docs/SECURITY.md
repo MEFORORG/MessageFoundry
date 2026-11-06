@@ -855,8 +855,9 @@ the exchange, and a failed exchange is refused with its own reason rather than `
 **Why a sign-in callback is floored only sometimes.** An IdP that still holds a live single sign-on
 session answers the engine's redirect with no human step at all. A floor there would refuse that
 sign-in on every retry. So the sign-in is floored only when the verified `auth_time` is at or after
-the flow's start, which means the person signed in at the IdP inside this flow. An IdP clock that
-runs ahead can make an older sign-on look fresh. The refusal then clears once the skew has passed,
+the flow's start, rounded down to the whole second because `auth_time` carries whole seconds. That
+means the person signed in at the IdP inside this flow, or in the second it started. An IdP clock
+that runs ahead can make an older sign-on look fresh. The refusal then clears once the skew has passed,
 and it never lets a flow through early. An IdP clock that runs behind can do the reverse, and then
 that sign-in is not floored. A sign-on made before the flow starts is the case the list under
 *What these floors do not do*, below, records as a limitation.
@@ -916,18 +917,22 @@ below that, at 1 s, because M is an average and some people are faster. The comm
 - An OIDC sign-in that rides a live single sign-on session at the IdP would not be floored. OIDC is
   off by default. *Why a sign-in callback is floored only sometimes*, above, gives the rule. So a
   client could avoid the floor by authenticating at the IdP before the flow starts, by script or by
-  hand. It cannot forge the verified `auth_time`, but it chooses when that sign-on happens. One
-  sign-on could then serve unfloored sign-ins for as long as `[auth].oidc_max_age_seconds` accepts
-  it, and a fresh sign-on starts that again. The engine has no human step to time between such a
-  start and its callback, and it cannot check the IdP's own anti-automation. This is a decided
-  limitation of the floors, recorded on 2026-10-09 under BACKLOG #1115. It is no oversight, and it
-  still counts as a gap. The sign-in rate limit would still apply to that path, and it does not
-  detect automation either. Switching it off, or setting its window to 0 or less or both its counts
-  to 0, removes it. [Business-logic limits](#business-logic-limits-asvs-213) gives its size and
-  settings. The [Route to limiter map](#route--limiter-map) lists the routes that charge it, and
-  says when the "you are leaving this site" confirm is shown before the start. That confirm is no control on this
-  path: a script can post the start without loading the page, and nothing times the confirm.
-  Revisit the decision if OIDC ever ships on by default.
+  hand. It cannot forge the verified `auth_time`, but it chooses when that sign-on happens. A
+  retry would avoid the floor the same way. A callback refused as `too_early` has already signed
+  in at the IdP, so a new flow started in a later second rides that sign-on and is not floored.
+  One sign-on could then serve unfloored sign-ins for as long as `[auth].oidc_max_age_seconds`
+  accepts it, 12 hours by default, and a fresh sign-on starts that again. The engine has no human
+  step to time between such a start and its callback, and it cannot check the IdP's own
+  anti-automation. This is a decided limitation of the floors, recorded on 2026-10-09 under
+  BACKLOG #1115, and it still counts as a gap. The sign-in rate limit would still apply to that
+  path. It counts per client address and globally, not per account, and it does not detect
+  automation either. Switching it off, or setting its window to 0 or less, removes it. Setting one
+  of its two counts to 0 removes only that count's limit, and the other still applies.
+  [Business-logic limits](#business-logic-limits-asvs-213) gives its size and settings. The [Route
+  to limiter map](#route--limiter-map) lists the routes that charge it, and says when the "you are
+  leaving this site" confirm is shown before the start. That confirm is no control on this path: a
+  script can post the start without loading the page, and nothing times the confirm. Revisit the
+  decision if OIDC ever ships on by default.
 - The MFA floor compares two wall-clock readings, as the approval dwell does. A clock step backward
   refuses a good code until the clocks agree again. A step forward lets a code through early.
 - The response hides the reason, but the audit row names it. The account holder's own security
@@ -5478,6 +5483,35 @@ that state, and audits `auth.ad_reconcile_paging_refused` naming the account. Th
 page are stated in [CONNECTIONS.md](CONNECTIONS.md#table-b--per-service-resource-strategy-asvs-1313),
 the Active Directory rows.
 
+### Which system bounds a session, per sign-in leg (ASVS 7.1.3)
+
+The engine mints every session itself, at one site (`AuthService._issue_session`), whichever leg
+proved the user. An outside system takes part only through what its leg hands the engine. Both
+federated legs ship off, as the next section says, and each needs `[auth].ad_enabled`, so the last
+two rows describe a site that turns one on. At least these legs exist:
+
+| Sign-in leg | Systems that create or manage the session | Lifetime the leg exposes, and what the engine does with it | What else can end the session | Re-authentication |
+|---|---|---|---|---|
+| Local account: a password, alone or with a code, or a passkey (`POST /auth/login`, `POST /ui/login`, `POST /ui/login/passkey`) | The engine alone | None. The session gets only the engine's idle and absolute caps | A password change | A step-up in the engine, by password or an engine second factor ([Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) |
+| Directory password, LDAP simple bind | None. The sign-in leg is retired (BACKLOG #1137): `POST /auth/login` with `provider: "ad"` is refused and mints nothing, and `GET /auth/providers` reports `ad: false` | None. No session comes from this leg | Not applicable | The bind survives only as the password step-up of a directory account, against Active Directory |
+| Windows SSO, Kerberos (`POST /auth/negotiate`, `GET /ui/sso`) | The KDC issues the service ticket, the engine mints its own session from it, and Active Directory holds the account | **None.** The engine reads no ticket lifetime, so the session gets only the engine's idle and absolute caps and can outlive the ticket. Bounding it by the KDC authentication event is declined; see below | The [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2). An expired ticket ends nothing | A password re-bind against Active Directory, or an engine second factor after a directory lookup. The ticket is never checked again |
+| Federated OIDC, browser only (`POST /ui/oidc/start`, `GET /ui/oidc/callback`) | The IdP holds its own session, the engine mints its own, and Active Directory holds the account, since every federated account is a directory account | The signature-verified `id_token.exp` and `auth_time`. Each can shorten the session's absolute expiry, never lengthen it ([Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142), *Time since the IdP sign-in is bounded too*, gives the rule) | The directory reconciler, and a change to the account's federated binding. A sign-out at the IdP ends nothing | A step-up at the IdP, which must report a later `auth_time`, never a password. It does not extend the session |
+
+On every leg, the concurrent-session cap and the engine-side events in the [IdP independence
+table](#the-engine-session-is-independent-of-the-idp-session-asvs-761) below can end a session too.
+The *Session age* row of the
+[signal table](#contextual-and-environmental-security-inputs-asvs-813--814) gives each cap's
+default and setting. The [holder table under Sessions](#sessions) names at least the clients that
+keep a token once a leg mints it. The VS Code extension is one, and with the directory password
+leg retired it signs in on the local leg.
+
+**The Kerberos leg exposes no ticket lifetime, and bounding a Kerberos session by the KDC
+authentication event is declined**
+([ADR 0079](adr/0079-kerberos-idp-session-coordination.md), amendment of 2026-07-21). *Why the
+engine keeps its own session*, below, gives the reason. The owner re-affirmed the decline on
+2026-11-05. So a Kerberos session would end at the engine's own caps, or when the reconciler or an
+engine-side event ends it, whatever the ticket says.
+
 ### The engine session is independent of the IdP session (ASVS 7.6.1)
 
 The engine mints its own session at sign-in. That session does not follow the identity provider
@@ -7367,7 +7401,7 @@ BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** a
   protecting the payload. Re-open when a destination begins publishing an `ECHConfig`, or when CPython
   ships a first-class ECH API.
 
-### In-use memory protection — best-effort partial + deployment requirement (13.3.3 / 11.7.1 / 11.7.2, #198)
+### In-use memory protection — best-effort partial + deployment requirement (13.3.3 / 11.7.1, #198; 11.7.2, #1174)
 
 The store cipher holds an unwrapped 32-byte DEK and transient plaintext PHI in process heap while it
 runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and accepts the rest:
@@ -7398,7 +7432,8 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
   it writes it to the store, and only with a key set;
   [PHI.md §3, *Data minimization during processing*](PHI.md#data-minimization-during-processing-in-use-posture-asvs-1172)
   says what that does and does not cover. A PHI instance can still start keyless through the
-  audited opt-out that `[security].allow_unencrypted_phi` sets. PHI.md §3, under *Fail-closed*,
+  audited opt-out that `[security].allow_unencrypted_phi = true` or
+  `[security].encrypt_stored_data = false` sets. PHI.md §3, under *Fail-closed*,
   states the second flag that strict enforcement adds and the other settings involved.
   **CORRECTED 2026-10-10 (BACKLOG #1174):** the 11.7.1 bullet above ended *"11.7.2's
   encrypt-after-use guarantee is active only on a keyed instance (a key must be configured), which

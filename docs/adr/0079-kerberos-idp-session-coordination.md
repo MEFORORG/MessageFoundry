@@ -339,3 +339,11 @@ record. Held accounts now stay in the population the breaker judges, so its coun
 again.* What it counts changed in one way: held accounts are left out of the population it judges,
 so it weighs only what the pass could still revoke. A pass the breaker aborts still writes the
 `auth.ad_reconcile_held` row when it also holds.
+
+## Amendment (2026-11-05) -- the owner re-affirms the decline of a KDC-event bound on Kerberos sessions (BACKLOG #1145)
+
+Asked again whether to bound a Windows SSO (Kerberos) session by the KDC authentication event, for
+example through `sspilib`'s acceptor expiry, the owner answered "Keep declined" on 2026-11-05. The
+2026-07-21 amendment above stands, and the engine does not build that bound.
+[SECURITY.md](../SECURITY.md#which-system-bounds-a-session-per-sign-in-leg-asvs-713) records, per
+sign-in leg, what bounds a session instead.

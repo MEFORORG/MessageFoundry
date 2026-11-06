@@ -20,6 +20,13 @@
   - Decision item 2's list of gated properties lacked `reason`, which `main` added after the draft
     (BACKLOG #2443). The old list was *"(summary, error, metadata, last_error, detail)"*.
   - The line above the decision list now says which items were re-read, and when.
+- **Correction 2026-11-06 (BACKLOG #1174 items 2 and 4).** Factual only; the decision is unchanged.
+  Read at engine `origin/main` `a1a686e0a1`. At least these places changed:
+  - Decision item 5 now says the cache keys stay plaintext. It said nothing about them.
+  - Option 4 and *Negative / risks* said *"engine memory"*. Each now names the per-inbound worker
+    process under `[sandbox].mode = "subprocess"` too, as *What a Handler receives* already did.
+  - *What a Handler receives* named only *"`[security].allow_unencrypted_phi`"* as the keyless
+    opt-out. It now names `[security].encrypt_stored_data = false` beside it, since either sets it.
 - **Related:** BACKLOG #1174 (ASVS 11.7.2), #1185 (ASVS 14.2.2) · [ADR 0005](0005-transform-accessible-state.md) ·
   [ADR 0105](0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md) · CLAUDE.md §1, §2, §9 · [`docs/PHI.md`](../PHI.md) §3
 
@@ -65,8 +72,9 @@ off-by-default detach described below. A Router receives the whole message too: 
 memory, as immutable Python strings and in every copy the Router's or Handler's own code makes, for
 as long as that code and the garbage collector keep it. That memory is the engine process's, and
 also the per-inbound worker process's under `[sandbox].mode = "subprocess"`. By default, the persisted copy is
-re-encrypted by the store cipher on every write (`store/crypto.py`); `[security].allow_unencrypted_phi`
-is the audited keyless opt-out (a second flag under strict enforcement).
+re-encrypted by the store cipher on every write (`store/crypto.py`). The audited keyless opt-out is
+`[security].allow_unencrypted_phi = true` or `[security].encrypt_stored_data = false`, with a second
+flag under strict enforcement.
 
 ### Where minimization is enforced
 
@@ -99,7 +107,9 @@ at least these; it is not complete.
    does not keep a message open between stages. This does not hold for the correlation
    read-through caches, which keep every live key for the store's lifetime. Since #1174 part C
    (engine PR 1802), each cached value is sealed and decrypted only inside the read that asks for
-   it. `docs/PHI.md` §3, *Sealed correlation caches*, says how and what that does not cover.
+   it. The keys are not sealed: they stay plaintext in the cache, as the `state.key` and
+   `reference.key` columns do at rest (`docs/PHI.md` §2 says when a key would carry PHI). `docs/PHI.md` §3,
+   *Sealed correlation caches*, says how and what that does not cover.
    > **Superseded text, kept as a record (corrected 2026-10-10).** The last two sentences of this
    > item read: *"This does not hold for the correlation read-through caches: on `main` the state
    > and reference caches hold decrypted values for the store's lifetime by default. #1174 part C,
@@ -159,7 +169,8 @@ surfaces this ADR relies on. Each links to an existing test that already guards 
 4. **Re-score 11.7.2 on the strength of a nearby control** (the no-store directive, the retention
    purge, the detach seam, or the per-read decrypt of the caches that #1174 part C added).
    Rejected:
-   none of them is the clinical body in engine memory, which is the verb's subject.
+   none of them is the clinical body in process memory, the engine's or a sandbox worker's, which
+   is the verb's subject.
    > **Superseded text, kept as a record (corrected 2026-10-10).** The parenthesis ended *"the
    > per-read decrypt of the caches that #1174 part C proposes"*.
 
@@ -169,8 +180,9 @@ surfaces this ADR relies on. Each links to an existing test that already guards 
 reader has to wonder whether a narrower Handler contract was ever on the table.
 
 **Negative / risks** — On a first deployment, the decrypted body of every message a Handler
-processes would live in engine memory until garbage collection. Reading it needs access to the
-engine process's memory: a core dump, a debugger, unencrypted swap, or a local administrator. That
+processes would live in the engine process's memory until garbage collection, and also in the
+per-inbound worker process's under `[sandbox].mode = "subprocess"`. Reading it needs access to that
+process's memory: a core dump, a debugger, unencrypted swap, or a local administrator. That
 exposure is the in-use residual `docs/PHI.md` §3 describes, which §10 carries as a stated
 deployment requirement.
 
