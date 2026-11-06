@@ -22,7 +22,7 @@ reported as its own violation class and is never quietly folded into "missing".
 SCOPE IS STATED POSITIVELY AND WAS MEASURED, NOT ASSUMED. Every tracked file carrying one of the
 extensions in ``COMMENT_PREFIXES`` is in scope. There is still no TREE exemption -- every directory
 this project owns is checked against ``EXPECTED_IDENTIFIER`` with no exceptions. ``tee/`` (vendored
-from this project's own ``messagefoundry/anon/``) is already fully compliant, as are ``harness/``,
+from this project's own ``messagefoundry_toolkit/anon/``) is already fully compliant, as are ``harness/``,
 ``samples/``, ``packaging/``, ``docker/``, ``messagefoundry_webconsole/`` and the archived
 ``docs/benchmarks/results/``.
 

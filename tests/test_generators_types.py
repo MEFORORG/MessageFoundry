@@ -6,11 +6,11 @@ from __future__ import annotations
 
 import pytest
 
-from messagefoundry.generators import (
+from messagefoundry.parsing import Peek
+from messagefoundry_toolkit.generators import (
     _core,
     all_types,  # noqa: F401  (registers every built-in type)
 )
-from messagefoundry.parsing import Peek
 
 _CASES = [(code, trigger) for code in _core.message_codes() for trigger in _core.triggers_for(code)]
 
