@@ -68,7 +68,8 @@ why the distinction is written down here rather than left to a tester.
 
 ### Minimum browser versions are deliberately not stated
 
-**Declined for now, by the owner on 2026-11-05, until a compatibility dataset is pinned.**
+**Declined for now, by the owner on 2026-11-05, until a compatibility dataset is pinned**
+(`BACKLOG #1124`, which cites the project's private planning ledger).
 MessageFoundry ships no pinned browser-compatibility dataset, so there is no version table here
 that anyone could check against a source. Naming engine versions without one would mean writing
 numbers chosen to match what already works, which tells you nothing about the feature the console

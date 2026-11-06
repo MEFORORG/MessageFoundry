@@ -522,12 +522,20 @@ async def _fed_and_still_open(
     ],
 )
 async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
-    request_bytes: bytes, status: int, bare_answers: bool
+    request_bytes: bytes, status: int, bare_answers: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """What uvicorn's Server.shutdown does to each connection still in its set: call
     ``shutdown()``. On the bare sans-I/O class that sends a 500 on a conn that has already ended
     its stream, and websockets asserts, which is the control. On the floored class the connection
     was answered and marked so, nothing more is written, and the call returns."""
+    rejection_passes: list[Any] = []
+    answer_a_parser_rejection = protocol_headers._answer_a_parser_rejection
+
+    def _counted_rejection(protocol: Any) -> None:
+        rejection_passes.append(protocol)
+        answer_a_parser_rejection(protocol)
+
+    monkeypatch.setattr(protocol_headers, "_answer_a_parser_rejection", _counted_rejection)
     bare, bare_transport = await _fed_and_still_open(WebSocketsSansIOProtocol, request_bytes)
     assert bool(bare_transport.written) is bare_answers
     with pytest.raises(AssertionError) as stopped:
@@ -548,8 +556,10 @@ async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
     assert written.startswith(f"HTTP/1.1 {status} ".encode()), written[:40]
     assert b"nosniff" in written and transport.closing
     # uvicorn runs handle_connect for a request the parser accepted, and never for one it
-    # rejected: the app-error case is the control that the count sees a call at all.
+    # rejected: the app-error case is the control that the count sees a call at all. The floor's
+    # parser-rejection step runs once, on the first bytes, in both cases.
     assert len(connects) == (1 if bare_answers else 0)
+    assert rejection_passes == [floored]
     if not bare_answers:
         # So the parser-rejection step set these itself.
         assert (floored.handshake_initiated, floored.handshake_complete, floored.close_sent) == (
@@ -558,8 +568,9 @@ async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
             True,
         )
         floored.data_received(b"more bytes after the rejection")  # no raise
-        # No second pass: handle_connect still never ran, and the check after shutdown() below
-        # shows nothing more was written.
+        # No second pass: the rejection step did not run again, handle_connect still never ran,
+        # and the check after shutdown() below shows nothing more was written.
+        assert rejection_passes == [floored]
         assert connects == []
     floored.shutdown()
     assert bytes(transport.written) == written

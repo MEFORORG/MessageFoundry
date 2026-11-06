@@ -48,7 +48,7 @@
   touch at least §1.5 item 4, 2026-09-24 on PR 1502, one §7.1 row, 2026-09-27, and the ODBC rows
   of §7.1's 2026-10-04 note, 2026-10-05, with the limits stated below that note's table, the
   three Vault rows of that note, 2026-10-13, in §12, and the same ODBC rows after their driver
-  test, 2026-11-05, in §14) · security working group
+  test, 2026-11-05, in the last limit below that note's table) · security working group
 - **Related:** **extends [ADR 0078](0078-certificate-revocation-posture.md)** (Accepted 2026-07-10,
   owner-ratified — that ADR made the `[api]` in-process delegation an *enforced* start-time refusal;
   this one grades the two remaining directions and records why one of them is unbuildable) ·
@@ -1178,7 +1178,7 @@ of the list above:
 | DATABASE connector, SQL Server preset: `transports/database.py`, `_build_dsn`, reached through `_build_connection` by `DatabaseDestination` and `DatabaseSource` | rows built from messages, rows polled into messages, the SQL login | The same two keywords, emitted last (*code*). The driver is the `odbc_driver` setting, which defaults to ODBC Driver 18 (*code*). This builder emits no `ServerCertificate=` (*code*). The weakened arm is verify-off: it is refused on an enforcing instance unless the connection declares `tls_hop_attested` (*code*) | None in the engine (*code*). The driver's own: *not established*, except the one case the amendment of 2026-11-05 below the table measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
 | DATABASE connector, generic dialect: `transports/database.py`, `_build_odbc_dsn`, the other arm of `_build_connection` | the same | The operator's driver and its own keywords. Only a keyword on `_ODBC_PARAM_ALLOWLIST` passes through `odbc_params` (*code*). The engine cannot tell whether a keyword's value verifies the peer, and the builder's docstring says so (*code*). `generic_cleartext_hop_guard` gates a connection that sets no TLS mode, or sets one to a value meaning TLS is not required. On an enforcing instance it refuses that hop off-loopback unless the connection is attested or declares cleartext accepted (*code*). The psqlODBC and MySQL ODBC documentation was not read for revocation. *(CORRECTED 2026-10-30, BACKLOG #2483: this cell read "sets no TLS keyword" and "documentation was not read". The guard now keys on a TLS mode, and the two drivers' TLS-mode keywords have since been read; their revocation behaviour has not.)* | None in the engine (*code*). The allowlist holds no CRL keyword, so a driver's own CRL option could not be set through the engine today (*code*). Each driver's own behaviour: *not established*, except the one case the amendment of 2026-11-05 below the table measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** Two limits in the paragraph below the table bear hardest here. This arm counts among the five by the Manager's reading. It can also name a driver other than Driver 18. The list above does not name this arm |
 | `db_lookup` reads: `transports/database.py`, `DatabaseLookupExecutor.__init__` | lookup parameters taken from a message, the rows that come back, the SQL login | `_build_dsn(read_only=True)`, so the SQL Server preset row applies. The generic dialect cannot be reached from here (*code*) | None in the engine (*code*). The driver's own: *not established*, except the one case the amendment of 2026-11-05 below the table measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
-| DATABASE reference-sync source: `pipeline/reference_sync.py`, `database_source_dsn` and `_load_database_source` | reference rows, the SQL login | `_build_dsn` and a pool of its own, so the SQL Server preset row applies. A reference source takes no dialect (*code*) | None in the engine (*code*). The driver's own: *not established*, except the one case the amendment of 2026-11-05 below the table measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
+| DATABASE reference-sync source: `pipeline/reference_sync.py`, `database_source_dsn` and `_load_database_source` | reference rows, the SQL login | `_build_dsn(read_only=True)` and a pool of its own, so the SQL Server preset row applies with `ApplicationIntent=ReadOnly`, as on `db_lookup`. A reference source takes no dialect (*code*). *(CORRECTED 2026-11-06: this cell read "`_build_dsn` and a pool of its own"; the read-only flag has been passed since BACKLOG #2617.)* | None in the engine (*code*). The driver's own: *not established*, except the one case the amendment of 2026-11-05 below the table measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
 | Vault key provider: `store/keyprovider_vault.py`, `_build_client`. `store_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, the store's data-encryption key back | `hvac` over `requests`. Each handshake runs on a fresh context from the factory `assert_hvac_tls_suites` returns, set per connection by `_narrowed_pool_classes` in `transports/strict_requests.py` (*code*). The context requires a verified peer and checks the host name (*measured*). It trusts the file `MEFOR_STORE_VAULT_CA_FILE` names. With that unset the engine passes no anchor, and the pinned libraries choose one: hvac reads `VAULT_CACERT` and `VAULT_CAPATH`, requests reads `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`, and the certifi bundle is last (*code*, in hvac 2.4.0 and requests 2.34.2). `verify=False` is refused, and so is a connection that would verify no peer (*code*). Through an `https://` proxy there is a second verified leg, to the proxy, on its own context from the same factory (*code*). This note does not grade that leg as a row. *(Since 2026-10-26 that leg has a guard of its own, vault BACKLOG #3561; §12 says how.)* | None. The factory never calls `harden_crl_check` (*code*). A context it built had `VERIFY_CRL_CHECK_LEAF` clear and no CRL loaded, and the same read returned true for a control context with the flag set (*measured*, with hvac 2.4.0, requests 2.34.2 and urllib3 2.8.0). A search of those installed `requests` and `urllib3` packages found no CRL or OCSP handling (*code*) | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 | Vault Transit cipher: `store/crypto_transit.py`, which calls the key provider's `_build_client` | the Vault token, and message bodies sent to Vault to encrypt and decrypt | The key provider's row applies: it is the same client build (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 | Vault secret provider: `config/secretprovider_vault.py`, its own `_build_client`. `secrets_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, connector credentials back | The same shape as the key provider, proxy leg included, with `MEFOR_SECRETS_VAULT_CA_FILE` as its anchor (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
@@ -1206,8 +1206,8 @@ ruling, and the last bullet records the owner's later ruling on the test's resul
   against one way of publishing revocation.** The ruling's "then test it" half ran under #3009.
   ODBC Driver 18.7 on Windows did not use a published revocation list on any of the four
   connection-string shapes tested. The amendment of 2026-11-05 below this note's bullets says what
-  ran and what it does not show. Every other driver, every other operating system, and OCSP are
-  still unmeasured. *(Until 2026-11-05 this bullet read: "**The drivers' own revocation behaviour
+  ran and lists what it does not show; at least every other driver or build, every other operating
+  system, OCSP and a chain with an intermediate CA are still unmeasured. *(Until 2026-11-05 this bullet read: "**The drivers' own revocation behaviour
   is still unmeasured.** The ruling's "then test it" half is owed. It needs a SQL Server whose
   certificate can be revoked. A control connection to a certificate that is not revoked shows that
   a refusal comes from the revocation. Until #3009 runs, nothing here says whether Driver 18 checks
@@ -1270,8 +1270,8 @@ share. Their records are private, in the vault beside #3009, and are not repeate
   **A**, the string the SQL Server store and the DATABASE connector's SQL Server preset build;
   **L**, the read-only string `db_lookup` builds; **G**, the generic dialect naming Driver 18; and
   **P**, the store's string with a `ServerCertificate=` pin that matches the server's certificate,
-  under `Encrypt=yes`. Reference-sync builds the preset's string, so shape A stands for it by the
-  code read in its row above.
+  under `Encrypt=yes`. Reference-sync builds the same read-only string `db_lookup` does, so shape
+  L stands for it (*code*: `database_source_dsn` calls `_build_dsn` with `read_only=True`).
 - **What the driver did.** Every shape connected while the server presented the revoked
   certificate, with the list cleared from the cache and again with it warmed into the cache first.
   The list's server logged no request during any leg. Every shape also connected once the same
@@ -1479,7 +1479,8 @@ cells, whose old grade is quoted once, in the grades bullet:
 
 **Where the facts live.** The paragraph below §7.1's ODBC table is where this file states the
 ruling's limits and what the test must show. Other places name the ruling and point there. When
-BACKLOG #3009 has a result, it goes in that paragraph.
+BACKLOG #3009 has a result, it goes in that paragraph. *(Since 2026-11-05 the result sits beside
+that paragraph, in a dated amendment below its bullets; §14 says where.)*
 
 **What this amendment does not do.** It builds no guard, changes no code and measures nothing.
 
@@ -1680,7 +1681,8 @@ amendment does not change those three call sites.
 a result, and the owner has ruled on it: the five ODBC hops stay a named gap. The result is stated
 once, in the amendment of 2026-11-05 below §7.1's ODBC table, beside the paragraph §11 named for
 it, and the ruling once, in that paragraph's last limit. This amendment edits at least these
-places, and keeps the old words beside the new:
+places. Where it replaced a claim, the old words are kept beside the new, except in the five
+revocation cells, whose old words are quoted once, in item 3:
 
 1. The Status paragraph, and the Deciders line in this file's header.
 2. The paragraph below §7.1's ODBC table: its lead sentence, the lead-in to its bullets, and its
@@ -1688,5 +1690,7 @@ places, and keeps the old words beside the new:
 3. The revocation cell of each of the five ODBC rows. Each read "The driver's own: *not
    established*", or, on the generic dialect, "Each driver's own behaviour: *not established*".
 4. The last bullet of the counts list after §7.1's note.
+5. The reference-sync row's verification cell, corrected in place: it builds the read-only string.
+6. A note under §11's sentence on where a #3009 result goes.
 
 **What this amendment does not do.** It builds no guard, changes no code, and changes no grade.

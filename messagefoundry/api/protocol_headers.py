@@ -95,10 +95,11 @@ assigns and has stopped reading, nor tell ``self.<name> = ...`` from the same na
 another object. For one name a test does: the parser-rejection case of
 ``test_shutdown_of_an_answered_still_open_connection_does_not_raise`` fails when uvicorn's
 ``shutdown`` stops reading ``close_sent`` (a mutation removing that read raised ``InvalidState``).
-No test covers any other name, or the other-object case. That case stays unfixed on purpose: a
-check keyed on ``self`` would read the bytecode that loads the object, which CPython changes
-between versions (3.14 fuses such loads), so it would trade a documented over-acceptance for a
-refusal at start that nothing documents. The checked hooks are: the HTTP protocol's
+No test covers any other name, or the other-object case. That case stays unfixed on purpose: it
+can only pass a name a server assigns on some other object, and a check keyed on ``self`` would
+read the load opcodes before each store, which CPython has changed in recent versions (3.13 added
+fused loads, 3.14 borrowed ones), so a miss there would refuse the start. The checked hooks are:
+the HTTP protocol's
 ``send_400_response``, its ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
 ``send_500_response``, ``default_headers``, ``send``, and the ``disconnected``, ``message_event``
 and ``response_complete`` it reads, and the WebSocket protocol's hooks. For the legacy

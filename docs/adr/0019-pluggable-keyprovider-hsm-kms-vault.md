@@ -5,8 +5,8 @@
   connector `SecretProvider` (§5) promoted design → BUILT, AD-bind + SMTP credential points wired (see
   the [2026-07-12 amendment](#amendment-2026-07-12--connector-secretprovider-5-promoted-to-built)).**
   **Amended again after 2026-07-12, at least six times.** Each later amendment is a dated
-  `## Amendment` section below, and its heading says what it changed; dated corrections sit inside
-  them. *(Until 2026-11-06 this Status line stopped at the 2026-07-12 amendment, BACKLOG #1173
+  `## Amendment` section below, and its heading says what it changed; most dated corrections sit
+  inside them. *(Until 2026-11-06 this Status line stopped at the 2026-07-12 amendment, BACKLOG #1173
   item 6.)*
   Designs the pluggable
   **KeyProvider** seam (work package **WP-BL3-04**) that lets the store's at-rest data-encryption key be
@@ -801,12 +801,13 @@ token, and this table did not list it.)*
 4. **Volume wears out a key, not the generator.** The one value whose safety falls with volume is the
    96-bit random AES-GCM nonce, and that is a limit on the key, not on the generator. The default path
    counts it: the 2026-07-22 amendment above, and `store/gcm_bound.py`. The `vault_transit` path
-   counts nothing. In its place it has a recorded operator attestation, `enforce_transit_bound_attestation`
-   in `store/transit_attestation.py` (BACKLOG #2337), which is still weaker than the counted bound.
-   [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
-   2026-10-07 amendment is the one place that says what that gate does under each enforcement level,
-   and the forgery it does not catch. Its 2026-09-28 amendment states the rotation precondition the
-   operator attests to. *(Until 2026-11-06 this point also restated the gate's behaviour: "Without
+   counts nothing. In its place, `Engine.start` calls `enforce_transit_bound_attestation` in
+   `store/transit_attestation.py`, which checks for a recorded operator attestation naming the
+   configured Transit data key (BACKLOG #2337). An attestation is still weaker than the counted
+   bound. [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)'s
+   2026-10-07 amendment records what that gate does under each enforcement level, and the forgery
+   it does not catch. Its 2026-09-28 amendment states the rotation precondition the operator
+   attests to. *(Until 2026-11-06 this point also restated the gate's behaviour: "Without
    one, the engine refuses to start under `[security].enforcement = enforce` and only logs a warning
    under `warn`." BACKLOG #1173 item 3, SDS-3.5.)*
 
