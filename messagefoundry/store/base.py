@@ -3984,9 +3984,10 @@ async def open_store(
     store it minted for; a handoff it wrote is not its to read). Under any other provider a host
     blob or a handoff in the custody directory refuses the open, and ``custody`` must be ``None``.
     ``recovery_wrap`` is the minting command's recovery wrap, written into the new store's genesis
-    record beside its store id (draft rule 4). A writable open first opens the store read-only to
-    check the pin, so a store that is not the blob's is refused before anything is written to it,
-    its salt bind and at-rest sweep included.
+    record beside its store id (draft rule 4). A writable open checks the pin once the schema is in
+    place and before its first write (``store.store.check_open_store_pin``), so a store that is not
+    the blob's is refused before anything is written to it, its salt bind and at-rest sweep
+    included.
     Every custody refusal is a :class:`~messagefoundry.store.keyprovider.KeyProviderError`.
     """
     if create and read_only:
@@ -4011,8 +4012,6 @@ async def open_store(
         read_only=read_only,
         recovery_wrap=recovery_wrap,
     )
-    if pin is not None and not read_only:
-        await _check_pin_before_writes(settings, pin, host_key, posture, message_events)
     cipher = build_store_cipher(settings, posture=posture, host_key=host_key)
     setter = getattr(cipher, "set_refusal_hook", None)
     if refusal_hook is not None and callable(setter):
@@ -4051,39 +4050,6 @@ async def open_store(
             key_named=bool(settings.encryption_key or settings.encryption_key_file),
         )
     return store
-
-
-async def _check_pin_before_writes(
-    settings: StoreSettings,
-    pin: StorePin,
-    host_key: str | None,
-    posture: HopPosture | None,
-    message_events: str,
-) -> None:
-    """Open an EXISTING store read-only, under ``pin``, and close it: the pin check every backend's
-    read-only open makes, before the writable open binds a salt or seals a row under a key that may
-    not be this store's (vault BACKLOG #3411). An absent store has nothing to check. A probe cipher
-    of its own, so the writable open's cipher is bound to the store once."""
-    if _absent_sqlite_store(settings) is not None:
-        return
-    probe = build_store_cipher(settings, posture=posture, host_key=host_key)
-    pinned = OPEN_STORE_PIN.set(pin)
-    try:
-        store = await _open_backend(
-            settings,
-            cipher=probe,
-            audit_mac_key=probe.audit_mac_key(),
-            audit_mac_fn=probe.audit_mac_fn(),
-            message_events=message_events,
-            posture=posture,
-            create=False,
-            read_only=True,
-        )
-    except StoreNotFoundError:
-        return  # a server database with no store in it yet
-    finally:
-        OPEN_STORE_PIN.reset(pinned)
-    await store.close()
 
 
 def _host_custody_for_open(

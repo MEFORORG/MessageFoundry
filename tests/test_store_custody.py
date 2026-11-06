@@ -1164,7 +1164,8 @@ def test_windows_an_engine_on_a_shared_account_reads_no_handoff(
 def test_windows_a_handoff_made_for_this_account_round_trips(tmp_path: Path) -> None:
     path = tmp_path / "handoff.key"
     me = _engine_sid()
-    custody.write_handoff_file(path, _blob(), service_account=f"*{me}")
+    # enforcing=False: the account may be a domain one on a dev box; the rule is the wiring's test.
+    custody.write_handoff_file(path, _blob(), service_account=f"*{me}", enforcing=False)
     assert _aces(path) == {(0, _FULL, _SYSTEM), (0, _FULL, _ADMINS), (0, _READ_DELETE, me)}
     assert custody.read_handoff_file(path) == _blob()
     assert custody.consume_handoff_file(path, lambda blob: None) == _blob()
@@ -1188,7 +1189,7 @@ def test_windows_an_elevated_handoff_is_owned_by_administrators_and_reads(tmp_pa
     from messagefoundry.store import store as store_mod
 
     path = tmp_path / "handoff.key"
-    custody.write_handoff_file(path, _blob(), service_account=f"*{_engine_sid()}")
+    custody.write_handoff_file(path, _blob(), service_account=f"*{_engine_sid()}", enforcing=False)
     parsed = store_mod._parse_sddl_dacl(store_mod._read_dacl_sddl(path, owner=True) or "")
     assert parsed is not None and parsed.owner == _ADMINS
     assert custody.read_handoff_file(path) == _blob()

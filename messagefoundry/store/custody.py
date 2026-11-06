@@ -76,6 +76,7 @@ __all__ = [
     "RecoveryKey",
     "StoreId",
     "check_handoff_writable",
+    "check_host_writable",
     "consume_handoff_file",
     "protect_host_blob",
     "read_handoff_file",
@@ -937,6 +938,16 @@ def _refuse_a_shared_posix_engine_account(what: str) -> None:
     problem = _posix_engine_account_problem(euid, name)
     if problem is not None:
         raise CustodyError(f"{what}: {problem}")
+
+
+def check_host_writable() -> None:
+    """Raise :class:`CustodyError` when :func:`write_host_file` would refuse this process's
+    account: SYSTEM, LOCAL SERVICE or NETWORK SERVICE on Windows, root or nobody on Linux. So a
+    minting command can ask before it mints anything or shows a recovery key."""
+    if sys.platform == "win32":
+        _refuse_a_shared_engine_account("the host file would not be written")
+    else:
+        _refuse_a_shared_posix_engine_account("the host file would not be written")
 
 
 def _refuse_a_shared_engine_account(what: str) -> None:

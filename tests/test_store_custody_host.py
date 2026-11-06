@@ -735,3 +735,28 @@ def test_no_blob_is_reported_missing_before_the_account_is_judged(
     monkeypatch.setattr(custody_host, "non_local_account_reading", _refuse)
     with pytest.raises(HostCustodyMissing):
         load_host_custody(_settings(tmp_path), enforcing=True, environ={})
+
+
+# --- review round two -----------------------------------------------------------------------------
+
+
+@windows_only
+def test_a_shared_account_is_refused_before_the_mint_with_its_own_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(custody_host, "_engine_sid", lambda: "S-1-5-18")
+    console = _Console()
+    with pytest.raises(HostCustodyRefused, match="many services share") as excinfo:
+        _mint(_settings(tmp_path), console)
+    assert "domain" not in str(excinfo.value)
+    assert console.shown == []
+
+
+@host_file_platforms
+async def test_an_empty_store_file_is_built_under_the_host_provider(tmp_path: Path) -> None:
+    # The pin is checked once the schema is in place, so a file the open must still build opens.
+    settings = _settings(tmp_path)
+    (tmp_path / "store.db").write_bytes(b"")
+    blob = _mint(settings)
+    await _create(settings, blob)
+    assert await _genesis_store_id(settings, blob) == blob.store_id.value

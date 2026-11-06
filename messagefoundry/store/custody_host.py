@@ -87,8 +87,10 @@ HOST_PROVIDER = HOST_KEY_PROVIDER  # the one spelling, in the custody_posture le
 HOST_FILE_NAME, HANDOFF_FILE_NAME = CUSTODY_FILE_NAMES
 #: How many times the recovery key may be entered back before the mint stops, writing nothing.
 RECOVERY_KEY_ATTEMPTS = 3
-#: Clears the screen and, where the terminal honours it, its scrollback, before the read-back.
-_CLEAR_SCREEN = "\x1b[2J\x1b[3J\x1b[H"
+#: Pushes the key off the screen, then clears the screen and, where the terminal honours it, its
+#: scrollback. The blank lines do it where escape sequences are not honoured (a console with no
+#: virtual terminal processing prints them as text instead).
+_CLEAR_SCREEN = "\n" * 100 + "\x1b[2J\x1b[3J\x1b[H"
 #: The HKDF label the store's data key is derived from the master key under, until slice S4 puts the
 #: master key over wrapped data keys (draft rule 6). The master key itself never seals data.
 _HOST_STORE_KEY_INFO = b"mefor/host-store-key/v1"
@@ -116,8 +118,9 @@ class HostCustodyMissing(HostCustodyRefused):
 
 class RecoveryKeyTerminal(Protocol):
     """The terminal the recovery key is shown on and entered back at. ``show`` writes to the
-    console device itself, never to stdout, stderr or a log; ``read`` returns one entry, never
-    echoed anywhere else. Either raises ``OSError`` when the console is gone."""
+    console device itself, never to stdout, stderr or a log; ``read`` returns one entry, read
+    without echo and never written anywhere else. Either raises ``OSError`` when the console is
+    gone."""
 
     def show(self, text: str) -> None: ...
 
@@ -225,20 +228,23 @@ def non_local_account_reading(
     """Why this process's account is not local to this host, or ``None`` when it is (or off
     Windows). Under ``enforcing`` that is a refusal (:class:`HostCustodyRefused`); outside it the
     reason is returned for the caller to name as a loosening. SYSTEM and the shared service accounts
-    are refused by the custody files themselves, whatever the setting. ``sid_of`` stands in for the
-    account read in a test."""
+    are refused first, whatever the setting, as the custody files refuse them. ``sid_of`` stands in
+    for the account read in a test."""
     if sys.platform != "win32" and sid_of is None:
         return None
     from messagefoundry.restricted_file import (
+        custody_engine_problem,
         custody_non_local_account_problem,
         local_account_domain_sid,
     )
 
     sid = (sid_of or _engine_sid)()
-    if sid is None:
-        problem: str | None = "the account the engine runs as could not be read"
-    else:
-        problem = custody_non_local_account_problem(sid, local_account_domain_sid())
+    # SYSTEM and the shared service accounts first, refused whatever the setting, so they are
+    # never named as a domain account.
+    if (shared := custody_engine_problem(sid)) is not None:
+        raise HostCustodyRefused(f"the store key is not held for this account: {shared}")
+    assert sid is not None  # custody_engine_problem refuses an unread account
+    problem = custody_non_local_account_problem(sid, local_account_domain_sid())
     if problem is not None and enforcing:
         raise HostCustodyRefused(
             f"the store key is not held for this account: {problem}. "
@@ -327,9 +333,15 @@ def _convert_handoff(host: Path, handoff: Path) -> HostBlob:
 
     def convert(blob: HostBlob) -> None:
         write_host_file(host, blob)
-        if read_host_file(host) != blob:
-            # Removed, so the next start finds the handoff alone and converts again, rather than
-            # take this file for a copy the crash rule may keep.
+        # A host file that does not read back as the handoff's blob, or does not read back at all,
+        # is removed, so the next start finds the handoff alone and converts again, rather than
+        # refuse on this file or take it for a copy the crash rule may keep.
+        try:
+            same = read_host_file(host) == blob
+        except BaseException:
+            host.unlink()
+            raise
+        if not same:
             host.unlink()
             raise CustodyError("the host file written does not open to the handoff's key")
 
@@ -472,7 +484,15 @@ def mint_target(
                 "is never made over it"
             )
     if service_account is None:
+        # What the write refuses for this account, asked now: the shared and non-local accounts
+        # (and on Linux root and nobody).
+        from messagefoundry.store.custody import CustodyError, check_host_writable
+
         non_local_account_reading(enforcing=enforcing)
+        try:
+            check_host_writable()
+        except CustodyError as exc:
+            raise _refused("no store key was minted", exc) from exc
         return host
     if sys.platform != "win32":
         raise HostCustodyRefused(
@@ -571,7 +591,9 @@ def mint_host_custody(
     terminal.show("Press Enter once the recovery key is copied off this host. ")
     terminal.read()
     terminal.show(_CLEAR_SCREEN)
-    if not _prove_recovery_key(terminal, wrapped, master_key=master_key, store_id=store_id):
+    proved = _prove_recovery_key(terminal, wrapped, master_key=master_key, store_id=store_id)
+    terminal.show(_CLEAR_SCREEN)
+    if not proved:
         raise HostCustodyRefused(
             f"the recovery key was not entered back in {RECOVERY_KEY_ATTEMPTS} tries, so it is not "
             "shown to be kept; nothing was written. Run the command again: it mints a new one"

@@ -7049,13 +7049,16 @@ def _enrol_totp_at_terminal(
 class _RecoveryKeyConsole:
     """The console ``provision-admin`` shows a new store's recovery key on and reads it back from
     (vault BACKLOG #3411): the console device itself for what is shown, never stdout, stderr or a
-    log, and a line of stdin for the entry. Either raises ``OSError`` when the console is gone."""
+    log, and the entry read without echo. Either raises ``OSError`` when the console is gone."""
 
     def show(self, text: str) -> None:
         _show_on_terminal(text)
 
     def read(self) -> str:
-        return sys.stdin.readline()
+        import getpass
+
+        # Without echo, as the password is read, so the key typed back is not left on the screen.
+        return getpass.getpass("")
 
 
 def _discard_minted_custody(path: Path, store: StoreSettings, failure: BaseException) -> None:
@@ -7073,15 +7076,21 @@ def _discard_minted_custody(path: Path, store: StoreSettings, failure: BaseExcep
     )
     if not nothing_written:
         print(
-            f"WARNING: the store could not be created, and it may already hold rows under the "
-            f"store key minted for it, so that key is kept in {path}, and the recovery key shown "
-            "stays the one for it. Clear the failure and run the command again, or remove both "
-            "the store and that file to start over",
+            f"WARNING: the store could not be created, and it may already have been started "
+            f"under the store key minted for it, so that key is kept in {path}. No Administrator "
+            "was provisioned into it. To start over, remove both the store and that file, then "
+            "run the command again: it mints a new key, and the recovery key shown this time is "
+            "then void",
             file=sys.stderr,
         )
         return
     try:
         path.unlink()
+        print(
+            f"The store key minted for it was removed from {path}, so the recovery key shown is "
+            "void; the next run mints a new one.",
+            file=sys.stderr,
+        )
     except FileNotFoundError:
         pass
     except OSError as exc:
@@ -8747,7 +8756,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # BACKLOG #2081 they escaped to the dispatch floor, and a malformed key did until #3054.
     key_unresolved = _key_unresolved()
     # Vault BACKLOG #3411: under [store].key_provider = 'host' a new store's key is minted here.
-    from messagefoundry.store.custody_host import HOST_PROVIDER, HostCustodyMissing, mint_target
+    from messagefoundry.store.custody_host import (
+        HOST_PROVIDER,
+        HostCustodyMissing,
+        HostCustodyRefused,
+        mint_target,
+    )
 
     host_custody = settings.store.key_provider == HOST_PROVIDER
     if args.service_account is not None and not host_custody:
@@ -8761,13 +8775,17 @@ def _provision_admin(args: argparse.Namespace) -> int:
         service = _build_provision_auth_service(settings, store_slot, posture=posture)
         try:
             absent, exists = run_guarded(administrator_exists())
-        except HostCustodyMissing:
+        except HostCustodyMissing as missing:
             # A SQLite store that exists has no key here, and minting one cannot open it. A server
             # database is asked, under a throwaway pin, whether it holds a store already.
             if settings.store.backend is StoreBackend.SQLITE or not run_guarded(
                 server_store_absent()
             ):
-                raise
+                raise HostCustodyRefused(
+                    f"the store already exists, and {missing}. A new key cannot open a store "
+                    "another key made: put back the host blob it was made with, or remove the "
+                    "store to provision a new one"
+                ) from missing
             absent, exists = True, None
         if host_custody and absent:
             # Checked before the prompts, so a refused or repeated mint asks for nothing. The mint
@@ -9025,7 +9043,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # Vault BACKLOG #3411: last before the write, so nothing after it can refuse for want of
         # an answer the operator could have given first. The recovery key goes to the console
         # device only, and nothing is written until it has been entered back.
-        from messagefoundry.store.custody_host import HostCustodyRefused, mint_host_custody
+        from messagefoundry.store.custody_host import mint_host_custody
 
         try:
             minted = mint_host_custody(
@@ -12300,7 +12318,8 @@ def _security(args: argparse.Namespace) -> int:
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). Nor are the engine process's remote-debugging "
             "reading, its start-up reading (launch flags, start-up code, writable site "
-            "directories) and its Windows service-environment reading: this command is a separate "
+            "directories), its Windows service-environment reading and its key custody reading "
+            "(recovery_key_unproved, key_custody_non_local_account): this command is a separate "
             "process (GET /security/posture reports them). "
             "These are the AUTHORED values, so a `serve --host` bind override on a "
             "running engine is not reflected here either — see `messagefoundry check` or "

@@ -5488,6 +5488,20 @@ async def _store_pin_refusal(
     return None
 
 
+async def check_open_store_pin(host: AuditRangeHost) -> None:
+    """Refuse a store the open's host blob does not name, before the open writes to it (vault
+    BACKLOG #3411). Each backend's writable open calls this once its schema is in place and BEFORE
+    it binds a salt, reserves a cipher block or seals a row, so a blob that is not this store's
+    writes nothing under its key. An empty chain passes here; :func:`_load_audit_chain` writes its
+    genesis record with the pin and checks it there. A no-op when no pin is set."""
+    pin = OPEN_STORE_PIN.get()
+    if pin is None:
+        return
+    problem = await _store_pin_refusal(host, await host._audit_genesis_row(), pin)
+    if problem is not None:
+        raise StoreIdPinRefused(f"refusing to open the store: {problem}")
+
+
 def parse_audit_genesis(detail: object) -> str | None:
     """The key id a genesis row's ``detail`` names, or ``None`` when ``detail`` is not one; see
     :func:`parse_audit_genesis_record`."""
@@ -9684,6 +9698,7 @@ class MessageStore:
             )
             store._read_only = read_only
             if not read_only:
+                await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
