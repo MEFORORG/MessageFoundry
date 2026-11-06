@@ -19068,7 +19068,7 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT name FROM main.sqlite_master WHERE type = 'table'"
-                " AND sql NOT LIKE 'CREATE VIRTUAL TABLE%'"
+                " AND (sql IS NULL OR sql NOT LIKE 'CREATE VIRTUAL TABLE%')"
                 " AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
             )
             names = [str(row[0]) for row in await cur.fetchall()]

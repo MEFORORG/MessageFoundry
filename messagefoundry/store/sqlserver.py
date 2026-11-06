@@ -16087,13 +16087,18 @@ class SqlServerStore:
         schema-wide gap may have cut short. What that check does not show is stated on
         :meth:`Store.table_occupancy`."""
         anchor = await self._fetchone(
-            "SELECT a.s, HAS_PERMS_BY_NAME(a.s, N'SCHEMA', N'VIEW DEFINITION') AS vd,"
-            " HAS_PERMS_BY_NAME(a.s, N'SCHEMA', N'SELECT') AS sel"
+            "SELECT a.s, HAS_PERMS_BY_NAME(QUOTENAME(a.s), N'SCHEMA', N'VIEW DEFINITION') AS vd,"
+            " HAS_PERMS_BY_NAME(QUOTENAME(a.s), N'SCHEMA', N'SELECT') AS sel"
             " FROM (SELECT OBJECT_SCHEMA_NAME(OBJECT_ID(N'schema_meta', N'U')) AS s) AS a"
         )
         if anchor is None or anchor["s"] is None:
             return {}
         store_schema = str(anchor["s"])
+        if anchor["vd"] is None or anchor["sel"] is None:
+            raise TableCensusIncomplete(
+                f"SQL Server did not answer whether this login may read schema {store_schema!r},"
+                " so whether the store holds data cannot be read"
+            )
         if not (anchor["vd"] == 1 or anchor["sel"] == 1):
             raise TableCensusIncomplete(
                 f"this login holds neither the view definition nor the select permission on schema"

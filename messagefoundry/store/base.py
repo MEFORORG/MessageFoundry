@@ -1860,11 +1860,13 @@ class QueueStore(StoreLifecycle, Protocol):
         What it cannot see, at least: rows a row-level security policy (Postgres) or a security
         policy filter (SQL Server) hides from this login, which read as empty and raise nothing;
         and on SQL Server a table the login holds no permission on, or a table-level ``DENY``
-        hides, which ``sys.tables`` does not list. It raises :class:`TableCensusIncomplete` unless
-        the login holds ``VIEW DEFINITION`` or ``SELECT`` on the whole schema, which shows only
-        that no schema-wide gap hides a table, not that no table-level ``DENY`` does. A listed
-        table that cannot be read raises the driver's error. Counts only, never a cell, so an open
-        under a throwaway key decrypts nothing (vault BACKLOG #3411)."""
+        hides, which ``sys.tables`` does not list. SQL Server alone raises
+        :class:`TableCensusIncomplete` unless the login holds ``VIEW DEFINITION`` or ``SELECT`` on
+        the whole schema, which shows only that no schema-wide gap hides a table, not that no
+        table-level ``DENY`` does; SQLite and Postgres make no such check. A listed table that
+        cannot be read raises the driver's error. Existence only: no cell is read except the two
+        plaintext integers a seed filter compares (``global_session_epoch.id`` and ``.epoch``),
+        so an open under a throwaway key decrypts nothing (vault BACKLOG #3411)."""
         ...
 
     def pool_status(self) -> PoolStatus | None:

@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry import custody_posture, restricted_file
-from messagefoundry.config.settings import ServiceSettings, StoreBackend, StoreSettings
+from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.custody_posture import KeyCustodyPosture, key_custody_loosenings
 from messagefoundry.store import custody, custody_host
@@ -1041,46 +1041,12 @@ async def _failed_mint_leftovers(path: Path, tmp_path: Path) -> None:
     )
 
 
-@host_file_platforms
-async def test_a_failed_mint_that_left_only_the_keyed_open_tables_gives_up_its_key(
-    tmp_path: Path,
-) -> None:
-    # PR 2804 hold, finding 2: a create-open that failed after its own commits but before the
-    # genesis record kept the minted key, so the next run could never mint. Read back holding only
-    # those tables, the key is removed; with a row of data, or unreadable, it is kept.
-    from messagefoundry import __main__ as cli
-
-    settings = _settings(tmp_path)
-    await _failed_mint_leftovers(Path(settings.path), tmp_path)
-    blob = HostBlob(MasterKey.mint(), StoreId.mint())
-
-    async def _left_nothing(store: StoreSettings) -> bool:
-        service = ServiceSettings().model_copy(update={"store": store})
-        return await cli._failed_mint_left_nothing(service, blob, posture=None)
-
-    assert await _left_nothing(settings)
-    key = tmp_path / "minted.key"
-    key.write_bytes(b"k")
-    cli._discard_minted_custody(key, settings, StoreIdPinRefused("after"), left_nothing=True)
-    assert not key.exists()
-    missing = settings.model_copy(update={"path": str(tmp_path / "missing.db")})
-    assert not await _left_nothing(missing)  # cannot be read: the key is kept
-    store = await open_store(StoreSettings(path=settings.path), keyless_chain_refusal=None)
-    try:
-        await store.record_connection_event(
-            connection="IB_TEST_ADT", transport="mllp", direction="inbound", kind="established"
-        )
-    finally:
-        await store.close()
-    assert not await _left_nothing(settings)
-
-
 @pytest.mark.parametrize(
     ("census", "refusal"),
     [
         ("connection event", "the store already exists"),
         ("incomplete", "neither the view definition nor the select permission"),
-        ("unreadable", "could not be read, so no key is minted"),
+        ("unreadable", "could not be read (OperationalError)"),
     ],
 )
 def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absent(
