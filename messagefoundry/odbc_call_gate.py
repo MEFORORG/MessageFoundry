@@ -111,6 +111,12 @@ def _close_orphaned_cursor(func: Callable[..., Any], result: Any) -> None:
         log.debug("odbc: closing a cancelled call's new cursor failed", exc_info=True)
 
 
+def _skippable(func: Callable[..., Any]) -> bool:
+    """Whether an abandoned call that never entered the gate may be skipped: any but a close
+    (``Connection.close``, ``Cursor.close``), which frees a handle and must still run in the gate."""
+    return getattr(func, "__name__", None) != "close"
+
+
 class CallGate:
     """Runs one connection's pyodbc calls one at a time, and frees its handles only between calls.
 
@@ -136,8 +142,11 @@ class CallGate:
     lent to its next borrower. Now a call whose awaiting future was cancelled before it entered
     never runs, as an executor already skips one it cancels before a worker takes it: nothing
     awaits its result, and the cancelled task's cleanup reads the gate after the mark is made
-    (:meth:`submit` says why). One that had entered runs to its end, and a cursor it makes is
-    closed as it returns, since nobody else ever holds it.
+    (:meth:`submit` says why). A ``close`` is the exception: it still runs, inside the gate,
+    because skipping it would leave its handle for aioodbc's ``__del__`` or the collector, outside
+    the gate; a close of a handle a cleanup already closed only fails, and nobody awaits that. One
+    that had entered runs to its end, and a cursor it makes is closed as it returns, since nobody
+    else ever holds it.
     """
 
     __slots__ = ("_abandoned", "_after", "_deferred", "_lock", "_running", "_state")
@@ -189,7 +198,7 @@ class CallGate:
     ) -> Any:
         with self._lock:
             with self._state:
-                if call is not None and call.abandoned:
+                if call is not None and call.abandoned and _skippable(func):
                     # Cancelled before it entered: nobody awaits it, so it never runs.
                     return None
                 self._running = True

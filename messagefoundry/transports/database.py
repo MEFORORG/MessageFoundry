@@ -2831,14 +2831,15 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     with no gate (one :func:`~messagefoundry.odbc_call_gate.install_call_gate` could not wrap,
     which it logs at ERROR, or a test double) has nothing to hand a close to, so a cancellation
     drops its handle and closes nothing: the pool gets it back closed, and pyodbc frees the cursor
-    and then the connection once nothing uses them, since its cursor holds the connection.
+    and then the connection once nothing uses them, since its cursor holds the connection, on a
+    worker thread (:func:`_free_on_a_worker`).
 
     **What this does not cover, at least.** A cursor with no raw pyodbc cursor (a test double, or
     an aioodbc that renamed ``_impl``, which :func:`~messagefoundry.odbc_call_gate.raw_cursor` logs
     once) is closed through its own ``close()`` as a task, and a teardown cancel of that task keeps
     the connection out of the pool (:func:`_return_when_settled`). An ungated connection's
-    unclosed handle is freed on whichever thread drops it last, the event loop's included, and
-    its session ends only then. A cancellation that lands after a ``cursor()`` call returned on its
+    session ends only when pyodbc frees its unclosed handle (:func:`_free_on_a_worker`). A
+    cancellation that lands after a ``cursor()`` call returned on its
     thread, but before the loop delivered the result, leaves that cursor for the collector.
 
     **``discard`` closes the connection instead of returning it open (BACKLOG #5010).** A caller
@@ -2852,8 +2853,8 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     hand_to_gate = cancelled and gate is not None
     if cancelled and gate is None and not discard and getattr(conn, "_conn", None) is not None:
         # No gate to hand a close to, so any close here would run beside a call that may still be
-        # running. Drop the handle and close nothing (BACKLOG #2394).
-        drop_handle(conn)
+        # running. Drop the handle and close nothing (BACKLOG #2394), and free it on a worker.
+        _free_on_a_worker(drop_handle(conn), _take_raw_cursor(cur))
         logger.debug("DATABASE: a cancelled borrow on an ungated connection discarded it unclosed")
         await _release(pool, conn)
         return
@@ -2888,16 +2889,52 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
         # The loop holds a task only weakly; keep this one alive until its done-callback has run.
         _DETACHED_SETTLES.add(work)
         work.add_done_callback(_DETACHED_SETTLES.discard)
+    if cur is not None:
+        what = "a cursor close"
+    else:
+        what = "a connection close" if dropped is not None else "a rollback after a cancel"
     if cancelled:
         # The close may be waiting for a cancelled statement; the cancellation must not.
-        _return_when_settled(pool, conn, work, "a cursor close")
+        _return_when_settled(pool, conn, work, what)
         return
     try:
         await asyncio.shield(work)
     except BaseException:
-        _return_when_settled(pool, conn, work, "a cursor close")
+        _return_when_settled(pool, conn, work, what)
         raise
     await _release(pool, conn)
+
+
+def _take_raw_cursor(cur: Any) -> Any:
+    """Take ``cur``'s pyodbc cursor off it and return that, or ``None``, as
+    :func:`~messagefoundry.odbc_call_gate.drop_handle` takes a connection's. The wrapper, which the
+    cancelled caller's frames may keep alive on the loop, then holds no driver handle."""
+    raw_cur = raw_cursor(cur)
+    if raw_cur is not None:
+        try:
+            cur._impl = None
+        except AttributeError:  # a wrapper that refuses the write keeps it; the frames may too
+            logger.debug("DATABASE: could not take the raw cursor off its wrapper")
+    return raw_cur
+
+
+def _free_on_a_worker(*handles: Any) -> None:
+    """Drop the last engine references to an ungated connection's raw handles on a worker thread
+    (BACKLOG #2394), never closing them.
+
+    pyodbc frees a cursor, then the connection it holds, once nothing refers to them, and freeing a
+    connection rolls back and disconnects: driver I/O that must not run on the event loop
+    (CLAUDE.md section 6). A call still running on them holds them until it returns, on its own
+    worker thread; otherwise this job is the last holder, on a worker. Where the executor is shut
+    down, they are freed wherever the last reference goes."""
+    try:
+        asyncio.get_running_loop().run_in_executor(None, partial(_drop, handles))
+    except RuntimeError:
+        logger.debug("DATABASE: executor shut down; an ungated connection is freed where it drops")
+
+
+def _drop(handles: tuple[Any, ...]) -> None:
+    """On a worker: nothing. The ``partial`` holding ``handles`` is released on this thread."""
 
 
 async def _close_cursor_then_drop(cur: Any, raw: Any, gate: CallGate | None) -> None:

@@ -3758,7 +3758,10 @@ class SqlServerStore:
         cursor first, once no pyodbc call is running on them. Otherwise both close through the
         gate in one job, waited on through :func:`asyncio.wait`, which never cancels it: a second
         cancellation propagates at once, and the close still runs, so no dedicated connection
-        leaks with consistent-looking counters."""
+        leaks with consistent-looking counters. **What it does not change:** a claim reaches here
+        only after :meth:`claim_fifo_heads`' shielded LOCK_TIMEOUT reset, which the gate holds
+        behind a running claim statement, so a cancelled claim still waits for that statement
+        there."""
         self._claim_holders_open -= 1
         self._claim_holders_discarded_total += 1
         log.warning(

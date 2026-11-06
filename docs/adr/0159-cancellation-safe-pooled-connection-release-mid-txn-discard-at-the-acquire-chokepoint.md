@@ -641,18 +641,21 @@ the next reader does not re-derive the wrong precedent from the same comment.
   open* above are superseded, and a cancelled statement on a connection with no gate no longer
   returns it.** The gate now tracks a call from the moment aioodbc submits it. A call whose
   awaiting future was cancelled before it took the gate's lock never runs, as an executor already
-  skips one it cancels before a worker takes it, so no close races it. A call that had entered runs
-  to its end, and a cursor it makes (`Connection.cursor`, `Connection.execute`) is closed by the
-  gate as it returns, before any job or connection close handed to it. A DATABASE borrow cancelled
+  skips one it cancels before a worker takes it, so no close races it; a cancelled close is the
+  exception, and still runs inside the gate. A call that had entered runs to its end, and a new
+  cursor it returns is closed by the gate as it returns, before any job or connection close handed
+  to it. A DATABASE borrow cancelled
   during `conn.cursor()` hands its rollback to that call, so its connection goes back only once the
   call has returned. A cancelled DATABASE borrow on a connection with no gate drops its handle and
   closes nothing: the pool gets it back closed, and pyodbc frees the cursor, then the connection,
-  once nothing uses them, since a pyodbc cursor holds its connection. That handle is freed on
-  whichever thread drops it last, the event loop's included, and its session ends only then. The
-  SQL Server store's claim holder now leaves through the one-shot exits the open-time probes use:
-  a cancelled open or a cancelled claim hands its connection and cursor to the gate with no await,
-  and an ordinary discard waits on a close a second cancellation cannot cut short. **Still open, at
-  least:** a cancellation that lands after a `cursor()` call returned on its thread but before the
+  once nothing uses them, since a pyodbc cursor holds its connection; the engine's last references
+  to both are dropped on a worker thread, so that free never runs on the event loop. Its session
+  ends only then. The SQL Server store's claim holder now leaves through the one-shot exits the
+  open-time probes use: a cancelled open and the discard after a cancelled claim hand the
+  connection and cursor to the gate with no await, and an ordinary discard waits on a close a
+  second cancellation cannot cut short. A cancelled claim still waits for its statement in
+  `claim_fifo_heads`' shielded `SET LOCK_TIMEOUT -1` reset, which the gate holds behind it and which
+  runs before the discard. **Still open, at least:** a cancellation that lands after a `cursor()` call returned on its thread but before the
   loop delivered the result leaves that cursor for the collector; and the store's pooled
   quarantine, its `_cursor` helper and the one-shot exits still close an ungated connection beside a
   running call. Under the `aioodbc==0.5.0` pin (BACKLOG #5005) no real connection is ungated.

@@ -48,6 +48,7 @@ from tests._odbc_cancel_fakes import (
     cancelled_at_once,
     never,
     wait_for_entry,
+    wait_until,
 )
 
 _CLAIM = "SELECT 1 AS claim"
@@ -79,6 +80,14 @@ async def rig() -> AsyncIterator[_Rig]:
 # --- the gate ------------------------------------------------------------------------------------
 
 
+async def _waiting_on_the_gate(rig: _Rig) -> None:
+    """Wait until a worker has taken the call just submitted, so it waits on the gate's lock behind
+    the running statement. While it is still queued, the executor skips it on a cancel by itself,
+    and an arm built on that window would pass without the gate."""
+    assert await wait_until(rig.executor._work_queue.empty), "no worker took the call"
+    await asyncio.sleep(0.05)  # the worker's few bytecodes between the queue and the lock
+
+
 async def test_a_call_cancelled_before_it_entered_the_gate_never_runs(rig: _Rig) -> None:
     """A commit whose task was cancelled while it waited for the gate, behind a running
     statement. Red before this slice: the commit ran once the statement returned, on a connection
@@ -90,7 +99,7 @@ async def test_a_call_cancelled_before_it_entered_the_gate_never_runs(rig: _Rig)
     assert await asyncio.to_thread(rig.started.wait, WAIT), "the statement never started"
 
     commit = asyncio.ensure_future(conn.commit())
-    await asyncio.sleep(0.1)  # time for a worker to take the commit and wait on the gate's lock
+    await _waiting_on_the_gate(rig)
     commit.cancel()
     await cancelled_at_once(commit)
 
@@ -102,6 +111,28 @@ async def test_a_call_cancelled_before_it_entered_the_gate_never_runs(rig: _Rig)
     assert USE_AFTER_FREE not in rig.log, rig.log
 
 
+async def test_a_close_cancelled_before_it_entered_the_gate_still_runs_inside_it(rig: _Rig) -> None:
+    """The one call the skip leaves alone. Skipped, a cancelled close would leave its handle for
+    aioodbc's ``__del__`` or the collector, outside the gate; it runs once the statement returns."""
+    conn = rig.conn(blocks=always)
+    install_call_gate(conn)
+    cur = await conn.cursor()
+    statement = asyncio.ensure_future(cur.execute(_CLAIM))
+    assert await asyncio.to_thread(rig.started.wait, WAIT), "the statement never started"
+
+    closing = asyncio.ensure_future(conn.close())
+    await _waiting_on_the_gate(rig)
+    closing.cancel()
+    await cancelled_at_once(closing)
+    assert "conn.close" not in rig.log, "the arm is vacuous: the close ran beside the statement"
+
+    rig.release.set()
+    await asyncio.wait_for(statement, WAIT)
+    await wait_for_entry(rig.log, "conn.close")
+    assert rig.log.index("execute:end") < rig.log.index("conn.close"), rig.log
+    assert USE_AFTER_FREE not in rig.log, rig.log
+
+
 async def test_an_uncancelled_call_waiting_on_the_gate_still_runs(rig: _Rig) -> None:
     """The control: a call that waits behind a running one, and is not cancelled, runs after it."""
     conn = rig.conn(blocks=always)
@@ -110,7 +141,7 @@ async def test_an_uncancelled_call_waiting_on_the_gate_still_runs(rig: _Rig) -> 
     statement = asyncio.ensure_future(cur.execute(_CLAIM))
     assert await asyncio.to_thread(rig.started.wait, WAIT), "the statement never started"
     commit = asyncio.ensure_future(conn.commit())
-    await asyncio.sleep(0.1)
+    await _waiting_on_the_gate(rig)
 
     rig.release.set()
     await asyncio.wait_for(asyncio.gather(statement, commit), WAIT)
