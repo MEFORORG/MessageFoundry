@@ -792,11 +792,54 @@ def test_a_base_exception_from_the_walk_leaves_without_the_codec_error_on_its_ch
         else:
             _with_provider(monkeypatch, error)
             getattr(store_base, entry)(StoreSettings())
-    assert caught.value is interrupt
-    links = _every_link(caught.value)
+    _assert_left_unchained(caught.value, interrupt, error)
+
+
+def _assert_left_unchained(
+    escaped: BaseException, interrupt: BaseException, error: BaseException
+) -> None:
+    """``escaped`` is ``interrupt`` itself, and nothing its chain reaches is or quotes ``error``."""
+    assert escaped is interrupt
+    links = _every_link(escaped)
     assert not any(link is error for link in links), links
     for link in links:
         _assert_no_key_byte(repr(link))
         for arg in link.args:
             _assert_no_key_byte(repr(arg))
-    _assert_no_key_byte("".join(traceback.format_exception(caught.value)))
+    _assert_no_key_byte("".join(traceback.format_exception(escaped)))
+
+
+class _InterruptingDecodeError(UnicodeDecodeError):
+    """A codec error whose ``start``, which its codec-safe rendering reads, raises ``interrupt``."""
+
+    interrupt: BaseException
+
+    @property
+    def start(self) -> int:  # type: ignore[override]  # the read is the point
+        raise self.interrupt
+
+
+@pytest.mark.parametrize(
+    "make_interrupt",
+    [KeyboardInterrupt, lambda: SystemExit(3)],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+@pytest.mark.parametrize(
+    "entry", ["build_store_cipher", "resolve_active_key", "resolve_decrypt_keys"]
+)
+def test_a_base_exception_from_rendering_the_codec_error_leaves_without_it(
+    entry: str, make_interrupt: Callable[[], BaseException], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round one of the repair's review: the walk stops at the codec error itself, and the
+    interrupt rose later, from its rendering, still inside the refusing handler."""
+    interrupt = make_interrupt()
+    try:
+        raise _InterruptingDecodeError("ascii", _KEY_BYTES, 18, 19, "ordinal not in range(128)")
+    except _InterruptingDecodeError as exc:
+        exc.interrupt = interrupt
+        error = exc
+    assert any(spelling in _whole(error) for spelling in _BYTE_SPELLINGS), "the fixture holds none"
+    _with_provider(monkeypatch, error)
+    with pytest.raises(type(interrupt)) as caught:
+        getattr(store_base, entry)(StoreSettings())
+    _assert_left_unchained(caught.value, interrupt, error)
