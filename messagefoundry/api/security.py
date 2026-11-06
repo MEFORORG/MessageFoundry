@@ -1138,7 +1138,8 @@ async def _session_caller(
 
 
 async def _authenticate_session_before_body(request: Request) -> None:
-    """The early-check step of every gate built on :func:`require`: refuse, or return nothing.
+    """The early-check step of :func:`require` and every gate built on :func:`_admit`: refuse, or
+    return nothing.
 
     It counts as no activity. The gate that runs after the body is what moves the session's idle
     clock, so a request whose body then fails to parse leaves the clock where it was, which is
@@ -1152,15 +1153,15 @@ def require(
     """Build a dependency that authenticates the caller and asserts each of ``permissions``.
 
     ``mfa_gate=False`` suppresses the ASVS 6.3.3 second-factor ACCESS gate for routes an MFA-pending
-    session must still reach. Only the ``*_reauth_only*`` factories pass it, because an un-enrolled
-    user cannot satisfy a gate standing in front of the one route that enrolls them.
+    session must still reach, because an un-enrolled user cannot satisfy a gate standing in front of
+    the one route that enrolls them. The ``*_reauth_only*`` factories pass the same flag to
+    :func:`_admit`, which holds every check this gate makes (BACKLOG #1197).
 
-    The flag lives HERE rather than on a private helper, which was tried and reverted: routing the
-    body through ``_require`` renamed the returned closure's ``__qualname__``, and the route-map drift
-    guard derives a route's gate from exactly that (``_gate_of`` ignores any qualname not starting
-    with ``require``). Every route then read as UNGATED. Widening this signature instead costs one
-    ``ENGINE_UI_SEAM`` bump — the mechanism that exists for precisely this — while ``mfa_gate`` is an
-    ordinary closure cell the drift guard already ignores."""
+    The returned closure is still built HERE, and named ``dependency`` inside ``require``: an earlier
+    attempt built it in a private ``_require``, which renamed its ``__qualname__``, and the route-map
+    drift guard derives a route's gate from exactly that (``_gate_of`` ignores any qualname not
+    starting with ``require``). Every route then read as UNGATED. Delegating the closure's BODY to
+    :func:`_admit` keeps the qualname, and ``permissions`` and ``mfa_gate`` stay closure cells."""
 
     async def dependency(request: Request) -> Identity:
         auth, identity = await _admit(request, permissions, mfa_gate=mfa_gate)
@@ -1245,8 +1246,8 @@ def _audited_permission(request: Request, permissions: tuple[Permission, ...]) -
     GETs included, except the PHI-view grants that the PHI-access audit path already records. With
     the switch off, the method guard drops every GET (including the polled GET /approvals, which
     carries APPROVALS_APPROVE) and the permission set drops every read/monitoring grant, leaving
-    only the sensitive/state-changing surface on a NON-GET request. A derived gate's refusal row
-    (:func:`_recorded_decision`) takes the same answer, because it takes the grant row's place."""
+    only the sensitive/state-changing surface on a NON-GET request. :func:`_recorded_decision`
+    says why a derived gate's refusal row reads it too."""
     audit_all = _audit_all_authz(request.app.state)
     if audit_all or request.method != "GET":
         return _grant_audit_permission(permissions, audit_all=audit_all)
@@ -1269,20 +1270,33 @@ class _GateRefusal(HTTPException):
     its ``auth.gate_refused`` row names (BACKLOG #1197).
 
     It is an :class:`HTTPException`, so FastAPI answers it, and every caller that catches one,
-    exactly as before. Every raise site names a ``reason``. The ``None`` default exists only so
-    ``copy`` and ``pickle`` can rebuild one from its args, as they can a plain HTTPException, and
-    then restore ``reason`` from its state; a refusal with no reason writes no row."""
+    exactly as before. ``reason`` is required, so a raise site cannot drop its row by leaving it
+    out. :meth:`__reduce__` lets ``copy`` and ``pickle`` rebuild one, as they can a plain
+    HTTPException."""
 
     def __init__(
         self,
         status_code: int,
         detail: str,
         *,
-        reason: Literal["step_up", "throttled"] | None = None,
+        reason: Literal["step_up", "throttled"],
         headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(status_code, detail, headers=headers)
         self.reason = reason
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (_rebuild_gate_refusal, (self.status_code, self.detail, self.reason, self.headers))
+
+
+def _rebuild_gate_refusal(
+    status_code: int,
+    detail: str,
+    reason: Literal["step_up", "throttled"],
+    headers: dict[str, str] | None,
+) -> _GateRefusal:
+    """Rebuild a :class:`_GateRefusal` for ``copy`` and ``pickle``, which pass arguments by position."""
+    return _GateRefusal(status_code, detail, reason=reason, headers=headers)
 
 
 @asynccontextmanager
@@ -1308,7 +1322,7 @@ async def _recorded_decision(
         yield
     except _GateRefusal as refusal:
         audited = _audited_permission(request, permissions)
-        if refusal.reason is not None and audited is not None:
+        if audited is not None:
             await auth.audit_gate_refused(
                 identity,
                 audited,
@@ -1898,7 +1912,7 @@ def require_step_up_action(
                 # lost it, and docs/SECURITY.md filed it under "No limiter of any kind" until then.
                 # Adding it here closes that too rather than only sparing the routes #1148 promotes.
                 _enforce_admin_write_pacing(request, auth, identity)
-                # NOT redundant with the ASVS 6.3.3 gate in require(), despite covering the same
+                # NOT redundant with the ASVS 6.3.3 gate in _admit(), despite covering the same
                 # sessions for every non-exempt path. DELETE /me/mfa shares its path with the
                 # MFA-exempt GET /me/mfa, so if _MFA_EXEMPT_ROUTES is ever flattened to bare paths
                 # this check is the ONLY thing stopping a half-authenticated session from switching
@@ -1998,7 +2012,7 @@ def require_reauth_only_action(
                 )
                 # After the new-IP signal, so a refused request still records it, and before the
                 # grant check, which pops: a refusal here must not burn a grant. Audited like
-                # require()'s MFA gate, since this is the same refusal reached past that gate's
+                # _admit()'s MFA gate, since this is the same refusal reached past that gate's
                 # carve-out.
                 if await auth.factor_binding_is_blocked(token, action):
                     raise await _mfa_refusal(request, auth, identity)

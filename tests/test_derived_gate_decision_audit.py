@@ -13,6 +13,8 @@ positive control: it leaves one grant row and no refusal row.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -289,30 +291,60 @@ async def test_require_step_up_action_records_its_throttle_too(engine: Engine) -
     assert reasons == [(_REFUSED, "step_up"), (_REFUSED, "throttled")]
 
 
-def test_every_gate_that_runs_admit_records_its_decision() -> None:
-    """RED when: a gate factory calls ``_admit`` without the ``_recorded_decision`` block, and so
-    writes no grant row at all for the requests it admits. ``require`` is the one factory that
-    writes its grant directly. The count is the positive control: the walk found the six gates."""
-    import ast
-    import inspect
+#: The calls in a derived gate that can refuse a request or spend something on it. Each must run
+#: inside the gate's ``_recorded_decision`` block, or the grant row is written before it decides.
+_GATE_CHECKS = frozenset(
+    {
+        "_enforce_admin_write_pacing",
+        "enforce_phi_read_pacing",
+        "refuse_from_new_address",
+        "_step_up_refusal",
+        "_mfa_refusal",
+        "_action_step_up_ok",
+    }
+)
 
+
+def _names_called(node: ast.AST) -> list[str]:
+    return [
+        n.func.id if isinstance(n.func, ast.Name) else n.func.attr
+        for n in ast.walk(node)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name | ast.Attribute)
+    ]
+
+
+def test_every_gate_that_runs_admit_decides_inside_its_decision_block() -> None:
+    """RED when: a gate factory calls ``_admit`` with no ``_recorded_decision`` block, so it writes
+    no grant row for the requests it admits, or makes one of its own checks outside that block, so
+    the grant row is written before that check decides. ``require`` is the one factory that writes
+    its grant directly. The counts are the positive control: the walk found the six gates, and a
+    check in each."""
     from messagefoundry.api import security
 
     tree = ast.parse(inspect.getsource(security))
-    callers = {}
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name != "_admit":
-            called = {
-                n.func.id
-                for n in ast.walk(node)
-                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-            }
-            if "_admit" in called:
-                callers[node.name] = called
-    assert len(callers) == 7, sorted(callers)
-    assert "_record_grant" in callers.pop("require")
-    missing = sorted(name for name, called in callers.items() if "_recorded_decision" not in called)
-    assert missing == [], f"these gates run _admit with no _recorded_decision block: {missing}"
+    gates = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name not in {"_admit", "require"}
+        and "_admit" in _names_called(node)
+    ]
+    assert len(gates) == 6, sorted(g.name for g in gates)
+    for gate in gates:
+        blocks = [
+            node
+            for node in ast.walk(gate)
+            if isinstance(node, ast.AsyncWith)
+            and any("_recorded_decision" in _names_called(item.context_expr) for item in node.items)
+        ]
+        assert len(blocks) == 1, (gate.name, len(blocks))
+        inside = [name for stmt in blocks[0].body for name in _names_called(stmt)]
+        everywhere = _names_called(gate)
+        checks = [name for name in everywhere if name in _GATE_CHECKS]
+        assert checks, gate.name
+        assert sorted(checks) == sorted(name for name in inside if name in _GATE_CHECKS), (
+            f"{gate.name} makes a check outside its _recorded_decision block"
+        )
 
 
 class _Recorder:
@@ -348,7 +380,8 @@ def _post_request() -> Request:
 
 async def test_only_a_refusal_with_a_reason_writes_a_gate_refusal_row() -> None:
     """The second-factor refusal writes ``auth.mfa_denied`` where it is raised (``_mfa_refusal``),
-    and the decision block writes no second row for it, as for any refusal that names no reason.
+    and the decision block writes no second row for it, as for any refusal that is not a
+    ``_GateRefusal``.
     The control is a step-up refusal through the same block, which does write one. A derived
     gate's own factor check is reached only past ``_admit``'s, which refuses the same sessions
     first, so this is driven on the block directly."""
@@ -358,7 +391,6 @@ async def test_only_a_refusal_with_a_reason_writes_a_gate_refusal_row() -> None:
     request = _post_request()
     for make, rows in (
         (lambda: _mfa_refusal(request, auth, identity), ["auth.mfa_denied"]),
-        (lambda: _as_coro(_GateRefusal(403, "refused")), []),
         (lambda: _as_coro(HTTPException(403, "refused")), []),
         (lambda: _as_coro(_GateRefusal(403, "refused", reason="step_up")), [_REFUSED]),
     ):
