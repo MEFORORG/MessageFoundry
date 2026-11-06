@@ -152,6 +152,7 @@ async def _assert_lockout_contract(store: Any, *, corrupt_passkeys: PasskeyCorru
         await _assert_no_verdict_falls_back_to_the_enabled_rule(store, race)
     await _assert_a_wrong_password_below_the_threshold_opens_no_cell(store)
     await _assert_get_totp_secret_opens_off_the_loop(store)
+    await _assert_the_increment_carries_the_escalation_verdict(store)
 
 
 async def _assert_single_counter_policy(store: Any) -> None:
@@ -1151,3 +1152,53 @@ async def _assert_get_totp_secret_opens_off_the_loop(store: Any) -> None:
         del store.open_totp_secret
     assert store.open_totp_secret == real_open
     await store.delete_user("loop-u1")
+
+
+async def _assert_the_increment_carries_the_escalation_verdict(store: Any) -> None:
+    """BACKLOG #3948 finding 16, on every backend: the increment that sets a later-cycle sign-in
+    lock returns the TOTP verdict its escalation used (``totp_state``), so the lock notice can read
+    it rather than judge the cell again. A first lock, which the escalation does not judge, and the
+    second-step counter carry none."""
+    for uid, secret, verdict in (
+        ("lock-tv1", "JBSWY3DPEHPK3PXP", "usable"),
+        ("lock-tv2", "totp1:SHA1:6:30:JBSWY3DPEHPK3PXP", "refused"),
+    ):
+        await store.create_user(
+            user_id=uid,
+            username=f"{uid}-alice",
+            auth_provider="local",
+            password_hash="h",
+            now=1.0,
+            password_generated=False,
+            audits=(),
+        )
+        cell = await store.set_totp_secret(uid, secret=secret, now=1.0)
+        assert await store.enable_totp(
+            uid, expected_secret_cell=cell, recovery_code_hashes=[], now=1.0
+        )
+
+        async def fail(at: float, counter: str = "sign_in", uid: str = uid) -> Any:
+            return await store.increment_login_failure(
+                uid,
+                counter=counter,
+                threshold=THRESHOLD,
+                lockout_seconds=LOCKOUT_SECONDS,
+                max_lockout_seconds=MAX_LOCKOUT_SECONDS,
+                now=at,
+                totp_usable=_opened_totp_state,
+                passkey_escalates=None,
+            )
+
+        start = 70_000.0
+        first = [await fail(start + i) for i in range(THRESHOLD)]
+        assert first[-1].just_locked and first[-1].cycles == 1
+        assert [r.totp_state for r in first] == [None] * THRESHOLD, "a first lock was judged"
+        later = start + LOCKOUT_SECONDS + 10.0
+        second = [await fail(later + i) for i in range(THRESHOLD)]
+        assert second[-1].just_locked and second[-1].cycles == 2
+        assert second[-1].totp_state == verdict, (uid, second[-1])
+        assert [r.totp_state for r in second[:-1]] == [None] * (THRESHOLD - 1)
+        step = await fail(later + 100.0, counter="second_step")
+        assert step.totp_state is None
+        await store.disable_totp(uid, now=99_999.0)
+        await store.delete_user(uid)

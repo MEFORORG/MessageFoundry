@@ -2178,6 +2178,9 @@ class _Reproof:
     just_locked: bool = False
     #: The sign-in lock's cycle count after this attempt (ADR 0197), carried to the lock notice.
     cycles: int = 0
+    #: The TOTP verdict that attempt's escalation used (:class:`LockoutIncrement`), carried to the
+    #: lock notice too (BACKLOG #3948 finding 16).
+    totp_state: TotpState | None = None
     cleared: bool = False
     #: A closed-set slug for an uncounted directory refusal: at least one that judged no password
     #: (BACKLOG #2027), a row with no id or any :class:`_DirectoryRebind` reason, and one that judged
@@ -5634,7 +5637,9 @@ class AuthService:
         passkey and no usable TOTP tells it the combined passkey sign-in does. A TOTP nobody could
         judge (a cell that did not open) is offered as the plain rule offers it and reported as
         unknown, beside the passkey when there is one. A record nobody checked against its seal
-        claims neither (BACKLOG #3422)."""
+        claims neither (BACKLOG #3422). Where the lock's escalation judged the TOTP, the notice
+        reads that verdict (``failure.totp_state``) and judges nothing itself, so it cannot report
+        a TOTP the escalation read differently (BACKLOG #3948 finding 16)."""
         if not failure.just_locked:
             return
         notice: dict[str, Any] = {
@@ -5648,7 +5653,9 @@ class AuthService:
             first = "first_step" if user.auth_provider == AuthProvider.LOCAL.value else "directory"
             notice["factor_right"] = factor if factor in ("password", "code", "passkey") else first
         elif user.auth_provider == AuthProvider.LOCAL.value and isinstance(user, VerifiedUser):
-            totp_state = await self._totp_state(user)
+            # The verdict the escalation used, where it used one, so the notice cannot tell the
+            # owner something the lock's length was not decided on (BACKLOG #3948 finding 16).
+            totp_state = failure.totp_state or await self._totp_state(user)
             if totp_state in ("usable", "unknown"):
                 notice["combined_sign_in"] = True
             if totp_state == "unknown":
@@ -12208,12 +12215,11 @@ class AuthService:
         current = await self._load_user(user.id)
         locked = current is not None and _live_lock(current, now)
         if not verdict:
-            attempts, just_locked, cycles = 0, False, 0
+            failure = LockoutIncrement(0, False, 0)
             if current is not None and not locked:
                 # The SIGN-IN counter, per R4 of 2026-09-23 and ADR 0197 Decision item 1.
-                attempts, just_locked, cycles = await self._register_failure(
-                    user, now, counter="sign_in"
-                )
+                failure = await self._register_failure(user, now, counter="sign_in")
+            attempts, just_locked, cycles = failure.attempts, failure.just_locked, failure.cycles
             if charged >= threshold:
                 # The caller audits this attempt, records any lockout, and only then revokes, so a
                 # failed revoke cannot lose those rows. Until the revoke lands the count stays at the
@@ -12225,9 +12231,15 @@ class AuthService:
                     attempts=attempts,
                     just_locked=just_locked,
                     cycles=cycles,
+                    totp_state=failure.totp_state,
                 )
             return _Reproof(
-                ok=False, user=user, attempts=attempts, just_locked=just_locked, cycles=cycles
+                ok=False,
+                user=user,
+                attempts=attempts,
+                just_locked=just_locked,
+                cycles=cycles,
+                totp_state=failure.totp_state,
             )
         if current is None:
             return _Reproof(ok=False, user=user)
@@ -12277,7 +12289,7 @@ class AuthService:
             await self._record_lock(
                 proof.user,
                 "sign_in",
-                LockoutIncrement(proof.attempts, proof.just_locked, proof.cycles),
+                LockoutIncrement(proof.attempts, proof.just_locked, proof.cycles, proof.totp_state),
                 client=client,
                 audit_detail=audit_detail,
             )

@@ -3549,6 +3549,15 @@ def lockout_increment(
         )
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord:
+        # The verdict the escalation reads below, where it judged the cell this locked row holds.
+        judged = (
+            totp_counts
+            if counter == "sign_in"
+            and isinstance(totp_counts, TotpJudgement)
+            and r.row.totp_enabled
+            and not totp_counts.moved(r)
+            else None
+        )
         state = next_lockout_state(
             failed_attempts=int(getattr(r.row, attempts_col)),
             locked_until=getattr(r.row, until_col),
@@ -3561,16 +3570,19 @@ def lockout_increment(
                 counter,
                 auth_provider=r.row.auth_provider,
                 totp_enabled=r.row.totp_enabled
-                and not (
-                    counter == "sign_in"
-                    and isinstance(totp_counts, TotpJudgement)
-                    and totp_counts.refuses(r)
-                ),
+                and not (judged is not None and judged.state == "refused"),
                 passkey_way_past=passkey_way_past(r),
             ),
             lockable=lockout_arms(counter, password_generated=r.row.password_generated),
         )
-        out.append(LockoutIncrement(state.attempts, state.just_locked, state.cycles))
+        out.append(
+            LockoutIncrement(
+                state.attempts,
+                state.just_locked,
+                state.cycles,
+                None if judged is None else judged.state,
+            )
+        )
         return r.changed(
             **{
                 attempts_col: state.attempts,
@@ -8222,11 +8234,18 @@ class LockoutState:
 
 class LockoutIncrement(NamedTuple):
     """What ``increment_login_failure`` returns: the counter's new failure count, whether this
-    attempt set the lock, and the counter's cycle count after it (the notice reports it)."""
+    attempt set the lock, and the counter's cycle count after it (the notice reports it).
+
+    ``totp_state`` is the TOTP verdict the SIGN-IN lock's escalation used (:func:`judge_totp`), on
+    the cell the locked row still holds, or ``None`` where the escalation used none: a first lock,
+    a failure that sets no later-cycle lock, the second-step counter, or a cell that moved since
+    the judgement. The lock notice reads it, so it tells the owner what the escalation decided on
+    rather than judging the cell again (BACKLOG #3948 finding 16)."""
 
     attempts: int
     just_locked: bool
     cycles: int
+    totp_state: TotpState | None = None
 
 
 def next_lockout_state(
