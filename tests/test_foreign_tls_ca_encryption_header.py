@@ -12,6 +12,8 @@ wherever it hands a CA FILE path to one:
   parses it first, but ``cryptography``'s parser accepts a certificate block with the headers, so
   the parse was not a refusal. :func:`messagefoundry.pki.load_pinned_server_certificate` now checks.
 * ``odbc_params`` ``sslca`` on a generic DATABASE connection, which MySQL's ODBC driver loads.
+* libpq's own root certificate on a psqlODBC connection, ``PGSSLROOTCERT`` or libpq's default
+  ``root.crt``, which the engine never hands over but libpq reads from its environment (step 3).
 
 A CA DIRECTORY handed to a driver is not changed: ``sslcapath`` is pinned here as still building.
 
@@ -125,14 +127,18 @@ def test_a_plain_sqlserver_pin_still_loads(tmp_path: Path) -> None:
 # --- odbc_params sslca, a generic DATABASE connection's CA file ---------------------------------
 
 
-def _build(**params: Any) -> str:
+def _build_generic(driver: str, params: dict[str, Any]) -> str:
     settings = {
         "dialect": "generic",
-        "odbc_driver": "MySQL ODBC 9.1 Unicode Driver",
+        "odbc_driver": driver,
         "server": "db.synthetic.test",
-        "odbc_params": {"SSLMODE": "VERIFY_IDENTITY", **params},
+        "odbc_params": params,
     }
     return _build_odbc_dsn(settings, connection=_CONNECTION)
+
+
+def _build(**params: Any) -> str:
+    return _build_generic("MySQL ODBC 9.1 Unicode Driver", {"SSLMODE": "VERIFY_IDENTITY", **params})
 
 
 @pytest.mark.parametrize("spelling", ["sslca", "SSLCA"])
@@ -252,6 +258,128 @@ def test_a_ca_directory_still_reaches_the_driver(tmp_path: Path) -> None:
     _write(tmp_path, _headered(_certificate()), "0a1b2c3d.0")
     assert f"sslcapath={tmp_path};" in _build(sslcapath=str(tmp_path))
     assert f"sslca={tmp_path};" in _build(sslca=str(tmp_path))
+
+
+# --- libpq's own root certificate, which psqlODBC's libpq reads from the environment -----------
+
+
+def _build_psql(sslmode: str = "verify-full") -> str:
+    return _build_generic("PostgreSQL Unicode", {"SSLmode": sslmode})
+
+
+@pytest.fixture
+def _no_libpq_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """A libpq home with no ``root.crt`` and no ``PGSSLROOTCERT``, so nothing reads the runner's
+    own; the home is returned for a test to fill."""
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+    home = tmp_path / "libpq-home"
+    home.mkdir()
+    monkeypatch.setattr(database, "_libpq_home", lambda: str(home))
+    return home
+
+
+@pytest.mark.usefixtures("_no_libpq_root")
+@pytest.mark.parametrize("text", _shapes())
+def test_a_pgsslrootcert_with_an_encryption_header_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str
+) -> None:
+    """BACKLOG #3090, step 3. Red with ``_refuse_encrypted_libpq_root_cert`` removed: the builder
+    would build, and libpq would load the file at the first connect."""
+    monkeypatch.setenv("PGSSLROOTCERT", _write(tmp_path, text))
+    with pytest.raises(ValueError, match="DATABASE PGSSLROOTCERT") as refused:
+        _build_psql()
+    message = str(refused.value)
+    assert _CONNECTION in message and ENCRYPTION_HEADER_SCOPE in message
+    assert "AES-256-CBC" not in message and _body_of(text) not in message
+
+
+@pytest.mark.parametrize("sslmode", ["verify-full", "require", "prefer"])
+def test_libpqs_default_root_certificate_with_an_encryption_header_is_refused(
+    _no_libpq_root: Path, sslmode: str
+) -> None:
+    """With no ``PGSSLROOTCERT``, libpq reads ``root.crt`` under its home directory.
+
+    Red with ``_refuse_encrypted_libpq_root_cert`` removed."""
+    _write(_no_libpq_root, _headered(_certificate()), "root.crt")
+    with pytest.raises(ValueError, match="DATABASE libpq's default root certificate") as refused:
+        _build_psql(sslmode)
+    assert ENCRYPTION_HEADER_SCOPE in str(refused.value)
+
+
+@pytest.mark.parametrize("label", _KEY_SHAPES)
+def test_libpqs_root_certificate_with_a_private_key_is_refused(
+    _no_libpq_root: Path, label: str
+) -> None:
+    _write(_no_libpq_root, _with_key(label), "root.crt")
+    with pytest.raises(ValueError, match=re.escape(f"the CA file {PRIVATE_KEY_SCOPE}")) as refused:
+        _build_psql()
+    assert "AAAA" not in str(refused.value)
+
+
+def test_libpqs_root_certificate_controls_still_build(
+    _no_libpq_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The controls: a plain root certificate builds; an encrypted one is not read under
+    ``sslmode=disable``, by a driver that is not psqlODBC, or when ``PGSSLROOTCERT`` says
+    ``system``; and a missing file is left to libpq."""
+    assert "SSLmode=verify-full;" in _build_psql()  # no file at all
+    _write(_no_libpq_root, _certificate(), "root.crt")
+    assert "SSLmode=verify-full;" in _build_psql()
+    _write(_no_libpq_root, _headered(_certificate()), "root.crt")
+    assert "SSLmode=disable;" in _build_psql("disable")
+    assert "SSLMODE=VERIFY_IDENTITY;" in _build()  # MySQL's driver reads no libpq root
+    monkeypatch.setenv("PGSSLROOTCERT", "system")
+    assert "SSLmode=verify-full;" in _build_psql()
+
+
+@pytest.mark.usefixtures("_no_libpq_root")
+def test_a_pgsslrootcert_on_another_host_is_refused_unread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Red with the ``names_another_host`` branch dropped: the build would read a share on the
+    event loop. The refusal names the way out."""
+    monkeypatch.setenv("PGSSLROOTCERT", "//db.synthetic.test/share/root.crt")
+    with pytest.raises(ValueError, match="not a plain local path") as refused:
+        _build_psql()
+    assert "set PGSSLROOTCERT to a local path" in str(refused.value)
+
+
+def test_libpqs_root_certificate_the_check_cannot_read_is_refused(
+    _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _write(_no_libpq_root, _certificate(), "root.crt")
+    real_open = os.open
+
+    def unreadable(path: Any, *args: Any, **kwargs: Any) -> int:
+        if str(path) == root:
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", unreadable)
+    with pytest.raises(ValueError, match="root certificate file could not be read to check it"):
+        _build_psql()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="libpq reads HOME and the password file off Windows")
+def test_libpqs_home_falls_back_to_the_password_file_for_an_empty_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """libpq 15 and later treat an empty ``HOME`` as unset; ``expanduser`` would give ``/``."""
+    import pwd
+
+    monkeypatch.setenv("HOME", "")
+    expected = os.path.join(pwd.getpwuid(os.geteuid()).pw_dir, ".postgresql")
+    assert database._libpq_home() == expected
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the shell folder is read on Windows only")
+def test_libpqs_home_on_windows_is_the_shell_roaming_folder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """libpq asks the shell, so an unset ``APPDATA`` does not hide the default file."""
+    monkeypatch.delenv("APPDATA", raising=False)
+    home = database._libpq_home()
+    assert home is not None and home.endswith(os.sep + "postgresql")
 
 
 @pytest.mark.parametrize("keyword", ["sslrootcert", "sslcrl", "sslcrldir", "ServerCertificate"])

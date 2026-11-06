@@ -536,6 +536,23 @@ def _quiesce_background_loggers_at_teardown(
         _quiesce_targets()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _no_libpq_root_certificate_read() -> Iterator[None]:
+    """Keep every psqlODBC build off the runner's own libpq root certificate (BACKLOG #3090, step
+    3). A build reads ``PGSSLROOTCERT`` or libpq's default ``root.crt`` from the environment, so a
+    runner's own file, or its absence, would decide unrelated tests. ``system`` names no file, so
+    nothing is read; a test of that check sets its own value."""
+    before = os.environ.get("PGSSLROOTCERT")
+    os.environ["PGSSLROOTCERT"] = "system"
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop("PGSSLROOTCERT", None)
+        else:
+            os.environ["PGSSLROOTCERT"] = before
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _no_qt_object_left_in_a_reference_cycle(request: pytest.FixtureRequest) -> Iterator[None]:
     """In a Qt test module, keep automatic garbage collection off until the module ends, then

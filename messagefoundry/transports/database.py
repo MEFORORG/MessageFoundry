@@ -1202,6 +1202,10 @@ _WINDOWS_INVALID_NAME = 123
 _WINDOWS_UNREACHABLE = frozenset({53, 67})
 
 
+#: What a CA file's read checks it for, as its refusals word it.
+_CA_CHECKED_FOR = "it for an encryption header or a private key"
+
+
 def _refuse_encrypted_driver_ca(
     named: Mapping[str, Any],
     *,
@@ -1235,21 +1239,137 @@ def _refuse_encrypted_driver_ca(
         "sslca",
         connection,
         "CA file",
-        "it for an encryption header or a private key",
+        _CA_CHECKED_FOR,
         leave_unreachable=generic_odbc_tls_off({"dialect": "generic", "odbc_params": named}),
         verdicts=verdicts,
     ):
-        if has_encryption_header_bytes(data):
-            raise ValueError(
-                f"{setting}: the CA file {ENCRYPTION_HEADER_SCOPE}. The driver loads it with its "
-                "own TLS library, which can wait for a password on an encrypted block; refusing "
-                "to hand it over (BACKLOG #3090)"
-            )
-        if has_private_key_label_bytes(data):
-            raise ValueError(
-                f"{setting}: the CA file {PRIVATE_KEY_SCOPE}. A CA file is public trust material, "
-                "so a private key does not belong in it; refusing to hand it over (BACKLOG #3745)"
-            )
+        _refuse_ca_content(setting, data, refusing="refusing to hand it over")
+
+
+def _refuse_ca_content(setting: str, data: bytes, *, refusing: str) -> None:
+    """Raise ``ValueError`` when the CA file ``data`` holds an encryption header or a private-key
+    label. The message names ``setting`` and ends with ``refusing``, never the file's content."""
+    if has_encryption_header_bytes(data):
+        raise ValueError(
+            f"{setting}: the CA file {ENCRYPTION_HEADER_SCOPE}. The driver loads it with its "
+            f"own TLS library, which can wait for a password on an encrypted block; {refusing} "
+            "(BACKLOG #3090)"
+        )
+    if has_private_key_label_bytes(data):
+        raise ValueError(
+            f"{setting}: the CA file {PRIVATE_KEY_SCOPE}. A CA file is public trust material, "
+            f"so a private key does not belong in it; {refusing} (BACKLOG #3745)"
+        )
+
+
+#: libpq's root certificate file name under its home directory (``ROOT_CERT_FILE`` in libpq).
+_LIBPQ_ROOT_CERT = "root.crt"
+
+
+def _libpq_root_cert() -> tuple[str, str] | None:
+    """The ``(setting, path)`` of the root certificate libpq reads from the engine's environment
+    when no ``sslrootcert`` is given, which the generic dialect never gives (BACKLOG #3090, step
+    3): ``PGSSLROOTCERT`` when it is set and not empty, else ``root.crt`` in
+    :func:`_libpq_home`. ``None`` for ``system``, libpq's name for the platform's own store, which
+    is no file, and when no home directory can be named, where libpq reads no default either."""
+    named = os.environ.get("PGSSLROOTCERT")
+    if named:
+        return None if named == "system" else ("PGSSLROOTCERT", named)
+    home = _libpq_home()
+    if home is None:
+        return None
+    return "libpq's default root certificate", os.path.join(home, _LIBPQ_ROOT_CERT)
+
+
+def _libpq_home() -> str | None:
+    """The directory libpq reads its default files from, found as libpq 15 and later find it:
+    ``postgresql`` in the roaming application-data folder the shell names on Windows, and
+    ``.postgresql`` in ``HOME``, or in the effective user's password-file home when ``HOME`` is
+    unset or empty, elsewhere. libpq 14 and older read the password-file home only. ``None`` when
+    neither can be named."""
+    if sys.platform == "win32":
+        appdata = _windows_roaming_appdata()
+        return os.path.join(appdata, "postgresql") if appdata else None
+    home = os.environ.get("HOME")
+    if not home:
+        import pwd
+
+        try:
+            home = pwd.getpwuid(os.geteuid()).pw_dir
+        except KeyError:
+            return None
+    return os.path.join(home, ".postgresql") if home else None
+
+
+#: ``CSIDL_APPDATA``: the roaming application-data folder libpq asks the Windows shell for.
+_CSIDL_APPDATA = 0x1A
+
+
+def _windows_roaming_appdata() -> str | None:
+    """``SHGetFolderPathW``'s ``CSIDL_APPDATA`` folder, the call libpq makes, rather than the
+    ``APPDATA`` variable, which a service's environment may not carry. ``None`` when the call
+    fails. Raises ``OSError`` off Windows."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the application-data folder is read only on Windows")
+    import ctypes
+
+    shell32 = ctypes.WinDLL("shell32")
+    shell32.SHGetFolderPathW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_wchar_p,
+    ]
+    shell32.SHGetFolderPathW.restype = ctypes.c_long
+    buf = ctypes.create_unicode_buffer(260)  # MAX_PATH, the size the call is documented to take
+    if shell32.SHGetFolderPathW(None, _CSIDL_APPDATA, None, 0, buf) != 0:
+        return None
+    return buf.value or None
+
+
+def _refuse_encrypted_libpq_root_cert(
+    named: Mapping[str, Any], *, family: str, connection: str | None = None
+) -> None:
+    """Refuse a psqlODBC connection whose libpq would load a root certificate with an encryption
+    header or a private key (BACKLOG #3090, step 3), as :func:`_refuse_encrypted_driver_ca`
+    refuses an ``sslca``.
+
+    psqlODBC hands libpq no ``sslrootcert``, since the generic dialect refuses that keyword and
+    ``pqopt``, so libpq takes the file :func:`_libpq_root_cert` names, at each connect. Its
+    documentation says a root file that exists makes ``require`` behave as ``verify-ca``, so the
+    file is loaded under at least ``require`` and both ``verify`` modes; this was read, not
+    measured. Erring wide, the check runs for the psqlODBC family unless ``sslmode`` turns TLS off
+    (:func:`generic_odbc_tls_off`), since ``allow`` and ``prefer`` may still go to TLS. The path
+    takes the remote-path check (:func:`names_another_host`) and :func:`_read_driver_file`'s read,
+    as an ``sslca`` does: a path that names another host is refused unread, a missing file or a
+    directory is left to libpq, and a file the check cannot read is refused. That holds for the
+    default path too, on a redirected profile folder say, whether or not a file is there; the
+    refusal names ``PGSSLROOTCERT`` as the way out. As for an ``sslca``, the trimmed spelling is
+    judged as well, though only the path as libpq reads it is read.
+
+    **It reads the environment of the process that builds the connection**, so ``messagefoundry
+    check`` and a dry run judge their own machine's file, not the service's. **It runs when the
+    connection is built, not at each connect**, as the ``sslca`` check does, and the file is no
+    lane anchor: no ACL, change or audit check covers it. Nor is a ``sslrootcert`` read that a
+    libpq service file, or a DSN registered with the driver manager, names."""
+    if family != "psqlodbc" or generic_odbc_tls_off({"dialect": "generic", "odbc_params": named}):
+        return
+    found = _libpq_root_cert()
+    if found is None:
+        return
+    source, path = found
+    setting = f"{hop_name_prefix(connection)}DATABASE {source}"
+    if names_another_host(path):
+        raise ValueError(
+            f"{setting}: the root certificate file is not a plain local path on this host, so it "
+            f"was not read to check {_CA_CHECKED_FOR}; set PGSSLROOTCERT to a local path"
+        )
+    data = _read_driver_file(path, setting, "root certificate file", _CA_CHECKED_FOR)
+    if data is not None:
+        _refuse_ca_content(
+            setting, data, refusing="refusing to build a connection libpq loads it on"
+        )
 
 
 def _driver_file_spellings(
@@ -1534,6 +1654,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     _refuse_weak_driver_key(named, connection=connection, verdicts=verdicts)
     _refuse_weak_driver_cert(named, connection=connection, verdicts=verdicts)
     _refuse_encrypted_driver_ca(named, connection=connection, verdicts=verdicts)
+    _refuse_encrypted_libpq_root_cert(named, family=family, connection=connection)
     _warn_generic_tls_unenforced(params, family=family, connection=connection)
     return ";".join(parts) + ";"
 
