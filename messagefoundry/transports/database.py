@@ -1153,9 +1153,9 @@ def _capath_entries_leave_host(value: object, verdicts: FileVerdicts) -> bool:
     did not.
 
     Each spelling :func:`driver_file_spellings` gives that is a folder is listed, and every entry
-    in it, not only the hash-named ones, is judged by :func:`_capath_entry_clear`. One ``lstat``
-    clears an entry it reads as a plain file or folder; any other entry takes
-    :func:`_path_verdict`, where ``True`` or ``None`` for any one refuses, as for the trimmed
+    in it, not only the hash-named ones, is judged by :func:`_capath_entry_clear`. There one
+    ``lstat`` clears a plain file or folder whose name the walk does not end on. Any other entry
+    takes :func:`_path_verdict`. ``True`` or ``None`` for any one refuses, as for the trimmed
     spelling of a file keyword. So does a folder that cannot be listed, whether at open or partway
     through, or one holding more than :data:`_MAX_CAPATH_ENTRIES`. A spelling that names no folder,
     or a file, is left to the driver, as a missing file is. Entries are not walked into: the driver
@@ -1188,7 +1188,8 @@ def _capath_folder_clear(folder: str) -> bool:
             # No folder at this spelling: left to the driver, as a missing file is. The reason
             # only, since the exception's text names the path.
             logger.debug(
-                "sslcapath names no folder to list, so it is left to the driver: %s", _why(exc)
+                "sslcapath gave no folder listing at open, so it is left to the driver: %s",
+                _why(exc),
             )
             return True
         with listing:

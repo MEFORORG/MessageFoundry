@@ -2245,9 +2245,10 @@ share, a `subst` drive onto one included, leave the anchor check unable to judge
 is audited as `path_indeterminate`, which warns at `warn` and refuses at `enforce`, unless a
 matching pin lets it through where `auth.trust_anchors` module item 6 allows one. An `SSLCA`
 value of that kind is refused by the file-keyword check first, in either mode. A `tls_ca_file`
-takes no file-keyword check, so the anchor check is the only one it meets: at `warn` that check
-audits it and warns rather than refusing it; at `enforce` it refuses it, unless a matching pin
-lets it through as above.
+takes no file-keyword check, so the anchor check is the only one it meets. Where that check reads
+the file but cannot judge its path, it audits `path_indeterminate`. At `warn` it then warns and
+does not refuse. At `enforce` it refuses, unless a matching pin lets it through as above. A file
+the check cannot read at all is refused in either mode, and so is a pin that does not match.
 
 An `SSLKEY` file, and an `SSLCERT` file when no `SSLKEY` is set, takes the key-wrap check
 (BACKLOG #1352, #3090) when the connection is built, with `sslpassword` as its passphrase. A key

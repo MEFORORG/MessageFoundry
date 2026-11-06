@@ -780,7 +780,8 @@ def test_closing_step_4_a_listing_that_fails_partway_is_refused(
 ) -> None:
     """A folder that opens and then fails while it is listed was judged in part. Read as a missing
     folder, the value was cleared with the remaining entries unjudged. Red: a not-found or
-    not-a-folder raised partway left it to the driver."""
+    not-a-folder raised partway left it to the driver. The PermissionError case is a control: it
+    was refused before the fix too."""
     folder = _capath(tmp_path, "a.0", "b.0")
     _entry_verdicts(monkeypatch, {})
     real = os.scandir
@@ -809,7 +810,8 @@ def test_closing_step_4_a_listing_that_fails_partway_is_refused(
     with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
         database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
     warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert warned and all("phi-capath" not in m for m in warned)
+    assert any("an sslcapath folder could not be listed: gone partway" in m for m in warned)
+    assert all("phi-capath" not in m for m in warned)
 
 
 def test_closing_step_4_a_missing_folder_or_a_file_is_left_to_the_driver(
@@ -819,13 +821,16 @@ def test_closing_step_4_a_missing_folder_or_a_file_is_left_to_the_driver(
     reason, never the path. Red: nothing was logged."""
     _entry_verdicts(monkeypatch, {})
     caplog.set_level(logging.DEBUG, logger=database.logger.name)
-    database._build_odbc_dsn(_generic(SSLCAPATH=str(tmp_path / "phi-absent")), connection=_OUT)
     single = tmp_path / "phi-ca.pem"
     single.write_bytes(b"synthetic")
-    database._build_odbc_dsn(_generic(SSLCAPATH=str(single)), connection=_OUT)
-    left = [r.getMessage() for r in caplog.records if "left to the driver" in r.getMessage()]
-    assert len(left) >= 2 and all("sslcapath" in m for m in left)
-    assert all("phi-" not in m and str(tmp_path) not in m for m in left)
+    for value in (tmp_path / "phi-absent", single):
+        caplog.clear()
+        database._build_odbc_dsn(_generic(SSLCAPATH=str(value)), connection=_OUT)
+        left = [r for r in caplog.records if "left to the driver" in r.getMessage()]
+        assert left and all(r.levelno == logging.DEBUG for r in left)
+        for message in (r.getMessage() for r in left):
+            assert "sslcapath" in message
+            assert "phi-" not in message and str(tmp_path) not in message
 
 
 def test_closing_step_4_the_entries_are_not_listed_where_only_the_spelling_is_checked(
