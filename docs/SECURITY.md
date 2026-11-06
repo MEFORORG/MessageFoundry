@@ -5444,8 +5444,8 @@ fails, at least one a fault, the pass judges no account it asked about and revok
 outage, but it still pages, and it still strikes an id-less row (BACKLOG #3170). A pass where every
 probe fails and none faults is a plain outage, and pages nobody until a run of them lasts
 `ad_reconcile_outage_passes` passes (BACKLOG #3709). An account whose probe fails that many
-times running pages as a partial outage, on the next pass that is not a whole outage, a pass of
-faults included. A
+times running pages as a partial outage, unless the whole outage is paging, a pass of faults
+included. A
 connection, timeout or name-lookup error that escapes the directory layer is still read as
 unreachable. So is at least an operating-system error saying the network or host is unreachable,
 down or reset. Another network-class error can still read as a probe fault and page.
