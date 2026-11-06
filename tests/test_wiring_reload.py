@@ -9,6 +9,7 @@ in-flight outbox deliveries, and rejecting a bad/empty config without disturbing
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -523,9 +524,17 @@ async def test_engine_two_overlapping_first_loads_start_one_runner(
         started.append(self)
         await real_start(self, *args, **kwargs)
 
+    entered: list[RegistryRunner] = []
+    both_in = asyncio.Event()
+
     async def slow_check(self: RegistryRunner, *args: Any, **kwargs: Any) -> None:
-        # Holds each check open long enough that the other reload reaches its own.
-        await asyncio.sleep(0.1)
+        # Holds each check open until the other reload has reached its own, so on the unfixed
+        # engine the two overlap every time. Bounded, because the fix keeps the second out.
+        entered.append(self)
+        if len(entered) >= 2:
+            both_in.set()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(both_in.wait(), timeout=1.0)
         await real_check(self, *args, **kwargs)
 
     monkeypatch.setattr(RegistryRunner, "start", recording_start)
@@ -536,7 +545,8 @@ async def test_engine_two_overlapping_first_loads_start_one_runner(
     await eng.start()
     assert eng.registry_runner is None
     try:
-        await asyncio.gather(eng.reload(good), eng.reload(good))
+        results = await asyncio.gather(eng.reload(good), eng.reload(good), return_exceptions=True)
+        assert not [r for r in results if isinstance(r, BaseException)], results
         assert len(started) == 1, started
         assert eng.registry_runner is started[0] and started[0].running
     finally:

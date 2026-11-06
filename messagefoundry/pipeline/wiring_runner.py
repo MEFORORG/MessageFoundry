@@ -7834,12 +7834,11 @@ class RegistryRunner:
         try:
             await replaced.aclose()
         except Exception as exc:  # noqa: BLE001 - a connector's close can fail in any way; logged
+            reason = safe_exc(exc)
             log.warning(
-                "reload: closing the replaced connector of outbound %r failed: %s",
-                name,
-                safe_exc(exc),
+                "reload: closing the replaced connector of outbound %r failed: %s", name, reason
             )
-            failures.append((name, safe_exc(exc)))
+            failures.append((name, reason))
 
     # --- atomic reload (quiesce-and-swap) ------------------------------------
 

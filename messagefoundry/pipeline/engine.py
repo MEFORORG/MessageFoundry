@@ -379,7 +379,8 @@ class ReloadOutcome:
       live graph is untouched, so the operator fixes the config and retries.
     * **The reload happened cleanly.** ``applied`` is True and ``failures`` is empty.
     * **The reload happened and a follow-on step failed.** ``applied`` is True and ``failures``
-      names each step. The NEW graph is live. Reporting outright failure here would describe an
+      names each step, once each (``outbound_close`` names every lane in its ``detail``). The NEW
+      graph is live. Reporting outright failure here would describe an
       engine that does not exist, and reporting plain success would hide a step an operator has to
       go finish by hand -- so the partial outcome is its own answer (ASVS 2.3.3, BACKLOG #1111).
 
@@ -1457,6 +1458,29 @@ class Engine:
             env_values=self._env_values,
             coordinator=self._coordinator,
         )
+
+    def _refuse_shard_universe_change(self, registry: Registry) -> None:
+        """Raise ``WiringError`` when ``registry``, already shard-filtered, names a different
+        engine-shard set from the running graph's. A no-op with no running graph or no filter."""
+        rr = self._registry_runner
+        if self._registry_filter is None or rr is None:
+            return
+        running = rr.registry
+        if registry.all_shard_ids != running.all_shard_ids:
+            # ADR 0073: outbound-lane ownership is a pure function of the shard universe, and a
+            # reload is a PER-PROCESS operation with no fleet coordination — accepting a changed
+            # universe here would leave this shard claiming by a NEW map while siblings claim by
+            # the OLD one: some lanes get two concurrent consumers (per-lane FIFO inversion),
+            # others get none (ACKed messages stall with no alert). Fail closed instead.
+            old, new = running.all_shard_ids, registry.all_shard_ids
+            old_ids = join_shard_names(old) if old else "<single>"
+            new_ids = join_shard_names(new) if new else "<single>"
+            raise WiringError(
+                f"reload changes the engine-shard set ({old_ids} -> {new_ids}) — outbound-lane "
+                "ownership (ADR 0073) is pinned to the shard universe, so a shard-set change "
+                "requires a coordinated full-fleet restart (stop supervise, apply the config, "
+                "start), not a per-shard reload"
+            )
 
     async def _first_load(self, registry: Registry, env_values: dict[str, Any]) -> RegistryRunner:
         """Install and start the runner for ``registry`` on an engine with none, for
@@ -3224,7 +3248,8 @@ class Engine:
         raises there fails honestly: nothing was applied. Only two steps cannot move -- reference-set
         reconciliation reads its specs off the LIVE registry, and the cluster version bump announces
         a config this node has already taken -- so those two run after the swap and report as
-        ``failures`` rather than as a failed reload.
+        ``failures`` rather than as a failed reload. The swap itself reports one more,
+        ``outbound_close``: an outbound connector it replaced and could not close.
 
         ``dry_run`` performs the full validation **against this instance's environment** — it loads
         the graph and build-checks every connector, which resolves the graph's ``env()`` references
@@ -3415,22 +3440,7 @@ class Engine:
             # Re-apply this process's shard filter so a reload keeps owning only its shard's inbounds
             # (outbound/routers/handlers stay shared). Pure + cheap (sharding.filter_registry_for_shard).
             registry = self._registry_filter(registry)
-            running = self._registry_runner.registry if self._registry_runner is not None else None
-            if running is not None and registry.all_shard_ids != running.all_shard_ids:
-                # ADR 0073: outbound-lane ownership is a pure function of the shard universe, and a
-                # reload is a PER-PROCESS operation with no fleet coordination — accepting a changed
-                # universe here would leave this shard claiming by a NEW map while siblings claim by
-                # the OLD one: some lanes get two concurrent consumers (per-lane FIFO inversion),
-                # others get none (ACKed messages stall with no alert). Fail closed instead.
-                old, new = running.all_shard_ids, registry.all_shard_ids
-                old_ids = join_shard_names(old) if old else "<single>"
-                new_ids = join_shard_names(new) if new else "<single>"
-                raise WiringError(
-                    f"reload changes the engine-shard set ({old_ids} -> {new_ids}) — outbound-lane "
-                    "ownership (ADR 0073) is pinned to the shard universe, so a shard-set change "
-                    "requires a coordinated full-fleet restart (stop supervise, apply the config, "
-                    "start), not a per-shard reload"
-                )
+            self._refuse_shard_universe_change(registry)
         # KEPT, and NOT redundant with the load-time rule (BACKLOG #1648). `load_config` above now
         # refuses an empty graph inside `Registry.validate`, but that fires BEFORE
         # `self._registry_filter` — so on a `serve --shard X` process the filter can empty a graph the
@@ -3465,14 +3475,17 @@ class Engine:
         # the old values with the old graph (vault BACKLOG #2596).
         first_load = False
         close_failures: tuple[tuple[str, str], ...] = ()
-        if runner is None:
-            async with self._first_load_lock:
-                # A first load that held the lock before this one may have installed a runner,
-                # and this graph then applies to it as a reload, below.
-                runner = self._registry_runner
-                if runner is None:
-                    first_load = True
-                    runner = await self._first_load(registry, env_values)
+        # Taken by every applied reload, and held across a first load until its runner has
+        # started or been cleared, so the runner read here is never one a first load is still
+        # starting. A first load that held it before this reload may have installed the runner
+        # this graph then applies to as a reload, so the shard set is checked against that one.
+        async with self._first_load_lock:
+            runner = self._registry_runner
+            if runner is None:
+                first_load = True
+                runner = await self._first_load(registry, env_values)
+            else:
+                self._refuse_shard_universe_change(registry)
         if not first_load:
             try:
                 # The runner swaps the values under its reload lock and restores them on a rollback.
@@ -3492,9 +3505,12 @@ class Engine:
         self.last_reload_dir = path
         # A connector the swap replaced and could not close: the new one is live, so it is a step
         # an operator may still have to finish, not a failed reload (engine PR 2815).
-        for outbound_name, detail in close_failures:
+        if close_failures:
             failures.append(
-                ReloadStepFailure("outbound_close", f"outbound {outbound_name!r}: {detail}")
+                ReloadStepFailure(
+                    "outbound_close",
+                    "; ".join(f"outbound {name!r}: {detail}" for name, detail in close_failures),
+                )
             )
         # Reference sets (ADR 0006): re-arm + materialize after the swap, so a reference set added by
         # this reload syncs immediately (resolves on the next message, not only after the refresh

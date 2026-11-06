@@ -1267,6 +1267,8 @@ async def test_hold_f2_a_replaced_connector_whose_close_raises_leaves_the_reload
         claim_mode="pooled" if worker_alive else "per_lane",
     )
     await runner.start()
+    stale: database.DatabaseDestination | None = None
+    real_close = database.DatabaseDestination.aclose
     try:
         state = cast(Any, runner)
         stale = state._destinations[_OUT]
@@ -1275,7 +1277,6 @@ async def test_hold_f2_a_replaced_connector_whose_close_raises_leaves_the_reload
             worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await worker
-        real_close = database.DatabaseDestination.aclose
 
         async def close(self: database.DatabaseDestination) -> None:
             if self is stale:
@@ -1292,5 +1293,9 @@ async def test_hold_f2_a_replaced_connector_whose_close_raises_leaves_the_reload
         assert [name for name, _detail in failures] == [_OUT]
         assert "synthetic close failure" in failures[0][1]
         assert state._failed.get(("outbound", _OUT)) is None
+        if not worker_alive:
+            assert not state._workers[_OUT].done()  # the rebuild respawned the lane's worker
     finally:
         await runner.stop()
+        if stale is not None:
+            await real_close(stale)
