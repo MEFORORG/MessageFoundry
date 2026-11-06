@@ -2394,6 +2394,126 @@ def test_the_swallow_tests_fail_without_the_stop(monkeypatch: pytest.MonkeyPatch
     assert len(leaked) >= 500, f"only {len(leaked)} family lines leaked without the stop"
 
 
+# --- BACKLOG #2966: a plain value running on into a later braced password --------------------------
+#
+# A plain value ran on over a later ``_CREDENTIAL_KV`` label and stopped at the space inside its
+# braces, so the braced value's tail printed. Why the value now takes that label up to the closer and
+# writes the tail back masked, and which shapes are left, is stated once, on ``_BRACED_RUN_ON`` in
+# ``messagefoundry/secretscrub.py``.
+
+#: The braced value's two words. Synthetic, and each holds "-" and "_", so the bundle's long-base64
+#: sweep cannot be what hides it.
+_BRACED_WORDS = ("bv-Br_A-71", "bv-Br_B-72")
+
+#: The five shapes the row was measured on: a ``MEFOR_`` value, a ``MEFOR_`` DSN, and the token,
+#: session and api_key labels, each then ``;PWD=`` with a braced value holding a space.
+BRACED_AFTER_PLAIN = tuple(
+    f"connect failed {first}={value};PWD={{{_BRACED_WORDS[0]} {_BRACED_WORDS[1]}}} for svc"
+    for first, value in (
+        ("MEFOR_X", "bv-Fst_0-70"),
+        ("MEFOR_STORE_DSN", "Server=h"),
+        ("token", "bv-Fst_0-70"),
+        ("session", "bv-Fst_0-70"),
+        ("api_key", "bv-Fst_0-70"),
+    )
+)
+
+
+@pytest.mark.parametrize(
+    "line", BRACED_AFTER_PLAIN, ids=("mefor", "mefor-dsn", "token", "session", "api-key")
+)
+def test_a_plain_value_does_not_print_a_later_braced_password(line: str) -> None:
+    """No word of the braced value prints on any surface, and the first label stays visible.
+
+    The installed chain is not one of these surfaces: its query filter still prints the tail on the
+    ``token=`` line, before this pass runs. That half is the query filter's own."""
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        printed = [word for word in _BRACED_WORDS if word in out]
+        assert not printed, f"{surface}: {printed} printed -- got {out!r}"
+        first = line.split()[2].split("=")[0]
+        assert f"{first}=" in out, f"{surface}: the label {first} was lost -- got {out!r}"
+
+
+def test_the_braced_tail_is_written_back_masked_with_its_closer() -> None:
+    """The tail keeps its white space, punctuation and closer, and loses every letter and digit, so a
+    later pass reads text of the shape the old class left. Pinned exactly, on both copies."""
+    assert scrub_credentials("MEFOR_X=a;PWD={pp ww}") == "MEFOR_X=<redacted> xx}"
+    assert scrub_credentials("token=a;PWD={pp w;9!} tail") == "token=<redacted> x;x!} tail"
+    assert redact_log_line("MEFOR_X=a;PWD={pp ww}") == f"MEFOR_X={REDACTION_PLACEHOLDER} xx}}"
+
+
+def _without_the_braced_run_on(module: ModuleType) -> dict[str, re.Pattern[str]]:
+    """``module``'s stopped patterns with the braced stop and run-on cut out: the plain classes as
+    ``origin/main`` had them, for the swallow shapes. Each source must hold both, or the cut proves
+    nothing."""
+    never = NEVER_MATCHES.pattern
+    rebuilt: dict[str, re.Pattern[str]] = {}
+    for name in _STOPPED_PATTERNS:
+        pattern: re.Pattern[str] = getattr(module, name)
+        source = pattern.pattern
+        assert module._BRACED_LABEL in source, f"{module.__name__}.{name} has no braced stop"
+        assert module._BRACED_RUN_ON in source, f"{module.__name__}.{name} has no braced run-on"
+        source = source.replace(module._BRACED_RUN_ON, never).replace(module._BRACED_LABEL, never)
+        rebuilt[name] = re.compile(source, pattern.flags)
+    return rebuilt
+
+
+def test_the_braced_shapes_print_without_the_run_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE POSITIVE CONTROL. With the braced stop and run-on cut out of both copies, every shape
+    prints the braced value's second word on the write-time pass and the bundle, as it did before
+    BACKLOG #2966. Otherwise the test above cannot fail."""
+    for module in (scrub_mod, redact_mod):
+        for name, pattern in _without_the_braced_run_on(module).items():
+            monkeypatch.setattr(module, name, pattern)
+    for line in BRACED_AFTER_PLAIN:
+        for surface, apply in (
+            ("scrub_credentials", scrub_credentials),
+            ("bundle", redact_log_line),
+        ):
+            out = apply(line)
+            assert _BRACED_WORDS[1] in out, f"{surface}: {line!r} did not print -- got {out!r}"
+
+
+def _braced_check_run(length: int) -> str:
+    """A token value holding about ``length`` characters of unclosed ``;PWD={a`` labels, then a
+    space: the value walks to the space, and every label starts a braced walk."""
+    return "token=x" + ";PWD={a" * (length // 7) + ' "'
+
+
+def test_the_braced_stop_grows_linearly_in_line_length() -> None:
+    """The braced stop walks a "{" at every credential label inside a plain value, on text an attacker
+    can influence. THE POSITIVE CONTROL lets the walk cross a "{", as :data:`_GUARDED_BRACED_VALUE`
+    does: every label's walk then runs to the end of the value, which is quadratic. The shipped walk
+    ends at the next "{"."""
+    for module in (scrub_mod, redact_mod):
+        shipped: re.Pattern[str] = module._BEARER
+        head = module._SPACED_BRACED_HEAD
+        assert head in shipped.pattern, f"{module.__name__}._BEARER lost its braced walk"
+        control = re.compile(
+            shipped.pattern.replace(head, head.replace("[^{}", "[^}")), shipped.flags
+        )
+
+        def growth(pattern: re.Pattern[str]) -> float:
+            return _growth_between(
+                lambda text: pattern.sub("x", text),
+                _braced_check_run(_GROWTH_LENGTHS[0]),
+                _braced_check_run(_GROWTH_LENGTHS[1]),
+                rounds=5,
+            )
+
+        control_growth = growth(control)
+        assert control_growth > _MAX_GROWTH, (
+            f"{module.__name__}: the quadratic control grew only {control_growth:.1f}x, so this "
+            "input cannot show the hazard and the shipped reading proves nothing"
+        )
+        shipped_growth = growth(shipped)
+        assert shipped_growth <= _MAX_GROWTH, (
+            f"{module.__name__}._BEARER grew {shipped_growth:.1f}x for 8x the line length, against "
+            f"{control_growth:.1f}x for the quadratic control"
+        )
+
+
 # --- the change must not print anything the patterns before it hid ---------------------------------
 #
 # A DIFFERENTIAL AGAINST THE PATTERNS AS THEY STOOD BEFORE, at 50a4a3dccb, and not against the new
