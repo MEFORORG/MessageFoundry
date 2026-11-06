@@ -20,6 +20,7 @@ accounts only.
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -319,9 +320,10 @@ def _refusing_for(store: MessageStore, refused_id: str) -> None:
     store.revoke_user_sessions = revoke  # type: ignore[method-assign]
 
 
-async def test_one_account_given_up_on_does_not_stop_the_others() -> None:
+async def test_a_batch_stops_at_the_account_given_up_on_and_counts_the_rest() -> None:
     """A custom-role edit revokes each holder in turn. The first holder's revoke refused every time
-    is recorded and raised, but only after the second holder's sessions are ended too."""
+    is recorded and raised at once, so a failing store costs one account's wait, not one per
+    account; its row counts the holder it did not reach."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(require_mfa=False))
@@ -335,12 +337,35 @@ async def test_one_account_given_up_on_does_not_stop_the_others() -> None:
                 permissions=["messages:view_summary"],
                 actor="alice",
             )
-        assert await _live(store, list(sessions.values())) == [sessions["h1"]]
+        assert await _live(store, list(sessions.values())) == list(sessions.values())
         [missed] = [
             r for r in await _actions(store) if r["action"] == SESSIONS_REVOKE_FAILED_ACTION
         ]
         assert missed["actor"] == "alice"
-        assert json.loads(missed["detail"])["user_id"] == "h1"
+        detail = json.loads(missed["detail"])
+        assert detail["user_id"] == "h1" and detail["accounts_not_attempted"] == 1
+    finally:
+        await store.close()
+
+
+async def test_a_defect_is_raised_at_once_and_not_recorded_as_a_refusal() -> None:
+    """``sqlite3.ProgrammingError`` is a ``DatabaseError``, so ``_session_write_errors`` catches it,
+    but it reads as a bug: re-running it fails the same way. It is raised on the first call."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        await _account(store, service)
+        calls = [0]
+
+        async def broken(user_id: str, **kwargs: Any) -> Any:
+            calls[0] += 1
+            raise sqlite3.ProgrammingError("synthetic bad bind")
+
+        store.revoke_user_sessions = broken  # type: ignore[method-assign]
+        with pytest.raises(sqlite3.ProgrammingError):
+            await service.set_roles("u1", ["operator"], actor="admin")
+        assert calls[0] == 1
+        assert not any(r["action"] == SESSIONS_REVOKE_FAILED_ACTION for r in await _actions(store))
     finally:
         await store.close()
 

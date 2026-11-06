@@ -4487,10 +4487,9 @@ Facts that are easy to get wrong, stated plainly first:
   On both, `[store].command_timeout` still bounds the statement unless it is set to 0, and a lost
   connection still fails it. An HTTP request's own deadline still cancels the wait, and a cancelled
   wait writes nothing and records nothing. A revoke the store refuses after a committed change is
-  run again, up to three times within 15 seconds. One the service gives up on leaves the account's other sessions
-  unrevoked, and the change's own audit row and notice are lost with it; an
-  `auth.sessions_revoke_failed` row names the account and the change instead, unless the store
-  refuses that write too, and an ERROR line is written either way. A rotation that fails,
+  run again within a bounded budget, and one the service gives up on is recorded, as
+  [SECURITY.md](SECURITY.md) states; it leaves the account's other sessions unrevoked, and the
+  change's own audit row and notice are lost with it. A rotation that fails,
   including one that reached the SQL Server limit, is answered as a lost session: the old session
   is revoked, best effort, an `auth.session_rotation_failed` row with reason `store_error` records
   in `revokes_landed` whether every revoke landed, and the caller signs in again. The same callers

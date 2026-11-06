@@ -997,13 +997,15 @@ custom-role edit, a directory map save, a directory sign-in's role or scope resy
 custom-role delete revokes before it deletes, so a refusal there leaves the role in place and
 writes no such row; the directory reconciler's demotion is not covered yet. A store
 refusal of that revoke, such as a pool shortage at the acquire limit, a statement timeout or a lost
-connection, is run again, up to three attempts, none started 15 seconds or more after the first.
-At the default `acquire_timeout` a SQL Server pool wait uses up that budget on its own, so it is
-recorded at once rather than run into the request deadline. Where one account's revoke is given up
-on, the other accounts of a role edit or map save are still revoked before the refusal is raised. A
-revoke the service gives up on is logged at ERROR
+connection, is run again, up to three attempts. A re-run starts only while less than 15 seconds
+have passed since the first attempt began, give or take its half-second pause, and nothing bounds
+how long one attempt runs. At the default `acquire_timeout` a SQL Server pool wait uses up that
+budget on its own, so it is recorded at once rather than run into the request deadline. A refusal
+that reads as a defect, such as a statement the store cannot run, is raised at once, unretried and
+unrecorded. A revoke the service gives up on is logged at ERROR
 and writes one `auth.sessions_revoke_failed` row naming the account, the change, the attempts and
-the error class; the request still fails, the change stands, and the account's other sessions stay
+the error class. A role edit or map save stops at that account, and its row counts the accounts it
+did not reach as `accounts_not_attempted`; the request still fails, the change stands, and the account's other sessions stay
 live until they lapse. The change's own audit row is not written then, so this row is its record.
 Its write is soft, as above: on a store that refuses it too, the ERROR line is the only trace. A
 cancellation, such as the request deadline, skips both the retry and the row (vault BACKLOG #3802).

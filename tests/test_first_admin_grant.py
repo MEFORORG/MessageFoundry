@@ -98,9 +98,11 @@ def _busy() -> sqlite3.OperationalError:
 async def test_a_busy_grant_runs_again_rather_than_answering(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A busy write is not a refusal: the transaction runs again from its read. The end-to-end
-    case, where the re-read finds another process's committed Administrator, is
-    :func:`test_a_grant_that_loses_to_another_process_is_refused_through_sqlite_busy`."""
+    """A busy is not a refusal: the transaction runs again from its read. Since BEGIN IMMEDIATE
+    (F5) a busy arises at the BEGIN, once ``busy_timeout`` is outlasted, not at the write; the
+    re-run's handling is the same wherever it is raised in the block, so the write stands in for
+    it. The cross-process case is
+    :func:`test_a_grant_in_another_process_waits_for_the_open_one_rather_than_racing_it`."""
     await seed_roles(store)
     await provisioned_row(store, "a", totp=False)
     monkeypatch.setattr(store_module, "_ADMIN_GRANT_BUSY_BACKOFF_SECONDS", 0.0)

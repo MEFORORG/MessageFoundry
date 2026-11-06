@@ -153,6 +153,7 @@ from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
 from messagefoundry.store.base import (
     AdminStore,
     audit_write_errors,
+    is_store_shape_error,
     store_call_errors,
     store_open_errors,
 )
@@ -271,6 +272,15 @@ def _session_write_errors() -> tuple[type[Exception], ...]:
     row's seal is a local HMAC, so no Transit call can refuse it, and an engine ``RuntimeError``
     other than the acquire timeout still reads as a defect."""
     return store_open_errors()
+
+
+def _is_revoke_defect(exc: BaseException) -> bool:
+    """Whether a refusal :func:`_session_write_errors` catches is a defect rather than a fault, so
+    the post-commit revoke raises it at once (vault BACKLOG #3023): one of
+    :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`, or a store that is not the shape the
+    statement needs (:func:`~messagefoundry.store.base.is_store_shape_error`). Re-running either
+    fails the same way, and recording it as a store refusal would hide a bug as a fault."""
+    return isinstance(exc, AUDIT_WRITE_DEFECTS) or is_store_shape_error(exc)
 
 
 class _RotationStoreError(Exception):
@@ -2845,7 +2855,9 @@ SESSIONS_REVOKE_FAILED_ACTION: Final = "auth.sessions_revoke_failed"
 #: How many times that revoke runs at most, the pause before each re-run (times its number), and
 #: the seconds after the first attempt past which none is re-run. The revoke is safe to repeat: it
 #: ends unrevoked rows and raises the account's session epoch, and a repeat does both again. A
-#: statement timeout or a lost connection fails fast and is re-run. A pool shortage on SQL Server
+#: statement timeout or a lost connection fails fast and is re-run. The budget is checked when an
+#: attempt fails, before the pause, so a re-run can start up to half a second past it, and nothing
+#: bounds how long an attempt runs. A pool shortage on SQL Server
 #: fails only after waiting up to ``2 x acquire_timeout``, 60 s at the default, which is past the
 #: budget, so at the default it is recorded at once: a second such wait would reach the API's
 #: request deadline, which cancels the request before any row is written (vault BACKLOG #3802
@@ -10424,7 +10436,13 @@ class AuthService:
         return not refused
 
     async def _revoke_after_commit(
-        self, user_id: str, *, change: str, actor: str | None = None, client: str | None = None
+        self,
+        user_id: str,
+        *,
+        change: str,
+        actor: str | None = None,
+        client: str | None = None,
+        not_attempted: int = 0,
     ) -> RevokeResult:
         """Revoke every session of ``user_id`` after a ``change`` that has already committed, such
         as a password change, a disable or a role change (vault BACKLOG #3023).
@@ -10434,7 +10452,10 @@ class AuthService:
         :data:`_POST_COMMIT_REVOKE_BUDGET_SECONDS` both allow. A refusal past either is logged at
         ERROR, recorded as :data:`SESSIONS_REVOKE_FAILED_ACTION` (the comment there says what the
         row stands for), and raised, so the caller still fails. Any other exception is raised at
-        once, unretried: it reads as a defect, not a fault. A cancellation is not an ``Exception``
+        once, unretried: it reads as a defect, not a fault, and so does a store refusal
+        :func:`_is_revoke_defect` names. ``not_attempted`` is how many accounts of the same change a
+        batch caller will not reach if this one is given up on; the row records it. A
+        cancellation is not an ``Exception``
         and skips the retry and the row, as in :meth:`_rotate_session_hash` (vault BACKLOG
         #3802)."""
         loop = asyncio.get_running_loop()
@@ -10445,11 +10466,19 @@ class AuthService:
             try:
                 return await self._store.revoke_user_sessions(user_id)
             except _session_write_errors() as exc:
+                if _is_revoke_defect(exc):
+                    raise
                 if attempt < _POST_COMMIT_REVOKE_ATTEMPTS and loop.time() < give_up_at:
                     await asyncio.sleep(_POST_COMMIT_REVOKE_BACKOFF_SECONDS * attempt)
                     continue
                 await self._record_revoke_miss(
-                    user_id, exc, change=change, attempts=attempt, actor=actor, client=client
+                    user_id,
+                    exc,
+                    change=change,
+                    attempts=attempt,
+                    actor=actor,
+                    client=client,
+                    not_attempted=not_attempted,
                 )
                 raise
 
@@ -10462,6 +10491,7 @@ class AuthService:
         attempts: int,
         actor: str | None,
         client: str | None,
+        not_attempted: int,
     ) -> None:
         """The ERROR line, then the :data:`SESSIONS_REVOKE_FAILED_ACTION` row, for a revoke
         :meth:`_revoke_after_commit` gave up on. The line comes first, so a refused row still
@@ -10474,12 +10504,14 @@ class AuthService:
             type(refused).__name__,
             exc_info=refused,
         )
-        detail = {
+        detail: dict[str, object] = {
             "user_id": user_id,
             "change": change,
             "attempts": attempts,
             "error": type(refused).__name__,
         }
+        if not_attempted:
+            detail["accounts_not_attempted"] = not_attempted
         await write_audit_soft(
             lambda: self._audit(
                 SESSIONS_REVOKE_FAILED_ACTION, actor=actor, detail=_json(detail), client=client
@@ -15049,10 +15081,13 @@ class AuthService:
         """Whether a passkey of ``user_id`` already carries ``label``, compared without case, as
         SQL Server's collation compares the (user_id, label) index (BACKLOG #2733, pass F)."""
         wanted = label.casefold()
-        return any(
-            held.label.casefold() == wanted
-            for held in await self._store.list_webauthn_credentials(user_id)
-        )
+        try:
+            held = await self._store.list_webauthn_credentials(user_id)
+        except PasskeyRowMalformed as exc:
+            # Read as no label held: the store's own index still refuses a real clash.
+            _log.warning("a passkey row of user %s did not parse (%s)", user_id, exc)
+            return False
+        return any(cred.label.casefold() == wanted for cred in held)
 
     async def finish_webauthn_registration(
         self,
@@ -15118,13 +15153,6 @@ class AuthService:
         # store takes, all three take.
         if not label or utf16_units(label) > self._WEBAUTHN_LABEL_MAX:
             raise ValueError("label must be 1-100 characters")
-        # Without case (BACKLOG #2733, pass F finding 4): SQL Server's default collation makes the
-        # (user_id, label) index refuse "laptop" beside "Laptop", where SQLite and Postgres took
-        # both. Asked before the ceremony is consumed, so the user can resubmit another label. A
-        # check before the insert, so two enrolments racing case variants can still both land on
-        # SQLite and Postgres, whose indexes keep case.
-        if await self._passkey_label_held(user.id, label):
-            raise ValueError("label already in use")
         # No staged ceremony is answered BEFORE the floor, as confirm_mfa_enrollment answers "no
         # enrollment in progress" before it: otherwise the same request would get "verification
         # failed" inside the floor and "ceremony expired" outside it, which tells timing. A peek,
@@ -15231,6 +15259,14 @@ class AuthService:
         credential_id_hash = _credential_id_hash(result.credential_id)
         if await self._store.get_webauthn_credential(credential_id_hash) is not None:
             raise ValueError("this passkey is already enrolled")
+        # Without case (BACKLOG #2733, pass F finding 4): SQL Server's default collation makes the
+        # (user_id, label) index refuse "laptop" beside "Laptop", where SQLite and Postgres took
+        # both. Asked here, behind every guard above, so a session that has not passed them learns
+        # nothing about the account's labels; the cost is a used ceremony. A check before the
+        # insert, so two enrolments racing case variants can still both land on SQLite and
+        # Postgres, whose indexes keep case.
+        if await self._passkey_label_held(user.id, label):
+            raise ValueError("label already in use")
         now = time.time()
         cred = WebAuthnCredential(
             credential_id_hash=credential_id_hash,
@@ -16231,7 +16267,9 @@ class AuthService:
             builtin=False,
             permissions=_json([p.value for p in perms]),
         )
-        await self._revoke_sessions_for_role(role_id, actor=actor, after_commit=True)
+        await self._revoke_each_after_commit(
+            await self._custom_role_holders(role_id), change="custom_role_saved", actor=actor
+        )
         await self._audit(
             "role.updated",
             actor=actor,
@@ -16251,8 +16289,10 @@ class AuthService:
         whose row fails its integrity seal is deleted like any other (BACKLOG #2592)."""
         if not await self._custom_role_held(role_id):
             raise ValueError("no such custom role")
-        # Before the rows are gone.
-        await self._revoke_sessions_for_role(role_id, actor=actor, after_commit=False)
+        # Before the rows are gone, so nothing has committed yet: a refusal is raised at once with
+        # the role in place, and not recorded as a miss after a committed change (vault #3023).
+        for user_id in await self._custom_role_holders(role_id):
+            await self._store.revoke_user_sessions(user_id)
         await self._store.delete_custom_role(role_id)
         await self._audit("role.deleted", actor=actor, detail=_json({"role_id": role_id}))
 
@@ -16260,7 +16300,7 @@ class AuthService:
         """The account ids whose sessions an edit or a delete of custom role ``role_id`` would end.
 
         BACKLOG #3401 (ASVS 7.5.2). Read from the stored accounts, never from a caller's identity.
-        :meth:`_revoke_sessions_for_role` revokes exactly this set, so a route asking whether the
+        :meth:`_custom_role_holders` revokes exactly this set, so a route asking whether the
         save ends the caller's own sessions gets the answer the revoke acts on. Empty for a role
         nobody holds, including one that does not exist.
 
@@ -16275,40 +16315,27 @@ class AuthService:
             if any(held.casefold() == wanted for held in user.role_ids)
         )
 
-    async def _revoke_sessions_for_role(
-        self, role_id: str, *, actor: str, after_commit: bool
-    ) -> None:
-        """Revoke the live sessions of every user currently holding ``role_id`` so a permission
-        reduction / role deletion re-resolves on their next request (ADR 0045 D3).
-
-        ``after_commit`` is the edit, whose role write has committed: each account goes through
-        :meth:`_revoke_each_after_commit`. The delete revokes BEFORE it deletes, so nothing has
-        committed yet, and a refusal there is raised at once with the role still in place."""
-        # Sorted, so a revoke a store fault interrupts stops at a repeatable point.
-        holders = sorted(await self.sessions_ended_by_custom_role_save(role_id))
-        if after_commit:
-            await self._revoke_each_after_commit(holders, change="custom_role_saved", actor=actor)
-            return
-        for user_id in holders:
-            await self._store.revoke_user_sessions(user_id)
+    async def _custom_role_holders(self, role_id: str) -> list[str]:
+        """The accounts a custom-role save or delete revokes, sorted, so a revoke a store fault
+        interrupts stops at a repeatable point (ADR 0045 D3)."""
+        return sorted(await self.sessions_ended_by_custom_role_save(role_id))
 
     async def _revoke_each_after_commit(
         self, user_ids: Sequence[str], *, change: str, actor: str
     ) -> int:
-        """:meth:`_revoke_after_commit` for each of ``user_ids``, in order; the count revoked. A
-        revoke it gives up on is recorded there and does not stop the rest; the first such refusal
-        is raised once every account has had its turn (vault BACKLOG #3023)."""
+        """:meth:`_revoke_after_commit` for each of ``user_ids``, in order; the count revoked.
+
+        It stops at the first account given up on, whose row records how many accounts it did not
+        reach (vault BACKLOG #3023). Going on would cost each later account the same wait on a
+        store that is failing, and with two or more that passes the request deadline, which
+        cancels the request with no row at all."""
         revoked = 0
-        first: Exception | None = None
-        for user_id in user_ids:
-            try:
-                revoked += (
-                    await self._revoke_after_commit(user_id, change=change, actor=actor)
-                ).count
-            except _session_write_errors() as exc:
-                first = first or exc
-        if first is not None:
-            raise first
+        for n, user_id in enumerate(user_ids):
+            revoked += (
+                await self._revoke_after_commit(
+                    user_id, change=change, actor=actor, not_attempted=len(user_ids) - n - 1
+                )
+            ).count
         return revoked
 
     async def admin_reset_password(self, user_id: str, *, actor: str) -> IssuedCredential:
