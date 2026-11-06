@@ -226,8 +226,10 @@ async def test_a_host_blob_refuses_every_other_key_provider(tmp_path: Path, name
     low = refusal.lower()
     assert keep in low, refusal
     assert low.index(keep) < low.index(_KEY_SETTINGS_OUT), refusal
-    # One sentence, so "if it holds this store's key" governs the removal as well as the copy.
+    # One sentence, so "if it holds this store's key" governs the removal as well as the copy:
+    # the condition comes first, and no sentence ends between it and the removal.
     condition = low.index("if it holds this store's key")
+    assert condition < low.index(keep), refusal
     assert ". " not in low[condition : low.index(_KEY_SETTINGS_OUT)], refusal
     assert not _advises_changing(refusal, allowed=(_KEY_SETTINGS_OUT,)), refusal
     assert custody_host.keep_the_key_step(settings, new_store=False) in refusal, refusal
@@ -1300,8 +1302,8 @@ def test_the_fallback_step_fits_the_backend_and_the_command(
     assert "Copy into it every secret file" in step, step
     # Quoted, since a service account name can hold a space.
     command = (
-        "run `messagefoundry provision-admin` again, which mints this store's key in the new "
-        'custody directory, with every argument it was given, --service-account "NT SERVICE'
+        "run `messagefoundry provision-admin` again to mint this store's key in the new custody "
+        'directory, with every argument it was given, --service-account "NT SERVICE'
         '\\MessageFoundry" among them'
     )
     assert command in step, step
@@ -1324,30 +1326,42 @@ def test_the_fallback_step_fits_the_backend_and_the_command(
     assert "recovery key" not in auto and "new key" not in auto, auto
 
 
-@pytest.mark.parametrize("backend", [StoreBackend.SQLITE, StoreBackend.POSTGRES])
+@pytest.mark.parametrize(
+    "backend", [StoreBackend.SQLITE, StoreBackend.POSTGRES, StoreBackend.SQLSERVER]
+)
 @pytest.mark.parametrize("new_store", [True, False])
+@pytest.mark.parametrize("service_account", [None, "NT SERVICE\\MessageFoundry"])
 def test_the_fallback_re_run_never_points_back_at_the_old_store(
-    tmp_path: Path, backend: StoreBackend, new_store: bool
+    tmp_path: Path, backend: StoreBackend, new_store: bool, service_account: str | None
 ) -> None:
-    # PR 2804 seventh hold, finding 1: --db sets [store].path, so "the same arguments" would point
-    # a new store's re-run, and its service, back at the old store. A new SQLite store is named by
-    # --db or [store].path; a server backend reads [store].server/database, never --db. With the
-    # store kept, the re-run keeps every argument, --db and --service-config among them.
+    # PR 2804 seventh hold, finding 1: --db overrides [store].path, so "the same arguments" would
+    # point a new store's re-run, and its service, back at the old store. A new SQLite store leaves
+    # --db out of both, so the [store].path the step points serves them; a server store is named by
+    # [store].server/database, here and for the service. With the store kept, the re-run keeps
+    # every argument, --db and --service-config among them.
     settings = _settings(tmp_path).model_copy(update={"backend": backend})
-    step = custody_host.keep_the_key_step(settings, new_store=new_store)
+    step = custody_host.keep_the_key_step(
+        settings, new_store=new_store, service_account=service_account
+    )
     assert "same arguments" not in step, step
-    assert "provision-admin` again, which mints this store's key in the new custody" in step, step
-    assert "with every argument it was given" in step, step
+    command = (
+        "run `messagefoundry provision-admin` again to mint this store's key in the new custody "
+        "directory, with every argument it was given"
+    )
+    if service_account is not None:
+        command += f', --service-account "{service_account}" among them'
     sqlite_path = (
-        "with every argument it was given, except --db: name that new SQLite path with --db, or "
-        "leave --db out once [store].path names it, and point the service's own --db at it too"
+        ", except --db, which overrides [store].path: leave it out, and take it off the service's "
+        "own command too, if it has one"
     )
     database = (
-        "with every argument it was given, once [store] names that new database (--db sets only "
-        "[store].path, which this backend does not read)"
+        ", once [store] names that new database, here and for the service (--db sets only "
+        "[store].path, which does not name a server store)"
     )
-    assert (sqlite_path in step) is (new_store and backend is StoreBackend.SQLITE), step
-    assert (database in step) is (new_store and backend is StoreBackend.POSTGRES), step
+    server = backend is not StoreBackend.SQLITE
+    assert (command + sqlite_path in step) is (new_store and not server), step
+    assert (command + database in step) is (new_store and server), step
+    assert command in step, step
     assert ("--db" in step) is new_store, step
 
 

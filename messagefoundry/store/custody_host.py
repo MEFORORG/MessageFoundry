@@ -583,23 +583,24 @@ def keep_the_key_step(
     host = settings.key_provider == HOST_PROVIDER
     if host:
         text += (
-            ". Then run `messagefoundry provision-admin` again, which mints this store's key in "
-            "the new custody directory, with every argument it was given"
+            ". Then run `messagefoundry provision-admin` again to mint this store's key in the new "
+            "custody directory, with every argument it was given"
         )
         if service_account is not None:
             text += f', --service-account "{service_account}" among them'
-        # --db sets [store].path, for serve as for provision-admin, so the old --db would point a
-        # new store's re-run and its service back at the old store; a server backend reads
-        # [store].server/database and ignores --db (PR 2804 seventh hold).
+        # --db overrides [store].path, for serve as for provision-admin, so the old --db would
+        # point a new SQLite store's re-run and its service back at the old store. Leaving it out of
+        # both lets the [store].path the step above points serve them both. A server store is
+        # named by [store].server/database, which --db does not set (PR 2804 seventh hold).
         if new_store and server:
             text += (
-                ", once [store] names that new database (--db sets only [store].path, which this "
-                "backend does not read)"
+                ", once [store] names that new database, here and for the service (--db sets only "
+                "[store].path, which does not name a server store)"
             )
         elif new_store:
             text += (
-                ", except --db: name that new SQLite path with --db, or leave --db out once "
-                "[store].path names it, and point the service's own --db at it too, if it has one"
+                ", except --db, which overrides [store].path: leave it out, and take it off the "
+                "service's own command too, if it has one"
             )
         if service_account is None and sys.platform == "win32":
             text += (
