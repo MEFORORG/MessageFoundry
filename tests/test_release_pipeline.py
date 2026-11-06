@@ -25,9 +25,9 @@ pinned together here.
 
 Most sections are pure text / `re` / `tomllib` checks. At least three do more: section (7) shells out to
 bash and `tar` over tarballs it builds with `tarfile`; section (8) builds a throwaway venv with
-`python -m venv`, plants a synthesized install into it, and runs each separately-built wheel smoke's own
-`PYSMOKE` inspection script under that interpreter; and section (9) spawns `sys.executable` to run the
-engine wheel smoke's own import probe against a planted checkout. None of them needs `python -m build` or
+`python -m venv`, plants a synthesized install into it, and runs each release wheel smoke's own
+`PYSMOKE` inspection script under that interpreter; and section (9) spawns `sys.executable` with the
+engine wheel smoke's own interpreter flags against a planted checkout. None of them needs `python -m build` or
 the network, so they run everywhere the suite runs. They do NOT and cannot assert the artifacts are actually
 built/signed/SBOM'd/uploaded — that remains a CI-leg claim validated by the workflow_dispatch dry-run +
 a `vX.Y.Z-rc1` pre-release tag.
@@ -870,8 +870,12 @@ def test_both_wheel_smokes_compare_versions_not_strings() -> None:
     # versioned console) was added — a guard that must be edited whenever the thing it guards grows is
     # a guard that gets its number bumped without thought. The property worth pinning is "EVERY wheel
     # smoke normalises", so derive the expected set of smokes rather than a literal.
-    wheel_builds = rel.count("python -m build --wheel")
-    assert wheel_builds >= 2, f"expected the harness + console wheel builds, found {wheel_builds}"
+    # The same predicate section (8) counts with, over executed shell: a bare `python -m build`
+    # (the engine's) produces a wheel too, so it owes a smoke like any other (BACKLOG #1583).
+    wheel_builds = len(_WHEEL_BUILD.findall(_executed_shell(rel)))
+    assert wheel_builds >= 4, (
+        f"expected the engine, toolkit, console and harness wheel builds, found {wheel_builds}"
+    )
 
     # ASKED PER STEP, because a TOTAL over the file cannot express that property and this one silently
     # stopped doing so. It counted `from packaging.version import` occurrences against `wheel_builds +
@@ -889,9 +893,9 @@ def test_both_wheel_smokes_compare_versions_not_strings() -> None:
         for step in (job.get("steps") or [])
         if isinstance(step, dict) and str(step.get("name") or "").startswith("Smoke-check")
     }
-    assert len(smokes) == wheel_builds + 1, (
-        f"expected one smoke step per wheel-building job ({wheel_builds}) plus the engine's, found "
-        f"{sorted(smokes)}. A wheel job without a smoke step publishes an artifact nothing read."
+    assert len(smokes) == wheel_builds, (
+        f"expected one smoke step per wheel build ({wheel_builds}), found {sorted(smokes)}. A "
+        f"wheel without a smoke step publishes an artifact nothing read."
     )
     for name, run in sorted(smokes.items()):
         assert "from packaging.version import" in run, (
@@ -904,8 +908,8 @@ def test_both_wheel_smokes_compare_versions_not_strings() -> None:
     # NAMED SHAPES, because the import check above only proves a step normalises SOMEWHERE. Each
     # wheel smoke now normalises in TWO places — its inspection's own version check, and its tag
     # compare — so reverting ONE of them, and deleting the import it no longer needs, leaves the
-    # other import behind and that loop green. Measured before this was added: per step, the engine
-    # held 1 occurrence and the console and harness 2 each; the engine holds 2 since BACKLOG #1583.
+    # other import behind and that loop green. Measured: per step, the engine (since BACKLOG #1583)
+    # holds 2, as do the console and harness.
     #
     # These are the two string compares actually removed (BACKLOG #1701, #1585), named one at a time
     # so a revert says WHICH came back. Scanned over CODE ONLY: the workflow quotes both shapes in
@@ -1655,9 +1659,11 @@ def test_each_wheel_smoke_installs_the_built_wheel_into_a_throwaway_venv() -> No
             # holding `id-token: write`. A bare --no-deps is not the fix: the same step's PYEXPOSE
             # check imports messagefoundry.__main__, which needs those dependencies. What this does
             # pin is that the engine installs its OWN built wheel into the throwaway venv.
-            assert re.search(
-                r"/tmp/\S+/bin/pip install --quiet (?:--no-deps )?dist/\S*\.whl", shell
-            ), (
+            assert "--no-deps" not in shell, (
+                "the engine smoke has gained --no-deps, so BACKLOG #1583 option (c) has landed: "
+                "delete this carve-out so the engine is held to the --no-deps assertion below"
+            )
+            assert re.search(r"/tmp/\S+/bin/pip install --quiet dist/\S*\.whl", shell), (
                 f"{job}'s smoke does not install the engine's own built wheel (dist/*.whl) into its "
                 f"throwaway venv"
             )
@@ -1849,7 +1855,12 @@ def _clone_venv(template: Path, root: Path) -> tuple[Path, Path]:
 
 
 def _run_smoke(
-    exe: Path, script: str, workdir: Path, *, isolated: bool = True
+    exe: Path,
+    script: str,
+    workdir: Path,
+    *,
+    isolated: bool = True,
+    args: Sequence[str] = (),
 ) -> tuple[int, str, str]:
     """Run ``script`` the way the step does; return (rc, stdout, combined output).
 
@@ -1859,8 +1870,9 @@ def _run_smoke(
 
     ``-I`` matches the workflow. The one caller that drops it is the checkout-shadow control, which
     exists to prove the in-venv assertion fires rather than that the flag is spelled right.
+    ``args`` follow the ``-``, as ``python -I - "$built" "$want"`` passes them to a tag guard.
     """
-    argv = [str(exe), *(["-I"] if isolated else []), "-"]
+    argv = [str(exe), *(["-I"] if isolated else []), "-", *args]
     proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
         argv,
         input=script.encode("utf-8"),
@@ -1873,6 +1885,18 @@ def _run_smoke(
         proc.stdout.decode("utf-8", "replace"),
         (proc.stdout + proc.stderr).decode("utf-8", "replace"),
     )
+
+
+def _intact_checkout(root: Path, pkg: str) -> Path:
+    """A directory shaped like the release job's cwd: an intact source tree for ``pkg`` (and the
+    engine's, which every release job checks out) at :data:`_SHADOW_VERSION`, a version no wheel
+    here carries. BACKLOG #1583's acceptance keeps one present, so a pass that came from the
+    checkout shows as that version rather than as a green."""
+    _plant_a_checkout(root)
+    (root / pkg).mkdir(parents=True, exist_ok=True)
+    for rel, text in _good_package(pkg, _SHADOW_VERSION).items():
+        (root / pkg / rel).write_text(text, encoding="utf-8")
+    return root
 
 
 def _prepared(job: str, template: Path, tmp_path: Path) -> tuple[str, str, str, Path, Path]:
@@ -1899,7 +1923,7 @@ def test_a_wheel_smoke_accepts_a_correctly_built_wheel(
         purelib, dist, pkg, _SMOKE_VERSION, package_files=_good_package(pkg, _SMOKE_VERSION)
     )
 
-    rc, stdout, out = _run_smoke(exe, script, tmp_path)
+    rc, stdout, out = _run_smoke(exe, script, _intact_checkout(tmp_path / "checkout", pkg))
     assert rc == 0, (
         f"{job}'s smoke REJECTED a well-formed install, so every rejection below is measuring a "
         f"broken harness rather than the smoke.\n{out}"
@@ -1914,6 +1938,7 @@ def test_a_wheel_smoke_accepts_a_correctly_built_wheel(
     assert f"{pkg}/ members" in out, (
         f"{job}'s smoke passed without reporting how much of the package tree it found.\n{out}"
     )
+    assert _SHADOW_VERSION not in out, f"the intact checkout answered {job}'s smoke.\n{out}"
 
 
 def _no_package_tree(purelib: Path, dist: str, pkg: str) -> None:
@@ -1996,7 +2021,7 @@ def test_a_wheel_smoke_rejects(
     script, dist, pkg, exe, purelib = _prepared(job, venv_template, tmp_path)
     build_install(purelib, dist, pkg)
 
-    rc, _stdout, out = _run_smoke(exe, script, tmp_path)
+    rc, _stdout, out = _run_smoke(exe, script, _intact_checkout(tmp_path / "checkout", pkg))
     assert rc != 0, (
         f"{job}'s smoke PASSED a {build_install.__name__.lstrip('_')} wheel — the release would ship "
         f"it.\n{out}"
@@ -2038,36 +2063,34 @@ def test_a_wheel_smoke_refuses_a_module_resolved_outside_the_smoke_venv(
     )
 
 
-def test_the_console_smoke_compares_its_version_root_against_the_wheel_metadata(
-    venv_template: Path, tmp_path: Path
+@pytest.mark.parametrize("job", [_WEBCONSOLE_DIST, _ENGINE_DIST])
+def test_a_wheel_smoke_compares_its_version_root_against_the_wheel_metadata(
+    job: str, venv_template: Path, tmp_path: Path
 ) -> None:
-    """The console step's name promises "the console's OWN __version__", so it must read it.
+    """A version-mismatched wheel: its module says one version, its METADATA another.
 
-    Job-specific by construction: the console is the one distribution whose version root ships inside
-    its own wheel (``messagefoundry_webconsole/__init__.py``). The harness reads the ENGINE's
-    ``__init__.py``, which the harness wheel does not contain, so there is nothing there to read back.
+    Two distributions ship their version root inside their own wheel and read it back: the console
+    (its step promises "the console's OWN __version__") and the engine, whose METADATA is what the
+    tag guard compares since BACKLOG #1583. The harness reads the ENGINE's ``__init__.py``, which
+    the harness wheel does not contain, and the toolkit compares its pin instead. Run beside an
+    intact checkout, as #1583's acceptance asks; the pre-#1583 engine probe read ``__version__``
+    and passed this.
     """
-    script, dist, pkg, exe, purelib = _prepared(
-        "messagefoundry-webconsole", venv_template, tmp_path
-    )
+    script, dist, pkg, exe, purelib = _prepared(job, venv_template, tmp_path)
     _write_install(purelib, dist, pkg, _SMOKE_VERSION, package_files=_good_package(pkg, "9.9.9"))
 
-    rc, _stdout, out = _run_smoke(exe, script, tmp_path)
+    rc, _stdout, out = _run_smoke(exe, script, _intact_checkout(tmp_path / "checkout", pkg))
     assert rc != 0, (
-        f"the console smoke accepted a wheel whose installed __version__ (9.9.9) disagrees with its "
-        f"metadata ({_SMOKE_VERSION}) — the step's own promise goes unchecked.\n{out}"
+        f"{job}'s smoke accepted a wheel whose installed __version__ (9.9.9) disagrees with its "
+        f"metadata ({_SMOKE_VERSION}) -- the release would publish under a version it never "
+        f"checked.\n{out}"
     )
-    assert "9.9.9" in out and _SMOKE_VERSION in out, (
-        f"the console smoke rejected the mismatch without naming both versions.\n{out}"
+    assert "9.9.9" in out and _SMOKE_VERSION in out and "version root" in out, (
+        f"{job}'s smoke rejected the mismatch without naming both versions.\n{out}"
     )
 
 
-# --- the ENGINE smoke, with an intact checkout present (BACKLOG #1583's acceptance) -----------------
-#
-# The row's acceptance: keep an intact checkout present, and require a deliberately broken wheel and
-# a version-mismatched wheel each to fail. Every case below runs the engine's PYSMOKE under `-I`, as
-# the step does, FROM a directory holding an intact `messagefoundry/` source tree at a version no
-# wheel here carries, so a pass that came from the checkout is visible as that version.
+# --- the ENGINE smoke's tag guard reads the installed METADATA (BACKLOG #1583 half b) -------------
 
 
 def _engine_pyver_script() -> str:
@@ -2075,85 +2098,6 @@ def _engine_pyver_script() -> str:
     m = re.search(r"<<'PYVER'\n(.*?)\nPYVER\n", _engine_wheel_smoke_script(), re.S)
     assert m, "the engine wheel smoke has no PYVER tag guard"
     return m.group(1)
-
-
-def _run_pyver(exe: Path, script: str, workdir: Path, built: str, want: str) -> int:
-    """Run the tag guard the way the step does: ``python -I - "$built" "$want"``."""
-    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
-        [str(exe), "-I", "-", built, want],
-        input=script.encode("utf-8"),
-        cwd=str(workdir),
-        capture_output=True,
-        timeout=120,
-    )
-    return proc.returncode
-
-
-def test_the_engine_smoke_reads_the_wheel_not_the_intact_checkout_beside_it(
-    venv_template: Path, tmp_path: Path
-) -> None:
-    """POSITIVE CONTROL for the two rejections below: a good wheel passes from the checkout's cwd,
-    and what it reports is the wheel's version, not the checkout's."""
-    script, dist, pkg, exe, purelib = _prepared(_ENGINE_DIST, venv_template, tmp_path)
-    _write_install(
-        purelib, dist, pkg, _SMOKE_VERSION, package_files=_good_package(pkg, _SMOKE_VERSION)
-    )
-    work = _plant_a_checkout(tmp_path / "checkout")
-
-    rc, stdout, out = _run_smoke(exe, script, work)
-    assert rc == 0 and stdout.strip() == _SMOKE_VERSION, out
-    assert _SHADOW_VERSION not in out, f"the intact checkout answered the engine smoke.\n{out}"
-
-
-def _engine_wheel_missing_its_package(purelib: Path, dist: str, pkg: str) -> None:
-    """Broken: the force-include produced nothing, so only the checkout could answer the import."""
-    _write_install(purelib, dist, pkg, _SMOKE_VERSION, package_files=None)
-
-
-def _engine_wheel_whose_module_is_not_recorded(purelib: Path, dist: str, pkg: str) -> None:
-    """Broken in the way `-I` alone does not catch: the module imports from inside the venv, but the
-    engine distribution's RECORD does not list it. The pre-#1583 probe passed this."""
-    _record_does_not_list_the_module_it_resolved(purelib, dist, pkg)
-
-
-def _engine_wheel_metadata_disagrees_with_dunder_version(
-    purelib: Path, dist: str, pkg: str
-) -> None:
-    """Version-mismatched: the module says the tag's version, the METADATA (what PyPI and every
-    installer read) says another. The pre-#1583 probe read `__version__` and passed this."""
-    _write_install(purelib, dist, pkg, "7.7.8", package_files=_good_package(pkg, _SMOKE_VERSION))
-
-
-_ENGINE_SMOKE_REJECTIONS: list[tuple[Callable[[Path, str, str], None], str]] = [
-    (_engine_wheel_missing_its_package, "no package tree"),
-    (_engine_wheel_whose_module_is_not_recorded, "belongs to something else on sys.path"),
-    (_engine_wheel_metadata_disagrees_with_dunder_version, "!= wheel metadata version 7.7.8"),
-]
-
-
-@pytest.mark.parametrize(
-    ("build_install", "must_say"),
-    _ENGINE_SMOKE_REJECTIONS,
-    ids=[case[0].__name__.removeprefix("_engine_wheel_") for case in _ENGINE_SMOKE_REJECTIONS],
-)
-def test_the_engine_smoke_fails_a_broken_or_version_mismatched_wheel_beside_an_intact_checkout(
-    build_install: Callable[[Path, str, str], None],
-    must_say: str,
-    venv_template: Path,
-    tmp_path: Path,
-) -> None:
-    """BACKLOG #1583's acceptance, executed: each of these installs cleanly and must fail."""
-    script, dist, pkg, exe, purelib = _prepared(_ENGINE_DIST, venv_template, tmp_path)
-    build_install(purelib, dist, pkg)
-    work = _plant_a_checkout(tmp_path / "checkout")
-
-    rc, _stdout, out = _run_smoke(exe, script, work)
-    assert rc != 0, (
-        f"the engine smoke PASSED {build_install.__name__} — the release would ship it.\n{out}"
-    )
-    assert must_say in out, (
-        f"the engine smoke failed but not for the reason under test (missing {must_say!r}).\n{out}"
-    )
 
 
 def test_the_engine_tag_gate_compares_the_installed_metadata_version(
@@ -2168,7 +2112,7 @@ def test_the_engine_tag_gate_compares_the_installed_metadata_version(
     """
     script, dist, pkg, exe, purelib = _prepared(_ENGINE_DIST, venv_template, tmp_path)
     _write_install(purelib, dist, pkg, "7.7.7rc1", package_files=_good_package(pkg, "7.7.7-rc1"))
-    work = _plant_a_checkout(tmp_path / "checkout")
+    work = _intact_checkout(tmp_path / "checkout", pkg)
 
     rc, stdout, out = _run_smoke(exe, script, work)
     assert rc == 0, out
@@ -2178,13 +2122,15 @@ def test_the_engine_tag_gate_compares_the_installed_metadata_version(
         f"-- it is reading the module's __version__ again.\n{out}"
     )
 
-    # And the step feeds THAT value, captured from the PYSMOKE inspection, to the tag guard.
+    # And the step feeds THAT value (`built`, which _VERSION_PROBE pins as the PYSMOKE capture) to
+    # the tag guard, which passes the matching tag and refuses another.
     shell = _engine_wheel_smoke_script()
-    assert re.search(r"^\s*built=\$\(\S*/bin/python -I - <<'PYSMOKE'", shell, re.M), shell
     assert re.search(r'/bin/python -I - "\$built" "\$want" <<\'PYVER\'', shell), shell
     guard = _engine_pyver_script()
-    assert _run_pyver(exe, guard, work, built, "7.7.7-rc1") == 0
-    assert _run_pyver(exe, guard, work, built, "7.7.8") != 0
+    rc, _stdout, out = _run_smoke(exe, guard, work, args=(built, "7.7.7-rc1"))
+    assert rc == 0, out
+    rc, _stdout, out = _run_smoke(exe, guard, work, args=(built, "7.7.8"))
+    assert rc != 0 and "7.7.8" in out, out
 
 
 @pytest.mark.parametrize(
@@ -2902,7 +2848,7 @@ def _engine_wheel_smoke_script() -> str:
 
 
 def _wheel_smoke_import_flags() -> list[str]:
-    """The interpreter flags the engine smoke passes before ``-c``, e.g. ``['-I']``."""
+    """The interpreter flags the engine smoke passes before ``-``, e.g. ``['-I']``."""
     m = _VERSION_PROBE.search(_engine_wheel_smoke_script())
     assert m, (
         "could not find the engine wheel smoke's `built=$(... python ... - <<'PYSMOKE'` line — the "
