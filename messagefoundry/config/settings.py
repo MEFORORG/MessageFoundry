@@ -9028,9 +9028,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       Their ``[auth]`` spellings are refused at load, so the entries carry the ``[security]`` names.
       They are read off the ``[auth]`` copy, since this function is handed no ``[security]``. A
       caller whose two disagree reports the ``[auth]`` value, so it can miss a new loosening or
-      keep one just removed: at least the ``security set`` preview, which pairs the edited
-      ``[security]`` with the ``[auth]`` it loaded before the edit, and a ``security show`` that
-      could not load the whole file and fell back to a default ``[auth]``.
+      keep one just removed: at least a ``security show`` that could not load the whole file and
+      fell back to a default ``[auth]``, which its ``loosenings_partial`` marker says. The
+      ``security set`` preview reads the whole file again after the edit (vault BACKLOG #2600),
+      so it pairs the edited ``[security]`` with the ``[auth]`` that edit leaves.
       ``SessionRecord.is_live`` refuses a session idle past the first or older than the second (its
       expiry is stamped from it at sign-in), so a longer one is looser, and 0 or less
       ends every session at once, which is stricter.
@@ -10097,11 +10098,16 @@ def security_loosenings(
     SQLite store (vault BACKLOG #2619),
     ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288),
     ``[auth].require_action_step_up`` and the three ``[auth].password_check_*`` screens (vault
-    BACKLOG #2600), the ``[auth]``
-    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap, OIDC flow-cache,
-    AD timeout, step-up window, TOTP skew and temporary-password life
-    settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
-    the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
+    BACKLOG #2600), the ``[auth]`` settings :func:`_auth_limit_loosenings` lists, each named only
+    when set looser than its shipped default (#1131, vault BACKLOG #2600 step 4): at least the
+    sign-in, PHI-read and admin-write limiters, the lockout, the time floors, the session cap, the
+    ``[security]`` session limits (read off their ``[auth]`` copies), the step-up window, TOTP
+    skew, temporary-password life, recovery-code count, password length floor, AD timeouts, the
+    directory reconciler and federated sign-in (that function's docstring reads each field, and
+    the numeric census in ``tests/test_security_posture_defaults.py`` is the field list, red on a
+    numeric ``[auth]`` field neither named nor exempt with a reason, so these groups name no
+    field to fall behind), the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings`
+    lists, read the same way
     (#2489), an ``[approvals].operations`` list that leaves out a default operation (vault BACKLOG
     #3123), any ``[api].trusted_proxies`` entry covering more than one address, with its own
     wording where the entries together cover every peer of a family (#1131),

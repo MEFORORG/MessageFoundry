@@ -92,6 +92,48 @@ def test_set_rejects_a_file_that_still_has_a_relocated_legacy_key(
     assert rc == 1
 
 
+@pytest.mark.parametrize(
+    ("switch", "looser"), [("sign_out_after_idle_minutes", 31), ("max_session_hours", 13)]
+)
+def test_set_preview_reads_the_session_limits_after_the_edit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], switch: str, looser: int
+) -> None:
+    """Vault BACKLOG #2600: the two [security] session limits are reported off the [auth] copy the
+    desugar writes, so the preview must read the settings WITH the edit applied. Before the fix it
+    paired the edited [security] with the [auth] loaded before the edit, which missed a new
+    loosening (the first assertion) and kept one the edit had just removed (the second)."""
+    toml = tmp_path / "mf.toml"
+    rc, res = _set(toml, {switch: looser}, capsys)
+    assert rc == 0
+    assert switch in [lo["switch"] for lo in res["loosenings"]]
+    # Agrees with what `show` reads back from the saved file.
+    assert switch in [lo["switch"] for lo in _show(toml, capsys)["loosenings"]]
+    rc, res = _set(toml, {switch: None}, capsys)
+    assert rc == 0
+    assert switch not in [lo["switch"] for lo in res["loosenings"]]
+
+
+def test_set_preview_scope_is_read_after_the_edit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An edit that repairs the only reason the whole file would not load reports a complete
+    preview, not the pre-edit partial marker: the preview and its scope come from one post-edit
+    read. The pre-edit `show` is the control: the same file is partial before the edit.
+
+    A one-minute idle limit is shorter than the [auth] second-factor floor, a cross-section
+    refusal that [security] alone does not see, so the whole file will not load until the edit."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text(
+        "[security]\nsign_out_after_idle_minutes = 1\n[auth]\nmfa_verify_min_elapsed_seconds = 120\n",
+        encoding="utf-8",
+    )
+    assert _show(toml, capsys)["loosenings_partial"] is True
+    rc, res = _set(toml, {"sign_out_after_idle_minutes": 31}, capsys)
+    assert rc == 0
+    assert res["loosenings_partial"] is False and res["loosenings_partial_reason"] is None
+    assert "sign_out_after_idle_minutes" in [lo["switch"] for lo in res["loosenings"]]
+
+
 def test_set_rejects_bad_value_type(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     toml = tmp_path / "mf.toml"
     rc, _ = _set(toml, {"max_session_hours": "not-an-int"}, capsys)

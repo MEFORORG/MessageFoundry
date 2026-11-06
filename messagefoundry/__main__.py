@@ -12003,70 +12003,37 @@ def _security(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
-        AiSettings,
-        AlertsSettings,
-        ApiSettings,
-        ApprovalsSettings,
-        AuthSettings,
-        BackupSettings,
-        CertMonitorSettings,
-        SecretRotationSettings,
-        SecretsSettings,
         SecuritySettings,
-        StoreSettings,
+        ServiceSettings,
         security_loosenings,
     )
 
     path = args.service_config
 
-    # This subcommand edits [security], but security_loosenings() also reports [store]/[auth]/[alerts]/
-    # [secret_rotation]/[api]/[approvals]/[cert_monitor]/[backup]/[secrets]/[ai] deviations (ADR 0148: one posture). Resolve those from the whole file so the
-    # list is complete. If the file will
-    # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
-    # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
-    # reporting a subset as if it were everything.
-    # None unless the file exists and will not load. Then: WHY (vault BACKLOG #2600). A stray
-    # MEFOR_<SECTION>_<KEY> variable in this shell refuses the load, and a bare `true` sent the
-    # reader to a file that was fine. Rendered by settings_error_detail, which hides the refused
-    # input but prints each validator's message; its docstring says which messages quote a value.
-    _loosenings_partial_reason: str | None = None
-    _store, _auth, _alerts = StoreSettings(), AuthSettings(), AlertsSettings()
-    # BACKLOG #1004: [secret_rotation].enforce_store_key_expiry is a posture deviation too, so it is
-    # resolved from the same whole-file read and degrades with the same `loosenings_partial` marker.
-    _rotation = SecretRotationSettings()
-    # BACKLOG #1179: [api].plaintext_upstream_hop_acknowledged is a loosening too. Same read, same
-    # degradation marker.
-    _api = ApiSettings()
-    # BACKLOG #2489, vault #3123: [approvals] carries the dual-control dwell, expiry and held list.
-    # Same read, same marker.
-    _approvals = ApprovalsSettings()
-    # BACKLOG #2227: [cert_monitor].warn_days = 0 turns the certificate reminder off. Same read and marker.
-    _cert_monitor = CertMonitorSettings()
-    # Vault BACKLOG #2302: [backup].allow_unencrypted is a loosening too. Same read and marker.
-    _backup = BackupSettings()
-    # Vault BACKLOG #2983: [secrets].vault_revocation_attested is a loosening too. Same read and marker.
-    _secrets = SecretsSettings()
-    # BACKLOG #2193 slice (e): [ai].endpoint_revocation_attested is a loosening too. Same read and
-    # marker.
-    _ai = AiSettings()
-    if Path(path).exists():
-        # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
-        # and `security show` is expected to work offline before any config exists. Only a file that
-        # exists and will not resolve is partial.
-        # The shared load: its catch is the specific ways a settings file fails to resolve, and
-        # anything else is a programming error that surfaces.
-        _full, _loosenings_partial_reason = _load_service_settings(path)
-        if _full is not None:
-            _store, _auth, _alerts = _full.store, _full.auth, _full.alerts
-            _rotation = _full.secret_rotation
-            _api = _full.api
-            _approvals = _full.approvals
-            _cert_monitor = _full.cert_monitor
-            _backup = _full.backup
-            _secrets = _full.secrets
-            _ai = _full.ai
+    def _posture(sec: SecuritySettings) -> dict[str, object]:
+        """The loosening list for ``sec`` and its scope marker, read off the WHOLE file as it is now.
 
-    def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
+        This subcommand edits [security], but security_loosenings() also reports the other sections'
+        deviations (ADR 0148: one posture), so they are resolved from the whole file. If the file
+        will not load -- it may be invalid OUTSIDE [security], which must not break `security show`
+        -- they fall back to the shipped defaults and the `loosenings_partial` marker SAYS SO, with
+        WHY (vault BACKLOG #2600): a stray MEFOR_<SECTION>_<KEY> variable in this shell refuses the
+        load, and a bare `true` sent the reader to a file that was fine. The reason is rendered by
+        settings_error_detail, which hides the refused input but prints each validator's message;
+        its docstring says which messages quote a value.
+
+        `set` calls it AFTER the write, because [security] desugars into other sections: the two
+        session limits are reported off their [auth] copy (vault BACKLOG #2600), and a preview
+        paired with the pre-edit read missed a new loosening and kept a removed one."""
+        full, partial_reason = ServiceSettings(), None
+        # An ABSENT file is not a degraded read -- the shipped defaults ARE the effective posture
+        # there, and `security show` is expected to work offline before any config exists.
+        if Path(path).exists():
+            # The shared load: its catch is the specific ways a settings file fails to resolve, and
+            # anything else is a programming error that surfaces.
+            loaded, partial_reason = _load_service_settings(path)
+            if loaded is not None:
+                full = loaded
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
         # store — so it can see NEITHER the per-connection declarations NOR the two store
         # observations (#1008 privilege, #1905 audit-chain keying). It passes empty lists and None and
@@ -12077,14 +12044,14 @@ def _security(args: argparse.Namespace) -> int:
         # BACKLOG #2700), the start-up reading (vault BACKLOG #2701) and the service-environment
         # reading (vault BACKLOG #2595) are facts about the ENGINE process, and this command is
         # another process, so it passes None for those too.
-        return [
+        loosenings = [
             {"switch": s, "risk": r}
             for s, r in security_loosenings(
                 sec,
-                _store,
-                _auth,
-                _alerts,
-                _rotation,
+                full.store,
+                full.auth,
+                full.alerts,
+                full.secret_rotation,
                 cleartext_hops=(),
                 expiry_relaxed_hops=(),
                 hostname_unchecked_hops=(),
@@ -12094,12 +12061,12 @@ def _security(args: argparse.Namespace) -> int:
                 revocation_attested_hops=(),
                 path_form_fhir_hops=(),
                 ech_cleartext_sidecar_hops=(),
-                api=_api,
-                approvals=_approvals,
-                cert_monitor=_cert_monitor,
-                backup=_backup,
-                secrets=_secrets,
-                ai=_ai,
+                api=full.api,
+                approvals=full.approvals,
+                cert_monitor=full.cert_monitor,
+                backup=full.backup,
+                secrets=full.secrets,
+                ai=full.ai,
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,
@@ -12107,49 +12074,49 @@ def _security(args: argparse.Namespace) -> int:
                 service_env=None,
             )
         ]
-
-    #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
-    #: degraded or settings-only report for a complete one. `partial` means the sections outside
-    #: [security] could not be read at all (the file did not load), so they report shipped defaults; the scope string is the standing limitation above. It names
-    #: ALL the connection-scoped deviations (#333, ADR 0173) — naming only cleartext_accepted made the DECLARED
-    #: scope itself incomplete, which is the same defect one level up.
-    #:
-    #: BACKLOG #1852 added a FOURTH gap and it is named for that same reason. This command reads the
-    #: AUTHORED file; `serve --host` is a CLI override that `load_settings` folds into the [security]
-    #: view at load, so an engine started with an off-box --host reports `local_access_only = false` on
-    #: GET /security/posture while this command still shows the file's `true`. Both readings are right
-    #: for what they describe, and a scope marker that did not say so would send an auditor comparing
-    #: the two surfaces looking for a defect in one of them.
-    #:
-    #: Vault BACKLOG #2599 added a FIFTH, named for the same reason: the config-source escape is an
-    #: environment variable, and security_loosenings() reads it from the process that calls it. Here
-    #: that is the operator's shell, not the service.
-    _loosenings_scope = {
-        "loosenings_partial": _loosenings_partial_reason is not None,
-        # None unless the report is partial. Then: why the whole-file load failed.
-        "loosenings_partial_reason": _loosenings_partial_reason,
-        "loosenings_scope": (
-            "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]/"
-            "[cert_monitor]/[backup]); the "
-            "per-connection "
-            "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
-            "generic-ODBC database TLS, "
-            "tls_hop_attested, "
-            "tls_revocation_attested, FHIR update_url_form and http ECH sidecar declarations are "
-            "NOT included, and neither are the store-principal privilege and audit-chain keying "
-            "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
-            "GET /security/posture reports both). Nor are the engine process's remote-debugging "
-            "reading, its start-up reading (launch flags, start-up code, writable site "
-            "directories) and its Windows service-environment reading: this command is a separate "
-            "process (GET /security/posture reports them). "
-            "These are the AUTHORED values, so a `serve --host` bind override on a "
-            "running engine is not reflected here either — see `messagefoundry check` or "
-            "GET /security/posture. One entry is not read from the file at all: "
-            "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE is reported from the environment of THIS command, "
-            "which may not be the service's, so it can appear here beside an `enforce` file, or be "
-            "absent here while the service carries it — GET /security/posture reads the engine's own"
-        ),
-    }
+        # Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
+        # degraded or settings-only report for a complete one. `partial` means the sections outside
+        # [security] could not be read at all (the file did not load), so they report shipped defaults; the scope string is the standing limitation above. It names
+        # ALL the connection-scoped deviations (#333, ADR 0173) — naming only cleartext_accepted made the DECLARED
+        # scope itself incomplete, which is the same defect one level up.
+        #
+        # BACKLOG #1852 added a FOURTH gap and it is named for that same reason. This command reads the
+        # AUTHORED file; `serve --host` is a CLI override that `load_settings` folds into the [security]
+        # view at load, so an engine started with an off-box --host reports `local_access_only = false` on
+        # GET /security/posture while this command still shows the file's `true`. Both readings are right
+        # for what they describe, and a scope marker that did not say so would send an auditor comparing
+        # the two surfaces looking for a defect in one of them.
+        #
+        # Vault BACKLOG #2599 added a FIFTH, named for the same reason: the config-source escape is an
+        # environment variable, and security_loosenings() reads it from the process that calls it. Here
+        # that is the operator's shell, not the service.
+        return {
+            "loosenings": loosenings,
+            "loosenings_partial": partial_reason is not None,
+            # None unless the report is partial. Then: why the whole-file load failed.
+            "loosenings_partial_reason": partial_reason,
+            "loosenings_scope": (
+                "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]/"
+                "[cert_monitor]/[backup]); the "
+                "per-connection "
+                "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
+                "generic-ODBC database TLS, "
+                "tls_hop_attested, "
+                "tls_revocation_attested, FHIR update_url_form and http ECH sidecar declarations are "
+                "NOT included, and neither are the store-principal privilege and audit-chain keying "
+                "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
+                "GET /security/posture reports both). Nor are the engine process's remote-debugging "
+                "reading, its start-up reading (launch flags, start-up code, writable site "
+                "directories) and its Windows service-environment reading: this command is a separate "
+                "process (GET /security/posture reports them). "
+                "These are the AUTHORED values, so a `serve --host` bind override on a "
+                "running engine is not reflected here either — see `messagefoundry check` or "
+                "GET /security/posture. One entry is not read from the file at all: "
+                "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE is reported from the environment of THIS command, "
+                "which may not be the service's, so it can appear here beside an `enforce` file, or be "
+                "absent here while the service carries it — GET /security/posture reads the engine's own"
+            ),
+        }
 
     if args.action == "show":
         try:
@@ -12164,8 +12131,7 @@ def _security(args: argparse.Namespace) -> int:
                 "values": resolved.model_dump(),
                 "set": sorted(raw.keys()),
                 "defaults": SecuritySettings().model_dump(),
-                "loosenings": _loosenings(resolved),
-                **_loosenings_scope,
+                **_posture(resolved),
             },
             compact=args.json,
         )
@@ -12189,12 +12155,12 @@ def _security(args: argparse.Namespace) -> int:
             else:
                 merged[key] = value
         try:
-            SecuritySettings.model_validate(merged)
+            sec = SecuritySettings.model_validate(merged)
         except ValidationError as exc:
             return _emit_error(f"invalid [security] value: {exc}", as_json=args.json)
         result = security_edit.set_security(path, updates, validate=validate)
-        result["loosenings"] = _loosenings(SecuritySettings.model_validate(merged))
-        result.update(_loosenings_scope)
+        # Read AFTER the write, so the preview reports the posture the edit leaves (see _posture).
+        result.update(_posture(sec))
     except _OperatorJsonError as exc:
         return _emit_error(str(exc), as_json=args.json)
     except (security_edit.SecurityEditError, FileNotFoundError, ValueError, OSError) as exc:
