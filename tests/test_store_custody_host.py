@@ -869,18 +869,137 @@ async def test_a_fresh_store_holds_only_the_bookkeeping_it_seeds(tmp_path: Path)
 
 
 def test_every_row_a_schema_build_seeds_is_named_bookkeeping() -> None:
-    # A seed added to any backend's schema would make every fresh server store read as holding
-    # data, and refuse every mint, so each seeded table must be named in the exclusion. The control
-    # is that the pattern finds the one seed every backend has.
+    # A VALUES seed added to any backend's schema batch would make every fresh server store read
+    # as holding data, and refuse every mint, so each seeded table must be bookkeeping or have its
+    # seed filtered by the census. The control is that the pattern finds the one seed every backend
+    # has. It reads only `INSERT ... (cols) VALUES` in the batch, not a seed written elsewhere.
     from messagefoundry.store import postgres, sqlserver
     from messagefoundry.store import store as sqlite_store
+    from messagefoundry.store.base import SCHEMA_SEED_FILTERS
     from messagefoundry.store.custody_host import SCHEMA_BOOKKEEPING_TABLES
 
     seed = re.compile(r"\bINSERT\s+(?:OR\s+\w+\s+)?INTO\s+(\w+)\s*\([^)]*\)\s*VALUES\b", re.I)
     for ddl in (postgres._SCHEMA, sqlserver._SCHEMA, [sqlite_store._SCHEMA]):
-        seeded = {table.lower() for statement in ddl for table in seed.findall(statement)}
+        seeded = {table for statement in ddl for table in seed.findall(statement)}
         assert "global_session_epoch" in seeded
-        assert seeded <= SCHEMA_BOOKKEEPING_TABLES
+        assert seeded <= SCHEMA_BOOKKEEPING_TABLES | set(SCHEMA_SEED_FILTERS)
+
+
+def _seeded(path: Path, *statements: str) -> None:
+    """Run ``statements`` on the SQLite file at ``path`` directly, outside the store."""
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    try:
+        with conn:
+            for statement in statements:
+                conn.execute(statement)
+    finally:
+        conn.close()
+
+
+async def _holds_data(path: Path) -> bool:
+    from messagefoundry.store.custody_host import store_holds_data
+
+    store = await open_store(StoreSettings(path=str(path)), keyless_chain_refusal=None)
+    try:
+        return await store_holds_data(store)
+    finally:
+        await store.close()
+
+
+async def test_a_virtual_table_whose_module_is_not_loaded_is_skipped(tmp_path: Path) -> None:
+    # PR 2804 hold, finding 13: probing a virtual table raised "no such module". A virtual table
+    # and its shadow tables belong to a module, not to the store, so the census skips them.
+    path = tmp_path / "keyless.db"
+    await (await _keyless_store(path)).close()
+    _seeded(
+        path,
+        "PRAGMA writable_schema = ON",
+        "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES"
+        " ('table', 'vt', 'vt', 0, 'CREATE VIRTUAL TABLE vt USING no_such_module(x)')",
+    )
+    assert not await _holds_data(path)
+
+
+async def test_an_exact_case_lookalike_of_a_bookkeeping_table_holds_data(tmp_path: Path) -> None:
+    # PR 2804 hold, finding 4: names were compared casefolded, so U+017F (long s), which casefolds
+    # to "s", made this table read as schema_meta and its row as bookkeeping.
+    path = tmp_path / "keyless.db"
+    await (await _keyless_store(path)).close()
+    _seeded(
+        path,
+        'CREATE TABLE "\u017fchema_meta" (x INTEGER)',
+        'INSERT INTO "\u017fchema_meta" (x) VALUES (1)',
+    )
+    assert await _holds_data(path)
+
+
+async def test_a_census_whose_core_table_differs_in_case_holds_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PR 2804 hold, finding 4: "USERS" is not the store's users table on a case-sensitive server,
+    # so a census that lists only it did not see the store's own.
+    from messagefoundry.store.custody_host import store_holds_data
+
+    store = await _keyless_store(tmp_path / "keyless.db")
+    try:
+
+        async def _lookalike() -> dict[str, bool]:
+            return {"messages": False, "message_events": False, "audit_log": False, "USERS": False}
+
+        monkeypatch.setattr(store, "table_occupancy", _lookalike)
+        assert await store_holds_data(store)
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+async def test_a_raised_session_epoch_holds_data(tmp_path: Path) -> None:
+    # PR 2804 hold, finding 8: global_session_epoch was excluded whatever it held. Its seed row (id
+    # 1, epoch 0) is not data; an epoch a revoke-all raised is.
+    path = tmp_path / "keyless.db"
+    await (await _keyless_store(path)).close()
+    assert not await _holds_data(path)
+    _seeded(path, "UPDATE global_session_epoch SET epoch = 1 WHERE id = 1")
+    assert await _holds_data(path)
+
+
+@host_file_platforms
+async def test_a_mint_that_failed_before_its_genesis_record_can_run_again(tmp_path: Path) -> None:
+    # PR 2804 hold, finding 2: a server mint whose create-open committed the salt, the counter and
+    # the markers, then failed before the genesis record, with its key file removed. Those tables
+    # hold no operator data, so the probe reads the store as absent and a fresh mint takes it.
+    from messagefoundry.store.custody_host import store_holds_data
+
+    settings = _settings(tmp_path)
+    path = Path(settings.path)
+    await (await _keyless_store(path)).close()
+    keyed = tmp_path / "keyed.db"
+    store = await open_store(
+        StoreSettings(path=str(keyed), encryption_key=base64.b64encode(os.urandom(32)).decode()),
+        create=True,
+    )
+    await store.close()
+    _seeded(
+        path,
+        f"ATTACH DATABASE '{keyed}' AS keyed",
+        "INSERT INTO store_salt SELECT * FROM keyed.store_salt",
+        "INSERT INTO cipher_meta SELECT * FROM keyed.cipher_meta",
+        "INSERT INTO keyed_surface SELECT * FROM keyed.keyed_surface",
+    )
+    throwaway = HostBlob(MasterKey.mint(), StoreId.mint())
+    probe = await open_store(settings, read_only=True, custody=throwaway)
+    try:
+        occupancy = await probe.table_occupancy()
+        assert occupancy["store_salt"] and occupancy["keyed_surface"]
+        assert not occupancy["audit_log"]
+        assert not await store_holds_data(probe)
+    finally:
+        await probe.close()
+    blob = _mint(settings)
+    await _create(settings, blob)
+    assert await _genesis_store_id(settings, blob) == blob.store_id.value
 
 
 async def test_a_census_that_cannot_see_the_store_tables_refuses(
@@ -917,11 +1036,23 @@ async def test_a_census_that_cannot_see_the_store_tables_refuses(
         await store.close()
 
 
-def test_provision_admin_refuses_a_mint_over_a_server_store_with_only_connection_events(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("census", "refusal"),
+    [
+        ("connection event", "the store already exists"),
+        ("incomplete", "neither the view definition nor the select permission"),
+    ],
+)
+def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    census: str,
+    refusal: str,
 ) -> None:
     # PR 2804 hold (A), end to end: the server probe opens a store with an empty chain whose only
-    # data is a connection event, and the mint is refused before any prompt or key file.
+    # data is a connection event, or whose census cannot be shown complete, and the mint is refused
+    # before any prompt or key file, with a text that names the cause.
     import asyncio
 
     from messagefoundry.__main__ import main
@@ -932,9 +1063,13 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_with_only_connection
     async def _seed() -> None:
         store = await _keyless_store(held)
         try:
-            await store.record_connection_event(
-                connection="IB_TEST_ADT", transport="mllp", direction="inbound", kind="established"
-            )
+            if census == "connection event":
+                await store.record_connection_event(
+                    connection="IB_TEST_ADT",
+                    transport="mllp",
+                    direction="inbound",
+                    kind="established",
+                )
         finally:
             await store.close()
 
@@ -942,12 +1077,20 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_with_only_connection
     real_open = base.open_store
     probes: list[bool] = []
 
+    async def _incomplete() -> dict[str, bool]:
+        raise base.TableCensusIncomplete(
+            "this login holds neither the view definition nor the select permission on schema 'app' (stand-in)"
+        )
+
     async def _open(settings: StoreSettings, **kwargs: object) -> Store:
         if kwargs.get("custody") is not None:  # the server probe, under its throwaway blob
             probes.append(bool(kwargs.get("read_only")))
-            return await real_open(
+            store = await real_open(
                 StoreSettings(path=str(held)), read_only=True, keyless_chain_refusal=None
             )
+            if census == "incomplete":
+                monkeypatch.setattr(store, "table_occupancy", _incomplete)
+            return store
         raise HostCustodyMissing("no host blob and no handoff here (stand-in)")
 
     monkeypatch.setattr(base, "open_store", _open)
@@ -965,7 +1108,7 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_with_only_connection
     assert main(argv) != 0
     err = capsys.readouterr().err
     assert probes == [True], err  # the server probe ran, under a read-only open
-    assert "the store already exists" in err and "Traceback" not in err
+    assert refusal in err and "Traceback" not in err
     assert list(secrets.iterdir()) == []  # no host blob, no handoff
 
 

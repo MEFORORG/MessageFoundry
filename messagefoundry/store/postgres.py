@@ -11466,23 +11466,29 @@ class PostgresStore:
 
     async def table_occupancy(self) -> dict[str, bool]:
         """See :meth:`Store.table_occupancy`: the ordinary and partitioned tables in the schema
-        that holds the store's own ``schema_meta``, as ``to_regclass`` resolves the unqualified
-        name through the pool's ``search_path`` (the way every store statement resolves it), read
-        from ``pg_catalog`` by the stored name, each probed for one row. Each probe names the
+        that holds the store's own ``schema_meta`` (``pg_catalog.to_regclass`` resolves the
+        unqualified name through the pool's ``search_path``) and owned by ``schema_meta``'s owner,
+        the scope ``_verify_runtime_grants`` uses, so an extension's or a DBA's own table there
+        is not the store's. Read from ``pg_catalog`` by the stored name; each probe names the
         schema too, because an unqualified name would resolve through ``pg_catalog`` first. No
         ``schema_meta`` reads as no tables, which the caller must not take as empty."""
+        from messagefoundry.store.base import SCHEMA_SEED_FILTERS
+
         rows = await self._fetchall(
             "SELECT n.nspname AS s, c.relname AS t FROM pg_catalog.pg_class c"
             " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
-            " WHERE c.relkind IN ('r', 'p') AND c.relnamespace = (SELECT m.relnamespace"
-            " FROM pg_catalog.pg_class m WHERE m.oid = to_regclass('schema_meta'))"
+            " JOIN pg_catalog.pg_class m ON m.oid = pg_catalog.to_regclass('schema_meta')"
+            " WHERE c.relkind IN ('r', 'p') AND c.relnamespace = m.relnamespace"
+            " AND c.relowner = m.relowner"
         )
         occupancy: dict[str, bool] = {}
         for row in rows:
             schema, table = str(row["s"]), str(row["t"])
             qualified = ".".join('"' + name.replace('"', '""') + '"' for name in (schema, table))
+            seed = SCHEMA_SEED_FILTERS.get(table)
+            where = f" WHERE {seed}" if seed is not None else ""
             occupancy[table] = bool(
-                await self._fetchval(f"SELECT EXISTS (SELECT 1 FROM {qualified})")
+                await self._fetchval(f"SELECT EXISTS (SELECT 1 FROM {qualified}{where})")
             )
         return occupancy
 

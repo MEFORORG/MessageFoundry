@@ -6245,22 +6245,58 @@ async def test_webauthn_rehash_contract(store) -> None:
     await _assert_webauthn_rehash_contract(store)
 
 
+async def _empty_every_census_table(store) -> None:
+    """Every table the census lists, emptied but for ``schema_meta``, and the epoch back at its
+    seed, so the census reads a store nothing has used. The fixture leaves at least store_salt,
+    nodes and leader_lease as earlier tests wrote them."""
+    names = [n for n in await store.table_occupancy() if n != "schema_meta"]
+    names.remove("global_session_epoch")
+    quoted = ", ".join('"' + n.replace('"', '""') + '"' for n in names)
+    async with store._pool.acquire() as conn:
+        await conn.execute(f"TRUNCATE {quoted} RESTART IDENTITY CASCADE")
+        await conn.execute("DELETE FROM global_session_epoch WHERE id <> 1")
+        await conn.execute("UPDATE global_session_epoch SET epoch = 0 WHERE id = 1")
+
+
 async def test_table_occupancy_reads_the_store_schema_and_counts_a_connection_event(
     store,
 ) -> None:
     # PR 2804 hold (A): the mint's server probe reads every table in the store's schema from the
-    # catalog, so a connection event alone holds data. The positive control is that the catalog
-    # read lists the store's own tables; the fixture emptied connection_event, so it reads False.
+    # catalog, so a connection event alone holds data. The negative arm reads a store nothing has
+    # used as absent first, so the positive one is not true of every store.
     from messagefoundry.store.custody_host import store_holds_data
 
+    await _empty_every_census_table(store)
     before = await store.table_occupancy()
     assert {"messages", "message_events", "audit_log", "users", "connection_event", "sessions"} <= (
         set(before)
     )
     assert before["connection_event"] is False
+    assert not await store_holds_data(store)
     await store.record_connection_event(
         connection="IB_TEST_ADT", transport="mllp", direction="inbound", kind="established"
     )
     after = await store.table_occupancy()
     assert after["connection_event"] is True
     assert await store_holds_data(store)
+
+
+async def test_a_keyed_fresh_store_holds_data_until_its_chain_is_gone(store) -> None:
+    # PR 2804 hold (A): a keyed open, the shape a mint makes, starts the chain and so holds data. A
+    # mint that failed after the keyed open's own commits but before its genesis record leaves only
+    # the salt, counter and markers, which do not count, so the mint can be run again.
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.custody_host import store_holds_data
+    from messagefoundry.store.postgres import PostgresStore
+
+    await _empty_every_census_table(store)
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    await keyed.close()
+    occupancy = await store.table_occupancy()
+    assert occupancy["audit_log"] and occupancy["keyed_surface"]
+    assert await store_holds_data(store)
+    async with store._pool.acquire() as conn:
+        await conn.execute("TRUNCATE audit_log RESTART IDENTITY CASCADE")
+    assert not await store_holds_data(store)

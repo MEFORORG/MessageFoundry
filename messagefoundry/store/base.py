@@ -29,7 +29,8 @@ from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mappi
 from dataclasses import dataclass
 from functools import cache, partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import (
@@ -162,7 +163,9 @@ __all__ = [
     "Store",
     "StoreLifecycle",
     "KeylessAuditChainRefused",
+    "SCHEMA_SEED_FILTERS",
     "StoreNotFoundError",
+    "TableCensusIncomplete",
     "StreamingAttachmentsUnsupported",
     "PROVISION_SCHEMA_COMMAND",
     "SchemaDdlLockTimeout",
@@ -193,6 +196,23 @@ class DbaDelegatedError(RuntimeError):
     reimplemented in the engine, so the snapshot raises this rather than producing a half-baked copy. The
     BackupRunner / ``backup`` CLI catch it and fall back to a config-only backup (or skip) per
     ``[backup].config_only_on_server_db``."""
+
+
+class TableCensusIncomplete(RuntimeError):
+    """:meth:`Store.table_occupancy` could not show that it lists every table in the store's
+    schema: on SQL Server the login holds neither ``VIEW DEFINITION`` nor ``SELECT`` on that
+    schema, so ``sys.tables`` may hide a table that holds rows. The text names the schema and the
+    grant that clears it, never a row."""
+
+
+#: The row a schema build seeds into each table before anything uses the store, as a filter that
+#: matches every OTHER row: :meth:`Store.table_occupancy` reads such a table as held only when a
+#: row past its seed exists. ``global_session_epoch`` is seeded with its one row at epoch 0; a
+#: revoke-all raises it, which is state a mint must not take over. A constant fragment, the same
+#: on all three backends, never built from input.
+SCHEMA_SEED_FILTERS: Final[Mapping[str, str]] = MappingProxyType(
+    {"global_session_epoch": "NOT (id = 1 AND epoch = 0)"}
+)
 
 
 class ReferenceKeyCollision(ValueError):
@@ -1815,15 +1835,26 @@ class QueueStore(StoreLifecycle, Protocol):
     async def db_status(self) -> DbStatus: ...
 
     async def table_occupancy(self) -> Mapping[str, bool]:
-        """Every table in the store's own schema, read from the database's catalog rather than
-        from this build's DDL, mapped to whether it holds at least one row. The store's schema is
-        the SQLite file's main schema (less SQLite's internal ``sqlite_*`` tables), and on
-        Postgres and SQL Server the schema that holds the store's own ``schema_meta`` as the
-        server resolves the unqualified name (no ``schema_meta``, no tables). Names are as the
-        catalog stores them. A listed table the connection cannot read raises, so nothing listed
-        is reported as empty that was not read. What the catalog does not list is not reported
-        at all: SQL Server leaves out a table the login has no permission on. Counts only, never
-        a cell, so an open under a throwaway key decrypts nothing (vault BACKLOG #3411)."""
+        """The store's own tables, read from the database's catalog rather than from this build's
+        DDL, mapped to whether each holds a row. A table in :data:`SCHEMA_SEED_FILTERS` reads as
+        held only when it holds a row past the one a schema build seeds. Names are exactly as the
+        catalog stores them.
+
+        Which tables: on SQLite, the main schema's ordinary tables (``pragma_table_list`` type
+        ``table``: no virtual or shadow table, no view, none of SQLite's ``sqlite_*``). On
+        Postgres, the ordinary and partitioned tables in the schema of the store's own
+        ``schema_meta`` (as ``search_path`` resolves it) and owned by its owner, the role that
+        built the schema, as ``_verify_runtime_grants`` scopes them. On SQL Server, the tables in
+        the schema of the store's own ``schema_meta`` (as ``OBJECT_ID`` resolves it), less those
+        SQL Server ships and external ones. No ``schema_meta``, no tables.
+
+        What it cannot see, at least: rows a row-level security policy (Postgres) or a security
+        policy filter (SQL Server) hides from this login, which read as empty and raise nothing;
+        and on SQL Server a table the login holds no permission on, which ``sys.tables`` does not
+        list. For that last one it raises :class:`TableCensusIncomplete` unless the login holds
+        ``VIEW DEFINITION`` or ``SELECT`` on the schema. A listed table that cannot be read raises.
+        Counts only, never a cell, so an open under a throwaway key decrypts nothing (vault
+        BACKLOG #3411)."""
         ...
 
     def pool_status(self) -> PoolStatus | None:

@@ -74,6 +74,7 @@ __all__ = [
     "HostCustodyRefused",
     "MintedCustody",
     "RecoveryKeyTerminal",
+    "KEYED_OPEN_TABLES",
     "SCHEMA_BOOKKEEPING_TABLES",
     "custody_directory",
     "foreign_custody_refusal",
@@ -499,13 +500,16 @@ def load_host_custody(
     return blob
 
 
-#: The two tables whose rows a keyless schema build writes before anything uses the store, so a
-#: row in them is not data: ``schema_meta`` (a server store's schema hash) and
-#: ``global_session_epoch`` (the session epoch's singleton row, seeded at epoch 0). A keyed open
-#: writes more (at least ``store_salt``, ``cipher_meta``, ``keyed_surface`` and the genesis audit
-#: row), and each of those is evidence a key already holds this store, so they count. Every
-#: table but these two counts; a test ties this set to each backend's schema seeds.
-SCHEMA_BOOKKEEPING_TABLES: Final = frozenset({"schema_meta", "global_session_epoch"})
+#: The table whose row a server schema build writes before anything uses the store, so a row in
+#: it is not data: ``schema_meta`` (the schema hash). ``global_session_epoch``'s seed row is
+#: handled by the census itself (``SCHEMA_SEED_FILTERS``), which reads it as held only once a
+#: revoke-all has raised the epoch. Names compare exactly, as the catalog stores them.
+SCHEMA_BOOKKEEPING_TABLES: Final = frozenset({"schema_meta"})
+#: The tables a keyed open commits before it starts the audit chain: the store salt, the AES-GCM
+#: invocation counter and the keyed-surface markers. None holds a row of operator data. While
+#: the chain is empty they are what a mint that failed before its genesis record left, so they do
+#: not count; once ``audit_log`` holds a row they count like every other table.
+KEYED_OPEN_TABLES: Final = frozenset({"store_salt", "cipher_meta", "keyed_surface"})
 #: Tables every backend's schema has. A catalog read that does not list all of them did not see
 #: the store's schema (no ``schema_meta`` resolved, or a permission hid them), so it proves
 #: nothing about what the store holds.
@@ -517,18 +521,22 @@ async def store_holds_data(store: Store) -> bool:
     an empty audit chain may still be a store that ran keyless, so an empty chain alone does not
     make it absent (vault BACKLOG #3411).
 
-    Counted: every table :meth:`Store.table_occupancy` reads from the database's own catalog, so a
-    table this build does not name still counts. Excluded: only
-    :data:`SCHEMA_BOOKKEEPING_TABLES`. Any row in any other table holds data. Fails closed: a
-    catalog read that does not list every table in :data:`_STORE_CORE_TABLES` holds data, and a
-    listed table that cannot be read, or a query error, raises rather than reading as empty. Not
-    covered: a table the catalog does not list, which on SQL Server is one the login has no
-    permission on. Counts only, so a probe opened under a throwaway key decrypts nothing."""
+    Counted: every table :meth:`Store.table_occupancy` lists, read from the database's own
+    catalog, so a table this build does not name still counts. Excluded: only
+    :data:`SCHEMA_BOOKKEEPING_TABLES`, and :data:`KEYED_OPEN_TABLES` while ``audit_log`` is
+    empty. Any row in any other table holds data. Names compare exactly. Fails closed: a census
+    that does not list every table in :data:`_STORE_CORE_TABLES` holds data, and a census that
+    cannot be read, or cannot be shown complete, raises rather than reading as empty. What the
+    census cannot see is stated once, on :meth:`Store.table_occupancy`. Counts only, so a probe
+    opened under a throwaway key decrypts nothing."""
     occupancy = await store.table_occupancy()
-    if not _STORE_CORE_TABLES.issubset(name.casefold() for name in occupancy):
+    if not _STORE_CORE_TABLES.issubset(occupancy):
         return True
-    held = {name.casefold() for name, rows in occupancy.items() if rows}
-    return bool(held - SCHEMA_BOOKKEEPING_TABLES)
+    held = {name for name, rows in occupancy.items() if rows}
+    excluded = SCHEMA_BOOKKEEPING_TABLES | (
+        KEYED_OPEN_TABLES if not occupancy["audit_log"] else set()
+    )
+    return bool(held - excluded)
 
 
 # --- the mint -------------------------------------------------------------------------------------

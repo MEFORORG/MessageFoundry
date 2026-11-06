@@ -16075,20 +16075,48 @@ class SqlServerStore:
         """See :meth:`Store.table_occupancy`: the tables in the schema that holds the store's own
         ``schema_meta``, as ``OBJECT_ID`` resolves the unqualified name (the login's default
         schema, then ``dbo``, as the store's DDL resolved it), read from ``sys.tables`` less the
-        tables SQL Server itself ships (``is_ms_shipped``), each probed for one row through its
-        bracket-quoted, schema-qualified name. No ``schema_meta`` reads as no tables.
-        ``sys.tables`` lists only tables the login has some permission on, so a table it has none
-        on is not listed at all."""
+        tables SQL Server ships (``is_ms_shipped``) and external ones (``is_external``: a probe
+        of one would run a remote query), each probed for one row through its bracket-quoted,
+        schema-qualified name. No ``schema_meta`` reads as no tables.
+
+        ``sys.tables`` lists only the tables the login holds some permission on, so the census is
+        complete only where the login holds ``VIEW DEFINITION`` or ``SELECT`` on that schema
+        (either one, held directly, through a role or from the database, makes every table in it
+        visible). Without either it raises :class:`TableCensusIncomplete` rather than report a
+        census that may have missed a table."""
+        from messagefoundry.store.base import SCHEMA_SEED_FILTERS, TableCensusIncomplete
+
+        anchor = await self._fetchone(
+            "SELECT OBJECT_SCHEMA_NAME(OBJECT_ID(N'schema_meta', N'U')) AS s,"
+            " HAS_PERMS_BY_NAME(OBJECT_SCHEMA_NAME(OBJECT_ID(N'schema_meta', N'U')), N'SCHEMA',"
+            " N'VIEW DEFINITION') AS vd,"
+            " HAS_PERMS_BY_NAME(OBJECT_SCHEMA_NAME(OBJECT_ID(N'schema_meta', N'U')), N'SCHEMA',"
+            " N'SELECT') AS sel"
+        )
+        if anchor is None or anchor["s"] is None:
+            return {}
+        store_schema = str(anchor["s"])
+        if not (anchor["vd"] == 1 or anchor["sel"] == 1):
+            raise TableCensusIncomplete(
+                f"this login holds neither the view definition nor the select permission on schema"
+                f" {store_schema!r}, so SQL Server may hide a table there that holds rows, and"
+                " whether the store holds data cannot be read. Grant this login the view"
+                " definition permission on that schema"
+            )
         rows = await self._fetchall(
-            "SELECT SCHEMA_NAME(t.schema_id) AS s, t.name AS t FROM sys.tables t"
-            " WHERE t.is_ms_shipped = 0 AND t.schema_id = (SELECT o.schema_id FROM sys.objects o"
-            " WHERE o.object_id = OBJECT_ID(N'schema_meta', N'U'))"
+            "SELECT t.name AS t FROM sys.tables t"
+            " WHERE t.is_ms_shipped = 0 AND t.is_external = 0 AND t.schema_id = SCHEMA_ID(?)",
+            (store_schema,),
         )
         occupancy: dict[str, bool] = {}
         for row in rows:
-            schema, table = str(row["s"]), str(row["t"])
-            qualified = ".".join("[" + name.replace("]", "]]") + "]" for name in (schema, table))
-            held = await self._fetchone(f"SELECT TOP (1) 1 AS held FROM {qualified}")
+            table = str(row["t"])
+            qualified = ".".join(
+                "[" + name.replace("]", "]]") + "]" for name in (store_schema, table)
+            )
+            seed = SCHEMA_SEED_FILTERS.get(table)
+            where = f" WHERE {seed}" if seed is not None else ""
+            held = await self._fetchone(f"SELECT TOP (1) 1 AS held FROM {qualified}{where}")
             occupancy[table] = held is not None
         return occupancy
 

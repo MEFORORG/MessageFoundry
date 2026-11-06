@@ -8734,8 +8734,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         that holds no data either, is absent; a chain with a genesis record, or data under an empty
         chain, is a store this mint must not take. Connection and hop
         refusals surface here, before the prompts, as the ordinary pre-check's do."""
+        from messagefoundry.store.base import TableCensusIncomplete
         from messagefoundry.store.custody import HostBlob, MasterKey, StoreId
-        from messagefoundry.store.custody_host import store_holds_data
+        from messagefoundry.store.custody_host import HostCustodyRefused, store_holds_data
         from messagefoundry.store.store import StoreIdPinRefused
 
         throwaway = HostBlob(MasterKey.mint(), StoreId.mint())
@@ -8754,6 +8755,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
         try:
             # An empty chain may be a store that ran keyless: one that holds data is not absent.
             return not await store_holds_data(store)
+        except TableCensusIncomplete as incomplete:
+            # Fail closed, and say why: "the store already exists" would send the operator to
+            # remove a store that may hold nothing, when the fix is a grant.
+            raise HostCustodyRefused(
+                f"{incomplete}, then run the command again. Nothing was minted"
+            ) from incomplete
         finally:
             await store.close()
 
