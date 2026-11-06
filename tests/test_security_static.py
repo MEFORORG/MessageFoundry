@@ -671,7 +671,7 @@ _UNSCANNABLE_RE_PATTERNS = {
     # necessarily makes the expression unresolvable to this static scanner. The shape is bounded and
     # non-catastrophic by inspection: an alternation of digit literals followed by a fixed ``\d{4}`` —
     # no nested quantifier, no overlapping alternation.
-    "messagefoundry/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
+    "messagefoundry_toolkit/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
     "tee/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
     # BACKLOG #1678 -- the orphan sweep's temp-file shape. Unresolvable BY CONSTRUCTION, and that is
     # the point: the matcher is spliced from the SAME constants the atomic write MINTS the name from
@@ -1798,6 +1798,9 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     "harness/load/connscale/runner.py": frozenset({"messagefoundry.config.tls_policy"}),
     "harness/load/shardcert.py": frozenset({"messagefoundry.config.tls_policy"}),
     "tee/__main__.py": frozenset({"ssl"}),
+    # ADR 0030's keyed BLAKE2b, moved out of messagefoundry/ by ADR 0201 slice 6. Its vendored twin
+    # is the next row. See the INVENTORY row this duplicates.
+    "messagefoundry_toolkit/anon/keying.py": frozenset({"hashlib"}),
     "tee/anon/keying.py": frozenset({"hashlib"}),
     "tee/mefor_api.py": frozenset({"ssl"}),
     # ADR 0155: the DAST scan target mints a throwaway per-run password for the two ephemeral scan

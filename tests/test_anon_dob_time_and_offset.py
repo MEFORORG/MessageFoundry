@@ -15,8 +15,8 @@ from collections.abc import Callable
 
 import pytest
 
-from messagefoundry.anon import keying as engine_keying
-from messagefoundry.anon import surrogates as engine_surrogates
+from messagefoundry_toolkit.anon import keying as engine_keying
+from messagefoundry_toolkit.anon import surrogates as engine_surrogates
 from tee.anon import keying as tee_keying
 from tee.anon import surrogates as tee_surrogates
 

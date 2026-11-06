@@ -20,13 +20,20 @@ What is here:
   AES-256-GCM, keyed by HKDF-SHA256 over the recovery key, with the store id in the associated data.
   The wrap is not secret; it opens only with the right recovery key AND the right store id.
 * **The host provider.** Windows: the host blob under user-scope DPAPI, made by the service account
-  itself (:func:`protect_host_blob`). Linux: the host blob in a file only its owner can read (rule
-  3b), and a reader for a systemd credential (:func:`read_systemd_credential`). Both read the file's
-  POSIX access control list, which this engine reads on Linux only, so another POSIX host is
-  refused.
-* **The handoff blob** (:func:`write_handoff_file`): machine-scope DPAPI, in a file created
-  restricted with read for the service account and for no package SID. It carries the key from the
-  administrator who mints it to the service's first start, which re-wraps it in its own user scope.
+  itself (:func:`protect_host_blob`), in a file whose owner and exact access list are checked
+  through the open handle before it is read. Linux: the host blob in a file of mode exactly
+  ``0600``, owned by the engine's account and carrying no POSIX access control list (rule 3b), and
+  a reader for a systemd credential (:func:`read_systemd_credential`). Both Linux readers read the
+  file's POSIX access control list, which this engine reads on Linux only. So on another POSIX host
+  the host file is refused, and the credential reader refuses a set ``$CREDENTIALS_DIRECTORY``
+  rather than report the credential unavailable. Each kind of file is read only from the file
+  systems its own allowlist names, and the host file is written only to one, checked while it is
+  still empty. No key custody file is kept for SYSTEM, LOCAL SERVICE or NETWORK SERVICE.
+* **The handoff blob** (:func:`write_handoff_file`): machine-scope DPAPI, in a file created with
+  the draft's descriptor, DELETE added for the service: SYSTEM and Administrators with full
+  control, the service account with read and delete, and no one else. It carries the key from the
+  administrator who mints it to the service's first start, which re-wraps it in its own user scope
+  and deletes it through the handle that read it (:func:`consume_handoff_file`).
 
 The file path and the credential name are always parameters. How a host with several stores names
 their files is not decided here.
@@ -47,10 +54,12 @@ import os
 import stat
 import struct
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Self
+
+from messagefoundry.restricted_file import LINUX_CREDENTIAL_FILE_SYSTEMS, LINUX_HOST_FILE_SYSTEMS
 
 if TYPE_CHECKING:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -61,10 +70,12 @@ __all__ = [
     "STORE_ID_BYTES",
     "CredentialUnavailable",
     "CustodyError",
+    "HandoffLeftBehind",
     "HostBlob",
     "MasterKey",
     "RecoveryKey",
     "StoreId",
+    "consume_handoff_file",
     "protect_host_blob",
     "read_handoff_file",
     "read_host_file",
@@ -89,8 +100,18 @@ class CustodyError(ValueError):
 
 
 class CredentialUnavailable(CustodyError):
-    """No systemd credential is offered: ``$CREDENTIALS_DIRECTORY`` is unset, or holds no file of
-    that name. A caller may take this as "use another provider"; every other refusal it may not."""
+    """No systemd credential is offered. Raised at least when ``$CREDENTIALS_DIRECTORY`` is unset
+    or empty, and when the directory it names holds no file of that name. A caller may take this as
+    "use another provider"; every other refusal it may not, a set ``$CREDENTIALS_DIRECTORY`` this
+    engine cannot honour included."""
+
+
+class HandoffLeftBehind(Exception):
+    """The handoff was converted, and ``convert`` returned, but the handoff file is still there: its
+    delete was refused, or its name outlived the delete. Deliberately NOT a :class:`CustodyError`,
+    so a caller that refuses a start on a custody refusal cannot take this for one: every
+    :class:`CustodyError` of :func:`consume_handoff_file` comes before the conversion ran, and this
+    comes after, once the host file it wrote exists."""
 
 
 # --- the three minted values ----------------------------------------------------------------------
@@ -458,27 +479,50 @@ def unprotect_host_blob(protected: bytes) -> HostBlob:
     return _unprotect_in_scope(protected, machine_scope=False, what="host blob")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class _PosixPolicy:
-    """Who beside the engine's own account may own a POSIX custody file, and whether it may carry
-    a POSIX access control list.
+    """What a POSIX custody file is: which file systems may hold it, who beside the engine's own
+    account may own it, whether it may carry a POSIX access control list, and whether its whole
+    mode is fixed.
 
-    ``owners`` is the uids that may own the file beside the engine's own. ``access_list`` is
-    whether the file may carry an access control list at all: without it, any list is refused
-    whatever it grants; with it, :func:`_posix_acl_entries_problem` judges the list entry by entry
-    and refuses any named entry but read for the engine's own uid. :func:`_posix_file_problem`
-    checks at least the file type, the owner, the mode's group and other permission bits (its group
-    read bit only when there is no list) and the list. What it does not check includes at least the
-    owner's own bits and the setuid, setgid and sticky bits, and it cannot see an access model a file system keeps
-    outside the POSIX list (:func:`~messagefoundry.restricted_file.posix_access_acl`)."""
+    ``what`` names the file in a refusal. ``file_systems`` is the allowlist of ``statfs`` magics the
+    file may sit on; any other is refused, named by its magic in hex. ``owners`` is the uids that may
+    own the file beside the engine's own. ``access_list`` is whether the file may carry an access
+    control list at all: without it, any list is refused whatever it grants; with it,
+    :func:`_posix_acl_entries_problem` judges the list entry by entry and refuses any named entry
+    but read for the engine's own uid. ``mode``, when set, is the only permission mode the file may
+    have, its owner's own bits and the setuid, setgid and sticky bits included.
+    :func:`_posix_file_problem` says what it checks of the mode, owner and list. Compared and
+    hashed by identity, since ``file_systems`` is a read-only view that does not hash."""
 
+    what: str
+    file_systems: Mapping[int, str]
     owners: frozenset[int]
     access_list: bool
+    mode: int | None = None
 
 
-#: The host file (draft rule 3b): owned by the engine's account, no access for group or other in
-#: its mode, and no access control list at all, which :func:`write_host_file` makes sure it writes.
-_HOST_FILE_POLICY = _PosixPolicy(owners=frozenset(), access_list=False)
+#: The host file (draft rule 3b): on a local disk file system, owned by the engine's account, mode
+#: exactly ``0600``, and no access control list at all, which :func:`write_host_file` makes sure it
+#: writes.
+_HOST_FILE_POLICY = _PosixPolicy(
+    what="key custody host file",
+    file_systems=LINUX_HOST_FILE_SYSTEMS,
+    owners=frozenset(),
+    access_list=False,
+    mode=0o600,
+)
+
+#: A systemd credential: on the in-memory file system systemd mounts the credentials directory on,
+#: owned by root or the engine's account, and a list judged entry by entry, because systemd grants
+#: a non-root service user read through a named entry. No fixed mode: systemd writes ``0400``,
+#: which the list's mask shows as ``0440``.
+_CREDENTIAL_POLICY = _PosixPolicy(
+    what="systemd credential",
+    file_systems=LINUX_CREDENTIAL_FILE_SYSTEMS,
+    owners=frozenset({0}),
+    access_list=True,
+)
 
 #: Group write or execute, and any access for other accounts. Group read is judged apart, because
 #: with an access control list the group bits are its mask rather than the group's access.
@@ -550,10 +594,14 @@ def _posix_file_problem(
     """Why a custody file of this ``mode``, ``owner``, ``group`` and access control list must not
     be used, or ``None``. ``acl`` is the raw ``system.posix_acl_access`` value, ``None`` for none.
 
-    A file whose policy allows no list is refused if it carries one, whatever the list grants. With a list, the
-    mode's group bits are its mask rather than the group's access, so whether the group may reach
-    the file is judged from the list's group entry. Kept free of I/O so the decision is testable on
-    every platform."""
+    Refused, in this order: anything but a regular file; a mode with group write or execute, or any
+    bit for other accounts, list or no list; with no list, a mode with group read; an owner that is
+    neither the engine's uid nor one of ``policy.owners``; a list on a file whose policy allows
+    none, whatever it grants; a mode other than ``policy.mode``, when the policy fixes one; and a
+    list :func:`_posix_acl_entries_problem` refuses. With a list, the mode's group bits are its mask
+    rather than the group's access, so whether the group may read the file is judged from the list's
+    group entry. Where the policy fixes no mode, the owner's own bits and the setuid, setgid and
+    sticky bits are not judged. Kept free of I/O so the decision is testable on every platform."""
     if not stat.S_ISREG(mode):
         return "it is not a regular file"
     bits = stat.S_IMODE(mode)
@@ -563,10 +611,12 @@ def _posix_file_problem(
         return f"its mode is {bits:04o}, which lets its group gid {group} read it"
     if owner != euid and owner not in policy.owners:
         return f"it is owned by uid {owner}, not by the account the engine runs as (uid {euid})"
+    if acl is not None and not policy.access_list:
+        return "it carries a POSIX access control list, and this file must carry none"
+    if policy.mode is not None and bits != policy.mode:
+        return f"its mode is {bits:04o}, and this file's mode must be exactly {policy.mode:04o}"
     if acl is None:
         return None
-    if not policy.access_list:
-        return "it carries a POSIX access control list, and this file must carry none"
     return _posix_acl_entries_problem(acl, group, euid)
 
 
@@ -596,17 +646,21 @@ def _read_posix_checked(path: Path, policy: _PosixPolicy) -> bytes:
     """Read a custody file on Linux, checking the file it opened rather than the name.
 
     ``O_NOFOLLOW`` refuses a link, ``O_NONBLOCK`` keeps a FIFO from stalling the open until the
-    regular-file check refuses it, and the mode, owner, group and access control list are read from
-    the open descriptor, so the file checked is the file read. Any other POSIX host is refused before
-    the file is opened: this engine reads the access control list on Linux only, and a list that
-    is not read is not a list shown absent. ``FileNotFoundError`` propagates as it is; every other failure is a
+    regular-file check refuses it, and the mode, owner, group, file system type and access control
+    list are read from the open descriptor, so the file checked is the file read. A file on a file
+    system ``policy.file_systems`` does not name is refused, named by its magic in hex: an
+    allowlist, so a network, cluster, FUSE or overlay file system, one that may keep an access model
+    of its own and answer that it has no POSIX list, is refused without being named, and a list
+    that is not read is never taken as a list shown absent. Any other POSIX host is refused before
+    the file is opened, for the same reason: this engine reads the access control list on Linux
+    only. ``FileNotFoundError`` propagates as it is; every other failure is a
     :class:`CustodyError`, raised outside any handler."""
     if sys.platform != "linux":
         raise CustodyError(
             f"{path} is refused: a custody file is read on Linux and Windows only, because only "
             "there does this engine read its access control list"
         )
-    from messagefoundry.restricted_file import posix_access_acl
+    from messagefoundry.restricted_file import linux_file_system_refusal, posix_access_acl
 
     fd = -1
     reason: str | None = None
@@ -624,11 +678,24 @@ def _read_posix_checked(path: Path, policy: _PosixPolicy) -> bytes:
         os.close(fd)  # nothing owns the descriptor yet
         raise
     with handle:
-        status = os.fstat(fd)
-        acl: bytes | None = None
+        status: os.stat_result | None = None
         try:
-            # Only a regular file's list is read; anything else is refused on its type below.
-            acl = posix_access_acl(fd) if stat.S_ISREG(status.st_mode) else None
+            status = os.fstat(fd)
+        except OSError as exc:
+            reason = _os_reason(exc)
+        if status is None:
+            raise CustodyError(f"{path} could not be read: {reason}")
+        acl: bytes | None = None
+        # Only a regular file's file system and list are read; anything else is refused on its
+        # type below. The file system is judged before its list is asked for, so one the policy
+        # does not name is not asked.
+        regular = stat.S_ISREG(status.st_mode)
+        if regular:
+            unlisted = linux_file_system_refusal(fd, policy.file_systems, policy.what)
+            if unlisted is not None:
+                raise CustodyError(f"{path} is refused: {unlisted}")
+        try:
+            acl = posix_access_acl(fd) if regular else None
         except OSError as exc:
             reason = _os_reason(exc)
         if reason is not None:
@@ -648,11 +715,15 @@ def _read_posix_checked(path: Path, policy: _PosixPolicy) -> bytes:
         return _read_capped(handle, path)
 
 
-def _open_windows_held(path: Path) -> int:
+def _open_windows_held(path: Path, *, delete: bool = False) -> int:
     """Open ``path`` for reading as itself, never following a link, and return a descriptor.
 
     The share mode admits other readers only, so while the descriptor is open the file at the final
-    name cannot be renamed, replaced or deleted. A brief hold by another process is ridden out.
+    name cannot be renamed, replaced or deleted by anyone else. With ``delete`` the handle also
+    holds DELETE, so the file can be deleted through it (:func:`consume_handoff_file`), and while
+    it is open another open that asks for data or delete access and does not share delete is
+    refused; one that asks only for attributes or the security descriptor is not. A brief hold by
+    another process is ridden out.
     Anything but a disk file (a pipe, a device) is refused. Raises ``FileNotFoundError`` when there
     is no file, and :class:`CustodyError` for every other failure."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
@@ -661,7 +732,11 @@ def _open_windows_held(path: Path) -> int:
     import msvcrt
     from ctypes import wintypes
 
-    from messagefoundry.restricted_file import WINERROR_SHARING_VIOLATION, ride_out_a_held_file
+    from messagefoundry.restricted_file import (
+        _DELETE,
+        WINERROR_SHARING_VIOLATION,
+        ride_out_a_held_file,
+    )
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     create = kernel32.CreateFileW
@@ -680,6 +755,7 @@ def _open_windows_held(path: Path) -> int:
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
     generic_read, file_share_read, open_existing, file_type_disk = 0x80000000, 0x1, 3, 0x1
+    access = generic_read | (_DELETE if delete else 0)
     # FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT: a link is opened as itself, and the
     # access check that follows refuses it.
     flags = 0x00000080 | 0x00200000
@@ -687,7 +763,7 @@ def _open_windows_held(path: Path) -> int:
     opened: list[int] = []
 
     def _open() -> None:
-        handle = create(str(path), generic_read, file_share_read, None, open_existing, flags, None)
+        handle = create(str(path), access, file_share_read, None, open_existing, flags, None)
         if handle is None or handle == invalid:
             raise ctypes.WinError(ctypes.get_last_error())
         opened.append(handle)
@@ -711,71 +787,125 @@ def _open_windows_held(path: Path) -> int:
         raise
 
 
-def _read_windows_checked(path: Path) -> bytes:
-    """Read a custody file on Windows, refusing a link, anything but a disk file, and a file a known
-    broad group or an application package can read or change.
+@contextlib.contextmanager
+def _windows_checked(
+    path: Path, *, engine_read_only: bool, delete: bool = False
+) -> Iterator[tuple[bytes, int]]:
+    """Open and read a custody file on Windows, refusing a link, anything but a disk file, and a
+    file not owned and listed exactly as a key file is
+    (:func:`~messagefoundry.restricted_file.key_file_handle_problem`), and yield its bytes with the
+    open handle they were read through.
 
-    The file stays open, unshared for writing, renaming and deleting, while its access list is read.
-    **That list is still read by name**, so at least a link or junction in a PARENT directory that is
-    re-pointed between the open and that read is not caught: the list read may then belong to
-    another file. Reading the list from the open handle closes that, and the slice that wires these
-    reads must do so. ``FileNotFoundError`` propagates as it is; every other failure is a
-    :class:`CustodyError`."""
-    from messagefoundry.restricted_file import broad_access_problem
+    The file stays open, unshared for writing, renaming and deleting, until the block ends, and its
+    attributes, volume, owner and access list are read through that open handle, never by name, so
+    a link or junction in a parent directory re-pointed after the open does not change what is
+    judged. ``engine_read_only`` is whether the engine's own account holds read and delete (the
+    handoff) or full control (the host file). ``delete`` opens the handle with DELETE too, so the
+    file can be deleted through it (:func:`_open_windows_held`). ``FileNotFoundError`` propagates
+    as it is; every other failure is a :class:`CustodyError`."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise CustodyError("the Windows custody file read runs on Windows only")
+    import ctypes
+    import msvcrt
 
-    fd = _open_windows_held(path)
+    from messagefoundry.restricted_file import key_file_handle_problem
+
+    fd = _open_windows_held(path, delete=delete)
     try:
         handle = os.fdopen(fd, "rb")
     except BaseException:
         os.close(fd)  # nothing owns the descriptor yet
         raise
     with handle:
-        problem = broad_access_problem(path)
+        attributes = 0
+        reason: str | None = None
+        try:
+            attributes = os.fstat(fd).st_file_attributes
+        except OSError as exc:
+            reason = _os_reason(exc)
+        if reason is not None:
+            raise CustodyError(f"{path} could not be read: {reason}")
+        problem: str | None = None
+        if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            problem = "it is a link, and a custody file is read as itself"
+        else:
+            try:
+                problem = key_file_handle_problem(
+                    msvcrt.get_osfhandle(fd), engine_read_only=engine_read_only
+                )
+            except (OSError, ctypes.ArgumentError) as exc:
+                reason = str(exc) or type(exc).__name__
+            if reason is not None:
+                raise CustodyError(
+                    f"{path} is refused: its owner and access list could not be read ({reason})"
+                )
         if problem is not None:
             raise CustodyError(f"{path} is refused: {problem}")
-        return _read_capped(handle, path)
+        yield _read_capped(handle, path), msvcrt.get_osfhandle(fd)
+
+
+def _read_windows_checked(path: Path, *, engine_read_only: bool) -> bytes:
+    """The bytes of a custody file on Windows, checked as :func:`_windows_checked` says."""
+    with _windows_checked(path, engine_read_only=engine_read_only) as (data, _handle):
+        return data
 
 
 def write_host_file(path: Path, blob: HostBlob) -> None:
     """Write the host blob to a NEW file at ``path``, created restricted in the call that makes it.
 
-    Windows: the blob under user-scope DPAPI (:func:`protect_host_blob`), in a file whose access list
-    names SYSTEM, Administrators and the calling account. Linux: the blob itself, in a file of mode
-    ``0600`` owned by the calling account and carrying no POSIX access control list, one it inherits
-    from its directory's default list included (draft rules 3b and 5), so :func:`read_host_file`
-    accepts what this writes. Any other platform is refused before a file is made, because
-    :func:`read_host_file` refuses every file there. Raises :class:`CustodyError` on such a
-    platform, ``FileExistsError`` when ``path`` exists, and what
-    :func:`~messagefoundry.restricted_file.write_restricted_file` raises otherwise; after any failure
-    but ``FileExistsError`` there is no file at ``path``."""
+    Windows: the blob under user-scope DPAPI (:func:`protect_host_blob`), in a file whose protected
+    access list names SYSTEM, Administrators and the calling account, each with full control. A
+    calling account of SYSTEM, LOCAL SERVICE or NETWORK SERVICE is refused before the blob is
+    protected (:func:`~messagefoundry.restricted_file.custody_account_problem`), as the read
+    refuses it. Linux: the blob itself, in a file of mode ``0600`` owned by the calling account and
+    carrying no POSIX access control list, one it inherits from its directory's default list
+    included (draft rules 3b and 5).
+
+    The volume is checked on the still-empty file before a byte is written, as the read checks it:
+    a local NTFS or ReFS disk on Windows, and on Linux a file system
+    :data:`~messagefoundry.restricted_file.LINUX_HOST_FILE_SYSTEMS` names. A refused one leaves no
+    file. Any other platform is refused before a file is made, because :func:`read_host_file`
+    refuses every file there. Raises :class:`CustodyError` on such a platform or for such an
+    account, ``FileExistsError`` when ``path`` exists, and what
+    :func:`~messagefoundry.restricted_file.write_restricted_file` raises otherwise, which also says
+    whether a failure left a file behind."""
     from messagefoundry.restricted_file import write_restricted_file
 
     if sys.platform not in {"win32", "linux"}:
         raise CustodyError("a host file is written on Linux and Windows only, where it can be read")
-    data = protect_host_blob(blob) if sys.platform == "win32" else blob.serialize()
-    write_restricted_file(path, data)
+    if sys.platform == "win32":
+        _refuse_a_shared_engine_account("the host file was not written")
+        data = protect_host_blob(blob)
+    else:
+        data = blob.serialize()
+    write_restricted_file(path, data, local_volume_only=True)
+
+
+def _refuse_a_shared_engine_account(what: str) -> None:
+    """Windows: raise :class:`CustodyError`, prefixed with ``what``, when this process runs as an
+    account no key custody file is kept for, or one that could not be read."""
+    from messagefoundry.config.wiring import _win32_config_source_probes
+    from messagefoundry.restricted_file import custody_engine_problem
+
+    problem = custody_engine_problem(_win32_config_source_probes().self_sid)
+    if problem is not None:
+        raise CustodyError(f"{what}: {problem}")
 
 
 def read_host_file(path: Path) -> HostBlob:
     """Read the host blob :func:`write_host_file` wrote, refusing a file others can reach.
 
-    Windows: a link, or a file a known broad group or an application package can read or change,
-    is refused before it is read (:func:`~messagefoundry.restricted_file.broad_access_problem`), and
-    so is a blob that is not user-scope DPAPI. Linux: the owner alone may reach the file (draft rule
-    3b, mode ``0600``), so at least these are refused: a link, anything but a regular file, a file
-    whose mode grants any group or other access, one the engine's own account does not own, and one
-    that carries a POSIX access control list at all, whatever it grants (:func:`write_host_file`
-    writes none), or whose list cannot be read. Any other POSIX host is
-    refused, because this engine reads the file's access control list on Linux only. Raises
-    ``FileNotFoundError`` when there is no file, and :class:`CustodyError` (or a DPAPI error on
-    Windows) for every other refusal.
+    Windows: the file is judged before it is read by :func:`_read_windows_checked`, with the engine's
+    own account at full control, the list :func:`write_host_file` writes, and a blob that is not
+    user-scope DPAPI is refused after it is read. Linux: the file is judged by
+    :func:`_read_posix_checked` under the host file policy (draft rule 3b; mode exactly ``0600``
+    and no POSIX access control list, :data:`_HOST_FILE_POLICY`). Any other POSIX host is refused.
+    Raises ``FileNotFoundError`` when there is no file, and :class:`CustodyError` (or a DPAPI error
+    on Windows) for every other refusal.
 
-    Not checked on Windows yet, at least: the file's owner, an access list that names an account
-    outside the known broad groups, the containing directory's access, and a parent link swapped
-    between the open and the access-list read (:func:`_read_windows_checked`). The Linux arm checks
-    the owner."""
+    Not checked, at least: the containing directory's access, on either platform."""
     if sys.platform == "win32":
-        return unprotect_host_blob(_read_windows_checked(path))
+        return unprotect_host_blob(_read_windows_checked(path, engine_read_only=False))
     return HostBlob.parse(_read_posix_checked(path, _HOST_FILE_POLICY))
 
 
@@ -785,15 +915,36 @@ def read_host_file(path: Path) -> HostBlob:
 def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> None:
     """Write the handoff blob: ``blob`` under machine-scope DPAPI, in a NEW file created restricted.
 
-    Its access list names SYSTEM, Administrators and the calling account with full control, and
-    ``service_account`` (an account name such as ``NT SERVICE\\MessageFoundry``, or a SID with or
-    without a leading ``*``) with read. An account that resolves to a package SID is refused, so no
+    Its access list is the draft's descriptor (rule 5) with DELETE added to the service's entry,
+    ``D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRSD;;;<the service>)``: SYSTEM and Administrators with full
+    control, ``service_account`` (an account name such as ``NT SERVICE\\MessageFoundry``, or a SID
+    with or without a leading ``*``) with read and delete, so the service can delete the handoff
+    through the handle it read it with (:func:`consume_handoff_file`, draft rule 3 step 2), and
+    nothing for the calling account. ``service_account`` is resolved to its SID once, and that SID
+    is what the list names. An account that resolves to a package SID is refused, so no
     AppContainer package is ever granted the handoff. Machine scope lets any account on the host
-    unprotect the blob, so that access list is the only control, which is why the handoff lives only
-    from install to the service's first start (draft rule 3).
+    unprotect the blob, so that access list and the file's owner are the only controls, which is why
+    the handoff lives only from install to the service's first start (draft rule 3). The volume is
+    checked on the still-empty file before a byte is written: a local NTFS or ReFS disk.
 
-    The calling account's own full-control entry is wider than the draft's descriptor, which names
-    SYSTEM, Administrators and the service alone; ``write_restricted_file`` always writes it.
+    :func:`read_handoff_file` accepts the file only when SYSTEM, Administrators or the service owns
+    it, so this makes Administrators its owner in the call that creates it, whatever the policy
+    *System objects: Default owner for objects created by members of the Administrators group*
+    names, and reads that owner back through the creating handle before a byte is written. A
+    caller whose token does not hold Administrators enabled (at least an administrator who is not
+    elevated) is refused with :class:`CustodyError` before the blob is protected or a file is
+    created, so the owner a read would refuse is never written. A create Windows refuses that owner,
+    or a file that reads back owned by anyone else, is refused with :class:`CustodyError` too, and
+    no file is left; where the file cannot be removed, or the token's groups cannot be read,
+    :class:`~messagefoundry.restricted_file.RestrictedFileError` says so instead.
+
+    A ``service_account`` that is SYSTEM, LOCAL SERVICE or NETWORK SERVICE is refused with
+    :class:`CustodyError` before anything is written, unconditionally: the read grant would reach
+    every service that runs as it, and a grant to SYSTEM would collapse into SYSTEM's own entry. So
+    is any account that is not ONE account, as ``LookupAccountSidW`` reports it
+    (:func:`~messagefoundry.restricted_file.handoff_grantee_problem`): a group or an alias, such as
+    Administrators or Backup Operators, a domain, or a SID it maps to nothing, unless that SID has
+    the shape of one service's own SID. A user account and a virtual service account pass.
 
     Windows only: raises :class:`~messagefoundry.secrets_dpapi.DpapiUnavailable` elsewhere, because
     a POSIX host needs no handoff."""
@@ -802,30 +953,112 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
 
     if sys.platform != "win32":
         raise DpapiUnavailable("the handoff blob is Windows-only; a POSIX host needs no handoff")
-    # write_restricted_file refuses a grant that resolves to a package SID or a broad group.
-    write_restricted_file(
-        path, dpapi_protect(blob.serialize(), machine_scope=True), read_grants=[service_account]
+    from messagefoundry.auth.anchor_path import ADMINISTRATORS_SID
+    from messagefoundry.restricted_file import (
+        RestrictedFileError,
+        _administrators_enabled,
+        _lookup_sid_kind,
+        _OwnerRefused,
+        _resolve_sid,
+        handoff_grantee_problem,
     )
+
+    service_sid = _resolve_sid(service_account)
+    refused: str | None = None
+    try:
+        refused = handoff_grantee_problem(service_sid, _lookup_sid_kind)
+    except RestrictedFileError as exc:
+        refused = str(exc)
+    if refused is not None:
+        raise CustodyError(f"the handoff was not written for {service_account!r}: {refused}")
+    if not _administrators_enabled():
+        raise CustodyError(
+            "the handoff was not written: it must be owned by Administrators, and this process's "
+            "token does not hold that group enabled (an administrator who is not elevated holds "
+            "it for deny only); run it from an elevated prompt"
+        )
+    try:
+        # write_restricted_file refuses a grant that resolves to a package SID or a broad group.
+        write_restricted_file(
+            path,
+            dpapi_protect(blob.serialize(), machine_scope=True),
+            read_grants=[f"*{service_sid}"],
+            creator_access=False,
+            owner=ADMINISTRATORS_SID,
+            read_delete=True,
+            local_volume_only=True,
+        )
+    except _OwnerRefused as exc:
+        raise CustodyError(f"the handoff was not written: {exc}") from exc
 
 
 def read_handoff_file(path: Path) -> HostBlob:
-    """Read a handoff blob, refusing a link, a file a known broad group or an application package
-    can read or change, and a blob that is not machine-scope DPAPI.
+    """Read a handoff blob as the service it was made for.
+
+    The file is judged before it is read by :func:`_windows_checked`, with the engine's own account
+    at read and delete: the descriptor :func:`write_handoff_file` writes, with the engine's account
+    as the service. This reads the handoff and leaves it, so it opens it for reading only;
+    :func:`consume_handoff_file`, the first start's read, also opens it with DELETE. Machine scope opens for every account, so the owner and
+    list checks are what keep a handoff another local account made around a key it chose from being
+    read: that account owns its file. They do not keep out an account that holds a privilege to set
+    any owner, such as the restore privilege Administrators and Backup Operators hold. A blob that
+    is not machine-scope DPAPI is refused after it is read.
 
     Raises ``FileNotFoundError`` when there is none, :class:`CustodyError` for each refusal above or
     a blob that is not a host blob, and the DPAPI errors of
     :func:`~messagefoundry.secrets_dpapi.dpapi_unprotect`. Windows only, as the write is.
 
-    Not checked yet, at least what :func:`read_host_file` lists for Windows. Since machine scope
-    opens for every account, any local account that can create a file at this path can make a
-    handoff around a key it chose, and the access list is the only control. **So nothing may convert
-    a handoff read here until those checks exist**; the slice that converts it at first start must
-    add them first."""
+    Not checked, at least: the containing directory's access."""
     from messagefoundry.secrets_dpapi import DpapiUnavailable
 
     if sys.platform != "win32":
         raise DpapiUnavailable("the handoff blob is Windows-only; a POSIX host needs no handoff")
-    return _unprotect_in_scope(_read_windows_checked(path), machine_scope=True, what="handoff blob")
+    return _unprotect_in_scope(
+        _read_windows_checked(path, engine_read_only=True), machine_scope=True, what="handoff blob"
+    )
+
+
+def consume_handoff_file(path: Path, convert: Callable[[HostBlob], None]) -> HostBlob:
+    """The service's first start (draft rule 3 step 2): read the handoff as
+    :func:`read_handoff_file` does, hand the blob to ``convert``, and once ``convert`` returns,
+    delete the handoff through the same handle that read it, so the file deleted is the file read
+    and never whatever the name reaches by then. Returns the blob.
+
+    ``convert`` re-wraps the key in the service's own user scope, writes the host file and checks
+    that it opens. The handle, opened with DELETE, stays open until this returns, so the file cannot
+    be renamed, replaced or deleted under it. When ``convert`` raises, the handoff is left as it is
+    and the error propagates, so a start that cannot convert refuses and never runs from the
+    handoff (step 3). When Windows refuses the delete, or the name is still there once the handle
+    closes (a volume with no POSIX-semantics delete, while another handle holds the file),
+    :class:`HandoffLeftBehind` says so, after ``convert`` has run. Otherwise raises as
+    :func:`read_handoff_file` does. Windows only."""
+    from messagefoundry.restricted_file import delete_through_handle
+    from messagefoundry.secrets_dpapi import DpapiUnavailable
+
+    if sys.platform != "win32":
+        raise DpapiUnavailable("the handoff blob is Windows-only; a POSIX host needs no handoff")
+    reason: str | None = None
+    with _windows_checked(path, engine_read_only=True, delete=True) as (data, handle):
+        blob = _unprotect_in_scope(data, machine_scope=True, what="handoff blob")
+        convert(blob)
+        try:
+            delete_through_handle(handle)
+        except OSError as exc:
+            reason = f"could not be deleted through the handle that read it ({_os_reason(exc)})"
+    if reason is None:
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return blob
+        except OSError:
+            pass  # a name still pending its delete answers access denied: it is still there
+        reason = (
+            "was deleted through the handle that read it, and its name is still there: another "
+            "handle may still hold it, and the name goes when that closes"
+        )
+    raise HandoffLeftBehind(
+        f"{path} was converted, but {reason}; check that it is gone, and delete it if it is not"
+    )
 
 
 # --- the systemd credential (POSIX, draft rule 3b) ------------------------------------------------
@@ -840,21 +1073,20 @@ def read_systemd_credential(name: str, *, environ: Mapping[str, str] | None = No
     ``$CREDENTIALS_DIRECTORY`` is a path, not a secret, so reading it from the environment does not
     break draft rule 13. ``environ`` defaults to the process environment.
 
-    Raises :class:`CredentialUnavailable` when the variable is unset, names no such file, or the
-    host is not Linux, since systemd credentials are Linux-only. Raises :class:`CustodyError` for a
-    name that is not a plain file name, a directory that is not an absolute path, a file that is a
-    link, and content that is not a host blob. It raises the same for a file that is owned by an
-    account other than root or the engine's own, and for at least these grants: any access for the
-    file's group in its list's group entry or, with no access control list, in its mode's group
-    bits, any access for other accounts, and any
-    named user or group entry in its POSIX access control list but read for the engine's own uid.
-    A file system with its own access model, such as an NFSv4 or CIFS mount, shows no POSIX list,
-    so what that model grants is not checked
-    (:func:`~messagefoundry.restricted_file.posix_access_acl`). systemd writes the
-    credential owned by root at mode ``0400`` and grants a non-root service user read through a
-    named entry, which shows the mode as ``0440`` because the group bits are then the list's mask;
-    where the file system takes no access control list it gives the file to the service user and
-    group at mode ``0400`` instead. Neither form grants the file's group anything."""
+    Raises :class:`CredentialUnavailable` when the variable is unset or empty, or names a directory
+    that holds no file of that name. A set variable this reader cannot honour is a broken
+    credential setup rather than an absent credential, so it raises :class:`CustodyError`, and a
+    caller does not fall back to a weaker provider: on any host but Linux, since systemd credentials
+    are Linux-only, and for a directory that is not an absolute path or does not exist. It raises
+    :class:`CustodyError` too for a name that is not a plain file name and content that is not a
+    host blob, and for every refusal :func:`_read_posix_checked` makes under
+    :data:`_CREDENTIAL_POLICY`, which :func:`_posix_file_problem` lists; that policy fixes no mode,
+    so the owner's own bits and the setuid, setgid and sticky bits are not judged. systemd writes
+    the credential owned by root at mode ``0400`` and grants a non-root
+    service user read through a named entry, which shows the mode as ``0440`` because the group
+    bits are then the list's mask; where the file system takes no access control list it gives the
+    file to the service user and group at mode ``0400`` instead. Neither form grants the file's
+    group anything."""
     if not name or name in {".", ".."} or any(c in name for c in "/\\\x00"):
         raise CustodyError("a credential name is a plain file name, with no directory part")
     directory = (os.environ if environ is None else environ).get(_CREDENTIALS_DIRECTORY)
@@ -863,7 +1095,10 @@ def read_systemd_credential(name: str, *, environ: Mapping[str, str] | None = No
             f"${_CREDENTIALS_DIRECTORY} is not set, so no credential is offered"
         )
     if sys.platform != "linux":
-        raise CredentialUnavailable("a systemd credential is offered on Linux only")
+        # Set, so a credential was meant to be offered; refuse rather than let a caller fall back.
+        raise CustodyError(
+            f"${_CREDENTIALS_DIRECTORY} is set, but a systemd credential is read on Linux only"
+        )
     if not os.path.isabs(directory):
         raise CustodyError(f"${_CREDENTIALS_DIRECTORY} must be an absolute path")
     if not os.path.isdir(directory):
@@ -872,10 +1107,7 @@ def read_systemd_credential(name: str, *, environ: Mapping[str, str] | None = No
         raise CustodyError(f"${_CREDENTIALS_DIRECTORY} names no directory")
     data: bytes | None = None
     with contextlib.suppress(FileNotFoundError):
-        data = _read_posix_checked(
-            Path(directory) / name,
-            _PosixPolicy(owners=frozenset({0}), access_list=True),
-        )
+        data = _read_posix_checked(Path(directory) / name, _CREDENTIAL_POLICY)
     # Raised outside the suppressed error, so the refusal carries no chained exception.
     if data is None:
         raise CredentialUnavailable(f"${_CREDENTIALS_DIRECTORY} holds no credential named {name!r}")
