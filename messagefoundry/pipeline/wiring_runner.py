@@ -263,7 +263,6 @@ from messagefoundry.transports.base import (
     guard_dir_settings,
     guarded_destination_dirs,
     guarded_source_dirs,
-    validated_at_start,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.egress import warn_url_query_credentials_before_build
@@ -4572,13 +4571,14 @@ class RegistryRunner:
             await self._check_lane_anchor("outbound", name, dest.settings)
             # #200 (ADR 0092): stamp the derived instance posture, exactly as _start_outbound does —
             # an unstamped build makes the posture-keyed insecure-hop cells decide against the wrong
-            # (fail-closed/no-op default) posture. validated_at_start: validate_startup below runs
-            # before the lane serves, so a connector may move a blocking check there.
-            with active_hop_posture(self._hop_posture), validated_at_start():
-                # The step above has logged the warning, so the egress check does not repeat it.
-                connector = build_destination(
-                    dest, egress=self._egress, warn_query_credentials=False
-                )
+            # (fail-closed/no-op default) posture. Off the event loop (engine PR 2815, hold F2).
+            # The step above has logged the warning, so the egress check does not repeat it.
+            connector = await _build_off_loop(
+                self._hop_posture,
+                functools.partial(
+                    build_destination, dest, egress=self._egress, warn_query_credentials=False
+                ),
+            )
             # Opt-in at-start directory validation (#114) — the same hook _start_outbound awaits, so an
             # operator START of a File/RemoteFile outbound with validate_directory=true gets the same
             # refusal the engine start path gives it, isolated the same way (this method never raises).
@@ -5156,10 +5156,11 @@ class RegistryRunner:
         # it WARNS where its neighbours refuse. See the function for why a refusal is not available here.
         warn_unbudgeted_streaming_inbound(ic, budget=self._stream_inflight_budget)
         # #200 (ADR 0092): stamp the posture for the source build too (a DATABASE poll source keys its
-        # weakened-TLS refusal on it), matching the exposure-check posture threading above.
-        # validated_at_start: validate_startup below runs before the bind.
-        with active_hop_posture(self._hop_posture), validated_at_start():
-            source = build_source(source_cfg, egress=self._egress)
+        # weakened-TLS refusal on it), matching the exposure-check posture threading above. Off the
+        # event loop (engine PR 2815, hold F2).
+        source = await _build_off_loop(
+            self._hop_posture, functools.partial(build_source, source_cfg, egress=self._egress)
+        )
         # Inject the connection-event sink (#46) BEFORE start so a listen source can emit accept/refuse/
         # close. None when capture is off (byte-identical). transports/ stays store-agnostic — the sink
         # is a runner-owned coroutine that only enqueues onto the off-hot-path drain queue.
@@ -5798,13 +5799,15 @@ class RegistryRunner:
             # would ship cleartext) and the HTTP guards fail-closed (a legit non-prod cleartext lane would
             # wrongly refuse) on the primary serve path. Mirrors _start_inbound_unsafe threading posture
             # into the exposure checks. None in a test/embedding that derives no posture: the guards no-op
-            # there, and a weakened-TLS escape is refused (vault BACKLOG #2354). validated_at_start:
-            # validate_startup below runs before the lane serves.
-            with active_hop_posture(self._hop_posture), validated_at_start():
-                # The step above has logged the warning, so the egress check does not repeat it.
-                connector = build_destination(
-                    dest, egress=self._egress, warn_query_credentials=False
-                )
+            # there, and a weakened-TLS escape is refused (vault BACKLOG #2354). Off the event loop
+            # (engine PR 2815, hold F2). The step above has logged the warning, so the egress check
+            # does not repeat it.
+            connector = await _build_off_loop(
+                self._hop_posture,
+                functools.partial(
+                    build_destination, dest, egress=self._egress, warn_query_credentials=False
+                ),
+            )
             # ADR 0013: a capturing outbound on a backend that can't persist captures must not deliver
             # — but (ADR 0031) degrade THIS lane, don't crash the engine. Rows routed here are retried,
             # not dropped, so the ADR 0013 "never silently drop replies" intent is preserved.
@@ -7336,8 +7339,41 @@ class RegistryRunner:
         checks them without making them the live graph's (vault BACKLOG #2596).
 
         ``now`` pins the schedule clock the exposure gates' predicate reads
-        (:meth:`listener_bind_predicate`); ``None`` reads the clock."""
-        build_check_registry(
+        (:meth:`listener_bind_predicate`); ``None`` reads the clock.
+
+        Synchronous, for a caller that is not on a serving event loop; one that is awaits
+        :meth:`build_check_off_loop`."""
+        self._build_check_call(registry, env_values, now)()
+        self._check_store_backends(registry)
+
+    async def build_check_off_loop(
+        self,
+        registry: Registry,
+        env_values: Mapping[str, Any] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """:meth:`build_check`, with the connector builds in a worker thread, since a build can
+        list folders and read files, such as a DATABASE connector's ``sslcapath`` entries (engine PR
+        2815, hold F2). What the build reads from this runner is read here, on the loop, first
+        (:meth:`_build_check_call`), and the one write the build makes to ``registry``, the
+        idempotent :func:`apply_sync_reply_capture_implication`, is made here too, so the thread
+        repeats it as a no-op."""
+        apply_sync_reply_capture_implication(registry)
+        await asyncio.to_thread(self._build_check_call(registry, env_values, now))
+        self._check_store_backends(registry)
+
+    def _build_check_call(
+        self, registry: Registry, env_values: Mapping[str, Any] | None, now: datetime | None
+    ) -> Callable[[], None]:
+        """:func:`build_check_registry` bound to ``registry`` and to this runner's settings, read
+        now. The exposure gates' predicate is evaluated now as well, into the set of inbound names
+        it holds for, because :meth:`listener_bind_predicate` reads the DR threshold and the
+        schedule clock through ``self`` when it runs."""
+        binds = self.listener_bind_predicate(now=now)
+        gated = frozenset(ic.name for ic in registry.inbound.values() if ic.deployed and binds(ic))
+        return functools.partial(
+            build_check_registry,
             registry,
             inbound_bind_host=self._inbound_bind_host,
             env_values=self._env_values if env_values is None else env_values,
@@ -7349,8 +7385,11 @@ class RegistryRunner:
             # The exposure gates run on the listeners this runner would bind, read against its live
             # state. A reload calls this under its lock; a dry run does not, and
             # listener_bind_predicate says why that window is accepted (vault BACKLOG #3063 item 5).
-            exposure_gated=self.listener_bind_predicate(now=now),
+            exposure_gated=lambda ic: ic.name in gated,
         )
+
+    def _check_store_backends(self, registry: Registry) -> None:
+        """The store-capability gates :meth:`build_check` runs after the builds."""
         # PT-backend allow-list — folded in here (vs only at Engine.start) so EVERY reload + dry-run
         # path that build-checks the new registry also rejects a PT-on-non-SQLite graph before any
         # swap. RegistryRunner carries the resolved store, so the gate sees the backend's capability.
@@ -7668,21 +7707,27 @@ class RegistryRunner:
                 else name in self._destinations
             )
             if not live:
-                # added (or replacing a crashed worker): close any stale connector, build + spawn.
-                stale = self._destinations.pop(name, None)
-                if stale is not None:
-                    await stale.aclose()
-                # #200 (ADR 0092): stamp the posture for the reload rebuild too. build_check above vetted
-                # the new registry against the real posture, but the HTTP cells fail-closed when unstamped
-                # — so an unstamped rebuild here would raise InsecureHopRefused on a legit non-prod cleartext
-                # lane AFTER intake is quiesced (the "connector builds here cannot fail" invariant).
-                with active_hop_posture(self._hop_posture):
-                    self._destinations[name] = build_destination(
+                # added (or replacing a crashed worker): build, swap in, close any stale connector,
+                # spawn. #200 (ADR 0092): stamp the posture for the reload rebuild too. build_check
+                # above vetted the new registry against the real posture, but the HTTP cells
+                # fail-closed when unstamped — so an unstamped rebuild here would raise
+                # InsecureHopRefused on a legit non-prod cleartext lane AFTER intake is quiesced (the
+                # "connector builds here cannot fail" invariant). Built off the event loop (engine PR
+                # 2815, hold F2) BEFORE the pop, so no await falls between the pop and the swap.
+                built = await _build_off_loop(
+                    self._hop_posture,
+                    functools.partial(
+                        build_destination,
                         _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress),
                         egress=self._egress,
                         # build_check already warned for this reload (vault BACKLOG #2910)
                         warn_query_credentials=False,
-                    )
+                    ),
+                )
+                stale = self._destinations.pop(name, None)
+                self._destinations[name] = built
+                if stale is not None:
+                    await stale.aclose()
                 self._failed.pop(("outbound", name), None)
                 self._spawn_worker(name)
             elif (
@@ -7706,14 +7751,20 @@ class RegistryRunner:
                 # lane that then had nothing to deliver through, and its rows retried forever. A lane
                 # whose `live` is connector-keyed cannot reach this elif with a missing connector, so
                 # for those the clause is inert — which is every pooled FIFO lane (ADR 0066 D4).
-                old_conn = self._destinations.get(name)
-                # #200 (ADR 0092): stamp the posture for the in-place rebuild too (see the branch above).
-                with active_hop_posture(self._hop_posture):
-                    self._destinations[name] = build_destination(
+                # #200 (ADR 0092): stamp the posture for the in-place rebuild too, off the event loop,
+                # and read the old connector only after it, so no await falls between that read and
+                # the swap (see the branch above).
+                built = await _build_off_loop(
+                    self._hop_posture,
+                    functools.partial(
+                        build_destination,
                         _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress),
                         egress=self._egress,
                         warn_query_credentials=False,  # as in the branch above
-                    )
+                    ),
+                )
+                old_conn = self._destinations.get(name)
+                self._destinations[name] = built
                 self._failed.pop(("outbound", name), None)
                 if old_conn is not None:
                     await old_conn.aclose()
@@ -7892,7 +7943,7 @@ class RegistryRunner:
             now = self._schedule_clock()
             try:
                 # raises before any change on a bad connector
-                self.build_check(new_registry, now=now)
+                await self.build_check_off_loop(new_registry, now=now)
             except BaseException:
                 self._env_values = old_env_values
                 raise
@@ -12399,6 +12450,20 @@ def _dest_config(
         # delivery effect. Default 0.0 → byte-identical.
         waiting_display_delay=oc.waiting_display_delay,
     )
+
+
+async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T]) -> T:
+    """Run a connector ``build`` in a worker thread, inside ``active_hop_posture(posture)``. A
+    build can list folders and read files, such as a DATABASE connector's ``sslcapath`` entries and
+    its driver key and CA files, so a serving engine never builds on the event loop (engine PR 2815,
+    hold F2; CLAUDE.md section 6). A refusal raises here as it would have raised in place. A
+    connector constructor touches neither the loop nor the store; it only constructs."""
+
+    def stamped() -> T:
+        with active_hop_posture(posture):
+            return build()
+
+    return await asyncio.to_thread(stamped)
 
 
 def build_check_registry(

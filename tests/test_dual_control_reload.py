@@ -1554,15 +1554,15 @@ async def test_a_dry_run_checks_the_new_env_values_without_applying_them(
     runner = engine.registry_runner
     assert runner is not None
     checked: list[object] = []
-    real_check = runner.build_check
+    real_check = runner.build_check_off_loop
 
-    def _recording_check(registry: Any, *env_values: Any) -> None:
+    async def _recording_check(registry: Any, *env_values: Any) -> None:
         # Passes on only what it was given, so a call without the values fails the assert below
         # rather than the spy (the round-2 review).
         checked.append(env_values[0] if env_values else None)
-        real_check(registry, *env_values)
+        await real_check(registry, *env_values)
 
-    monkeypatch.setattr(runner, "build_check", _recording_check)
+    monkeypatch.setattr(runner, "build_check_off_loop", _recording_check)
     values["HOST"] = "second.example.invalid"
     await engine.reload_detail(dry_run=True)
     assert checked == [{"HOST": "second.example.invalid"}]

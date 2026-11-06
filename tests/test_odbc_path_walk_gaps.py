@@ -16,6 +16,8 @@ Synthetic paths and host names only.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import copy
 import logging
 import os
@@ -23,18 +25,30 @@ import pickle
 import re
 import sys
 import threading
-from collections.abc import Callable, Iterator, Mapping
+import time
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from messagefoundry.api.app import _run_connection_test
 from messagefoundry.auth import anchor_path
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import DIRECTORY, FILE, LINK, windows_chain
 from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.wiring import (
+    ConnectionSpec,
+    Database,
+    File,
+    Registry,
+    build_inbound_connection,
+    build_outbound_connection,
+)
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.store import MessageStore
 from messagefoundry.transports import database
-from messagefoundry.transports.base import validated_at_start
 
 _FIXED = 3  # GetDriveTypeW: a fixed disk
 _SHARE = r"\\files.test\share"
@@ -938,7 +952,158 @@ def test_hold_f1_an_sslcapath_entry_linked_onto_a_share_is_refused_with_a_logged
     assert all("phi-entry" not in m for m in warned)
 
 
-# --- F2: a build on the event loop lists no sslcapath folder -------------------------------------
+# --- F2: a serving engine never lists an sslcapath folder on the event loop ---------------------
+
+
+def _db_spec(folder: Path, statement: str = "INSERT INTO t (a) VALUES (:a)") -> ConnectionSpec:
+    return Database(
+        server="db.synthetic.test",
+        statement=statement,
+        dialect="generic",
+        odbc_driver="MySQL ODBC 9.1 Unicode Driver",
+        odbc_params={"SSLMODE": "VERIFY_IDENTITY", "SSLCAPATH": str(folder)},
+    )
+
+
+def _db_graph(folder: Path, statement: str = "INSERT INTO t (a) VALUES (:a)") -> Registry:
+    """One generic DATABASE outbound whose ``sslcapath`` names ``folder``."""
+    reg = Registry()
+    reg.add_outbound(build_outbound_connection(_OUT, _db_spec(folder, statement)))
+    return reg
+
+
+@pytest.fixture
+async def db_store(tmp_path: Path) -> AsyncIterator[MessageStore]:
+    s = await MessageStore.open(tmp_path / "hold-f2.db")
+    yield s
+    await s.close()
+
+
+def _db_runner(store: MessageStore, reg: Registry) -> RegistryRunner:
+    return RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
+
+
+async def _no_probe(_self: object) -> None:
+    """Stands in for a coroutine method the test does not exercise."""
+    return None
+
+
+class _LoopWatch:
+    """Each listing of an sslcapath folder, recorded with the thread it ran on and whether a
+    coroutine on the event loop ran while it took ``seconds``. A listing on the loop thread holds
+    the loop, so the coroutine cannot run during it."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, seconds: float = 0.0) -> None:
+        self.threads: list[int] = []
+        self.loop_ran: list[bool] = []
+        self._seconds = seconds
+        self._ticks = 0
+        real = database._capath_folder_clear
+
+        def listing(folder: str) -> bool:
+            self.threads.append(threading.get_ident())
+            before = self._ticks
+            time.sleep(self._seconds)  # a slow listing, as of a large folder or a slow volume
+            self.loop_ran.append(self._ticks > before)
+            return real(folder)
+
+        monkeypatch.setattr(database, "_capath_folder_clear", listing)
+
+    @contextlib.asynccontextmanager
+    async def ticking(self) -> AsyncIterator[None]:
+        """Run a coroutine that counts on the loop while the body runs."""
+        stop = asyncio.Event()
+
+        async def tick() -> None:
+            while not stop.is_set():
+                self._ticks += 1
+                await asyncio.sleep(0.005)
+
+        task = asyncio.create_task(tick())
+        try:
+            yield
+        finally:
+            stop.set()
+            await task
+
+
+async def test_hold_f2_a_reload_lists_the_folder_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore
+) -> None:
+    """A reload's build check and its rebuild of the changed lane each list the folder, and
+    neither holds the event loop while it does. Red: both listed on the loop thread, and the
+    concurrent coroutine did not run during either listing."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+    runner = _db_runner(db_store, _db_graph(folder))
+    await runner.start()
+    try:
+        watch = _LoopWatch(monkeypatch, seconds=0.2)
+        async with watch.ticking():
+            await runner.reload(_db_graph(folder, "INSERT INTO t (b) VALUES (:b)"))
+        assert len(watch.threads) == 2, watch.threads  # the build check, then the rebuild
+        assert threading.get_ident() not in watch.threads
+        assert all(watch.loop_ran), watch.loop_ran
+    finally:
+        await runner.stop()
+
+
+async def test_hold_f2_a_connection_test_lists_the_folder_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore
+) -> None:
+    """The connection test builds a fresh connector, and its listing does not hold the event loop.
+    Red: the test built it on the loop thread."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+
+    monkeypatch.setattr(database.DatabaseDestination, "test_connection", _no_probe)
+    runner = _db_runner(db_store, _db_graph(folder))
+    watch = _LoopWatch(monkeypatch, seconds=0.2)
+    async with watch.ticking():
+        result = await _run_connection_test(runner, _OUT, "outbound")
+    assert result.success, result.detail
+    assert len(watch.threads) == 1 and threading.get_ident() not in watch.threads
+    assert all(watch.loop_ran), watch.loop_ran
+
+
+async def test_hold_f2_no_lane_start_skips_the_entry_walk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore
+) -> None:
+    """The walk runs in the build itself, so no path can build a connector that skips it, even one
+    that never awaits ``validate_startup``. A refused entry still fails the lane before it serves,
+    with the build's own refusal. Red: a lane start left the walk to ``validate_startup``, so with
+    that not awaited the entry was never judged and the lane served."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
+
+    monkeypatch.setattr(database.DatabaseDestination, "validate_startup", _no_probe)
+    watch = _LoopWatch(monkeypatch)
+    runner = _db_runner(db_store, _db_graph(folder))
+    await runner.start()
+    try:
+        assert watch.threads and threading.get_ident() not in watch.threads
+        assert _OUT not in cast(Any, runner)._destinations
+        failure = cast(Any, runner)._failed.get(("outbound", _OUT))
+        assert failure is not None
+        assert "'sslcapath' must name a folder it can list" in str(failure)
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("direction", ["outbound", "inbound"])
+async def test_hold_f2_a_build_on_a_running_loop_still_refuses_at_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, direction: str
+) -> None:
+    """The control: constructing a connector directly judges the entries and refuses in the
+    constructor, whatever thread or loop it runs on, as ``messagefoundry check`` and the dry run
+    rely on."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list") as refused:
+        _db_connector(direction, folder)
+    assert "phi-capath" not in str(refused.value)
 
 
 def _db_connector(direction: str, folder: Path) -> Any:
@@ -960,92 +1125,43 @@ def _db_connector(direction: str, folder: Path) -> Any:
     )
 
 
-def _listing_threads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    """Record the thread each listing of an sslcapath folder runs on."""
-    threads: list[int] = []
-    real = database._capath_folder_clear
-
-    def recording(folder: str) -> bool:
-        threads.append(threading.get_ident())
-        return real(folder)
-
-    monkeypatch.setattr(database, "_capath_folder_clear", recording)
-    return threads
-
-
-@pytest.mark.parametrize("direction", ["outbound", "inbound"])
-async def test_hold_f2_a_lane_start_judges_the_entries_off_the_event_loop(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, direction: str
+async def test_hold_f2_no_runner_build_runs_on_the_event_loop_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore
 ) -> None:
-    """A lane start builds the connector on the event loop, inside ``validated_at_start``, so the
-    build lists no folder there. ``validate_startup`` judges the entries in a worker thread and
-    still refuses before the lane serves. Red: the constructor listed the folder and walked its
-    entries on the loop thread."""
-    folder = _capath(tmp_path, "0a1b2c3d.0", "readme.txt")
-    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
-    threads = _listing_threads(monkeypatch)
-    loop_thread = threading.get_ident()
-    with validated_at_start():
-        connector = _db_connector(direction, folder)
-    assert threads == []
-    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list") as refused:
-        await connector.validate_startup()
-    assert "phi-capath" not in str(refused.value)
-    assert threads and loop_thread not in threads
-
-
-@pytest.mark.parametrize("direction", ["outbound", "inbound"])
-async def test_hold_f2_a_clear_folder_passes_the_lane_start(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, direction: str
-) -> None:
-    """The control: a folder whose entries stay on the host passes, judged once, off the loop."""
-    folder = _capath(tmp_path, "0a1b2c3d.0")
-    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
-    threads = _listing_threads(monkeypatch)
-    with validated_at_start():
-        connector = _db_connector(direction, folder)
-    await connector.validate_startup()
-    assert len(threads) == 1 and threading.get_ident() not in threads
-
-
-@pytest.mark.parametrize("direction", ["outbound", "inbound"])
-async def test_hold_f2_a_build_no_start_follows_still_refuses_at_once(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, direction: str
-) -> None:
-    """The control: a build outside ``validated_at_start``, as a reload's, a dry run's
-    ``build_check`` or a connection test's, judges the entries itself and refuses, as before,
-    even on the event loop, since nothing awaits ``validate_startup`` after it."""
-    folder = _capath(tmp_path, "0a1b2c3d.0")
-    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
-    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
-        _db_connector(direction, folder)
-
-
-@pytest.mark.parametrize("direction", ["outbound", "inbound"])
-def test_hold_f2_a_build_off_the_event_loop_still_refuses_at_once(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, direction: str
-) -> None:
-    """The control: with no loop on the thread, as for ``messagefoundry check``, the build judges
-    the entries itself and refuses, as before."""
-    folder = _capath(tmp_path, "0a1b2c3d.0")
-    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
-    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
-        _db_connector(direction, folder)
-
-
-def test_hold_f2_the_runner_marks_each_build_it_follows_with_validate_startup() -> None:
-    """Each runner site that builds a connector inside ``validated_at_start`` awaits
-    ``validate_startup`` on it a few lines later, and the reload's rebuilds, which await none,
-    are outside it. A source scan: a marked build with no ``validate_startup`` after it would
-    leave the entries unjudged."""
+    """Every connector the runner builds from a coroutine is built on a worker thread: a lane
+    start of an inbound and an outbound, a reload's build check and rebuild, the dry run's build
+    check, and the connection test. Red: each built on the loop thread."""
     from messagefoundry.pipeline import wiring_runner
 
-    source = Path(wiring_runner.__file__).read_text(encoding="utf-8").splitlines()
-    marked = [i for i, line in enumerate(source) if "validated_at_start()" in line]
-    assert len(marked) == 3
-    for i in marked:
-        window = "\n".join(source[i : i + 70])
-        assert re.search(r"build_(source|destination)\(", "\n".join(source[i : i + 4]))
-        assert "await connector.validate_startup()" in window or (
-            "await source.validate_startup()" in window
-        )
+    built: list[tuple[str, int]] = []
+    for name in ("build_source", "build_destination"):
+        real = getattr(wiring_runner, name)
+
+        def recording(*args: Any, _real: Any = real, _name: str = name, **kwargs: Any) -> Any:
+            built.append((_name, threading.get_ident()))
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(wiring_runner, name, recording)
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+    monkeypatch.setattr(database.DatabaseDestination, "test_connection", _no_probe)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    reg = _db_graph(folder)
+    reg.add_inbound(build_inbound_connection(_IN, File(directory=str(inbox)), router="r"))
+    reg.add_router("r", lambda _m: [])
+    runner = _db_runner(db_store, reg)
+    await runner.start()
+    try:
+        changed = _db_graph(folder, "INSERT INTO t (b) VALUES (:b)")
+        changed.add_inbound(build_inbound_connection(_IN, File(directory=str(inbox)), router="r"))
+        changed.add_router("r", lambda _m: [])
+        await runner.reload(changed)
+        await runner.build_check_off_loop(changed)
+        await _run_connection_test(runner, _OUT, "outbound")
+    finally:
+        await runner.stop()
+    kinds = {kind for kind, _thread in built}
+    assert kinds == {"build_source", "build_destination"}, built
+    assert len(built) >= 7, built  # start 2, reload 3, dry-run check 2, connection test 1
+    assert threading.get_ident() not in {thread for _kind, thread in built}

@@ -126,7 +126,6 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     PollStopGuard,
     SourceConnector,
-    build_is_validated_at_start,
     count_setting,
     float_setting,
     intake_open,
@@ -1088,18 +1087,12 @@ def driver_file_spellings(value: object, verdicts: FileVerdicts | None = None) -
 
 
 def _refuse_remote_path(
-    value: object,
-    verdicts: FileVerdicts,
-    *,
-    name: str,
-    connection: str | None,
-    capath_entries: bool = True,
+    value: object, verdicts: FileVerdicts, *, name: str, connection: str | None
 ) -> None:
     """Raise ``ValueError`` when ``value`` breaks a rule :func:`driver_file_rule` names for the
     file keyword ``name`` and its ``verdicts`` (BACKLOG #2705); otherwise return. The message names
-    the keyword, not the value. ``capath_entries`` is :func:`driver_file_rule`'s ``entries``.
-    ``docs/CONNECTIONS.md``, Generic ODBC, states the check's limits."""
-    rule = driver_file_rule(name, value, verdicts, entries=capath_entries)
+    the keyword, not the value. ``docs/CONNECTIONS.md``, Generic ODBC, states the check's limits."""
+    rule = driver_file_rule(name, value, verdicts)
     if rule is not None:
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE odbc_params value for '{name}' {rule}"
@@ -1107,20 +1100,18 @@ def _refuse_remote_path(
 
 
 def _refuse_remote_paths(
-    named: Mapping[str, Any], *, connection: str | None, capath_entries: bool = True
+    named: Mapping[str, Any], *, connection: str | None
 ) -> dict[str, FileVerdicts]:
     """Compute the verdicts of each file keyword in ``named``, in sorted keyword order, and raise
     ``ValueError`` (:func:`_refuse_remote_path`) at the first that breaks a rule, in every
     ``sslmode``. Otherwise return the verdicts for the checks that read the files: one entry per
-    file keyword ``named`` holds, set or not. ``capath_entries`` is :func:`driver_file_rule`'s
-    ``entries``. ``docs/CONNECTIONS.md``, Generic ODBC, states the check's limits."""
+    file keyword ``named`` holds, set or not. ``docs/CONNECTIONS.md``, Generic ODBC, states the
+    check's limits."""
     verdicts: dict[str, FileVerdicts] = {}
     for name in sorted(_ODBC_PATH_KEYS & named.keys()):
         value = named[name]
         verdicts[name] = file_keyword_verdicts(value)
-        _refuse_remote_path(
-            value, verdicts[name], name=name, connection=connection, capath_entries=capath_entries
-        )
+        _refuse_remote_path(value, verdicts[name], name=name, connection=connection)
     return verdicts
 
 
@@ -1140,19 +1131,16 @@ CAPATH_ENTRY_RULE = (
 )
 
 
-def driver_file_rule(
-    keyword: str, value: object, verdicts: FileVerdicts, *, entries: bool = True
-) -> str | None:
+def driver_file_rule(keyword: str, value: object, verdicts: FileVerdicts) -> str | None:
     """The rule a driver file keyword's ``value`` breaks, given its ``verdicts``, or ``None``:
     :data:`REMOTE_PATH_RULE` when :func:`names_another_host` refuses it, and
     :data:`CAPATH_ENTRY_RULE` when an entry of an ``sslcapath`` folder must be refused
     (:func:`_capath_entries_leave_host`). The one judgement the build and the lane check
     (``auth.trust_anchors.database_ca_anchor_spec``) both run, so the two refuse alike (vault
-    BACKLOG #5197). ``entries=False`` leaves the ``sslcapath`` folder unlisted, for a build that
-    hands that judgement to ``validate_startup`` and a worker thread (:class:`_CapathCheck`)."""
+    BACKLOG #5197)."""
     if names_another_host(value, verdicts):
         return REMOTE_PATH_RULE
-    if entries and keyword == "sslcapath" and _capath_entries_leave_host(value, verdicts):
+    if keyword == "sslcapath" and _capath_entries_leave_host(value, verdicts):
         return CAPATH_ENTRY_RULE
     return None
 
@@ -1161,11 +1149,11 @@ def driver_file_rule(
 #: for :func:`_path_verdict` and for listing an ``sslcapath`` folder.
 _WALKS_BEYOND_SPELLING = sys.platform == "win32"
 #: How many entries of an ``sslcapath`` folder :func:`_capath_entries_leave_host` judges. A folder
-#: holding more is refused rather than judged in part. That bounds the time a lane start or a lane
-#: check spends in the worker thread that lists it (:class:`_CapathCheck`), and the time a build
-#: the runner does not follow with ``validate_startup``, at least a reload's, spends listing it on
-#: the event loop. A CA folder holds a few hundred at most (one file and one link per CA), and each
-#: entry that is not a link costs one ``lstat`` (:func:`_capath_entry_clear`).
+#: holding more is refused rather than judged in part, which bounds the time a build or a lane
+#: check spends listing it. A serving engine builds a connector, and runs the lane check, in a
+#: worker thread, never on the event loop (``pipeline.wiring_runner``; engine PR 2815, hold F2). A
+#: CA folder holds a few hundred at most (one file and one link per CA), and each entry that is not
+#: a link costs one ``lstat`` (:func:`_capath_entry_clear`).
 _MAX_CAPATH_ENTRIES = 4096
 
 
@@ -1251,37 +1239,6 @@ def _capath_entry_clear(path: str, name: str) -> bool:
             if kind != LINK:
                 return True
     return _path_verdict(path) is False
-
-
-class _CapathCheck:
-    """The ``sslcapath`` entry judgement a connector build left to ``validate_startup`` (engine PR
-    2815, hold F2; CLAUDE.md section 6). The runner builds a lane's connector on the event loop, so
-    inside :func:`~messagefoundry.transports.base.validated_at_start` the build does not list the
-    folder. :meth:`run` lists it and walks its entries in a worker thread instead, and the runner
-    awaits it in ``validate_startup`` before the lane serves. A refusal raises the ``ValueError``
-    the build would have raised (:func:`_refuse_remote_path`), which fails the lane as a build
-    refusal does. Outside that scope the build judges the entries itself, as before."""
-
-    def __init__(self, value: object, connection: str | None) -> None:
-        self._value = value
-        self._connection = connection
-
-    @classmethod
-    def deferred(cls, settings: Mapping[str, Any], connection: str | None) -> _CapathCheck | None:
-        """The check a build inside ``validated_at_start`` owes for ``settings``, or ``None``: a
-        build outside it judges the entries itself, and a connection naming no ``sslcapath`` has
-        none."""
-        if not build_is_validated_at_start():
-            return None
-        value = generic_odbc_param(settings, "sslcapath")
-        return None if value is None else cls(value, connection)
-
-    def _judge(self) -> None:
-        verdicts = file_keyword_verdicts(self._value)
-        _refuse_remote_path(self._value, verdicts, name="sslcapath", connection=self._connection)
-
-    async def run(self) -> None:
-        await asyncio.to_thread(self._judge)
 
 
 def _refuse_weak_driver_key(
@@ -1377,7 +1334,8 @@ def _refuse_weak_driver_wrap(
 #: How much of an ``sslca``, ``sslcert`` or ``sslkey`` file :func:`_read_driver_file` reads: 1 MiB,
 #: the cap :mod:`messagefoundry.keywrap` puts on a key file (vault BACKLOG #3090, step 8). A CA
 #: bundle is tens or hundreds of KiB, and a client certificate with its key a few KiB. The read
-#: runs on the event loop when the connection is built, so the cap bounds that stall too.
+#: runs when the connection is built, in a worker thread on a serving engine, so the cap bounds
+#: that stall too.
 _MAX_DRIVER_CA_FILE_BYTES = 1 << 20
 #: ``ERROR_INVALID_NAME``: Windows' answer for a path it cannot spell, such as one with a leading
 #: space before the drive letter.
@@ -1526,7 +1484,7 @@ def _read_driver_file(
         # read_if_regular returns None for a directory it stats. One swapped in after that stat
         # can fail the open instead, as PermissionError on Windows, so the path is looked at
         # again after that failure alone: on a share Windows could not reach, a second look would
-        # wait out the same network timeout again, on the event loop. A path through a file names
+        # wait out the same network timeout again. A path through a file names
         # no file either. POSIX reports it as NotADirectoryError, which keywrap refused, so sslkey
         # still does; Windows reports it as a missing name, left to the driver.
         if isinstance(exc, NotADirectoryError) or (
@@ -1585,9 +1543,7 @@ def _irregular(
     logger.debug("%s: not a regular file, so the engine does not check it", setting)
 
 
-def _build_odbc_dsn(
-    s: dict[str, Any], *, connection: str | None = None, capath_entries: bool = True
-) -> str:
+def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     """Build a GENERIC ODBC connection string (``dialect='generic'``, #66) — decoupled from the ODBC
     Driver 18 / T-SQL preset so a DB reached through its own ODBC driver (PostgreSQL, MySQL) works. The
     operator installs the target ODBC driver at the OS level and names it here.
@@ -1635,10 +1591,7 @@ def _build_odbc_dsn(
     places reads, and for psqlODBC and MySQL only at that family's own spellings (BACKLOG #5053,
     :func:`generic_odbc_tls_unenforced`); a name off the allowlist is refused above. What
     stays delegated is the case this path genuinely cannot judge: the family's mode keyword IS set,
-    and the engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md.
-
-    ``capath_entries=False`` leaves the entries of an ``sslcapath`` folder unjudged, for a connector
-    whose ``validate_startup`` judges them in a worker thread (:class:`_CapathCheck`)."""
+    and the engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md."""
     driver = str(s.get("odbc_driver") or "").strip()
     where = hop_name_prefix(connection)
     if not driver:
@@ -1710,7 +1663,7 @@ def _build_odbc_dsn(
         parts.append(f"{k}={literal}")
     # After the loop on purpose: these open the key and CA files, so the keywords are settled first.
     # Each file keyword is judged once, here, and every check below reads that judgement.
-    verdicts = _refuse_remote_paths(named, connection=connection, capath_entries=capath_entries)
+    verdicts = _refuse_remote_paths(named, connection=connection)
     _refuse_weak_driver_key(named, connection=connection, verdicts=verdicts)
     _refuse_weak_driver_cert(named, connection=connection, verdicts=verdicts)
     _refuse_encrypted_driver_ca(named, connection=connection, verdicts=verdicts)
@@ -1860,7 +1813,6 @@ def _build_connection(
     attested: bool = False,
     read_only: bool = False,
     connection: str | None = None,
-    capath_entries: bool = True,
 ) -> tuple[str, bool]:
     """Dispatch on ``dialect`` and return ``(dsn, weakened_tls)`` (#66). ``dialect='sqlserver'`` (default)
     runs the byte-identical SQL Server preset (:func:`_build_dsn`, weakened-TLS refusal + optional
@@ -1874,8 +1826,7 @@ def _build_connection(
     a string back without a hop decision it did not ask for.
 
     ``connection`` names the declaring connection in that WARNING (#333); it is used on the generic path
-    only, since the SQL Server preset refuses rather than warns. ``capath_entries`` is
-    :func:`_build_odbc_dsn`'s, and the SQL Server preset takes no ``sslcapath``."""
+    only, since the SQL Server preset refuses rather than warns."""
     dialect = str(s.get("dialect", "sqlserver")).lower()
     if dialect == "sqlserver":
         weakened = bool(s.get("trust_server_certificate", False)) or not bool_setting(
@@ -1886,7 +1837,7 @@ def _build_connection(
             weakened,
         )
     if dialect == "generic":
-        return _build_odbc_dsn(s, connection=connection, capath_entries=capath_entries), False
+        return _build_odbc_dsn(s, connection=connection), False
     raise ValueError(f"DATABASE dialect must be 'sqlserver' or 'generic', got {dialect!r}")
 
 
@@ -3330,13 +3281,8 @@ class DatabaseDestination(DestinationConnector):
         self._connection_name = config.name
         # The posture this connector was built under, for the send-time tripwire (vault BACKLOG #2354).
         self._hop_posture = current_hop_posture()
-        # In a lane start, the sslcapath entries are judged off the loop, in validate_startup.
-        self._capath_check = _CapathCheck.deferred(s, config.name)
         self._dsn, self._weakened_tls = _build_connection(
-            s,
-            attested=self._hop_attested,
-            connection=config.name,
-            capath_entries=self._capath_check is None,
+            s, attested=self._hop_attested, connection=config.name
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
         # BACKLOG #1178: the generic dialect's cleartext arm, which reaches none of the refusals above.
         # Built AFTER _build_connection so a malformed server/keyword keeps reporting its own shape
@@ -3390,12 +3336,6 @@ class DatabaseDestination(DestinationConnector):
             knob="capture_max_bytes",
             transport="DATABASE destination",
         )
-
-    async def validate_startup(self) -> None:
-        """Judge, in a worker thread, the ``sslcapath`` entries a build in a lane start left here,
-        so a refusal fails the lane before it serves (:class:`_CapathCheck`)."""
-        if self._capath_check is not None:
-            await self._capath_check.run()
 
     async def _get_pool(self) -> Any:
         if self._pool is not None:
@@ -3734,14 +3674,10 @@ class DatabaseSource(SourceConnector):
             raise ValueError(refusal)
         # Per-connection insecure-hop attestation (#200): the customer-DB poll link rides the same
         # posture-keyed verify-off refusal as the destination (a read still crosses the wire).
-        record_name = None if config.name is None else inbound_record_name(config.name)
-        # In a lane start, the sslcapath entries are judged off the loop, in validate_startup.
-        self._capath_check = _CapathCheck.deferred(s, record_name)
         self._dsn, _ = _build_connection(
             s,
             attested=config.tls_hop_attested,
-            connection=record_name,
-            capath_entries=self._capath_check is None,
+            connection=None if config.name is None else inbound_record_name(config.name),
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
         # BACKLOG #1178: the poll link dials OUT on the same generic-dialect hop the destination does,
         # with the same credential in the same DSN, so it is gated identically. Construction only —
@@ -3959,12 +3895,6 @@ class DatabaseSource(SourceConnector):
                 "DATABASE source leader gate failed; cutting the row step: %s", _safe_db_error(exc)
             )
             return False
-
-    async def validate_startup(self) -> None:
-        """Judge, in a worker thread, the ``sslcapath`` entries a build in a lane start left here,
-        so a refusal fails the lane before it polls (:class:`_CapathCheck`)."""
-        if self._capath_check is not None:
-            await self._capath_check.run()
 
     async def _get_pool(self) -> Any:
         if self._pool is not None:

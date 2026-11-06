@@ -23,7 +23,6 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextlib
-import contextvars
 import errno
 import logging
 import math
@@ -1895,32 +1894,6 @@ ECH_UNSUPPORTED_SOURCE_MSG = (
 # (vault BACKLOG #2605). A caller that wants a connector must say which policy it runs under, so no
 # build path can construct one unchecked. The import is lazy because `transports.egress` imports
 # connector modules that import this one.
-
-
-#: Set while the runner builds a connector it then awaits ``validate_startup`` on before the lane
-#: serves (:func:`validated_at_start`). Builds run on the event loop, so a connector may move a
-#: blocking check out of its constructor into ``validate_startup`` inside this scope, and run it off
-#: the loop there (engine PR 2815, hold F2). Outside it, as at a reload or ``messagefoundry check``,
-#: the constructor runs every check itself.
-_VALIDATED_AT_START: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "validated_at_start", default=False
-)
-
-
-@contextlib.contextmanager
-def validated_at_start() -> Iterator[None]:
-    """Mark the connector builds inside it as followed by ``validate_startup`` before the lane
-    serves (:data:`_VALIDATED_AT_START`)."""
-    token = _VALIDATED_AT_START.set(True)
-    try:
-        yield
-    finally:
-        _VALIDATED_AT_START.reset(token)
-
-
-def build_is_validated_at_start() -> bool:
-    """Whether the connector being built is inside :func:`validated_at_start`."""
-    return _VALIDATED_AT_START.get()
 
 
 def build_source(config: Source, *, egress: EgressSettings) -> SourceConnector:

@@ -3423,7 +3423,7 @@ class Engine:
                 coordinator=self._coordinator,
             )
             # The values it re-read are checked, never applied: a dry run changes nothing live.
-            checker.build_check(registry, env_values)
+            await checker.build_check_off_loop(registry, env_values)
             return ReloadOutcome(registry=registry, applied=False, directory=path)
         # Every check has passed, so the values go live with the graph, and a refused swap keeps
         # the old values with the old graph (vault BACKLOG #2596).
@@ -3431,7 +3431,7 @@ class Engine:
             previous_env_values, self._env_values = self._env_values, env_values
             try:
                 runner = self.add_registry(registry)
-                runner.build_check(registry)  # bad connector → WiringError (422), before any start
+                await runner.build_check_off_loop(registry)  # bad connector → WiringError (422)
                 # That check warned for this graph, so this start does not (vault BACKLOG #2910).
                 await runner.start(warn_query_credentials=False)
             except Exception:
