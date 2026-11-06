@@ -530,13 +530,15 @@ def _row_record(row: route_gates.RouteRow) -> dict[str, Any]:
     """A route row as the receipt carries it. ``kind`` and ``declaration`` tell a route public by
     design from one the engine refuses to every caller, which the method and path alone cannot
     (vault BACKLOG #2846, and #2955 for WebSocket rows). ``gates`` is what the walk found the
-    operation runs; for a WebSocket that authorizes in its body it is the only evidence it does."""
+    operation runs; for a WebSocket that authorizes in its body it is the only evidence it does.
+    ``permissions`` is what those gates demand, as wire strings."""
     return {
         "method": row.method,
         "path": row.path,
         "kind": row.kind,
         "declaration": row.declaration,
         "gates": list(row.gates),
+        "permissions": list(row.permissions),
     }
 
 
@@ -562,7 +564,7 @@ def _rows_not_declared(
     needs_gate: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Each row whose kind is not in ``passes``, and not in ``needs_reason`` with a declaration
-    (and, for a kind in ``needs_gate``, at least one gate).
+    (and, for a kind in ``needs_gate``, at least one gate and at least one permission).
 
     A row with no kind is listed too, so an older receipt cannot pass by omission."""
     found: list[str] = []
@@ -576,6 +578,10 @@ def _rows_not_declared(
             state = f"{kind}, no reason"
         elif kind in needs_gate and not row.get("gates"):
             state = f"{kind}, no gate found"
+        elif kind in needs_gate and not row.get("permissions"):
+            # Engine PR 2390 note 5: tests/test_route_gates.py rejects a shipped socket whose gate
+            # demands no Permission, so the sweep does too. A receipt with no field reads as none.
+            state = f"{kind}, no permission found"
         else:
             continue
         found.append(f"{str(row['method']).upper()} {row['path']} ({state})")

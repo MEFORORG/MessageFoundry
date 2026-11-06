@@ -397,11 +397,20 @@ def websocket_gates(
     argument; or one in a nested function that no read gate demands. Those last two rules are what
     catch a gate the walk does not recognise, such as one called through an attribute, a wrapped hook,
     or a permission passed by keyword. A gate with NO ``Permission`` argument that the walk does not
-    recognise is still invisible; the tests floor every shipped WebSocket route at one gate."""
+    recognise is still invisible; the tests floor every shipped WebSocket route at one gate. A gate
+    dependency that takes a ``Request`` raises too, because FastAPI cannot supply one to a socket."""
     chain: list[tuple[str, tuple[str, ...]]] = []
     for dep in route.dependant.dependencies:
         found = gate_of(dep.call)
         if found is not None:
+            if dep.request_param_name is not None:
+                # Vault BACKLOG #2955, engine PR 2390 note 2: a WebSocket scope carries no Request, so
+                # FastAPI fails this dependency's handshake for every caller. Reading it as a gate
+                # would vouch for a dead route.
+                raise ValueError(
+                    f"WebSocket route {route.path}: its gate dependency {found[0]} takes a Request, "
+                    "which a WebSocket handshake cannot supply, so it refuses every caller"
+                )
             chain.append((found[0], found[1]))
 
     endpoint = inspect.unwrap(route.endpoint)

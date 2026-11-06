@@ -358,6 +358,23 @@ def test_a_marked_gate_is_read_whatever_its_name() -> None:
     assert row.permissions == (Permission.MESSAGES_VIEW_RAW.value,), row
 
 
+def test_a_websocket_gate_dependency_taking_a_request_fails_the_walk() -> None:
+    """Vault BACKLOG #2955, engine PR 2390 note 2. FastAPI cannot supply a ``Request`` to a socket,
+    so a ``require()``-shaped gate taking one fails the handshake for every caller. The walk read
+    such a socket as gated; now it refuses to read it. The control: the same factory with a
+    ``WebSocket`` parameter still reads as a gate."""
+    gate = mark_route_gate(require_lookalike(Permission.MONITORING_READ))
+    app = FastAPI()
+    app.add_api_websocket_route("/ws/planted", _dependency_gated, dependencies=[Depends(gate)])
+    with pytest.raises(ValueError, match="takes a Request"):
+        route_gates.route_rows(app)
+    row = _planted_row(
+        _dependency_gated,
+        dependencies=[Depends(require_ws_probe(Permission.MONITORING_READ))],
+    )
+    assert row.gates == ("require_ws_probe",), row
+
+
 class _CallableGate:
     """A gate written as a class rather than a ``require*()`` closure."""
 

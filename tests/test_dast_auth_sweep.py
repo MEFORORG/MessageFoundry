@@ -241,7 +241,7 @@ def test_ungated_routes_are_exactly_the_documented_anonymous_set(
         "the receipt no longer reports the WebSocket row it excluded from HTTP probing"
     )
     # Vault BACKLOG #2955: each WebSocket row carries its kind, and none is refused or unexplained.
-    fields = ("kind", "declaration", "gates")
+    fields = ("kind", "declaration", "gates", "permissions")
     assert all(f in r for r in receipt["websocket_rows"] for f in fields), receipt["websocket_rows"]
     undeclared_ws = websocket_rows_not_declared(receipt)
     assert not undeclared_ws, f"WebSocket rows refused or not shown to authorize: {undeclared_ws}"
@@ -994,6 +994,7 @@ def _ws_row(**fields: Any) -> dict[str, Any]:
 
 
 _GATES = ["authorize_ws"]
+_PERMS = ["monitoring:read"]
 
 
 @pytest.mark.parametrize(
@@ -1017,11 +1018,26 @@ _GATES = ["authorize_ws"]
             id="outside-no-gate",
         ),
         pytest.param(_ws_row(kind=None, declaration=_REASON, gates=_GATES), True, id="no-kind"),
+        # Engine PR 2390 note 5: a gate found that demands no Permission does not vouch for it.
+        pytest.param(
+            _ws_row(kind=route_gates.KIND_IN_BODY, declaration=_REASON, gates=_GATES),
+            True,
+            id="in-body-no-permission-field",
+        ),
+        pytest.param(
+            _ws_row(
+                kind=route_gates.KIND_IN_BODY, declaration=_REASON, gates=_GATES, permissions=[]
+            ),
+            True,
+            id="in-body-no-permission",
+        ),
         # The shape the receipt wrote before #2955: method and path only.
         pytest.param(_ws_row(), True, id="older-receipt"),
         pytest.param(_ws_row(kind=route_gates.KIND_GATED, declaration=None), False, id="gated"),
         pytest.param(
-            _ws_row(kind=route_gates.KIND_IN_BODY, declaration=_REASON, gates=_GATES),
+            _ws_row(
+                kind=route_gates.KIND_IN_BODY, declaration=_REASON, gates=_GATES, permissions=_PERMS
+            ),
             False,
             id="in-body",
         ),
@@ -1029,7 +1045,9 @@ _GATES = ["authorize_ws"]
             _ws_row(kind=route_gates.KIND_PUBLIC, declaration=_REASON), False, id="public"
         ),
         pytest.param(
-            _ws_row(kind=route_gates.KIND_OUTSIDE, declaration=_REASON, gates=_GATES),
+            _ws_row(
+                kind=route_gates.KIND_OUTSIDE, declaration=_REASON, gates=_GATES, permissions=_PERMS
+            ),
             False,
             id="outside-with-reason",
         ),
