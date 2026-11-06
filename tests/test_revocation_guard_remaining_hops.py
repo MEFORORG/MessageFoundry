@@ -52,6 +52,7 @@ from messagefoundry.config.tls_policy import (
     context_checks_revocation,
     relax_verify_expiry,
     skips_validity_period,
+    verifies_peer_fully,
 )
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.transports import dicom as dicom_module
@@ -715,6 +716,25 @@ def test_a_plaintext_dicom_association_is_the_cleartext_refusal_not_this_one() -
     assert "revocation" not in str(exc.value)
 
 
+@pytest.mark.parametrize("allow_expired", [False, True], ids=["strict", "expiry-relaxed"])
+@pytest.mark.parametrize("crl", [False, True], ids=["no-crl", "crl"])
+def test_the_context_the_dicom_guard_is_handed_verifies_the_peer(
+    bare_crl: str, crl: bool, allow_expired: bool
+) -> None:
+    """The DICOM guard is taken on any TLS context, with no verify-off check of its own as the FTPS
+    guard has, because this connector has no setting that turns verification off. That rested on a
+    comment (BACKLOG #2987, Part B item 3); this pins it on each way the context is built. It
+    matters most on the CRL arm: ``context_checks_revocation`` reads only the context's flags, so a
+    context that verified nothing but carried a CRL flag would still earn the CRL's credit."""
+    policy = _crl_policy(bare_crl) if crl else None
+    with active_hop_posture(NOT_ENFORCING), _guard_log():
+        dest = DicomScuDestination(_scu(REMOTE, allow_expired=allow_expired, policy=policy))
+    assert dest._ssl is not None
+    assert dest._ssl.verify_mode is ssl.CERT_REQUIRED
+    assert dest._ssl.check_hostname is True
+    assert context_checks_revocation(dest._ssl) is crl
+
+
 # --- FTPS upload, the destination (transports/remotefile.py) ---------------------------------------
 
 
@@ -1199,6 +1219,50 @@ def test_a_direct_hop_with_no_credential_still_takes_no_revocation_guard(
         assert not log.has("revocation"), log.state()
         DirectDestination(_direct(direct_material, REMOTE))
         assert log.has("revocation"), log.state()
+
+
+@pytest.mark.parametrize("crl", [False, True], ids=["no-crl", "crl"])
+def test_the_context_the_direct_guard_is_handed_verifies_the_peer(
+    direct_material: dict[str, str], bare_crl: str, crl: bool
+) -> None:
+    """The DIRECT guard, like the DICOM one, has no verify-off check of its own: its comment says
+    the credential refusal before it already requires a verifying context (BACKLOG #2987, Part B
+    item 3). This pins the context it is handed on a credentialed hop."""
+    policy = _crl_policy(bare_crl) if crl else None
+    with active_hop_posture(NOT_ENFORCING), _guard_log():
+        dest = DirectDestination(_direct(direct_material, REMOTE, policy=policy))
+    assert verifies_peer_fully(dest._tls_context)
+    assert context_checks_revocation(dest._tls_context) is crl
+
+
+@pytest.mark.parametrize("weak", ["tls_verify", "tls_check_hostname"])
+def test_a_credentialed_direct_hop_that_verifies_less_never_reaches_the_guard_even_with_the_escape(
+    direct_material: dict[str, str], monkeypatch: pytest.MonkeyPatch, weak: str
+) -> None:
+    """The other half of the claim the test above pins: the weakened TLS escape, which does let an
+    uncredentialed hop verify less, does not let a credentialed one reach the guard with a context
+    that verifies less. The uncredentialed build is the CONTROL that the escape is live here."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+
+    def build(*, credential: bool) -> DirectDestination:
+        # Every named parameter is passed, so the one weakened setting can only land in **extra.
+        return DirectDestination(
+            _direct(
+                direct_material,
+                REMOTE,
+                credential=credential,
+                attested=False,
+                policy=None,
+                **{weak: False},
+            )
+        )
+
+    with active_hop_posture(NOT_ENFORCING), _guard_log():
+        weakened = build(credential=False)
+        with pytest.raises(ValueError, match="authentication credentials"):
+            build(credential=True)
+    assert weakened._tls_context is not None
+    assert not verifies_peer_fully(weakened._tls_context)
 
 
 def test_a_credentialed_direct_hop_on_loopback_still_crosses(
