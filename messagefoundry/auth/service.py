@@ -6469,8 +6469,8 @@ class AuthService:
 
     def _oidc_callback_too_early(self, flow: PendingFlow) -> bool:
         """Whether ``flow``'s callback came back sooner than ``[auth].oidc_callback_min_elapsed_seconds``
-        after the flow started, on the flow cache's own clock (BACKLOG #2301). The caller decides
-        whether the floor applies."""
+        after the flow started, on the flow cache's own clock, measured to the instant the flow was
+        consumed (BACKLOG #2301, #3221). The caller decides whether the floor applies."""
         floor = self._settings.oidc_callback_min_elapsed_seconds
         flows = self._oidc_flows
         return floor > 0 and flows is not None and flows.age(flow) < floor
@@ -6629,8 +6629,9 @@ class AuthService:
         flow = await self._redeem_step_up_flow(flow_id, state, client=client)
         if isinstance(flow, OidcStepUp):
             return flow
-        # BACKLOG #2301, #3221: read before the actor lookup's store reads, so store latency never
-        # counts as the person's time. The refusal itself comes further down.
+        # BACKLOG #2301, #3221: the age ends at the consume, which the flow cache stamps, and it is
+        # read here too, before the actor lookup's store reads, so store latency never counts as
+        # the person's time. The refusal itself comes further down.
         arrived_too_early = self._oidc_callback_too_early(flow)
         return_to = flow.return_to
         actor = await self._step_up_actor(flow)
@@ -14175,8 +14176,17 @@ class AuthService:
         session's factor is not yet stamped, and less than ``[auth].mfa_verify_min_elapsed_seconds``
         has passed since its mint, which is the sign-in (BACKLOG #2301). Both floor helpers read it,
         so the verify and enrolment legs share one rule (BACKLOG #3194)."""
-        floor = self._settings.mfa_verify_min_elapsed_seconds
-        return floor > 0 and session.mfa_verified_at is None and now - session.created_at < floor
+        return (
+            self._mfa_floor_on()
+            and session.mfa_verified_at is None
+            and now - session.created_at < self._settings.mfa_verify_min_elapsed_seconds
+        )
+
+    def _mfa_floor_on(self) -> bool:
+        """Whether the login-to-MFA floor is on: ``[auth].mfa_verify_min_elapsed_seconds`` above 0.
+        :meth:`_mfa_floor_holds` reads it, and :meth:`_enrolment_too_early` reads it first to spare
+        a session read on a site with the floor off."""
+        return self._settings.mfa_verify_min_elapsed_seconds > 0
 
     async def _audit_mfa_too_early(
         self, user: UserRecord, *, event: str, client: str | None, phase: str | None
@@ -14214,7 +14224,10 @@ class AuthService:
         :meth:`finish_webauthn_registration`, which can also satisfy a pending session (BACKLOG
         #2389), call :meth:`_enrolment_too_early`, which reads the same predicate. A new leg that can satisfy a pending session
         calls one of the two. ``tests/test_second_step_time_floors.py`` reads this module's syntax
-        tree and fails on a function that stamps a session's factor without calling either first."""
+        tree and fails on a function here that calls ``mark_session_mfa_verified`` itself without a
+        top-level ``if await`` of either, which refuses, ahead of the call. It reads source order,
+        not every path, and does not follow a stamp made through a helper, so a new leg is still
+        checked by hand."""
         if not self._mfa_floor_holds(session, now):
             return False
         await self._audit_mfa_too_early(user, event=event, client=client, phase=phase)
@@ -14250,7 +14263,7 @@ class AuthService:
         ``[auth].require_action_step_up``, the route in front of ``POST /me/mfa/confirm`` has
         already spent its single-use password step-up, exactly as it has for a wrong code, so a
         refusal there costs the person one password re-proof."""
-        if self._settings.mfa_verify_min_elapsed_seconds <= 0:
+        if not self._mfa_floor_on():
             return False  # spares the session read; the rule is _mfa_floor_holds
         session = await self._load_session(hash_token(token))
         if session is None or not self._mfa_floor_holds(session, now):

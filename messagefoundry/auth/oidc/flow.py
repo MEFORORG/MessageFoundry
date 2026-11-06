@@ -150,6 +150,11 @@ class PendingFlow:
     #: staged the flow. ``AuthService.oidc_step_up_flow`` says why the callback needs it (#3374).
     #: Declared last so the positional order of the fields above did not move.
     step_up_user_id: str | None = None
+    #: Stamped by :meth:`FlowCache.pop_if_state_matches` on the cache's clock when it consumes the
+    #: flow, so :meth:`FlowCache.age` ends at the callback's arrival, wherever in the callback leg it
+    #: is read: no store read or exchange after the consume counts as the person's time (BACKLOG
+    #: #3221). ``None`` on a flow not consumed, which :meth:`FlowCache.age` reads up to now.
+    redeemed: float | None = None
 
     def __post_init__(self) -> None:
         # A step-up flow names both its session and its user, or neither, so every reader may ask
@@ -216,8 +221,10 @@ class FlowCache:
         return staged
 
     def age(self, flow: PendingFlow) -> float:
-        """Seconds since ``flow`` was staged, on this cache's clock (BACKLOG #2301)."""
-        return self._clock() - flow.started
+        """Seconds from ``flow``'s staging to its consumption, on this cache's clock (BACKLOG #2301,
+        #3221), or to now for a flow not consumed."""
+        end = flow.redeemed if flow.redeemed is not None else self._clock()
+        return end - flow.started
 
     def peek(self, flow_id: str) -> PendingFlow | None:
         """The live flow for ``flow_id`` WITHOUT consuming it; None if absent or expired.
@@ -241,18 +248,19 @@ class FlowCache:
         once it is consumed. The flow cookie is SameSite=Lax, so any page can send the browser to
         the callback with it. Comparing first means such a forged callback cannot spend the flow
         the real IdP return needs. Nothing here awaits, so two matching callbacks still spend it
-        once.
+        once. A consumed flow comes back stamped with ``redeemed``, the instant it was consumed.
         """
         key = self._key(flow_id)
         flow = self._entries.get(key)
-        if flow is not None and flow.deadline <= self._clock():
+        now = self._clock()
+        if flow is not None and flow.deadline <= now:
             # Expired: dropped now, so it stops holding a cap slot until the next put prunes.
             del self._entries[key]
             flow = None
         if flow is None or state is None or not state_matches(flow.state, state):
             return flow, False
         del self._entries[key]
-        return flow, True
+        return replace(flow, redeemed=now), True
 
 
 def new_flow_id() -> str:
