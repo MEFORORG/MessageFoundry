@@ -4422,9 +4422,8 @@ class RegistryRunner:
 
     def _forget_removed_anchor_lanes(self) -> None:
         """Drop the refusal marks, and the lane check's memory, of every lane the graph no
-        longer declares (vault BACKLOG #3188). A reload calls it once its swap has committed, so a
-        removed or renamed lane leaves nothing behind. A lane the graph still declares keeps both,
-        as a rolled-back reload keeps them."""
+        longer declares (vault BACKLOG #3188). A reload calls it once its swap has committed. A
+        refused or rolled-back reload does not call it."""
         lanes: set[tuple[Direction, str]] = {("inbound", n) for n in self.registry.inbound}
         lanes |= {("outbound", n) for n in self.registry.outbound}
         for lane in [k for k in self._anchor_refused if k not in lanes]:

@@ -12,6 +12,7 @@ Each test names the mutation it goes red under.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -176,6 +177,47 @@ async def test_a_remembered_pass_does_not_pass_a_changed_file_acl_or_pin(
     assert judgments[0] == 5
 
 
+async def test_a_remembered_pass_whose_baseline_moved_is_judged_again(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repeat skips the rows only while the audited baseline names the bytes it read. Another
+    writer of the label, here a row for other bytes, moves it, and the next check is judged and
+    writes ``changed`` back to these bytes. Red under the repeat trusting its memory over the
+    store's baseline."""
+    ca = _ca(tmp_path)
+    judgments = _count_judgments(monkeypatch)
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    await check("outbound", _OUT, _settings(ca))
+    spec = ta.lane_anchor_spec("outbound", _OUT, _settings(ca))
+    assert spec is not None
+    await ta._record(store, spec, "changed", fingerprint="ab" * 32, previous=_sha(ca))
+    await check("outbound", _OUT, _settings(ca))
+    assert judgments[0] == 2
+    rows = await _rows(store, _LABEL)
+    assert rows[0]["event"] == "changed" and rows[0]["fingerprint"] == _sha(ca), rows
+    await check("outbound", _OUT, _settings(ca))
+    assert judgments[0] == 2  # the baseline names these bytes again
+
+
+async def test_a_remembered_warn_mode_pass_still_warns(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A repeat under ``warn`` writes no row, and still logs the warning a judged pass logs, so an
+    operator who reloads sees the finding stand. Red under the repeat returning with no warning."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    ca = _ca(tmp_path)
+    check = ta.make_lane_anchor_check(store, enforcing=False)
+    with caplog.at_level(logging.WARNING, logger=ta.log.name):
+        for _ in range(2):
+            await check("outbound", _OUT, _settings(ca))
+    warned = [r for r in caplog.records if "writable by a non-owner" in r.getMessage()]
+    assert len(warned) == 2, [r.getMessage() for r in caplog.records]
+
+
 async def test_a_pass_the_store_stopped_is_not_remembered(
     tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -223,3 +265,44 @@ async def test_a_reload_that_removes_a_lane_drops_its_mark_and_memory(
         assert set(check._last) == {("outbound", "KEPT")}  # type: ignore[attr-defined]
     finally:
         await runner.stop()
+
+
+async def test_a_reload_that_renames_a_lane_keeps_only_the_new_name(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """A rename is a removal and an addition. With the file fixed, the reload checks the new
+    name and drops the old name's mark and memory. Red under the prune reading the old graph."""
+    ca = _ca(tmp_path)
+    good = ca.read_bytes()
+    pin = _sha(ca)
+    ca.write_bytes(_block(b"substitute"))
+    runner = _runner(store, _outbound_registry(ca, pin))
+    check = runner._lane_anchor_check
+    await runner.start()
+    try:
+        assert ("outbound", _OUT) in runner._anchor_refused
+        ca.write_bytes(good)
+        renamed = Registry()
+        spec = Rest(url="https://partner.example.org/api", tls_ca_file=str(ca), tls_ca_pin=pin)
+        renamed.add_outbound(build_outbound_connection("OUT2", spec))
+        await runner.reload(renamed)
+        assert not runner._anchor_refused
+        assert set(check._last) == {("outbound", "OUT2")}
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_of_a_stopped_runner_drops_removed_lanes(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """A reload of a runner that is not running swaps the graph and returns early. It prunes
+    there too. Red under the early return skipping the prune."""
+    ca = _ca(tmp_path)
+    runner = _runner(store, _outbound_registry(ca, _sha(ca)))
+    check = runner._lane_anchor_check
+    assert check is not None
+    await check("outbound", _OUT, _settings(ca))
+    runner._anchor_refused[("outbound", "GONE")] = (str(ca), None)
+    await runner.reload(Registry())
+    assert not runner._anchor_refused
+    assert not check._last
