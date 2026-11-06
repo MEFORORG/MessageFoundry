@@ -22,7 +22,8 @@ export function writeStamped(
   clock: () => Date = () => new Date(),
   label?: string,
 ): void {
-  const head = label === undefined ? clock().toISOString() : `${clock().toISOString()} ${label}`;
+  const stamp = clock().toISOString();
+  const head = label === undefined ? stamp : `${stamp} ${label}`;
   const lines = text.split(/\r\n|\r|\n/).map((line) => (line === "" ? head : `${head} ${line}`));
   // One write for the block, as before this file existed: check output can run to many lines.
   sink.appendLine(lines.join("\n"));

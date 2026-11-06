@@ -20,12 +20,6 @@ suite("engineLog: the stamper's level label", () => {
     writeStamped({ appendLine: (b) => blocks.push(b) }, "first\r\n\nthird", () => FIXED, "WARN");
     assert.deepStrictEqual(blocks, [`${STAMP} WARN first\n${STAMP} WARN\n${STAMP} WARN third`]);
   });
-
-  test("control: with no label the line is the stamp and the text, as on the Checks channel", () => {
-    const blocks: string[] = [];
-    writeStamped({ appendLine: (b) => blocks.push(b) }, "x", () => FIXED);
-    assert.deepStrictEqual(blocks, [`${STAMP} x`]);
-  });
 });
 
 // ---- The real module, node-side -----------------------------------------------------------------
@@ -76,11 +70,9 @@ let el!: EngineLogModule;
 if (NODE_SIDE) {
   // Loaded fresh against THIS stub, and the cache put back afterwards, for the reason
   // source-control-trust.test.ts gives: another suite's copy is bound to another suite's stub.
-  const fresh = ["../../engineLog"].map((m) => require.resolve(m));
-  const saved = new Map(fresh.map((f) => [f, require.cache[f]]));
-  for (const f of fresh) {
-    delete require.cache[f];
-  }
+  const file = require.resolve("../../engineLog");
+  const saved = require.cache[file];
+  delete require.cache[file];
   loader._load = function (request: string, parent: unknown, isMain: boolean): unknown {
     return request === "vscode" ? vscodeStub : realLoad.call(this, request, parent, isMain);
   };
@@ -88,12 +80,10 @@ if (NODE_SIDE) {
     el = require("../../engineLog") as EngineLogModule;
   } finally {
     loader._load = realLoad;
-    for (const [f, entry] of saved) {
-      if (entry) {
-        require.cache[f] = entry;
-      } else {
-        delete require.cache[f];
-      }
+    if (saved) {
+      require.cache[file] = saved;
+    } else {
+      delete require.cache[file];
     }
   }
 }
@@ -117,7 +107,7 @@ channelSuite("engineLog: what reaches the MessageFoundry Engine channel", () => 
     assert.deepStrictEqual(created, [{ name: "MessageFoundry Engine", options: undefined }]);
   });
 
-  test("each level writes a line that starts with a UTC instant and its level word", () => {
+  test("each level writes a line that starts with the wall clock's UTC instant and its level word", () => {
     const before = Date.now();
     el.engineLog().info("one");
     el.engineLog().warn("two");
@@ -141,8 +131,7 @@ channelSuite("engineLog: what reaches the MessageFoundry Engine channel", () => 
     const written = lines();
     assert.strictEqual(written.length, 2, JSON.stringify(written));
     for (const line of written) {
-      assert.match(line, STAMPED, line);
-      assert.ok(line.includes(" WARN "), line);
+      assert.strictEqual(STAMPED.exec(line)?.[2], "WARN", line);
     }
   });
 

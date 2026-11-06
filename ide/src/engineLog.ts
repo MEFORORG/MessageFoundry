@@ -28,37 +28,32 @@ export interface EngineLog {
   show(preserveFocus?: boolean): void;
 }
 
+// The channel is created lazily, on the first write or reveal, so merely importing this module
+// costs nothing.
+//
+// It is a PLAIN output channel, stamped by this extension, not a LogOutputChannel. That one is
+// stamped by the editor, in a format and zone the extension cannot set (ASVS 16.2.2). Every line
+// goes through `writeStamped`, so it starts with an ISO 8601 UTC instant and then its level word,
+// `INFO`, `WARN` or `ERROR`. The editor's per-level filter on this channel is gone with it.
 let channel: vscode.OutputChannel | undefined;
-let log: EngineLog | undefined;
+const out = (): vscode.OutputChannel =>
+  (channel ??= vscode.window.createOutputChannel("MessageFoundry Engine"));
 
-/** The singleton channel. Created lazily so merely importing this module costs nothing.
- *
- *  It is a PLAIN output channel, stamped by this extension, not a LogOutputChannel. That one is
- *  stamped by the editor, in a format and zone the extension cannot set (ASVS 16.2.2). Every line
- *  goes through `writeStamped`, so it starts with an ISO 8601 UTC instant and then its level word,
- *  `INFO`, `WARN` or `ERROR`. The editor's per-level filter on this channel is gone with it. */
+const log: EngineLog = {
+  info: (message) => writeStamped(out(), message, undefined, "INFO"),
+  warn: (message) => writeStamped(out(), message, undefined, "WARN"),
+  error: (message) => writeStamped(out(), message, undefined, "ERROR"),
+  show: (preserveFocus) => out().show(preserveFocus),
+};
+
+/** The Engine channel's writer. */
 export function engineLog(): EngineLog {
-  if (!log) {
-    const out = vscode.window.createOutputChannel("MessageFoundry Engine");
-    const at =
-      (level: string) =>
-      (message: string): void =>
-        writeStamped(out, message, undefined, level);
-    channel = out;
-    log = {
-      info: at("INFO"),
-      warn: at("WARN"),
-      error: at("ERROR"),
-      show: (preserveFocus) => out.show(preserveFocus),
-    };
-  }
   return log;
 }
 
 export function disposeEngineLog(): void {
   channel?.dispose();
   channel = undefined;
-  log = undefined;
 }
 
 /** Reveal the channel (the "Show the engine log" action). */
