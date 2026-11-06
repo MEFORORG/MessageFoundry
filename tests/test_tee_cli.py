@@ -433,7 +433,7 @@ def test_out_help_states_what_the_writer_does_to_the_file(command: str) -> None:
         "a symbolic link at FILE is replaced",
         "On Windows an existing FILE is written in place",
         "keeps its access list and owner",
-        "On POSIX, a target that resolves, through any link, to something that is neither a regular file nor a directory, and that this account owns, is written through instead of replaced.",
+        "On POSIX, a target that resolves, through any link, to a character device, or to a pipe or socket this account owns, is written through instead of replaced.",
     ):
         assert consequence in text, f"{command} --out help lacks {consequence!r}: {text}"
 
