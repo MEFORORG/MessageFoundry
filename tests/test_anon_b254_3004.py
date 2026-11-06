@@ -28,10 +28,10 @@ from typing import Any
 
 import pytest
 
-import messagefoundry.anon as engine_anon
+import messagefoundry_toolkit.anon as engine_anon
 import tee.anon as tee_anon
-from messagefoundry.anon import leak as engine_leak
-from messagefoundry.anon import rules as engine_rules
+from messagefoundry_toolkit.anon import leak as engine_leak
+from messagefoundry_toolkit.anon import rules as engine_rules
 from tee.__main__ import main as tee_main
 from tee.anon import leak as tee_leak
 from tee.anon import rules as tee_rules

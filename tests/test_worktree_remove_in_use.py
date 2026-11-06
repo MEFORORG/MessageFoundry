@@ -647,7 +647,9 @@ def test_the_listing_helper_does_not_skip_what_it_may_not_read() -> None:
     """.NET's EnumerationOptions defaults IgnoreInaccessible to TRUE, and then an unlistable directory
     lists as empty, which is the fail-open these refusals exist to stop. The ACL tests drive this
     only where a deny binds, so the setting is pinned here as well, on every runner."""
-    text = SCRIPT.read_text(encoding="utf-8")
+    # remove.ps1 dot-sources the helper from worktree-gates.ps1, shared with the nightly removal.
+    assert '. "$PSScriptRoot\\worktree-gates.ps1"' in SCRIPT.read_text(encoding="utf-8")
+    text = (SCRIPT.parent / "worktree-gates.ps1").read_text(encoding="utf-8")
     body = text[text.index("function Get-EntriesOrThrow") :]
     body = body[: body.index("\n}\n")]
     assert "$opts.IgnoreInaccessible = $false" in body, body

@@ -86,7 +86,7 @@ flowchart TB
   subgraph DEV["Dev / test tooling"]
     CLI["CLI: messagefoundry<br/>serve, check, dryrun, verify and more"]:::devtool
     TOOLKIT["Toolkit: messagefoundry-toolkit<br/>authoring and development tooling"]:::devtool
-    GEN["Synthetic HL7 generators<br/>messagefoundry/generators/"]:::devtool
+    GEN["Synthetic HL7 generators<br/>messagefoundry_toolkit/generators/"]:::devtool
     HARNESS["Test harness<br/>harness/ · PySide6 · MLLP send/receive"]:::devtool
   end
 
