@@ -447,7 +447,9 @@ _PR_VERSION_TAIL = re.compile(
 )
 #: Even a `V` lead is a version after "HL7": `HL7 V2.5.1` is the message standard, not a requirement.
 _PR_HL7_LEAD = re.compile(r"(?i)\bhl7[\s*`_]*$")
-_PR_FMT = r"[*`_\"']*"
+#: The markup characters markdown wraps around a value.
+_PR_MARKUP = r"[*`_\"']"
+_PR_FMT = _PR_MARKUP + "*"
 _PR_SEP = r"[\s*`_\"']+"
 #: Binds a label to a value: colon, equals, pipe, the dashes and arrows, a bracket or table cell edge.
 _PR_BIND = r"[:=|\-\u2013\u2014\u2192"
@@ -460,33 +462,69 @@ _PR_VERDICT = (
 )
 #: Verbs that only a record uses of a verdict. A version does not "stay partial", so these bind even an
 #: identifier the version filter set aside ("Applies to <id>, which stays partial").
+#: The record's verbs for keeping a requirement at a verdict ("held at", "capped at", "held partial").
+_PR_HOLD_VERB = r"(?:held|holds?|holding|kept|keeps?|capped|pinned)"
 _PR_STRONG_VERB = (
-    r"(?:stays?|remains?|held at|holds? at|holding at|went to|goes to|moves? to|moved to|back to"
+    rf"(?:stays?|remains?|{_PR_HOLD_VERB} at|went to|goes to|moves? to|moved to|back to"
     r"|re-?scored(?: as)?|scored(?: as)?|scores"
     # "<id> went from partial to pass" names the old verdict as surely as the new one.
     r"|(?:went|goes|moves?|moved) from)"
 )
 _PR_STATE_VERB = rf"(?:{_PR_STRONG_VERB}|is(?: now| still)?|was|are|reads|now|at|from)"
-_PR_QUALIFIER = r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest)" + _PR_SEP + r")*"
+_PR_QUALIFIER = (
+    r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest|recorded|known|interim|provisional)"
+    + _PR_SEP
+    + r")*"
+)
+#: Words that may stand between the identifier and its verb without unbinding it: a passive auxiliary
+#: ("<id> was held at partial") and the adverbs a record sentence hedges with ("<id> likely stays").
+_PR_AUX = (
+    r"(?:(?:is|was|are|were|be|been|has been|have been|had been|likely|probably|still|now|also"
+    r"|only|then|already|so)" + _PR_SEP + r")*"
+)
+#: A modal or a negation bound to a bare verdict verb: "<id> cannot pass", "<id> would not be met",
+#: "<id> needs to pass". It is a verdict about the identifier only because it follows the identifier
+#: directly, so it never binds an identifier the version filter set aside.
+_PR_MODAL = (
+    r"(?:can(?:not)?|can't|could|would|will|should|may|might|must|does|do|did|doesn't|didn't"
+    r"|won't|wouldn't|couldn't|shouldn't|needs? to|has to|is (?:un)?able to)"
+    rf"(?:{_PR_SEP}(?:not|now|still|yet|never|only|honestly|also|then|reach|be))*"
+)
 #: Read from the end of the identifier: "<id> stays partial", "<id> cell to pass", "<id> | fail".
 _PR_VERDICT_AFTER = re.compile(
-    rf"(?i)^{_PR_FMT}(?:\s+cell)?"
+    rf"(?i)^{_PR_FMT}(?:\s+(?:cell|row))?"
     rf"(?:\s*{_PR_BIND}>\](]+\s*|{_PR_SEP})"
-    rf"(?:{_PR_FMT}(?:(?:which|that){_PR_SEP})?"
-    rf"(?:(?P<strong>{_PR_STRONG_VERB})|{_PR_STATE_VERB}|(?P<to>to)){_PR_SEP}(?:at{_PR_SEP})?)?"
+    rf"(?:{_PR_FMT}(?:(?:which|that){_PR_SEP})?{_PR_AUX}"
+    rf"(?:(?P<strong>{_PR_STRONG_VERB})|{_PR_MODAL}|{_PR_STATE_VERB}|as|(?P<to>to))"
+    rf"{_PR_SEP}(?:at{_PR_SEP})?)?"
     rf"{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
+)
+#: A verb that states the verdict BEFORE the identifier: "does not meet <id>", "satisfies ASVS <id>",
+#: and the record's idiom for a requirement that does not pass yet, "an honest pass for <id>".
+_PR_VERB_BEFORE = re.compile(
+    rf"(?i)\b(?:meets?|meeting|satisf(?:y|ies|ied|ying)|honest{_PR_SEP}pass{_PR_SEP}(?:at|for|on)"
+    rf"|{_PR_MODAL}{_PR_SEP}(?:meet|satisfy|pass|fail))"
+    rf"(?:{_PR_SEP}(?:the|cells?|requirements?|its|all|any|of))*{_PR_SEP}{_PR_FMT}$"
 )
 #: "to <verdict>" with no move verb is ordinary English ("requires <version> to pass"), so a bare "to"
 #: binds only when the text before the identifier says the identifier is what moves.
 _PR_MOVE_LEAD = re.compile(
     r"(?i)\b(?:move[sd]?|moving|takes?|took|brings?|brought|re-?grade[sd]?|re-?score[sd]?|of"
-    r"|upgrade[sd]?|downgrade[sd]?|sets?|flip(?:s|ped)?|raise[sd]?|lower(?:s|ed)?|drops?|dropped)"
+    r"|upgrade[sd]?|downgrade[sd]?|sets?|flip(?:s|ped)?|raise[sd]?|lower(?:s|ed)?|drops?|dropped"
+    r"|update[sd]?|updating|mark(?:s|ed)?)"
     rf"{_PR_SEP}(?:(?:the|vault|cells?|ASVS){_PR_SEP})*$"
 )
 #: Read up to the start of the identifier: "partial: <id>", "| fail | <id>".
 _PR_VERDICT_BEFORE = re.compile(rf"(?i)\b{_PR_VERDICT}{_PR_FMT}\s*{_PR_BIND}<\[(]+\s*{_PR_FMT}$")
 #: A table cell that is nothing but a verdict, optionally after a state verb ("Stay partial").
 _PR_CELL_VERDICT = re.compile(rf"(?i)(?:{_PR_STATE_VERB}{_PR_SEP})?{_PR_QUALIFIER}{_PR_VERDICT}")
+#: A cell that OPENS with a verdict and goes on: "unchanged, partial. No build reaches it."
+_PR_CELL_VERDICT_LEAD = re.compile(
+    rf"(?i)(?:(?:unchanged[,;:]?|{_PR_STATE_VERB}){_PR_SEP})?{_PR_QUALIFIER}{_PR_VERDICT}[.;,](?:\s|$)"
+)
+#: The markup a table cell wraps around a value, and the separators of a cell that lists identifiers.
+_PR_CELL_MARKUP = re.compile(_PR_MARKUP)
+_PR_CELL_LIST = re.compile(r"\s*(?:,|;|/|\band\b)\s*")
 #: The record's own nouns carrying the verdict when the identifier is a clause away: "held the cell at
 #: partial", "the cell stays partial", "its re-score to pass". Read inside _PR_WINDOW like a gap word,
 #: because "cell" or "re-score" beside a verdict is record vocabulary, not ordinary English.
@@ -494,11 +532,16 @@ _PR_PROSE_VERDICT = re.compile(
     rf"(?i)\b(?:cells?|row){_PR_SEP}(?:is{_PR_SEP}|was{_PR_SEP}|confirmed{_PR_SEP})?"
     rf"(?:{_PR_STATE_VERB}|held|reading){_PR_SEP}{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
     rf"|\bheld{_PR_SEP}(?:(?:the|both|its|each|that){_PR_SEP})?cells?{_PR_SEP}at{_PR_SEP}{_PR_FMT}{_PR_VERDICT}"
-    rf"|\bre-?(?:score|grade|read)\w*{_PR_SEP}(?:to|(?:can{_PR_SEP})?reach(?:es|ed)?){_PR_SEP}"
-    rf"{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
+    rf"|\bre-?(?:score|grade|read)\w*{_PR_SEP}(?:{_PR_MODAL}{_PR_SEP})?"
+    rf"(?:to|reach(?:es|ed)?){_PR_SEP}{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
+    # The verdict held with a pronoun or no object at all: "held it at partial", "hold partial",
+    # "capped at partial". "held" and its kin beside a verdict word are record vocabulary.
+    rf"|\b{_PR_HOLD_VERB}"
+    rf"(?:{_PR_SEP}(?:it|them|both|each))?{_PR_SEP}(?:at{_PR_SEP})?{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
 )
 _PR_GAP = re.compile(
-    r"(?i)\b(?:gaps?|residuals?|shortfalls?|unimplemented|unmet"
+    r"(?i)\b(?:gaps?|residuals?|shortfalls?|unimplemented|unmet|incomplete|lacks?|lacking"
+    r"|omits?|omissions?|grounds?|(?:still|falls?|fell) short"
     r"|not (?:yet )?(?:implemented|built|covered|met|reachable))\b"
 )
 #: A source path, a path under one of this repository's code roots, a dotted engine module, or a link to
@@ -507,8 +550,27 @@ _PR_GAP = re.compile(
 _PR_CODE = re.compile(
     r"(?<![\w/.-])(?:[\w.-]+/)*[\w-]+\.(?:py|pyi|pyx|ts|tsx|js|mjs|cjs|ps1|psm1|sh|ya?ml)\b"
     r"|(?<![\w/.-])(?:messagefoundry\w*|harness|ide|tee|packaging|scripts|tests)/[\w./-]+"
-    r"|\bmessagefoundry\w*(?:\.\w+)+"
+    # A dotted engine module, also as a regular expression escapes it (`messagefoundry\.anon`).
+    r"|\bmessagefoundry\w*(?:\\?\.\w+)+"
     r"|\bgithub\.com/[\w.-]+/[\w.-]+/(?:blob|tree)/\S+"
+    # A code symbol in backticks that only code has the shape of: a private name, a call, or a dotted
+    # attribute carrying an underscore or a class name. A plain word, a version, a domain, a file name
+    # and a hyphenated label do not have that shape. A plain snake_case name is weaker evidence, because
+    # a setting or a field has it too, so it is _PR_SNAKE below and binds only a marked identifier.
+    # The argument list stops at its first ")", so it cannot overlap the "->" tail and backtrack.
+    r"|`(?:def\s+|class\s+)?(?:_\w+(?:\.\w+)*(?:\([^`\n)]*\))?"
+    r"|[A-Za-z]\w*(?:\.\w+)*\([^`\n)]*\)"
+    r"|(?=[A-Z]|[\w.]*(?:_|\.[A-Z]))[A-Za-z]\w*(?:\.[A-Za-z_]\w*)+"
+    r"(?<!\.md)(?<!\.rst)(?<!\.txt)(?<!\.toml)(?<!\.json)(?<!\.lock)(?<!\.html)(?<!\.org)(?<!\.com))"
+    r"(?:\s*->[^`\n]*)?`"
+)
+#: A snake_case name in backticks (`require_paced`, `MFA_ENABLED`): code, or a setting named like code.
+_PR_SNAKE = re.compile(r"`[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+`")
+#: An identifier the text itself marks as a requirement: "ASVS <id>", "cell <id>", "<id>'s", "<id>
+#: row". A version is never written that way, so a weaker kind of evidence may bind it.
+_PR_MARK_BEFORE = re.compile(r"(?i)\b(?:cells?|requirements?)[\s*`_]*$")
+_PR_MARK_AFTER = re.compile(
+    r"(?i)[*`_]*(?:'s\b|\s+(?:cell|row|anchor|limb|ground|clause|re-?score|re-?read)s?\b)"
 )
 #: How far a gap word or a code path may sit from the identifier, inside one sentence.
 _PR_WINDOW = 80
@@ -581,10 +643,28 @@ def _pr_requirement_ids(text: str) -> list[tuple[re.Match[str], bool]]:
     return found
 
 
+def _pr_evidence(window: str) -> tuple[bool, bool, bool]:
+    """Whether the window holds a gap word, a code path or symbol, and a snake_case name."""
+    return (
+        _PR_GAP.search(window) is not None,
+        _PR_CODE.search(window) is not None,
+        _PR_SNAKE.search(window) is not None,
+    )
+
+
+def _pr_marked(text: str, m: re.Match[str]) -> bool:
+    """Whether the text names the identifier as a requirement, not just a number of that shape."""
+    return bool(
+        m.group("lead")
+        or _PR_MARK_BEFORE.search(text, max(0, m.start() - 20), m.start())
+        or _PR_MARK_AFTER.match(text, m.end())
+    )
+
+
 def _pr_verdict_bound(text: str, m: re.Match[str], version: bool) -> bool:
     before = text[max(0, m.start() - 60) : m.start()]
     after = text[m.end() : m.end() + 80]
-    if not version and _PR_VERDICT_BEFORE.search(before):
+    if not version and (_PR_VERDICT_BEFORE.search(before) or _PR_VERB_BEFORE.search(before)):
         return True
     hit = _PR_VERDICT_AFTER.match(after)
     if hit is None:
@@ -597,8 +677,10 @@ def _pr_verdict_bound(text: str, m: re.Match[str], version: bool) -> bool:
 
 def _pr_table_verdict(row: str, ids: set[str]) -> bool:
     """A table row with an identifier cell and a cell that is nothing but a verdict, wherever it sits."""
-    cells = [c.strip(" *`_\"'") for c in row.strip().strip("|").split("|")]
-    return any(c in ids for c in cells) and any(_PR_CELL_VERDICT.fullmatch(c) for c in cells)
+    cells = [_PR_CELL_MARKUP.sub("", c).strip() for c in row.strip().strip("|").split("|")]
+    return any(all(part in ids for part in _PR_CELL_LIST.split(c)) for c in cells if c) and any(
+        _PR_CELL_VERDICT.fullmatch(c) or _PR_CELL_VERDICT_LEAD.match(c) for c in cells
+    )
 
 
 def _pr_sentences(unit: str, is_row: bool) -> list[tuple[int, str]]:
@@ -631,8 +713,10 @@ def scan_pr_body(body: str) -> list[str]:
                     found["verdict"] = pair.start()
                     break
             ids = _pr_requirement_ids(sentence)
+            # A table pairs an identifier cell with any other cell, so a row is one whole window, and
+            # its searches run once rather than once per identifier: a row is unbounded in length.
+            row_evidence: tuple[bool, bool, bool] | None = None
             for m, version in ids:
-                # A table pairs an identifier cell with any other cell, so a row is one whole window.
                 window = (
                     sentence
                     if is_row
@@ -645,9 +729,12 @@ def scan_pr_body(body: str) -> list[str]:
                     found["verdict"] = m.start()
                 if version:
                     continue
-                if "gap" not in found and _PR_GAP.search(window):
+                if is_row:
+                    row_evidence = row_evidence or _pr_evidence(sentence)
+                gap, code, snake = row_evidence or _pr_evidence(window)
+                if "gap" not in found and gap:
                     found["gap"] = m.start()
-                if "map" not in found and _PR_CODE.search(window):
+                if "map" not in found and (code or (snake and _pr_marked(sentence, m))):
                     found["map"] = m.start()
             requirement_ids = {m.group(0) for m, version in ids if not version}
             if is_row and "verdict" not in found and _pr_table_verdict(sentence, requirement_ids):

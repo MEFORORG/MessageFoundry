@@ -20,6 +20,7 @@ import importlib.util
 import io
 import json
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -736,6 +737,95 @@ _PR_VERSION_MUST_STAY_QUIET = [
 ]
 
 
+#: BACKLOG #3364's residue, "some prose phrasings are missed": each line is a phrasing engine PR 2448's
+#: detector let through, taken from the shapes merged engine PR bodies use and rebuilt with the synthetic
+#: identifiers and invented names above. Each must fire with the kind it is listed under.
+_PR_RESIDUE_MUST_FIRE: list[tuple[str, str]] = [
+    # A passive auxiliary or a hedging adverb between the identifier and its record verb.
+    ("verdict", f"ASVS {_REQ} was held at {_PARTIAL} by two shipped docs."),
+    ("verdict", f"{_REQ} likely stays {_PARTIAL}, because it needs a second signal."),
+    ("verdict", f"On this platform {_REQ} is capped at {_PARTIAL}."),
+    # A modal or a negation bound to a bare verdict verb.
+    ("verdict", f"## Why {_REQ} still cannot {_PASS}"),
+    ("verdict", f"After this merges, the {_REQ} re-read should reach {_PASS}."),
+    # The verdict held with a pronoun, or with no object at all.
+    ("verdict", f"A re-read of ASVS cell {_REQ} held it at {_PARTIAL} on review."),
+    ("verdict", f"The {_REQ} re-read, at engine abc1234, held {_PARTIAL} on seven sentences."),
+    ("verdict", f"Cell {_REQ} names those accounts as what holds it {_PARTIAL}."),
+    # "as" a verdict, and a row moved "to" one by "update".
+    ("verdict", f"The owner ruled to sign ASVS {_REQ} as a recorded {_PARTIAL}."),
+    ("verdict", f"These commits update the {_REQ} row to `{_NA}` under rule 1."),
+    # A verb stating the verdict before the identifier, and the record's "honest pass" idiom.
+    ("verdict", f"An at-least gate does not meet {_REQ}'s all."),
+    ("verdict", f"BACKLOG #1: research an honest {_PASS} for ASVS {_REQ}."),
+    # A table row listing several identifiers, with a cell that opens with the verdict.
+    ("verdict", f"| #1, #2 | {_REQ}, {_REQ_B} | unchanged, `{_PARTIAL}`. |"),
+    # Gap words the record uses: omits, omissions, lacks, incomplete, ground, still short.
+    ("gap", f"So cell {_REQ} omits it, rather than the record lacking it."),
+    ("gap", f"| #1 | {_REQ} | at least four more | 9 open omissions |"),
+    ("gap", f"{_REQ} lacks a row-completeness pin."),
+    ("gap", f"Incomplete {_REQ} row: the source cells do not list the claim."),
+    ("gap", f"That limit is the one ground holding ASVS {_REQ} today."),
+    ("gap", f"A re-read today would read {_REQ} as still short on one arm."),
+    # A code symbol in backticks rather than a path: a call, a private name, a class attribute, a
+    # dotted name with an underscore, and a module as a regular expression escapes it.
+    (
+        "map",
+        f"The store passes `example_aad(...)` on every call; the ASVS {_REQ} binding needs it.",
+    ),
+    ("map", f"It is the carve-out on the ASVS {_REQ} expiry inside `_example_login`."),
+    ("map", f"The engine masks `ExampleDetail.error` until a reveal (ASVS {_REQ})."),
+    ("map", f"`_example_helper` was renamed, so a re-anchor is likely needed on {_REQ}."),
+    ("map", f"`shared_example.read_example_log` reads through a cap (cell {_REQ})."),
+    ("map", f"Cell {_REQ}'s `messagefoundry\\.example` absence pattern matches nothing."),
+    # A plain snake_case name binds only an identifier the text marks as a requirement.
+    ("map", f"`example_setting` now counts this posture, and {_REQ}'s warning fires."),
+    ("map", f"`EXAMPLE_CHANGED` is an account notice under ASVS {_REQ}."),
+]
+#: The negative controls for the residue rules: the same shapes beside a version or a plain number.
+_PR_RESIDUE_MUST_STAY_QUIET = [
+    # A plain snake_case name beside a number the text does not mark as a requirement.
+    f"The advisory's own `first_patched_version` field says **{_REQ_B}**, and {_REQ_B} is published.",
+    f"Old rule ({_REQ_B}, checked here): `revoked` gets in and `delta_revoked` is refused.",
+    # A domain and a documentation file name in backticks are not code.
+    f"`resolved` points at `registry.example.org`; {_REQ_B} was published last week.",
+    f"`EXAMPLE.md` names {_REQ_B} in its heading.",
+    # A modal after a version is not a verdict.
+    f"ldap3 2.9.1 cannot {_PASS} the probe without the patch.",
+    f"Python 3.14.6 would {_FAIL} the collection step.",
+    # Hold and omit without a requirement number.
+    f"The buffer holds {_PARTIAL} frames until the reader drains them; the parser omits blank lines.",
+]
+
+
+@pytest.mark.parametrize(("kind", "line"), _PR_RESIDUE_MUST_FIRE)
+def test_a_pr_body_phrasing_the_first_detector_missed_is_flagged(sf, kind: str, line: str) -> None:
+    """BACKLOG #3364's residue: each phrasing went through engine PR 2448's detector unflagged."""
+    assert kind in _pr_kinds(sf, f"Context above.\n\n{line}\n\nContext below."), line
+
+
+@pytest.mark.parametrize("line", _PR_RESIDUE_MUST_STAY_QUIET)
+def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str) -> None:
+    assert sf.scan_pr_body(line) == [], line
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        # Searching a row once per identifier made this take about 80 seconds.
+        "| " + ", ".join([_REQ] * 8000) + " | the outbound limb |",
+        # An argument list that could overlap the "->" tail of a code symbol backtracks on this.
+        f"| {_REQ} | `a(" + ")->" * 21000 + " |",
+    ],
+)
+def test_a_long_table_row_scans_in_linear_time(sf, row: str) -> None:
+    """A row is one window for every identifier in it and has no length limit, so each search over it
+    must run once and in linear time. Both rows scan in well under a second."""
+    began = time.perf_counter()
+    sf.scan_pr_body(row)
+    assert time.perf_counter() - began < 10
+
+
 def _pr_kinds(sf, body: str) -> set[str]:
     hits = sf.scan_pr_body(body)
     return {kind for kind, reason in sf.PR_BODY_REASONS.items() if any(reason in h for h in hits)}
@@ -795,11 +885,12 @@ def test_one_line_restating_a_verdict_reports_it_once(sf) -> None:
 
 def test_the_pr_body_detector_reports_no_value(sf) -> None:
     """The identifier beside its verdict IS the disclosure; a public CI log must not repeat it."""
-    body = "\n".join(_PR_VERDICT_MUST_FIRE + _PR_GAP_MUST_FIRE + _PR_MAP_MUST_FIRE)
+    residue = [line for _, line in _PR_RESIDUE_MUST_FIRE]
+    body = "\n".join(_PR_VERDICT_MUST_FIRE + _PR_GAP_MUST_FIRE + _PR_MAP_MUST_FIRE + residue)
     hits = sf.scan_pr_body(body)
     assert hits, "the fixtures must fire, or this asserts nothing"
     for h in hits:
-        for leaked in (_REQ, "example_module", "example.py", f" {_PARTIAL} "):
+        for leaked in (_REQ, "example_module", "example.py", "example_aad", f" {_PARTIAL} "):
             assert leaked not in h, f"the reason echoed {leaked!r}: {h!r}"
 
 
