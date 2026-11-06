@@ -429,7 +429,11 @@ _WINDOWS_MAPPED: dict[int, tuple[type[OSError], int]] = {
     3: (FileNotFoundError, errno.ENOENT),
     5: (PermissionError, errno.EACCES),
     15: (FileNotFoundError, errno.ENOENT),
+    21: (PermissionError, errno.EACCES),
+    23: (PermissionError, errno.EACCES),
+    31: (PermissionError, errno.EACCES),
     32: (PermissionError, errno.EACCES),
+    33: (PermissionError, errno.EACCES),
     59: (OSError, errno.EINVAL),
     64: (OSError, errno.EINVAL),
     65: (PermissionError, errno.EACCES),
@@ -476,7 +480,7 @@ def test_the_windows_rows_match_cpythons_own_mapping() -> None:
         pytest.param(PermissionError(errno.EACCES, "Permission denied"), False, id="EACCES"),
         pytest.param(PermissionError(errno.EPERM, "Not permitted"), False, id="EPERM"),
         pytest.param(ValueError("embedded null byte"), False, id="NUL"),
-        *(_win(code, False) for code in (2, 3, 5, 15, 32, 65, 123, 161, 206, 267, 1921)),
+        *(_win(code, False) for code in (2, 3, 5, 15, 123, 161, 206, 267, 1921)),
         # Refused: a fault that may clear before a later connect, when libpq loads the file.
         pytest.param(OSError(errno.EIO, "Input/output error"), True, id="EIO"),
         pytest.param(OSError(errno.ETIMEDOUT, "Timed out"), True, id="ETIMEDOUT"),
@@ -484,6 +488,9 @@ def test_the_windows_rows_match_cpythons_own_mapping() -> None:
         pytest.param(OSError(errno.ENOTCONN, "Not connected"), True, id="ENOTCONN"),
         pytest.param(_ShareNotReached(errno.ENOENT, "No network path"), True, id="share"),
         *(_win(code, True) for code in (59, 64, 67, 121, 1231)),
+        # A PermissionError on Windows other than ERROR_ACCESS_DENIED: an I/O, sharing, lock or
+        # network fault, which may clear before a later connect.
+        *(_win(code, True) for code in (21, 23, 31, 32, 33, 65)),
     ],
 )
 def test_a_root_certificate_the_engine_cannot_stat(
