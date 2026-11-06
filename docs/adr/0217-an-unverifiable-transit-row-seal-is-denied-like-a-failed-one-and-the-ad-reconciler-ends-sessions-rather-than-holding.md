@@ -112,6 +112,12 @@ in this file, apart from this section, the status line and *Open findings carrie
 5. The retry paragraph: a sentence that `main`'s `revoke_all_sessions` already raises the global
    epoch first (#5091). It states `main` and changes nothing. The owner was not told.
 
+Confirmed 2026-11-06 (UTC): the owner was asked about the five differences above, and about the
+carried findings below, and selected 'Confirm current text (Recommended)'. Record:
+https://github.com/MEFORORG/MessageFoundry/pull/2565#issuecomment-6682609779. Anchors: branch
+anchor/adr0217-owner-ruled-20261106 (94b485c2e1) and branch anchor/adr0217-owner-confirmed-20261106
+(ae898dc817).
+
 ## Context
 
 Engine `main` seals identity and authorization rows (sessions, users with their role grants, custom
