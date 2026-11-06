@@ -935,9 +935,11 @@ def test_a_refused_engine_list_is_a_refusal_at_first_use_not_an_import_failure()
     and the child exited 1."""
     result = subprocess.run(
         [sys.executable, "-c", _IMPORT_UNDER_A_REFUSING_NARROWER],
+        cwd=_ROOT,  # sys.path[0] for -c, so the child imports THIS tree, and its tests package
         capture_output=True,
         text=True,
         check=False,
+        timeout=120,
     )
     assert result.returncode == 0, result.stderr
     refused = "EngineTlsListRefused"

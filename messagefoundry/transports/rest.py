@@ -476,6 +476,12 @@ def _shared_no_redirect_opener() -> urllib.request.OpenerDirector:
         return _shared_opener
 
 
+def _is_shared_no_redirect_opener(opener: urllib.request.OpenerDirector) -> bool:
+    """Whether ``opener`` is the shared one, answered without building it, so a connection that
+    never dials the shared opener does not build it to ask."""
+    return opener is _shared_opener
+
+
 def _insecure_opener(
     *extra_handlers: urllib.request.BaseHandler,
 ) -> urllib.request.OpenerDirector:
@@ -2859,7 +2865,7 @@ class RestDestination(DestinationConnector):
                     "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
                     "(mutually exclusive — configure exactly one)"
                 )
-            if self._opener is _shared_no_redirect_opener():
+            if _is_shared_no_redirect_opener(self._opener):
                 # Rebuild a per-connection verifying opener so add_handler never touches the shared one.
                 # Through _no_redirect_opener, not a bare build_opener: the bare form lets urllib
                 # fill in an HTTPSHandler whose context the engine never names, so the forward-secrecy

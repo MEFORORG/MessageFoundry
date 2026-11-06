@@ -110,6 +110,7 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _expiry_relaxed_opener,
     _insecure_opener,
+    _is_shared_no_redirect_opener,
     _no_redirect_opener,
     _redact_url,
     _shared_no_redirect_opener,
@@ -1248,7 +1249,7 @@ class FhirDestination(DestinationConnector):
                     "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
                     "(mutually exclusive — configure exactly one)"
                 )
-            if self._opener is _shared_no_redirect_opener():
+            if _is_shared_no_redirect_opener(self._opener):
                 # _no_redirect_opener, not a bare build_opener: the bare form lets urllib fill in an
                 # HTTPSHandler whose context the engine never names, so the forward-secrecy assertion
                 # cannot reach this hop (ASVS 12.1.2).

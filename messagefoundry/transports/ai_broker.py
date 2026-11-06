@@ -53,7 +53,6 @@ import urllib.request
 from typing import TYPE_CHECKING
 
 from messagefoundry.config.tls_policy import (
-    EngineTlsListRefused,
     HopDisposition,
     HopPosture,
     RevocationHopGuard,
@@ -360,11 +359,12 @@ class AiBroker:
             )
         # The opener is chosen before the guard and handed to it, so the guard judges the context
         # this broker really dials with, whichever opener that later becomes.
-        # BACKLOG #2484: the shared opener is built on first use, so an OpenSSL that refuses the
-        # engine's list refuses here. Re-raised as AiBrokerError, the API surface's one error type.
+        # BACKLOG #2484: the shared opener is built on first use, so a build refusal, such as an
+        # OpenSSL that refuses the engine's list (EngineTlsListRefused, a ValueError), lands here.
+        # Re-raised as AiBrokerError, the API surface's one error type.
         try:
             opener: urllib.request.OpenerDirector = _shared_no_redirect_opener()
-        except EngineTlsListRefused as exc:
+        except ValueError as exc:
             raise AiBrokerError(f"[ai] endpoint opener refused: {exc}") from exc
         # Last, so an endpoint refused for any reason above never logs a revocation crossing, and
         # the operator is never sent to attest a hop that is refused anyway (BACKLOG #2193 (e)).

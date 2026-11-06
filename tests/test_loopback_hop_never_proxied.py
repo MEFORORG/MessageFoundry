@@ -148,8 +148,8 @@ def _assert_only_loopback_goes_direct(opener: urllib.request.OpenerDirector) -> 
 
 
 #: One builder per opener family, each called after the environment is set. urllib reads the
-#: environment when an opener is built, and the shared module-level openers are built by these same
-#: functions at import.
+#: environment when an opener is built, and the shared openers are built by these same
+#: functions.
 _FAMILIES: dict[str, Callable[[], urllib.request.OpenerDirector]] = {
     "bare": build_strict_opener,
     "http-family-shared": rest._no_redirect_opener,

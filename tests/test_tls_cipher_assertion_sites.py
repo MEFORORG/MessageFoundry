@@ -69,10 +69,10 @@ from messagefoundry.transports.http_auth import with_http_digest
 from tests._ast_sites import call_sites, find_funcs
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
-# Imported at module scope ON PURPOSE. `rest` and `alert_sinks` build their shared opener AT IMPORT,
-# so a first import inside the every_suite_looks_weak fixture would raise during module execution and
-# fail the test for the wrong reason. Importing here puts them in sys.modules before any patch runs,
-# which also means the assertions below exercise the same module objects the engine uses.
+# Imported at module scope ON PURPOSE, so the assertions below exercise the same module objects the
+# engine uses. Their shared openers are built on first use (BACKLOG #2484); a session fixture in
+# tests/conftest.py builds them before any test, so none is first built inside the
+# every_suite_looks_weak fixture, where the build would raise and fail a test for the wrong reason.
 
 
 def _cipher_names(ctx: ssl.SSLContext) -> list[str]:

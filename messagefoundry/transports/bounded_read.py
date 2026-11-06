@@ -780,9 +780,9 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
     :class:`ProxyCredentialsRefusedError` states the rule.
     The check is made here, per request and per proxy, because this method sees every proxy a
     request is handed to, from every source: the environment, the system settings, and a
-    ``proxy_url`` an operator configured. It is not made when the handler is built. Shared openers
-    are built at start, and a refusal there would stop the engine starting over a proxy that many
-    of its hops never use.
+    ``proxy_url`` an operator configured. It is not made when the handler is built. A shared
+    opener serves many hops, and a refusal at its build would stop all of them over a proxy that
+    many of them never use.
 
     ``caller_header_admitted`` is set only by a connection whose ``proxy_user`` credential its
     posture-keyed guard admitted when the connection was built
