@@ -885,7 +885,12 @@ _DRIVE_UNKNOWN = 0
 class _LeavesHost(Exception):
     """Raised through :func:`~messagefoundry.auth.anchor_path.windows_chain` by a reader that met
     another host: a network drive, a link to a share, or a share Windows could not reach. Not an
-    ``OSError``, which the walk would catch and report as a cause."""
+    ``OSError``, which the walk would catch and report as a cause. ``kind`` names the check that
+    found it and never the path, for the WARNING :func:`_not_cleared` logs."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
 
 
 class _PathEnds(Exception):
@@ -926,6 +931,8 @@ def _windows_path_verdict(
     with :func:`~messagefoundry.auth.anchor_path.windows_chain`. ``True``: the walk found the path
     leads to another host. ``None``: the walk could not finish; a path-free class of its cause is
     logged at WARNING and the whole cause, which can name the path, at DEBUG (:func:`_not_cleared`).
+    ``True`` is logged the same way, naming the check that found the other host, so a refusal that
+    points the operator at the server log finds a reason there (engine PR 2815, hold F1).
     ``False``: the walk found nothing that leads off the host, which is not proof the path is
     local. ``probe``, ``drive_type``, ``drive_target`` and ``cwd`` are the walk's inputs, passed in
     so a test can stand in for the file system. ``docs/CONNECTIONS.md``, Generic ODBC, states the
@@ -938,7 +945,7 @@ def _windows_path_verdict(
     def volume_cause(root: str) -> str | None:
         kind = drive_type(root)
         if kind == _DRIVE_REMOTE:
-            raise _LeavesHost
+            raise _LeavesHost("the path is on a network drive")
         if kind == _DRIVE_NO_ROOT_DIR:
             raise _PathEnds  # no volume at that letter here: left to the driver, as a missing file is
         if kind == _DRIVE_UNKNOWN:
@@ -950,19 +957,20 @@ def _windows_path_verdict(
             kind, target = probe(part)
         except (FileNotFoundError, NotADirectoryError) as exc:
             if getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
-                raise _LeavesHost from None
+                raise _LeavesHost("the path is on a share Windows could not reach") from None
             raise _PathEnds from None
         if target is not None:
             text = target.strip()
             if is_remote_spelling(text) and not _LOCAL_DEVICE_TARGET.match(text):
-                raise _LeavesHost
+                raise _LeavesHost("a link on the path leads to a share or a device path")
         return kind, target
 
     try:
         _chain, cause = windows_chain(
             path, cwd, probing, volume_cause=volume_cause, drive_target=drive_target
         )
-    except _LeavesHost:
+    except _LeavesHost as leaves:
+        _not_cleared(leaves.kind, path)
         return True
     except _PathEnds:
         return False
@@ -973,7 +981,9 @@ def _windows_path_verdict(
         )
         return None
     if cause is not None and cause.kind == SHARE_CAUSE:
-        return True  # the walk reached a share, as through a subst drive onto \??\UNC\host\share
+        # The walk reached a share, as through a subst drive onto \??\UNC\host\share.
+        _not_cleared(cause.kind, path)  # the cause's text is its kind, so DEBUG gets the path
+        return True
     if cause is not None:
         _not_cleared(cause.kind, cause)
         return None
@@ -981,9 +991,10 @@ def _windows_path_verdict(
 
 
 def _not_cleared(kind: str, detail: object) -> None:
-    """Log why the walk did not clear a file keyword path: ``kind``, which names no path, at
-    WARNING, so the operator who meets the refusal sees a reason, and ``detail``, which can name
-    the path, at DEBUG only (``docs/PHI.md``; vault BACKLOG #5197 item 22)."""
+    """Log why the walk did not clear a file keyword path, or what it found leads off the host:
+    ``kind``, which names no path, at WARNING, so the operator who meets the refusal sees a reason,
+    and ``detail``, which can name the path, at DEBUG only (``docs/PHI.md``; vault BACKLOG #5197
+    item 22)."""
     logger.warning(
         "DATABASE file keyword path not cleared: %s (the path, if any, is logged at DEBUG)", kind
     )
@@ -1076,12 +1087,18 @@ def driver_file_spellings(value: object, verdicts: FileVerdicts | None = None) -
 
 
 def _refuse_remote_path(
-    value: object, verdicts: FileVerdicts, *, name: str, connection: str | None
+    value: object,
+    verdicts: FileVerdicts,
+    *,
+    name: str,
+    connection: str | None,
+    capath_entries: bool = True,
 ) -> None:
     """Raise ``ValueError`` when ``value`` breaks a rule :func:`driver_file_rule` names for the
     file keyword ``name`` and its ``verdicts`` (BACKLOG #2705); otherwise return. The message names
-    the keyword, not the value. ``docs/CONNECTIONS.md``, Generic ODBC, states the check's limits."""
-    rule = driver_file_rule(name, value, verdicts)
+    the keyword, not the value. ``capath_entries`` is :func:`driver_file_rule`'s ``entries``.
+    ``docs/CONNECTIONS.md``, Generic ODBC, states the check's limits."""
+    rule = driver_file_rule(name, value, verdicts, entries=capath_entries)
     if rule is not None:
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE odbc_params value for '{name}' {rule}"
@@ -1089,18 +1106,20 @@ def _refuse_remote_path(
 
 
 def _refuse_remote_paths(
-    named: Mapping[str, Any], *, connection: str | None
+    named: Mapping[str, Any], *, connection: str | None, capath_entries: bool = True
 ) -> dict[str, FileVerdicts]:
     """Compute the verdicts of each file keyword in ``named``, in sorted keyword order, and raise
     ``ValueError`` (:func:`_refuse_remote_path`) at the first that breaks a rule, in every
     ``sslmode``. Otherwise return the verdicts for the checks that read the files: one entry per
-    file keyword ``named`` holds, set or not. ``docs/CONNECTIONS.md``, Generic ODBC, states the
-    check's limits."""
+    file keyword ``named`` holds, set or not. ``capath_entries`` is :func:`driver_file_rule`'s
+    ``entries``. ``docs/CONNECTIONS.md``, Generic ODBC, states the check's limits."""
     verdicts: dict[str, FileVerdicts] = {}
     for name in sorted(_ODBC_PATH_KEYS & named.keys()):
         value = named[name]
         verdicts[name] = file_keyword_verdicts(value)
-        _refuse_remote_path(value, verdicts[name], name=name, connection=connection)
+        _refuse_remote_path(
+            value, verdicts[name], name=name, connection=connection, capath_entries=capath_entries
+        )
     return verdicts
 
 
@@ -1120,16 +1139,19 @@ CAPATH_ENTRY_RULE = (
 )
 
 
-def driver_file_rule(keyword: str, value: object, verdicts: FileVerdicts) -> str | None:
+def driver_file_rule(
+    keyword: str, value: object, verdicts: FileVerdicts, *, entries: bool = True
+) -> str | None:
     """The rule a driver file keyword's ``value`` breaks, given its ``verdicts``, or ``None``:
     :data:`REMOTE_PATH_RULE` when :func:`names_another_host` refuses it, and
     :data:`CAPATH_ENTRY_RULE` when an entry of an ``sslcapath`` folder must be refused
     (:func:`_capath_entries_leave_host`). The one judgement the build and the lane check
     (``auth.trust_anchors.database_ca_anchor_spec``) both run, so the two refuse alike (vault
-    BACKLOG #5197)."""
+    BACKLOG #5197). ``entries=False`` leaves the ``sslcapath`` folder unlisted, for a build on the
+    event loop, which hands that judgement to a worker thread (:class:`_CapathCheck`)."""
     if names_another_host(value, verdicts):
         return REMOTE_PATH_RULE
-    if keyword == "sslcapath" and _capath_entries_leave_host(value, verdicts):
+    if entries and keyword == "sslcapath" and _capath_entries_leave_host(value, verdicts):
         return CAPATH_ENTRY_RULE
     return None
 
@@ -1138,9 +1160,10 @@ def driver_file_rule(keyword: str, value: object, verdicts: FileVerdicts) -> str
 #: for :func:`_path_verdict` and for listing an ``sslcapath`` folder.
 _WALKS_BEYOND_SPELLING = sys.platform == "win32"
 #: How many entries of an ``sslcapath`` folder :func:`_capath_entries_leave_host` judges. A folder
-#: holding more is refused rather than judged in part, since the build runs on the event loop. A
-#: CA folder holds a few hundred at most (one file and one link per CA), and each entry that is not
-#: a link costs one ``lstat`` (:func:`_capath_entry_clear`).
+#: holding more is refused rather than judged in part, which bounds the time a lane start or a
+#: lane check waits on the worker thread that lists it; a build on the event loop never lists it
+#: (:class:`_CapathCheck`). A CA folder holds a few hundred at most (one file and one link per CA),
+#: and each entry that is not a link costs one ``lstat`` (:func:`_capath_entry_clear`).
 _MAX_CAPATH_ENTRIES = 4096
 
 
@@ -1226,6 +1249,48 @@ def _capath_entry_clear(path: str, name: str) -> bool:
             if kind != LINK:
                 return True
     return _path_verdict(path) is False
+
+
+def _on_event_loop_thread() -> bool:
+    """Whether this thread is running an event loop, where a build must not list a folder."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+class _CapathCheck:
+    """The ``sslcapath`` entry judgement a connector build left undone because it ran on the event
+    loop (engine PR 2815, hold F2; CLAUDE.md section 6). The listing and the entry walks of
+    :func:`_capath_entries_leave_host` run in a worker thread instead, through :meth:`run`, which
+    the connector awaits in ``validate_startup``, before the lane serves, and before its pool is
+    first made, before the driver reads the folder. A refusal raises the ``ValueError`` the build
+    would have raised (:func:`_refuse_remote_path`). Once a run passes, later runs do nothing."""
+
+    def __init__(self, value: object, connection: str | None) -> None:
+        self._value = value
+        self._connection = connection
+        self._passed = False
+
+    @classmethod
+    def deferred(cls, settings: Mapping[str, Any], connection: str | None) -> _CapathCheck | None:
+        """The check a build on the event loop owes for ``settings``, or ``None``: a build off the
+        loop judged the entries itself, and a connection naming no ``sslcapath`` has none."""
+        if not _on_event_loop_thread():
+            return None
+        value = generic_odbc_param(settings, "sslcapath")
+        return None if value is None else cls(value, connection)
+
+    def _judge(self) -> None:
+        verdicts = file_keyword_verdicts(self._value)
+        _refuse_remote_path(self._value, verdicts, name="sslcapath", connection=self._connection)
+
+    async def run(self) -> None:
+        if self._passed:
+            return
+        await asyncio.to_thread(self._judge)
+        self._passed = True
 
 
 def _refuse_weak_driver_key(
@@ -1529,7 +1594,9 @@ def _irregular(
     logger.debug("%s: not a regular file, so the engine does not check it", setting)
 
 
-def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
+def _build_odbc_dsn(
+    s: dict[str, Any], *, connection: str | None = None, capath_entries: bool = True
+) -> str:
     """Build a GENERIC ODBC connection string (``dialect='generic'``, #66) — decoupled from the ODBC
     Driver 18 / T-SQL preset so a DB reached through its own ODBC driver (PostgreSQL, MySQL) works. The
     operator installs the target ODBC driver at the OS level and names it here.
@@ -1577,7 +1644,10 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     places reads, and for psqlODBC and MySQL only at that family's own spellings (BACKLOG #5053,
     :func:`generic_odbc_tls_unenforced`); a name off the allowlist is refused above. What
     stays delegated is the case this path genuinely cannot judge: the family's mode keyword IS set,
-    and the engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md."""
+    and the engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md.
+
+    ``capath_entries=False`` leaves the entries of an ``sslcapath`` folder unjudged, for a connector
+    built on the event loop, which judges them in a worker thread (:class:`_CapathCheck`)."""
     driver = str(s.get("odbc_driver") or "").strip()
     where = hop_name_prefix(connection)
     if not driver:
@@ -1649,7 +1719,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
         parts.append(f"{k}={literal}")
     # After the loop on purpose: these open the key and CA files, so the keywords are settled first.
     # Each file keyword is judged once, here, and every check below reads that judgement.
-    verdicts = _refuse_remote_paths(named, connection=connection)
+    verdicts = _refuse_remote_paths(named, connection=connection, capath_entries=capath_entries)
     _refuse_weak_driver_key(named, connection=connection, verdicts=verdicts)
     _refuse_weak_driver_cert(named, connection=connection, verdicts=verdicts)
     _refuse_encrypted_driver_ca(named, connection=connection, verdicts=verdicts)
@@ -1799,6 +1869,7 @@ def _build_connection(
     attested: bool = False,
     read_only: bool = False,
     connection: str | None = None,
+    capath_entries: bool = True,
 ) -> tuple[str, bool]:
     """Dispatch on ``dialect`` and return ``(dsn, weakened_tls)`` (#66). ``dialect='sqlserver'`` (default)
     runs the byte-identical SQL Server preset (:func:`_build_dsn`, weakened-TLS refusal + optional
@@ -1812,7 +1883,8 @@ def _build_connection(
     a string back without a hop decision it did not ask for.
 
     ``connection`` names the declaring connection in that WARNING (#333); it is used on the generic path
-    only, since the SQL Server preset refuses rather than warns."""
+    only, since the SQL Server preset refuses rather than warns. ``capath_entries`` is
+    :func:`_build_odbc_dsn`'s, and the SQL Server preset takes no ``sslcapath``."""
     dialect = str(s.get("dialect", "sqlserver")).lower()
     if dialect == "sqlserver":
         weakened = bool(s.get("trust_server_certificate", False)) or not bool_setting(
@@ -1823,7 +1895,7 @@ def _build_connection(
             weakened,
         )
     if dialect == "generic":
-        return _build_odbc_dsn(s, connection=connection), False
+        return _build_odbc_dsn(s, connection=connection, capath_entries=capath_entries), False
     raise ValueError(f"DATABASE dialect must be 'sqlserver' or 'generic', got {dialect!r}")
 
 
@@ -3267,8 +3339,13 @@ class DatabaseDestination(DestinationConnector):
         self._connection_name = config.name
         # The posture this connector was built under, for the send-time tripwire (vault BACKLOG #2354).
         self._hop_posture = current_hop_posture()
+        # Built on the event loop, the sslcapath entries are judged off it, before the lane serves.
+        self._capath_check = _CapathCheck.deferred(s, config.name)
         self._dsn, self._weakened_tls = _build_connection(
-            s, attested=self._hop_attested, connection=config.name
+            s,
+            attested=self._hop_attested,
+            connection=config.name,
+            capath_entries=self._capath_check is None,
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
         # BACKLOG #1178: the generic dialect's cleartext arm, which reaches none of the refusals above.
         # Built AFTER _build_connection so a malformed server/keyword keeps reporting its own shape
@@ -3323,11 +3400,20 @@ class DatabaseDestination(DestinationConnector):
             transport="DATABASE destination",
         )
 
+    async def validate_startup(self) -> None:
+        """Judge the ``sslcapath`` entries a build on the event loop left to a worker thread, so a
+        refusal fails the lane before it serves (:class:`_CapathCheck`)."""
+        if self._capath_check is not None:
+            await self._capath_check.run()
+
     async def _get_pool(self) -> Any:
         if self._pool is not None:
             return self._pool
         async with self._pool_lock:
             if self._pool is None:
+                if self._capath_check is not None:
+                    # A build no start awaited, such as a reload's: the driver reads no folder unjudged.
+                    await self._capath_check.run()
                 self._pool = await _make_pool(
                     self._dsn,
                     self._pool_max,
@@ -3660,10 +3746,14 @@ class DatabaseSource(SourceConnector):
             raise ValueError(refusal)
         # Per-connection insecure-hop attestation (#200): the customer-DB poll link rides the same
         # posture-keyed verify-off refusal as the destination (a read still crosses the wire).
+        record_name = None if config.name is None else inbound_record_name(config.name)
+        # Built on the event loop, the sslcapath entries are judged off it, before the poll binds.
+        self._capath_check = _CapathCheck.deferred(s, record_name)
         self._dsn, _ = _build_connection(
             s,
             attested=config.tls_hop_attested,
-            connection=None if config.name is None else inbound_record_name(config.name),
+            connection=record_name,
+            capath_entries=self._capath_check is None,
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
         # BACKLOG #1178: the poll link dials OUT on the same generic-dialect hop the destination does,
         # with the same credential in the same DSN, so it is gated identically. Construction only —
@@ -3882,11 +3972,20 @@ class DatabaseSource(SourceConnector):
             )
             return False
 
+    async def validate_startup(self) -> None:
+        """Judge the ``sslcapath`` entries a build on the event loop left to a worker thread, so a
+        refusal fails the lane before it polls (:class:`_CapathCheck`)."""
+        if self._capath_check is not None:
+            await self._capath_check.run()
+
     async def _get_pool(self) -> Any:
         if self._pool is not None:
             return self._pool
         async with self._pool_lock:
             if self._pool is None:
+                if self._capath_check is not None:
+                    # A build no start awaited: the driver reads no folder unjudged.
+                    await self._capath_check.run()
                 # autocommit: each mark is its own committed statement, giving per-row mark durability.
                 self._pool = await _make_pool(
                     self._dsn,

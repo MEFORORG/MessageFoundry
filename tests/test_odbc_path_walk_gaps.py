@@ -22,6 +22,7 @@ import os
 import pickle
 import re
 import sys
+import threading
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ import pytest
 from messagefoundry.auth import anchor_path
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import DIRECTORY, FILE, LINK, windows_chain
+from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.transports import database
 
 _FIXED = 3  # GetDriveTypeW: a fixed disk
@@ -863,3 +865,182 @@ def test_closing_step_4_a_refused_folder_never_reads_as_clear(
     folder = r"S:\certs"
     assert database._capath_entries_leave_host(folder, {folder: True}) is True
     assert database._capath_entries_leave_host(folder, {folder: None}) is True
+
+
+# === engine PR 2815 hold ========================================================================
+
+# --- F1: a walk that finds another host says which check found it ------------------------------
+
+
+def _unreached(path: str) -> OSError:
+    exc = FileNotFoundError(2, "not reached", path)
+    exc.winerror = 53  # type: ignore[attr-defined]
+    return exc
+
+
+@pytest.mark.parametrize(
+    ("walk", "kind"),
+    [
+        (
+            lambda: _walk(r"C:\phi-name\a.0", {r"C:\phi-name\a.0": _SHARE + r"\ca.pem"}),
+            "a link on the path leads to a share",
+        ),
+        (
+            lambda: _walk(r"S:\phi-name\a.0", substs={"S:": "\\??\\UNC\\files.test\\share"}),
+            "network share",
+        ),
+        (
+            lambda: database._windows_path_verdict(
+                r"Z:\phi-name\a.0",
+                probe=_probe(),
+                drive_type=lambda _root: database._DRIVE_REMOTE,
+                drive_target=lambda _drive: None,
+                cwd=r"C:\work",
+            ),
+            "network drive",
+        ),
+        (
+            lambda: _walk(r"C:\phi-name\a.0", failing={r"C:\phi-name": _unreached(r"C:\phi-name")}),
+            "could not reach",
+        ),
+    ],
+)
+def test_hold_f1_a_walk_that_finds_another_host_warns_the_check(
+    caplog: pytest.LogCaptureFixture, walk: Callable[[], bool | None], kind: str
+) -> None:
+    """``CAPATH_ENTRY_RULE`` sends the operator to the server log for the check that failed, so
+    every arm that refuses logs one: the check's kind at WARNING, the path at DEBUG only. Red: the
+    arms that found another host returned ``True`` and logged nothing."""
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    assert walk() is True
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(kind in m for m in warned), warned
+    assert all("phi-name" not in m for m in warned)
+    debugged = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+    assert any("phi-name" in m for m in debugged)
+
+
+def test_hold_f1_an_sslcapath_entry_linked_onto_a_share_is_refused_with_a_logged_check(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The case the hold names: an entry of the folder that links onto a share. Red: refused with
+    no line in the log, where the refusal says the log names the check."""
+    entry = r"C:\capath\phi-entry.0"
+    monkeypatch.setattr(database, "_win_probe", lambda _p: (LINK, _SHARE + r"\ca.pem"))
+    monkeypatch.setattr(
+        database, "_path_verdict", lambda p: _walk(p, {entry: _SHARE + r"\ca.pem"}, cwd=_no_cwd)
+    )
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    assert database._capath_entry_clear(entry, "phi-entry.0") is False
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("a link on the path leads to a share" in m for m in warned), warned
+    assert all("phi-entry" not in m for m in warned)
+
+
+# --- F2: a build on the event loop lists no sslcapath folder -------------------------------------
+
+
+def _db_connector(direction: str, folder: Path) -> Any:
+    settings = _generic(SSLCAPATH=str(folder))
+    if direction == "outbound":
+        return database.DatabaseDestination(
+            Destination(
+                name=_OUT,
+                type=ConnectorType.DATABASE,
+                settings={**settings, "statement": "INSERT INTO t (a) VALUES (:a)"},
+            )
+        )
+    return database.DatabaseSource(
+        Source(
+            name=_IN,
+            type=ConnectorType.DATABASE,
+            settings={**settings, "poll_statement": "SELECT a FROM t"},
+        )
+    )
+
+
+def _listing_threads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record the thread each listing of an sslcapath folder runs on."""
+    threads: list[int] = []
+    real = database._capath_folder_clear
+
+    def recording(folder: str) -> bool:
+        threads.append(threading.get_ident())
+        return real(folder)
+
+    monkeypatch.setattr(database, "_capath_folder_clear", recording)
+    return threads
+
+
+@pytest.mark.parametrize("direction", ["outbound", "inbound"])
+async def test_hold_f2_a_build_on_the_event_loop_judges_the_entries_off_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, direction: str
+) -> None:
+    """The build runs on the event loop, so it lists no folder there. The lane's start awaits the
+    judgement, which runs in a worker thread and still refuses before the lane serves. Red: the
+    constructor listed the folder and walked its entries on the loop thread."""
+    folder = _capath(tmp_path, "0a1b2c3d.0", "readme.txt")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
+    threads = _listing_threads(monkeypatch)
+    loop_thread = threading.get_ident()
+    connector = _db_connector(direction, folder)
+    assert threads == []
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list") as refused:
+        await connector.validate_startup()
+    assert "phi-capath" not in str(refused.value)
+    assert threads and loop_thread not in threads
+
+
+@pytest.mark.parametrize("direction", ["outbound", "inbound"])
+async def test_hold_f2_the_pool_is_not_made_before_the_entries_are_judged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, direction: str
+) -> None:
+    """A build no start awaited, such as a reload's, still has its folder judged before the
+    driver is handed it: making the pool runs the judgement first, off the loop."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
+    threads = _listing_threads(monkeypatch)
+    made: list[str] = []
+
+    async def make_pool(dsn: str, *_args: Any, **_kwargs: Any) -> object:
+        made.append(dsn)
+        return object()
+
+    monkeypatch.setattr(database, "_make_pool", make_pool)
+    connector = _db_connector(direction, folder)
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
+        await connector._get_pool()
+    assert made == []
+    assert threads and threading.get_ident() not in threads
+
+
+@pytest.mark.parametrize("direction", ["outbound", "inbound"])
+async def test_hold_f2_a_clear_folder_is_judged_once_and_the_lane_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, direction: str
+) -> None:
+    """The control: a folder whose entries stay on the host passes, and the pool's own check does
+    not list it again."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+    threads = _listing_threads(monkeypatch)
+
+    async def make_pool(*_args: Any, **_kwargs: Any) -> object:
+        return object()
+
+    monkeypatch.setattr(database, "_make_pool", make_pool)
+    connector = _db_connector(direction, folder)
+    await connector.validate_startup()
+    await connector._get_pool()
+    assert len(threads) == 1
+
+
+@pytest.mark.parametrize("direction", ["outbound", "inbound"])
+def test_hold_f2_a_build_off_the_event_loop_still_refuses_at_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, direction: str
+) -> None:
+    """The control: with no loop on the thread, as for ``messagefoundry check``, the build judges
+    the entries itself and refuses, as before."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
+        _db_connector(direction, folder)
