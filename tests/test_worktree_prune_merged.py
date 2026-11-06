@@ -43,6 +43,7 @@ import sys
 import textwrap
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -1717,6 +1718,96 @@ def test_a_repaired_orphan_stops_being_reported(fx: Fixture, sleeper: int) -> No
     later = run(fx)
     assert later["counts"]["orphansFromEarlierRuns"] == 0
     assert later["_exit"] == 0
+
+
+def _write_orphan_ledger(fx: Fixture, *paths: Path) -> None:
+    common = Path(
+        _git(fx.primary, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    )
+    entries = [{"path": str(p), "branch": p.name, "at": "2026-11-01T00:00:00Z"} for p in paths]
+    (common / "prune-merged-orphans.json").write_text(json.dumps(entries), encoding="utf-8")
+
+
+def test_a_fully_deleted_orphan_stops_being_reported(fx: Fixture, sleeper: int) -> None:
+    """Red on engine PR 2803 at 210c9cb278: an entry whose directory AND parent are both gone threw
+    out of the presence check, read as "not confirmed gone", and exited 3 every night with nothing a
+    human could clear. Absent under a folder that is there and lists is confirmed gone."""
+    live_record(fx, sleeper, fx.primary)
+    gone = fx.root / "wt" / "deleted-parent" / "repo-deleted"
+    assert not gone.parent.exists(), "CONTROL: the parent is gone too"
+    _write_orphan_ledger(fx, gone)
+    later = run(fx)
+    assert later["counts"]["orphansFromEarlierRuns"] == 0, later["orphansFromEarlierRuns"]
+    assert later["_exit"] == 0
+
+
+@contextmanager
+def _unlistable(folder: Path) -> Iterator[None]:
+    """Deny this user the right to list ``folder``, with the bypass privileges off, and give it back
+    afterwards. Skips when the deny does not bind, as ``test_worktree_remove_in_use`` does."""
+    from tests.test_worktree_remove_in_use import _privileges_disabled
+
+    who = subprocess.run(
+        ["whoami"], capture_output=True, text=True, check=False, timeout=30
+    ).stdout.strip()
+    made = subprocess.run(
+        ["icacls", str(folder), "/deny", f"{who}:(RD)"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    if not who or made.returncode != 0:
+        pytest.skip(f"could not deny access with icacls: {made.stdout} {made.stderr}")
+    try:
+        with _privileges_disabled():
+            probe = subprocess.run(
+                [
+                    "pwsh",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$null = [System.IO.DirectoryInfo]::new($env:T_DIR).GetFileSystemInfos()",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120,
+                env={**os.environ, "T_DIR": str(folder)},
+            )
+            if probe.returncode == 0:
+                pytest.skip(f"{who} can still list {folder} after the deny")
+            yield
+    finally:
+        subprocess.run(
+            ["icacls", str(folder), "/remove:d", who],
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+
+
+@pytest.mark.parametrize("ancestor", ["a-file", "denied"])
+def test_an_orphan_under_an_unreadable_ancestor_stays_reported(
+    fx: Fixture, sleeper: int, ancestor: str
+) -> None:
+    """The other side of the rule above: a not-found under a folder that is there but cannot be
+    listed (a file standing where the folder should be, or a folder this user may not list) is not
+    confirmed gone, so the entry keeps being reported and the run exits 3."""
+    live_record(fx, sleeper, fx.primary)
+    above = fx.root / "unreadable"
+    gone = above / "deleted-parent" / "repo-deleted"
+    _write_orphan_ledger(fx, gone)
+    if ancestor == "a-file":
+        above.write_text("not a folder", encoding="utf-8")
+        later = run(fx)
+    else:
+        above.mkdir()
+        with _unlistable(above):
+            later = run(fx)
+    assert [o["path"] for o in later["orphansFromEarlierRuns"]] == [str(gone)], later
+    assert "not confirmed gone" in later["orphansFromEarlierRuns"][0]["why"]
+    assert later["_exit"] == 3
 
 
 def test_a_name_that_matches_nothing_does_not_exit_green(fx: Fixture, sleeper: int) -> None:
