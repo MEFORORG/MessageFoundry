@@ -146,12 +146,13 @@ def _parse_age(spec: str) -> float:
 # reads it (vault BACKLOG #3166 step 4). It names at least the consequences an operator would
 # act on; :func:`_write_owner_only` is the source of record, and docs/TEE-RELAY.md the long form.
 _OUT_IN_PLACE_ON_WINDOWS = (
-    "Lines end in LF on every OS, Windows included. On POSIX the file is created owner-only (0600), "
-    "and an existing FILE is replaced rather than written into: a read-only (0444) FILE is "
-    "overwritten, a hard link at FILE is broken, and a symbolic link at FILE is replaced, not "
-    "followed; a named stream such as /dev/stdout is written through. On Windows an existing FILE "
-    "is written in place, through any link, and keeps its access list and owner; one it cannot "
-    "write is an error, never replaced."
+    "Lines end in LF on every OS, Windows included. On POSIX a new file's mode is never wider "
+    "than 0600, and an existing FILE is replaced rather than written into: a read-only (0444) FILE "
+    "is overwritten, a hard link at FILE is broken, and a symbolic link at FILE is replaced. The "
+    "exception on POSIX: a FILE that resolves, through any link, to a character device, or to a "
+    "pipe or socket this account owns, is written through. On Windows an existing FILE is written "
+    "in place, through any link, and keeps its access list and owner; one it cannot write is an "
+    "error, never replaced."
 )
 
 
@@ -303,9 +304,11 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         default=None,
         help=(
-            "write the JSON report to FILE instead of stdout. On POSIX the file is created "
-            "owner-only (0600). On every OS an existing FILE is replaced rather than written into, "
-            "so on Windows the report takes its folder's access list"
+            "write the JSON report to FILE instead of stdout. On POSIX a new file's mode is never "
+            "wider than 0600. On every OS an existing FILE is replaced rather than written into, so "
+            "on Windows the report takes its folder's access list. The exception: a FILE that "
+            "resolves, through any link, to a character device, or to a pipe or socket (on POSIX, "
+            "one this account owns), is written through"
         ),
     )
     compare.add_argument(
@@ -433,7 +436,7 @@ async def _export(args: argparse.Namespace) -> int:
     text = json.dumps(data, indent=2)
     if args.out:
         try:
-            # Off the event loop: the writer opens, writes and fsyncs synchronously.
+            # Off the event loop: the writer opens and writes synchronously, and on POSIX fsyncs.
             await asyncio.to_thread(
                 _write_owner_only, args.out, text + "\n", in_place_on_windows=True
             )

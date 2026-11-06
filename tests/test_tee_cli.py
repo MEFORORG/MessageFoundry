@@ -427,20 +427,20 @@ def test_out_help_states_what_the_writer_does_to_the_file(command: str) -> None:
     text = _out_help(command)
     for consequence in (
         "LF on every OS, Windows included",
-        "owner-only (0600)",
+        "never wider than 0600",
         "a read-only (0444) FILE is overwritten",
         "a hard link at FILE is broken",
         "a symbolic link at FILE is replaced",
         "On Windows an existing FILE is written in place",
         "keeps its access list and owner",
-        "a named stream such as /dev/stdout is written through",
+        "to a character device, or to a pipe or socket this account owns, is written through",
     ):
         assert consequence in text, f"{command} --out help lacks {consequence!r}: {text}"
 
 
 def test_compare_out_help_states_that_an_existing_file_is_replaced() -> None:
     text = _out_help("compare")
-    assert "owner-only (0600)" in text
+    assert "never wider than 0600" in text
     assert "an existing FILE is replaced" in text
 
 
@@ -469,7 +469,7 @@ def test_out_goes_through_the_owner_only_writer(
 def test_out_is_written_off_the_event_loop(
     command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # export and anonymize-captures run inside asyncio.run, and the writer fsyncs; called on the
+    # export and anonymize-captures run inside asyncio.run, and the writer fsyncs on POSIX; called on the
     # loop's thread it would block the loop (PR 2390 note 4, vault BACKLOG #3166).
     import tee.__main__ as tee_main
 

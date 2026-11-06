@@ -143,11 +143,12 @@ python -m tee export --db ./tee.db --naks-only --since 24h --out ./tee-review.js
 `_write_owner_only` in `tee/__main__.py`, which is the source of record. At least these
 consequences follow from it:
 
-* **On POSIX the file is created owner-only (`0600`)**, whatever the umask.
+* **On POSIX a new file's mode is never wider than `0600`**, whatever the umask.
 * **On POSIX an existing file is replaced, not written into.** A read-only (`0444`) file is
   overwritten, a hard link at the path is broken (the other name keeps the old contents), and a
-  symbolic link at the path is replaced rather than followed. A named stream such as `/dev/stdout`
-  is written through. These hold for all three commands.
+  symbolic link at the path is replaced. The exception: a path that resolves, through any link, to
+  a character device, or to a pipe or socket this account owns, is written through. These hold for
+  all three commands.
 * **`export` and `anonymize-captures` write LF line endings on every OS**, Windows included. Before
   vault BACKLOG #3166 a Windows `export` file ended its lines in CRLF.
 * **On Windows, `export` and `anonymize-captures` write an existing file in place**, as `write_text`
@@ -158,11 +159,9 @@ consequences follow from it:
   at least one this account may not write, a read-only, Hidden or System one, a directory, and one
   another process holds open without write sharing. A new file takes its folder's access list.
 * **`compare` replaces an existing file on Windows too**, so the report takes its folder's access
-  list, whatever list the old file had, and a link at the path is replaced, not followed. It
-  writes the platform's line endings.
-
-The POSIX replace and the LF line endings were accepted as behaviour changes by a Lander decision
-under the owner's driver rule (vault BACKLOG #3166), not by a standalone owner ruling.
+  list, whatever list the old file had, and a link at the path is replaced. The exception: a path
+  that resolves, through any link, to a character device, a pipe or a socket is written through.
+  It writes the platform's line endings.
 
 ### Purge
 
