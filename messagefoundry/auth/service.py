@@ -3479,11 +3479,11 @@ class AuthService:
         self._reconcile_outage_run_paged = False
         self._reconcile_outage_paged = False
         #: A PARTIAL outage's state (BACKLOG #3709 step 1, #4772 item 6): each account's count of
-        #: probes running the directory left unanswered, whether the standing condition's page is
-        #: recorded, and whether any partial page was raised in THIS process.
+        #: probes running the directory left unanswered, the accounts already paged for that are
+        #: still at the threshold, and whether a partial page was raised since the last clear.
         #: `_note_partial_outage` and `_latch_outage_page` keep them.
         self._reconcile_unreached: dict[str, int] = {}
-        self._reconcile_partial_run_paged = False
+        self._reconcile_partial_paged_ids: set[str] = set()
         self._reconcile_partial_paged = False
         #: The accounts behind the trip, referral and hold now open, kept only so that a forfeited
         #: standing logs once per new one (BACKLOG #3083). Logging state: no decision reads it.
@@ -8194,8 +8194,8 @@ class AuthService:
         self, plan: reconcile.ReconcilePlan, probes: Iterable[reconcile.Probe]
     ) -> reconcile.ReconcilePlan:
         """Count, per account, the probes running the directory left unanswered, and say on the
-        plan whether this pass pages a PARTIAL outage or clears it (BACKLOG #3709 step 1, #4772
-        item 6).
+        plan which accounts this pass pages a PARTIAL outage for, or whether it clears one
+        (BACKLOG #3709 step 1, #4772 item 6).
 
         Before this, one answered probe ended the outage run, so a directory that answered for
         some accounts and never for the rest paged nobody, and those accounts went unreconciled
@@ -8203,73 +8203,72 @@ class AuthService:
         UNAVAILABLE for any reason but the engine's own paging bound: the directory answered that
         one, and it pages on its own (vault BACKLOG #3696).
 
-        **Counted per account, not per pass.** An unanswered probe adds one to that account's
-        streak, and any other answer, a referral, a configuration refusal or a fault included,
-        ends it. An account this pass did not probe keeps its streak, so a probe budget smaller
-        than the estate (``[auth].ad_session_recheck_max_users``) cannot reset it, and one-off
-        failures on different accounts never add up. An account that leaves the candidates leaves
-        its streak (pruned with the other ledgers). A whole outage pass extends every streak too,
-        so an account that stays unanswered as the rest of the directory comes back has already
-        waited its passes. The whole outage's own run, page and resolve are unchanged
-        (:meth:`_note_directory_outage`).
+        **Counted per account, on passes that are not a whole outage.** An unanswered probe adds
+        one to that account's streak, and any other answer, a referral, a configuration refusal
+        or a fault included, ends it. An account this pass did not probe keeps its streak, so a
+        probe budget smaller than the estate (``[auth].ad_session_recheck_max_users``) cannot reset
+        it, and one-off failures on different accounts never add up. An account that leaves the
+        candidates leaves its streak (pruned with the other ledgers). **A whole outage pass leaves
+        every streak as it stands**: that outage is the whole run's to page
+        (:meth:`_note_directory_outage`, unchanged), and feeding the streaks would leave every
+        account at the threshold when it ends, so the first blip after it would page. The cost: a
+        pass whose every sampled probe goes unanswered reads as a whole outage and feeds nothing,
+        so under a small probe budget an account whose sample is often alone counts more slowly.
 
-        **Its own page.** A pass pages once when it finds unanswered an account whose streak
-        has reached ``[auth].ad_reconcile_outage_passes``, so a pass that asked only accounts the
-        directory answered never pages, even while an unprobed account's streak stands. It does
-        not page while the whole outage's page is raised or standing in its run, so one pass never
-        raises both; once a pass reaches part of the directory and ends that run, the next pass
-        that finds such an account unanswered pages as a partial outage. With a probe budget
-        smaller than the estate an account's streak grows only on the passes that probe it, so
-        that page can come several passes after the whole outage's resolves. The page is latched
-        only once the pass's rows are written (:meth:`_latch_outage_page`).
+        **Its page, once per account entering the state.** Each pass that is not a whole outage
+        and asked the directory pages for every account whose streak has reached
+        ``[auth].ad_reconcile_outage_passes`` and that is not paged already
+        (``partial_outage_entered``), whether or not this pass probed it: nothing answered it
+        since. A second account reaching the threshold while the first is open pages again, under
+        the same source. An account that is answered or leaves re-arms. The page is latched only
+        once its audit row is written (:meth:`_record_partial_outage`,
+        :meth:`_latch_outage_page`), so a refused row leaves it to the next pass.
 
-        **Its clear.** Once no account's streak is that long, because each has been answered since
-        or has left with its sessions, the condition ends, and once one here has paged every such
-        pass marks ``partial_outage_clear``, a whole outage pass included, as the outage clear is
-        raised. Process-local, as the whole run is.
+        **Its clear.** Once no account's streak is that long, the condition ends, and if a page was
+        raised since the last clear this pass marks ``partial_outage_clear`` once. Process-local,
+        as the whole run is.
 
         "Unanswered" here is :attr:`~reconcile.Probe.unreached`. It is not
         ``_reconcile_unanswered`` (BACKLOG #3844), which holds the REFERRED, FAULT and MISCONFIGURED
         outcomes: those are answers the directory gave, and each ends a streak here."""
         streaks = self._reconcile_unreached
+        if not plan.directory_outage:
+            for probe in probes:
+                if probe.unreached:
+                    streaks[probe.user_id] = streaks.get(probe.user_id, 0) + 1
+                elif probe.outcome is not reconcile.ProbeOutcome.UNKEYED:  # UNKEYED: never asked
+                    streaks.pop(probe.user_id, None)
         threshold = self._settings.ad_reconcile_outage_passes
-        hit = False
-        for probe in probes:
-            if probe.unreached:
-                streaks[probe.user_id] = streaks.get(probe.user_id, 0) + 1
-                hit = hit or streaks[probe.user_id] >= threshold
-            elif probe.outcome is not reconcile.ProbeOutcome.UNKEYED:  # UNKEYED was never asked
-                streaks.pop(probe.user_id, None)
-        longest = max(streaks.values(), default=0)
-        if longest >= threshold:
-            page = (
-                hit
-                and not plan.outage_page
-                and not self._reconcile_outage_run_paged
-                and not self._reconcile_partial_run_paged
+        standing = {uid for uid, count in streaks.items() if count >= threshold}
+        self._reconcile_partial_paged_ids &= standing  # answered or left: re-armed
+        if standing:
+            if plan.directory_outage or plan.asked == 0:
+                return plan
+            entered = tuple(
+                (uid, streaks[uid]) for uid in sorted(standing - self._reconcile_partial_paged_ids)
             )
-            return replace(plan, partial_outage_passes=longest, partial_outage_page=page)
-        if self._reconcile_partial_run_paged:
-            _log.warning(
-                "directory reconcile: no signed-in account is left unanswered by the directory "
-                "for a run of probes any more"
-            )
-        self._reconcile_partial_run_paged = False
-        return replace(
-            plan, partial_outage_passes=longest, partial_outage_clear=self._reconcile_partial_paged
+            return replace(plan, partial_outage_entered=entered, partial_outage_page=bool(entered))
+        if not self._reconcile_partial_paged:
+            return plan
+        _log.warning(
+            "directory reconcile: no signed-in account is left unanswered by the directory for a "
+            "run of probes any more"
         )
+        self._reconcile_partial_paged = False
+        return replace(plan, partial_outage_clear=True)
 
     def _latch_outage_page(self, plan: reconcile.ReconcilePlan) -> None:
         """Record that this run's outage page, whole or partial, is raised, once its pass's rows are
         written (BACKLOG #3709; :meth:`_note_directory_outage` says why it waits for them)."""
         if plan.partial_outage_page:
-            self._reconcile_partial_run_paged = True
+            self._reconcile_partial_paged_ids.update(uid for uid, _ in plan.partial_outage_entered)
             self._reconcile_partial_paged = True
             _log.error(
-                "directory reconcile: the directory has left a signed-in account unanswered on "
-                "%d probes running (%d of %d unanswered on this pass); a directory disable or "
-                "deletion does not reach an unanswered account's sessions while it lasts",
-                plan.partial_outage_passes,
+                "directory reconcile: the directory has left %d more signed-in account(s) "
+                "unanswered on %d probes running (%d of %d unanswered on this pass); a directory "
+                "disable or deletion does not reach an unanswered account's sessions while it lasts",
+                len(plan.partial_outage_entered),
+                plan.partial_outage_probes,
                 plan.unreached,
                 plan.asked,
             )
@@ -8283,26 +8282,37 @@ class AuthService:
             plan.outage_passes,
         )
 
-    async def _record_partial_outage(self, plan: reconcile.ReconcilePlan) -> None:
+    async def _record_partial_outage(
+        self, plan: reconcile.ReconcilePlan
+    ) -> reconcile.ReconcilePlan:
         """Audit a lasting partial outage's page, so the page matches a row (ASVS 8.3.2; BACKLOG
-        #3709 step 1). Its own action, ``auth.ad_reconcile_partial_outage``: such a pass judged
-        every probe that was answered, so it is not the skipped row a whole outage writes. Written
-        on the paging pass only, through the same soft write as the other reconcile rows; the
-        WARNING each such pass logs records the rest of the run."""
+        #3709 step 1), and return the plan with the page dropped when the row was refused, so it
+        is neither raised nor latched and the next pass that is not a whole outage tries again.
+
+        Its own action, ``auth.ad_reconcile_partial_outage``: such a pass judged every probe that
+        was answered, so it is not the skipped row a whole outage writes. Written on a paging pass
+        only, through the same soft write as the other reconcile rows. It carries counts and no
+        username: how many accounts entered, the longest streak among them, and the pass's
+        unanswered and asked probes. How long the condition lasted is the time between this row
+        and the inverse that resolves the alert; nothing else records each pass of it."""
         if not plan.partial_outage_page:
-            return
-        await self._audit_reconciler_row(
+            return plan
+        written = await self._audit_reconciler_row(
             "auth.ad_reconcile_partial_outage",
             detail=_json(
                 {
                     "reason": reconcile.PARTIAL_OUTAGE_REASON,
+                    "accounts": len(plan.partial_outage_entered),
+                    # One account's probes, not passes: under a probe budget they differ.
+                    "probes": plan.partial_outage_probes,
                     "unreached": plan.unreached,
                     "asked": plan.asked,
-                    # One account's probes, not passes: under a probe budget they differ.
-                    "probes": plan.partial_outage_passes,
                 }
             ),
         )
+        if written:
+            return plan
+        return replace(plan, partial_outage_page=False, partial_outage_entered=())
 
     async def _record_paging_refusals(self, plan: reconcile.ReconcilePlan) -> None:
         """Log, audit and latch each account entering the paging-refused state (vault BACKLOG
@@ -8575,7 +8585,7 @@ class AuthService:
                 # unjudged) leaves the hold's message alone and marks no clear (BACKLOG #2538).
                 await self._record_reconcile_hold(plan)
                 plan = self._mark_reconcile_clears(plan, users)
-            await self._record_partial_outage(plan)  # a breaker trip or a referral can be one
+            plan = await self._record_partial_outage(plan)  # a trip or a referral can be one
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
             # BACKLOG #3709. Last, so any pass that raises before it leaves the next one to page.
             self._latch_outage_page(plan)
@@ -8647,7 +8657,7 @@ class AuthService:
         # lifespan task still raises an alert for each revocation above and for the hold.
         await self._record_reconcile_hold(plan)
         # BACKLOG #3709 step 1. After the revocations too; it pages once per run, as they do not.
-        await self._record_partial_outage(plan)
+        plan = await self._record_partial_outage(plan)
         # BACKLOG #2027. Reported LAST, on every exit, so an audit write that keeps failing costs
         # only this report and never stops the probes and revocations above from running. A
         # failed write is logged, not raised (BACKLOG #2137), for the same reason as the hold's.

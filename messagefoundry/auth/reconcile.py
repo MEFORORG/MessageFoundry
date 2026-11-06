@@ -216,8 +216,9 @@ HOLD_REASON = "user_account_control_undetermined"
 OUTAGE_ABORT = "directory_unavailable"
 
 #: The reason slug of a lasting PARTIAL outage's alert and audit row (BACKLOG #3709 step 1, #4772
-#: item 6): passes that reached the directory for some probes and not for others. Never an
-#: ``aborted`` slug, since such a pass judged every probe that was answered.
+#: item 6): a signed-in account the directory left unanswered on
+#: ``[auth].ad_reconcile_outage_passes`` of its probes running, counted on passes that were not a
+#: whole outage. Never an ``aborted`` slug: the pass that pages it is not aborted for it.
 PARTIAL_OUTAGE_REASON = "directory_partly_unavailable"
 
 #: The ``aborted`` slug of a pass whose every answer went unjudged, at least one a referral (BACKLOG
@@ -368,20 +369,26 @@ class ReconcilePlan:
     #: #3709). Read like the other ``*_clear`` flags: the caller resolves the outage's instance on it.
     outage_clear: bool = False
     #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3709 step 1,
-    #: #4772 item 6): the longest run of consecutive probes of one signed-in account that the
-    #: directory left unanswered (:attr:`Probe.unreached`), whole outage passes included, in this
-    #: process. 0 when no account's last probe went unanswered. ``AuthService._note_partial_outage``
-    #: keeps it.
-    partial_outage_passes: int = 0
-    #: Whether the lifespan task pages for a lasting PARTIAL outage on this pass: this pass found
-    #: unanswered an account whose run has reached ``[auth].ad_reconcile_outage_passes``, the whole
-    #: outage is not paging in its run, and no partial page is recorded for the standing condition
-    #: yet.
+    #: #4772 item 6): ``(user_id, streak)`` of each account this pass pages a PARTIAL outage for,
+    #: where ``streak`` is how many of its probes running the directory left unanswered
+    #: (:attr:`Probe.unreached`), at least ``[auth].ad_reconcile_outage_passes``. An account already
+    #: paged and still at the threshold is not here. Empty on a whole outage pass.
+    #: ``AuthService._note_partial_outage`` keeps it.
+    partial_outage_entered: tuple[tuple[str, int], ...] = ()
+    #: Whether the lifespan task pages for a lasting PARTIAL outage on this pass:
+    #: ``partial_outage_entered`` is not empty and its audit row was written.
     partial_outage_page: bool = False
-    #: Whether no account's run is that long any more, because each was answered since or left
-    #: with its sessions, after a partial page in this process. Set on a whole outage pass too. The
-    #: caller resolves the partial outage's instance on it.
+    #: Whether no account's streak is that long any more, because each was answered since or
+    #: left with its sessions, on the first such pass after a partial page in this process. It can
+    #: be a whole outage pass, through an account leaving. The caller resolves the partial
+    #: outage's instance on it.
     partial_outage_clear: bool = False
+
+    @property
+    def partial_outage_probes(self) -> int:
+        """The longest streak among ``partial_outage_entered``: what the page and its row report,
+        so they name an account that tripped it rather than a stale one (BACKLOG #3709)."""
+        return max((streak for _, streak in self.partial_outage_entered), default=0)
 
     @property
     def directory_outage(self) -> bool:
