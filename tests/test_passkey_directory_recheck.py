@@ -19,9 +19,11 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import sys
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, replace
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -31,6 +33,7 @@ pytest.importorskip("webauthn")
 from webauthn.helpers import base64url_to_bytes  # noqa: E402
 
 from messagefoundry.auth import reconcile  # noqa: E402
+from messagefoundry.auth import service as auth_service_module  # noqa: E402
 from messagefoundry.auth.identity import SessionMechanism  # noqa: E402
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer  # noqa: E402
 from messagefoundry.auth.service import (  # noqa: E402
@@ -45,7 +48,11 @@ from messagefoundry.auth.service import (  # noqa: E402
 )
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
-from messagefoundry.store.base import StoreAcquireTimeout  # noqa: E402
+from messagefoundry.store.base import (  # noqa: E402
+    StoreAcquireTimeout,
+    audit_write_errors,
+    store_call_errors,
+)
 from messagefoundry.store.crypto import CipherError, generate_key, make_cipher  # noqa: E402
 from messagefoundry.store.store import (  # noqa: E402
     MessageStore,
@@ -1302,36 +1309,92 @@ async def test_a_defect_in_the_passkey_re_read_still_raises(
         )
 
 
-@pytest.mark.parametrize(
-    "read_fault",
-    [
-        sqlite3.OperationalError("synthetic: the set read was refused"),
-        RuntimeError("synthetic: an engine refusal"),
-        ValueError("synthetic: no active connection"),
-        OSError("synthetic: the connection was lost at the socket"),
-        StoreAcquireTimeout("synthetic: the pool borrow timed out"),
-    ],
-    ids=["call-driver", "call-runtime", "call-closed", "connect-socket", "connect-acquire"],
-)
-async def test_a_connect_class_read_fault_takes_the_call_class_path(
-    read_fault: Exception,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+class _PyodbcError(Exception):
+    """A stand-in for pyodbc's ``Error`` root, which pyodbc raises for a deadlock victim (40001)."""
+
+
+@pytest.fixture
+def fake_pyodbc(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """A stand-in ``pyodbc`` module with its ``Error`` root, imported the way the store's guarded
+    imports read it. The cached catch sets are cleared on the way in and out, so each is built once
+    against the stand-in and once without it."""
+    module = ModuleType("pyodbc")
+    module.Error = _PyodbcError  # type: ignore[attr-defined]
+    module.DatabaseError = type("DatabaseError", (_PyodbcError,), {})  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pyodbc", module)
+    caches = (
+        store_call_errors,
+        audit_write_errors,
+        auth_service_module._session_write_errors,
+        auth_service_module._passkey_read_errors,
+    )
+    for cached in caches:
+        cached.cache_clear()
+    yield
+    for cached in caches:
+        cached.cache_clear()
+
+
+#: Each case builds its fault in the test, so no instance (and its traceback) outlives a run.
+_READ_FAULTS: dict[str, Callable[[], Exception]] = {
+    "call-runtime": lambda: RuntimeError("synthetic: an engine refusal"),
+    "call-closed": lambda: ValueError("synthetic: no active connection"),
+    "connect-socket": lambda: OSError("synthetic: the connection was lost at the socket"),
+    "connect-acquire": lambda: StoreAcquireTimeout("synthetic: the pool borrow timed out"),
+}
+
+
+async def _assert_the_read_fault_refuses(
+    read_fault: Exception, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #3775, vault BACKLOG #4728 finding 3. The passkey re-read after the sign-count write
-    catches ``store_call_errors()`` and ``store_connect_errors()``, so a store-call fault and a
-    connect fault take one path: a ``store_error`` refusal with its audit row, the factor unmarked.
-    RED when: any of them raises past ``finish_webauthn_assertion`` (the ``RuntimeError`` and
-    ``ValueError`` cases did, under the narrower session-write catch), marks the factor, or writes
-    no ``store_error`` row."""
     store, token, refused = await _assert_with_the_set_read_failing(monkeypatch, read_fault)
     try:
         assert refused.ok is False and refused.session_lost is False
         assert "the passkey re-read raised" in caplog.text
         assert {"reason": "store_error"} in await _audited_assertion_failures(store)
         assert await store.list_audit(action="auth.webauthn_verified") == []
+        assert await _clone_answers(store) == []
         session = await store.get_session(hash_token(token))
         assert session is not None and session.revoked_at is None
         assert session.mfa_verified_at is None
     finally:
         await store.close()
+
+
+@pytest.mark.parametrize("case", list(_READ_FAULTS))
+async def test_a_connect_class_read_fault_takes_the_call_class_path(
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3775, vault BACKLOG #4728 finding 3. The passkey re-read after the sign-count write
+    catches ``store_call_errors()`` and ``store_connect_errors()``, so a store-call fault and a
+    connect fault take one path: a ``store_error`` refusal with its audit row, no clone row, the
+    factor unmarked. RED when: any of them raises past ``finish_webauthn_assertion`` (the
+    ``RuntimeError`` and ``ValueError`` cases did, under the narrower session-write catch), marks
+    the factor, or writes no ``store_error`` row."""
+    await _assert_the_read_fault_refuses(_READ_FAULTS[case](), monkeypatch, caplog)
+
+
+@pytest.mark.usefixtures("fake_pyodbc")
+async def test_a_pyodbc_root_read_fault_takes_the_call_class_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3775. pyodbc's ``Error`` root, which it raises for a deadlock victim, is in the
+    connect set and not in ``store_call_errors()``, so it is what the connect half of the catch
+    adds. RED when: the catch drops ``store_connect_errors()`` and the fault raises. CONTROL: the
+    call set alone really misses it."""
+    assert not isinstance(_PyodbcError(), store_call_errors())
+    await _assert_the_read_fault_refuses(_PyodbcError("40001"), monkeypatch, caplog)
+
+
+async def test_a_sqlite_interface_error_in_the_passkey_re_read_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3775. ``sqlite3.InterfaceError`` is outside both sets the catch takes (it is a
+    ``sqlite3.Error``, not a ``DatabaseError``), and ADR 0068 says it still raises there. RED when:
+    a wider catch answers it as a ``store_error`` refusal while the ADR still says otherwise."""
+    with pytest.raises(sqlite3.InterfaceError, match="synthetic"):
+        await _assert_with_the_set_read_failing(
+            monkeypatch, sqlite3.InterfaceError("synthetic: an unsupported bind type")
+        )

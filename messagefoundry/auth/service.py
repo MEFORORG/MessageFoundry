@@ -272,6 +272,19 @@ def _session_write_errors() -> tuple[type[Exception], ...]:
     return store_open_errors()
 
 
+@cache
+def _passkey_read_errors() -> tuple[type[Exception], ...]:
+    """What the passkey set read after the sign-count write refuses rather than raises (BACKLOG
+    #3775; vault BACKLOG #4728 finding 3 decided it):
+    :func:`~messagefoundry.store.base.store_call_errors` and
+    :func:`~messagefoundry.store.base.store_connect_errors`. Wider than
+    :func:`_session_write_errors` by ``ValueError`` (aiosqlite's closed connection) and every
+    ``RuntimeError``; the connect set adds pyodbc's ``Error`` root, which pyodbc raises for a
+    deadlock victim. The caller re-raises ``AUDIT_WRITE_DEFECTS`` first. Cached, as
+    ``store_call_errors`` is, so a refusal does not run the driver import on the event loop."""
+    return (*store_call_errors(), *store_connect_errors())
+
+
 class _RotationStoreError(Exception):
     """A session rotation the store refused (BACKLOG #3023). ``old_revoked`` says whether every
     best-effort revoke that followed it landed, under the old hash and the new one; the audit row
@@ -3559,9 +3572,10 @@ class AuthService:
         # The same for the soft catches that read store_call_errors (a refused enrolment's revoke,
         # the step-up refusal's session read), whichever plane meets a store fault first, and for
         # every audit write that catches `audit_write_errors`, the API's alert-rules row among them
-        # (#3403).
+        # (#3403), and for the passkey set read after the sign-count write (#3775).
         store_call_errors()
         audit_write_errors()
+        _passkey_read_errors()
         # Advisory, NON-STICKY federated-IdP health (ADR 0142 AC-8) — see the oidc_available docstring.
         self._oidc_unavailable_reason: str | None = None
         self._oidc_client_auth: oidc.ClientAuthentication | None = None
@@ -15471,14 +15485,12 @@ class AuthService:
             # SQLite's bad statement or bind is a defect, not a store refusal. On PostgreSQL and
             # SQL Server a bad statement is a driver DatabaseError, so it is refused below.
             raise
-        except (*store_call_errors(), *store_connect_errors()):
+        except _passkey_read_errors():
             # BACKLOG #3775: after the sign-count write, a store fault here refuses with an audit
-            # row rather than raising past the ceremony with none. The catch is the store-call set
-            # and the connect set, not the narrower session-write set, so a closed-connection
-            # ValueError or an engine RuntimeError refuses too (vault BACKLOG #4728 finding 3). At
-            # least sqlite3.InterfaceError is outside both sets and still raises. Soft, so a store
-            # that refuses that row too still gets the refusal back: the refusal is the fail-closed
-            # control, and the row only records it.
+            # row rather than raising past the ceremony with none; what the set holds is in its
+            # docstring, and ADR 0068 lists what still raises. Soft, so a store that refuses that
+            # row too still gets the refusal back: the refusal is the fail-closed control, and the
+            # row only records it.
             _log.exception("finish_webauthn_assertion: the passkey re-read raised")
             await write_audit_soft(
                 lambda: self._assertion_refused(user, client, "store_error"),
