@@ -293,11 +293,13 @@ async def test_a_handshake_finishing_after_stop_began_is_refused_unread(
 async def test_a_listener_running_its_own_handshake_counts_each_failure_once(
     tmp_path: Path, tls_path: str
 ) -> None:
-    """The listener counts a failed handshake itself on both paths, with the peer, and never hooks
-    its context (`HandshakeFailures.watch`), which would count each failure a second time. Before
-    the accept loop, the forced path counted through that hook alone, with no peer."""
+    """The listener counts a failed handshake itself on both paths, with the peer. A context left
+    hooked (`HandshakeFailures.watch`) would count each failure a second time, with no peer, so
+    start() unhooks it on both paths. Before the accept loop, the forced path counted through that
+    hook alone, with no peer."""
     source, _cert_path = _tls_source(tmp_path)
     assert source._ssl is not None
+    source._tls_failures.watch(source._ssl)  # a hook start() must take off
     events = _Events()
     source.on_connection_event = events
     await source.start(receipt_handler(_Intake()))
@@ -424,6 +426,18 @@ _Scenario = Callable[[Path, pytest.MonkeyPatch], Awaitable[None]]
         pytest.param(
             lambda p, m: test_stop_closes_a_socket_still_in_its_handshake(p, m, "uvloop"),
             id="stop",
+        ),
+        pytest.param(
+            lambda p, m: test_a_handshake_finishing_after_stop_began_is_refused_unread(
+                p, m, "uvloop"
+            ),
+            id="handshake_after_stop",
+        ),
+        pytest.param(
+            lambda p, _m: test_a_listener_running_its_own_handshake_counts_each_failure_once(
+                p, "uvloop"
+            ),
+            id="failure_counted_once",
         ),
         pytest.param(
             lambda p, _m: test_mtls_subject_reads_the_certificate_after_either_handshake(

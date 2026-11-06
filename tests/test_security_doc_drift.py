@@ -2930,6 +2930,11 @@ def test_data_plane_mtls_listeners_are_derived_from_the_transports() -> None:
         "the row must state that a refusal at the TLS handshake opens no session, which is why "
         "its only connection event is the throttled handshake failure"
     )
+    # And the stale loop scoping is gone, so the row cannot drift back to it unseen.
+    for stale in ("never reaches the accept path", "standard asyncio loop", "BaseEventLoop"):
+        assert stale not in joined, (
+            f"the row scopes the HTTP listener's admission by loop: {stale!r}"
+        )
 
 
 def test_connection_event_capture_defaults_to_on() -> None:

@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -250,3 +252,30 @@ def test_a_handshake_ending_after_a_restart_leaves_the_restarted_count_alone() -
         refused = gate.check(w, host, handshake=True)
         assert refused is not None and refused.reason == "max_handshakes_per_host"
     assert gate.handshaking == {}
+
+
+# The two socket tests above, on the real uvloop (BACKLOG #2479), where the listener's own accept
+# loop runs with nothing forced. They skip where uvloop is not installed, so they run on CI's Linux
+# legs only.
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uvloop does not run on Windows")
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        pytest.param(test_one_address_holds_at_most_the_budget_in_its_handshake, id="budget"),
+        pytest.param(test_a_completed_handshake_does_not_count_against_the_budget, id="completed"),
+    ],
+)
+def test_the_budget_applies_on_uvloop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: Callable[[Path, pytest.MonkeyPatch, str], Awaitable[None]],
+) -> None:
+    uvloop = pytest.importorskip("uvloop")
+
+    async def run() -> None:
+        assert http_module._upgrades_tls_itself(asyncio.get_running_loop()) is False
+        await scenario(tmp_path, monkeypatch, "uvloop")
+
+    asyncio.run(run(), loop_factory=uvloop.new_event_loop)

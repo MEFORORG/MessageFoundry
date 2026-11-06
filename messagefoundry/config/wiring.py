@@ -3115,8 +3115,8 @@ def Http(
     (vault BACKLOG #2606): behind a reverse proxy every partner arrives from one address, so a cap
     would become the listener's whole capacity. Set one only where the listener sees real client
     addresses. ``max_handshakes_per_host`` (32) **ships on**: it caps only the sockets one address
-    holds a connection slot with while still in their TLS handshake, which happens where the engine
-    runs on a stdlib event loop with ``tls=True`` (vault BACKLOG #4888). See ``docs/DEPLOYMENT.md``
+    holds a connection slot with while still in their TLS handshake, which happens with
+    ``tls=True`` on every event loop (vault BACKLOG #4888, BACKLOG #2479). See ``docs/DEPLOYMENT.md``
     for the L4 load-balancer case.
 
     **Message-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast this listener

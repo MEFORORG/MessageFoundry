@@ -20,8 +20,9 @@ configuration (BACKLOG #2431, #5102).
 **Why this lives in ``transports/`` and not ``api/``.** The one-way dependency rule (CLAUDE.md §2/§4)
 forbids ``transports/`` from importing ``api/``. The engine's FastAPI app stays the admin/RBAC surface;
 message intake is a registry connector that owns its own bound ``asyncio`` socket. So this is a
-**stdlib-only** HTTP/1.1 request reader over ``asyncio.start_server`` — **no new web-framework
-dependency** (FastAPI/uvicorn are an ``api/`` concern).
+**stdlib-only** HTTP/1.1 request reader over ``asyncio.start_server``, or, for TLS on a loop that
+is not a stdlib loop class, over the MLLP listener's own accept loop (BACKLOG #2479) — **no new
+web-framework dependency** (FastAPI/uvicorn are an ``api/`` concern).
 
 It is a faithful ``MLLPSource`` sibling: it inherits the per-connection IP allowlist, per-connection
 inbound TLS, the runner's exposed-gate (``check_http_tls_exposure``), ADR 0031 fault isolation, and the
@@ -963,6 +964,10 @@ class HttpSource(SourceConnector):
         if self._ssl is None:
             self._server = await asyncio.start_server(self._on_client, self.host, self.port)
             return
+        # This listener counts its own failures on both paths and never hooks its context. Unhooked
+        # anyway, as MLLPSource.start does, so a context something else hooked cannot count each
+        # failure a second time, with no peer.
+        self._tls_failures.unwatch(self._ssl)
         if self._upgrade_tls:
             self._server = await asyncio.start_server(self._on_tls_accept, self.host, self.port)
             return
@@ -1000,10 +1005,10 @@ class HttpSource(SourceConnector):
 
         ``MLLPSource._handshake_accepted`` states each step's reasoning once: who owns the socket
         when, the DEBUG-only failure line, a failure before the transport holds the socket, and a
-        clean close during the handshake. Two differences. A refusal emits its event and is
-        closed with no answer, as `_on_client` closes one awaiting its upgrade. And an admitted
-        socket counts against ``max_handshakes_per_host`` until its handshake ends, however it
-        ends (vault BACKLOG #4888)."""
+        clean close during the handshake. Two differences. An admitted socket counts against
+        ``max_handshakes_per_host`` until its handshake ends, however it ends (vault BACKLOG
+        #4888). And no ``ssl_shutdown_timeout`` is passed, so the TLS close exchange keeps
+        asyncio's default, as on this listener's other path; start() says why."""
         assert self._ssl is not None
         try:
             peer = _AcceptedPeer(sock)
@@ -1455,6 +1460,14 @@ class HttpSource(SourceConnector):
         `_handshake_accepted` already took for it, after its handshake, which this call then owns
         and releases."""
         assert self._handler is not None
+        if slot is not None and self._admission.stopping:
+            # The handshake `_handshake_accepted` ran finished after stop() began, so nothing will
+            # wait for this connection: refuse it unread and unregistered, as
+            # `MLLPSource._on_client` does. The close is not awaited, so a peer that never answers
+            # close_notify cannot hold stop() for the shutdown grace.
+            self._admission.release(*slot)
+            writer.close()
+            return
         # Register before anything else so stop() can always find + close this connection (H-2).
         task = asyncio.current_task()
         self._clients.add(writer)
@@ -1479,8 +1492,6 @@ class HttpSource(SourceConnector):
             if slot is not None:
                 # Admitted before its handshake, by `_handshake_accepted` (BACKLOG #2479).
                 peer_host, epoch = slot
-                if self._admission.stopping:
-                    return  # the handshake finished after stop() began: refuse it unread
                 refusal = None
             else:
                 # vault BACKLOG #2606: stop, allowlist, global cap and per-host cap, decided in one
