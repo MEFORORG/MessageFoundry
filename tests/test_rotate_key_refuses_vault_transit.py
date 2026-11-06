@@ -68,7 +68,8 @@ def test_rotate_key_refuses_vault_transit_mode_before_vault_or_the_store(
     monkeypatch.chdir(tmp_path)
     db, key = tmp_path / "transit.db", generate_key()
     asyncio.run(_seed(db, key))
-    before = db.read_bytes()
+    # The sidecars too: a writable WAL open puts its writes in transit.db-wal before a checkpoint.
+    before = {p.name: p.read_bytes() for p in tmp_path.glob("transit.db*")}
 
     built: list[str] = []
 
@@ -87,10 +88,11 @@ def test_rotate_key_refuses_vault_transit_mode_before_vault_or_the_store(
     captured = capsys.readouterr()
     assert "does not run under [store].cipher_provider" in captured.err, captured.err
     assert "between two Transit keys" in captured.err, captured.err
-    assert "min_decryption_version" in captured.err, captured.err
+    assert "Retiring an old version of the audit key" in captured.err, captured.err
     assert "Nothing was changed." in captured.err, captured.err
-    assert "MEFOR_STORE_ENCRYPTION_KEY to the new active key" not in captured.err, captured.err
+    assert "needs an active key" not in captured.err, captured.err
     assert "Traceback" not in captured.err, captured.err
     assert "OK:" not in captured.out, captured.out
     assert built == [], "the command dialled Vault before refusing"
-    assert db.read_bytes() == before, "the command wrote to the store before refusing"
+    after = {p.name: p.read_bytes() for p in tmp_path.glob("transit.db*")}
+    assert after == before, "the command wrote to the store before refusing"

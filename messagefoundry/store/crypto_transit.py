@@ -164,8 +164,7 @@ class TransitCipher(_UnmarkedPolicy):
             # the refusal names none.
             raise CipherError(
                 "value was encrypted in-process (mfenc:v1, v2 or v4); the Transit cipher cannot read it, "
-                "and no command moves it into Transit (BACKLOG #2109). Read this store under "
-                '[store].cipher_provider = "aesgcm" with the key that sealed it'
+                "and no command moves it into Transit (BACKLOG #2109)"
             )
         ciphertext = stored[len(_V3_PREFIX) :]  # the full "vault:v1:…" blob (may contain ':')
         assoc = self._associated_data(aad)

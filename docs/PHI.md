@@ -732,8 +732,7 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    sidecar that is not UTF-8 only past that part is removed by the prune at expiry, but the API
    cannot delete it either: its read fails before the class check.
    **Under `cipher_provider = "vault_transit"` a plaintext upload still reads back as plaintext.**
-   `rotate-key` refuses to run in that mode: it needs a local active key, and the store's own
-   rotation raises there (BACKLOG #1165). So no command could ever seal the upload, and refusing it
+   `rotate-key` refuses to run in that mode (BACKLOG #1165, #2109). So no command could ever seal the upload, and refusing it
    would strand the file for good. The transit cipher still refuses unmarked values in the store's own
    columns.
    **A third at-rest tier ships — `[store].cipher_provider = "vault_transit"` (`mfenc:v3`, ADR 0138).**

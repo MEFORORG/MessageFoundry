@@ -10407,9 +10407,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "(BACKLOG #2109). To rotate the Transit data key, rotate it in Vault: that makes a "
             "new version of the key named by MEFOR_STORE_TRANSIT_KEY, new values are sealed under "
             "it, and values under an older version still read. Nothing re-seals those older "
-            "values, so do not raise the key's min_decryption_version past a version that still "
-            "seals a value or MACs an audit row: they would no longer read or verify. The same "
-            "holds for MEFOR_STORE_TRANSIT_AUDIT_KEY when it is set. Nothing was changed.",
+            "values, so rotating is safe and retiring a version that still seals a value or MACs "
+            "an audit row is not; docs/SECURITY.md, under 'Retiring an old version of the audit "
+            "key breaks the chain', says which Vault settings retire one. Nothing was changed.",
             file=sys.stderr,
         )
         return 2
