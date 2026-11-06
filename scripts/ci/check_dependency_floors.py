@@ -16,14 +16,11 @@ skips (yanked, no wheel for this Python, or conflicting with another floor) reds
 way a runtime floor does (vault BACKLOG #3177). Naming ``--extra`` reads those extras instead of
 ``dev``. An extra ``pyproject.toml`` does not declare is refused rather than read as empty.
 
-A dependency installed above its floor fails the check unless ``--raised NAME`` names it. The
-workflow passes none: a floor that cannot install on this Python is raised in ``pyproject.toml``
-instead (vault BACKLOG #3177). A ``--raised`` name that sits at its floor after all fails too, so
-an exception goes when its reason does.
+A dependency installed above its floor fails the check, with no exception list: a floor that cannot
+install on this Python is raised in ``pyproject.toml`` instead (vault BACKLOG #3177).
 
 USAGE
     python scripts/ci/check_dependency_floors.py [--pyproject PATH] [--extra NAME ...]
-        [--raised NAME ...]
 """
 
 from __future__ import annotations
@@ -111,16 +108,13 @@ def _installed(name: str) -> Version | None:
 
 def check(
     floors: dict[str, Version | None],
-    raised: Iterable[str],
     installed: Callable[[str], Version | None] = _installed,
 ) -> tuple[list[str], list[str]]:
     """``(report lines, failures)``. The check passes when ``failures`` is empty."""
-    expected_raised = {canonicalize_name(name) for name in raised}
     lines: list[str] = []
     failures: list[str] = [] if floors else ["no dependency declares a floor; nothing read"]
     for name in sorted(floors):
         floor, found = floors[name], installed(name)
-        raised_on_purpose = name in expected_raised
         if floor is None:
             failures.append(
                 f"{name}: declares no floor this check can read; write it as >=X, "
@@ -131,19 +125,9 @@ def check(
         elif found < floor:
             failures.append(f"{name}: installed {found}, BELOW the declared floor {floor}")
         elif found == floor:
-            if raised_on_purpose:
-                failures.append(
-                    f"{name}: listed as raised but installed at its floor {floor}; "
-                    "drop it from --raised"
-                )
-            else:
-                lines.append(f"{name} {found}: at its floor")
-        elif raised_on_purpose:
-            lines.append(f"{name} {found}: above its floor {floor}, raised on purpose")
+            lines.append(f"{name} {found}: at its floor")
         else:
             failures.append(f"{name}: installed {found}, but the declared floor is {floor}")
-    for name in sorted(expected_raised - floors.keys()):
-        failures.append(f"{name}: listed as raised but declares no floor that applies here")
     return lines, failures
 
 
@@ -160,13 +144,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--extra with no NAME reads the runtime dependencies alone"
         ),
     )
-    parser.add_argument(
-        "--raised",
-        action="append",
-        default=[],
-        metavar="NAME",
-        help="a dependency deliberately installed above its floor; repeatable",
-    )
     args = parser.parse_args(argv)
     extras = DEFAULT_EXTRAS if args.extra is None else args.extra
     try:
@@ -174,7 +151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except UndeclaredExtra as exc:
         print(f"FLOOR NOT MEASURED: {exc}", file=sys.stderr)
         return 1
-    lines, failures = check(floors, args.raised)
+    lines, failures = check(floors)
     for line in lines:
         print(line)
     for failure in failures:

@@ -174,43 +174,42 @@ def test_each_verdict() -> None:
     floors: dict[str, Version | None] = {
         "at-floor": Version("1.0"),
         "above": Version("1.0"),
-        "raised": Version("1.0"),
-        "raised-below": Version("2.0"),
-        "stale-raise": Version("1.0"),
+        "below": Version("2.0"),
         "missing": Version("1.0"),
         "unreadable": None,
     }
     installed = {
         "at-floor": "1.0.0",
         "above": "1.1",
-        "raised": "1.2",
-        "raised-below": "1.9",
-        "stale-raise": "1.0",
+        "below": "1.9",
         "missing": None,
         "unreadable": "1.0",
     }
-    lines, failures = check(
-        floors,
-        ["raised", "raised-below", "Stale_Raise", "unknown"],
-        installed=_installed(installed),
-    )
-    assert lines == [
-        "at-floor 1.0.0: at its floor",
-        "raised 1.2: above its floor 1.0, raised on purpose",
-    ]
+    lines, failures = check(floors, installed=_installed(installed))
+    assert lines == ["at-floor 1.0.0: at its floor"]
     assert failures == [
         "above: installed 1.1, but the declared floor is 1.0",
+        "below: installed 1.9, BELOW the declared floor 2.0",
         "missing: declared >=1.0 but not installed",
-        "raised-below: installed 1.9, BELOW the declared floor 2.0",
-        "stale-raise: listed as raised but installed at its floor 1.0; drop it from --raised",
         "unreadable: declares no floor this check can read; write it as >=X, "
         "with no specifier for this name excluding X",
-        "unknown: listed as raised but declares no floor that applies here",
     ]
+
+
+def test_the_retired_raised_flag_is_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #3177, PR 2390 note (c): no exception list is left, so a floor above its mark cannot
+    be waved through; it is raised in ``pyproject.toml`` instead."""
+    path = _pyproject(tmp_path, f"packaging=={metadata.version('packaging')}", dev=[])
+    with pytest.raises(SystemExit) as exited:
+        main(["--pyproject", str(path), "--raised", "packaging"])
+    assert exited.value.code == 2
+    assert "unrecognized arguments: --raised" in capsys.readouterr().err
 
 
 def test_an_empty_floor_set_fails_rather_than_passes() -> None:
-    assert check({}, [])[1] == ["no dependency declares a floor; nothing read"]
+    assert check({})[1] == ["no dependency declares a floor; nothing read"]
 
 
 def test_main_exits_non_zero_on_a_failure(
