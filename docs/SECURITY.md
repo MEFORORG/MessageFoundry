@@ -4824,27 +4824,32 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   no Administrator can sign in to unbind one. Since vault BACKLOG #2711, `provision-admin` at the
   host can make a local Administrator then, because a bound one does not block it.
 - **Limits of the session sweep.** **A session whose token is rotated while a whole-account
-  sweep runs is swept too, on all three stores (BACKLOG #4974).** Until then the SQL Server
-  store could miss one. That store's re-key moves the session row to a new clustered key, so a
-  sweep that met the row locked mid-move would find the old key gone and the new one outside its
-  read. Its rotation now takes the account's row under `UPDLOCK` before the session row, the order
-  each whole-account sweep there read for this takes them in, through the account write or the
-  epoch raise: a bind, an unbind, a TOTP re-enrolment, and the whole-account revokes, at least an
-  administrator's revoke of a user's sessions, a role change and a password reset. The session
-  cap's trim takes no account row, so it is not covered. So a rotation either commits before the
+  sweep runs is swept too, on all three stores, except in the SQL Server cases this paragraph
+  names (BACKLOG #4974).** Until then the SQL Server store could miss any such session. That
+  store's re-key moves the session row to a new clustered key, so a sweep waiting on the row's
+  old key would find it gone and the new one outside its read. Its rotation now takes the
+  account's row under `UPDLOCK` before the session row, the order each whole-account sweep there
+  read for this takes them in, through the account write or the epoch raise: a bind, an unbind,
+  a TOTP re-enrolment, and the whole-account revokes, at least an administrator's revoke of a
+  user's sessions, a role change and a password reset. So a rotation either commits before the
   sweep locks the account's row, and the sweep reads the new key, or waits until the sweep
   commits and then finds the session ended. That holds where the account's record fails its
   seal too, because the raise reads the row under that lock before it checks the seal. The
   every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) takes
   the row of each account its read of the account list returns before its table-wide sweep, so
-  the same holds for those accounts. A session of an account created after that read is outside
-  its sweep; the global epoch below ends it. The Postgres store's rotation takes no account row:
-  its sweep waits on the rotated row and then re-checks that row's newest version, which still
-  matches. The SQLite store runs one writer at a time. `test_rotation_racing_a_sweep_is_swept`
-  replays a rotation paused mid-re-key against a bind, an unbind and a revoke of a user's
-  sessions on both server legs, from `tests/_federated_unbind_store_contract.py`, and on the SQL
-  Server leg a rotation started while a bind holds the account's row. That the old SQL Server
-  order missed the session was read from the code and was not run.
+  the same holds for those accounts. Its sweep also reaches the sessions of an account created
+  after that read, but nothing orders a rotation of one of them against it, so on SQL Server a
+  rotation in that instant can still be missed; the global epoch below ends such a session at
+  its next presentation. The session cap's trim takes no account row, so a rotation can still
+  slip past it on SQL Server too. The Postgres store's rotation takes no account row: its sweep
+  waits on the rotated row and then re-checks that row's newest version, which still matches.
+  The SQLite store runs one writer at a time. `test_rotation_racing_a_sweep_is_swept`, from
+  `tests/_federated_unbind_store_contract.py`, pauses a rotation after its locked read and before
+  its re-key, then runs a bind, an unbind, a revoke of a user's sessions and the every-account
+  revoke against it, on both server legs; on the SQL Server leg it also starts a rotation while a
+  bind holds the account's row. The TOTP re-enrolment's own sweep was read from the code and is
+  not replayed. That the old SQL Server order missed the session
+  was read from the code and was not run.
   **A session a sweep missed is refused the next time it is presented** (BACKLOG #2592),
   within the limits the rest of this bullet states. Each of these raises the
   account's session epoch in the same transaction, and a rotation keeps the epoch the session was

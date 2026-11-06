@@ -536,9 +536,9 @@ def test_the_bind_notice_tells_the_holder_what_the_bind_took_away() -> None:
 
 
 def test_the_security_doc_states_the_limits_beside_the_session_claim() -> None:
-    """RED when: the claim that nothing minted before a bind outlives it loses the limits written
-    beside it. The claim is true of the sweep as designed, and the limit is what a reader planning
-    on it has to know.
+    """RED when: the claim that nothing minted before a bind outlives it loses its pointer to the
+    sweep's limits, or goes back to naming a limit that is closed. The limits are what a reader
+    planning on the claim has to know.
 
     BACKLOG #2738 closed the second limit, the deadlock with a user delete, and corrected the
     first. So the old collision bullet must be gone, and the sweep's bullet must name the false

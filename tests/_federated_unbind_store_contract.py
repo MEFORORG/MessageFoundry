@@ -419,15 +419,18 @@ async def _hold_then_race(
     second: _Step,
     holder_of: Callable[[Any], Awaitable[object]],
     is_blocking: Callable[[object], Awaitable[bool]],
+    pause_before: str | None = None,
 ) -> tuple[Any, Any]:
     """Run ``first`` until its call to ``store.<attr>`` for ``key`` has landed, and hold it there
     with its locks; start ``second``; require that ``second`` really waits on ``first``'s server
     session; then release ``first`` and return both results, ``first``'s first.
 
     ``attr`` names a write helper called ``(handle, key, change)``: ``_write_user`` or
-    ``_write_session``. Only the first call for ``key`` pauses. The race is hooked, not timed:
-    without the probe a pass could come from a ``second`` that never met ``first``, which proves
-    nothing about the order.
+    ``_write_session``. Only the first call for ``key`` pauses. With ``pause_before``, the pause
+    comes inside that call instead, just before the handle runs the first statement starting with
+    that text, so ``first`` holds what the helper's locked read took and has written nothing yet.
+    The race is hooked, not timed: without the probe a pass could come from a ``second`` that never
+    met ``first``, which proves nothing about the order.
     """
     (first_name, start_first), (second_name, start_second) = first, second
     real_write = getattr(store, attr)
@@ -435,12 +438,32 @@ async def _hold_then_race(
     release = asyncio.Event()
     holder: list[object] = []
 
+    async def _hold(handle: Any) -> None:
+        holder.append(await holder_of(handle))
+        holding.set()
+        await release.wait()
+
+    class _PausingHandle:
+        """``handle`` with its ``execute`` paused once, before the ``pause_before`` statement."""
+
+        def __init__(self, handle: Any) -> None:
+            self._handle = handle
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._handle, name)
+
+        async def execute(self, sql: str, *args: Any) -> Any:
+            if not holder and pause_before is not None and sql.startswith(pause_before):
+                await _hold(self._handle)
+            return await self._handle.execute(sql, *args)
+
     async def _paused_write(handle: Any, written_key: str, change: Any) -> Any:
+        if written_key != key or holder:
+            return await real_write(handle, written_key, change)
+        if pause_before is not None:
+            return await real_write(_PausingHandle(handle), written_key, change)
         written = await real_write(handle, written_key, change)
-        if not holder and written_key == key:
-            holder.append(await holder_of(handle))
-            holding.set()
-            await release.wait()
+        await _hold(handle)
         return written
 
     setattr(store, attr, _paused_write)
@@ -500,11 +523,18 @@ async def _sweep_by_revoke(store: Any, account: str) -> int:
     return int((await store.revoke_user_sessions(account, now=3.0)).count)
 
 
-#: Each whole-account sweep the race is replayed against, and whether its account starts bound.
+async def _sweep_every_account(store: Any, account: str) -> int:
+    """The every-account revoke. It ends every live session in the store, so it runs last, when
+    the earlier cases have ended theirs and the rotated session is the only one left."""
+    return int((await store.revoke_all_sessions(now=3.0)).count)
+
+
+#: Each sweep the race is replayed against, and whether its account starts bound.
 _SWEEPS: tuple[tuple[str, Callable[[Any, str], Coroutine[Any, Any, int]], bool], ...] = (
     ("bind", _sweep_by_bind, False),
     ("unbind", _sweep_by_unbind, True),
     ("revoke", _sweep_by_revoke, False),
+    ("revoke-all", _sweep_every_account, False),
 )
 
 
@@ -527,18 +557,19 @@ async def _assert_rotation_racing_a_sweep_is_swept(
     holder_of: Callable[[Any], Awaitable[object]],
     is_blocking: Callable[[object], Awaitable[bool]],
 ) -> None:
-    """A session rotated while a whole-account sweep runs is swept too (BACKLOG #4974, #2738).
+    """A session rotated while a sweep runs is swept too (BACKLOG #4974, #2738).
 
-    The rotation is paused right after its re-key, holding the session's row, and the sweep is
-    started; the probe requires that the sweep really waits on the rotation. Released, the rotation
-    commits, and the sweep must end the session under its NEW hash. On SQL Server the re-key moves
-    the row to a new clustered key, so a sweep that met it locked would find the old key gone and
-    the new one outside its read. The new hash sorts before the old one, so a scan in key order has
-    passed it too. On SQL Server the rotation takes the account row first, so the sweep waits there,
-    before it reads any session. On Postgres the sweep waits on the session row and then follows the
-    row to its new version. The bind, the unbind and a revoke of the user's sessions are each
-    replayed. By the reading in ``rotate_session``, SQL Server without the account row first would
-    count 0 and leave the new hash live; that was not run.
+    The rotation is paused after its locked read of the session row and before its re-key, so it
+    holds the row under its OLD hash and has moved nothing yet. The sweep is started, and the probe
+    requires that it really waits on the rotation. Released, the rotation re-keys and commits, and
+    the sweep must end the session under its NEW hash. On SQL Server the re-key moves the row to a
+    new clustered key, so a sweep waiting on the old key would find it gone and the new one outside
+    its read; the new hash sorts before the old one, so a scan in key order has passed it too. On
+    SQL Server the rotation takes the account row first, so the sweep waits there, before it reads
+    any session. On Postgres the sweep waits on the session row and then follows the row to its new
+    version. The bind, the unbind, a revoke of the user's sessions and the every-account revoke are
+    each replayed. By the reading in ``rotate_session``, SQL Server without the account row first
+    would count 0 and leave the new hash live; that was not run.
 
     ``holder_of`` and ``is_blocking`` are the lock-order test's: no timing decides the race.
     """
@@ -570,6 +601,7 @@ async def _assert_one_sweep_takes_a_rotated_session(
         second=(f"{name}: the sweep", lambda: sweep(store, account)),
         holder_of=holder_of,
         is_blocking=is_blocking,
+        pause_before="UPDATE sessions",  # after the locked read, before the re-key moves the row
     )
 
     assert rotated is True, f"{name}: the rotation did not land"

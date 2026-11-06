@@ -11503,9 +11503,11 @@ class AuthService:
         - ``"epoch"``: a whole-account revoke raised the account's epoch, or an every-account
           revoke raised the store's global epoch, after this session was sealed, so the session
           belongs to sessions that were ended (BACKLOG #2592, #5091). That revoke
-          blanked every seal it reached under the account's lock. On SQL Server its sweep can miss
-          a row a rotation moved mid-scan, and that row stays live with a valid seal and the old
-          epoch (BACKLOG #2738). It is ended and reported like a row that fails its seal;
+          blanked every seal it reached under the account's lock. A row it did not reach stays
+          live with a valid seal and the old epoch: at least, on SQL Server, a session of an
+          account the every-account revoke's list read did not return, rotated while its sweep ran
+          (BACKLOG #4974 ordered a rotation against every account that read returned, and against
+          the per-account sweeps). It is ended and reported like a row that fails its seal;
           docs/SECURITY.md, *Limits of the session sweep*, states what that costs.
 
         :meth:`logout` and :meth:`_supersede_session_hash` act on ``"credential"`` only. They read
