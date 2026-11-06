@@ -1010,6 +1010,16 @@ def test_a_file_link_in_the_allocation_registry_is_read_not_refused(fx: Fx) -> N
     assert rows["clean"]["Outcome"] == "WOULD-REMOVE", rows["clean"]
 
 
+def test_the_header_states_the_allocation_link_rule_the_code_applies() -> None:
+    """Red on engine PR 2803 at 210c9cb278: the header, the one statement of the re-check list, said
+    a link of any kind below the allocation registry refuses, while the code and the test above read
+    a linked file as a record. Only a linked folder refuses."""
+    header = " ".join(HELPER.read_text(encoding="utf-8").split("#>", 1)[0].split())
+    assert "a link anywhere below the allocation registry" not in header
+    assert "a linked folder anywhere below the allocation registry" in header
+    assert "a linked file there is read as a record" in header
+
+
 def test_a_junction_above_the_tree_inside_its_claude_segment_refuses(fx: Fx) -> None:
     """The tree root is plain, but .claude/worktrees is a link, so the tree lives elsewhere and the
     path-shape gate would accept it."""
