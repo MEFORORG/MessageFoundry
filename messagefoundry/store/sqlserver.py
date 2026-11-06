@@ -2322,6 +2322,21 @@ _SCHEMA: list[str] = [
         reason NVARCHAR(1000) NOT NULL, actor NVARCHAR(256) NOT NULL,
         attested_at FLOAT NOT NULL, audit_seq BIGINT NOT NULL,
         audit_hash NVARCHAR(64) NOT NULL)""",
+    # The keyring (vault BACKLOG #3411) -- see the SQLite `_SCHEMA`. BIN2 so ids and the
+    # code-constant names compare case- and accent-exactly. It does NOT fix trailing spaces: see the
+    # `state` table's comment, so a writer must refuse them. `wrapped` is MAX so this batch fixes no
+    # width for a sealed key before S4 settles its encoding. The key's three columns are at most 640
+    # bytes, inside the 900-byte limit on a clustered key.
+    """IF OBJECT_ID('keyring','U') IS NULL CREATE TABLE keyring (
+        key_id NVARCHAR(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        purpose NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        key_class NVARCHAR(32) COLLATE Latin1_General_100_BIN2 NOT NULL DEFAULT N'',
+        state NVARCHAR(32) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        period_from FLOAT NULL, period_to FLOAT NULL,
+        wrapped_by NVARCHAR(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        wrapped NVARCHAR(MAX) NOT NULL DEFAULT N'',
+        created_at FLOAT NOT NULL, state_at FLOAT NOT NULL, proved_at FLOAT NULL,
+        CONSTRAINT pk_keyring PRIMARY KEY (key_id, purpose, wrapped_by))""",
     # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112), one row per upload in
     # flight (vault BACKLOG #3180) — see the SQLite `_SCHEMA` for the rationale. One of the two
     # backends a real engine-sharded deployment runs (`require_unified_store` makes a server DB

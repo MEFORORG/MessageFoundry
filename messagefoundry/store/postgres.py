@@ -891,6 +891,21 @@ _SCHEMA: list[str] = [
         audit_seq   BIGINT NOT NULL,
         audit_hash  TEXT NOT NULL
     )""",
+    # The keyring (vault BACKLOG #3411) -- see the SQLite `_SCHEMA`.
+    """CREATE TABLE IF NOT EXISTS keyring (
+        key_id      TEXT NOT NULL,
+        purpose     TEXT NOT NULL,
+        key_class   TEXT NOT NULL DEFAULT '',
+        state       TEXT NOT NULL,
+        period_from DOUBLE PRECISION,
+        period_to   DOUBLE PRECISION,
+        wrapped_by  TEXT NOT NULL,
+        wrapped     TEXT NOT NULL DEFAULT '',
+        created_at  DOUBLE PRECISION NOT NULL,
+        state_at    DOUBLE PRECISION NOT NULL,
+        proved_at   DOUBLE PRECISION,
+        PRIMARY KEY (key_id, purpose, wrapped_by)
+    )""",
     # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112), one row per upload in
     # flight (vault BACKLOG #3180) — see the SQLite `_SCHEMA` for the rationale. This is the backend
     # a real engine-sharded deployment runs: `require_unified_store` makes a server DB mandatory

@@ -96,6 +96,33 @@
 # `-*` tags publish to PRODUCTION PyPI (a TestPyPI route would need its own Trusted Publisher). Cut the tag
 # only AFTER the py.typed marker (WS-3) is on main — the wheel smoke step enforces this on a tag.
 #
+# EVERY PYPI UPLOAD RUNS THE PUBLISH ACTION'S CONTAINER IMAGE BY DIGEST, NOT THE ACTION (BACKLOG
+# #5046). Called as `pypa/gh-action-pypi-publish@<commit>`, that action is a composite whose step
+# "Create Docker container action" writes a docker action naming
+# `docker://ghcr.io/pypa/gh-action-pypi-publish:<commit>`: a registry TAG, so the commit pin on the
+# action never pinned the code that uploads. Whoever can push that package can repoint the tag, and
+# the image would then run holding the publish job's `id-token: write` under the `pypi` environment.
+# The tag has already moved once in ordinary operation: upstream's `release/v1` and `release/v1.14`
+# build runs both pushed it for the same commit. So each upload step names, by its `sha256:` digest,
+# the image that COMMIT's tag resolved to when this pin was taken, and calls the image directly.
+# That is the image the action itself would have run. Upstream's `:v1.14.3` tag names a different
+# build of the same commit, with a different digest, so do not check the pin against that tag.
+# Calling the image skips the composite, which also supplied the image's input defaults, so each
+# upload step passes every input the composite passed, at the composite's own default value, except
+# `skip-existing`, which stays true where the composite defaults it false (the toolkit step says
+# why: a re-run must not die on "File already exists"). The
+# image's entry script runs under `set -u` and reads at least the user name, password and verbose
+# inputs directly, so leaving one out fails the step; its token exchange reads the repository URL
+# with no default, so leaving that out fails it too. A repository URL other than PyPI's would send
+# the OIDC token to that index and turn PEP 740 attestations off. The token user name with an empty
+# password is how the image selects Trusted Publishing; neither carries a secret.
+# tests/test_release_pipeline.py pins the image spelling, one digest and one comment at every
+# site, and every input's value.
+# DEPENDABOT DOES NOT MOVE THIS DIGEST, and no longer sees the action at all: its github-actions
+# parser skips a `docker://` reference, and its docker entry scans /docker only. A bump is a hand
+# edit: read action.yml and twine-upload.sh at the new commit, re-check the inputs against them,
+# resolve the new commit tag's digest, and change every upload step together.
+#
 # SECOND distribution — `messagefoundry-harness` (the synthetic test/load/failover harness,
 # packaging/messagefoundry-harness/) — is built by the `release-harness` job and published by the
 # last step of `publish-pypi`, after the engine it pins, in lockstep (same version, same tag). That
@@ -1288,7 +1315,7 @@ jobs:
     outputs:
       upload-outcome: ${{ steps.harness-upload.outcome }}
     # The ONLY kind of job that names the `pypi` environment, and it builds nothing (vault BACKLOG
-    # #2631, limb 1). No checkout: it runs no repository code, only the pinned actions below.
+    # #2631, limb 1). No checkout: it runs no repository code, only the pinned actions and image below.
     environment: pypi
     permissions:
       id-token: write   # PyPI Trusted Publishing (OIDC) and PEP 740 attestations; nothing else
@@ -1348,11 +1375,17 @@ jobs:
       # on, not the pending publisher (ADR 0201, To resolve on acceptance, records the reading).
       - name: Publish messagefoundry-toolkit to PyPI before the engine (Trusted Publishing / OIDC)
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
-        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # commit 7245906fb61fa33a13554f9d5fb856fe61758086 (v1.14.3), its commit tag's image; the header says why
         with:
           packages-dir: toolkit-dist/
           skip-existing: true
           attestations: true
+          repository-url: https://upload.pypi.org/legacy/
+          user: __token__
+          password: ""
+          verify-metadata: true
+          verbose: true
+          print-hash: true
 
       # AFTER THE BUILD on purpose: PyPI is the one IRREVERSIBLE sink (uploads can't be replaced), so
       # it runs after build/smoke/sign/release — this job needs `release` and `release-harness`, and
@@ -1368,11 +1401,17 @@ jobs:
       # version==tag smoke check already prevents a wrong-version upload).
       - name: Publish to PyPI (Trusted Publishing / OIDC)
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
-        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # commit 7245906fb61fa33a13554f9d5fb856fe61758086 (v1.14.3), its commit tag's image; the header says why
         with:
           packages-dir: dist-pub/
           skip-existing: true
           attestations: true
+          repository-url: https://upload.pypi.org/legacy/
+          user: __token__
+          password: ""
+          verify-metadata: true
+          verbose: true
+          print-hash: true
 
       # AFTER THE ENGINE, which the harness pins exactly: the implicit success() skips this step if
       # the engine upload failed, so no harness naming an engine PyPI lacks is uploaded. THIS BENDS
@@ -1385,11 +1424,17 @@ jobs:
       - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
         id: harness-upload
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-harness.outputs.publish-harness == 'true' && vars.PUBLISH_HARNESS == 'true' }}
-        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # commit 7245906fb61fa33a13554f9d5fb856fe61758086 (v1.14.3), its commit tag's image; the header says why
         with:
           packages-dir: harness-dist/
           skip-existing: true
           attestations: true
+          repository-url: https://upload.pypi.org/legacy/
+          user: __token__
+          password: ""
+          verify-metadata: true
+          verbose: true
+          print-hash: true
 
   release-webconsole:
     # Build + publish the SEPARATE `messagefoundry-webconsole` distribution (the browser ops console,
@@ -1799,7 +1844,7 @@ jobs:
     outputs:
       upload-outcome: ${{ steps.webconsole-upload.outcome }}
     # The ONLY kind of job that names the `pypi` environment, and it builds nothing (vault BACKLOG
-    # #2631, limb 1). No checkout: it runs no repository code, only the pinned actions below.
+    # #2631, limb 1). No checkout: it runs no repository code, only the pinned actions and image below.
     environment: pypi
     permissions:
       id-token: write   # PyPI Trusted Publishing (OIDC) and PEP 740 attestations; nothing else
@@ -1843,11 +1888,17 @@ jobs:
       - name: Publish messagefoundry-webconsole to PyPI (Trusted Publishing / OIDC)
         id: webconsole-upload
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-webconsole.outputs.publish-webconsole == 'true' && vars.PUBLISH_WEBCONSOLE == 'true' }}
-        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # commit 7245906fb61fa33a13554f9d5fb856fe61758086 (v1.14.3), its commit tag's image; the header says why
         with:
           packages-dir: webconsole-dist/
           skip-existing: true
           attestations: true
+          repository-url: https://upload.pypi.org/legacy/
+          user: __token__
+          password: ""
+          verify-metadata: true
+          verbose: true
+          print-hash: true
 
   # PUBLISH THE CONSOLE'S GITHUB RELEASE ONCE ITS WHEEL IS ON PYPI (vault BACKLOG #2975). Before this
   # job, release-webconsole published its release in the call that made it, so the release was public
@@ -1987,7 +2038,8 @@ jobs:
           python -m venv /tmp/harnesssmoke
           /tmp/harnesssmoke/bin/pip install --quiet "packaging==$PKG_PIN"
           # --no-deps IS LOAD-BEARING, NOT AN OPTIMISATION. messagefoundry-harness depends on
-          # messagefoundry[harness], so a full install would resolve the ENGINE AND PySide6 FROM PYPI
+          # messagefoundry[harness] and messagefoundry-toolkit, so a full install would resolve the
+          # ENGINE, THE TOOLKIT AND PySide6 FROM PYPI
           # inside a job holding contents: write — and on a first run the engine is not on PyPI
           # yet, since publish-pypi waits on this job (a re-run of this job may follow its upload),
           # so it would also be a live index round-trip on the release path. Install the
@@ -2168,10 +2220,42 @@ jobs:
                   f"table in packaging/messagefoundry-harness/pyproject.toml and re-cut the tag."
               )
 
+          # THE TOOLKIT PIN, THE SAME WAY (ADR 0201 slice 7, AC-7). The harness imports
+          # messagefoundry_toolkit.generators, so it declares the toolkit, lockstep like the engine.
+          # The resolution check below stubs the toolkit at this wheel's own version and so cannot
+          # see this pin drift, and nothing else here reads it: a missing or loose line would
+          # publish a harness that dies on ImportError at its first generator call.
+          toolkit = [
+              req
+              for raw in (dist.metadata.get_all("Requires-Dist") or [])
+              if (req := Requirement(raw)).name.replace("_", "-").lower() == "messagefoundry-toolkit"
+              and not gated_by_an_extra(req)
+          ]
+          toolkit_clauses = list(toolkit[0].specifier) if len(toolkit) == 1 else []
+          toolkit_pin = None
+          if (
+              len(toolkit_clauses) == 1
+              and toolkit_clauses[0].operator == "=="
+              and toolkit[0].marker is None
+              and not toolkit[0].extras
+          ):
+              try:
+                  toolkit_pin = Version(toolkit_clauses[0].version)
+              except InvalidVersion:
+                  toolkit_pin = None  # a wildcard pin is a drift, as for the engine above
+          if toolkit_pin != shipped:
+              raise SystemExit(
+                  f"::error::{DIST} {dist.version} requires {[str(req) for req in toolkit]} of "
+                  f"messagefoundry-toolkit, not exactly messagefoundry-toolkit=={dist.version} (ADR "
+                  f"0201 AC-7). Fix the dependencies table in "
+                  f"packaging/messagefoundry-harness/pyproject.toml and re-cut the tag."
+              )
+
           print(
               f"harness wheel installed from {origin}: {len(recorded)} {PKG}/ members, "
               f"entry point {PKG}.__main__:main resolves, requires "
-              f"messagefoundry[harness]{engine[0].specifier}, version {dist.version}",
+              f"messagefoundry[harness]{engine[0].specifier} and "
+              f"messagefoundry-toolkit{toolkit[0].specifier}, version {dist.version}",
               file=sys.stderr,
           )
           print(dist.version)
