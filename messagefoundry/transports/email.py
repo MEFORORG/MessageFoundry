@@ -308,24 +308,20 @@ class CheckedEnvelope:
         in no ``except`` block, so the chain carries nothing either. A caller that sends ``QUIT``
         after this raises recovers a permanent refusal with :func:`envelope_refusal_under`."""
         to_addrs = list(dict.fromkeys(self.recipients))
-        codes: list[int] = []
         try:
             refused = smtp.send_message(msg, from_addr=self.sender, to_addrs=to_addrs)
         except smtplib.SMTPRecipientsRefused as exc:
             # The reply codes only: the dict's keys are the addresses, and its texts can echo them.
             codes = sorted({_reply_code(reply) for reply in exc.recipients.values()})
-            refused = {}
-        if codes:
-            raise _total_refusal(cell, len(to_addrs), codes)
-        if not refused:
-            return
-        raise NegativeAckError(
-            f"{cell}: {len(refused)} of {len(to_addrs)} recipients refused",
-            code=PARTIAL_REFUSAL_CODE,
-            permanent=True,
-            credential_fault=False,
-            config_fault=False,
-        )
+        else:
+            if not refused:
+                return
+            raise _permanent_refusal(
+                f"{cell}: {len(refused)} of {len(to_addrs)} recipients refused",
+                PARTIAL_REFUSAL_CODE,
+            )
+        # Outside the handler, so the chain does not carry SMTPRecipientsRefused.
+        raise _total_refusal(cell, len(to_addrs), codes)
 
 
 #: The :class:`~messagefoundry.transports.base.NegativeAckError` code of a partial RCPT refusal.
@@ -347,17 +343,19 @@ def _reply_code(reply: object) -> int:
     return -1
 
 
+def _permanent_refusal(text: str, code: str) -> NegativeAckError:
+    """A permanent envelope refusal. Neither fault flag is set: a refused mailbox is not a fault
+    in the connection, and a config fault would stop the lane."""
+    return NegativeAckError(
+        text, code=code, permanent=True, credential_fault=False, config_fault=False
+    )
+
+
 def _total_refusal(cell: str, count: int, codes: list[int]) -> DeliveryError:
     """The error for a refusal of every recipient: permanent when every code is ``5xx``."""
     text = f"{cell}: all {count} recipients refused ({', '.join(map(str, codes))})"
     if all(500 <= code <= 599 for code in codes):
-        return NegativeAckError(
-            text,
-            code=TOTAL_REFUSAL_CODE,
-            permanent=True,
-            credential_fault=False,
-            config_fault=False,
-        )
+        return _permanent_refusal(text, TOTAL_REFUSAL_CODE)
     return DeliveryError(text)
 
 
@@ -752,10 +750,8 @@ class EmailDestination(DestinationConnector):
                         channel_encrypted=self.use_tls,
                         cell="EMAIL outbound",
                     )
-                # A partial RCPT refusal, or a 5xx refusal of every recipient, raises
-                # NegativeAckError, and a 4xx refusal of every recipient a content-free
-                # DeliveryError. No arm below catches either, so each reaches the delivery worker
-                # as it is (vault BACKLOG #2924, #2884).
+                # A recipient refusal raises what CheckedEnvelope.send says, which no arm below
+                # catches, so it reaches the delivery worker as it is (vault BACKLOG #2924, #2884).
                 self._envelope.send(smtp, msg, cell=f"Email {self.host}:{self.port}")
         except InsecureHopRefused as exc:
             # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,

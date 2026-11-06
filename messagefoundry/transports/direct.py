@@ -818,10 +818,8 @@ class DirectDestination(DestinationConnector):
                         channel_encrypted=self.use_tls,
                         cell="DIRECT outbound",
                     )
-                # A partial RCPT refusal, or a 5xx refusal of every recipient, raises
-                # NegativeAckError, and a 4xx refusal of every recipient a content-free
-                # DeliveryError. No arm below catches either, so each reaches the delivery worker
-                # as it is (vault BACKLOG #2924, #2884).
+                # A recipient refusal raises what CheckedEnvelope.send says, which no arm below
+                # catches, so it reaches the delivery worker as it is (vault BACKLOG #2924, #2884).
                 self._envelope.send(smtp, msg, cell=f"Direct {self.host}:{self.port}")
         except InsecureHopRefused as exc:
             # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,

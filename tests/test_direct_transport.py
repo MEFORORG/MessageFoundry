@@ -72,6 +72,7 @@ from tests.test_email_destination import (
     _WireCapture,
     assert_partial_refusal,
     assert_total_refusal,
+    refuse_every_recipient,
 )
 
 # A synthetic (never-real-PHI) HL7 body for the crypto round-trip (CLAUDE.md §9).
@@ -547,25 +548,20 @@ async def test_a_permanent_refusal_of_every_recipient_fails_the_direct_delivery_
 ) -> None:
     # Every recipient refused with a 5xx (vault BACKLOG #2884, #2924 step 5): permanent, as a
     # partial refusal is, and content-free. RED on main: a retried DeliveryError.
-    wire.refuse_rcpt = frozenset(a.encode() for a in _PARTIAL_RECIPIENTS)
-    if not quit_ok:
-        wire.quit_reply = b"500 no\r\n"
+    refuse_every_recipient(wire, quit_ok=quit_ok)
     d = _wire_direct(monkeypatch, pki, wire.port, recipients=_PARTIAL_RECIPIENTS)
     with pytest.raises(NegativeAckError) as caught:
         await d.send(_SYNTHETIC_HL7)
-    assert caught.value.code == "total-refusal" and caught.value.permanent is True
     assert_total_refusal(caught.value, f"Direct 127.0.0.1:{wire.port}", wire, "550")
 
 
 async def test_a_temporary_refusal_of_every_recipient_is_a_retried_direct_failure(
     monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], wire: _WireCapture
 ) -> None:
-    wire.refuse_rcpt = frozenset(a.encode() for a in _PARTIAL_RECIPIENTS)
-    wire.refuse_code = b"450"
+    refuse_every_recipient(wire, b"450")
     d = _wire_direct(monkeypatch, pki, wire.port, recipients=_PARTIAL_RECIPIENTS)
     with pytest.raises(DeliveryError) as caught:
         await d.send(_SYNTHETIC_HL7)
-    assert not isinstance(caught.value, NegativeAckError)
     assert_total_refusal(caught.value, f"Direct 127.0.0.1:{wire.port}", wire, "450")
 
 
