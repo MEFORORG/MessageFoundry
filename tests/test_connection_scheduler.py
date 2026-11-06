@@ -42,6 +42,7 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 from messagefoundry.store.store import Stage
 from messagefoundry.transports.base import NegativeAckError
+from tests._log_absence import assert_capture_sees
 
 # 2026-07-13 is a Monday (datetime.weekday() == 0).
 MON = 0
@@ -968,6 +969,7 @@ async def test_a_reload_that_removes_a_scheduled_connection_cancels_its_calendar
         assert runner._schedule_workers == {}
         caplog.clear()
         await asyncio.sleep(0.2)  # ten ticks of the old task's cadence
+        assert_capture_sees(caplog, "messagefoundry.pipeline.wiring_runner")
         assert not [r for r in caplog.records if "reconcile failed" in r.getMessage()]
     finally:
         await runner.stop()

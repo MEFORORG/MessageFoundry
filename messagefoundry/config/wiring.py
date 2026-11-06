@@ -6884,12 +6884,15 @@ def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
-def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
+def query_credential_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
     """Every outbound and ``FhirLookup`` whose ``url`` carries a credential-like query parameter, as
     ``(name, parameter names)`` (ASVS 14.2.1). Lookup names are prefixed ``fhir_lookup:``.
 
     The single reader, on the contract of :func:`expiry_relaxed_hops`, so ``messagefoundry check``,
-    ``security_loosenings()`` and ``GET /security/posture`` cannot disagree. Sorted by name. The
+    ``security_loosenings()`` and ``GET /security/posture`` cannot disagree on a literal ``url``;
+    on an ``env()`` one they read the values each has, as below. Sorted by name. The
     second element is the parameter NAMES only, comma-joined, from
     :func:`~messagefoundry.secretscrub.credential_query_params`; a value never leaves this function.
 
@@ -6899,15 +6902,24 @@ def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
     it nowhere else, so it is reported rather than refused, except where
     ``transports.egress.warn_url_query_credentials`` says a build refuses it.
 
-    It reads a literal ``url`` only. An ``env()`` URL is unresolved here and cannot be read; the
-    construction WARNING, ``transports.egress.warn_url_query_credentials``, reads the resolved one.
-    Pure."""
+    An ``env()`` URL is resolved with :func:`resolve_env_settings`, the build's own resolution and
+    the one ``transports.egress.warn_url_query_credentials_before_build`` applies, against
+    ``env_values`` (the live posture route passes the runner's). A key the values do not hold, or
+    no values at all, falls back to its literal ``default=`` (vault BACKLOG #3766 item 15); one with
+    neither is not read. A ``deployed=False`` outbound with an ``env()`` URL is skipped, as the
+    DATABASE and ECH readers skip one: its values are never resolved and it is never built (ADR
+    0111 AC-1). It touches nothing but the graph and the values, except that resolving runs an
+    ``env()`` URL's operator ``cast``, as the build does."""
     out: list[tuple[str, str]] = []
     for name, settings in (
-        *((oc.name, oc.spec.settings) for oc in registry.outbound.values()),
+        *(
+            (oc.name, oc.spec.settings)
+            for oc in registry.outbound.values()
+            if oc.deployed or not isinstance(oc.spec.settings.get("url"), EnvRef)
+        ),
         *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
     ):
-        url = settings.get("url")
+        url = _db_setting(settings, "url", None, env_values or {})
         if isinstance(url, str) and (names := credential_query_params(url)):
             out.append((name, ", ".join(names)))
     return sorted(out)
@@ -7631,7 +7643,8 @@ def oauth_request_advisories(registry: Registry) -> OAuthRequestAdvisories:
       graded.
 
     **It reads literal values only, and that limit is large.** An ``env()`` reference is unresolved in
-    the loaded graph, exactly as :func:`query_credential_hops` records for ``url``. Measured
+    the loaded graph; :func:`query_credential_hops` resolves its ``url``, and this reader does not.
+    Measured
     2026-10-04 over the tracked tree: all five worked examples of the two composers spell the endpoint
     ``url`` and the token URL as ``env()``, and none sets an audience. So on a configuration written
     the documented way, both audience rules have nothing to compare. No construction-time reader of
