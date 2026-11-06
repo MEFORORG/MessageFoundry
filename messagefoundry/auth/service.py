@@ -2804,7 +2804,9 @@ CredentialIssueOp = Literal["create", "password_reset", "mfa_reset"]
 #: What :meth:`AuthService.logout` reports, and what its ``auth.logout`` row's ``outcome`` records.
 #: ``lapsed`` is a revoke of a row :meth:`AuthService._was_live_at_revoke` found not live, or of a
 #: live one whose owner's admin-issued temporary credential had passed its deadline
-#: (:meth:`AuthService._gate_refusal`'s ``"credential"``) (BACKLOG #3749).
+#: (:meth:`AuthService._gate_refusal`'s ``"credential"``) (BACKLOG #3749). An ``auth.logout`` row can
+#: also carry ``unrecorded``, which no sign-out returns: the row that counts the sign-outs the
+#: miss-row bound left unwritten (BACKLOG #4735, :meth:`AuthService._count_unrecorded_logout_misses`).
 LogoutOutcome = Literal["revoked", "lapsed", "nothing_to_revoke"]
 #: BACKLOG #3715, #3749: how far before the moment a sign-out's token was proven live, or before
 #: the call when nothing proved it, the sign-out follows the session lineage. ``/ui/logout``
@@ -11509,15 +11511,19 @@ class AuthService:
         row's detail is ``{"outcome": "unrecorded", "count": N}``, N being the misses left
         unwritten since the last count row; its own outcome keeps it from reading as one
         ``nothing_to_revoke`` sign-out. It names no actor and no client, because it counts misses
-        from every source. The count is in-process: a restart loses it, and so does a refused
-        write, whose ERROR line gives N."""
+        from every source, and a WARNING line gives N as each one is written. The count is
+        in-process: a restart loses it, and so does a refused write, whose ERROR line gives N."""
         if refused:
             self._logout_misses_unrecorded += 1
         count = self._logout_misses_unrecorded
         if not count or not self._logout_miss_count_rows.allow("auth.logout"):
             return
-        # Taken before the await, so a sign-out arriving during the write cannot count these twice.
-        self._logout_misses_unrecorded = 0
+        # The one operator signal, as often as the count row: the trail is being thinned.
+        _log.warning(
+            "%d sign-outs that ended nothing went past the audit bound; one auth.logout row "
+            "counts them",
+            count,
+        )
         await write_audit_soft(
             lambda: self._audit(
                 "auth.logout", detail=_json({"outcome": "unrecorded", "count": count})
@@ -11529,6 +11535,9 @@ class AuthService:
             # A raise would answer a sign-out the caller is owed with a failure (BACKLOG #3884).
             defects=(),
         )
+        # Taken off after the write, not zeroed before it: misses counted during the await stay
+        # for the next row, and a cancelled write, which escapes with no ERROR line, keeps these.
+        self._logout_misses_unrecorded -= count
 
     async def _ended_owner(self, row: SessionRecord) -> VerifiedUser | None:
         """The account that owns ``row``, a session a revoke has just ended: the one owner lookup

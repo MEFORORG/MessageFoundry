@@ -18,10 +18,9 @@ async def logout_rows(
 ) -> list[tuple[object, object, object]]:
     """Each ``auth.logout`` row, newest first, as its actor, client address and
     ``detail.outcome``. ``limit``, when given, is passed to ``list_audit``."""
-    extra = {} if limit is None else {"limit": limit}
     return [
-        (row["actor"], row["client"], json.loads(str(row["detail"] or "{}")).get("outcome"))
-        for row in await store.list_audit(action="auth.logout", **extra)
+        (actor, client, detail.get("outcome"))
+        for actor, client, detail in await logout_entries(store, limit=limit)
     ]
 
 

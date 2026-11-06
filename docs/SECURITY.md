@@ -5764,19 +5764,24 @@ request to `/ui/logout` whose session cookie ends no session writes an `auth.log
 `outcome` `nothing_to_revoke`, and the route needs no credential, so the engine bounds those rows.
 Each source writes at most 3 such rows in any 60 seconds, and all sources together at most 120. A
 source is the caller's address, folded as the sign-in limiter folds it, and every caller with no
-address shares one source. So ten addresses flooding the route write 30 rows a minute and leave
-every other caller its rows. A flood spread over more than 40 addresses reaches the 120 ceiling,
-and then no source writes its own row until earlier rows age out of the window. A sign-out past either limit is
-counted, never dropped silently: one `auth.logout` row a minute, with no actor and no client,
-has `outcome` `unrecorded` and `"count": N`, the sign-outs left unwritten since the last such
-row. Its own outcome keeps a reader that counts `nothing_to_revoke` rows from reading it as one
-sign-out. The first sign-out
-past a limit writes that row at once. The count left when a flood stops is written by the next
-sign-out that ends nothing after the minute. With the audit store refusing writes, the ERROR line
-each refused write logs is bounded the same way.
+address shares one source. So ten distinct sources flooding the route write 30 rows a minute and
+leave every other source its rows. Forty sources at their share fill the 120 ceiling, and then no
+source writes its own row until earlier rows age out of the window. A sign-out past either limit
+is not written as its own row but counted: one `auth.logout` row a minute, with no actor and no
+client, has `outcome` `unrecorded` and `"count": N`, the sign-outs left unwritten since the last
+such row, and a WARNING log line gives the same N. Its own outcome keeps a reader that counts
+`nothing_to_revoke` rows from reading it as one sign-out. The first sign-out past a limit writes
+that row at once. The count left when a flood stops is written by the next sign-out that ends
+nothing after the minute. With the audit store refusing writes, the ERROR line each refused write
+logs is bounded the same way.
 
-At least these limits stay. The bound and the count are in-process, so each engine shard keeps its
-own, and a restart loses a count not yet written. Nothing prunes `audit_log` (see
+At least these limits stay. Callers the engine sees under one folded address are one source: every
+caller behind a proxy whose forwarded address the engine does not trust, every loopback caller,
+and every caller with no address. Three misses from any of them then cost the rest their own rows
+for the window, and only the count records the others. The source is the whole address, so an
+IPv6 host that holds a /64 can be 40 sources by itself and fill the ceiling. The bound and the
+count are in-process, so each engine shard keeps its own, and a restart loses a count not yet
+written. Nothing prunes `audit_log` (see
 [retention](CONFIGURATION.md#retention)), so the rows still grow, by at most 121 a minute for each
 engine process. The bound gates the row only: the sign-out itself is never refused or delayed. A
 sign-out that ended a session always writes its row, and so does one that names its caller, as
@@ -6732,7 +6737,7 @@ IP is a backlog follow-up).
 ## Audit
 
 Every authentication and authorization event is written to the durable `audit_log` with the acting
-user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.directory_login_locked` / `auth.logout` /
+user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.directory_login_locked` / `auth.logout` (an unauthenticated sign-out that ends nothing, past its bound, is counted in a row rather than written as its own; see [Session inventory](#session-inventory--targeted-revocation-wp-10)) /
 `auth.login_new_ip` / `auth.login_address_unevaluated` (the first-seen sign-in address, BACKLOG #288;
 on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
 `auth.permission_denied` / `auth.channel_denied` / `auth.self_target_refused` / `auth.session_revoke_missed`, the 6.3.5 events `auth.account_locked` /

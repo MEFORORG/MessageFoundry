@@ -14,6 +14,7 @@ end. These pin what a route test cannot see:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -623,6 +624,17 @@ async def test_a_logout_ends_the_session_a_rotation_in_flight_re_keyed(
 _MISS_ROWS = 2 * _LOGOUT_MISS_ROWS_ALL  # room for every row the tests below can write
 
 
+@pytest.fixture
+def miss_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The bound's monotonic clock, frozen, so every miss of a test lands in one window however
+    slow the runner; a test steps it by adding to the one item."""
+    clock = [time.monotonic()]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    return clock
+
+
 async def _misses(service: AuthService, count: int, client: str | None) -> None:
     """``count`` sign-outs from ``client`` that name no caller and end nothing."""
     for n in range(count):
@@ -650,7 +662,7 @@ async def _counted(store: MessageStore) -> list[tuple[object, object, object]]:
 
 
 async def test_a_source_writes_its_share_of_miss_rows_and_its_next_miss_is_counted(
-    store: MessageStore,
+    store: MessageStore, miss_clock: list[float]
 ) -> None:
     """RED when: a source's share is not the stated one, or a miss past it is dropped uncounted."""
     service = await _service(store)
@@ -664,7 +676,7 @@ async def test_a_source_writes_its_share_of_miss_rows_and_its_next_miss_is_count
 
 
 async def test_ten_flooding_sources_and_the_unaddressed_leave_another_source_its_rows(
-    store: MessageStore,
+    store: MessageStore, miss_clock: list[float]
 ) -> None:
     """RED when: a set of sources, the hold's ten addresses among them, or callers with no address,
     can spend the rows of a source that has not flooded (BACKLOG #4735 step 1 (b))."""
@@ -682,15 +694,11 @@ async def test_ten_flooding_sources_and_the_unaddressed_leave_another_source_its
 
 
 async def test_a_flood_from_many_sources_stops_at_the_aggregate_and_is_counted(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+    store: MessageStore, miss_clock: list[float]
 ) -> None:
     """RED when: misses spread over many sources grow the rows past the stated aggregate, the
     aggregate fires before it is reached, or a miss past it leaves no count (step 1 (a))."""
     service = await _service(store)
-    clock = [time.monotonic()]
-    monkeypatch.setattr(
-        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
-    )
     sources = [
         f"2001:db8::{n:x}" for n in range(_LOGOUT_MISS_ROWS_ALL // _LOGOUT_MISS_ROWS_PER_SOURCE)
     ]
@@ -703,11 +711,40 @@ async def test_a_flood_from_many_sources_stops_at_the_aggregate_and_is_counted(
     assert len(await _own_miss_rows(store)) == _LOGOUT_MISS_ROWS_ALL
     # The first miss past it is counted at once; the rest wait for the window to pass.
     assert [n for _, _, n in await _counted(store)] == [1]
-    clock[0] += _LOGOUT_MISS_ROW_WINDOW_SECONDS + 1
+    miss_clock[0] += _LOGOUT_MISS_ROW_WINDOW_SECONDS + 1
     await _misses(service, 1, "192.0.2.81")
     counts = [n for _, _, n in await _counted(store)]
     assert counts == [1, 2], "the misses past the bound were not all counted"
     assert (await _own_miss_rows(store))[0] == "192.0.2.81", "a new window wrote no row"
+
+
+async def test_a_cancelled_count_row_keeps_its_count_for_the_next_one(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, miss_clock: list[float]
+) -> None:
+    """RED when: a count row whose write is cancelled loses its count, which no ERROR line logs."""
+    service = await _service(store)
+    real = service._audit
+
+    async def _cancel_count(
+        action: str,
+        *,
+        actor: str | None = None,
+        detail: str | None = None,
+        client: str | None = None,
+    ) -> None:
+        if '"unrecorded"' in str(detail):
+            raise asyncio.CancelledError
+        await real(action, actor=actor, detail=detail, client=client)
+
+    await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, "203.0.113.9")
+    monkeypatch.setattr(service, "_audit", _cancel_count)
+    with pytest.raises(asyncio.CancelledError):
+        await _misses(service, 1, "203.0.113.9")
+    monkeypatch.setattr(service, "_audit", real)
+    miss_clock[0] += _LOGOUT_MISS_ROW_WINDOW_SECONDS + 1
+    await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE + 1, "203.0.113.9")
+    # The cancelled row's 1 is written by the first miss of the next window.
+    assert [n for _, _, n in await _counted(store)] == [1]
 
 
 async def test_a_sign_out_that_names_its_caller_is_never_bounded(store: MessageStore) -> None:
@@ -726,7 +763,7 @@ async def test_a_sign_out_that_names_its_caller_is_never_bounded(store: MessageS
 
 
 async def test_a_sign_out_that_ends_a_session_is_audited_past_the_bound(
-    store: MessageStore,
+    store: MessageStore, miss_clock: list[float]
 ) -> None:
     """RED when: a spent bound costs a sign-out that ended a session its row."""
     service = await _service(store)
@@ -734,12 +771,18 @@ async def test_a_sign_out_that_ends_a_session_is_audited_past_the_bound(
     await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE + 1, "203.0.113.9")
     for n in range(_LOGOUT_MISS_ROWS_ALL // _LOGOUT_MISS_ROWS_PER_SOURCE):
         await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, f"198.51.100.{n}")
+    # CONTROL: the bound is spent, so a fresh source's miss writes no row of its own.
+    await _misses(service, 1, "192.0.2.90")
+    assert "192.0.2.90" not in await _own_miss_rows(store)
     assert await service.logout(token, client="203.0.113.9", proven_at=None) == "revoked"
     assert (await logout_rows(store, limit=_MISS_ROWS))[0] == ("op", "203.0.113.9", "revoked")
 
 
 async def test_a_refusing_audit_store_logs_at_most_one_error_line_per_bounded_row(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    miss_clock: list[float],
 ) -> None:
     """RED when: with the audit store refusing writes, a flood of misses logs an ERROR line per
     request past the bound (#4735 step 3, the QA comment's critic note 4)."""
