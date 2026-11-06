@@ -427,6 +427,26 @@ _MSSQL_EPOCH_NOW = (
 # which is the memory budget the 500-row passes actually spend; 500 here would be ~650 MiB held in a
 # single transaction while the store is still opening.
 _ATTACHMENT_CHUNK_BATCH = 16
+
+
+def _check_walk_identifiers(*names: str) -> None:
+    """Refuse a cipher-walk identifier that is not a plain ASCII name. The walk's names are declared
+    constants (BACKLOG #1719), so this only stops a caller that passed something else."""
+    for name in names:
+        if not (name.isascii() and name.isidentifier()):
+            raise ValueError(f"not a plain identifier for the cipher walk: {name!r}")
+
+
+def _key_after(order: tuple[str, ...], after: tuple[Any, ...]) -> tuple[str, list[Any]]:
+    """``(a, b) > (x, y)`` as T-SQL spells it, ``a > x OR (a = x AND b > y)``, and its values in
+    placeholder order: T-SQL has no row-value comparison."""
+    column, value = order[0], after[0]
+    if len(order) == 1:
+        return f"[{column}] > ?", [value]
+    inner, values = _key_after(order[1:], after[1:])
+    return f"([{column}] > ? OR ([{column}] = ? AND {inner}))", [value, value, *values]
+
+
 # ADR 0073: ownership-scoped reset lane-chunk bound (lane names per UPDATE's IN list) — well under
 # pyodbc's ~2,100-parameter bound with the fixed parameters; chunks run inside the reset's single
 # transaction, so the all-or-nothing recovery pass is unchanged.
@@ -4332,6 +4352,76 @@ class SqlServerStore:
             f"SELECT TOP (1) 1 AS x FROM {table} WHERE [{column}] LIKE ?", (like,)
         )
         return row is not None
+
+    # --- the read-only cipher-cell walk (BACKLOG #1719) ----------------------
+    # The source `cipher_cells.read_server_cipher_cells` reads, for `messagefoundry cipher-audit`.
+    # Each call is one SELECT through `_fetchall`, which ends its read transaction, so none spans
+    # chunks. Every identifier is a declared constant from `cipher_cells`, bracket-quoted because
+    # `key` and `count` are reserved here; only values are parameters.
+
+    async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]:
+        """The columns of each of ``tables`` this store's schema holds; an absent table is left out.
+        ``OBJECT_ID`` resolves a name the way the store's own unqualified statements do."""
+        found: dict[str, frozenset[str]] = {}
+        for table in tables:
+            _check_walk_identifiers(table)
+            rows = await self._fetchall(
+                "SELECT c.name AS name FROM sys.columns c WHERE c.object_id = OBJECT_ID(?, 'U')",
+                (table,),
+            )
+            if rows:
+                found[table] = frozenset(str(r["name"]) for r in rows)
+        return found
+
+    async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
+        """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the table exists."""
+        row = await self._fetchone(
+            "SELECT TOP (1) surface_table, surface_column FROM keyed_surface"
+            " ORDER BY surface_table, surface_column"
+        )
+        return None if row is None else (str(row["surface_table"]), str(row["surface_column"]))
+
+    async def cipher_walk_surface_sealed(self, table: str, column: str, *, keyed: bool) -> bool:
+        """Whether the store has sealed ``table.column``, by the rule its at-open sweep applies
+        (BACKLOG #3383); ``keyed`` says the ``keyed_surface`` table exists to be asked."""
+        _check_walk_identifiers(table, column)
+        if keyed and await self._surface_keyed(table, column):
+            return True
+        return await self._surface_holds_ciphertext(table, column, f"{_ENC_MARKER_PREFIX}%")
+
+    async def cipher_walk_chunk(
+        self,
+        table: str,
+        column: str,
+        select: Sequence[str],
+        order: Sequence[str],
+        after: Sequence[Any] | None,
+        limit: int,
+        *,
+        sealed_only: bool,
+    ) -> list[tuple[Any, ...]]:
+        """Up to ``limit`` rows of ``table`` whose ``column`` is not NULL, after the ``order`` key
+        ``after`` (``None`` for the first chunk), in ``order``. Each row is the ``select`` values,
+        then ``column``'s. ``sealed_only`` keeps a value only when it starts with the marker in any
+        ASCII case, as ``cipher_cells._sealed_test`` reads one."""
+        _check_walk_identifiers(table, column, *select, *order)
+        params: list[Any] = [int(limit)]
+        where = [f"[{column}] IS NOT NULL"]
+        if sealed_only:
+            prefix = _ENC_MARKER_PREFIX.lower()
+            where.append(f"LOWER(LEFT([{column}], ?)) = ?")
+            params += [len(prefix), prefix]
+        if after is not None:
+            bound, values = _key_after(tuple(order), tuple(after))
+            where.append(bound)
+            params += values
+        picked = ", ".join(f"[{c}]" for c in (*select, column))
+        ordered = ", ".join(f"[{c}]" for c in order)
+        sql = (
+            f"SELECT TOP (?) {picked} FROM [{table}] WHERE {' AND '.join(where)} ORDER BY {ordered}"
+        )
+        names = (*select, column)
+        return [tuple(r[c] for c in names) for r in await self._fetchall(sql, tuple(params))]
 
     async def _count_unmarked(self, count_sql: str, *params: str) -> int:
         """The ``n`` that ``count_sql`` (a ``COUNT_BIG(*) AS n``) returns for ``params``."""

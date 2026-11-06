@@ -21,7 +21,7 @@ import json
 import re
 import shutil
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -37,15 +37,22 @@ from messagefoundry.store.base import build_store_cipher
 from messagefoundry.store.cipher_cells import (
     COMPOSITE_CIPHER_CELLS,
     DEFAULT_CHUNK_ROWS,
+    POSITION,
+    POSTGRES_CIPHER_CELLS,
     SQLITE_CIPHER_CELLS,
+    SQLSERVER_CIPHER_CELLS,
+    CipherAudit,
     CipherCell,
+    CipherCellSource,
     CipherWalkInterrupted,
     audit_cipher_cells,
+    audit_server_cipher_cells,
     connect_readonly,
     read_cipher_cells,
 )
 from messagefoundry.store.crypto import _V4_PREFIX, MARKER_PREFIX, Cipher, CipherError, generate_key
 from messagefoundry.store.store import Stage
+from tests.test_store_cipher_sweep_parity import _covered_cells, _parsed
 
 #: Every value the fixture writes, keys included, carries this. A FAIL reason must never contain it:
 #: that would be a plaintext, or a composite key column (a ``state`` or ``reference`` key can be PHI).
@@ -1084,3 +1091,292 @@ def test_chunks_read_every_row_and_hold_no_read_transaction_between_them(
     finally:
         reader.close()
         writer.close()
+
+
+# --- the server stores' inventories and walk (BACKLOG #1719) ----------------------------------
+
+
+@pytest.mark.parametrize(
+    ("backend", "cells"),
+    [("postgres.py", POSTGRES_CIPHER_CELLS), ("sqlserver.py", SQLSERVER_CIPHER_CELLS)],
+    ids=["postgres", "sqlserver"],
+)
+def test_each_server_inventory_names_exactly_its_backends_cipher_cells(
+    backend: str, cells: tuple[CipherCell, ...]
+) -> None:
+    """Each server inventory is pinned to its backend's own ``cell_aad`` calls, read with the
+    instrument the sweep parity guard holds the sweeps to. A ciphered column added to that backend
+    reds this until the inventory names it, and an entry no writer seals reds it too.
+
+    Equality, so the control below can show the pin is not satisfied by any list."""
+    covered = _covered_cells(_parsed(backend))
+    declared = [(c.table, c.column) for c in cells]
+    assert len(declared) == len(set(declared)), f"a cell is declared twice: {sorted(declared)}"
+    assert set(declared) == covered, (
+        f"messagefoundry/store/cipher_cells.py has drifted from {backend}'s cell_aad calls.\n"
+        f"  sealed by {backend}, not declared: {sorted(covered - set(declared))}\n"
+        f"  declared, not sealed by {backend}: {sorted(set(declared) - covered)}"
+    )
+    # Control: the same comparison reds on an inventory one cell short.
+    assert set(declared[1:]) != covered
+
+
+def test_a_server_cell_is_paged_by_a_key_and_never_located_by_a_phi_key() -> None:
+    """A server table has no rowid, so every server cell pages by named columns, and a cell whose
+    key can be PHI is located by its position, as SQLite locates it by rowid, never by the key."""
+    for cell in (*POSTGRES_CIPHER_CELLS, *SQLSERVER_CIPHER_CELLS):
+        assert "rowid" not in cell.order and "rowid" not in cell.locator, cell
+        if cell.table in ("state", "reference", "shared_body", "attachment_chunk"):
+            assert cell.locator == (POSITION,), cell
+
+
+class _SqliteSource:
+    """A :class:`CipherCellSource` over a SQLite store file, so the server walk can be measured on
+    the plain leg against values the REAL store writers sealed (the server writers bind the same
+    AAD; the live server tests prove that). It pages by key as the server sources do, with SQLite
+    row values, and records each chunk's limit."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+        self.limits: dict[str, list[int]] = {}
+
+    async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]:
+        found: dict[str, frozenset[str]] = {}
+        for table in tables:
+            names = frozenset(r[1] for r in self.conn.execute(f"PRAGMA table_info({table})"))
+            if names:
+                found[table] = names
+        return found
+
+    async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
+        row = self.conn.execute(
+            "SELECT surface_table, surface_column FROM keyed_surface ORDER BY 1, 2 LIMIT 1"
+        ).fetchone()
+        return None if row is None else (str(row[0]), str(row[1]))
+
+    async def cipher_walk_surface_sealed(self, table: str, column: str, *, keyed: bool) -> bool:
+        if (
+            keyed
+            and self.conn.execute(
+                "SELECT 1 FROM keyed_surface WHERE surface_table = ? AND surface_column = ?",
+                (table, column),
+            ).fetchone()
+        ):
+            return True
+        return (
+            self.conn.execute(
+                f"SELECT 1 FROM {table} WHERE {column} LIKE ? LIMIT 1", (f"{MARKER_PREFIX}%",)
+            ).fetchone()
+            is not None
+        )
+
+    async def cipher_walk_chunk(
+        self,
+        table: str,
+        column: str,
+        select: Sequence[str],
+        order: Sequence[str],
+        after: Sequence[Any] | None,
+        limit: int,
+        *,
+        sealed_only: bool,
+    ) -> list[tuple[Any, ...]]:
+        self.limits.setdefault(f"{table}.{column}", []).append(limit)
+        where, params = [f"{column} IS NOT NULL"], []
+        if sealed_only:
+            where.append(f"lower(substr({column}, 1, ?)) = ?")
+            params += [len(MARKER_PREFIX), MARKER_PREFIX.lower()]
+        if after is not None:
+            where.append(f"({', '.join(order)}) > ({', '.join('?' for _ in after)})")
+            params += list(after)
+        sql = (
+            f"SELECT {', '.join((*select, column))} FROM {table} WHERE {' AND '.join(where)}"
+            f" ORDER BY {', '.join(order)} LIMIT ?"
+        )
+        return [tuple(r) for r in self.conn.execute(sql, (*params, limit))]
+
+
+def _server_audit(db: Path, cipher: Cipher, **kwargs: Any) -> tuple[CipherAudit, _SqliteSource]:
+    conn = connect_readonly(db, busy_timeout=5.0)
+    try:
+        source = _SqliteSource(conn)
+        audit = asyncio.run(
+            audit_server_cipher_cells(
+                cast(CipherCellSource, source), cipher, cells=POSTGRES_CIPHER_CELLS, **kwargs
+            )
+        )
+    finally:
+        conn.close()
+    return audit, source
+
+
+def _counts(audit: CipherAudit) -> list[tuple[str, int, int, int, int, int]]:
+    return [(t.name, t.opened, t.failed, t.blob, t.unmarked, t.legacy) for t in audit.tallies]
+
+
+@pytest.mark.parametrize("chunk_rows", [1, DEFAULT_CHUNK_ROWS])
+def test_the_server_walk_reads_what_the_sqlite_walk_reads(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], chunk_rows: int
+) -> None:
+    """Paged by key instead of rowid, one row per chunk or many, the server walk opens exactly the
+    values the SQLite walk opens, cell by cell, and every count is the number sealed in that cell."""
+    db, settings = _copy(_template, tmp_path)
+    cipher = build_store_cipher(settings)
+    conn = connect_readonly(db, busy_timeout=5.0)
+    try:
+        sqlite_audit = audit_cipher_cells(conn, cipher)
+    finally:
+        conn.close()
+    server_audit, _source = _server_audit(db, cipher, chunk_rows=chunk_rows)
+    assert server_audit.key_mismatch is None and server_audit.failed == 0
+    assert _counts(server_audit) == _counts(sqlite_audit)
+    assert {t.name: t.opened for t in server_audit.tallies} == _sealed_by_cell(db)
+    assert server_audit.opened > len(COMPOSITE_CIPHER_CELLS)
+
+
+#: The server cells the fixture writes a sealed value into: every composite one, and one id-keyed.
+_SERVER_WRITTEN = [
+    c
+    for c in POSTGRES_CIPHER_CELLS
+    if (c.table, c.column) == ("messages", "raw")
+    or any((c.table, c.column) == (k.table, k.column) for k in COMPOSITE_CIPHER_CELLS)
+]
+
+
+@pytest.mark.parametrize("cell", _SERVER_WRITTEN, ids=lambda c: f"{c.table}.{c.column}")
+def test_the_server_walk_names_each_corrupted_cell_by_a_phi_free_locator(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], cell: CipherCell
+) -> None:
+    """One flipped byte per cell is one failure in that cell, named by table, column and locator:
+    the id for an id-keyed cell, the position for a key that can be PHI. Never a value or a key."""
+    db, settings = _copy(_template, tmp_path)
+    sqlite_cell = next(
+        c for c in SQLITE_CIPHER_CELLS if (c.table, c.column) == (cell.table, cell.column)
+    )
+    where = _flip_one_aead_byte(db, sqlite_cell)
+    audit, _source = _server_audit(db, build_store_cipher(settings))
+    tally = next(t for t in audit.tallies if (t.table, t.column) == (cell.table, cell.column))
+    assert tally.failed == 1 and audit.failed == 1, _counts(audit)
+    first = tally.first_failure or ""
+    if cell.locator == (POSITION,):
+        assert re.match(rf"{cell.table}\.{cell.column} position=\d+ did not decrypt", first), first
+    else:
+        assert first.startswith(f"{cell.table}.{cell.column} {where} did not decrypt"), first
+    assert _SYNTH not in first, f"the failure line leaked a plaintext or a key: {first}"
+
+
+def test_the_server_walk_counts_a_damaged_marker_and_plaintext_as_unmarked(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """A value whose marker is damaged, and a plain value, on a surface the keyed store sealed:
+    both are unmarked, which the store refuses at read. The marker test is the walk's own, so
+    ``MFENC:`` is still sealed, and fails as one rather than passing as plaintext."""
+    db, settings = _copy(_template, tmp_path)
+    conn = sqlite3.connect(db)
+    try:
+        rows = conn.execute(
+            "SELECT rowid, raw, id FROM messages WHERE raw LIKE ? ORDER BY id",
+            (f"{MARKER_PREFIX}%",),
+        ).fetchall()
+        assert len(rows) >= 2, "the fixture holds too few messages for two shapes"
+        (r1, v1, id1), (r2, _v2, _id2) = rows[:2]
+        conn.execute("UPDATE messages SET raw = ? WHERE rowid = ?", ("x" + v1[1:], r1))
+        conn.execute("UPDATE messages SET raw = ? WHERE rowid = ?", ("SYNTH-PLAIN", r2))
+        r3, v3 = conn.execute(
+            "SELECT rowid, body FROM response WHERE body LIKE ? LIMIT 1", (f"{MARKER_PREFIX}%",)
+        ).fetchone()
+        conn.execute("UPDATE response SET body = ? WHERE rowid = ?", (v3[:6].upper() + v3[6:], r3))
+        conn.commit()
+    finally:
+        conn.close()
+    audit, _source = _server_audit(db, build_store_cipher(settings))
+    raw = next(t for t in audit.tallies if t.name == "messages.raw")
+    assert raw.unmarked == 2 and raw.failed == 0, _counts(audit)
+    assert raw.first_unmarked == f"messages.raw id={id1} carries no at-rest marker"
+    body = next(t for t in audit.tallies if t.name == "response.body")
+    assert body.failed == 1 and "is not spelled" in (body.first_failure or ""), _counts(audit)
+
+
+def test_the_server_walk_reads_plaintext_on_a_surface_never_sealed_as_legacy(
+    tmp_path: Path,
+) -> None:
+    """A store written with no key, read with one: nothing is sealed and no keyed open has recorded
+    a surface, so every value is legacy plaintext the next keyed open seals, not a failure."""
+    db = tmp_path / "msg.db"
+    _keyless_store(db)
+    keyed = StoreSettings(path=str(db), encryption_key=generate_key())
+    audit, _source = _server_audit(db, build_store_cipher(keyed))
+    assert audit.failed == 0 and audit.unmarked == 0 and audit.legacy >= 1, _counts(audit)
+
+
+def test_a_keyless_server_walk_of_a_keyed_store_is_a_key_mismatch(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """No key and a store a keyed open recorded: the key mismatch, before any value is read."""
+    db, _settings = _copy(_template, tmp_path)
+    audit, source = _server_audit(db, build_store_cipher(StoreSettings(path=str(db))))
+    assert audit.key_mismatch is not None and "resolved no key" in audit.key_mismatch
+    assert source.limits == {}, "a value was read after the key mismatch was known"
+
+
+def test_a_server_walk_with_no_keyed_record_meets_a_sealed_value_as_keyless(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """No ``keyed_surface`` record, so the walk itself meets a sealed value with no key: that
+    reading decides the key mismatch, and the walk stops on it."""
+    db, _settings = _copy(_template, tmp_path)
+    _plant(db, "DELETE FROM keyed_surface", ())
+    audit, source = _server_audit(db, build_store_cipher(StoreSettings(path=str(db))))
+    assert audit.key_mismatch is not None and "keyless open" in audit.key_mismatch
+    assert sum(len(v) for v in source.limits.values()) == 1, source.limits
+
+
+def test_a_non_text_server_value_fails_as_a_blob(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """Every server cipher column is text; a value that comes back as anything else fails."""
+    db, settings = _copy(_template, tmp_path)
+    rowid, value = _first_sealed(db, "messages", "raw")
+    _set(db, "messages", "raw", rowid, value.encode())
+    audit, _source = _server_audit(db, build_store_cipher(settings))
+    raw = next(t for t in audit.tallies if t.name == "messages.raw")
+    assert raw.blob == 1 and "BLOB" in (raw.first_failure or ""), _counts(audit)
+
+
+def test_the_server_walk_reads_large_rows_in_small_chunks(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """A server driver fetches a whole chunk at once, so ``attachment_chunk``, one 1 MiB slice a
+    row, is read at most its cap at a time whatever ``chunk_rows`` asks; other cells are not."""
+    db, settings = _copy(_template, tmp_path)
+    _audit_result, source = _server_audit(db, build_store_cipher(settings), chunk_rows=500)
+    cap = next(c.chunk_cap for c in POSTGRES_CIPHER_CELLS if c.table == "attachment_chunk")
+    assert cap is not None and cap < 500
+    assert set(source.limits["attachment_chunk.ciphertext"]) == {cap}
+    assert set(source.limits["messages.raw"]) == {500}
+
+
+def test_an_unreachable_key_service_stops_the_server_audit(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """As on SQLite: the first outage is raised, and no later value is sent to the key service."""
+    db, _settings = _copy(_template, tmp_path)
+
+    class _Down:
+        encrypts = True
+        calls = 0
+
+        def is_encrypted(self, stored: str) -> bool:
+            return stored.startswith(MARKER_PREFIX)
+
+        def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+            self.calls += 1
+            try:
+                raise ConnectionRefusedError("synthetic outage")
+            except OSError as exc:
+                raise CipherError("Transit decrypt failed") from exc
+
+    down = _Down()
+    with pytest.raises(CipherError):
+        _server_audit(db, cast(Cipher, down))
+    assert down.calls == 1, "the walk kept asking a key service that was down"

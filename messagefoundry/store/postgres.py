@@ -413,6 +413,16 @@ _PG_EPOCH_NOW = "EXTRACT(EPOCH FROM statement_timestamp())::double precision"
 # which is the memory budget the 500-row passes actually spend; 500 here would be ~650 MiB held in a
 # single transaction while the store is still opening.
 _ATTACHMENT_CHUNK_BATCH = 16
+
+
+def _check_walk_identifiers(*names: str) -> None:
+    """Refuse a cipher-walk identifier that is not a plain ASCII name. The walk's names are declared
+    constants (BACKLOG #1719), so this only stops a caller that passed something else."""
+    for name in names:
+        if not (name.isascii() and name.isidentifier()):
+            raise ValueError(f"not a plain identifier for the cipher walk: {name!r}")
+
+
 # BACKLOG #3383: write a surface's `keyed_surface` marker unless it exists. RETURNING yields a row
 # only when this statement wrote the marker, which is how the seal learns it was the writer.
 _INSERT_KEYED_MARKER = (
@@ -3505,6 +3515,75 @@ class PostgresStore:
             f"SELECT 1 AS x FROM {table} WHERE {column} LIKE $1 LIMIT 1", like
         )
         return row is not None
+
+    # --- the read-only cipher-cell walk (BACKLOG #1719) ----------------------
+    # The source `cipher_cells.read_server_cipher_cells` reads, for `messagefoundry cipher-audit`.
+    # Each call is one SELECT on its own bounded borrow, so no read transaction spans chunks. Every
+    # identifier is a declared constant from `cipher_cells`; only values are parameters.
+
+    async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]:
+        """The columns of each of ``tables`` this store's schema holds; an absent table is left out."""
+        rows = await self._fetchall(
+            "SELECT table_name, column_name FROM information_schema.columns"
+            " WHERE table_schema = current_schema() AND table_name = ANY($1::text[])",
+            list(tables),
+        )
+        found: dict[str, set[str]] = {}
+        for r in rows:
+            found.setdefault(str(r["table_name"]), set()).add(str(r["column_name"]))
+        return {t: frozenset(c) for t, c in found.items()}
+
+    async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
+        """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the table exists."""
+        row = await self._fetchone(
+            "SELECT surface_table, surface_column FROM keyed_surface ORDER BY 1, 2 LIMIT 1"
+        )
+        return None if row is None else (str(row[0]), str(row[1]))
+
+    async def cipher_walk_surface_sealed(self, table: str, column: str, *, keyed: bool) -> bool:
+        """Whether the store has sealed ``table.column``, by the rule its at-open sweep applies
+        (BACKLOG #3383); ``keyed`` says the ``keyed_surface`` table exists to be asked."""
+        _check_walk_identifiers(table, column)
+        if keyed and await self._surface_keyed(table, column):
+            return True
+        return await self._surface_holds_ciphertext(table, column, f"{_ENC_MARKER_PREFIX}%")
+
+    async def cipher_walk_chunk(
+        self,
+        table: str,
+        column: str,
+        select: Sequence[str],
+        order: Sequence[str],
+        after: Sequence[Any] | None,
+        limit: int,
+        *,
+        sealed_only: bool,
+    ) -> list[tuple[Any, ...]]:
+        """Up to ``limit`` rows of ``table`` whose ``column`` is not NULL, after the ``order`` key
+        ``after`` (``None`` for the first chunk), in ``order``. Each row is the ``select`` values,
+        then ``column``'s. ``sealed_only`` keeps a value only when it starts with the marker in any
+        ASCII case, as ``cipher_cells._sealed_test`` reads one."""
+        _check_walk_identifiers(table, column, *select, *order)
+        params: list[Any] = []
+
+        def bind(value: Any) -> str:
+            params.append(value)
+            return f"${len(params)}"
+
+        where = [f'"{column}" IS NOT NULL']
+        if sealed_only:
+            prefix = _ENC_MARKER_PREFIX.lower()
+            where.append(f'lower(left("{column}", {bind(len(prefix))})) = {bind(prefix)}')
+        if after is not None:
+            keys = ", ".join(f'"{c}"' for c in order)
+            where.append(f"({keys}) > ({', '.join(bind(v) for v in after)})")
+        picked = ", ".join(f'"{c}"' for c in (*select, column))
+        ordered = ", ".join(f'"{c}"' for c in order)
+        sql = (
+            f'SELECT {picked} FROM "{table}" WHERE {" AND ".join(where)}'
+            f" ORDER BY {ordered} LIMIT {bind(int(limit))}"
+        )
+        return [tuple(r) for r in await self._fetchall(sql, *params)]
 
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
 
