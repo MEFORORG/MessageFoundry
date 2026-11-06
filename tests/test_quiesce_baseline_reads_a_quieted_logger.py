@@ -18,6 +18,7 @@ carries the same reading and is not pinned here."""
 
 from __future__ import annotations
 
+import ast
 import logging
 from collections.abc import Iterator
 from pathlib import Path
@@ -61,23 +62,54 @@ def logger() -> Iterator[logging.Logger]:
 _ConsoleSentinel = type(_SENTINEL, (logging.NullHandler,), {})
 
 
-def test_both_trees_name_their_sentinel_alike(engine_conftest: ModuleType) -> None:
+def _console_top_level() -> dict[str, ast.stmt]:
+    """The web console conftest's top-level classes and assignments, by name. Parsed, not grepped,
+    so a name in a comment or docstring does not count."""
+    tree = ast.parse(_CONSOLE_CONFTEST.read_text(encoding="utf-8"))
+    found: dict[str, ast.stmt] = {}
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            found[node.name] = node
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            found.update({t.id: node for t in targets if isinstance(t, ast.Name)})
+    return found
+
+
+def test_both_trees_mark_a_quieted_logger_alike(engine_conftest: ModuleType) -> None:
+    """The two markers each tree's ``_Baseline`` reads off the other's quiet: the sentinel's class
+    NAME and the sentinel level."""
+    console = _console_top_level()
     assert engine_conftest._QuiesceNullHandler.__name__ == _SENTINEL
-    assert f"class {_SENTINEL}(" in _CONSOLE_CONFTEST.read_text(encoding="utf-8")
+    assert isinstance(console.get(_SENTINEL), ast.ClassDef), sorted(console)
+    level = console.get("_ABOVE_CRITICAL")
+    assert isinstance(level, ast.Assign), sorted(console)
+    assert ast.unparse(level.value) == "logging.CRITICAL + 10"
+    assert engine_conftest._ABOVE_CRITICAL == logging.CRITICAL + 10
 
 
-@pytest.mark.parametrize("left", ["level", "handler", "both"])
-def test_a_logger_the_other_tree_quieted_is_read_as_natural(
+@pytest.mark.parametrize("left", ["level", "both"])
+def test_a_logger_quieted_to_the_sentinel_level_is_read_as_natural(
     engine_conftest: ModuleType, logger: logging.Logger, left: str
 ) -> None:
     logger.propagate = False
-    # The handler-only arm starts from a non-default level, so the level assertion can fail there.
-    logger.setLevel(logging.CRITICAL + 10 if left in ("level", "both") else logging.INFO)
-    if left in ("handler", "both"):
+    logger.setLevel(engine_conftest._ABOVE_CRITICAL)
+    if left == "both":
         logger.addHandler(_ConsoleSentinel())
     baseline = engine_conftest._Baseline(logger)
     assert baseline.level == logging.NOTSET
     assert baseline.propagate is True
+
+
+def test_a_logger_left_only_the_other_trees_sentinel_handler_propagates_again(
+    engine_conftest: ModuleType, logger: logging.Logger
+) -> None:
+    """The handler alone marks the quiet too. Only ``propagate`` is asserted: the level starts at
+    NOTSET, and what a non-default level beside a sentinel should read as is the conftest's open
+    guess, not a contract."""
+    logger.propagate = False
+    logger.addHandler(_ConsoleSentinel())
+    assert engine_conftest._Baseline(logger).propagate is True
 
 
 def test_a_logger_nobody_quieted_keeps_its_own_state(

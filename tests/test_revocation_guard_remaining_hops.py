@@ -203,11 +203,11 @@ def _spy_guard_contexts(monkeypatch: pytest.MonkeyPatch) -> list[ssl.SSLContext 
 
     The real call still runs, so every refusal and log line is unchanged."""
     seen: list[ssl.SSLContext | None] = []
-    real = RevocationHopGuard.capture
+    real = RevocationHopGuard.__dict__["capture"].__func__  # unbound, so cls is forwarded
 
     def spy(cls: type[RevocationHopGuard], /, **kwargs: Any) -> RevocationHopGuard:
         seen.append(kwargs.get("context"))
-        return real(**kwargs)
+        return real(cls, **kwargs)
 
     monkeypatch.setattr(RevocationHopGuard, "capture", classmethod(spy))
     return seen
@@ -739,8 +739,8 @@ def test_the_context_the_dicom_guard_is_handed_verifies_the_peer(
     """The DICOM guard is taken on any TLS context, with no verify-off check of its own as the FTPS
     guard has, because this connector has no setting that turns verification off. That rested on a
     comment (BACKLOG #2987, Part B item 3). This pins it on the system-roots anchor, with and
-    without a CRL and ``tls_allow_expired``; a ``tls_ca_file`` pin, an internal CA and mTLS are not
-    covered here. It matters most on the CRL arm: ``context_checks_revocation`` reads only the
+    without a CRL and ``tls_allow_expired``; at least a ``tls_ca_file`` pin, an internal CA and
+    mTLS are not covered here. It matters most on the CRL arm: ``context_checks_revocation`` reads only the
     context's flags, so a context that verified nothing but carried a CRL flag would still earn
     the CRL's credit."""
     policy = _crl_policy(bare_crl) if crl else None
@@ -753,6 +753,24 @@ def test_the_context_the_dicom_guard_is_handed_verifies_the_peer(
     assert ctx.check_hostname is True
     assert skips_validity_period(ctx) is allow_expired
     assert context_checks_revocation(ctx) is crl
+
+
+def test_a_dicom_association_ignores_the_verify_off_keys_other_connectors_read() -> None:
+    """The premise the test above leans on: the keys that turn verification down on EMAIL, DIRECT
+    and FTPS are not read here, so naming them leaves the association verifying the peer."""
+    settings: dict[str, object] = {
+        "ae_title": "MF_SCU",
+        "host": REMOTE,
+        "port": 11112,
+        "tls": True,
+        "tls_verify": False,
+        "tls_check_hostname": False,
+    }
+    with active_hop_posture(NOT_ENFORCING):
+        dest = DicomScuDestination(_dest("OB_PACS", ConnectorType.DIMSE, settings))
+    assert dest._ssl is not None
+    assert dest._ssl.verify_mode is ssl.CERT_REQUIRED
+    assert dest._ssl.check_hostname is True
 
 
 # --- FTPS upload, the destination (transports/remotefile.py) ---------------------------------------
