@@ -2930,9 +2930,9 @@ async def test_a_row_wait_with_no_grace_left_does_not_wait() -> None:
 
 
 def test_the_undrained_row_wait_fits_inside_the_engine_stop_reserve() -> None:
-    """Nothing hands engine.stop() a remaining time, so the cap alone bounds a cancelled convergence
-    reload's row wait there, and it must leave most of the reserve to the rest of the stop
-    (BACKLOG #3191)."""
+    """The cap bounds a cancelled convergence reload's row wait inside engine.stop(), and must leave
+    most of the reserve to the rest of the stop (BACKLOG #3191). It is not the runner step's share:
+    engine.stop() can cut that step sooner, as ``_ROW_CANCEL_WAIT_SECONDS`` says."""
     from messagefoundry.api import app as app_module
 
     assert app_module._ROW_CANCEL_WAIT_SECONDS <= app_module._ENGINE_STOP_RESERVE_SECONDS / 3

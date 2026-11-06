@@ -289,9 +289,10 @@ def test_the_shutdown_budget_fits_the_nssm_stop_window() -> None:
     steps take at most the larger of its budget and their floors, plus a cut grace for every bounded
     step, since each can be cut (vault BACKLOG #3740 item 15). engine.stop() is one of those steps,
     never cut and handed a bound no shorter than its reserve, so it adds nothing past that bound
-    once the reserve covers its own floors and cut graces (BACKLOG #3191 item 3). The one wait not
-    counted is the store's close past its floor, which is never cut; the 1 s left over is for it and
-    for the interpreter to exit."""
+    once the reserve covers its own floors and cut graces (BACKLOG #3191 item 3). Not counted, at
+    least: what a step that is never cut takes past its floor (the store-reading reap, the store's
+    close), and what the interpreter waits for as it exits (a cut step still unwinding, a worker
+    thread). The 1 s left over is all the room they have."""
     script = (_REPO / "scripts" / "service" / "install-service.ps1").read_text(encoding="utf-8")
     match = re.search(r"AppStopMethodConsole\s+(\d+)", script)
     assert match is not None, "the install script no longer sets AppStopMethodConsole"
@@ -871,16 +872,37 @@ async def test_a_hung_graph_stop_is_cut_and_the_later_steps_still_run(
     async def _drain(timeout: float) -> None:
         calls.append("config drain")
 
-    engine._registry_runner = SimpleNamespace(stop=_hung_stop)  # type: ignore[assignment]
+    # A cut graph stop leaves its sources registered, as the real runner's does.
+    engine._registry_runner = SimpleNamespace(  # type: ignore[assignment]
+        stop=_hung_stop, has_residual_state=True
+    )
     engine.drain_config_writes = _drain  # type: ignore[method-assign]
+    engine.on_graph_stopped = lambda: calls.append("graph-stopped clear")
     budget = app_module._ENGINE_STOP_RESERVE_SECONDS
-    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.teardown"):
+    with caplog.at_level(logging.ERROR):
         began = time.monotonic()
         await asyncio.wait_for(engine.stop(budget_seconds=budget), _WAIT_S)
         elapsed = time.monotonic() - began
+    # No clear says a graph that may still be serving has gone.
     assert calls == ["graph stop", "config drain", "close"]
     assert elapsed < budget, f"engine.stop() took {elapsed:.2f}s"
-    assert any("the graph's stop did not finish within" in r.getMessage() for r in caplog.records)
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("the graph's stop did not finish within" in m for m in messages), messages
+    assert any("the graph did not stop" in m for m in messages), messages
+
+
+async def test_a_graph_that_stopped_gets_its_graph_stopped_clear_under_a_budget(
+    tmp_path: Path,
+) -> None:
+    """The control for the test above: with the graph stopped, the clear is raised."""
+    engine = await _bare_engine(tmp_path / "stopped-graph.db")
+    calls: list[str] = []
+    _record_close(engine, calls)
+    engine.on_graph_stopped = lambda: calls.append("graph-stopped clear")
+    await asyncio.wait_for(
+        engine.stop(budget_seconds=app_module._ENGINE_STOP_RESERVE_SECONDS), _WAIT_S
+    )
+    assert calls == ["graph-stopped clear", "close"]
 
 
 async def test_engine_stop_with_no_budget_raises_the_first_failure_as_before(
@@ -892,11 +914,16 @@ async def test_engine_stop_with_no_budget_raises_the_first_failure_as_before(
         raise RuntimeError("PROBE: deliberate graph stop failure")
 
     real_runner = engine._registry_runner
-    engine._registry_runner = SimpleNamespace(stop=_boom)  # type: ignore[assignment]
-    with pytest.raises(RuntimeError, match="PROBE"):
+    engine._registry_runner = SimpleNamespace(  # type: ignore[assignment]
+        stop=_boom, has_residual_state=True
+    )
+    try:
+        with pytest.raises(RuntimeError, match="PROBE"):
+            await engine.stop()
+    finally:
+        # Closes the store whatever the assertion did, so its worker thread cannot wedge the run.
+        engine._registry_runner = real_runner
         await engine.stop()
-    engine._registry_runner = real_runner
-    await engine.stop()
 
 
 # --- the embedded lifespan (create_app(engine=...)) ---------------------------------------------

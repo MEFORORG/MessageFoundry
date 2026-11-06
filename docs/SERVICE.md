@@ -313,12 +313,16 @@ restart commands send the same request, so there is no reason to use them.
 after that NSSM escalates. uvicorn first drains open connections for a fixed bound, then the
 shutdown runs under one fixed budget, `engine.stop()` included: it is handed what that budget has
 left, and holds each of its own waits to a share of it. A step that overruns its share is cut,
-logged at ERROR, and the next step runs, so a hung step costs that step's work and no other. A
-message a cut step left claimed is recovered at the next start, as after a crash. The one wait never
-cut is the store's close. The figures are constants in `messagefoundry/__main__.py`
-(`_UVICORN_DRAIN_SECONDS`) and `messagefoundry/api/app.py` (`_SHUTDOWN_BUDGET_SECONDS`,
-`_ENGINE_STOP_RESERVE_SECONDS`), and `tests/test_lifespan_teardown.py` sums their worst case
-against the installer's value.
+logged at ERROR, and the next step runs. A cut step can keep running beside the later steps, and
+a graph stop that was cut leaves its listeners and workers to end with the process. A message a cut
+step left claimed is recovered at the next start, as after a crash. At least two steps are never
+cut: the reap of the lifespan's store-reading tasks, and the store's close. The figures are
+constants in `messagefoundry/__main__.py` (`_UVICORN_DRAIN_SECONDS`),
+`messagefoundry/api/app.py` (`_SHUTDOWN_BUDGET_SECONDS`, `_ENGINE_STOP_RESERVE_SECONDS`) and
+`messagefoundry/pipeline/teardown.py` (`CUT_GRACE_SECONDS`), with each step's floor beside it.
+`tests/test_lifespan_teardown.py` sums their worst case against the installer's value. What a
+step that is never cut takes past its floor, and work the interpreter joins as it exits, are not
+in that sum.
 
 The service's own `nssm.exe` is in `C:\Program Files\MessageFoundry\nssm` (the installer's
 `-NssmDir`). The installer checked that copy's hash, and keeps it where only administrators can

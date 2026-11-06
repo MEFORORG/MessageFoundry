@@ -142,16 +142,19 @@ class RemoteDebugRefusalWatch:
         self._stop.clear()
         self._task = asyncio.create_task(self._run())
 
-    async def stop(self) -> None:
-        """Signal the loop, let it make its last pass, and await its exit (idempotent)."""
+    async def stop(self, timeout: float | None = None) -> None:
+        """Signal the loop, let it make its last pass, and await its exit (idempotent). Each of its
+        two waits is ``_STOP_SECONDS``, or ``timeout`` where that is shorter, as engine.stop()
+        passes under its budget (BACKLOG #3191)."""
         self._stop.set()
         task, self._task = self._task, None
         if task is None:
             return
+        wait = _STOP_SECONDS if timeout is None else min(timeout, _STOP_SECONDS)
         # ``wait``, not ``wait_for``: a loop task that something else cancelled must not make
         # this call look cancelled, which would end the engine's stop before it closed the store.
         try:
-            done, _pending = await asyncio.wait({task}, timeout=_STOP_SECONDS)
+            done, _pending = await asyncio.wait({task}, timeout=wait)
         except asyncio.CancelledError:
             task.cancel()
             raise
@@ -159,11 +162,11 @@ class RemoteDebugRefusalWatch:
             task.cancel()
             # Bounded too: a driver call can take as long to unwind a cancel as it took to hang,
             # and the engine's stop must still reach the store's close.
-            await asyncio.wait({task}, timeout=_STOP_SECONDS)
+            await asyncio.wait({task}, timeout=wait)
             log.warning(
-                "remote-debug refusal watch: the last pass did not finish in %.0f s and was "
+                "remote-debug refusal watch: the last pass did not finish in %.2f s and was "
                 "cancelled, so a refusal since the pass before it may have no audit row",
-                _STOP_SECONDS,
+                wait,
             )
 
     async def _run(self) -> None:

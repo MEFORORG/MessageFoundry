@@ -1224,8 +1224,9 @@ class CrlReloadRunner:
         self._stop.clear()
         self._task = asyncio.create_task(self._run())
 
-    async def stop(self) -> None:
-        """Signal the loop and await its exit, for at most ``stop_timeout_seconds`` (idempotent).
+    async def stop(self, timeout: float | None = None) -> None:
+        """Signal the loop and await its exit, for at most ``stop_timeout_seconds`` (idempotent), or
+        ``timeout`` where that is shorter, as engine.stop() passes under its budget (BACKLOG #3191).
 
         A pass in flight gets that long to finish, so it does not go on loading CRLs after the engine
         stopped. A pass that takes longer, such as a read hung on a network share, is abandoned: the
@@ -1239,16 +1240,17 @@ class CrlReloadRunner:
         self._stop.set()
         task = self._task
         self._task = None
+        wait = self._stop_timeout if timeout is None else min(timeout, self._stop_timeout)
         if task is not None:
             try:
-                done, _ = await asyncio.wait({task}, timeout=self._stop_timeout)
+                done, _ = await asyncio.wait({task}, timeout=wait)
             except asyncio.CancelledError:
                 task.cancel()
                 raise
             if not done:
                 log.warning(
                     "crl_reload: a reload pass did not finish within %gs of stop; abandoning it",
-                    self._stop_timeout,
+                    wait,
                 )
                 task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

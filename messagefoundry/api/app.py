@@ -1306,7 +1306,7 @@ _SHUTDOWN_BUDGET_SECONDS: Final = 10.0
 #: from here: it ends in store.close(), and a store left open keeps a non-daemon worker thread alive,
 #: which is the hang BACKLOG #2087 fixed. It must cover engine.stop()'s own floors and cut graces,
 #: which tests/test_lifespan_teardown.py checks against the real steps.
-_ENGINE_STOP_RESERVE_SECONDS: Final = 3.5
+_ENGINE_STOP_RESERVE_SECONDS: Final = 3.0
 #: The part of the long-operations drain's share it spends waiting before it cancels, the rest being
 #: the grace for the rollback arms. A policy, not derived from the drain's defaults (vault BACKLOG
 #: #3740 item 17): their ratio, 0.5 s to 6 s, would leave the wait about 0.2 s under the shipped
@@ -1478,7 +1478,8 @@ def _managed_teardown_steps(
     # BACKLOG #2623: a connection flag write whose caller was cancelled still commits its row.
     # Drained here, under the budget, rather than by the 5 s wait engine.stop() runs when no drain
     # ran first. Draining closes the engine's gate, and engine.stop() then gives a write still
-    # running only a 1 s late wait, inside its reserve. Handed _INNER_SHARE of its bound, so its
+    # running at most a 1 s late wait, shorter where its share of the reserve is (BACKLOG #3191).
+    # Handed _INNER_SHARE of its bound, so its
     # wait ends before the step is cut; the wait never cancels a write. A small floor, since the
     # gate closes at once and most shutdowns have no write running. The embedded lifespan
     # (create_app(engine=...)) has no such step, so its caller's engine.stop() runs the 5 s wait,
@@ -2226,10 +2227,11 @@ async def _reload_and_record(
 #: (:func:`_write_through_cancel`). A store write may have no bound of its own, so a hung write must
 #: not hold the shutdown. A drain's cancel waits for what its grace has left instead
 #: (:func:`_row_cancel_wait`). This is the bound for the rest, at least the convergence reload
-#: engine.stop() cancels and awaits as one of its runner stops. Under the managed lifespan
-#: engine.stop() cuts that step at its share of its budget (BACKLOG #3191), so this cap keeps the
-#: wait well inside _ENGINE_STOP_RESERVE_SECONDS and the cut a backstop.
-#: tests/test_dual_control_reload.py pins it there.
+#: engine.stop() cancels and awaits as one of its runner stops. This cap keeps that wait well inside
+#: _ENGINE_STOP_RESERVE_SECONDS, and tests/test_dual_control_reload.py pins it there. It is not
+#: always inside that step's share: under the managed lifespan engine.stop() cuts the step at its
+#: share of its budget (BACKLOG #3191), which a shutdown that spent its slack before engine.stop()
+#: leaves below this cap, and then the row is lost to the store's close.
 _ROW_CANCEL_WAIT_SECONDS: Final = 1.0
 #: The part of a drain's remaining grace a row wait leaves for the reload's task to unwind, so the
 #: drain sees the task end rather than timing out beside it.

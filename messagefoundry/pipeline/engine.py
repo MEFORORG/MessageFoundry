@@ -163,7 +163,8 @@ _CONFIG_WRITE_DRAIN_SECONDS = 5.0
 
 #: How long stop waits for a config write the lifespan's drain left running. Within the share of
 #: the shutdown budget the API reserves for stop (``_ENGINE_STOP_RESERVE_SECONDS`` in
-#: ``api/app.py``), and spent only while such a write is still running.
+#: ``api/app.py``), and spent only while such a write is still running. Under a budget it is the
+#: shorter of this and a share of its step's bound (BACKLOG #3191).
 _CONFIG_WRITE_LATE_DRAIN_SECONDS = 1.0
 
 #: How long stop waits for the graph supervisor to exit on its own, an in-flight reconcile included,
@@ -3826,13 +3827,13 @@ class Engine:
         The floors and the cut graces must fit ``_ENGINE_STOP_RESERVE_SECONDS`` in ``api/app.py``,
         which tests/test_lifespan_teardown.py checks against this list."""
         return [
-            TeardownStep("the graph supervisor's exit", 0.25, self._stop_graph_supervisor),
-            TeardownStep("the background runners' stops", 0.25, self._stop_background_runners),
-            TeardownStep("the graph's stop", 0.75, self._stop_registry_runner),
-            TeardownStep("the after-graph stops", 0.25, self._stop_after_graph),
-            TeardownStep("the cluster coordinator's stop", 0.25, self._stop_coordinator),
+            TeardownStep("the graph supervisor's exit", 0.2, self._stop_graph_supervisor),
+            TeardownStep("the background runners' stops", 0.2, self._stop_background_runners),
+            TeardownStep("the graph's stop", 0.6, self._stop_registry_runner),
+            TeardownStep("the after-graph stops", 0.2, self._stop_after_graph),
+            TeardownStep("the cluster coordinator's stop", 0.2, self._stop_coordinator),
             TeardownStep("the late config-write drain", 0.1, self._drain_config_writes_at_stop),
-            TeardownStep("the alert-state drain", 0.25, self._drain_alert_state_at_stop),
+            TeardownStep("the alert-state drain", 0.2, self._drain_alert_state_at_stop),
             TeardownStep("the store's close", 0.5, self._close_store_at_stop, bounded=False),
         ]
 
@@ -3863,10 +3864,12 @@ class Engine:
             # wait_for already cancelled the task on timeout; absorb its cancellation.
             await asyncio.gather(supervisor, return_exceptions=True)
 
-    async def _stop_background_runners(self, _bound: float) -> None:
+    async def _stop_background_runners(self, bound: float) -> None:
         # Concurrent, so one runner slow to stop, as a CRL pass hung on a share is, holds none of the
         # others (BACKLOG #3191). Each stops its own loop and nothing else, and every one of them
-        # stops before the coordinator, as the leader sweep and both convergence loops need.
+        # stops before the coordinator, as the leader sweep and both convergence loops need. The CRL
+        # runner, the one with a long wait of its own, is handed a share of the bound for it, so it
+        # still resolves its open alerts before the step is cut.
         runners = [
             runner
             for runner in (
@@ -3884,12 +3887,24 @@ class Engine:
             )
             if runner is not None
         ]
-        self._crl_reload_runner = None
-        self._log_forward_watch = None
-        self._state_convergence = None
+        crl = self._crl_reload_runner
         results = await asyncio.gather(
-            *(runner.stop() for runner in runners), return_exceptions=True
+            *(
+                crl.stop(timeout=bound * INNER_SHARE)
+                if runner is crl and crl is not None
+                else runner.stop()
+                for runner in runners
+            ),
+            return_exceptions=True,
         )
+        stopped = [r for r, result in zip(runners, results, strict=True) if result is None]
+        # Forgotten only once stopped, so a stop() run again after a failure retries them, as before.
+        if crl is not None and crl in stopped:
+            self._crl_reload_runner = None
+        if self._log_forward_watch is not None and self._log_forward_watch in stopped:
+            self._log_forward_watch = None
+        if self._state_convergence is not None and self._state_convergence in stopped:
+            self._state_convergence = None
         failures = [result for result in results if isinstance(result, BaseException)]
         for failure in failures[1:]:
             log.warning("engine stop: another runner's stop also failed: %s", safe_exc(failure))
@@ -3900,24 +3915,37 @@ class Engine:
         if self._registry_runner is not None:
             await self._registry_runner.stop()
 
-    async def _stop_after_graph(self, _bound: float) -> None:
-        # After the graph, so the listeners are already closed when the monitor opens the gate on its
-        # way out; stopping it first would let a paused listener read again during shutdown.
-        if self._intake_monitor is not None:
-            await self._intake_monitor.stop()
-            self._intake_monitor = None
-        # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that is
-        # still serving has gone, and ahead of the alert-state drain, which gives its write a chance.
-        if self.on_graph_stopped is not None:
-            try:
-                self.on_graph_stopped()
-            except Exception as exc:  # noqa: BLE001 - a stop must go on to close the store
-                log.warning("a graph-stopped callback failed: %s", type(exc).__name__)
+    async def _stop_after_graph(self, bound: float) -> None:
+        # A graph's stop that was cut, or that failed, can leave listeners and workers live. Then
+        # neither the gate is opened nor the graph reported gone, since both would be false; the
+        # monitor's loop, left running, ends with the process (BACKLOG #3191).
+        runner = self._registry_runner
+        if runner is not None and runner.has_residual_state:
+            log.error(
+                "engine stop: the graph did not stop, so the intake gate stays as it is and no "
+                "graph-stopped clear is raised; its claimed rows recover at the next start"
+            )
+        else:
+            # After the graph, so the listeners are already closed when the monitor opens the gate
+            # on its way out; stopping it first would let a paused listener read again during
+            # shutdown.
+            if self._intake_monitor is not None:
+                await self._intake_monitor.stop()
+                self._intake_monitor = None
+            # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that
+            # is still serving has gone, and ahead of the alert-state drain, which gives its write a
+            # chance.
+            if self.on_graph_stopped is not None:
+                try:
+                    self.on_graph_stopped()
+                except Exception as exc:  # noqa: BLE001 - a stop must go on to close the store
+                    log.warning("a graph-stopped callback failed: %s", type(exc).__name__)
         # Vault BACKLOG #2742: after the graph, so a script refused during the drain is still
         # reported by the watch's last pass. That pass may write an audit row and raise an alert,
-        # so it runs while the store is open, and ahead of the alert-state drain at the end.
+        # so it runs while the store is open, and ahead of the alert-state drain at the end. Its two
+        # waits share part of the bound, so it logs the pass it cut before this step is cut.
         if self._remote_debug_watch is not None:
-            await self._remote_debug_watch.stop()
+            await self._remote_debug_watch.stop(timeout=bound * INNER_SHARE / 2)
             self._remote_debug_watch = None
         # Settle the GCM invocation bound only AFTER the message graph has quiesced. stop() spends the
         # unused remainder of this process's reserved block and unhooks the refill signal, so anything
@@ -3938,13 +3966,15 @@ class Engine:
         # step-down cannot fire a wake into a supervisor that is already gone.
         if isinstance(self._coordinator, _SupportsDemoteHook):
             self._coordinator.set_on_demote(None)
-        await self._coordinator.stop()
         # Cancel the background pool warm-up if still running (best-effort; the store is about to close).
         # It releases any connections it holds in its own finally, but at shutdown the pool closes anyway.
+        # First, so a coordinator stop cut at its share cannot skip it and leave the warm-up holding
+        # connections the store's close then waits for (BACKLOG #3191).
         if self._warm_pool_task is not None:
             self._warm_pool_task.cancel()
             await asyncio.gather(self._warm_pool_task, return_exceptions=True)
             self._warm_pool_task = None
+        await self._coordinator.stop()
 
     async def _drain_config_writes_at_stop(self, bound: float) -> None:
         # A config write whose caller was cancelled is still running, and its row needs the store
