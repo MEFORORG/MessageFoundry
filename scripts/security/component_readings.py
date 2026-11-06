@@ -663,7 +663,9 @@ def _cell(value: object) -> bool:
     A ``|`` would end the cell early and a line break would end the row, so either one would
     shift every later cell of that row into the wrong column.
     """
-    return _said(value) and not any(mark in str(value) for mark in "|\r\n")
+    text = str(value)
+    # ``splitlines`` is how the page guards read a row back, so it names every line break.
+    return _said(value) and "|" not in text and text.splitlines() == [text]
 
 
 def _said_list(value: object) -> bool:
@@ -880,7 +882,9 @@ def survey_problems(
             # The source and data answers are what the search found, so none is made before it.
             if run is not None and forms_day < run:
                 problems.append(f"{name}: the source and data answers are dated before the search")
-            forms_days.append(forms_day)
+            # A wheel nobody fetched was never searched, so its day says nothing of the search.
+            if wheels_named:
+                forms_days.append(forms_day)
         problems += [f"{name}: {problem}" for problem in _own_line_problems(wheel, wheels_named)]
         problems += [f"{name}: {problem}" for problem in _hit_problems(wheel, words, wheels_named)]
         route = wheel.get("route")
@@ -925,10 +929,15 @@ def _projects_named(projects: object) -> bool:
 def _display_holds(project: Mapping[str, Any]) -> bool:
     """Whether a project's ``display`` is text for one cell that holds its name and its version."""
     display = project["display"]
+    version = str(project["version"])
+    # The page prints no version for one "as locked", so a display need not hold those words.
+    # A version is found whole: "1.0" is not in "11.0.2", and "1.2.1" is not in "1.2.13".
+    whole = rf"(?<![\w.]){re.escape(version)}(?![\w]|\.\w)"
     return (
         isinstance(display, str)
         and _cell(display)
-        and all(str(project[key]) in display for key in ("name", "version"))
+        and str(project["name"]) in display
+        and (version == "as locked" or re.search(whole, display) is not None)
     )
 
 

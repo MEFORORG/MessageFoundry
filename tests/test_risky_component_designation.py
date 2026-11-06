@@ -1815,9 +1815,12 @@ def test_the_survey_checks_can_fail() -> None:
             found,
         )
     # Source and data answers dated before the compiled one, both after the search ran.
-    early = one({"surveyed": "2026-10-07", "forms_surveyed": "2026-10-06"})
+    run = dt.date.fromisoformat(survey["search"]["run"])
+    early = one(
+        {"surveyed": str(run + dt.timedelta(2)), "forms_surveyed": str(run + dt.timedelta(1))}
+    )
     assert early == [f"{name}: the source and data answers are dated before the first"], early
-    assert one({"surveyed": "2026-10-05", "forms_surveyed": "2026-10-05"}) == []
+    assert one({"surveyed": str(run), "forms_surveyed": str(run)}) == []
     # A malformed entry is reported, and neither the check nor the renderer raises on it.
     # The first is on a wheel whose compiled answer is "yes", so its entry is read and rendered.
     carrier = next(w for w in wheels if w["carries"] == "yes")
@@ -2140,7 +2143,8 @@ def test_the_survey_cell_line_and_search_day_checks_can_fail() -> None:
     on that day.
 
     THE POSITIVE CONTROL FOR ENGINE PR 2390 NOTES 1, 2, 3 AND 5 (vault BACKLOG #3030). Each case
-    changes one field of the tracked record, which passes as tracked.
+    changes one wheel, or the search, of the tracked record, which passes as tracked. A case may
+    set two fields that must agree, such as a hit and its adapted module.
     """
     page = _DOC.read_text(encoding="utf-8")
     data, survey = _snapshot(), _survey()
@@ -2170,12 +2174,18 @@ def test_the_survey_cell_line_and_search_day_checks_can_fail() -> None:
     yes = {"carries": "yes", "evidence": "a file list"}
     shown = {"name": "a table", "version": "1.0", "display": "a table, version 1.0"}
     assert problems(plain, {"data": {**yes, "projects": [shown]}}) == []
+    locked = {"name": "a table", "version": "as locked", "display": "a table, from the lock"}
+    assert problems(plain, {"data": {**yes, "projects": [locked]}}) == []
     for project in (
         {**shown, "name": "a | table", "display": "a | table, version 1.0"},
         {**shown, "version": "1.0\n2.0", "display": "a table, version 1.0\n2.0"},
         {**shown, "display": "a table, version 1.0 | 2.0"},
         {**shown, "display": "a table, the first edition"},
         {**shown, "display": "the first edition, version 1.0"},
+        {**shown, "display": "a table, version 11.0.2"},
+        {**shown, "display": "a table, version 1.0.3"},
+        {"name": "a | table", "version": "1.0"},
+        {"name": "a table", "version": "1.0 2.0"},
     ):
         red(plain, {"data": {**yes, "projects": [project]}}, "the data answer 'yes'")
     # Note 1: an adapted module's file and project, a route's reason and a read route's fields.
@@ -2216,6 +2226,18 @@ def test_the_survey_cell_line_and_search_day_checks_can_fail() -> None:
     )
     earlier = {**survey, "search": {**stated, "run": str(run - dt.timedelta(days=1))}}
     found = component_readings.survey_problems(earlier, data, labels)
+    assert any(line.startswith("the survey's search ran on") for line in found), found
+    # A wheel nobody fetched was never searched, so its day cannot stand for the search's.
+    unfetched = [w for w in wheels if not component_readings._wheel_files(w)]
+    assert unfetched, f"no wheel in {_SURVEY.name} was left unfetched"
+    moved = str(run + dt.timedelta(days=30))
+    redated = [
+        {**w, "forms_surveyed": str(run)}
+        if w in unfetched
+        else {**w, "surveyed": moved, "forms_surveyed": moved}
+        for w in wheels
+    ]
+    found = component_readings.survey_problems({**survey, "wheels": redated}, data, labels)
     assert any(line.startswith("the survey's search ran on") for line in found), found
 
 
