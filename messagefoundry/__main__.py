@@ -11016,6 +11016,15 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         _emit_error(detail or "could not load the service settings", as_json=as_json)
         return 2
     store = settings.store
+    if args.db is not None and store.backend != StoreBackend.SQLITE:
+        # --db names a SQLite file. Under a server backend it would be ignored, and the audit would
+        # read the server store the operator did not name.
+        _emit_error(
+            f"--db names a SQLite store, but [store].backend is {store.backend.value!r}; "
+            "drop --db, or use a service config whose backend is sqlite",
+            as_json=as_json,
+        )
+        return 2
     chunk_rows = DEFAULT_CHUNK_ROWS if args.chunk_rows is None else args.chunk_rows
     if chunk_rows < 1 or args.busy_timeout < 0:
         _emit_error(

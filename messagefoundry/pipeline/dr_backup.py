@@ -3446,9 +3446,9 @@ def _verify_in_staging(
         )
     decrypted_cells = 0
     if full:
-        # The heavier end-to-end restore: open the snapshot through the real open_store path
-        # (cipher + migrations) to prove it restores, decrypt + authenticate its PHI, then
-        # discard it.
+        # The heavier end-to-end restore: decrypt + authenticate its PHI as archived, open the
+        # snapshot through the real open_store path (cipher + migrations) to prove it restores,
+        # then discard it.
         full_status, full_msg, decrypted_cells = _full_open_check(
             snap,
             _as_store_settings(store_settings),
@@ -3685,17 +3685,17 @@ def _full_open_check(
     # it was archived, and the verdict matches `cipher-audit`'s on the same store.
     try:
         walked = _decrypt_check(snap, snap_settings, posture=posture)
-    except Exception as exc:
-        # Its cipher build is the open's own, so a failure there (a key provider, a refused Vault
-        # hop, a cipher config) is the FAIL the open's handler below gave it when the open ran first.
-        return "FAIL", safe_exc(exc), 0
+    except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
+        # Its cipher build and its read-only connect are the open's own, so a failure there (a key
+        # provider or DPAPI, a cipher config or a refused hop, a file the connect cannot read) is the
+        # FAIL the open's handler below gave it when the open ran first. Still a verdict, and still
+        # behind an incompatible snapshot's, so the open below runs and the order there decides.
+        walked = ("FAIL", safe_exc(exc), 0)
     # ADR 0196 AC-8: the snapshot is a copy of the LIVE store and carries its salt. Opened as it is,
     # anything the open seals (the at-open sweep) would land under the live store's data sub-key and
     # be counted only in this throwaway copy's row. Dropping the salt makes the open mint a new one,
     # so whatever it seals is under a key nothing else uses. Every existing value names its own salt,
     # and the decrypt pass above has read them. The copy is discarded afterwards either way.
-    import sqlite3
-
     from messagefoundry.store.store import forget_store_salt
 
     try:

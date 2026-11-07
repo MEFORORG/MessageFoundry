@@ -13,7 +13,8 @@ authenticates fails the verify instead of surfacing at first use. It also reads 
 with no marker, so a text value whose marker itself is damaged fails it on a surface the keyed store
 has sealed.
 
-:func:`read_cipher_cells` is the one walk over those cells. The restore-verify stops at its first
+:func:`read_cipher_cells` is the one walk over a SQLite store's cells, and
+:func:`read_server_cipher_cells` its twin for a server store. The restore-verify stops at its first
 failure; :func:`audit_cipher_cells`, behind ``messagefoundry cipher-audit``, reads a LIVE store with
 it to the end and also counts, in a keyed store, the non-blank text values that carry no marker,
 which is where a damaged marker lands.

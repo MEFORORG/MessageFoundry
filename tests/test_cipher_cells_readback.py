@@ -1693,3 +1693,45 @@ def test_a_salt_reset_failure_keeps_the_walks_verdict(
 
     monkeypatch.setattr(store_module, "forget_store_salt", reset_fails)
     assert dr_backup._full_open_check(db, settings) == walked
+
+
+def test_db_with_a_server_backend_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--db names a SQLite file; under a server backend it would be ignored and the server store
+    read instead. Refused, exit 2, before any open."""
+    opened: list[object] = []
+
+    async def must_not_open(settings: StoreSettings, **_kw: Any) -> object:
+        opened.append(settings)
+        raise AssertionError("cipher-audit opened a store it was not pointed at")
+
+    monkeypatch.setattr(store_base, "open_store", must_not_open)
+    rc, payload, out = _run_server_cli(
+        tmp_path, monkeypatch, capsys, "postgres", "--db", str(tmp_path / "copy.db")
+    )
+    assert rc == 2 and "--db names a SQLite store" in payload["error"], out
+    assert opened == []
+
+
+def test_the_full_walk_failing_still_yields_to_an_incompatible_snapshot(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A walk that could not run is a FAIL verdict, but an incompatible snapshot's remedy still
+    leads it, as the verdict order says."""
+    from messagefoundry.store.keyprovider import KeyProviderError
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    db, settings = _copy(_template, tmp_path)
+
+    def build_fails(*_a: Any, **_kw: Any) -> tuple[str, str, int]:
+        raise KeyProviderError("synthetic: the key service did not answer")
+
+    def incompatible(coro: Any) -> Any:
+        coro.close()
+        raise SchemaMismatchError("synthetic: schema written by another build")
+
+    monkeypatch.setattr(dr_backup, "_decrypt_check", build_fails)
+    monkeypatch.setattr(dr_backup, "run_guarded", incompatible)
+    status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
+    assert status == "FAIL" and "0.0.1" in reason and "key service" not in reason, reason
