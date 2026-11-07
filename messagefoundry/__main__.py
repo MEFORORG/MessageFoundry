@@ -1089,8 +1089,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "row, never a value. Exit 0 PASS, 1 FAIL (at least: a value that does not decrypt, a BLOB "
         "where the store writes text, a non-blank value with no at-rest marker on a surface the "
         "keyed store has sealed, or a walk stopped part way, by a VACUUM, a lock, a lost "
-        "connection, an unreadable row or the key service), 2 could not start, 4 KEY_MISMATCH. "
-        "Run it with the service's own key: a shell "
+        "connection, an unreadable row or the key service), 2 could not start, 3 NOT COVERED (a "
+        "PostgreSQL or SQL Server store whose catalog does not show this login a table or column "
+        "the cipher inventory expects, at least through a missing grant, so those cells were not "
+        "read), 4 KEY_MISMATCH. Run it with the service's own key: a shell "
         "without it resolves keyless and reports KEY_MISMATCH. Under [store].cipher_provider = "
         "'vault_transit' every value is one Transit request (BACKLOG #1719)",
     )
@@ -1099,7 +1101,11 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         default=None,
         help="service settings TOML (default: ./messagefoundry.toml if present) — the store key source",
     )
-    cipher_audit.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    cipher_audit.add_argument(
+        "--db",
+        default=None,
+        help="SQLite store path (overrides [store].path); refused when [store].backend is a server",
+    )
     cipher_audit.add_argument(
         "--table",
         action="append",
@@ -10970,9 +10976,13 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     :data:`~messagefoundry.store.cipher_cells.SQLSERVER_CIPHER_CELLS`, each cell paged by its
     primary key; a cell whose key can be PHI is located by its position there.
 
-    Exit 0 PASS, 1 FAIL, 2 could not start, 4 KEY_MISMATCH (a sealed value and no key resolved,
-    the usual cause being a shell without the service's key). 3 is no longer returned: it was
-    NOT COVERED, for a server backend this did not read."""
+    A server store's schema is the build's, so every cell of the inventory asked for must be
+    visible in its catalog read. One that is not, a table or a column, was not read, at least
+    because the login lacks a grant on it: that is NOT COVERED, never a PASS over the rest.
+
+    Exit 0 PASS, 1 FAIL, 2 could not start, 3 NOT COVERED (a server store whose catalog hides an
+    expected cell), 4 KEY_MISMATCH (a sealed value and no key resolved, the usual cause being a
+    shell without the service's key). A FAIL or KEY_MISMATCH the visible cells earn leads 3."""
     from messagefoundry.config.settings import (
         StoreBackend,
         hop_posture_from_ai,
@@ -11219,6 +11229,19 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             f"{audit.unmarked} non-blank value(s) on surfaces this keyed store has sealed carry no "
             "at-rest marker, so the store refuses each at read: a damaged or stripped marker, or a "
             f"planted row (BACKLOG #1169); the first: {first}"
+        )
+    elif audit.absent and store.backend != StoreBackend.SQLITE:
+        # A server schema is the build's own, so an expected cell the catalog read did not show
+        # was hidden from this login (at least a missing grant) rather than never created. Its
+        # values were not read, so the store is not audited whole and cannot PASS. The names come
+        # from the inventory, never from a row.
+        status, code = "NOT_COVERED", 3
+        reason = (
+            f"{len(audit.absent)} expected cipher cell(s) are not visible in the catalog of "
+            f"{_store_label(store)} and were not read: {', '.join(audit.absent)}. At least a "
+            "missing grant on the table, or a schema behind this build, hides one; grant the "
+            f"login read on it and run again. {audit.opened} sealed value(s) in the visible cells "
+            "decrypted and authenticated"
         )
     else:
         status, code = "PASS", 0

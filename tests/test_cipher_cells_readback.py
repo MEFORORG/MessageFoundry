@@ -1602,6 +1602,72 @@ def test_table_narrows_a_server_audit_to_that_backends_inventory(
     assert rc == 2 and "no cipher-covered table named synth_none" in payload["error"], out
 
 
+def _hide_from_catalog(
+    monkeypatch: pytest.MonkeyPatch, table: str, column: str | None = None
+) -> None:
+    """Make the catalog read leave out ``table`` (or only its ``column``), as a login with no grant
+    on it sees the catalog. The rows stay; only the catalog hides them."""
+    real = _SqliteSource.cipher_walk_columns
+
+    async def hiding(self: _SqliteSource, tables: Sequence[str]) -> dict[str, frozenset[str]]:
+        found = await real(self, tables)
+        if column is None:
+            found.pop(table, None)
+        elif table in found:
+            found[table] = found[table] - {column}
+        return found
+
+    monkeypatch.setattr(_SqliteSource, "cipher_walk_columns", hiding)
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+@pytest.mark.parametrize(
+    ("table", "column", "hidden"),
+    [
+        ("search_presets", None, "search_presets.criteria"),
+        ("messages", "summary", "messages.summary"),
+    ],
+    ids=["table", "column"],
+)
+def test_a_server_cell_the_catalog_hides_is_not_covered_never_a_pass(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    backend: str,
+    table: str,
+    column: str | None,
+    hidden: str,
+) -> None:
+    """A table or column of the inventory that the catalog read does not show, as a missing grant
+    hides it, was never read. Exit 3, NOT_COVERED, naming the cell and no value; never the PASS
+    over the visible cells it read before. Control: the same store with nothing hidden PASSes."""
+    db, settings = _copy(_template, tmp_path)
+    _serve_from(monkeypatch, db, build_store_cipher(settings))
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, backend)
+    assert rc == 0 and payload["status"] == "PASS", out
+    _hide_from_catalog(monkeypatch, table, column)
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, backend)
+    assert rc == 3 and payload["status"] == "NOT_COVERED", out
+    assert hidden in payload["reason"] and "not read" in payload["reason"], payload
+    assert _cells(payload)[hidden]["present"] is False, payload
+
+
+def test_a_failure_in_a_visible_server_cell_leads_a_hidden_one(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A damaged value the walk did read is still exit 1: a hidden cell never masks a FAIL."""
+    db, settings = _copy(_template, tmp_path)
+    _flip_one_aead_byte(db, next(c for c in SQLITE_CIPHER_CELLS if c.table == "state"))
+    _serve_from(monkeypatch, db, build_store_cipher(settings))
+    _hide_from_catalog(monkeypatch, "search_presets")
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "sqlserver")
+    assert rc == 1 and payload["status"] == "FAIL", out
+
+
 # --- round-1 review repairs: what reaches each exit (BACKLOG #1719) ---------
 
 
