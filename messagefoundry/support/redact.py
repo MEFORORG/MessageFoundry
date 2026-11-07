@@ -149,36 +149,21 @@ _LABEL_HEAD = (
 _MEFOR_LABEL_HEAD = r"\b(?-i:MEFOR_[A-Z0-9_]++)\b['\"]?\s*+[:=]\s*+"
 _QUOTED_LABEL = _LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
-_RUN_ON_LABEL = (
-    r"(?:(?=(?i:[abceipst]))"
-    r"(?:(?i:pass(?:word|wd|phrase)?|pwd|secret|credential|encryption_key(?:s_retired)?|private_key"
-    r"|intake_api_key_next)\b[^\S\r\n]*+[:=][^\S\r\n]*+"
-    r"|(?i:bearer|authorization|token|session|api[_-]?key)\b[^\S\r\n]*+[:=][^\S\r\n]*+"
-    r"(?:(?i:bearer|basic|digest)[^\S\r\n]++)?)"
-    r"|\b(?-i:MEFOR_[A-Z0-9_]++)\b[^\S\r\n]*+[:=][^\S\r\n]*+)"
-)
-# The stop fires before a ``_CREDENTIAL_KV`` label whose braced value holds white space and no "{"
-# too, and the value then takes that label up to the braced value's closer (BACKLOG #2966), so
-# ``MEFOR_X=a;PWD={pp ww}`` no longer prints " ww}". Why the closer stays, why those conditions on
-# the braces and the label are what refuse each shape measured printing a value, and why the scan
-# stays linear, are stated once, on the same fragments in ``messagefoundry/secretscrub.py``. THIS
-# COPY RUNS BEFORE THE PHI PASS, and the tail is written back masked, so a PHI reader that keys on
-# letters in the braces no longer sees them; the tail refuses the readers found doing so, an XML tag
-# and any capital letter (a segment ID, an ``MSH`` header and a name glued behind digits among them),
-# and a differential that runs the PHI pass after this layer is the measurement for this copy, not
-# the write-time one. ``_MFB64`` runs before this layer and writes ``[REDACTED]`` into the braces, so
-# a tail holding it is refused, here and in ``secretscrub``, and prints as before. The tail is a copy of
-# ``secretscrub``'s, its label refusal spelled with this copy's ``_RUN_ON_LABEL``; a test holds the two
-# equal on that substitution.
+# The stop fires before a ``_CREDENTIAL_KV`` label whose braced value holds a space followed only by
+# lower case letters and spaces, and the value then takes that label up to the braced value's closer
+# (BACKLOG #2966), so ``MEFOR_X=a;PWD={pp ww}`` no longer prints " ww}". Why the closer stays, why
+# the braced tail is an allowlist and the label's conditions are what they are, and why the scan stays
+# linear, are stated once, on the same fragments in ``messagefoundry/secretscrub.py``. THIS COPY RUNS
+# BEFORE THE PHI PASS, and the tail is written back masked, which is why the tail takes nothing but
+# lower case letters and spaces: any other character, at least a digit, a capital letter,
+# punctuation, a tab and a character outside ASCII, refuses the braced label, and the line prints as
+# it did before, so the PHI pass reads it as before. A differential that runs the PHI pass after
+# this layer is the measurement for this copy, not the write-time one. ``_MFB64`` runs before this
+# layer and writes ``[REDACTED]`` into the braces, which the allowlist refuses. The tail is a copy of
+# ``secretscrub``'s, and a test holds the two equal.
 _BRACED_HEAD = r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b[:=]"
 _SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s;,&]|\}\})*+"
-_SPACED_BRACED_TAIL = (
-    r"[ \t](?:[^{}'\"%;,&<\r\n\v\f\x1c-\x1eA-Za-z0-9\x80-\U0010ffff]|\}\}"
-    + r"|(?!"
-    + _RUN_ON_LABEL
-    + r"|(?i:bearer|basic|digest)\s"
-    + r")(?-i:[a-z0-9])++)*+"
-)
+_SPACED_BRACED_TAIL = r" (?: |(?!(?i:bearer|basic|digest) )(?-i:[a-z])++)*+"
 _BRACED_LABEL = _BRACED_HEAD + _SPACED_BRACED_HEAD + _SPACED_BRACED_TAIL + r"\}(?!\})"
 _BRACED_RUN_ON = (
     _BRACED_HEAD
@@ -211,6 +196,14 @@ _NOT_BEFORE_QUOTED_LABEL = (
 # linear, are stated once, on the same fragment in ``messagefoundry/secretscrub.py``. Written as plain
 # concatenation, not built by a helper, so ``tests/test_security_static.py`` can resolve this copy and
 # scan it.
+_RUN_ON_LABEL = (
+    r"(?:(?=(?i:[abceipst]))"
+    r"(?:(?i:pass(?:word|wd|phrase)?|pwd|secret|credential|encryption_key(?:s_retired)?|private_key"
+    r"|intake_api_key_next)\b[^\S\r\n]*+[:=][^\S\r\n]*+"
+    r"|(?i:bearer|authorization|token|session|api[_-]?key)\b[^\S\r\n]*+[:=][^\S\r\n]*+"
+    r"(?:(?i:bearer|basic|digest)[^\S\r\n]++)?)"
+    r"|\b(?-i:MEFOR_[A-Z0-9_]++)\b[^\S\r\n]*+[:=][^\S\r\n]*+)"
+)
 _SQ_RUN_ON_WALK = r"(?:[^'\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"')[A-Za-z0-9]++)*+"
 _DQ_RUN_ON_WALK = r"(?:[^\"\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"\")[A-Za-z0-9]++)*+"
 _RUN_ON_INNER = (

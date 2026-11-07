@@ -2402,9 +2402,10 @@ def test_the_swallow_tests_fail_without_the_stop(monkeypatch: pytest.MonkeyPatch
 # writes the tail back masked, and which shapes are left, is stated once, on ``_BRACED_RUN_ON`` in
 # ``messagefoundry/secretscrub.py``.
 
-#: The braced value's two words. Synthetic, and each holds "-" and "_", so the bundle's long-base64
-#: sweep cannot be what hides it. Lower case, because a tail holding a capital letter is refused.
-_BRACED_WORDS = ("bv-br_a-71", "bv-br_b-72")
+#: The braced value's two words. Synthetic. The first, before the space, holds "-" and "_", so the
+#: bundle's long-base64 sweep cannot be what hides it; the second is the tail, and holds only lower
+#: case letters, because a tail holding anything else is refused and prints as before.
+_BRACED_WORDS = ("bv-br_a-71", "bvbrbwq")
 
 #: The five shapes the row was measured on: a ``MEFOR_`` value, a ``MEFOR_`` DSN, and the token,
 #: session and api_key labels, each then ``;PWD=`` with a braced value holding a space.
@@ -2443,12 +2444,12 @@ def test_a_plain_value_does_not_print_a_later_braced_password(line: str) -> None
 
 
 def test_the_braced_tail_is_written_back_masked_with_its_closer() -> None:
-    """The tail keeps its white space, punctuation and closer, and its words are masked by the
-    connection-string member mask, letters to "x" and digits to "0", so a later pass reads text of the
-    shape the old class left. Pinned exactly, on both copies."""
+    """The tail keeps its spaces and closer, and its words are masked by the connection-string member
+    mask, each letter to "x". Pinned exactly, on both copies and the store path."""
     assert scrub_credentials("MEFOR_X=a;PWD={pp ww}") == "MEFOR_X=<redacted> xx}"
-    assert scrub_credentials("token=a;PWD={pp w.9!} tail") == "token=<redacted> x.0!} tail"
+    assert scrub_credentials("token=a;PWD={pp w  ab} tail") == "token=<redacted> x  xx} tail"
     assert redact_log_line("MEFOR_X=a;PWD={pp ww}") == f"MEFOR_X={REDACTION_PLACEHOLDER} xx}}"
+    assert _store_detail("MEFOR_X=a;PWD={pp ww}") == f"MEFOR_X={REDACTION_PLACEHOLDER} xx}}"
 
 
 def _without_the_braced_run_on(module: ModuleType) -> dict[str, re.Pattern[str]]:
@@ -2519,7 +2520,7 @@ def test_a_label_inside_the_braces_is_left_to_the_passes(line: str, value: str) 
 def test_a_placeholder_and_a_line_break_in_a_braced_value_survive() -> None:
     """A tail holding the bundle's ``[REDACTED]`` or a later label is refused by the run-on, so the
     line reads as before and the placeholder stays, and the run-on does not cross a line break before
-    the separator. A taken tail keeps the PHI pass's lowercase placeholder, pinned last."""
+    the separator. A tail holding the PHI pass's placeholder is refused too, pinned last."""
     bundled = redact_log_line("token=a;PWD={p mfb64:v1:QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=} next")
     assert bundled == f"token={REDACTION_PLACEHOLDER} {REDACTION_PLACEHOLDER}}} next"
     assert (
@@ -2531,21 +2532,17 @@ def test_a_placeholder_and_a_line_break_in_a_braced_value_survive() -> None:
     # A record break the log and bundle readers split at is not white space the run-on may cross.
     for brk in ("\v", "\f", "\x1c", "\x85", "\u2028", "\u2029"):
         assert scrub_credentials(f"token=a;PWD={{pp{brk}ww}}") == f"token=<redacted>{brk}ww}}"
-    assert scrub_credentials("token=a;PWD={p [redacted] vq9}") == "token=<redacted> [redacted] xx0}"
+    assert scrub_credentials("token=a;PWD={p [redacted] vq9}") == "token=<redacted> [redacted] vq9}"
     # A capital letter after the first white space refuses the braced label: the line reads as before.
     assert scrub_credentials("token=a;PWD={p w Summer2024}") == "token=<redacted> w Summer2024}"
 
 
 def test_the_bundle_copy_of_the_braced_tail_is_the_write_time_one() -> None:
-    """The bundle restates the braced fragments so the regex scanner can read them. Its tail is the
-    write-time tail with its own label refusal spliced in, its braced head the same, and its braced
-    label takes the same credential words, so a refusal added to one copy alone goes red here."""
+    """The bundle restates the braced fragments so the regex scanner can read them. Its tail and its
+    braced head are the write-time ones, and its braced label takes the same credential words, so a
+    change to one copy alone goes red here."""
     assert redact_mod._SPACED_BRACED_HEAD == scrub_mod._SPACED_BRACED_HEAD
-    assert scrub_mod._RUN_ON_LABEL in scrub_mod._SPACED_BRACED_TAIL
-    assert (
-        scrub_mod._SPACED_BRACED_TAIL.replace(scrub_mod._RUN_ON_LABEL, redact_mod._RUN_ON_LABEL)
-        == redact_mod._SPACED_BRACED_TAIL
-    )
+    assert redact_mod._SPACED_BRACED_TAIL == scrub_mod._SPACED_BRACED_TAIL
     heads = [re.compile(module._BRACED_HEAD) for module in (scrub_mod, redact_mod)]
     for word in (*scrub_mod._CREDENTIAL_WORDS, "token", "session", "pwds", "xpwd", "PWD"):
         for sep in ("=", ":", " =", "'="):
@@ -2655,44 +2652,122 @@ def test_the_spaced_head_lines_print_when_the_head_takes_a_space_or_tab(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """THE POSITIVE CONTROL. With spaces and tabs allowed before the separator, as the previous form
-    did, each line prints its value on the write-time pass or the bundle."""
+    did, and the round-2 denylist tail, which took the digits in these tails, each line prints its
+    value on the write-time pass or the bundle."""
     _widen_the_braced_head(monkeypatch, r"[ \t]*+")
+    _restore_an_earlier_tail(monkeypatch)
     for line, value in _BRACED_SPACED_HEAD_LINES:
         outs = [scrub_credentials(line), redact_log_line(line)]
         assert any(value in out for out in outs), f"{line!r} printed no value -- got {outs!r}"
 
 
-#: The tail's run class, as both copies spell it: lower case letters and digits, so a capital letter
-#: ends the tail and the braced label is refused. That is what refuses a segment ID, an ``MSH`` and
-#: a name, glued behind digits or not.
-_TAIL_RUN = "(?-i:[a-z0-9])++"
-#: The run class and segment checks the earlier forms had, for the positive controls.
+#: The run class and segment checks the earlier, denylist forms of the tail had, for the positive
+#: controls: the round-2 form took lower case letters and digits, and the forms before it any letter.
+_DENYLIST_TAIL_RUN = "(?-i:[a-z0-9])++"
 _EARLIER_TAIL_RUN = "(?-i:[A-Za-z0-9])++"
 _EARLIER_SEGMENT_CHECKS = (
     r"|(?-i:[A-Z][A-Z0-9]{2})(?![A-Za-z0-9])|[A-Za-z0-9]*?(?-i:MSH|BHS|FHS)(?![A-Za-z0-9])"
 )
 
 
+def _denylist_tail(
+    module: ModuleType,
+    *,
+    run: str = _DENYLIST_TAIL_RUN,
+    segment_checks: bool = False,
+    take_lt: bool = False,
+) -> str:
+    """The braced tail as the denylist forms spelled it, before the allowlist: a space or a tab, then
+    anything but the characters and words each review refused, with ``module``'s own label refusal."""
+    refused = "%;,&" if take_lt else "%;,&<"
+    checks = _EARLIER_SEGMENT_CHECKS if segment_checks else ""
+    return (
+        r"[ \t](?:[^{}'\""
+        + refused
+        + r"\r\n\v\f\x1c-\x1eA-Za-z0-9\x80-\U0010ffff]|\}\}"
+        + r"|(?!"
+        + module._RUN_ON_LABEL
+        + r"|(?i:bearer|basic|digest)\s"
+        + checks
+        + r")"
+        + run
+        + r")*+"
+    )
+
+
 def _restore_an_earlier_tail(
-    monkeypatch: pytest.MonkeyPatch, *, segment_checks: bool, take_lt: bool = False
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run: str = _DENYLIST_TAIL_RUN,
+    segment_checks: bool = False,
+    take_lt: bool = False,
 ) -> None:
-    """Both copies' stopped patterns with the tail taking capital letters again, with the earlier
-    segment checks or without them, and taking a "<" too where ``take_lt``."""
+    """Both copies' stopped patterns with the braced tail put back to a denylist form."""
     for module in (scrub_mod, redact_mod):
         tail = module._SPACED_BRACED_TAIL
-        assert tail.endswith(")" + _TAIL_RUN + ")*+"), f"{module.__name__}: the tail run moved"
-        head, _ = tail.rsplit(")" + _TAIL_RUN, 1)
-        checks = _EARLIER_SEGMENT_CHECKS if segment_checks else ""
-        bare = head + checks + ")" + _EARLIER_TAIL_RUN + ")*+"
-        if take_lt:
-            assert "%;,&<" in bare, f"{module.__name__}._SPACED_BRACED_TAIL lost its '<'"
-            bare = bare.replace("%;,&<", "%;,&")
+        bare = _denylist_tail(module, run=run, segment_checks=segment_checks, take_lt=take_lt)
         for name in _STOPPED_PATTERNS:
             pattern: re.Pattern[str] = getattr(module, name)
             assert tail in pattern.pattern, f"{module.__name__}.{name} has no braced tail"
             monkeypatch.setattr(
                 module, name, re.compile(pattern.pattern.replace(tail, bare), pattern.flags)
             )
+
+
+#: Lines whose braced tail holds something outside the allowlist, a date glued to a label and an
+#: ``mrn`` before a "[", that the round-2 denylist took, with the value it then printed in the bundle
+#: and on the store path, and what the code before the run-on wrote on the write-time pass and in the
+#: bundle and the store path, which they write again. The write-time pass alone printed the value
+#: before too; the bundle and the store path are where the PHI pass after it hid it.
+_OUTSIDE_THE_ALLOWLIST_LINES: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "Bearer abcd.PWD={pp 2024-01-01t09:15private_key=vq9}vq10 rest",
+        "vq10",
+        "Bearer <redacted> 2024-01-01t09:15private_key=vq9}vq10 rest",
+        f"Bearer {REDACTION_PLACEHOLDER} [redacted]private_key={REDACTION_PLACEHOLDER} rest",
+    ),
+    (
+        "token=a;PWD={pp mrn[vq7code=x}",
+        "vq7code",
+        "token=<redacted> mrn[vq7code=x}",
+        f"token={REDACTION_PLACEHOLDER} mrn[[redacted]=x}}",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("line", "value", "scrubbed", "bundled"), _OUTSIDE_THE_ALLOWLIST_LINES, ids=range(2)
+)
+def test_a_braced_tail_outside_the_allowlist_prints_as_before(
+    line: str, value: str, scrubbed: str, bundled: str
+) -> None:
+    """The braced label is refused, so the line reads exactly as it did before the run-on, pinned on
+    the write-time pass, the bundle and the store path."""
+    assert scrub_credentials(line) == scrubbed
+    assert redact_log_line(line) == bundled
+    assert _store_detail(line) == bundled
+    assert value not in bundled
+
+
+def test_the_outside_lines_print_their_value_under_the_denylist_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL. With the tail put back to the round-2 denylist, each line prints its
+    value in the bundle and on the store path."""
+    _restore_an_earlier_tail(monkeypatch)
+    for line, value, _, _ in _OUTSIDE_THE_ALLOWLIST_LINES:
+        for surface, out in (("bundle", redact_log_line(line)), ("store", _store_detail(line))):
+            assert value in out, f"{surface}: {line!r} hid -- got {ascii(out)}"
+
+
+def test_only_lower_case_letters_and_spaces_are_taken_after_the_first_space() -> None:
+    """The allowlist, character by character: a tail of lower case letters and plain spaces is
+    masked, and a tail holding any other character, or opening on a tab, prints as before."""
+    assert scrub_credentials("token=a;PWD={pp ab cd  ef}") == "token=<redacted> xx xx  xx}"
+    for odd in ("1", "A", ".", "-", "_", "[", "é", "ſ", "\t", " ", "}}"):
+        line = f"token=a;PWD={{pp ab{odd}cd}}"
+        assert scrub_credentials(line) == f"token=<redacted> ab{odd}cd}}", ascii(line)
+    assert scrub_credentials("token=a;PWD={pp\tab}") == "token=<redacted>\tab}"
 
 
 #: Braces whose tail holds what the bundle's PHI pass reads by its letters: an XML tag, an HL7
@@ -2719,7 +2794,7 @@ def test_the_phi_reader_lines_print_when_the_tail_takes_them(
 ) -> None:
     """THE POSITIVE CONTROL. With the tail taking a "<" and capital letters again, each line prints
     its value in the bundle."""
-    _restore_an_earlier_tail(monkeypatch, segment_checks=False, take_lt=True)
+    _restore_an_earlier_tail(monkeypatch, run=_EARLIER_TAIL_RUN, take_lt=True)
     for line, value in _BRACED_PHI_READER_LINES:
         out = redact_log_line(line)
         assert value in out, f"{line!r} hid -- got {ascii(out)}"
@@ -2766,7 +2841,7 @@ def test_the_glued_segment_lines_print_when_the_tail_reads_only_a_run_start(
     """THE POSITIVE CONTROL. With the tail taking capital letters again and refusing a
     segment-shaped triple only at the START of a run, and a run ending in ``MSH``, ``BHS`` or ``FHS``,
     as the earlier forms did, each line prints its value on the store path."""
-    _restore_an_earlier_tail(monkeypatch, segment_checks=True)
+    _restore_an_earlier_tail(monkeypatch, run=_EARLIER_TAIL_RUN, segment_checks=True)
     for line, value in _GLUED_SEGMENT_LINES:
         out = _store_detail(line)
         assert value in out, f"{line!r} hid -- got {ascii(out)}"
@@ -2775,9 +2850,9 @@ def test_the_glued_segment_lines_print_when_the_tail_reads_only_a_run_start(
 def test_the_bare_scheme_pass_writes_the_braced_tail_back_masked() -> None:
     """A bare ``Bearer`` value takes a later braced label too, on the scheme pass's own path, and
     writes the tail back masked with its closer, on both copies."""
-    line = "retry Bearer abcd.PWD={pp w9} next"
-    assert scrub_credentials(line) == "retry Bearer <redacted> x0} next"
-    assert redact_log_line(line) == f"retry Bearer {REDACTION_PLACEHOLDER} x0}} next"
+    line = "retry Bearer abcd.PWD={pp wq} next"
+    assert scrub_credentials(line) == "retry Bearer <redacted> xx} next"
+    assert redact_log_line(line) == f"retry Bearer {REDACTION_PLACEHOLDER} xx}} next"
 
 
 def _braced_check_run(length: int) -> str:
