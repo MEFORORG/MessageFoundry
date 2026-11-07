@@ -3688,7 +3688,7 @@ def _full_open_check(
     # anything the open seals (the at-open sweep) would land under the live store's data sub-key and
     # be counted only in this throwaway copy's row. Dropping the salt makes the open mint a new one,
     # so whatever it seals is under a key nothing else uses. Every existing value names its own salt,
-    # so the decrypt pass below is unaffected. The copy is discarded afterwards either way.
+    # and the decrypt pass above has read them. The copy is discarded afterwards either way.
     import sqlite3
 
     from messagefoundry.store.store import forget_store_salt

@@ -7,10 +7,11 @@ rest bind to a composite or natural key, so each has its own migration and rotat
 store, and until this module no caller outside it could read them back. This module names those cells
 and the columns each writer binds into ``cell_aad``, in the order it binds them, and joins both kinds
 into :data:`SQLITE_CIPHER_CELLS`. :data:`POSTGRES_CIPHER_CELLS` and :data:`SQLSERVER_CIPHER_CELLS`
-are the same cells as each server store seals them, paged by primary key. The full restore-verify reads every sealed value in them back
-through the cipher, so a ciphertext whose tag no longer authenticates fails the verify instead of
-surfacing at first use. It selects the values :func:`_sealed_test` calls sealed, so a text value
-whose marker itself is damaged is not reached by that pass.
+are the same cells as each server store seals them, paged by primary key. The full restore-verify
+reads every sealed value in them back through the cipher, so a ciphertext whose tag no longer
+authenticates fails the verify instead of surfacing at first use. It also reads the non-blank values
+with no marker, so a text value whose marker itself is damaged fails it on a surface the keyed store
+has sealed.
 
 :func:`read_cipher_cells` is the one walk over those cells. The restore-verify stops at its first
 failure; :func:`audit_cipher_cells`, behind ``messagefoundry cipher-audit``, reads a LIVE store with
@@ -21,8 +22,9 @@ It is READ-ONLY: nothing here writes a cell, and the store's own passes do not c
 every pass from one declaration is BACKLOG #1169's scope, not this one's. Until then two guards keep
 this list honest. ``tests/test_store_cipher_sweep_parity.py`` fails when ``store.py`` gains a composite
 cipher cell this module does not name, and ``tests/test_cipher_cells_readback.py`` does the same for
-``postgres.py`` and ``sqlserver.py`` against their inventories. ``tests/test_cipher_cells_readback.py`` writes each cell through
-the real store writer, proves the AAD here opens it, and proves a flipped byte fails it.
+``postgres.py`` and ``sqlserver.py`` against their inventories. ``tests/test_cipher_cells_readback.py``
+also writes each cell through the real store writer, proves the AAD here opens it, and proves a
+flipped byte fails it.
 """
 
 from __future__ import annotations
