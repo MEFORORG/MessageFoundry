@@ -1184,7 +1184,8 @@ at that moment. The over-grants above fall in two classes:
   `GET /security/posture`.
 - **The warning class:** everything else the probe calls over-granted, at least one token serving
   both hops, an extra capability on a path the engine calls, and a policy name the probe cannot tell
-  apart from `root` by reading it. These log a warning and write the audit row; they never refuse.
+  apart from `root` by reading it. These log a warning, write the audit row and raise the alert
+  below; they never refuse.
 
 A probe that could not read the token because of a network failure, a timeout or a 403 also only
 warns. Any other failure leaves the token unjudged for a reason the ruling does not excuse: at
@@ -1196,8 +1197,19 @@ the opt-out does not lift it.
 Under `enforcement = warn` nothing refuses. The probe's limits stay: it asks about exact paths only,
 so a wildcard grant such as `secret/data/*` would read clean, and a token made with `-no-default-policy` reads
 as not observed at every start unless its policy grants the two paths the probe reads. Neither
-limit was measured against a live Vault. No alert is raised for a Vault finding yet; the log line
-and the audit row are the record.
+limit was measured against a live Vault.
+
+**Every Vault finding also raises an alert, and a clean read resolves it** (vault BACKLOG #2903
+slice B). A hop that is over-granted, in either class, or that could not be read raises
+`vault_privilege_warning` under the subject `vault:store` or `vault:secrets`, before any refusal,
+so a refused start still pages, and an accepted opt-out quiets nothing. The payload is the finding,
+the count of refusing-class grants and the hop's judgment, which names policy names, paths and
+capabilities, never a token, an accessor or a digest of either. A later start that reads that
+hop's token clean raises `vault_privilege_clean`, which pages nobody and resolves the open
+instance, as `store_privilege_clean` does for the store. The subject names the hop and nothing
+about the token, because a fix is usually a new token: so engine processes that share one store
+share each hop's alert, and a clean start by one resolves a warning another raised on a different
+token. The log line and the audit row of every start stay the record.
 
 ### Data-layer hops refuse cleartext on their defaults (ASVS 12.3.1 census)
 

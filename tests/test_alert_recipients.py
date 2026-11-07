@@ -44,6 +44,8 @@ from tests.test_email_destination import (
     _SENDER_SHAPES,
     _WireCapture,
     assert_partial_refusal,
+    assert_total_refusal,
+    refuse_every_recipient,
 )
 
 #: The [alerts] revocation guards count no posture as enforcing (ADR 0173 section 12), so an
@@ -272,12 +274,34 @@ def test_a_partial_rcpt_refusal_fails_the_alert_send(wire: _WireCapture, quit_ok
     assert_partial_refusal(caught.value, ALERTS_SMTP_CELL, wire)
 
 
-async def test_the_notifier_logs_a_partial_refusal_without_an_address(
-    wire: _WireCapture, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize("quit_ok", [True, False], ids=["quit-221", "quit-refused"])
+def test_a_permanent_refusal_of_every_recipient_fails_the_alert_send_content_free(
+    wire: _WireCapture, quit_ok: bool
+) -> None:
+    # Every recipient refused (vault BACKLOG #2884, #2924 step 5). RED on main: smtplib's own
+    # SMTPRecipientsRefused, whose args hold each address and the relay's reply, reached the
+    # notifier, which logs a failed send with exc_info.
+    refuse_every_recipient(wire, quit_ok=quit_ok)
+    with pytest.raises(NegativeAckError) as caught:
+        _send_to(wire.port, "engine@hospital.example", _PARTIAL_RECIPIENTS)
+    assert_total_refusal(caught.value, ALERTS_SMTP_CELL, wire, "550")
+
+
+@pytest.mark.parametrize(
+    ("refused", "expected"),
+    [
+        ([_PARTIAL_REFUSED], "1 of 2 recipients refused"),
+        # vault BACKLOG #2884: RED on main, the log held SMTPRecipientsRefused and both addresses.
+        (_PARTIAL_RECIPIENTS, "all 2 recipients refused (550)"),
+    ],
+    ids=["partial", "total"],
+)
+async def test_the_notifier_logs_a_refusal_without_an_address(
+    wire: _WireCapture, caplog: pytest.LogCaptureFixture, refused: list[str], expected: str
 ) -> None:
     # The notifier logs a failed transport with exc_info, so the refusal's text and traceback are
     # what reach the log. Neither may name a recipient.
-    wire.refuse_rcpt = frozenset({_PARTIAL_REFUSED.encode()})
+    wire.refuse_rcpt = frozenset(a.encode() for a in refused)
     email = EmailTransport(
         host="127.0.0.1",
         port=wire.port,
@@ -299,7 +323,7 @@ async def test_the_notifier_logs_a_partial_refusal_without_an_address(
     assert record.exc_info is not None
     assert isinstance(record.exc_info[1], NegativeAckError)
     logged = caplog.text.lower()
-    assert "1 of 2 recipients refused" in logged
+    assert expected in logged
     for address in _PARTIAL_RECIPIENTS:
         assert address not in logged
 
