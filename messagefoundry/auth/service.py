@@ -11511,7 +11511,7 @@ class AuthService:
 
     async def _count_unrecorded_logout_misses(self, *, refused: bool) -> None:
         """Count a miss :meth:`_admit_logout_miss_row` ``refused``, and write the count once no
-        count row was written in the last window (BACKLOG #4735).
+        count row was attempted in the last window (BACKLOG #4735).
 
         Called for every sign-out that names no caller and ended nothing, admitted or not (after
         an admitted one's own row). Only such a sign-out writes the count, so a count left when a

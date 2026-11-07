@@ -5782,9 +5782,13 @@ sign-outs left unwritten since the last such row, and at most one such row is wr
 seconds. A WARNING log line gives the same N once the row is written. Its own outcome keeps a reader
 that counts `nothing_to_revoke` rows from reading it as one sign-out. Only a sign-out that names no
 caller and ends nothing writes the count: the first one past a limit writes it at once, unless a
-count row was written in the 60 seconds before. A sign-out through `POST /auth/logout` never writes
-it. The row's time is when it was written, not when the misses it counts arrived. With the audit
-store refusing writes, the ERROR line each refused write logs is bounded the same way.
+count row was attempted in the 60 seconds before, since a count-row write that is refused or
+cancelled spends that window's one slot too. A sign-out through `POST /auth/logout` never writes
+it. The row's time is when it was written, not when the misses it counts arrived. When only the
+audit writes are refused, the ERROR line each refused row write logs is bounded the same way. When
+the whole store refuses, that bound does not apply: the revoke's own store write raises before any
+row is attempted, so each request with a cookie answers 500, and nothing bounds the errors those
+requests log.
 
 **What the count can miss.** A count stays in memory until a later sign-out that names no caller
 and ends nothing arrives after the 60 seconds, so the misses at the end of a flood are written only
