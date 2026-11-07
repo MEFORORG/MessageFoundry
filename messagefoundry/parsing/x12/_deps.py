@@ -18,6 +18,7 @@ This module imports ``pyx12`` (third-party, not an engine package) and nothing f
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 
@@ -43,9 +44,9 @@ def load_x12_validator() -> tuple[Any, Any]:
     return pyx12.x12n_document.x12n_document, pyx12.params.params
 
 
-def load_x12_code_resolver() -> Any:
+def load_x12_code_resolver() -> Callable[..., str | None]:
     """Return ``pyx12.error_codes.x12_code_for``, or a clear :class:`RuntimeError` if the ``[x12]``
-    extra is absent.
+    extra is absent or older than pyx12 4.0.1, which added that module.
 
     ``x12_code_for(err_cde, prefer_5010=...)`` resolves a pyx12 error name to the X12 code the
     997 (``prefer_5010=False``, AK codes) or 999 (``True``, IK codes) carries, ``None`` where pyx12
@@ -53,5 +54,9 @@ def load_x12_code_resolver() -> Any:
     try:
         import pyx12.error_codes
     except ImportError as exc:  # pragma: no cover - exercised only without the [x12] extra
-        raise _missing_extra("strict X12 validation") from exc
-    return pyx12.error_codes.x12_code_for
+        raise RuntimeError(
+            "strict X12 validation requires pyx12>=4.0.1 from the optional 'x12' extra: "
+            "pip install 'messagefoundry[x12]'"
+        ) from exc
+    resolver: Callable[..., str | None] = pyx12.error_codes.x12_code_for
+    return resolver

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import io
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,8 +50,8 @@ class X12SegmentError:
     """One conformance violation, reduced to **PHI-safe structural locators only**.
 
     ``code`` is the X12 error code pyx12 maps it to, preferring the generated ack's code list (997 AK
-    for a 004010 group, 999 IK otherwise, e.g. ``"8"``) and taking the other list's code where pyx12
-    has only that one, or pyx12's own error name where it maps to neither; ``message`` is a
+    when the ack is a 997, 999 IK otherwise, e.g. ``"8"``) and taking the other list's code where
+    pyx12 has only that one, or pyx12's own error name where it maps to neither; ``message`` is a
     synthesized, value-free description;
     ``segment_id`` / ``element_position`` / ``line`` / ``loop`` locate it; ``element_name`` is the
     *schema* data-element label (e.g. ``"Transaction Set Creation Date"``), never the input value."""
@@ -170,28 +171,25 @@ def _element_error(code: str, seg: dict[str, Any], ele: dict[str, Any]) -> X12Se
     )
 
 
-def _prefers_5010(group: dict[str, Any]) -> bool:
-    """Whether a group's codes resolve to 999 IK codes. pyx12 acks a GS08 starting ``004010`` with a
-    997 and a ``005010`` one with a 999, so ``code`` follows the ack the same pass generates."""
-    return not str(group.get("vriic") or "").startswith("004010")
-
-
-def _error_code(err: dict[str, Any], resolve: Any, prefer_5010: bool) -> str:
+def _error_code(err: dict[str, Any], resolve: Callable[..., str | None], prefer_5010: bool) -> str:
     """The X12 error code for one pyx12 JSON error dict. Since pyx12 4.0.1, ``err_cde`` holds pyx12's
     own error name (e.g. ``"ELE_8_invalid_date"``) at segment, element and interchange level, while
     group and transaction level still emit raw X12 numbers, which ``resolve`` passes through. The
-    report's ``x12_code`` field is not read: pyx12 fills it 999-first whatever the version, so a 004010
-    group would report 999-only codes (``"I4"`` for a not-used segment where the 997 says ``"2"``).
+    report's ``x12_code`` field is not read: pyx12 fills it 999-first whatever the version, so a 997
+    pass would report 999-only codes (``"I4"`` for a not-used segment where the 997 says ``"2"``).
     The name stands in only where pyx12 maps it to no X12 code (e.g. ``SEG_8_hl_count_mismatch``)."""
     err_cde = str(err.get("err_cde", ""))
     x12_code = resolve(err_cde, prefer_5010=prefer_5010)
-    return err_cde if x12_code is None else str(x12_code)
+    return err_cde if x12_code is None else x12_code
 
 
-def _flatten_errors(report: dict[str, Any]) -> list[X12SegmentError]:
+def _flatten_errors(
+    report: dict[str, Any], resolve: Callable[..., str | None], prefer_5010: bool
+) -> list[X12SegmentError]:
     """Walk pyx12's nested JSON error report (interchange → group → transaction → segment → element),
-    flattening every recorded error into a PHI-safe :class:`X12SegmentError`."""
-    resolve = load_x12_code_resolver()
+    flattening every recorded error into a PHI-safe :class:`X12SegmentError`. ``prefer_5010`` is False
+    only when the pass generated a 997: pyx12 picks one ack per document (from the last GS08), so the
+    codes follow that ack rather than each group's own version."""
     out: list[X12SegmentError] = []
     for interchange in report.get("interchanges", []):
         # ISA-level codes are the same in the 997 and the 999 (TA1 note codes), so no version is needed.
@@ -199,20 +197,21 @@ def _flatten_errors(report: dict[str, Any]) -> list[X12SegmentError]:
             code = _error_code(err, resolve, True)
             out.append(X12SegmentError(code=code, message="interchange error"))
         for group in interchange.get("groups", []):
-            v5010 = _prefers_5010(group)
             for err in group.get("errors", []):
-                code = _error_code(err, resolve, v5010)
+                code = _error_code(err, resolve, prefer_5010)
                 out.append(X12SegmentError(code=code, message="group error"))
             for txn in group.get("transactions", []):
                 for err in txn.get("errors", []):
-                    code = _error_code(err, resolve, v5010)
+                    code = _error_code(err, resolve, prefer_5010)
                     out.append(X12SegmentError(code=code, message="transaction error"))
                 for seg in txn.get("segments", []):
                     for err in seg.get("errors", []):
-                        out.append(_segment_error(_error_code(err, resolve, v5010), seg, err))
+                        out.append(_segment_error(_error_code(err, resolve, prefer_5010), seg, err))
                     for ele in seg.get("elements", []):
                         for err in ele.get("errors", []):
-                            out.append(_element_error(_error_code(err, resolve, v5010), seg, ele))
+                            out.append(
+                                _element_error(_error_code(err, resolve, prefer_5010), seg, ele)
+                            )
     return out
 
 
@@ -234,6 +233,7 @@ def validate(raw: str | bytes) -> X12ValidationResult:
         text = raw
 
     x12n_document, make_params = load_x12_validator()
+    resolve = load_x12_code_resolver()  # before the walk, so a pyx12 older than 4.0.1 fails first
     params = make_params()
     fd_ack = io.StringIO()
     fd_json = io.StringIO()
@@ -258,12 +258,13 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     if refused is not None:  # pragma: no cover - pyx12 emits well-formed JSON
         raise X12ValidationError("strict X12 validation produced an unreadable error report")
 
-    errors = tuple(_flatten_errors(report))
     ack_text = fd_ack.getvalue().strip()
     ack = ack_text or None
+    ack_transaction = _ack_transaction(ack_text) if ack else None
+    errors = tuple(_flatten_errors(report, resolve, prefer_5010=ack_transaction != "997"))
     return X12ValidationResult(
         valid=valid and not errors,
         errors=errors,
         ack=ack,
-        ack_transaction=_ack_transaction(ack_text) if ack else None,
+        ack_transaction=ack_transaction,
     )

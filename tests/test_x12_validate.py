@@ -25,6 +25,7 @@ from messagefoundry.parsing.x12 import (  # noqa: E402 - after importorskip
     X12ValidationResult,
     validate,
 )
+from messagefoundry.parsing.x12._deps import load_x12_code_resolver  # noqa: E402
 
 _ISA = (
     "ISA*00*          *00*          *ZZ*SENDER         *ZZ*RECEIVER       "
@@ -308,8 +309,8 @@ def test_segment_error_is_frozen_dataclass() -> None:
 
 
 def test_codes_follow_the_ack_version_and_fall_back_to_the_pyx12_name() -> None:
-    # pyx12's own x12_code field is 999-first whatever the version; a 004010 group is acked with a 997,
-    # so its not-used segment is AK304 "2", not the 999's IK304 "I4". A raw group-level X12 number
+    # pyx12's own x12_code field is 999-first whatever the version; a pass that generated a 997 (a
+    # 004010 GS08) reports a not-used segment as AK304 "2", not the 999's IK304 "I4". A raw X12 number
     # passes through, and a name pyx12 maps to no X12 code (an HL count mismatch) stands in as itself.
     def report(vriic: str) -> dict[str, object]:
         seg = {"seg_id": "REF", "errors": [{"err_cde": "SEG_2_segment_not_used"}], "elements": []}
@@ -318,7 +319,28 @@ def test_codes_follow_the_ack_version_and_fall_back_to_the_pyx12_name() -> None:
         group = {"vriic": vriic, "errors": [{"err_cde": "5"}], "transactions": [txn]}
         return {"interchanges": [{"errors": [], "groups": [group]}]}
 
-    codes_4010 = [e.code for e in _X12_VALIDATE._flatten_errors(report("004010X092A1"))]
-    codes_5010 = [e.code for e in _X12_VALIDATE._flatten_errors(report("005010X222A1"))]
+    resolve = load_x12_code_resolver()
+    flatten = _X12_VALIDATE._flatten_errors
+    codes_4010 = [e.code for e in flatten(report("004010X092A1"), resolve, prefer_5010=False)]
+    codes_5010 = [e.code for e in flatten(report("005010X222A1"), resolve, prefer_5010=True)]
     assert codes_4010 == ["5", "2", "SEG_8_hl_count_mismatch"]
     assert codes_5010 == ["5", "I4", "SEG_8_hl_count_mismatch"]
+
+
+def test_validate_resolves_codes_against_the_ack_it_generated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The 004010 270 is acked with a 997, so its codes resolve AK-first; the 005010 837 gets a 999.
+    real = load_x12_code_resolver()
+    seen: list[bool] = []
+
+    def recording(err_cde: str, prefer_5010: bool = True) -> str | None:
+        seen.append(prefer_5010)
+        return real(err_cde, prefer_5010=prefer_5010)
+
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_code_resolver", lambda: recording)
+    result = validate(_conformant_270(dob="19431399"))
+    assert result.ack_transaction == "997" and seen and not any(seen)
+    seen.clear()
+    result = validate(_interchange("ST*837*0001*005010X222A1~", "SE*2*0001~"))
+    assert result.ack_transaction == "999" and seen and all(seen)
