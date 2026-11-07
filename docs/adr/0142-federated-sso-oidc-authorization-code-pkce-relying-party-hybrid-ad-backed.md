@@ -604,6 +604,10 @@ retried" did not say who retries a failed request. It also did not say that both
 from the code and not run. SECURITY.md, linked above, is the source of record for what remains,
 including what a failed request costs.
 
+**CORRECTED 2026-11-05 (BACKLOG #4974).** The first limit is closed: a session rotated while the
+bind's sweep runs is swept too, on SQL Server because a rotation now takes the account's row
+before its session row. SECURITY.md, *Limits of the session sweep*, says how.
+
 **Not decided here.** An account with no binding still enrols its first engine factor on proof of the
 directory credential alone. Closing that needs its own decision.
 [ADR 0207](0207-a-single-use-enrolment-code-for-a-directory-account-s-first-engine-factor.md) takes

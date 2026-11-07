@@ -4886,9 +4886,12 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   binds an account to a federated identity, Windows SSO refuses it. `POST /auth/negotiate` and
   `GET /ui/sso` answer as they do for any failed sign-in, and the `auth.login_failed` row carries
   `reason=federated_sign_in_required`. **Every bind also ends every live session of that
-  account**, in the bind's own transaction, so nothing minted before the bind outlives it,
-  with one limit on the SQL Server store that *Limits of the session sweep* below states. The
-  audit row, the route's answer and the holder's notice carry the count. A Windows SSO sign-in
+  account**. On a first bind the transaction of the bind's own write ends them all. On a rebind
+  the clear, in a transaction of its own before that write, ends every session live at the
+  clear, and the write's transaction ends any minted between the two. So nothing minted before
+  the bind outlives it, a session rotated while the bind runs included (*Limits of the session
+  sweep* below). The audit row, the route's answer and the holder's notice carry the count. A
+  Windows SSO sign-in
   already in flight cannot slip past either: its session insert requires an unbound row. The
   binding decides, not `oidc_enabled`: an account bound while federation is off, or under an
   issuer that is no longer configured, signs in by neither leg until an administrator unbinds
@@ -4899,19 +4902,91 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   has no Windows SSO fallback during an IdP outage. If every enabled Administrator is bound,
   no Administrator can sign in to unbind one. Since vault BACKLOG #2711, `provision-admin` at the
   host can make a local Administrator then, because a bound one does not block it.
-- **Limits of the session sweep.** On the SQL Server store, a session whose token is rotated
-  in the instant the sweep runs can be missed by it. The same holds on that store for an
-  unbind and for every other whole-account revoke, which run the same sweep: at least an
-  administrator's revoke of a user's sessions, a role change and a password reset. The
-  every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) runs
-  its own table-wide statement of the same `UPDATE ... OUTPUT` shape, so treat it as having this
-  limit too. That is a reading by likeness to the per-account sweep, not one traced for the
-  table-wide statement, and the lock-order bullet below does not cover its every-account lock
-  footprint. **A missed session is refused the next time it is presented** (BACKLOG #2592),
-  within the limits the rest of this bullet states. Each of these raises the
-  account's session epoch in the same transaction, and a rotation keeps the epoch the session was
-  sealed under. So the gate refuses and ends the session, and the user's own session list hides
-  it and ends it the same way.
+- **Limits of the session sweep.** **A session whose token is rotated while a whole-account
+  sweep runs is swept too, on all three stores, except in at least the SQL Server cases this
+  paragraph names (BACKLOG #4974).** Until then the SQL Server store could miss any such session. That
+  store's re-key moves the session row to a new clustered key, so a sweep waiting on the row's
+  old key could find it gone and the new one outside its read, or deadlock with the re-key,
+  depending on the query plan. Its rotation now takes the
+  account's row under `UPDLOCK` before the session row, the order each whole-account sweep there
+  read for this takes them in. The unbind takes that row first through its own prior-pair
+  `UPDLOCK` read in `clear_user_federated_subject`, before its account write. A bind that passes
+  its own checks first runs `clear_user_federated_subject`'s transaction, which takes the row
+  through that same prior-pair read. On a pair mismatch (`changed=True`), whether the bind is a
+  first bind or a rebind, that transaction writes nothing and sweeps nothing, and the bind is
+  refused. Otherwise, on a rebind it sweeps, and on a first bind it
+  writes nothing. The row is released between that transaction and the bind's own write, which
+  then takes the row through the account write, and sweeps where that write lands. The TOTP
+  re-enrolment takes it through the account write too, and the whole-account revokes through the
+  epoch raise, at least an administrator's revoke of a user's sessions, a role change and a
+  password reset. So a rotation either commits before the sweep locks the account's row, and the
+  sweep reads the new key, or waits until the sweep commits and then finds the session ended.
+  Where the account's record fails its seal, at least an administrator's revoke of a user's sessions and the every-account revoke still end its
+  sessions, and for those two the order holds too, because the raise reads the row under that
+  lock before it checks the seal. That the order holds there was read from the code and not run.
+  The every-account revoke is run on such an account only as a store call, by the contracts in
+  `tests/test_b2614_revoke_all.py` and `tests/test_b5091_global_session_epoch.py`, which
+  `test_every_account_revoke_contracts` runs on both server legs. Both run it there only in the
+  form that spares the caller's session; neither runs the form with no kept session, which
+  `admin-revoke-sessions` calls. Of the two, only `tests/test_b2614_revoke_all.py` reads back a
+  session the revoke ended there: on such an account that form ends the session it was asked to
+  keep, and that is the session it reads back. `tests/test_b5091_global_session_epoch.py` reads
+  back no session the revoke ended on such an account: it finds that account's session refused
+  once raw writes have put back the session and the account's pre-revoke row. That the
+  administrator's revoke of a user's sessions still ends such an account's sessions was read
+  from the code and not run.
+  The per-account revoke's other form, which spares the caller's session, is reached through the
+  service on such an account only where the seal fails after identity resolution:
+  `DELETE /me/sessions` and the console's `POST /ui/account/sessions/revoke-others`, the only
+  two callers of `AuthService.revoke_other_sessions` that a search of the tree outside `tests/`
+  found for BACKLOG #4974, each resolve the caller in their gate, and then each route's handler
+  calls
+  `AuthService.revoke_other_sessions` with that identity, which it does not resolve again. The
+  API route's gate is `require_reauth_only_action` (`messagefoundry/api/auth_routes.py`),
+  which resolves through `identity_for_token` in `_session_caller` in
+  `messagefoundry/api/security.py`, and its handler `revoke_my_other_sessions` makes the
+  call (`messagefoundry/api/auth_routes.py`). The console route's gate is
+  `require_ui_reauth_only_action` (`messagefoundry_webconsole/routes/account.py`), which
+  resolves through `identity_for_token` in `require_ui` in `messagefoundry_webconsole/_auth.py`,
+  and its handler `ui_revoke_other_sessions` makes
+  the call (`messagefoundry_webconsole/routes/account.py`). That resolution refuses an
+  account whose record fails its seal. It is run on such an account only as a store call, where
+  it ends that session too, by the body in
+  `tests/_session_seal_contract.py`, which `test_session_seal_contract` runs on both server legs.
+  At least a bind, an unbind, a TOTP re-enrolment, an administrator's role change and a password
+  reset of such an account end no session; that was read from the code. The
+  every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) takes
+  the row of each account its read of the account list returns before its table-wide sweep, so
+  the same holds for those accounts. Its sweep also reaches the sessions of an account created
+  after that read, but nothing orders a rotation of one of them against it, so on SQL Server a
+  rotation in that instant can still be missed; the global epoch below ends such a session at
+  its next presentation. A sweep that takes no account row is not ordered against a rotation
+  either, at least the session cap's trim. The trim raises no epoch, so a session a rotation
+  carries past it on SQL Server is not refused later: it stays live, over the cap, until
+  something else ends it, at least a logout, a whole-account sweep, its own expiry, or a later
+  trim that ranks it past the cap. The Postgres store's rotation takes no account row: its
+  sweep waits on the rotated row and then re-checks that row's newest version, which still
+  matches. The SQLite store runs one writer at a time. `test_rotation_racing_a_sweep_is_swept`,
+  in `tests/test_postgres_store.py` and `tests/test_sqlserver_store.py`, runs the shared body in
+  `tests/_federated_unbind_store_contract.py`. It pauses a rotation after its locked read and before
+  its re-key, then runs a bind, an unbind, a revoke of a user's sessions and the every-account
+  revoke against it, on both server legs; on the SQL Server leg it also starts a rotation while a
+  bind holds the account's row. Its bind (`_sweep_by_bind`) is only the store's
+  `set_user_federated_subject` on an unbound account, without the `expect_unbound` the service
+  passes: neither the service's clear-then-write path nor a rebind is raced as one operation.
+  The unbind case races the clear's transaction alone, and no test races a rotation in the gap
+  between the clear and the write. The TOTP re-enrolment's own sweep was read from the code and
+  is not replayed. A role change and a password reset each run that same per-account revoke,
+  `revoke_user_sessions`, in a transaction after their own write; that was read from `set_roles`
+  and `admin_reset_password` in `messagefoundry/auth/service.py`, and neither is replayed through
+  the service. That the old SQL Server order could miss the session, or deadlock with the
+  re-key, depending on the plan, was read from the code and was not run.
+  **A session a whole-account sweep missed is refused the next time it is presented** (BACKLOG
+  #2592), within the limits the rest of this bullet states. The bind, the unbind, the TOTP
+  re-enrolment and the per-account revoke each raise the account's session epoch in the same
+  transaction, and the every-account revoke raises it for each account its list read returned.
+  A rotation keeps the epoch the session was sealed under. So the gate refuses and ends the
+  session, and the user's own session list hides it and ends it the same way.
   **The every-account revoke also raises the store's global session epoch, on all three stores
   (BACKLOG #5091).** Every session is stamped with that epoch when it is minted and resolves
   only while it is current, so the revoke ends a session whatever its read of the account list
@@ -4992,26 +5067,26 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   re-alert throttle, or only to the log where no alert notifier is running.
   **That is a known false alarm, not intended behaviour:** nothing was altered, and neither the
   alert nor the audit row says which case it is, so an operator cannot tell it from tampering.
-  The count the bind, the unbind or the revoke reports leaves out each session it missed. The
-  bind's and the unbind's are read from the driver's row count, so where a session-wide
+  The count the every-account revoke reports leaves out each session it missed: on SQL Server, a
+  session of an account its list read did not return, rotated while it ran. The bind's and the
+  unbind's are read from the driver's row count, so where a session-wide
   `SET NOCOUNT ON` has leaked onto the connection they report -1 instead (BACKLOG #2283). And
-  until the session is presented or listed, the store still holds it as live. A follow-up row,
-  not yet filed, is to carry the fix for the missed session: a sweep that follows a rotated
-  session, so no rotated session is missed. That would not change the -1 count. The Postgres
-  store follows a rotated row and the SQLite store runs one writer at a time, so neither misses a
-  rotated session. The rotation miss was read from the code and has not
-  been reproduced against a server. A bind ends sessions only: an engine factor already enrolled
-  on the account stays.
+  until the session is presented or listed, the store still holds it as live. BACKLOG #4974,
+  which closed the rotation miss as the opening of this bullet states, did not change the -1
+  count. A bind ends sessions only: an engine factor already enrolled on the account stays.
 - **A bind and a user delete take one lock order on both server stores** (BACKLOG #2738). A
-  bind, an unbind and a whole-account revoke lock the account's row and then its sessions.
-  Deleting a user now takes the account's row first too, on SQL Server since BACKLOG #2733 and
+  bind, an unbind and a whole-account revoke lock the account's row and then its sessions, and
+  on SQL Server so does a session rotation (BACKLOG #4974). Deleting a user now takes the account's row first too, on SQL Server since BACKLOG #2733 and
   on Postgres since #2738, so the two cannot deadlock against one account. The order was read
   from the code. `test_bind_and_user_delete_take_one_lock_order` runs on both server legs: it
   pauses a bind while it holds the row, waits until the delete is queued behind it, then
   releases the bind and requires both to finish. Under the old Postgres order, by the same
   reading, the database would end one of them as a deadlock; that was not run. No bind,
   unbind, revoke or user delete retries a deadlock, so a deadlock between any of them and
-  another write still fails that request, and it has to be made again by hand. The SQLite store runs one writer at a time, so it has no lock order to get wrong.
+  another write still fails that request, and it has to be made again by hand. Nor does a
+  rotation: one the server ends as a deadlock victim is a store refusal, which the service
+  answers by revoking the session under both hashes, best effort, and failing the ceremony
+  closed (BACKLOG #3023). The SQLite store runs one writer at a time, so it has no lock order to get wrong.
 - **An account with no binding still signs in by Windows SSO, and its first engine factor needs
   an enrolment code** (ADR 0207). The directory credential alone no longer binds it: the binding
   step also asks a single-use issued code, and so does a federated session on a
