@@ -556,6 +556,53 @@ async def test_engine_two_overlapping_first_loads_start_one_runner(
                 await orphan.stop()
 
 
+async def test_engine_first_load_does_not_start_a_runner_after_a_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop that lands while a first load awaits its threaded build check finds no runner to
+    stop. The load then installs nothing and starts nothing. Red (engine PR 2815, Lander hold
+    6698688363 item 4): the load went on to add_registry and started a runner after the stop."""
+    good = tmp_path / "good"
+    _write_valid_config(good, tmp_path / "in", tmp_path / "out")
+    started: list[RegistryRunner] = []
+    real_start = RegistryRunner.start
+    real_check = RegistryRunner.build_check_off_loop
+    in_check = asyncio.Event()
+    release = asyncio.Event()
+
+    async def recording_start(self: RegistryRunner, *args: Any, **kwargs: Any) -> None:
+        started.append(self)
+        await real_start(self, *args, **kwargs)
+
+    async def held_check(self: RegistryRunner, *args: Any, **kwargs: Any) -> None:
+        in_check.set()
+        await release.wait()
+        await real_check(self, *args, **kwargs)
+
+    monkeypatch.setattr(RegistryRunner, "start", recording_start)
+    monkeypatch.setattr(RegistryRunner, "build_check_off_loop", held_check)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
+    await eng.start()
+    load = asyncio.create_task(eng.reload(good))
+    try:
+        await asyncio.wait_for(in_check.wait(), timeout=5)
+        await eng.stop()
+        release.set()
+        with pytest.raises(RuntimeError, match="stopping"):
+            await asyncio.wait_for(load, timeout=5)
+        assert started == []
+        assert eng.registry_runner is None
+    finally:
+        release.set()
+        if not load.done():
+            load.cancel()
+        await asyncio.gather(load, return_exceptions=True)
+        for orphan in started:
+            await orphan.stop()
+
+
 def _write_env_config(cfg: Path, inbox: Path) -> None:
     """A valid graph whose outbound peer is env()-driven (resolved per environment)."""
     cfg.mkdir(parents=True, exist_ok=True)

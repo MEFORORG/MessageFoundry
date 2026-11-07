@@ -808,6 +808,9 @@ class Engine:
         # unserialized, two overlapping first loads both installed and started a runner, and the
         # first was orphaned (engine PR 2815). reload_detail says what the second one does.
         self._first_load_lock = asyncio.Lock()
+        # Set as stop() begins. A first load reads it under _first_load_lock once its build check
+        # returns, so a stop that found no runner to stop is not followed by one starting.
+        self._stopping = False
         self._graph_reconcile_interval = 1.0
         # The config writes started and not finished: today the connection flag's store write
         # (BACKLOG #2623), the one write this engine tracks. A caller that is cancelled stops
@@ -1490,6 +1493,10 @@ class Engine:
         # could take it, unstarted, as the live runner in that window. Nothing yields between
         # add_registry below and the start taking the runner's reload lock.
         await self._check_runner(registry).build_check_off_loop(registry, env_values)
+        # A stop that began during the check found no runner to stop, so none may start now
+        # (engine PR 2815, Lander hold 6698688363 item 4). Nothing yields from here to add_registry.
+        if self._stopping:
+            raise RuntimeError("the engine is stopping, so the first load started no runner")
         previous_env_values, self._env_values = self._env_values, env_values
         try:
             runner = self.add_registry(registry)
@@ -3829,6 +3836,7 @@ class Engine:
     async def stop(self) -> None:
         """Stop the retention task + the wired graph, then close the store."""
         log.info("engine stopping")
+        self._stopping = True
         # Quiesce the active-passive graph supervisor FIRST (Workstream A1) so it can't reconcile (and
         # re-start the graph) while we tear down. A no-op single-node (never spawned). Cooperative: set
         # the stop event and let any in-flight reconcile finish under the lock (so we never abandon a
