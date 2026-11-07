@@ -429,9 +429,21 @@ async def test_require_seal_for_write_names_each_cause() -> None:
             local_key, USER_KIND, unreadable, local_key.seal(USER_KIND, FIELDS), subject="u"
         )
 
+    # A stored seal that is not text is Forged, not a raw TypeError.
+    with pytest.raises(RowSealError):
+        await require_seal_for_write(
+            sealer,
+            SESSION_KIND,
+            FIELDS,
+            stored.encode(),  # type: ignore[arg-type]
+            subject="s",
+        )
+
     # A TypeError from a defect in the check itself is not a Forged row: it propagates.
     def broken_verify(key_name: str, digest: bytes, mac: str) -> bool:
         raise TypeError("a synthetic defect in the backend")
+
+    sealer = _sealer(backend)  # a fresh cache, so the check reaches Transit
 
     original_verify = backend.verify_seal_hmac
     backend.verify_seal_hmac = broken_verify  # type: ignore[method-assign]

@@ -443,7 +443,8 @@ _UNVERIFIABLE: Final = "unverifiable"
 
 #: The most ROW SEAL Transit calls in flight at once, process-wide. They run on this pool, not
 #: asyncio's default executor, so a slow Vault cannot fill the default executor with seal checks.
-#: Only row-seal calls use it; no other Transit call does. The
+#: The row sealer's own calls use it, through ``_in_transit_pool``; nothing here keeps another
+#: caller from importing that, so check before relying on it being theirs alone. The
 #: queue past the bound has no deadline, so a check waits for a free thread for as long as the
 #: calls ahead of it take, each bounded by the Vault client's own timeout; a thread whose caller
 #: was cancelled finishes its call, and interpreter exit waits for it.
@@ -467,11 +468,14 @@ async def _in_transit_pool[**P, T](call: Callable[P, T], *args: P.args, **kwargs
     refused = False
     try:
         future = loop.run_in_executor(_transit_pool(), bound)
-    except RuntimeError:  # the pool would not take the call (shut down, or no thread to start)
+    except (
+        RuntimeError
+    ):  # the pool refused it (shut down), or queued it but could not start a thread
         refused = True
     if refused:
         # A CipherError, so the sealer reads it as an Outage. Only the hand-off is caught: a
-        # RuntimeError raised BY the call is a defect and propagates as itself.
+        # RuntimeError raised BY the call is a defect and propagates as itself. Where the pool
+        # queued the call before failing to start a thread, it may still run later, unawaited.
         raise CipherError("the Transit row-seal pool could not take the call")
     return await future
 
@@ -807,6 +811,10 @@ async def require_seal_for_write(
     here; a whole token hash in it would reach ``args``."""
     if sealer is None:
         return
+    if stored is not None and not isinstance(stored, str):
+        # A stored seal that is not text (a BLOB a writer put there) is no seal: Forged, as main's
+        # record checks read it, and never a raw TypeError from the parse.
+        raise RowSealError(kind, subject)
     fields = list(fields)
     if kind != SESSION_KIND:
         # A record holding a value the encoder cannot read fails its seal, as main's record checks

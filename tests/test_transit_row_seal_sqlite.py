@@ -119,11 +119,15 @@ async def test_an_outage_on_a_user_write_writes_nothing(
         await store.set_user_disabled("u-1", disabled=True)
     backend.down = False
     assert _seal_of(path, "SELECT authz_seal FROM users WHERE id=?", ("u-1",)) == seal
+    backend.down = True
     with pytest.raises(TransitSealUnavailableError):
-        backend.down = True
         await _user(store, "u-2")
     backend.down = False
-    assert store.row_sealer is not None
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM users WHERE id='u-2'").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 async def test_a_session_write_checks_under_the_active_key(
@@ -143,7 +147,11 @@ async def test_a_session_write_checks_under_the_active_key(
     with pytest.raises(RowSealUnverifiableError) as caught:
         await store.mark_session_reauthed(token)
     # The exception carries no token hash: its args are the kind and a subject.
-    assert token not in repr(caught.value) and token not in str(caught.value.args)
+    assert caught.value.args == ("session", "")
+    # Nothing was written: the planted seal is still there.
+    assert _seal_of(path, "SELECT seal FROM sessions WHERE token_hash=?", (token,)) == _planted(
+        seal
+    )
 
 
 async def test_a_role_upsert_seals_through_transit(
