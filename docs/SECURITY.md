@@ -4814,8 +4814,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   the clear, in a transaction of its own before that write, ends every session live at the
   clear, and the write's transaction ends any minted between the two. So nothing minted before
   the bind outlives it, a session rotated while the bind runs included (*Limits of the session
-  sweep* below). The
-  audit row, the route's answer and the holder's notice carry the count. A Windows SSO sign-in
+  sweep* below). The audit row, the route's answer and the holder's notice carry the count. A
+  Windows SSO sign-in
   already in flight cannot slip past either: its session insert requires an unbound row. The
   binding decides, not `oidc_enabled`: an account bound while federation is off, or under an
   issuer that is no longer configured, signs in by neither leg until an administrator unbinds
@@ -4857,20 +4857,22 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   keep, and that is the session it reads back. `tests/test_b5091_global_session_epoch.py` reads
   back no session the revoke ended on such an account: it finds that account's session refused
   once raw writes have put back the session and the account's pre-revoke row. That the
-  administrator's revoke
-  of a user's sessions still ends such an account's sessions was read from the code and not run.
+  administrator's revoke of a user's sessions still ends such an account's sessions was read
+  from the code and not run.
   The per-account revoke's other form, which spares the caller's session, is reached through the
   service on such an account only where the seal fails after identity resolution:
-  at least `DELETE /me/sessions` and the console's `POST /ui/account/sessions/revoke-others`
-  each resolve the caller in their gate, and then each route's handler calls
+  `DELETE /me/sessions` and the console's `POST /ui/account/sessions/revoke-others`, the only
+  two callers of `AuthService.revoke_other_sessions` that a search of the tree outside `tests/`
+  found for BACKLOG #4974, each resolve the caller in their gate, and then each route's handler
+  calls
   `AuthService.revoke_other_sessions` with that identity, which it does not resolve again. The
   API route's gate is `require_reauth_only_action` (`messagefoundry/api/auth_routes.py:1155`),
-  which resolves through `identity_for_token` in `_session_caller`
-  (`messagefoundry/api/security.py:1140`), and its handler `revoke_my_other_sessions` makes the
+  which resolves through `identity_for_token` in `_session_caller` in
+  `messagefoundry/api/security.py`, and its handler `revoke_my_other_sessions` makes the
   call (`messagefoundry/api/auth_routes.py:1158`). The console route's gate is
   `require_ui_reauth_only_action` (`messagefoundry_webconsole/routes/account.py:692`), which
-  resolves through `identity_for_token` in `require_ui`
-  (`messagefoundry_webconsole/_auth.py:519`), and its handler `ui_revoke_other_sessions` makes
+  resolves through `identity_for_token` in `require_ui` in `messagefoundry_webconsole/_auth.py`,
+  and its handler `ui_revoke_other_sessions` makes
   the call (`messagefoundry_webconsole/routes/account.py:697`). That resolution refuses an
   account whose record fails its seal. It is run on such an account only as a store call, where
   it ends that session too, by the body in
