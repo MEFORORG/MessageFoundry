@@ -7066,11 +7066,14 @@ class _RecoveryKeyConsole:
 _REMOVE_THE_VOID_KEY = "remove that file and run the command again"
 
 #: The step a kept-key warning gives when the store may hold nothing under the key this run minted
-#: and this run cannot tell (PR 2804 twelfth hold). The file is moved, never deleted, until a run
-#: settles whose key it is: a run that mints again found nothing under it, and a run that finds
-#: the store holds data found the store started under it.
+#: and this run cannot tell (PR 2804 twelfth hold). The file is moved, not renamed, since a
+#: secrets directory refuses a file no setting names, and on the same volume, since a move across
+#: volumes on Windows replaces the access list the key file is read under. It is never deleted
+#: until a run settles whose key it is: a run that mints again found nothing under it, and a run
+#: that finds the store holds data found the store started under it.
 _MOVE_THE_KEPT_KEY_ASIDE = (
-    "move that file out of its directory, keeping it, and run the command again"
+    "move that file into another directory on the same volume, keeping it, and run the command "
+    "again"
 )
 
 
@@ -7087,27 +7090,32 @@ def _settle_the_kept_key(
     shown is void or the store's only other key, and the step that settles which. The step moves
     the file aside rather than re-running over it, since under ``--service-account`` the file is a
     handoff a run here cannot convert. Names no key."""
-    from messagefoundry.store.custody_host import keep_the_key_step
-
     flag = "" if service_account is None else f', --service-account "{service_account}" among them'
     if service_account is None:
         back = "move it back and run the command again, which carries on with that store"
     else:
-        back = (
-            "move it back, and keep it. The service converts it into its host blob when it first "
-            "starts as its own account, but this command cannot provision the Administrator from "
-            "a handoff under --service-account. "
-            + keep_the_key_step(store, new_store=True, service_account=service_account)
-        )
+        back = "move it back, and keep it. " + _handoff_kept_step(store, service_account)
     return (
-        f"WARNING: the store could not be created, and {why}, so the store key minted for it is "
+        f"WARNING: the store could not be created, and {why}. So the store key minted for it is "
         f"kept in {path}. No Administrator was provisioned into it. If nothing was written under "
-        "that key, that file and the recovery key shown are void; if the store was started under "
-        "it, they are the store's only keys, so keep both until this is settled. To settle it, "
-        f"{once}{_MOVE_THE_KEPT_KEY_ASIDE} with every argument it was given{flag}. If that run "
-        "mints a new key, nothing was written under the moved file: delete it, and the recovery "
-        "key shown with it is void. If that run stops because the store already holds data, the "
-        f"store was started under the moved file: {back}"
+        "that key, that file and the recovery key shown are void. If the store was started under "
+        "it, they are the store's only keys. Keep both until this is settled. To settle it, "
+        f"{once}{_MOVE_THE_KEPT_KEY_ASIDE}, with every argument it was given{flag}. If that run "
+        "mints a new key, nothing was written under the moved file. Delete it then: the "
+        "recovery key shown with it is void. If that run stops because the store already holds "
+        f"data, the store was started under the moved file. Then {back}"
+    )
+
+
+def _handoff_kept_step(store: StoreSettings, service_account: str) -> str:
+    """The way on for a handoff kept over a store that may have been started under it: a run here
+    cannot convert it, so a re-run over it never carries on (PR 2804 twelfth hold, item 2)."""
+    from messagefoundry.store.custody_host import keep_the_key_step
+
+    return (
+        "The service converts it into its host blob when it first starts as its own account, but "
+        "this command cannot provision the Administrator from a handoff under --service-account. "
+        + keep_the_key_step(store, new_store=True, service_account=service_account)
     )
 
 
@@ -7152,7 +7160,7 @@ def _discard_minted_custody(
         )
         print(_settle_the_kept_key(path, store, service_account, why=why), file=sys.stderr)
         return
-    if server_found == "unread":
+    if server_found == "unread" and not nothing_written:
         why = "whether anything was written under that key could not be read"
         print(
             _settle_the_kept_key(
@@ -7162,6 +7170,16 @@ def _discard_minted_custody(
         )
         return
     if not nothing_written:
+        if service_account is not None:
+            # A re-run over a handoff stops at its conversion, never carries on (twelfth hold).
+            print(
+                "WARNING: the store could not be created, and it may already have been started "
+                f"under the store key minted for it, so that key is kept in {path}. No "
+                "Administrator was provisioned into it. Keep that file. "
+                + _handoff_kept_step(store, service_account),
+                file=sys.stderr,
+            )
+            return
         print(
             f"WARNING: the store could not be created, and it may already have been started "
             f"under the store key minted for it, so that key is kept in {path}. No Administrator "
@@ -7188,7 +7206,9 @@ def _discard_minted_custody(
             service_account=service_account,
         )
         made = ""
-        if store.backend is StoreBackend.SQLITE:
+        if store.backend is StoreBackend.SQLITE and not isinstance(
+            failure, StoreIdPinRefusedBeforeWrite
+        ):
             # A serve can make the SQLite file under the key while it stays, and the re-run then
             # meets a store that exists (PR 2804 twelfth hold, item 3).
             db = Path(store.path).resolve()
@@ -8914,11 +8934,11 @@ def _provision_admin(args: argparse.Namespace) -> int:
         :func:`server_store_found` (PR 2804 eleventh hold). ``None`` where it is not asked: SQLite,
         whose absence ``_discard_minted_custody`` reads itself, a pin refused before the open's
         first write, which already settles it, and an interrupt, which is not answered with more
-        I/O. ``unread`` whenever the probe cannot read the store, so the key is kept, and for
-        ``none`` where the pre-check found a store schema: the schema may only be hidden from this
-        login. Only the refusals a store read can raise are read so; any other exception, a defect
-        in the probe, propagates (PR 2804 twelfth hold, item 1)."""
-        from messagefoundry.config.tls_policy import InsecureHopRefused
+        I/O. ``unread`` whenever the probe cannot read the store, so the key is kept. ``None``, so
+        the key is kept with no settling step, for ``none`` where the pre-check found a store
+        schema: the schema may only be hidden from this login, which a re-run's pre-check would
+        read the same way. Only the refusals a store read can raise are read as ``unread``; any
+        other exception, a defect in the probe, propagates (PR 2804 twelfth hold, item 1)."""
         from messagefoundry.store.base import store_connect_errors, store_driver_errors
         from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
 
@@ -8944,7 +8964,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                     "the store schema the pre-check found is not visible after the failed create,"
                     " so the store key minted for it is kept"
                 )
-                return "unread"
+                return None
             return found
         except HostCustodyRefused as unread:
             # The engine's own text, which names the grant or the server fault, never a cell.

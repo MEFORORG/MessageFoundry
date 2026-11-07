@@ -720,13 +720,16 @@ def _refuse_an_unusable_directory(
         # The variable is named as a literal: this text reaches stderr (keep_the_key_step says
         # why).
         variable = (
-            "set MEFOR_SECRETS_DIRECTORY, here and in the service's own environment, to " + to
+            "set MEFOR_SECRETS_DIRECTORY, here and in the service's own environment, to "
+            f"{to}, and copy into it every other secret file the current secrets directory "
+            "holds, if one is set, since the service reads its other secrets from there too"
         )
         if named:
             return variable
         return (
-            f"point --db at a SQLite path in {to}, since the store key sits beside the store "
-            f"file, or {variable}"
+            f"point --db at a SQLite path in {to}, by its absolute path, here and wherever the "
+            "service passes --db, since the store key sits beside the store file, or "
+            f"{variable}"
         )
 
     if not directory.is_dir():
@@ -736,9 +739,11 @@ def _refuse_an_unusable_directory(
                 f"{none_shown}. To go on, {move_on('a directory ' + secrets_directory)}, and run "
                 "the command again"
             )
+        # A directory behind a parent this account cannot search reads as absent here too.
         raise HostCustodyRefused(
-            f"the custody directory {directory} is missing, {none_shown}. Create it, "
-            f"{secrets_directory}, and run the command again"
+            f"the custody directory {directory} is missing, or a directory above it is one this "
+            f"account cannot search, {none_shown}. Create it, {secrets_directory}, or let this "
+            "account search the directories above it, and run the command again"
         )
     if startupcode._can_add_files(directory) is False:
         raise HostCustodyRefused(

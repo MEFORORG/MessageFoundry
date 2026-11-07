@@ -1457,12 +1457,14 @@ def test_the_advised_reinstall_is_one_the_installer_accepts() -> None:
     assert never in step, step
 
 
-#: The kept-key warning's steps (PR 2804 twelfth hold): the file moved aside and kept, then deleted
-#: only once a run minted a new key, or moved back once a run found the store started under it.
+#: The kept-key warning's steps (PR 2804 twelfth hold): the file moved aside on its volume and
+#: kept, then deleted only once a run minted a new key, or moved back once a run found the store
+#: started under it.
 _SETTLING_STEPS = (
-    "move that file out of its directory, keeping it, and run the command again",
+    "move that file into another directory on the same volume, keeping it, and run the command "
+    "again",
     "the moved file",
-    "delete it",
+    "Delete it then",
     "move it back",
 )
 
@@ -1856,9 +1858,9 @@ def test_a_minted_key_that_cannot_be_removed_is_named_as_this_runs_own(
     assert "Copy into it every secret file" in " ".join(warning.split()), warning
 
 
-@pytest.mark.parametrize("found", ["empty", "unread"])
+@pytest.mark.parametrize("found", ["empty", "unread", "held"])
 def test_a_kept_handoff_names_steps_that_work_under_the_service_account_flag(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], found: Literal["empty", "unread"]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], found: Literal["empty", "unread", "held"]
 ) -> None:
     # PR 2804 twelfth hold, item 2: under --service-account the kept file is a handoff the
     # administrator cannot convert, so a re-run with it in place stops at the conversion. The
@@ -1880,7 +1882,9 @@ def test_a_kept_handoff_names_steps_that_work_under_the_service_account_flag(
     )
     warning = " ".join(capsys.readouterr().err.split())
     assert kept.exists(), warning
-    assert cli._MOVE_THE_KEPT_KEY_ASIDE in warning, warning
+    # "held" may be a started store: no settling step, and no re-run over the handoff.
+    assert (cli._MOVE_THE_KEPT_KEY_ASIDE in warning) is (found != "held"), warning
+    assert "Keep that file and run the command again" not in warning, warning
     assert f'--service-account "{account}" among them' in warning, warning
     assert "If it stops because the store's audit chain was never started" not in warning
     assert "cannot provision the Administrator from a handoff" in warning, warning
@@ -1918,6 +1922,7 @@ def test_a_void_sqlite_key_that_cannot_be_removed_names_the_store_file_a_serve_m
     # store file under it, and the removal step then meets a store that exists. The step names
     # that file too.
     from messagefoundry import __main__ as cli
+    from messagefoundry.store.crypto import CipherError
     from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
 
     db = tmp_path / "never.db"
@@ -1929,11 +1934,16 @@ def test_a_void_sqlite_key_that_cannot_be_removed_names_the_store_file_a_serve_m
         raise PermissionError(13, "Access is denied")
 
     monkeypatch.setattr(Path, "unlink", _held)
-    cli._discard_minted_custody(kept, sqlite, StoreIdPinRefusedBeforeWrite("before"))
+    cli._discard_minted_custody(kept, sqlite, CipherError("the create failed (stand-in)"))
     warning = " ".join(capsys.readouterr().err.split())
     assert cli._REMOVE_THE_VOID_KEY in warning, warning
     assert f"If a serve made the store file {db.resolve()} meanwhile" in warning, warning
     assert f"{db.name}-wal" in warning and f"{db.name}-shm" in warning, warning
+    # Where the pin refused before the write, a store another key made is at that path: it is
+    # never named for removal.
+    cli._discard_minted_custody(kept, sqlite, StoreIdPinRefusedBeforeWrite("before"))
+    pinned = " ".join(capsys.readouterr().err.split())
+    assert cli._REMOVE_THE_VOID_KEY in pinned and "If a serve made" not in pinned, pinned
 
 
 @host_file_platforms
@@ -2231,19 +2241,24 @@ def test_a_failed_server_create_discards_the_minted_key_only_over_a_store_that_h
         # The key may hold data, so it is kept, unchanged, and named.
         assert host_file.read_bytes() == b"minted (stand-in)"
         assert "was removed from" not in err, err
-        if shape == "holds data":
+        if shape in ("holds data", "schema hidden"):
+            # "schema hidden": a re-run's pre-check reads the store as this probe did, so no step
+            # that rests on a re-run's mint is given.
             assert f"so that key is kept in {host_file}" in err, err
+            assert cli._MOVE_THE_KEPT_KEY_ASIDE not in err, err
             return
         assert f"the store key minted for it is kept in {host_file}" in err, err
-        why = "could not be read" if shape in unsettled else "may still have been on its way"
+        why = "could not be read" if shape in ("unreadable", "unreachable") else "on its way"
         assert why in err, err
         # Whether the shown recovery key is void, or is the store's only other key, is said.
         assert "that file and the recovery key shown are void" in err, err
         assert "they are the store's only keys" in err, err
         assert cli._MOVE_THE_KEPT_KEY_ASIDE in err and "If that run mints a new key" in err, err
         assert "--service-account" not in err, err
-        # The step, taken: the file moved aside, and the run again, once the server answers.
-        aside = tmp_path / "aside.key"
+        # The step, taken: the file moved aside on its volume, and the run again, once the server
+        # answers. A secrets directory refuses a file no setting names, so a rename in place fails.
+        (tmp_path / "aside").mkdir()
+        aside = tmp_path / "aside" / host_file.name
         host_file.rename(aside)
         reachable.append(True)
         assert main(argv) == 2
