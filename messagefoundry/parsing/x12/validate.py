@@ -51,8 +51,9 @@ class X12SegmentError:
 
     ``code`` is the X12 error code pyx12 maps it to, preferring the code list of the ack pyx12 picks
     from the last group's GS08 (997 AK for 004010, also when no ack is generated; 999 IK otherwise;
-    e.g. ``"8"``) and taking the other list's code where pyx12 has only that one, or pyx12's own error
-    name where it maps to neither; ``message`` is a synthesized, value-free description;
+    e.g. ``"8"``) and taking the other list's code where pyx12 has only that one, except a 999-only
+    ``I`` code on a 997 pass; pyx12's own error name stands in where no code applies;
+    ``message`` is a synthesized, value-free description;
     ``segment_id`` / ``element_position`` / ``line`` / ``loop`` locate it; ``element_name`` is the
     *schema* data-element label (e.g. ``"Transaction Set Creation Date"``), never the input value."""
 
@@ -70,7 +71,8 @@ class X12ValidationResult:
     """The outcome of a strict pass. ``valid`` is True iff pyx12 found no errors. ``errors`` is the
     flattened, PHI-safe violation list (empty when valid). ``ack`` is the generated 997/999
     Functional Acknowledgment ready to return to the sender (``None`` only if pyx12 emitted none, e.g.
-    for an already-FA transaction); ``ack_transaction`` names which (``"997"``/``"999"``/``None``)."""
+    for an already-FA transaction); ``ack_transaction`` names which (``"997"``/``"999"``), and is ``None``
+    with no ack or with a fragment pyx12's ack writer left when it failed before the closing IEA."""
 
     valid: bool
     errors: tuple[X12SegmentError, ...] = ()
@@ -131,6 +133,13 @@ def _mute_pyx12_logger() -> None:
             logger.setLevel(_MUTED)
 
 
+def _ack_is_complete(ack_text: str) -> bool:
+    """Whether a generated ack runs to its closing IEA. pyx12 writes acks with its own fixed ``*`` and
+    ``~``, and the IEA is the last segment it writes, after every echoed sender value."""
+    segments = [seg.strip() for seg in ack_text.split("~") if seg.strip()]
+    return bool(segments) and segments[-1].startswith("IEA*")
+
+
 # pyx12's ack choice by the last GS08's first six characters; any other version gets no ack.
 _ACK_FOR_VERSION = {"004010": "997", "005010": "999"}
 
@@ -185,10 +194,16 @@ def _error_code(err: dict[str, Any], resolve: Callable[..., str | None], prefer_
     group and transaction level still emit raw X12 numbers, which ``resolve`` passes through. The
     report's ``x12_code`` field is not read: pyx12 fills it 999-first whatever the version, so a 997
     pass would report 999-only codes (``"I4"`` for a not-used segment where the 997 says ``"2"``).
-    The name stands in only where pyx12 maps it to no X12 code (e.g. ``SEG_8_hl_count_mismatch``)."""
+    The name stands in where pyx12 maps it to no X12 code (e.g. ``SEG_8_hl_count_mismatch``), and on a
+    997 pass where its only code is a 999 implementation code (``I`` and digits, e.g. ``"I10"`` for
+    ``ELE_I10_NOT_USED``), which pyx12's 997 omits and no 997 carries."""
     err_cde = str(err.get("err_cde", ""))
     x12_code = resolve(err_cde, prefer_5010=prefer_5010)
-    return err_cde if x12_code is None else x12_code
+    if x12_code is None:
+        return err_cde
+    if not prefer_5010 and x12_code[:1] == "I" and x12_code[1:].isdigit():
+        return err_cde
+    return x12_code
 
 
 def _flatten_errors(
@@ -269,7 +284,9 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     ack_text = fd_ack.getvalue().strip()
     ack = ack_text or None
     version = _last_group_version(report)
-    ack_transaction = _ACK_FOR_VERSION.get(version[:6]) if ack else None
+    # A writer that raises partway is caught and logged by pyx12, leaving a fragment; only an ack that
+    # reached its closing IEA segment is labelled.
+    ack_transaction = _ACK_FOR_VERSION.get(version[:6]) if _ack_is_complete(ack_text) else None
     prefer_5010 = _ACK_FOR_VERSION.get(version[:6]) != "997"
     errors = tuple(_flatten_errors(report, resolve, prefer_5010=prefer_5010))
     return X12ValidationResult(

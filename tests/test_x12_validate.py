@@ -404,3 +404,23 @@ def test_sender_separators_cannot_forge_the_acks_st_segment(
     assert result.ack is not None and "~ST*999" in result.ack and "ST*997" in result.ack
     assert result.ack_transaction == "997"
     assert seen and not any(seen)
+
+
+def test_a_997_pass_never_reports_a_999_only_code() -> None:
+    # NM110 is not used in this 004010 270. pyx12 maps that error to the 999's I10 alone, with no 997
+    # AK code, so on a 997 pass the code is pyx12's own name rather than a code no 997 carries.
+    result = validate(_conformant_270().replace("MI*11122333301~", "MI*11122333301*X~"))
+    assert result.ack_transaction == "997"
+    element = [
+        (e.segment_id, e.element_position, e.code) for e in result.errors if e.element_position
+    ]
+    assert element == [("NM1", 10, "ELE_I10_NOT_USED")]
+    assert not [e.code for e in result.errors if e.code[:1] == "I" and e.code[1:].isdigit()]
+
+
+def test_a_fragment_from_an_ack_writer_that_failed_is_not_labelled() -> None:
+    # An ST with no ST02 makes pyx12's 997 writer raise after its AK1, and pyx12 swallows the error;
+    # the fragment it leaves has no closing IEA, so it is no 997.
+    result = validate(_conformant_270().replace("ST*270*0001~", "ST*270~"))
+    assert result.ack is not None and "IEA" not in result.ack
+    assert result.ack_transaction is None
