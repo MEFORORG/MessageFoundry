@@ -1598,7 +1598,12 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
             holds = re.search(r"\b(?:hold|holds|held|holding)\b", clause)
             if holds and re.search(r"\b(?:state|level|trigger|number)s?\b", clause, re.I):
                 wrongs.append(f"says the hook holds the states or levels: {clause!r}")
-            read_from = re.search(r"\bfrom `[^`]*(?:watch\.py|thresholds\.json)`", clause)
+            # Exempt only a named script reading from the file, not "take the levels from it".
+            read_from = re.search(
+                r"`[\w./-]+\.ps1`(?:(?![.;]\s).)*?\b(?:grades|reads|takes)\b"
+                r"(?:(?![.;]\s).)*?\bfrom `[^`]*(?:watch\.py|thresholds\.json)`",
+                clause,
+            )
             if re.search(r"\b(?:level|trigger)", clause, re.I) and not (read_from and not holds):
                 wrongs.append(f"names the hook beside a level or trigger: {clause!r}")
             # The opening clause says what binds, whatever its verb.
@@ -1704,6 +1709,7 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
                 "wherever that file sets one", "which holds the numbers"
             ),
             "holds the states": "`watch.py` holds the states.",
+            "take the levels from the hook": "Take the HOLD levels and triggers from `watch.py`.",
         }
         for name, sentence in holds.items():
             with self.subTest(form=name):
