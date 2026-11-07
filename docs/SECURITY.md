@@ -3599,23 +3599,36 @@ second factor with a TOTP code or a recovery code. `DELETE /me/mfa` disables it,
 account `[security].require_mfa` covers that holds no passkey recorded as discoverable: TOTP is then
 its only way past the sign-in lock, so it keeps it (ADR 0197 Amendment A). Such an account's first
 factor must be TOTP or a discoverable passkey, too.
-An administrator clears a
-lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user's sessions).
-A confirm turns TOTP on only while the row still holds the staged secret the confirm verified,
-and TOTP is still off (BACKLOG #2224, #3025): the enable is a compare-and-set on the stored
+An administrator clears a lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes
+the user's sessions).
+A confirm turns TOTP on only while the row still holds the staged secret the confirm verified, and
+TOTP is still off (BACKLOG #2224, #3025): the enable is a compare-and-set on the stored
 `totp_secret` cell the code was checked against. If a reset clears the secret during the confirm,
-another confirm turns TOTP on first, or a second enrolment start re-stages a different secret
-inside the same window, the confirm turns nothing on and returns no recovery codes. The refused
-confirm asks the store to end the session it just rotated, and answers as a lost session: `401` on
-`POST /me/mfa/confirm`, and the sign-in page in the web console. It is audited
-`auth.mfa_enroll_refused`. The `reason` values it records include `account_gone`, `already_enabled`,
-`secret_cleared`, `secret_replaced` and `write_lost`. Each is read from the row after the refusal,
-so a `reason` points an operator at the likely cause rather than proving it. The row's
-`session_ended` is false when the store refused to end the rotated session. The token is still not
-handed back, and the row is written whatever the revoke raised, unless its own write fails,
-which is logged at ERROR (vault BACKLOG #3113). The compare is
-on the stored ciphertext, so at least a store-key rotation that re-encrypts the column inside the
-window refuses too. That refusal reads as `secret_replaced` although no second enrolment started.
+another confirm turns TOTP on first, or a second enrolment start re-stages a different secret inside
+the same window, the confirm turns nothing on and returns no recovery codes. The refused confirm
+asks the store to end the session it just rotated, and answers as a lost session: `401` on
+`POST /me/mfa/confirm`, and the sign-in page in the web console. It is audited `auth.mfa_enroll_refused`.
+The `reason` values it records include `account_gone`, `already_enabled`, `secret_cleared`,
+`secret_replaced` and `write_lost`. Each is read from the row after the refusal, so a `reason`
+points an operator at the likely cause rather than proving it. The row's `session_ended` is false
+when no revoke of the rotated session landed, as far as the confirm saw: a cancellation that lands
+after the store committed the revoke still reads false. The
+`auth.mfa_enroll_refused` row is written whatever the revoke raised, unless its own write fails,
+which is logged at ERROR (vault BACKLOG #3113). `AuthService.confirm_mfa_enrollment` tries a refused
+revoke once more (BACKLOG #3025). It retries a raise in `audit_write_errors()`
+(`messagefoundry/store/base.py`) that is not in `AUDIT_WRITE_DEFECTS`
+(`messagefoundry/audit_write.py`), and nothing else. The confirm stamps the session MFA-verified
+before it rotates it, so the rotated session is stamped MFA-verified from the moment it exists. It
+can stay live until its own timers end it in at least these cases: the revoke does not land, because
+the first attempt is refused and the retry does not land either, or because the first attempt meets
+a cancellation or a raise the helper does not answer False, so no second attempt runs; `enable_totp`
+itself raises, so no revoke runs; the `auth.session_rotated` audit write raises, after the rotation
+and before `enable_totp`; a cancellation lands during the session-cap run that follows the rotation,
+also before `enable_totp`; or the `auth.mfa_enrolled` audit write raises, after `enable_totp` turned
+TOTP on. While the session lives, it counts as a full session under `[auth].max_sessions_per_user`.
+Its token is not handed back in any case. The compare is on the stored ciphertext, so at least a
+store-key rotation that re-encrypts the column inside the window refuses too. That refusal reads as
+`secret_replaced` although no second enrolment started.
 `write_lost` means the row still held the verified secret with TOTP off, so the enable lost to
 some other concurrent write. After a `write_lost` or a store-key rotation the staged secret still
 stands. The user signs in again, because the refused confirm hands no token back and asks the
