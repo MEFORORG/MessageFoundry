@@ -173,7 +173,9 @@ async def test_executor_query_returns_rows_as_dicts(monkeypatch: pytest.MonkeyPa
     sql, params = pool.cursor_obj.executed
     assert ":mrn" not in sql and "?" in sql
     assert params == ("M1",)
-    assert pool.acquired == 1 and pool.released == 1  # connection always released
+    # Two borrows: the login role probe's when the pool first opened (BACKLOG #2617), then the
+    # lookup's. Each connection is always released.
+    assert pool.acquired == 2 and pool.released == 2
 
 
 async def test_executor_empty_result(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -207,7 +209,7 @@ async def test_executor_db_error_is_phi_free(monkeypatch: pytest.MonkeyPatch) ->
     msg = str(ei.value)
     assert "clarity" in msg and "08S01" in msg
     assert "ssn" not in msg and "000-00-0000" not in msg and "patient" not in msg
-    assert pool.released == 1  # released even on error
+    assert pool.released == 2  # the role probe's borrow and the lookup's, released even on error
 
 
 async def test_executor_aclose_closes_pools(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -249,7 +251,9 @@ async def test_executor_refuses_a_result_over_max_rows_at_the_fetch(
     assert "NPI0" not in msg and "SSN-" not in msg and "patient" not in msg and "M1" not in msg
     assert pool.cursor_obj.fetched == 4
     assert pool.cursor_obj.fetchall_calls == 0
-    assert pool.released == 1  # the connection goes back even on a refusal
+    # The role probe's borrow (BACKLOG #2617) and the lookup's; the lookup's goes back even on a
+    # refusal.
+    assert pool.released == 2
 
 
 async def test_executor_returns_a_result_of_exactly_max_rows(

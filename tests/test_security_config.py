@@ -44,16 +44,19 @@ from messagefoundry.config.settings import (
 )
 
 
-def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
+def _loosenings(
+    sec: SecuritySettings, *, auth: AuthSettings | None = None
+) -> list[tuple[str, str]]:
     """``security_loosenings`` with the shipped [store]/[auth] defaults and an empty accepted set.
 
     The registry takes all four inputs as REQUIRED arguments deliberately (ADR 0148: one posture, and a
     deviation the registry cannot see is a second posture by the back door). The tests below are about
-    the ``[security]`` switches specifically, so the other three are pinned at shipped values here."""
+    the ``[security]`` switches specifically, so the other three are pinned at shipped values here.
+    ``auth`` replaces the default [auth] for a switch the registry reads off its [auth] copy."""
     return security_loosenings(
         sec,
         StoreSettings(),
-        AuthSettings(),
+        AuthSettings() if auth is None else auth,
         AlertsSettings(),
         SecretRotationSettings(),
         cleartext_hops=(),
@@ -542,6 +545,25 @@ def test_single_factor_at_exposure_advisory_names_what_the_gate_reads() -> None:
     )
 
 
+def _ide_field_entry(switch: str) -> tuple[str, str]:
+    """The IDE Security Settings page's FIELDS entry for ``switch``, and its decoded ``risk``.
+
+    TypeScript cannot import the Python, so this reads the source. One FIELDS entry is one
+    `{ ... }` with no nested braces, so `[^{}]` keeps the match inside it, and the captured literal
+    is decoded as JSON so a backslash-u escape compares as its character. Whitespace is optional
+    around every token, so reformatting the entry still matches it."""
+    source = (
+        Path(__file__).resolve().parent.parent / "ide" / "src" / "securityEditorWebview.ts"
+    ).read_text(encoding="utf-8")
+    entry = re.search(rf'\{{\s*key\s*:\s*"{re.escape(switch)}"\s*,[^{{}}]*\}}', source)
+    assert entry is not None, f"no FIELDS entry for {switch} in securityEditorWebview.ts"
+    risk = re.search(r'\brisk\s*:\s*("(?:[^"\\]|\\.)*")', entry.group(0))
+    assert risk is not None, f"the {switch} entry has no risk string"
+    decoded = json.loads(risk.group(1))
+    assert isinstance(decoded, str)
+    return entry.group(0), decoded
+
+
 @pytest.mark.parametrize(
     ("switch", "sec"),
     [
@@ -570,22 +592,39 @@ def test_ide_security_editor_risk_mirrors_the_engine_text(
     single-factor" after the engine text was corrected. TypeScript cannot import the Python, so this
     reads the source. Scoped to the two MFA switches, the message-body window and the per-tier
     retention acknowledgements (vault BACKLOG #2280); other risks there are shorter on purpose."""
-    source = (
-        Path(__file__).resolve().parent.parent / "ide" / "src" / "securityEditorWebview.ts"
-    ).read_text(encoding="utf-8")
-    # One FIELDS entry is one `{ ... }` with no nested braces, so `[^{}]` keeps the match inside it,
-    # and the captured literal is decoded as JSON so a backslash-u escape compares as its character.
-    # Whitespace is optional around every token, so reformatting the entry still matches it.
-    entry = re.search(rf'\{{\s*key\s*:\s*"{re.escape(switch)}"\s*,[^{{}}]*\}}', source)
-    assert entry is not None, f"no FIELDS entry for {switch} in securityEditorWebview.ts"
-    risk = re.search(r'\brisk\s*:\s*("(?:[^"\\]|\\.)*")', entry.group(0))
-    assert risk is not None, f"the {switch} entry has no risk string"
-    assert json.loads(risk.group(1)) == dict(_loosenings(sec))[switch]
+    entry, risk = _ide_field_entry(switch)
+    assert risk == dict(_loosenings(sec))[switch]
     if switch.startswith("allow_"):
         # An acknowledgement is a bool whose TRUE is the loosening. Without both, the page would
         # show no warning for the switch, or warn on its secure position.
-        assert re.search(r'\btype\s*:\s*"bool"', entry.group(0)), f"{switch} is not a bool"
-        assert re.search(r"\binsecure\s*:\s*true\b", entry.group(0)), f"{switch}: insecure != true"
+        assert re.search(r'\btype\s*:\s*"bool"', entry), f"{switch} is not a bool"
+        assert re.search(r"\binsecure\s*:\s*true\b", entry), f"{switch}: insecure != true"
+
+
+@pytest.mark.parametrize(
+    ("switch", "auth"),
+    [
+        ("sign_out_after_idle_minutes", AuthSettings(session_idle_timeout_minutes=31)),
+        ("max_session_hours", AuthSettings(session_absolute_hours=13)),
+    ],
+)
+def test_ide_security_editor_marks_a_session_limit_above_its_default(
+    switch: str, auth: AuthSettings
+) -> None:
+    """Vault BACKLOG #2600. The engine names each [security] session limit above its shipped
+    default, so the IDE page must read it the same way: a ``looserAboveDefault`` entry, not a
+    single ``insecure`` value, whose risk ends with the engine's own clause. The engine text quotes
+    the value and the default, so only the clause after them is compared.
+
+    The engine reads each limit off the [auth] field the desugar copies it into, so ``auth`` holds
+    the looser value and the registry is asked for the ``[security]`` name."""
+    entry, risk = _ide_field_entry(switch)
+    assert re.search(r"\blooserAboveDefault\s*:\s*true\b", entry), switch
+    assert not re.search(r"\binsecure\s*:", entry), f"{switch}: one value is not the rule"
+    engine = dict(_loosenings(SecuritySettings(), auth=auth))[switch]
+    assert ", so " in engine, f"{switch}: the engine risk lost the clause the IDE mirrors"
+    clause = engine.split(", so ", 1)[1]
+    assert risk.endswith(", so " + clause)
 
 
 def test_loosening_warns_and_prod_phi_refuses(

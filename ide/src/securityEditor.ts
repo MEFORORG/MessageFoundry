@@ -7,9 +7,9 @@
 // read-only (GET /security/posture). The switches are pure data (booleans/ints/strings, no code), so —
 // like connections.toml (ADR 0007) and [[alerts.rules]] (ADR 0014) — they are GUI-manageable.
 //
-// Every switch defaults to the SECURE position; when the operator moves one to its insecure value the
-// form shows a plain-language loosening warning in place (CISA "make deviations from safe defaults
-// obvious"). A change takes effect on the next engine restart (the TOML is read at startup).
+// Every switch defaults to the SECURE position; when the operator moves one to its insecure value, or a
+// session limit above its default, the form shows a plain-language loosening warning in place (CISA
+// "make deviations from safe defaults obvious"). A change takes effect on the next engine restart (the TOML is read at startup).
 import * as vscode from "vscode";
 import { runJson, serviceConfig, workspaceDir } from "./cli";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";

@@ -26,6 +26,7 @@ import asyncio
 import datetime
 import gc
 import logging
+import os
 import ssl
 import time
 from collections.abc import Callable, Hashable, Mapping, Sequence
@@ -85,8 +86,9 @@ _SECONDS_PER_DAY = 86_400
 
 @dataclass(frozen=True)
 class MonitoredCert:
-    """A certificate file the engine serves with: ``label`` identifies it in the alert (``"api"`` or a
-    connection name); ``path`` is the PEM file to read (public cert only — never its key)."""
+    """A certificate file the engine serves or presents with: ``label`` identifies it in the alert
+    (``"api"``, a connection name, or a setting's dotted name from :func:`certs_from_settings`);
+    ``path`` is the PEM file to read (public cert only — never its key)."""
 
     label: str
     path: str
@@ -226,21 +228,43 @@ def crls_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
 
 def certs_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
     """The certificate files the service settings name that no connection carries, each a
-    ``kind="cert"`` :class:`MonitoredCert`. Today that is the SQL Server ``[store].ssl_root_cert``
-    pin, labelled ``"store.ssl_root_cert"`` in the dotted style of :func:`crls_from_settings`.
+    ``kind="cert"`` :class:`MonitoredCert` labelled in the dotted style of
+    :func:`crls_from_settings`. At least these two:
 
-    Vault BACKLOG #2223: the store sends that pin with ``Encrypt=strict``, where Microsoft documents
-    that the driver does not check a pin match's expiry; the ``ssl_root_cert`` row of
-    ``docs/CONFIGURATION.md`` says more. The store refuses an expired pin only at store open, and a
-    store opened before the pin expired keeps connecting after it, so watching it here is what warns
-    ahead of that. A PostgreSQL ``ssl_root_cert`` is a CA bundle the driver
-    validates itself, so it is not listed."""
+    - ``store.ssl_root_cert``, the SQL Server store pin. Vault BACKLOG #2223: the store sends that
+      pin with ``Encrypt=strict``, where Microsoft documents that the driver does not check a pin
+      match's expiry; the ``ssl_root_cert`` row of ``docs/CONFIGURATION.md`` says more. The store
+      refuses an expired pin only at store open, and a store opened before the pin expired keeps
+      connecting after it, so watching it here is what warns ahead of that. A PostgreSQL
+      ``ssl_root_cert`` is a CA bundle the driver validates itself, so it is not listed.
+    - ``auth.oidc_client_certificate``, whose thumbprint each OIDC ``private_key_jwt`` client
+      assertion carries (BACKLOG #296). The signer checks its validity window only at start.
+      Listed only where the signer loads it (OIDC on, ``private_key_jwt``), so a leftover value
+      raises no alert for a credential nothing sends. Inline PEM names no file, so only a path is
+      listed (``-----BEGIN`` is the signer's own test for inline PEM). Unlike the signer, which
+      probes nothing and names the setting instead of the value (BACKLOG #1664), this list probes:
+      it keeps only a value naming an existing file, so a mis-set value such as a bare base64 body
+      is never echoed into the log or the inventory as a "path". The cost is that a mistyped path
+      adds no row here; the signer still refuses it at start, by setting name. The signer reads the
+      file once, so the row watches the file, not the copy the signer holds."""
+    certs: list[MonitoredCert] = []
     store, pin = settings.store, settings.store.ssl_root_cert
     # Only where the store sends it: an escaped weakened posture sends no pin.
     sends_pin = store.encrypt and not store.trust_server_certificate
     if store.backend is StoreBackend.SQLSERVER and sends_pin and isinstance(pin, str) and pin:
-        return [MonitoredCert("store.ssl_root_cert", pin)]
-    return []
+        certs.append(MonitoredCert("store.ssl_root_cert", pin))
+    auth, oidc_cert = settings.auth, settings.auth.oidc_client_certificate
+    # oidc_private_key_jwt is belt and braces: with OIDC on, settings load already refuses a
+    # certificate beside the secret method, so only oidc_enabled filters a loadable config today.
+    if (
+        auth.oidc_enabled
+        and auth.oidc_private_key_jwt
+        and isinstance(oidc_cert, str)
+        and "-----BEGIN" not in oidc_cert
+        and os.path.isfile(oidc_cert)
+    ):
+        certs.append(MonitoredCert("auth.oidc_client_certificate", oidc_cert))
+    return certs
 
 
 def peer_cert_expiry(peercert: Mapping[str, Any], *, now: float) -> tuple[str, int] | None:

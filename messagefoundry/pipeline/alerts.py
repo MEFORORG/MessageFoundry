@@ -459,8 +459,10 @@ class AlertSink(Protocol):
         ...
 
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
-        """A served TLS certificate is expired or within the configured warn window. ``name`` labels
-        which cert (``"api"`` or the connection name); ``path`` is the PEM file; ``not_after`` is the
+        """A watched certificate is expired or within the configured warn window: a served or
+        presented TLS certificate, or a certificate setting such as the OIDC client certificate. ``name`` labels
+        which cert (``"api"``, a connection name, or a setting's dotted name such as
+        ``"auth.oidc_client_certificate"``); ``path`` is the PEM file; ``not_after`` is the
         ISO expiry; ``days_remaining`` is negative once expired. No key material is read or logged.
         Emitted by the :class:`~messagefoundry.pipeline.cert_expiry.CertExpiryRunner`."""
         ...
@@ -885,6 +887,28 @@ class AlertSink(Protocol):
         """The INVERSE of :meth:`store_privilege_warning`: a start whose preflight OBSERVED a clean
         store principal. No page; when alert-state is wired (ADR 0044) it auto-resolves the open
         warning for the same subject, so a fixed grant clears the dashboard."""
+        ...
+
+    def vault_privilege_warning(
+        self, name: str, *, finding: str, refusing_count: int, detail: str
+    ) -> None:
+        """The Vault privilege preflight found a Vault token over-granted, or could not read it, at
+        start (BACKLOG #2903, ADR 0216). ``finding`` is ``"over_granted"`` or ``"unobservable"``.
+        ``refusing_count`` is how many of the over-grants are in the class that refuses a start
+        under ``enforce`` (the root policy, a grant on an administrative path); it is 0 for a token
+        whose over-grants are all in the warning class, and means nothing for ``"unobservable"``.
+        ``name`` is the subject, ``vault:<hop>`` (``vault:store`` or ``vault:secrets``). ``detail``
+        is the hop's judgment with control characters escaped: policy names, paths and capabilities
+        only, never a token, an accessor or a digest of either, and no message content. Fired
+        before any refusal, so a refused start still pages, and on a grant the opt-out accepts,
+        which quiets nothing. Emitted by
+        :func:`~messagefoundry.vault_preflight.run_vault_privilege_preflight`."""
+        ...
+
+    def vault_privilege_clean(self, name: str) -> None:
+        """The INVERSE of :meth:`vault_privilege_warning`: a start whose preflight read a Vault
+        token and found it clean. No page; when alert-state is wired (ADR 0044) it auto-resolves
+        the open warning for the same subject, so a fixed token clears the dashboard."""
         ...
 
     def config_changed(
@@ -1473,6 +1497,21 @@ class LoggingAlertSink:
     def store_privilege_clean(self, name: str) -> None:
         # The inverse (auto-resolve) event; no page, so DEBUG: the preflight already logged at INFO.
         log.debug("ALERT store_privilege_clean: %r store principal observed clean", name)
+
+    def vault_privilege_warning(
+        self, name: str, *, finding: str, refusing_count: int, detail: str
+    ) -> None:
+        # An unobservable read never judged the grant, so a "0 in the refusing class" would read clean.
+        counted = (
+            f"{refusing_count} grant(s) in the refusing class"
+            if finding == "over_granted"
+            else "the token's grants were not read"
+        )
+        log.warning("ALERT vault_privilege_warning: %r %s (%s): %s", name, finding, counted, detail)
+
+    def vault_privilege_clean(self, name: str) -> None:
+        # The inverse (auto-resolve) event; no page, so DEBUG: the preflight already logged at INFO.
+        log.debug("ALERT vault_privilege_clean: %r Vault token observed clean", name)
 
     def config_changed(
         self,

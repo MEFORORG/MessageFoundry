@@ -92,6 +92,377 @@ def test_set_rejects_a_file_that_still_has_a_relocated_legacy_key(
     assert rc == 1
 
 
+@pytest.mark.parametrize(
+    ("switch", "looser"), [("sign_out_after_idle_minutes", 31), ("max_session_hours", 13)]
+)
+def test_set_preview_reads_the_session_limits_after_the_edit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], switch: str, looser: int
+) -> None:
+    """Vault BACKLOG #2600: the two [security] session limits are reported off their [auth] copies,
+    so the preview must name a limit the edit sets looser (the first assertion) and drop one the
+    edit removes (the second), as the saved file reads back. Before the fix it paired the edited
+    [security] with the [auth] loaded before the edit and did neither. The pairing with the
+    pre-edit load itself is guarded by test_set_preview_scope_is_read_after_the_edit."""
+    toml = tmp_path / "mf.toml"
+    rc, res = _set(toml, {switch: looser}, capsys)
+    assert rc == 0
+    assert switch in [lo["switch"] for lo in res["loosenings"]]
+    # Agrees with what `show` reads back from the saved file.
+    assert switch in [lo["switch"] for lo in _show(toml, capsys)["loosenings"]]
+    rc, res = _set(toml, {switch: None}, capsys)
+    assert rc == 0
+    assert switch not in [lo["switch"] for lo in res["loosenings"]]
+
+
+def _entries(res: dict, switch: str) -> list[dict]:
+    return [lo for lo in res["loosenings"] if lo["switch"] == switch]
+
+
+def test_the_session_limits_are_reported_as_the_file_sets_them(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both commands print the file's [security] in `values`, so a session limit the file sets
+    looser is named once, as the file's, even while a shell variable tightens it (vault BACKLOG
+    #2600). The variable is a valid one, so the load succeeds and nothing reads as partial."""
+    toml = tmp_path / "mf.toml"
+    monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", "12")
+    rc, res = _set(toml, {"max_session_hours": 24}, capsys)
+    assert rc == 0 and res["loosenings_partial"] is False
+    (entry,) = _entries(res, "max_session_hours")
+    assert "MEFOR_SECURITY" not in entry["risk"]
+
+
+@pytest.mark.parametrize(
+    ("switch", "looser"), [("max_session_hours", "48"), ("sign_out_after_idle_minutes", "240")]
+)
+def test_a_session_limit_only_the_environment_loosens_is_named_as_the_environments(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    switch: str,
+    looser: str,
+) -> None:
+    """The file leaves the limit at its default and a MEFOR_SECURITY_* variable in this shell sets
+    it looser. `show` and the `set` preview still name it, as origin/main did, labelled with the
+    variable, since `values` prints the file's default (vault BACKLOG #2600). The control is the
+    same file with no variable: nothing is named."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nrequire_mfa = true\n", encoding="utf-8")
+    assert _entries(_show(toml, capsys), switch) == []
+    variable = f"{_ENV_PREFIX}SECURITY_{switch.upper()}"
+    monkeypatch.setenv(variable, looser)
+    data = _show(toml, capsys)
+    assert data["loosenings_partial"] is False
+    assert data["values"][switch] == data["defaults"][switch]
+    rc, res = _set(toml, {"block_unlisted_outbound": True}, capsys)
+    assert rc == 0 and res["loosenings_partial"] is False
+    for report in (data, res):
+        (entry,) = _entries(report, switch)
+        assert entry["risk"].startswith(f"set by {variable} in this command's environment")
+
+
+def test_a_variable_looser_than_a_loose_file_is_named_beside_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file sets the limit looser and the variable looser still: both values are named, the
+    file's unlabelled and the variable's labelled, so the looser one this shell loads is not hidden
+    behind the file's (vault BACKLOG #2600)."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nmax_session_hours = 24\n", encoding="utf-8")
+    monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", "48")
+    authored, from_env = _entries(_show(toml, capsys), "max_session_hours")
+    assert "MEFOR_SECURITY" not in authored["risk"]
+    assert from_env["risk"].startswith(f"set by {_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS")
+
+
+def test_two_reads_that_disagree_with_no_variable_are_not_blamed_on_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no variable set, a loaded limit that differs from the [security] read, as a concurrent
+    edit between the two reads leaves it, is still named but not labelled as a variable that does
+    not exist (vault BACKLOG #2600)."""
+    from messagefoundry.config import security_edit
+
+    monkeypatch.delenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", raising=False)
+    monkeypatch.setattr(security_edit, "read_security", lambda service_config: {})
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nmax_session_hours = 48\n", encoding="utf-8")
+    (entry,) = _entries(_show(toml, capsys), "max_session_hours")
+    assert entry["risk"].startswith("read differently by the whole-file load")
+
+
+def _clear_security_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove every spelling of a MEFOR_SECURITY_* variable from this test's environment, so a
+    developer shell's own cannot change what the test reads."""
+    import os
+
+    for name in list(os.environ):
+        if name.upper().startswith(f"{_ENV_PREFIX}SECURITY_"):
+            monkeypatch.delenv(name)
+
+
+def test_a_variable_equal_to_the_file_adds_no_entry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A MEFOR_SECURITY_* variable that sets a session limit to the file's own value adds nothing:
+    the limit is named once, as the file's, unlabelled (vault BACKLOG #2600). The control is the
+    same file with the variable one hour looser: a second, labelled entry appears."""
+    _clear_security_env(monkeypatch)
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nmax_session_hours = 48\n", encoding="utf-8")
+    variable = f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS"
+    monkeypatch.setenv(variable, "48")
+    (entry,) = _entries(_show(toml, capsys), "max_session_hours")
+    assert not _is_labelled(entry), entry
+    monkeypatch.setenv(variable, "49")
+    authored, labelled = _entries(_show(toml, capsys), "max_session_hours")
+    assert not _is_labelled(authored) and labelled["risk"].startswith(f"set by {variable}")
+
+
+def test_set_on_a_new_file_names_the_variable_show_on_an_absent_one_does_not(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`show` on a file that does not exist runs no load, so a variable that loosens a session
+    limit is not named there; `set` on that path writes a new file and loads it, so its preview
+    names the variable (vault BACKLOG #2600). Each arm is the other's control."""
+    _clear_security_env(monkeypatch)
+    toml = tmp_path / "mf.toml"
+    variable = f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS"
+    monkeypatch.setenv(variable, "48")
+    assert _entries(_show(toml, capsys), "max_session_hours") == []
+    rc, res = _set(toml, {"block_unlisted_outbound": True}, capsys)
+    assert rc == 0 and toml.exists()
+    (entry,) = _entries(res, "max_session_hours")
+    assert entry["risk"].startswith(f"set by {variable} in this command's environment")
+
+
+@pytest.mark.parametrize(
+    ("names", "read_by_the_load"),
+    [
+        (("MEFOR_security_max_session_hours",), True),
+        (("mefor_SECURITY_MAX_SESSION_HOURS",), False),
+        (("MEFOR_SECURITY_MAX_SESSION_HOURS", "MEFOR_security_max_session_hours"), True),
+    ],
+)
+def test_the_label_names_a_variable_by_the_loaders_rule(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    names: tuple[str, ...],
+    read_by_the_load: bool,
+) -> None:
+    """The label names a variable only as the loader reads one: the MEFOR_ prefix matched as
+    written, the rest in any case (vault BACKLOG #2600). The environment is a plain mapping, as a
+    case-sensitive platform's is, so this runs the same on Windows. The [security] read is emptied,
+    so the two reads disagree whether or not the variable is read.
+
+    A name the loader reads is named as written. One whose prefix is lower case the loader skips,
+    so the label must not blame it; an upper-casing lookup did. Of two spellings the loader reads,
+    the later one in the environment takes effect, and the label names that one alone: the earlier
+    is set to a stricter 12, so a label naming it would carry the wrong value."""
+    import os
+
+    from messagefoundry.config import security_edit
+
+    environ = {k: v for k, v in os.environ.items() if not k.upper().startswith("MEFOR_SECURITY_")}
+    for name in names[:-1]:
+        environ[name] = "12"
+    name = names[-1]
+    environ[name] = "49"
+    monkeypatch.setattr(os, "environ", environ)
+    monkeypatch.setattr(security_edit, "read_security", lambda service_config: {})
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nmax_session_hours = 48\n", encoding="utf-8")
+    (entry,) = _entries(_show(toml, capsys), "max_session_hours")
+    if read_by_the_load:
+        assert entry["risk"].startswith(f"set by {name} in this command's environment,"), entry
+        assert "49 hour" in entry["risk"], entry
+        assert all(other not in entry["risk"] for other in names[:-1]), entry
+    else:
+        assert entry["risk"].startswith("read differently by the whole-file load"), entry
+        assert "48 hour" in entry["risk"], entry
+
+
+@pytest.mark.parametrize("error", ["security_edit", "os"])
+def test_set_preview_does_not_refuse_an_edit_whose_candidate_read_raises(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    error: str,
+) -> None:
+    """The preview's read of the candidate is for the report only, so a SecurityEditError or an
+    OSError from it falls back to the pre-check view rather than refusing an edit the whole-file
+    load accepted (vault BACKLOG #2600). Only the candidate's read raises; the live file reads.
+
+    The fallback logs a WARNING naming the exception's type and nothing of its text, which can
+    quote the file's values. The control is an edit whose candidate reads: it logs no such line.
+    The handler sits on the module's logger, since `--json` replaces the root's handlers."""
+    import logging
+
+    from messagefoundry.config import security_edit
+
+    real = security_edit.read_security
+    toml = tmp_path / "mf.toml"
+    marker = "could not be re-read for the report"
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Collect(logging.WARNING)
+    logger = logging.getLogger("messagefoundry.__main__")
+    logger.addHandler(handler)
+    try:
+        rc, _ = _set(toml, {"require_mfa": True}, capsys)
+        assert rc == 0 and not [r for r in records if marker in r.getMessage()]
+
+        def failing_candidate(service_config: str | Path) -> dict:
+            if Path(service_config) != toml:
+                if error == "os":
+                    raise OSError("secret-sentinel-0451")
+                raise security_edit.SecurityEditError("secret-sentinel-0451")
+            return real(service_config)
+
+        monkeypatch.setattr(security_edit, "read_security", failing_candidate)
+        rc, res = _set(toml, {"max_session_hours": 48}, capsys)
+    finally:
+        logger.removeHandler(handler)
+    assert rc == 0, res
+    assert "max_session_hours = 48" in toml.read_text(encoding="utf-8")
+    assert _entries(res, "max_session_hours")
+    (record,) = [r for r in records if marker in r.getMessage()]
+    assert record.levelno == logging.WARNING and record.exc_info is None
+    expected = "OSError" if error == "os" else "SecurityEditError"
+    assert f"({expected})" in record.getMessage()
+    assert all("secret-sentinel-0451" not in r.getMessage() for r in records)
+
+
+def test_an_unset_session_limit_reads_the_auth_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The load copies a [security] switch into [auth] only when the file sets it, so an unset
+    session limit stays at the [auth] field's own default. The two defaults are separate literals,
+    so a [security] default moved alone must not make `show` name a limit the engine would not
+    (vault BACKLOG #2600). The control is the set limit: the same moved default, authored, is named."""
+    from messagefoundry.config import settings
+
+    class _MovedDefault(settings.SecuritySettings):
+        max_session_hours: int = 24
+
+    monkeypatch.setattr(settings, "SecuritySettings", _MovedDefault)
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nrequire_mfa = true\n", encoding="utf-8")
+    data = _show(toml, capsys)
+    assert data["values"]["max_session_hours"] == 24 and data["loosenings_partial"] is False
+    assert "max_session_hours" not in [lo["switch"] for lo in data["loosenings"]]
+    toml.write_text("[security]\nmax_session_hours = 24\n", encoding="utf-8")
+    assert "max_session_hours" in [lo["switch"] for lo in _show(toml, capsys)["loosenings"]]
+
+
+def _is_labelled(entry: dict) -> bool:
+    """Whether a loosening entry is one the whole-file load added, not an authored one."""
+    return entry["risk"].startswith(("set by ", "read differently by the whole-file load"))
+
+
+@pytest.mark.parametrize("candidate_read", ["fresh", "stale"])
+def test_set_preview_reads_the_security_it_saved(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_read: str,
+) -> None:
+    """The preview's [security] is the one in the candidate the edit lock validated, not the
+    pre-check read taken before the lock (vault BACKLOG #2600). The first read is made stale, as a
+    concurrent edit landing between it and the lock would leave it, and the saved file's looser
+    session limit is named exactly once, as the file's, with no entry labelled as the load's.
+
+    The `stale` arm is the control: the candidate's read is made stale too, as a preview that kept
+    the pre-check view would leave it. The limit is then named only by the load, labelled, so the
+    assertion on the `fresh` arm cannot pass on a stale view."""
+    from messagefoundry.config import security_edit
+
+    _clear_security_env(monkeypatch)
+    real = security_edit.read_security
+    calls: list[str] = []
+
+    def stale_first(service_config: str | Path) -> dict:
+        calls.append(str(service_config))
+        if len(calls) == 1 or candidate_read == "stale":
+            return {}
+        return real(service_config)
+
+    monkeypatch.setattr(security_edit, "read_security", stale_first)
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nmax_session_hours = 48\n", encoding="utf-8")
+    rc, res = _set(toml, {"block_unlisted_outbound": True}, capsys)
+    assert rc == 0 and len(calls) >= 2
+    assert "max_session_hours = 48" in toml.read_text(encoding="utf-8")
+    (entry,) = _entries(res, "max_session_hours")
+    assert _is_labelled(entry) is (candidate_read == "stale"), entry
+
+
+@pytest.mark.parametrize(
+    ("switch", "field"),
+    [
+        ("sign_out_after_idle_minutes", "session_idle_timeout_minutes"),
+        ("max_session_hours", "session_absolute_hours"),
+    ],
+)
+def test_the_session_limit_defaults_agree(switch: str, field: str) -> None:
+    """`show` prints the [security] default, the IDE marks a value above it, and the engine names a
+    value above the [auth] default. They are separate literals, so this pins them equal."""
+    from messagefoundry.config.settings import AuthSettings, SecuritySettings
+
+    assert SecuritySettings.model_fields[switch].default == AuthSettings.model_fields[field].default
+
+
+def test_set_preview_does_not_refuse_a_saved_edit_over_its_own_read(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preview's read of the saved [security] must not refuse an edit the whole-file load
+    accepted (vault BACKLOG #2600). A file value that fails on its own while a MEFOR_SECURITY_*
+    variable overrides it loads; the stale first read stands in for the concurrent edit that put it
+    there after the pre-check."""
+    from messagefoundry.config import security_edit
+
+    real = security_edit.read_security
+    calls: list[str] = []
+
+    def stale_first(service_config: str | Path) -> dict:
+        calls.append(str(service_config))
+        return {} if len(calls) == 1 else real(service_config)
+
+    monkeypatch.setattr(security_edit, "read_security", stale_first)
+    monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", "12")
+    toml = tmp_path / "mf.toml"
+    toml.write_text('[security]\nmax_session_hours = "x"\n', encoding="utf-8")
+    rc, res = _set(toml, {"block_unlisted_outbound": True}, capsys)
+    assert rc == 0, res
+    assert "block_unlisted_outbound = true" in toml.read_text(encoding="utf-8")
+
+
+def test_set_preview_scope_is_read_after_the_edit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An edit that repairs the only reason the whole file would not load reports a complete
+    preview, not the pre-edit partial marker: the preview and its scope come from one post-edit
+    read. The pre-edit `show` is the control: the same file is partial before the edit.
+
+    A one-minute idle limit is shorter than the [auth] second-factor floor, a cross-section
+    refusal that [security] alone does not see, so the whole file will not load until the edit."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text(
+        "[security]\nsign_out_after_idle_minutes = 1\n[auth]\nmfa_verify_min_elapsed_seconds = 120\n",
+        encoding="utf-8",
+    )
+    assert _show(toml, capsys)["loosenings_partial"] is True
+    rc, res = _set(toml, {"sign_out_after_idle_minutes": 31}, capsys)
+    assert rc == 0
+    assert res["loosenings_partial"] is False and res["loosenings_partial_reason"] is None
+    assert "sign_out_after_idle_minutes" in [lo["switch"] for lo in res["loosenings"]]
+
+
 def test_set_rejects_bad_value_type(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     toml = tmp_path / "mf.toml"
     rc, _ = _set(toml, {"max_session_hours": "not-an-int"}, capsys)

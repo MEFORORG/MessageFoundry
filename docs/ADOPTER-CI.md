@@ -213,16 +213,24 @@ that package's build code may run in CI:
     passes a URL or editable requirement unaudited. It skips an included file without a word
     (measured), so the job refuses a line starting `-r` or `--requirement`, read as plain bytes:
     a file with a byte-order mark, UTF-16, or an abbreviated option gets past that check. List
-    every pin in `requirements.txt` itself. Its closure is audited only through the lock, so a lock
-    that was not regenerated after `requirements.txt` changed audits the old closure, and nothing
-    in the job detects that.
+    every pin in `requirements.txt` itself. Its closure is audited only through the lock.
+  - So the job fails on a stale lock: one that does not pin a package `requirements.txt` names,
+    or pins it only under a marker false on the Windows runner, or at a version the requirement's
+    specifier does not allow. The step copies pip 26's line handling (continuation lines, comments,
+    `${VAR}` expansion, options), then parses each requirement with the `packaging` copy pip
+    carries, so versions compare as pip compares them. A requirement whose marker is false on the
+    runner, an extra (a lock records none), and a URL or path with no package name are only noted;
+    any other line it cannot parse fails.
   - The job takes the engine's pin out of the lock, as pip reads the lock, and installs that pin
     alone with `--no-deps --require-hashes`. The lock must pin `messagefoundry` exactly once, or the
     job says so and fails; pip refuses the pin if it carries no hash. No other locked package is
     installed into the interpreter that runs the auditor, pip and `pip-audit`, so no other locked
     package's code (a `.pth` file runs at every interpreter start) runs inside them.
-  - `pip-audit` itself is pinned to one version, and its own dependencies are installed into that
-    interpreter, resolved live and unhashed.
+  - `pip-audit` and its own dependencies are installed into that interpreter from
+    `requirements-audit.lock`, with `--require-hashes`, so they are not resolved live, with or
+    without a lock of yours. `messagefoundry-toolkit init` writes that file from the engine
+    release's own scanner lock, and its header says how to regenerate it. Hash-pinned, it no longer
+    moves on its own, so the job audits it too, as the runner evaluates its markers.
   - Then it runs the engine's own auditor, `python -P -m messagefoundry.security.audit_all_platforms
     requirements.lock`. That is the code the engine's own required audit runs, and the module
     documents what it checks. It dry-run installs the lock with `--require-hashes`, installing
@@ -239,11 +247,17 @@ that package's build code may run in CI:
     package your engine release records as published: at least `messagefoundry-webconsole`,
     `messagefoundry-harness` and `messagefoundry-toolkit`.
   - It refuses a lock with pip option lines, such as an index URL, `--trusted-host` or `--find-links`.
-    `uv pip compile --universal --generate-hashes requirements.txt -o requirements.lock` writes none
-    by default and writes every platform's pins. `pip-compile` needs its `--no-emit-*` flags for each
-    such line, and locks only the platform it runs on, so run it on Windows.
+    `uv pip compile --python-platform windows --python-version 3.14 --generate-hashes
+    requirements.txt -o requirements.lock` writes none by default and locks Windows alone.
+    `pip-compile` needs its `--no-emit-*` flags for each such line, and locks only the platform it
+    runs on, so run it on Windows.
   - A lock that pins one name at two versions under two markers fails: with the markers removed,
     `pip-audit` refuses the duplicate.
+  - A universal lock (`uv pip compile --universal`) pins every platform's dependencies, and the
+    auditor audits all of them. So an advisory against a package only another platform installs
+    fails the job, and so does a package the lock pins at two versions for two platforms. Triage
+    either by locking for Windows alone, as above, or, for an advisory, with `--ignore-vuln <ID>`
+    and the reason.
   - A requirement that continues onto a line other than a hash, option or comment fails, since a
     marker there would stay in place.
 - Each check is its own step, and a failed one does not hide a later one's result; the lock audit

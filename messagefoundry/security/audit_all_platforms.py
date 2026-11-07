@@ -34,9 +34,14 @@ WHAT IT DOES, in order, exiting with the first non-zero status:
    installed the lock into a fresh venv, so a pin with a wrong hash or no installable artifact on the
    runner reddened the gate. For ``ci/locks/ci-quality.lock`` that was the only such check in a
    required job. Markers are evaluated here, deliberately: this checks what the host would install.
-2. Writes a copy of the lock with the ``; <marker>`` removed from every requirement line, the pins
-   and ``--hash`` lines untouched, into a temporary directory (under ``$RUNNER_TEMP`` when set; never
-   committed, never installed), and prints each pin it un-gated.
+2. Writes a copy of the lock with the ``; <marker>`` removed from every requirement line, the pins,
+   their ``--hash`` options and any comment untouched, into a temporary directory (under
+   ``$RUNNER_TEMP`` when set; never committed, never installed), and prints each pin it un-gated.
+   The marker is found as pip 26 finds it (vault BACKLOG #3786 L2): pip hands everything from a
+   requirement's first word that starts with ``-`` to its option parser, so a ``--hash`` on the
+   requirement's own line, after its marker, is an option and stays; then it splits off the marker
+   at the first ``;``, in a ``name @ <url>`` requirement too, and at the first ``; `` after a bare
+   URL. (pip refuses a ``name @ <url>`` whose URL holds a ``;``.)
 3. ``pip-audit -r <copy> --desc --disable-pip --strict`` plus any extra arguments (``--ignore-vuln
    <ID>`` for a triaged advisory, which therefore goes AFTER the lock).
 
@@ -50,11 +55,13 @@ packages this release knows to be published, nothing checks that the named packa
 private: like ``--ignore-vuln``, it is the adopter's recorded decision.
 
 WHY STRIPPING IS SOUND HERE. Every pin in a uv export is a version that uv resolved for some
-environment. The engine sets no ``[tool.uv] environments``, so that includes environments nobody
-supports (PyPy, cygwin, macOS). Auditing those pins too is accepted: an advisory against one fails
-loudly and is triaged with ``--ignore-vuln``, while skipping a pin fails silently, which is the
-defect above. ``--disable-pip`` is not left to the caller: without it pip-audit installs the
-requirements through pip on the host, and a Windows-only distribution need not install on Linux.
+environment the lock covers. The engine's ``[tool.uv] environments`` limits that to CPython 3.14 on
+Windows and Linux, so every engine pin is one a supported host can install, and each exported line
+carries that environment as its marker. An adopter's lock may cover more (PyPy, cygwin, macOS);
+auditing those pins too is accepted: an advisory against one fails loudly and is triaged with
+``--ignore-vuln``, while skipping a pin fails silently, which is the defect above.
+``--disable-pip`` is not left to the caller: without it pip-audit installs the requirements through
+pip on the host, and a Windows-only distribution need not install on Linux.
 With it and a hashed file, pip-audit reads the pins as already resolved and refuses any requirement
 that lacks a hash. ``--strict`` makes a pin pip-audit could not look up (a release PyPI has removed,
 say) fail the audit instead of being skipped.
@@ -72,8 +79,14 @@ as an unknown option). It does not judge
 whether a non-empty lock is complete; released-line-audit carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
-before it (a line ending in a backslash continues, unless it is a comment), indented or not. A
-UTF-8, UTF-16 or UTF-32 byte-order mark is honoured, as pip honours it.
+before it (a line ending in a backslash continues, unless it is a comment), indented or not. It
+decodes the lock as pip 26 does (vault BACKLOG #3786 L3): by its UTF-8, UTF-16 or UTF-32
+byte-order mark; failing one, by a PEP 263 ``coding:`` declaration in a comment on either of the
+first two lines, and the copy is written in that encoding too; failing that, as UTF-8, and as the
+locale's encoding when it is not UTF-8. Every other copy is written as UTF-8 with a byte-order mark,
+which every reader takes first, so pip-audit's parser, whose fallback is the locale and not UTF-8,
+reads it as it was decoded. A lock that cannot be read, or that none of those decodes, is refused
+with exit 2, as is a declaration naming no codec this Python knows.
 
 Both subprocesses start through ``messagefoundry.childenv.python_module_argv``, so with ``-P``
 (the checked-out tree, the current directory, is not on their ``sys.path`` and cannot shadow a
@@ -90,6 +103,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import io
+import locale
 import os
 import re
 import subprocess
@@ -102,12 +116,12 @@ from messagefoundry.childenv import engine_environment, non_engine_environment, 
 
 
 def is_requirement_line(line: str) -> bool:
-    """A requirement starts at column 0 and is neither a comment nor a pip option.
+    """A line that starts a requirement: neither blank, a comment nor a pip option.
 
     Applied to a line that starts a logical line, with its indentation removed: the ``--hash``
     lines a uv export writes under each requirement continue it, so they are never asked.
     """
-    return bool(line) and not line[0].isspace() and line[0] not in "#-"
+    return bool(line) and line[0] not in "#-"
 
 
 def _body(line: str) -> str:
@@ -138,24 +152,33 @@ def _kinds(lines: list[str]) -> list[str]:
     return kinds
 
 
-def _lines_of(text: str, kind: str) -> list[str]:
-    lines = text.splitlines()
-    return [ln for ln, k in zip(lines, _kinds(lines), strict=True) if k == kind]
+def _classify(text: str) -> tuple[list[str], list[str]]:
+    """``text``'s physical lines, each with its terminator, and each line's kind (:func:`_kinds`).
+
+    :func:`main` classifies a lock once and reads every answer from that one list (vault BACKLOG
+    #3786 L6), so its refusals and its strip cannot read the same lock two ways.
+    """
+    lines = text.splitlines(keepends=True)
+    return lines, _kinds(lines)
+
+
+def _lines_of(lines: list[str], kinds: list[str], kind: str) -> list[str]:
+    return [_body(ln) for ln, k in zip(lines, kinds, strict=True) if k == kind]
 
 
 def requirement_lines(text: str) -> list[str]:
     """The lines that start a requirement, without their indentation."""
-    return [ln.lstrip() for ln in _lines_of(text, "requirement")]
+    return [ln.lstrip() for ln in _lines_of(*_classify(text), "requirement")]
 
 
 def option_lines(text: str) -> list[str]:
     """The pip option lines (``-r``, ``--index-url``, ...) that start a logical line."""
-    return _lines_of(text, "option")
+    return _lines_of(*_classify(text), "option")
 
 
 def continued_requirement_lines(text: str) -> list[str]:
     """Lines a requirement continues onto that the strip does not rewrite (see :func:`_kinds`)."""
-    return _lines_of(text, "continued")
+    return _lines_of(*_classify(text), "continued")
 
 
 #: Longest first: a UTF-32-LE mark begins with the UTF-16-LE one.
@@ -164,35 +187,115 @@ _BOMS = (
     (codecs.BOM_UTF32_BE, "utf-32"),
     (codecs.BOM_UTF16_LE, "utf-16"),
     (codecs.BOM_UTF16_BE, "utf-16"),
+    (codecs.BOM_UTF8, "utf-8-sig"),
 )
+
+#: A PEP 263 declaration, as pip 26's ``_decode_req_file`` finds one in a first-two-lines comment.
+_CODING = re.compile(rb"coding[:=]\s*([-\w.]+)")
+
+
+def _decode_lock(raw: bytes) -> tuple[str, str]:
+    """The lock as pip decodes it, and the encoding a copy needs to be read back the same way.
+
+    In pip's order: a byte-order mark; a PEP 263 declaration in a comment on either of the first two
+    lines, which a copy must keep honouring, so it is written in that encoding; UTF-8; and, when
+    UTF-8 fails, the locale's encoding. Any other copy takes a UTF-8 byte-order mark, which outranks
+    a declaration the text still carries. Raises ``UnicodeError`` when the chosen encoding does not
+    decode the bytes, and ``LookupError`` for a declaration naming an unknown codec.
+    """
+    copy_encoding = "utf-8-sig"
+    codec = next((name for bom, name in _BOMS if raw.startswith(bom)), None)
+    if codec is None:
+        declared = (_CODING.search(ln) for ln in raw.split(b"\n")[:2] if ln[:1] == b"#")
+        cookie = next((m for m in declared if m is not None), None)
+        if cookie is not None:
+            codec = copy_encoding = cookie[1].decode("ascii")
+    if codec is not None:
+        text = raw.decode(codec)
+    else:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode(locale.getencoding() or sys.getdefaultencoding())
+    # Universal newlines, as Path.read_text gives them.
+    return io.StringIO(text, newline=None).read(), copy_encoding
 
 
 def read_lock(path: Path) -> str:
-    """Decode a lock as pip would: by its UTF-32 or UTF-16 byte-order mark, otherwise as UTF-8."""
-    raw = path.read_bytes()
-    codec = next((name for bom, name in _BOMS if raw.startswith(bom)), "utf-8-sig")
-    # Universal newlines, as Path.read_text gives them.
-    return io.StringIO(raw.decode(codec), newline=None).read()
+    """Decode a lock as pip would (see :func:`_decode_lock`)."""
+    return _decode_lock(path.read_bytes())[0]
+
+
+#: A comment as pip finds one: at the start of a line, or after whitespace.
+_COMMENT = re.compile(r"(^|\s+)#.*$")
+
+
+#: The schemes pip 26's ``is_url`` takes for a URL: its four, and each VCS's own and ``vcs+`` forms.
+_URL_SCHEMES = frozenset(
+    ["http", "https", "file", "ftp"]
+    + [
+        f"{vcs}{suffix}"
+        for vcs, schemes in {
+            "git": ("", "+http", "+https", "+ssh", "+git", "+file"),
+            "hg": ("+file", "+http", "+https", "+ssh", "+static-http"),
+            "svn": ("", "+ssh", "+http", "+https", "+svn", "+file"),
+            "bzr": ("+http", "+https", "+ssh", "+sftp", "+ftp", "+lp", "+file"),
+        }.items()
+        for suffix in schemes
+    ]
+)
+
+
+def _split_marker(line: str) -> tuple[str, str, str] | None:
+    """``(pin, marker, what follows them)`` for the first line of a requirement with a marker.
+
+    ``line`` carries no terminator and no continuing backslash. What follows is the line's options
+    and comment, unchanged, so a ``--hash`` written after the marker survives the strip. ``None``
+    when there is no marker.
+    """
+    comment = _COMMENT.search(line)
+    code = line[: comment.start()] if comment else line
+    # pip's break_args_options: the options start at the first word that starts with "-".
+    words = code.split(" ")
+    first = next((n for n, word in enumerate(words) if word.startswith("-")), len(words))
+    requirement, options = " ".join(words[:first]), " ".join(words[first:]).strip()
+    # pip's parse_req_from_line: "; " after a URL, as pip's is_url judges the whole requirement
+    # by the scheme before its first ":", else the first ";", a name @ URL's too.
+    stripped = requirement.strip()
+    if ":" in stripped and stripped.split(":", 1)[0].lower() in _URL_SCHEMES:
+        at = requirement.find("; ")
+    else:
+        at = requirement.find(";")
+    if at < 0:
+        return None
+    rest = (f" {options}" if options else "") + line[len(code) :]
+    return requirement[:at].rstrip(), requirement[at + 1 :].strip(), rest
+
+
+def _strip(lines: list[str], kinds: list[str]) -> tuple[list[str], list[str], int]:
+    """``lines`` with each requirement's marker removed, line for line; the un-gated entries; and
+    the requirement count."""
+    out: list[str] = []
+    stripped: list[str] = []
+    requirements = 0
+    for line, kind in zip(lines, kinds, strict=True):
+        if kind == "requirement":
+            requirements += 1
+            body = _body(line)
+            continued = body.endswith("\\")
+            split = _split_marker(body.removesuffix("\\") if continued else body)
+            if split is not None:
+                pin, marker, rest = split
+                stripped.append(f"{pin.lstrip()} ; {marker}")
+                kept = (pin + rest).rstrip()
+                line = kept + (" \\" if continued else "") + line[len(body) :]
+        out.append(line)
+    return out, stripped, requirements
 
 
 def strip_markers(text: str) -> tuple[str, list[str], int]:
     """Return ``(text without markers, the entries whose marker was removed, requirement count)``."""
-    out: list[str] = []
-    stripped: list[str] = []
-    requirements = 0
-    lines = text.splitlines(keepends=True)
-    for line, kind in zip(lines, _kinds(lines), strict=True):
-        body = _body(line)
-        if kind == "requirement":
-            requirements += 1
-            pin, has_marker, marker = body.partition(";")
-            if has_marker:
-                continued = body.endswith("\\")
-                pin = pin.rstrip()
-                marker = marker.strip().removesuffix("\\").rstrip()
-                stripped.append(f"{pin.lstrip()} ; {marker}")
-                line = pin + (" \\" if continued else "") + line[len(body) :]
-        out.append(line)
+    out, stripped, requirements = _strip(*_classify(text))
     return "".join(out), stripped, requirements
 
 
@@ -205,15 +308,13 @@ def canonical_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def drop_requirements(text: str, names: Collection[str]) -> tuple[str, list[tuple[str, str]]]:
-    """``text`` without each requirement whose canonical name is in ``names``, the lines it
-    continues onto included; and each dropped requirement as ``(canonical name, first line)``.
-    Where a requirement starts and how far it goes on is read as :func:`_kinds` reads it."""
+def _drop(
+    lines: list[str], kinds: list[str], names: Collection[str]
+) -> tuple[list[str], list[tuple[str, str]]]:
     out: list[str] = []
     dropped: list[tuple[str, str]] = []
     dropping = continued = False
-    lines = text.splitlines(keepends=True)
-    for line, kind in zip(lines, _kinds(lines), strict=True):
+    for line, kind in zip(lines, kinds, strict=True):
         body = _body(line)
         if not continued:
             head = body.lstrip()
@@ -225,6 +326,14 @@ def drop_requirements(text: str, names: Collection[str]) -> tuple[str, list[tupl
         if not dropping:
             out.append(line)
         continued = body.endswith("\\") and not body.lstrip().startswith("#")
+    return out, dropped
+
+
+def drop_requirements(text: str, names: Collection[str]) -> tuple[str, list[tuple[str, str]]]:
+    """``text`` without each requirement whose canonical name is in ``names``, the lines it
+    continues onto included; and each dropped requirement as ``(canonical name, first line)``.
+    Where a requirement starts and how far it goes on is read as :func:`_kinds` reads it."""
+    out, dropped = _drop(*_classify(text), names)
     return "".join(out), dropped
 
 
@@ -293,18 +402,32 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     )
     args = parser.parse_args(argv)
 
-    text, stripped, requirements = strip_markers(read_lock(args.lock))
+    try:
+        raw = args.lock.read_bytes()
+    except OSError as exc:
+        print(f"::error::{args.lock}: not readable: {exc}", file=sys.stderr)
+        return 2
+    try:
+        source, copy_encoding = _decode_lock(raw)
+    except (UnicodeError, LookupError) as exc:
+        print(
+            f"::error::{args.lock}: not decodable the way pip decodes a requirements file: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    lines, kinds = _classify(source)
+    stripped_lines, stripped, requirements = _strip(lines, kinds)
     if requirements == 0:
         print(
             f"::error::{args.lock}: no requirement lines -- refusing an empty audit",
             file=sys.stderr,
         )
         return 2
-    options = option_lines(text)
+    options = _lines_of(lines, kinds, "option")
     if options:
         print(f"::error::{args.lock}: pip option lines are not audited: {options}", file=sys.stderr)
         return 2
-    continued = continued_requirement_lines(text)
+    continued = _lines_of(lines, kinds, "continued")
     if continued:
         print(
             f"::error::{args.lock}: a requirement continues onto a line whose marker would not be "
@@ -317,7 +440,8 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     if refusal:
         print(f"::error::{args.lock}: {refusal}", file=sys.stderr)
         return 2
-    text, skipped = drop_requirements(text, private)
+    # _strip rewrote lines one for one and kept each one's continuation, so their kinds stand.
+    kept, skipped = _drop(stripped_lines, kinds, private)
     unmatched = private - {name for name, _ in skipped}
     if unmatched:
         print(
@@ -350,7 +474,14 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         return status
     with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP") or None) as tmp:
         copy = Path(tmp) / args.lock.name
-        copy.write_text(text, encoding="utf-8")
+        try:
+            copy.write_text("".join(kept), encoding=copy_encoding)
+        except UnicodeError as exc:
+            print(
+                f"::error::{args.lock}: its copy is not writable as {copy_encoding}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
         audit = [*python_module_argv("pip_audit"), "-r", str(copy), "--desc", "--disable-pip"]
         return run([*audit, "--strict", *args.pip_audit_args])
 

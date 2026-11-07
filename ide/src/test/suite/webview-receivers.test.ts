@@ -1259,8 +1259,8 @@ suite("webview receivers discard a malformed payload and render a well-formed on
   // A refusal CLEARS what an earlier state left, it does not only hide it (owner ruling R4,
   // 2026-10-29, BACKLOG #1123). Every malformed state the suite already discards is a trigger, so a
   // case added there is covered here too. Each first renders a state with insecure values, so
-  // 'loosened' is set and defaults are held, and edits two controls without saving, one of them
-  // into a loosening.
+  // 'loosened' is set and defaults are held, and edits two controls into a loosening without
+  // saving: a session limit above its default, and a Yes/No.
 
   /** The page's own `defaults` binding, read in the page's realm: the object collectUpdates() reads. */
   function heldDefaults(p: Page): string[] {
@@ -1289,7 +1289,12 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       assert.strictEqual(save.disabled, false, `${why}: the good state did not render`);
       assert.deepStrictEqual(
         loosenedFields(p),
-        ["field-allow_unencrypted_phi", "field-local_access_only", "field-require_mfa"],
+        [
+          "field-allow_unencrypted_phi",
+          "field-local_access_only",
+          "field-max_session_hours",
+          "field-require_mfa",
+        ],
         `${why}: the good state and the edit did not mark their loosenings`,
       );
       const held = heldDefaults(p);
@@ -1384,6 +1389,41 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     p.deliver(STATE_OK);
     for (const k of keys) {
       assert.ok(!doc.getElementById("field-" + k).classList.contains("loosened"), `${k}: marked while off`);
+    }
+  });
+
+  test("Security Settings: a session limit is marked loosened only above the default the state carries", () => {
+    // Vault BACKLOG #2600: security_loosenings() names each session limit above its shipped default,
+    // and 0 or less is stricter. The default is read from the state, so the control at the end moves
+    // it and the same value stops being a loosening.
+    for (const key of ["sign_out_after_idle_minutes", "max_session_hours"]) {
+      const field = FIELDS.find((f) => f.key === key);
+      assert.ok(field?.looserAboveDefault, `${key}: not read against its default`);
+      assert.ok(field?.risk, `${key}: a loosening needs its risk text`);
+      const marked = (value: number, defaults?: number): boolean => {
+        const p = security.load();
+        p.deliver(
+          variant(STATE_OK, (c) => {
+            c.state.values[key] = value;
+            if (defaults !== undefined) { c.state.defaults[key] = defaults; }
+          }),
+        );
+        assert.deepStrictEqual(p.warnings, [], `${key}=${value}: discarded`);
+        return p.window.document.getElementById("field-" + key).classList.contains("loosened");
+      };
+      const shipped = SECURITY_SHOW.defaults[key] as number;
+      assert.strictEqual(marked(shipped + 1), true, `${key}: above the default is not marked`);
+      assert.strictEqual(marked(shipped), false, `${key}: the default is marked`);
+      assert.strictEqual(marked(shipped - 1), false, `${key}: a stricter value is marked`);
+      assert.strictEqual(marked(0), false, `${key}: 0, which ends every session, is marked`);
+      assert.strictEqual(marked(shipped + 1, shipped + 1), false, `${key}: read against a fixed number`);
+      // An unsaved edit marks it too, as a Yes/No does.
+      const p = security.load();
+      p.deliver(STATE_OK);
+      const input = p.window.document.getElementById("in-" + key);
+      input.value = String(shipped + 100);
+      input.dispatchEvent(new p.window.Event("input"));
+      assert.ok(p.window.document.getElementById("field-" + key).classList.contains("loosened"), `${key}: an edit is not marked`);
     }
   });
 

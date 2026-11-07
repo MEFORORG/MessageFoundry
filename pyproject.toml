@@ -578,6 +578,28 @@ ci-quality = [
     "pytest-timeout>=2.3.1",
 ]
 
+# The platforms the lock resolves for (vault BACKLOG #3786 step 2): CPython on Windows (the only
+# classifier, and the v1 deployment platform) and on Linux (the CI runners and the container images).
+# No workflow runs macOS, PyPy or cygwin, so a pin only those need has no place in uv.lock or the
+# exports. This matters to the required audit: scripts/security/audit_all_platforms.py strips every
+# environment marker before pip-audit reads a lock, so a pin meant only for an unsupported platform
+# would be audited as if it shipped, and its advisory would red the gate.
+#
+# THE 3.15 BOUND IS NOT A NEW SUPPORT LIMIT. Every install that reads these locks runs 3.14 (the
+# 3.15 and dependency-floor canaries install unconstrained on purpose). Without it uv must resolve a
+# 3.15 fork per platform, and under UV_NO_BUILD (security.yml's DEP-1 step) that fails: measured
+# 2026-11-06 with uv 0.13.1, pyyaml 6.0.3 has no cp315 Windows wheel and atheris 3.1.0 no cp315 wheel
+# at all. Raise the bound when the project moves to 3.15.
+#
+# THE COST: uv export writes this environment as the marker of every exported pin, so pip skips the
+# whole lock on any other platform rather than install an unresolved set. Add a platform here only
+# when a workflow tests it.
+[tool.uv]
+environments = [
+    "sys_platform == 'win32' and platform_python_implementation == 'CPython' and python_full_version < '3.15'",
+    "sys_platform == 'linux' and platform_python_implementation == 'CPython' and python_full_version < '3.15'",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 # Run the whole suite on ONE shared asyncio event loop (tests AND fixtures). pytest-asyncio's default
