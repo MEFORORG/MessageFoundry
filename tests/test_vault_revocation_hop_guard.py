@@ -211,8 +211,8 @@ def _assert_refused(caught: pytest.ExceptionInfo[Exception], entry: EntryPoint) 
         assert type(caught.value.__cause__) is strict_requests.VaultHopRefused
         assert text == f"{connector}: {strict_requests._UNREVOKED_VAULT_HOP} {lever}"
         assert f"[{section}].vault_revocation_attested = true" in text
-        assert f"[{section}].vault_revocation_attested_reason" in text
-    assert f"[{section}].vault_revocation_attested" in text
+    # Both texts name the reason the settings require beside the attestation (the ninth hold).
+    assert f"[{section}].vault_revocation_attested_reason" in text
     other = "secrets" if section == "store" else "store"
     for absent in (
         f"[{other}].",

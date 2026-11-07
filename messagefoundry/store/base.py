@@ -3735,7 +3735,8 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
 
 #: The text for every other ``ValueError`` from the build. It names the settings and the failure
 #: modes the build checks, and reads nothing from the error (the seventh hold on engine PR 2818);
-#: the refusal is raised from ``None``, so the error is not on its chain (the eighth hold).
+#: the refusal is built after the handler has exited, so the error is not on its chain (the
+#: eighth hold).
 _UNTEXTED = (
     "the store cipher could not be built from the settings: check [store].cipher_provider "
     "('aesgcm' or 'vault_transit'), the Vault Transit settings when it is vault_transit, and every "
@@ -3760,7 +3761,8 @@ _VAULT_HOP_TEXT = (
     f"{_KEY_SOURCE}: the store's Vault hop was refused by the engine's own hop checks, its text "
     "not shown; check that MEFOR_STORE_VAULT_ADDR is an https:// address, any proxy variable, the "
     "Vault CA and client settings, and the hop's certificate revocation coverage, which "
-    "[store].vault_revocation_attested speaks to and nothing else does"
+    "[store].vault_revocation_attested, set with a [store].vault_revocation_attested_reason, "
+    "speaks to and nothing else does"
 )
 
 #: :func:`_fresh_refusal`'s texts at the key seam (``resolve_active_key``, ``resolve_decrypt_keys``).

@@ -217,6 +217,29 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "the lookup error quotes the pipe or frame refusal, which names a frame and never "
         "its content (decode_frame keeps only safe_exc text)",
     ),
+    # The store key seam, cipher build and PostgreSQL TLS open (engine PR 2818, eighth hold): each
+    # builds its refusal after the handler has exited, so neither chain holds the caught error
+    # whether or not ``from None`` is written; the refusal's text is fixed and read from no error.
+    _Allowed(
+        "messagefoundry/store/base.py::build_store_cipher::<no handler>::refusal",
+        _SAFE + "raised after the handler exited, so nothing was suppressed: __context__ is empty "
+        "and the refusal's fixed text is read from no error",
+    ),
+    _Allowed(
+        "messagefoundry/store/base.py::resolve_active_key::<no handler>::refusal",
+        _SAFE + "raised after the handler exited, so nothing was suppressed: __context__ is empty "
+        "and the refusal's fixed text is read from no error",
+    ),
+    _Allowed(
+        "messagefoundry/store/base.py::resolve_decrypt_keys::<no handler>::refusal",
+        _SAFE + "raised after the handler exited, so nothing was suppressed: __context__ is empty "
+        "and the refusal's fixed text is read from no error",
+    ),
+    _Allowed(
+        "messagefoundry/store/postgres.py::_verifying_context_at_open::<no handler>::refusal",
+        _SAFE + "raised after the handler exited, so nothing was suppressed: __context__ is empty "
+        "and the refusal's fixed text is read from no error",
+    ),
     _Allowed(
         "messagefoundry/store/store.py::parse_audit_anchor::ValueError::AuditAnchorError",
         _SAFE + "int() quotes the anchor's count text, and the new error carries the whole anchor",

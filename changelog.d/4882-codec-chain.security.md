@@ -29,8 +29,12 @@
   are cleared through `BaseException`'s own descriptors, so an interrupt class's own `__setattr__`
   does not run. (`BACKLOG #4882`, `BACKLOG #3471`)
 - **Every other error from the store cipher build or the store key resolution is replaced by a new
-  refusal with a fixed text the site chooses, raised from `None`, and nothing is passed through.**
-  The new refusal's class follows the error's: an `InsecureHopRefused`, a `DpapiError` or a
+  refusal with a fixed text the site chooses, built after the handler has exited, and nothing is
+  passed through.** Which class the refusal takes depends on the codec judgement above. An error
+  with a codec error on it, or one whose chain cannot be read whole or whose judgement raised,
+  takes that bullet's two classes, so a hop refusal holding a codec error is a
+  `StoreCipherConfigError` and a `DpapiError` holding one a `KeyProviderError`. Where no codec
+  error is found, the new refusal's class follows the error's: an `InsecureHopRefused`, a `DpapiError` or a
   `DpapiUnavailable` is replaced by one of that base class, not of a subclass it may be, any other `ValueError` by a
   `StoreCipherConfigError`, and any other `Exception` by a `KeyProviderError`; at the cipher build
   a hop refusal is a `StoreCipherConfigError` too, as every `ValueError` there. Its text names the
@@ -51,8 +55,8 @@
 - **The PostgreSQL store's TLS context refusal at the open, `StoreTlsRefused`, carries a fixed text
   that names `[store].ssl_root_cert`, `[store].ssl_crl_file` and the hop's suites, and reads
   nothing from the context builder's `ValueError`.** Before, it carried that error's text, which
-  can quote the `ssl` or `cryptography` library's message. The refusal is raised from `None`, so
-  a traceback no longer prints that error. An `InsecureHopRefused` is replaced by a new one with a
+  can quote the `ssl` or `cryptography` library's message. The refusal is built after the handler
+  has exited, so neither of its chain links holds that error and a traceback no longer prints it. An `InsecureHopRefused` is replaced by a new one with a
   fixed text, and an `OSError` that is also a `ValueError` by a new error that is both, with a
   fixed text; neither passes through as it is. At least an error from the builder that is not a
   `ValueError`, such as a plain `OSError` or an `ssl.SSLError`, is not caught there and still
