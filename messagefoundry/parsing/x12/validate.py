@@ -72,7 +72,9 @@ class X12ValidationResult:
     flattened, PHI-safe violation list (empty when valid). ``ack`` is the generated 997/999
     Functional Acknowledgment ready to return to the sender (``None`` only if pyx12 emitted none, e.g.
     for an already-FA transaction); ``ack_transaction`` names which (``"997"``/``"999"``), and is ``None``
-    with no ack or with a fragment pyx12's ack writer left when it failed before the closing IEA."""
+    with no ack or with a fragment pyx12's ack writer left when it failed before the closing IEA. Such
+    a fragment is still returned in ``ack`` but is not a ready-to-return ack: send ``ack`` only when
+    ``ack_transaction`` is set."""
 
     valid: bool
     errors: tuple[X12SegmentError, ...] = ()
@@ -82,6 +84,8 @@ class X12ValidationResult:
 
 #: The one handler the ``pyx12`` logger tree ends at. A single module-level instance, because
 #: ``Logger.addHandler`` skips a handler already attached, under logging's own lock.
+_log = logging.getLogger(__name__)
+
 _PYX12_SINK = logging.NullHandler()
 #: Above CRITICAL, so a logger at this level builds no record at all.
 _MUTED = logging.CRITICAL + 1
@@ -133,11 +137,23 @@ def _mute_pyx12_logger() -> None:
             logger.setLevel(_MUTED)
 
 
-def _ack_is_complete(ack_text: str) -> bool:
-    """Whether a generated ack runs to its closing IEA. pyx12 writes acks with its own fixed ``*`` and
-    ``~``, and the IEA is the last segment it writes, after every echoed sender value."""
-    segments = [seg.strip() for seg in ack_text.split("~") if seg.strip()]
-    return bool(segments) and segments[-1].startswith("IEA*")
+class _AckBuffer(io.StringIO):
+    """The ack sink, which also keeps the last chunk written. Both of pyx12's ack writers write one
+    whole segment per ``write`` call, so a finished ack's last chunk is its IEA. The ack's text cannot
+    show that: a fragment echoes sender values, and with other separators a GS06 of
+    ``1~IEA*1*000000001`` makes a fragment's text end in an IEA that pyx12 never wrote."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_write = ""
+
+    def write(self, s: str, /) -> int:
+        if s.strip():
+            self.last_write = s
+        return super().write(s)
+
+    def complete(self) -> bool:
+        return self.last_write.lstrip().startswith("IEA*")
 
 
 # pyx12's ack choice by the last GS08's first six characters; any other version gets no ack.
@@ -195,15 +211,11 @@ def _error_code(err: dict[str, Any], resolve: Callable[..., str | None], prefer_
     report's ``x12_code`` field is not read: pyx12 fills it 999-first whatever the version, so a 997
     pass would report 999-only codes (``"I4"`` for a not-used segment where the 997 says ``"2"``).
     The name stands in where pyx12 maps it to no X12 code (e.g. ``SEG_8_hl_count_mismatch``), and on a
-    997 pass where its only code is a 999 implementation code (``I`` and digits, e.g. ``"I10"`` for
-    ``ELE_I10_NOT_USED``), which pyx12's 997 omits and no 997 carries."""
+    997 pass where pyx12's table has no AK code for it (e.g. ``ELE_I10_NOT_USED``, whose only code is
+    the 999's ``"I10"``), an error pyx12's 997 omits."""
     err_cde = str(err.get("err_cde", ""))
     x12_code = resolve(err_cde, prefer_5010=prefer_5010)
-    if x12_code is None:
-        return err_cde
-    if not prefer_5010 and x12_code[:1] == "I" and x12_code[1:].isdigit():
-        return err_cde
-    return x12_code
+    return err_cde if x12_code is None else x12_code
 
 
 def _flatten_errors(
@@ -258,7 +270,7 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     x12n_document, make_params = load_x12_validator()
     resolve = load_x12_code_resolver()  # before the walk, so a pyx12 older than 4.0.1 fails first
     params = make_params()
-    fd_ack = io.StringIO()
+    fd_ack = _AckBuffer()
     fd_json = io.StringIO()
 
     _mute_pyx12_logger()
@@ -284,10 +296,13 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     ack_text = fd_ack.getvalue().strip()
     ack = ack_text or None
     version = _last_group_version(report)
-    # A writer that raises partway is caught and logged by pyx12, leaving a fragment; only an ack that
-    # reached its closing IEA segment is labelled.
-    ack_transaction = _ACK_FOR_VERSION.get(version[:6]) if _ack_is_complete(ack_text) else None
-    prefer_5010 = _ACK_FOR_VERSION.get(version[:6]) != "997"
+    ack_for_version = _ACK_FOR_VERSION.get(version[:6])
+    # A writer that raises partway is caught and logged by pyx12 (muted here), leaving a fragment;
+    # only an ack whose last write was its closing IEA is labelled.
+    ack_transaction = ack_for_version if fd_ack.complete() else None
+    if ack and ack_transaction is None:
+        _log.warning("pyx12's ack writer stopped before the closing IEA; the ack is incomplete")
+    prefer_5010 = ack_for_version != "997"
     errors = tuple(_flatten_errors(report, resolve, prefer_5010=prefer_5010))
     return X12ValidationResult(
         valid=valid and not errors,

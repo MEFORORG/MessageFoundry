@@ -45,12 +45,15 @@ def load_x12_validator() -> tuple[Any, Any]:
 
 
 def load_x12_code_resolver() -> Callable[..., str | None]:
-    """Return ``pyx12.error_codes.x12_code_for``, or a clear :class:`RuntimeError` if the ``[x12]``
+    """Return a resolver over ``pyx12.error_codes``, or a clear :class:`RuntimeError` if the ``[x12]``
     extra is absent or older than pyx12 4.0.1, which added that module.
 
-    ``x12_code_for(err_cde, prefer_5010=...)`` resolves a pyx12 error name to the X12 code the
-    997 (``prefer_5010=False``, AK codes) or 999 (``True``, IK codes) carries, ``None`` where pyx12
-    maps the name to neither, and passes a raw X12 number through unchanged."""
+    ``resolve(err_cde, prefer_5010=...)`` is pyx12's ``x12_code_for``: the X12 code the 999
+    (``True``, IK first) or 997 (``False``, AK first) carries for a pyx12 error name, ``None`` where
+    pyx12 maps the name to neither, and a raw X12 number passed through unchanged. With
+    ``prefer_5010=False`` it also returns ``None`` where pyx12's table has no AK code for the name,
+    rather than ``x12_code_for``'s fallback to a 999 code no 997 carries; pyx12's own 997 writer
+    omits those errors by the same table."""
     try:
         import pyx12.error_codes
     except ImportError as exc:  # pragma: no cover - exercised only without the [x12] extra
@@ -58,5 +61,15 @@ def load_x12_code_resolver() -> Callable[..., str | None]:
             "strict X12 validation requires pyx12>=4.0.1 from the optional 'x12' extra: "
             "pip install 'messagefoundry[x12]'"
         ) from exc
-    resolver: Callable[..., str | None] = pyx12.error_codes.x12_code_for
-    return resolver
+    table = pyx12.error_codes.ERROR_CODES
+    x12_code_for = pyx12.error_codes.x12_code_for
+
+    def resolve(err_cde: str, prefer_5010: bool = True) -> str | None:
+        if not prefer_5010:
+            spec = table.get(err_cde)
+            if spec is not None and spec.ak_code is None:
+                return None
+        code: str | None = x12_code_for(err_cde, prefer_5010=prefer_5010)
+        return code
+
+    return resolve

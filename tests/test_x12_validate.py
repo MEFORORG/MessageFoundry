@@ -415,7 +415,10 @@ def test_a_997_pass_never_reports_a_999_only_code() -> None:
         (e.segment_id, e.element_position, e.code) for e in result.errors if e.element_position
     ]
     assert element == [("NM1", 10, "ELE_I10_NOT_USED")]
-    assert not [e.code for e in result.errors if e.code[:1] == "I" and e.code[1:].isdigit()]
+    import pyx12.error_codes
+
+    ik_only = {s.ik_code for s in pyx12.error_codes.ERROR_CODES.values() if s.ak_code is None}
+    assert not [e.code for e in result.errors if e.code in ik_only]
 
 
 def test_a_fragment_from_an_ack_writer_that_failed_is_not_labelled() -> None:
@@ -423,4 +426,17 @@ def test_a_fragment_from_an_ack_writer_that_failed_is_not_labelled() -> None:
     # the fragment it leaves has no closing IEA, so it is no 997.
     result = validate(_conformant_270().replace("ST*270*0001~", "ST*270~"))
     assert result.ack is not None and "IEA" not in result.ack
+    assert result.ack_transaction is None
+
+
+def test_sender_text_cannot_forge_the_closing_iea_of_a_fragment() -> None:
+    # With "|" and newline as the sender's separators, a GS06 of "1~IEA*1*000000001" is echoed into
+    # the fragment's AK102, so the fragment's text ends in an IEA segment pyx12 never wrote.
+    pipes = _conformant_270().replace("ST*270*0001~", "ST*270~").replace("*", "|")
+    pipes = pipes.replace("|1200|1|X|", "|1200|1#IEA*1*000000001|X|")
+    pipes = pipes.replace("GE|1|1~", "GE|1|1#IEA*1*000000001~")
+    msg = pipes.replace("~", chr(10)).replace("#", "~")
+    result = validate(msg)
+    assert result.ack is not None and result.ack.rstrip().endswith("IEA*1*000000001~")
+    assert "AK9" not in result.ack
     assert result.ack_transaction is None
