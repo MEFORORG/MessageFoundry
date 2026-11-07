@@ -12011,6 +12011,7 @@ def _security(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
+        _ENV_PREFIX,
         _SECURITY_PASSTHROUGH,
         AuthSettings,
         SecuritySettings,
@@ -12046,9 +12047,14 @@ def _security(args: argparse.Namespace) -> int:
         variable leaves it, not ``sec``'s default: the two are separate literals, which
         tests/test_security_cli.py pins equal for the session limits.
 
-        A session limit the environment layer loosens is still named, after the authored entries
-        and labelled with its variable (vault BACKLOG #2600); docs/SECURITY-LOOSENING.md, the
-        idle-limit entry, says when."""
+        Only the two session limits are also read off the load (vault BACKLOG #2600). Where the
+        load read one as a value other than ``sec``'s, and that value is itself a loosening, it is
+        named after the authored entries: labelled with the MEFOR_SECURITY_* variable when one is
+        set, and otherwise as the two reads disagreeing. A variable equal to ``sec``'s value, or
+        one whose value is no loosening, adds no entry, and no other switch's variable is named.
+        Only a load that ran and succeeded can surface one: `show` on an absent file runs none,
+        while `set` on a new file loads the candidate it wrote. docs/SECURITY-LOOSENING.md, the
+        idle-limit entry, says the same for an operator."""
         full: ServiceSettings | None = saved
         partial_reason: str | None = None
         # An ABSENT file is not a degraded read -- the shipped defaults ARE the effective posture
@@ -12128,15 +12134,22 @@ def _security(args: argparse.Namespace) -> int:
         if differs:
             import os
 
-            environ = {name.upper() for name in os.environ}
             for s, r in _auth_limit_loosenings(full.auth):
                 if s not in differs:
                     continue
-                variable = f"MEFOR_SECURITY_{s.upper()}"
+                # The names the load reads as this switch, by _env_overrides' rule: the prefix
+                # matched as written, the rest in any case. On Windows os.environ holds every name
+                # upper-cased, so the same rule reads there as the loader reads.
+                variables = sorted(
+                    name
+                    for name in os.environ
+                    if name.startswith(_ENV_PREFIX)
+                    and name[len(_ENV_PREFIX) :].lower() == f"security_{s}"
+                )
                 source = (
-                    f"set by {variable} in this command's environment, which overrides the file "
-                    "and may not be the service's"
-                    if variable in environ
+                    f"set by {', '.join(variables)} in this command's environment, which "
+                    "overrides the file and may not be the service's"
+                    if variables
                     else "read differently by the whole-file load than by the [security] read "
                     "this report shows, as a concurrent edit between the two leaves it"
                 )
@@ -12179,10 +12192,15 @@ def _security(args: argparse.Namespace) -> int:
                 "The [security] switches are the AUTHORED values, so a MEFOR_SECURITY_* "
                 "variable the service carries is NOT reflected here, and neither is a "
                 "`serve --host` bind override on a running engine — see `messagefoundry check` or "
-                "GET /security/posture. A session limit that a MEFOR_SECURITY_* variable in THIS "
-                "command's environment loosens is named after the authored entries, labelled with "
-                "the variable, but only when a whole-file load runs and succeeds: an absent file "
-                "runs none, so it is not named there. The other sections are read as the whole-file load "
+                "GET /security/posture. Of the MEFOR_SECURITY_* variables in THIS command's "
+                "environment, only the two session limits' are disclosed: one that sets a limit to "
+                "a value other than the file's [security] value, where that value is itself a "
+                "loosening, is named after the authored entries, labelled with the variable. One "
+                "equal to the file's value, or one whose value is no loosening, adds no entry, and "
+                "at least the require_mfa and block_unlisted_outbound variables are never named. "
+                "That needs a whole-file load that ran and succeeded: `show` on an absent file runs "
+                "none and names none, while `set` on a new file loads what it wrote and names it. "
+                "The other sections are read as the whole-file load "
                 "resolves them, so a MEFOR_<SECTION>_<KEY> variable in THIS command's environment "
                 "counts there, which may not be the service's. One entry is not read from the "
                 "file at all: "
@@ -12228,7 +12246,13 @@ def _security(args: argparse.Namespace) -> int:
             saved_sec.append(
                 SecuritySettings.model_validate(security_edit.read_security(candidate))
             )
-        except (ValueError, OSError):  # ValidationError and SecurityEditError are ValueErrors
+        except (ValueError, OSError) as exc:  # ValidationError, SecurityEditError are ValueErrors
+            # The type only: a validation or read error's text can quote the file's values.
+            logging.getLogger(__name__).warning(
+                "security set: the saved [security] could not be re-read for the report (%s), so "
+                "the loosenings are reported from the [security] checked before the edit",
+                type(exc).__name__,
+            )
             saved_sec.append(None)
 
     try:

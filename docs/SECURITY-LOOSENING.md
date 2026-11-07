@@ -513,13 +513,16 @@ false premise.
   `GET /security/posture` list it. A value of `0` or less ends every session at once, which is
   stricter, and is not named. `messagefoundry security show` and the `security set` preview read
   both limits from the file's `[security]`, the authored values `show` prints. When a
-  `MEFOR_SECURITY_*` variable in the operator's shell sets a limit to a value that is a loosening,
-  that value is named too, after the authored entries, beside any entry for the file's own value,
-  with a risk that starts by naming the variable. That happens only when the whole-file load runs
-  and succeeds: a report that is partial, or a file that does not exist yet, runs no successful
-  load and does not name it. The variable also feeds that load, so one the load refuses makes the
-  report partial, or refuses the edit. The IDE security editor marks a value above the default it
-  is shown.
+  `MEFOR_SECURITY_*` variable in the operator's shell sets a limit to a value other than the
+  file's, and that value is itself a loosening, it is named too, after the authored entries and
+  beside any entry for the file's own value, with a risk that starts by naming the variable. A
+  variable equal to the file's value, or one whose value is no loosening, adds no entry. Only the
+  two session limits get this: a `MEFOR_SECURITY_*` variable for another switch, at least
+  `require_mfa` and `block_unlisted_outbound`, is not named. It needs a whole-file load that ran
+  and succeeded, so a partial report names none, and so does `security show` on a file that does
+  not exist yet; `security set` on a new file loads what it wrote, and names it. The variable also
+  feeds that load, so one the load refuses makes the report partial, or refuses the edit. The IDE
+  security editor marks a value above the default it is shown.
 
 ### `block_unlisted_outbound = false` — allow-any outbound egress
 - **What you lose:** deny-by-default egress; a transform may send to **any** destination (PHI exfiltration

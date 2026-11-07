@@ -191,6 +191,79 @@ def test_two_reads_that_disagree_with_no_variable_are_not_blamed_on_one(
     assert entry["risk"].startswith("read differently by the whole-file load")
 
 
+def test_a_variable_equal_to_the_file_adds_no_entry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A MEFOR_SECURITY_* variable that sets a session limit to the file's own value adds nothing:
+    the limit is named once, as the file's, unlabelled (vault BACKLOG #2600). The control is the
+    same file with the variable one hour looser: a second, labelled entry appears."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nmax_session_hours = 48\n", encoding="utf-8")
+    variable = f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS"
+    monkeypatch.setenv(variable, "48")
+    (entry,) = _entries(_show(toml, capsys), "max_session_hours")
+    assert not _is_labelled(entry), entry
+    monkeypatch.setenv(variable, "49")
+    authored, labelled = _entries(_show(toml, capsys), "max_session_hours")
+    assert not _is_labelled(authored) and labelled["risk"].startswith(f"set by {variable}")
+
+
+def test_set_on_a_new_file_names_the_variable_show_on_an_absent_one_does_not(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`show` on a file that does not exist runs no load, so a variable that loosens a session
+    limit is not named there; `set` on that path writes a new file and loads it, so its preview
+    names the variable (vault BACKLOG #2600). Each arm is the other's control."""
+    toml = tmp_path / "mf.toml"
+    variable = f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS"
+    monkeypatch.setenv(variable, "48")
+    assert _entries(_show(toml, capsys), "max_session_hours") == []
+    rc, res = _set(toml, {"block_unlisted_outbound": True}, capsys)
+    assert rc == 0 and toml.exists()
+    (entry,) = _entries(res, "max_session_hours")
+    assert entry["risk"].startswith(f"set by {variable} in this command's environment")
+
+
+@pytest.mark.parametrize(
+    ("name", "read_by_the_load"),
+    [
+        ("MEFOR_security_max_session_hours", True),
+        ("mefor_SECURITY_MAX_SESSION_HOURS", False),
+    ],
+)
+def test_the_label_names_a_variable_by_the_loaders_rule(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    read_by_the_load: bool,
+) -> None:
+    """The label names a variable only as the loader reads one: the MEFOR_ prefix matched as
+    written, the rest in any case (vault BACKLOG #2600). The environment is a plain mapping, as a
+    case-sensitive platform's is, so this runs the same on Windows. The [security] read is emptied,
+    so the two reads disagree whether or not the variable is read.
+
+    A name the loader reads is named as written. One whose prefix is lower case the loader skips,
+    so the label must not blame it; an upper-casing lookup did."""
+    import os
+
+    from messagefoundry.config import security_edit
+
+    environ = {k: v for k, v in os.environ.items() if not k.upper().startswith("MEFOR_SECURITY_")}
+    environ[name] = "49"
+    monkeypatch.setattr(os, "environ", environ)
+    monkeypatch.setattr(security_edit, "read_security", lambda service_config: {})
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nmax_session_hours = 48\n", encoding="utf-8")
+    (entry,) = _entries(_show(toml, capsys), "max_session_hours")
+    if read_by_the_load:
+        assert entry["risk"].startswith(f"set by {name} in this command's environment"), entry
+        assert "49 hour" in entry["risk"], entry
+    else:
+        assert entry["risk"].startswith("read differently by the whole-file load"), entry
+        assert "48 hour" in entry["risk"], entry
+
+
 @pytest.mark.parametrize("error", ["security_edit", "os"])
 def test_set_preview_does_not_refuse_an_edit_whose_candidate_read_raises(
     tmp_path: Path,
@@ -200,24 +273,50 @@ def test_set_preview_does_not_refuse_an_edit_whose_candidate_read_raises(
 ) -> None:
     """The preview's read of the candidate is for the report only, so a SecurityEditError or an
     OSError from it falls back to the pre-check view rather than refusing an edit the whole-file
-    load accepted (vault BACKLOG #2600). Only the candidate's read raises; the live file reads."""
+    load accepted (vault BACKLOG #2600). Only the candidate's read raises; the live file reads.
+
+    The fallback logs a WARNING naming the exception's type and nothing of its text, which can
+    quote the file's values. The control is an edit whose candidate reads: it logs no such line.
+    The handler sits on the module's logger, since `--json` replaces the root's handlers."""
+    import logging
+
     from messagefoundry.config import security_edit
 
     real = security_edit.read_security
     toml = tmp_path / "mf.toml"
+    marker = "could not be re-read for the report"
+    records: list[logging.LogRecord] = []
 
-    def failing_candidate(service_config: str | Path) -> dict:
-        if Path(service_config) != toml:
-            if error == "os":
-                raise OSError("unreadable")
-            raise security_edit.SecurityEditError("unreadable")
-        return real(service_config)
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
 
-    monkeypatch.setattr(security_edit, "read_security", failing_candidate)
-    rc, res = _set(toml, {"max_session_hours": 48}, capsys)
+    handler = _Collect(logging.WARNING)
+    logger = logging.getLogger("messagefoundry.__main__")
+    logger.addHandler(handler)
+    try:
+        rc, _ = _set(toml, {"require_mfa": True}, capsys)
+        assert rc == 0 and not [r for r in records if marker in r.getMessage()]
+
+        def failing_candidate(service_config: str | Path) -> dict:
+            if Path(service_config) != toml:
+                if error == "os":
+                    raise OSError("secret-sentinel-0451")
+                raise security_edit.SecurityEditError("secret-sentinel-0451")
+            return real(service_config)
+
+        monkeypatch.setattr(security_edit, "read_security", failing_candidate)
+        rc, res = _set(toml, {"max_session_hours": 48}, capsys)
+    finally:
+        logger.removeHandler(handler)
     assert rc == 0, res
     assert "max_session_hours = 48" in toml.read_text(encoding="utf-8")
     assert _entries(res, "max_session_hours")
+    (record,) = [r for r in records if marker in r.getMessage()]
+    assert record.levelno == logging.WARNING and record.exc_info is None
+    expected = "OSError" if error == "os" else "SecurityEditError"
+    assert f"({expected})" in record.getMessage()
+    assert all("secret-sentinel-0451" not in r.getMessage() for r in records)
 
 
 def test_an_unset_session_limit_reads_the_auth_default(
@@ -242,21 +341,37 @@ def test_an_unset_session_limit_reads_the_auth_default(
     assert "max_session_hours" in [lo["switch"] for lo in _show(toml, capsys)["loosenings"]]
 
 
+def _is_labelled(entry: dict) -> bool:
+    """Whether a loosening entry is one the whole-file load added, not an authored one."""
+    return entry["risk"].startswith(("set by ", "read differently by the whole-file load"))
+
+
+@pytest.mark.parametrize("candidate_read", ["fresh", "stale"])
 def test_set_preview_reads_the_security_it_saved(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_read: str,
 ) -> None:
     """The preview's [security] is the one in the candidate the edit lock validated, not the
     pre-check read taken before the lock (vault BACKLOG #2600). The first read is made stale, as a
     concurrent edit landing between it and the lock would leave it, and the saved file's looser
-    session limit is still named."""
+    session limit is named exactly once, as the file's, with no entry labelled as the load's.
+
+    The `stale` arm is the control: the candidate's read is made stale too, as a preview that kept
+    the pre-check view would leave it. The limit is then named only by the load, labelled, so the
+    assertion on the `fresh` arm cannot pass on a stale view."""
     from messagefoundry.config import security_edit
 
+    monkeypatch.delenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", raising=False)
     real = security_edit.read_security
     calls: list[str] = []
 
     def stale_first(service_config: str | Path) -> dict:
         calls.append(str(service_config))
-        return {} if len(calls) == 1 else real(service_config)
+        if len(calls) == 1 or candidate_read == "stale":
+            return {}
+        return real(service_config)
 
     monkeypatch.setattr(security_edit, "read_security", stale_first)
     toml = tmp_path / "mf.toml"
@@ -264,7 +379,8 @@ def test_set_preview_reads_the_security_it_saved(
     rc, res = _set(toml, {"block_unlisted_outbound": True}, capsys)
     assert rc == 0 and len(calls) >= 2
     assert "max_session_hours = 48" in toml.read_text(encoding="utf-8")
-    assert "max_session_hours" in [lo["switch"] for lo in res["loosenings"]]
+    (entry,) = _entries(res, "max_session_hours")
+    assert _is_labelled(entry) is (candidate_read == "stale"), entry
 
 
 @pytest.mark.parametrize(
