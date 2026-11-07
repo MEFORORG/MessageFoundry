@@ -1001,8 +1001,10 @@ connection, is run again, up to three attempts. A re-run starts only while less 
 have passed since the first attempt began, give or take its half-second pause, and nothing bounds
 how long one attempt runs. At the default `acquire_timeout` a SQL Server pool wait uses up that
 budget on its own, so it is recorded at once rather than run into the request deadline. A refusal
-that reads as a defect, such as a statement the store cannot run, is raised at once, unretried and
-unrecorded. A revoke the service gives up on is logged at ERROR
+that reads as a defect is raised at once, unretried and unrecorded: at least a store whose tables,
+columns or grants are not what the statement needs, and SQLite's `ProgrammingError`. A SQL syntax
+error is not always one: SQLite's, and SQL Server's generic 42000, are run again and recorded like a
+fault, while PostgreSQL's, in SQLSTATE class 42, is raised at once. A revoke the service gives up on is logged at ERROR
 and writes one `auth.sessions_revoke_failed` row naming the account, the change, the attempts and
 the error class. A role edit or map save stops at that account, and its row counts the accounts it
 did not reach as `accounts_not_attempted`; the request still fails, the change stands, and the account's other sessions stay
