@@ -2342,7 +2342,9 @@ def test_reauth_surface_feeds_the_lockout_and_the_doc_says_so() -> None:
     assert "global ceiling does **not**" in block, (
         "the SEC-024 caveat must still state that the global sign-in ceiling does not cover them."
     )
-    assert "per engine process" in block, "the caveat must state the per-process limit of the cap."
+    assert "That count is per engine process" in block, (
+        "the SEC-024 caveat must state the per-process limit of the cap."
+    )
 
 
 def test_throttle_observability_split_is_documented() -> None:
