@@ -1671,13 +1671,16 @@ def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
     :func:`~messagefoundry.store.base.build_store_cipher` does not chain one (BACKLOG #2532,
     #3471): its text names a byte of what it decoded. A ``ValueError`` that is one, holds one, or
     has one on its chain, or whose chain cannot be read whole, is refused with a fixed text naming
-    the settings and which of the two it is, raised outside the handler (BACKLOG #4882). It names
-    no class, as :func:`~messagefoundry.store.base._codec_safe_refusal`'s fallback names none
-    (the third hold on engine PR 2818). The class test that comes first reads the class with
-    ``type``, so it runs none of the error's own code (the fourth hold). Not its ``codec_safe_str``
-    rendering: the CRL judge re-raises a codec error as a
-    ``ValueError`` whose own text already quotes the byte, which that rendering prints whole.
-    Every other ``ValueError`` keeps its text and its chain."""
+    the settings and which of the two it is, raised outside the handler (BACKLOG #4882). Not its
+    ``codec_safe_str`` rendering: the CRL judge re-raises a codec error as a ``ValueError`` whose
+    own text already quotes the byte, which that rendering prints whole. It names no class, as
+    :func:`~messagefoundry.store.base._codec_safe_refusal`'s fallback names none (the third hold
+    on engine PR 2818). Every other ``ValueError`` keeps its text and its chain.
+
+    The class test that comes first, for an ``InsecureHopRefused`` or an ``OSError``, reads the
+    class with ``type``, so it runs none of the error's own code (the fourth hold). It runs before
+    the codec judgement, so one of those keeps its own type, text and chain, a codec error on it
+    included."""
     try:
         return _verifying_context(settings)
     except ValueError as exc:

@@ -1128,6 +1128,29 @@ def test_the_postgres_tls_wrap_tests_the_class_with_type(
     assert escaped.__cause__ is None and escaped.__context__ is None
 
 
+class _HostFault(OSError, ValueError):
+    """A real OSError that is also a ValueError, as a CRL staging copy that failed is."""
+
+
+@pytest.mark.parametrize(
+    "make",
+    [lambda: _HostFault("synthetic: staging copy failed"), lambda: _host_echoing()],
+    ids=["oserror-and-valueerror", "insecure-hop-refused"],
+)
+def test_the_postgres_tls_wrap_passes_a_real_host_fault_or_hop_refusal_through(
+    make: Callable[[], ValueError], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the class test above: an error whose real type is one of the two leaves
+    as itself, untyped, as the docstring says."""
+    from messagefoundry.store import postgres
+
+    error = make()
+    monkeypatch.setattr(postgres, "_verifying_context", _raising(error))
+    with pytest.raises(ValueError) as caught:
+        postgres._verifying_context_at_open(StoreSettings())
+    assert caught.value is error
+
+
 class _ClassSaysTyped(ValueError):
     """A ValueError with no codec error whose ``__class__`` answers ``StoreCipherConfigError``."""
 

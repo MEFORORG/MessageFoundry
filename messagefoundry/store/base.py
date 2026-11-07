@@ -3481,7 +3481,8 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
         refusal = _codec_safe_refusal(exc)
         if refusal is None:
             # One already typed, as the key seam refuses a codec error, is not wrapped again. The
-            # class is read with ``type``, as by ``_refused``, which runs none of exc's own code.
+            # class test reads the class with ``type``, as ``_refused`` does, so it runs none of
+            # exc's own code; ``str(exc)`` below still runs its ``__str__``.
             kind = type(exc)
             if issubclass(kind, ValueError) and not issubclass(kind, StoreCipherConfigError):
                 raise StoreCipherConfigError(str(exc)) from exc
