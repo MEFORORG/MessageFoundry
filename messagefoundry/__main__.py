@@ -11069,12 +11069,14 @@ def _cipher_audit(args: argparse.Namespace) -> int:
 
         async def run_server() -> tuple[bool, CipherAudit, str | None] | None:
             _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
+            # Bound, as `audit-verify` binds it, so the posture census reads the name it passes.
+            posture = _command_hop_posture(settings)
             try:
                 handle = await _open_store_or_refuse(
                     open_store(
                         store,
                         read_only=True,
-                        posture=_command_hop_posture(settings),
+                        posture=posture,
                         # The shared verdict, as every CLI opener passes it (BACKLOG #1916).
                         keyless_chain_refusal=keyless_opt_out_refusal(
                             settings.store, settings.security
