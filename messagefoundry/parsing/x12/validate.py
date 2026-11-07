@@ -48,7 +48,8 @@ __all__ = ["X12SegmentError", "X12ValidationResult", "validate"]
 class X12SegmentError:
     """One conformance violation, reduced to **PHI-safe structural locators only**.
 
-    ``code`` is pyx12's numeric error code; ``message`` is a synthesized, value-free description;
+    ``code`` is the X12 error number (pyx12's ``x12_code``, e.g. ``"8"``), or pyx12's own error name
+    where pyx12 maps it to no X12 number; ``message`` is a synthesized, value-free description;
     ``segment_id`` / ``element_position`` / ``line`` / ``loop`` locate it; ``element_name`` is the
     *schema* data-element label (e.g. ``"Transaction Set Creation Date"``), never the input value."""
 
@@ -167,31 +168,35 @@ def _element_error(code: str, seg: dict[str, Any], ele: dict[str, Any]) -> X12Se
     )
 
 
+def _error_code(err: dict[str, Any]) -> str:
+    """The X12 error number for one pyx12 JSON error dict. Since pyx12 4.0.1, ``err_cde`` holds pyx12's
+    own error name (e.g. ``"ELE_8_invalid_date"``) and the X12 number moved to ``x12_code``, which is
+    ``None`` when pyx12 maps the name to no X12 number; only then does the name stand in."""
+    x12_code = err.get("x12_code")
+    if x12_code is not None:
+        return str(x12_code)
+    return str(err.get("err_cde", ""))
+
+
 def _flatten_errors(report: dict[str, Any]) -> list[X12SegmentError]:
     """Walk pyx12's nested JSON error report (interchange → group → transaction → segment → element),
     flattening every recorded error into a PHI-safe :class:`X12SegmentError`."""
     out: list[X12SegmentError] = []
     for interchange in report.get("interchanges", []):
         for err in interchange.get("errors", []):
-            out.append(
-                X12SegmentError(code=str(err.get("err_cde", "")), message="interchange error")
-            )
+            out.append(X12SegmentError(code=_error_code(err), message="interchange error"))
         for group in interchange.get("groups", []):
             for err in group.get("errors", []):
-                out.append(X12SegmentError(code=str(err.get("err_cde", "")), message="group error"))
+                out.append(X12SegmentError(code=_error_code(err), message="group error"))
             for txn in group.get("transactions", []):
                 for err in txn.get("errors", []):
-                    out.append(
-                        X12SegmentError(
-                            code=str(err.get("err_cde", "")), message="transaction error"
-                        )
-                    )
+                    out.append(X12SegmentError(code=_error_code(err), message="transaction error"))
                 for seg in txn.get("segments", []):
                     for err in seg.get("errors", []):
-                        out.append(_segment_error(str(err.get("err_cde", "")), seg, err))
+                        out.append(_segment_error(_error_code(err), seg, err))
                     for ele in seg.get("elements", []):
                         for err in ele.get("errors", []):
-                            out.append(_element_error(str(err.get("err_cde", "")), seg, ele))
+                            out.append(_element_error(_error_code(err), seg, ele))
     return out
 
 

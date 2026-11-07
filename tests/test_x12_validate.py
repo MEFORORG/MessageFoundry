@@ -75,6 +75,46 @@ def test_valid_conformant_interchange_validates_true() -> None:
     assert result.errors == ()
 
 
+def _conformant_270(
+    *, dob: str = "19430519", ge: str = "GE*1*1~", iea: str = "IEA*1*000000001~"
+) -> str:
+    """The conformant 270 above, with one slot left open so a test can break exactly one thing."""
+    return (
+        _ISA_270 + _GS_270 + "ST*270*0001~"
+        "BHT*0022*13*10001234*20060501*1319~"
+        "HL*1**20*1~"
+        "NM1*PR*2*ABC COMPANY*****PI*842610001~"
+        "HL*2*1*21*1~"
+        "NM1*1P*1*JONES*MARCUS****SV*0202034~"
+        "HL*3*2*22*0~"
+        "TRN*1*93175-012547*9877281234~"
+        "NM1*IL*1*SMITH*ROBERT****MI*11122333301~"
+        f"DMG*D8*{dob}*M~"
+        "DTP*307*D8*20060101~"
+        "EQ*30~"
+        "SE*13*0001~" + ge + iea
+    )
+
+
+def test_element_error_code_is_the_x12_number() -> None:
+    # pyx12 4.0.1 moved the X12 number from err_cde (now a pyx12 name such as
+    # "ELE_8_invalid_date_range") to x12_code; ``code`` must stay the X12 number (data element error 8,
+    # "Invalid Date").
+    result = validate(_conformant_270(dob="19431399"))
+    assert result.valid is False
+    element = [e for e in result.errors if e.element_position is not None]
+    assert [(e.segment_id, e.element_position, e.code) for e in element] == [("DMG", 2, "8")]
+    assert all(e.code.isdigit() for e in result.errors)
+
+
+def test_envelope_error_code_is_the_x12_number() -> None:
+    # IEA01 counts two groups but the interchange holds one: TA1 note code 021 ("Invalid Number of
+    # Included Groups Value"), not pyx12's "ISA_021_invalid_group_count".
+    result = validate(_conformant_270(iea="IEA*2*000000001~"))
+    assert result.valid is False
+    assert [(e.message, e.code) for e in result.errors] == [("interchange error", "021")]
+
+
 def test_validate_reports_conformance_errors_and_emits_999() -> None:
     # An 837 stub missing mandatory loops + a wrong SE count — pyx12 finds real violations.
     msg = _interchange(
