@@ -133,6 +133,53 @@ def test_the_session_limits_are_reported_as_the_file_sets_them(
     assert "max_session_hours" not in [lo["switch"] for lo in data["loosenings"]]
 
 
+def test_an_unset_session_limit_reads_the_auth_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The load copies a [security] switch into [auth] only when the file sets it, so an unset
+    session limit stays at the [auth] field's own default. The two defaults are separate literals,
+    so a [security] default moved alone must not make `show` name a limit the engine would not
+    (vault BACKLOG #2600). The control is the set limit: the same moved default, authored, is named."""
+    from messagefoundry.config import settings
+
+    class _MovedDefault(settings.SecuritySettings):
+        max_session_hours: int = 24
+
+    monkeypatch.setattr(settings, "SecuritySettings", _MovedDefault)
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nrequire_mfa = true\n", encoding="utf-8")
+    data = _show(toml, capsys)
+    assert data["values"]["max_session_hours"] == 24 and data["loosenings_partial"] is False
+    assert "max_session_hours" not in [lo["switch"] for lo in data["loosenings"]]
+    toml.write_text("[security]\nmax_session_hours = 24\n", encoding="utf-8")
+    assert "max_session_hours" in [lo["switch"] for lo in _show(toml, capsys)["loosenings"]]
+
+
+def test_set_preview_reads_the_security_it_saved(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preview's [security] is the one in the candidate the edit lock validated, not the
+    pre-check read taken before the lock (vault BACKLOG #2600). The first read is made stale, as a
+    concurrent edit landing between it and the lock would leave it, and the saved file's looser
+    session limit is still named."""
+    from messagefoundry.config import security_edit
+
+    real = security_edit.read_security
+    calls: list[str] = []
+
+    def stale_first(service_config: str | Path) -> dict:
+        calls.append(str(service_config))
+        return {} if len(calls) == 1 else real(service_config)
+
+    monkeypatch.setattr(security_edit, "read_security", stale_first)
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nmax_session_hours = 48\n", encoding="utf-8")
+    rc, res = _set(toml, {"block_unlisted_outbound": True}, capsys)
+    assert rc == 0 and len(calls) >= 2
+    assert "max_session_hours = 48" in toml.read_text(encoding="utf-8")
+    assert "max_session_hours" in [lo["switch"] for lo in res["loosenings"]]
+
+
 def test_set_preview_scope_is_read_after_the_edit(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

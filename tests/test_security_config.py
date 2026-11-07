@@ -622,6 +622,7 @@ def test_ide_security_editor_marks_a_session_limit_above_its_default(
     assert re.search(r"\blooserAboveDefault\s*:\s*true\b", entry), switch
     assert not re.search(r"\binsecure\s*:", entry), f"{switch}: one value is not the rule"
     engine = dict(_loosenings(SecuritySettings(), auth=auth))[switch]
+    assert ", so " in engine, f"{switch}: the engine risk lost the clause the IDE mirrors"
     clause = engine.split(", so ", 1)[1]
     assert risk.endswith(", so " + clause)
 
