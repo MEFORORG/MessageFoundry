@@ -45,6 +45,7 @@ from messagefoundry.auth.trust_anchors import (
     AnchorSettingRefused,
     AnchorStoreUnavailable,
     LaneAnchorCheck,
+    RetainsLanes,
     TrustAnchorError,
     anchor_store_refusal,
     connection_anchor_failure,
@@ -4419,6 +4420,17 @@ class RegistryRunner:
             and name not in self._destinations
         )
 
+    def _forget_removed_anchor_lanes(self) -> None:
+        """Drop the refusal marks, and the lane check's memory, of every lane the graph no
+        longer declares (vault BACKLOG #3188). A reload calls it once its swap has committed. A
+        refused or rolled-back reload does not call it."""
+        lanes: set[tuple[Direction, str]] = {("inbound", n) for n in self.registry.inbound}
+        lanes |= {("outbound", n) for n in self.registry.outbound}
+        for lane in [k for k in self._anchor_refused if k not in lanes]:
+            del self._anchor_refused[lane]
+        if isinstance(self._lane_anchor_check, RetainsLanes):
+            self._lane_anchor_check.retain_lanes(lanes)
+
     def _reload_anchor_lanes(
         self, old: Registry, new: Registry, old_inbound_names: Sequence[str]
     ) -> list[tuple[Direction, str, Mapping[str, Any]]]:
@@ -7910,6 +7922,7 @@ class RegistryRunner:
                     self._park_outbounds_while_passive()
             if not self._running:
                 self.registry = new_registry
+                self._forget_removed_anchor_lanes()
                 return
 
             old = self.registry
@@ -8127,6 +8140,7 @@ class RegistryRunner:
             # refusal mark. Not before: a rolled-back reload leaves the old marks as they were.
             for lane in anchors_passed:
                 self._anchor_refused.pop(lane, None)
+            self._forget_removed_anchor_lanes()
             # 3a. The swap committed, so the calendars follow it: every task is replaced from the new
             # graph, so an added schedule starts, an edited one changes and a removed one stops
             # (BACKLOG #2069). After the rollback point on purpose,
@@ -12078,8 +12092,12 @@ class _RedactedFault(Exception):
 class UserCodeCalledSysExit(_RedactedFault):
     """A Router or a Handler raised ``SystemExit``, ``sys.exit()`` called at run time (vault BACKLOG
     #3134). Converted at least where the engine runs that code in-process, so the message takes the
-    internal-error policy as for any other raise. Not under ``[sandbox].mode`` subprocess or
-    isolated, where the child's handler arm catches only ``Exception``.
+    internal-error policy as for any other raise. At ``[sandbox].mode`` subprocess or isolated, the
+    worker's ``_run_one`` converts at least a ``sys.exit()`` raised while the Router, predicate or
+    Handler runs, a generator Router's body included, and reports this class's text as an error;
+    the parent then raises ``SandboxError`` carrying it, and the worker serves the next message.
+    At least one case is not converted: at ``mode=off``, a ``sys.exit()`` in the ``__str__`` of an
+    exception user code raised, which the internal-error path renders on the event loop.
 
     **Why this differs from the config-code rule in ``config/wiring.py``**, whose comments say never
     to catch ``BaseException`` because ``SystemExit`` must keep propagating. That rule is about code

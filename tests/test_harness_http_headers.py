@@ -13,6 +13,11 @@ suite drives the real sink over a loopback socket and reads the bytes back.
 harness may not import ``messagefoundry.transports`` (``tests/test_dependency_boundaries.py``), and
 one test here pins the copy equal so the two cannot drift.
 
+**The case table is the sink's** (``SELF_TEST_CASES``), because the sink drives the same table
+before it starts and refuses to start when an answer lacks the baseline (BACKLOG #1121; owner
+ruling R1 of the vault's ``ASVS-OWNER-RULINGS-2026-10-23-BATCH340``). The tests at the end pin that
+self-test: it passes on the real sink, and a sink with a header stripped does not start.
+
 **Every case is paired with a control.** The same request against a sink whose one choke point has
 been removed must be found WITHOUT the headers. A probe that cannot report absence proves nothing by
 reporting presence.
@@ -22,9 +27,12 @@ from __future__ import annotations
 
 import http.client
 import http.server
+import logging
 import platform
 import socket
 import threading
+import time
+from collections.abc import Callable
 from typing import Any, cast
 
 import pytest
@@ -40,30 +48,15 @@ _Block = tuple[int, list[tuple[str, str]]]
 _EXPECTED = [(name.lower(), value) for name, value in _BASELINE_RESPONSE_HEADERS]
 
 
-def _exchange(port: int, request: bytes, *, half_close: bool) -> bytes:
-    """Send raw bytes and read until the sink closes the connection. ``half_close`` tells the sink
-    no more is coming, so a refusal that discards the rest of the request ends at once and not on
-    the read timeout."""
-    with socket.create_connection(("127.0.0.1", port), 5.0) as conn:
-        conn.sendall(request)
-        if half_close:
-            conn.shutdown(socket.SHUT_WR)
-        chunks = []
-        try:
-            while chunk := conn.recv(65536):
-                chunks.append(chunk)
-        except ConnectionError:
-            # The sink closed with unread input still queued. What arrived is the answer; with
-            # nothing arrived, the reset is the finding, and it is raised as itself.
-            if not chunks:
-                raise
-    return b"".join(chunks)
+#: The sink's own socket loop: send raw bytes, half-close when asked, read until the sink closes.
+#: Bound here at import, so a test that replaces the sink module's copy does not reach this one.
+_exchange = http_sink._exchange
 
 
 def _answer(monkeypatch: pytest.MonkeyPatch, request: bytes, status: int = 200) -> bytes:
     """What a fresh sink writes back for ``request``. Only the stalled-body case shortens the read
     timeout and keeps its side open: every other case leaves the sink its normal five seconds."""
-    stalled = request == _STALLED_BODY
+    stalled = request in _STALLING_REQUESTS
     if stalled:
         monkeypatch.setattr(http_sink, "READ_TIMEOUT_SECONDS", 0.3)
     with RestSink(status=status, reply_body=b'{"ok":1}') as sink:
@@ -112,74 +105,18 @@ def _is_bare(raw: bytes) -> bool:
     return not _blocks(raw)
 
 
-_POST = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}"
-
-#: Declares a hundred bytes and sends ten, then waits: the sink's 408.
-_STALLED_BODY = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nonly ten b"
-
-#: The longest request line the stdlib reads: a literal in http/server.py's handle_one_request,
-#: with no name to read it from. A release that raises it reads the case below, a two-word line
-#: ended by the half-close, as an HTTP/0.9 GET instead of answering the 414, and the case turns red.
-_REQUEST_LINE_LIMIT = 65536
-#: The longest header line: http.client's private _MAXLINE, which parse_headers reads.
-_HEADER_LINE_LIMIT: int = getattr(http.client, "_MAXLINE", 65536)
-_GET_LINE = b"GET /x HTTP/1.1\r\n"
-_LONG_REQUEST_LINE = b"GET /".ljust(_REQUEST_LINE_LIMIT + 1, b"a")
-_LONG_HEADER_LINE = b"X-Long: ".ljust(_HEADER_LINE_LIMIT + 1, b"a")
-#: One header past http.client's limit, with no blank line: the stdlib refuses as it reads the last.
-_MANY_HEADERS = b"X-H: v\r\n" * (getattr(http.client, "_MAXHEADERS", 100) + 1)
-
-#: (sink status, request, the statuses of the header blocks the sink must write).
+#: The answer families, from the sink's own table: the self-test the sink runs before every start
+#: drives the same list on the running Python (BACKLOG #1121). This suite reads the answers with
+#: its own parser and its own assertions, so the two header verdicts are reached separately. The
+#: socket loop that fetches the bytes is the sink's ``_exchange`` in both, so a fault there is
+#: shared.
 _CASES: list[Any] = [
-    pytest.param(200, _POST, [200], id="200"),
-    pytest.param(400, _POST, [400], id="configured-400"),
-    pytest.param(503, _POST, [503], id="configured-503"),
-    pytest.param(200, b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n", [200], id="get"),
-    pytest.param(200, b"HEAD /x HTTP/1.1\r\nHost: x\r\n\r\n", [200], id="head"),
-    # --- the sink's own refusals -----------------------------------------------------------------
-    pytest.param(
-        200,
-        b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999\r\n\r\n",
-        [413],
-        id="413-over-cap",
-    ),
-    pytest.param(200, b"POST /x HTTP/1.1\r\nHost: x\r\n\r\n", [411], id="411-no-length"),
-    pytest.param(
-        200,
-        b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
-        [400],
-        id="400-transfer-encoding",
-    ),
-    pytest.param(200, _STALLED_BODY, [408], id="408-stalled-body"),
-    # --- answers the stdlib handler writes itself, before the sink's handler runs --------------
-    #
-    # The stdlib answers these and closes without draining, and a close with input still unread
-    # can reset the connection and discard the answer before this client reads it. So each one,
-    # and each HTTP/0.9 case below, ends where the stdlib stops reading on Python 3.14: after the
-    # request line when it answers from that line alone, after the blank line when it reads
-    # headers first.
-    pytest.param(200, b"NOT A REQUEST\r\n", [400], id="stdlib-400-malformed"),
-    pytest.param(200, b"BREW /x HTTP/1.1\r\nHost: x\r\n\r\n", [501], id="stdlib-501-method"),
-    pytest.param(200, b"GET /x HTTP/3.0\r\n", [505], id="stdlib-505-version"),
-    pytest.param(200, _LONG_REQUEST_LINE, [414], id="stdlib-414-long-line"),
-    pytest.param(200, _GET_LINE + _LONG_HEADER_LINE, [431], id="stdlib-431-long-header"),
-    pytest.param(200, _GET_LINE + _MANY_HEADERS, [431], id="stdlib-431-many-headers"),
-    pytest.param(
-        200,
-        b"POST /x HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n{}",
-        [100, 200],
-        id="stdlib-100-continue",
-    ),
-    # An HTTP/0.9 answer has no status line and no header block, so there would be nowhere to
-    # put the headers. Which of these the stdlib answers that way depends on the Python patch
-    # level; _BARE_ON_SOME_PYTHON below is how the suite finds out. The sink answers each with a
-    # status line and a header block.
-    pytest.param(200, b"GET /x\r\n", [200], id="http-0.9-two-word-request"),
-    pytest.param(200, b"GET /x HTTP/0.9\r\n\r\n", [200], id="http-0.9-named-version"),
-    pytest.param(200, b"BREW /x HTTP/0.9\r\n\r\n", [501], id="http-0.9-stdlib-501"),
-    pytest.param(200, b"FOO\r\n", [400], id="http-0.9-one-word-line"),
-    pytest.param(200, b"POST /x\r\n", [400], id="http-0.9-two-word-not-get"),
+    pytest.param(case.sink_status, case.request, list(case.statuses), id=case.name)
+    for case in http_sink.SELF_TEST_CASES
 ]
+_POST = next(case.request for case in http_sink.SELF_TEST_CASES if case.name == "200")
+_STALLING_REQUESTS = frozenset(case.request for case in http_sink.SELF_TEST_CASES if case.stalls)
+
 
 #: The cases above that SOME stdlib answers with no header block at all, by id, each with the
 #: statuses the sink must answer it with. Which of them a given Python answers bare is observed by
@@ -221,16 +158,24 @@ def _plain_stdlib_answer(request: bytes) -> bytes:
         thread.join(timeout=5)
 
 
-def _without(monkeypatch: pytest.MonkeyPatch, override: str) -> None:
-    """Remove one of the sink handler's overrides, leaving the stdlib's own behaviour there."""
+def _change_handler(monkeypatch: pytest.MonkeyPatch, change: Callable[[Any], None]) -> None:
+    """Apply ``change`` to every handler class the sink module builds, the self-test's included."""
     real = http_sink._handler_for
 
-    def _stdlib_there(sink: Any) -> Any:
-        handler = real(sink)
-        delattr(handler, override)
+    def _changed(sink: Any, **kwargs: Any) -> Any:
+        handler = real(sink, **kwargs)
+        change(handler)
         return handler
 
-    monkeypatch.setattr(http_sink, "_handler_for", _stdlib_there)
+    monkeypatch.setattr(http_sink, "_handler_for", _changed)
+
+
+def _without(monkeypatch: pytest.MonkeyPatch, override: str) -> None:
+    """Remove one of the sink handler's overrides, leaving the stdlib's own behaviour there."""
+    _change_handler(monkeypatch, lambda handler: delattr(handler, override))
+    # The controls build a sink missing an override on purpose, which is what the self-test exists
+    # to refuse. The tests at the end of this file pin that refusal.
+    monkeypatch.setattr(http_sink, "self_test", lambda: None)
 
 
 @pytest.mark.parametrize(("status", "request_bytes", "statuses"), _CASES)
@@ -417,3 +362,194 @@ def test_the_body_and_the_record_are_unchanged() -> None:
     assert b"Content-Length: 8\r\n" in head + b"\r\n"
     assert record.payload == b"{}" and record.meta["status"] == "200"
     assert "refused" not in record.meta
+
+
+# --- the self-test the sink runs before it starts (BACKLOG #1121, owner ruling R1) ----------------
+
+
+def test_the_case_table_pins_the_answer_families_driven_today() -> None:
+    """The self-test drives exactly this table, so a case dropped from it would leave that answer
+    family unchecked on a new Python. This pin is where a drop turns red. It is not a claim that
+    the table is complete: a family a later stdlib adds is not in it until someone adds it."""
+    assert [case.name for case in http_sink.SELF_TEST_CASES] == [
+        "200",
+        "configured-400",
+        "configured-503",
+        "get",
+        "head",
+        "413-over-cap",
+        "411-no-length",
+        "400-transfer-encoding",
+        "408-stalled-body",
+        "stdlib-400-malformed",
+        "stdlib-501-method",
+        "stdlib-505-version",
+        "stdlib-414-long-line",
+        "stdlib-431-long-header",
+        "stdlib-431-many-headers",
+        "stdlib-100-continue",
+        "http-0.9-two-word-request",
+        "http-0.9-named-version",
+        "http-0.9-stdlib-501",
+        "http-0.9-one-word-line",
+        "http-0.9-two-word-not-get",
+    ]
+
+
+def test_the_self_test_passes_on_the_real_sink(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """On the running Python, every case is driven and none is refused."""
+    driven: list[str] = []
+    real_probe = http_sink._probe
+
+    def _counting(case: http_sink.SelfTestCase) -> list[str]:
+        driven.append(case.name)
+        return real_probe(case)
+
+    monkeypatch.setattr(http_sink, "_probe", _counting)
+    with caplog.at_level(logging.ERROR, logger=http_sink.__name__):
+        http_sink.self_test()
+    assert sorted(driven) == sorted(case.name for case in http_sink.SELF_TEST_CASES)
+    assert not caplog.records, caplog.text
+
+
+def _refusal(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> str:
+    """Start a sink, which must refuse before its own port is bound; return the refusal."""
+    names: list[str] = []
+    real_listen = http_sink._listen
+
+    def _recording(*args: Any, **kwargs: Any) -> Any:
+        names.append(args[3])
+        return real_listen(*args, **kwargs)
+
+    monkeypatch.setattr(http_sink, "_listen", _recording)
+    sink = RestSink()
+    with (
+        caplog.at_level(logging.ERROR, logger=http_sink.__name__),
+        pytest.raises(http_sink.SinkSelfTestError) as refused,
+    ):
+        sink.start()
+    assert names and set(names) == {"harness-http-sink-self-test"}, names
+    assert sink._server is None and sink.port == 0
+    ours = [record for record in caplog.records if record.name == http_sink.__name__]
+    assert [(record.levelno, record.getMessage()) for record in ours] == [
+        (logging.ERROR, str(refused.value))
+    ]
+    # A setup failure, as a port that will not bind is: the harness CLI reports an OSError as
+    # SETUP (exit 2), not as a FAIL verdict on the engine.
+    assert isinstance(refused.value, OSError)
+    return str(refused.value)
+
+
+@pytest.mark.parametrize("header", [name for name, _ in http_sink.BASELINE_RESPONSE_HEADERS])
+def test_a_sink_that_strips_a_baseline_header_refuses_to_start(
+    header: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def _strip(handler: Any) -> None:
+        send_header = handler.send_header
+
+        def _stripped(self: Any, keyword: str, value: str) -> None:
+            if keyword.lower() != header.lower():
+                send_header(self, keyword, value)
+
+        handler.send_header = _stripped
+
+    _change_handler(monkeypatch, _strip)
+    message = _refusal(monkeypatch, caplog)
+    assert f"lacks {header}:" in message, message
+    # Every final answer goes through the one choke point, so every case is named.
+    for case in http_sink.SELF_TEST_CASES:
+        assert f"{case.name}: " in message, case.name
+    if header == "Content-Security-Policy":
+        assert "names no frame-ancestors 'none' policy" in message
+
+
+@pytest.mark.parametrize("override", ["end_headers", "request_version", "send_header"])
+def test_a_sink_missing_an_override_refuses_to_start(
+    override: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Without end_headers no answer carries the baseline. Without request_version the stdlib's
+    HTTP/0.9-form answers have nowhere to carry it: at least the cases every CPython read so far
+    answers bare (``_BARE_ON_EVERY_PYTHON_READ``) are refused. Without the send_header filter the
+    stdlib's Server line, naming the Python patch level, reaches every answer."""
+    _change_handler(monkeypatch, lambda handler: delattr(handler, override))
+    message = _refusal(monkeypatch, caplog)
+    if override == "end_headers":
+        for case in http_sink.SELF_TEST_CASES:
+            assert f"{case.name}: the {case.statuses[-1]} lacks " in message, case.name
+    if override == "request_version":
+        for case_id in _BARE_ON_EVERY_PYTHON_READ:
+            assert f"{case_id}: the answer has no final status line" in message, message
+    if override == "send_header":
+        assert "200: the 200 carries server" in message, message
+        assert "lacks " not in message, message
+
+
+def test_a_case_answered_with_another_status_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A Python whose stdlib reads more headers than the many-headers case sends answers it 200,
+    with the baseline: the 431 path was never driven, so the self-test cannot vouch for it."""
+    monkeypatch.setattr(http.client, "_MAXHEADERS", 10_000)
+    message = _refusal(monkeypatch, caplog)
+    assert message.endswith(
+        "stdlib-431-many-headers: the answer is a 200, not the 431 this case drives, so that "
+        "answer family was not exercised"
+    ), message
+
+
+def test_a_late_send_still_gets_the_stalled_probe_its_408(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stalled-body probe's short wait covers the body read only. A request that reaches the
+    probe's handler later than that wait still gets its 408, rather than no answer, which would
+    refuse the start for a reason that has nothing to do with headers."""
+    (stalled,) = [case for case in http_sink.SELF_TEST_CASES if case.stalls]
+    late = http_sink._SELF_TEST_STALL_SECONDS * 3
+
+    def _late_exchange(port: int, request: bytes, *, half_close: bool) -> bytes:
+        with socket.create_connection(("127.0.0.1", port), 5.0) as conn:
+            time.sleep(late)
+            conn.sendall(request)
+            return b"".join(iter(lambda: conn.recv(65536), b""))
+
+    monkeypatch.setattr(http_sink, "_exchange", _late_exchange)
+    assert http_sink._probe(stalled) == []
+
+
+def test_a_baseline_whose_policy_allows_framing_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The frame-ancestors check reads the answer, not the constant: a baseline edited to drop the
+    directive is sent faithfully, and still refused."""
+    weakened = tuple(
+        (name, "base-uri 'none'" if name == "Content-Security-Policy" else value)
+        for name, value in http_sink.BASELINE_RESPONSE_HEADERS
+    )
+    monkeypatch.setattr(http_sink, "BASELINE_RESPONSE_HEADERS", weakened)
+    message = _refusal(monkeypatch, caplog)
+    assert "names no frame-ancestors 'none' policy" in message
+    assert "lacks " not in message, message
+
+
+@pytest.mark.parametrize(
+    ("policy", "denies"),
+    [
+        ("frame-ancestors 'none'; base-uri 'none'", True),
+        ("base-uri 'none';  FRAME-ANCESTORS 'NONE' ;", True),
+        ("frame-ancestors 'self'", False),
+        ("frame-ancestors 'none' https://a.example", False),
+        ("frame-ancestors 'self'; frame-ancestors 'none'", False),
+        ("default-src 'none'", False),
+        ("report-uri /frame-ancestors 'none'", False),
+        # A no-break space is not CSP whitespace: a browser reads one unknown directive here.
+        ("frame-ancestors\xa0'none'", False),
+        ("frame-ancestors\t'none'", True),
+        # A field may carry several policies, comma-separated; each is enforced on its own.
+        ("frame-ancestors 'none', script-src 'self'", True),
+        ("script-src 'self', frame-ancestors 'none'", True),
+        ("frame-ancestors 'self', script-src 'self'", False),
+        ("", False),
+    ],
+)
+def test_the_frame_ancestors_check_parses_directives(policy: str, denies: bool) -> None:
+    assert http_sink._csp_denies_framing(policy) is denies

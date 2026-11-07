@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-ce424894d11883ec
+bfae7aa7c6c809e6
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -91,6 +91,8 @@ set_channel_scope
 refuse_own_channel_scope
 reset_user_password
 reset_user_mfa
+issue_user_enrolment_code
+revoke_user_enrolment_code
 bind_user_federated_identity
 unbind_user_federated_identity
 admin_revoke_user_sessions
@@ -133,6 +135,7 @@ record_repeated_credential: (conn: 'Request | WebSocket', credential: 'str') -> 
 AuthService: class; its members are the AuthService section
 DirectoryRefusal: enum: DEMOTED, UNCONFIRMED
 Elevation: constructor (token: 'str | None' = None, session_lost: 'bool' = False, recovery_codes: 'tuple[str, ...]' = (), locked: 'bool' = False, idp_step_up_required: 'bool' = False, directory_refusal: 'DirectoryRefusal | None' = None) -> None; fields: directory_refusal, idp_step_up_required, locked, recovery_codes, session_lost, token; properties: ok
+EnrolmentCodeRefused: exception (ValueError < Exception < BaseException)
 FEDERATED_BINDING_CHANGED: attribute: str
 LoginOutcome: constructor (ok: 'bool', token: 'str | None' = None, identity: 'Identity | None' = None, must_change_password: 'bool' = False, error: 'str | None' = None, mfa_required: 'bool' = False, reason: 'str | None' = None, roles_gained: 'RolesGained | None' = None, flow_consumed: 'bool' = True) -> None; fields: error, flow_consumed, identity, mfa_required, must_change_password, ok, reason, roles_gained, token; properties: none
 MfaStatus: constructor (enabled: 'bool', enrolled_at: 'float | None', recovery_codes_remaining: 'int', required: 'bool', webauthn_enrolled: 'bool' = False, totp_reenrolment_recommended: 'bool' = False) -> None; fields: enabled, enrolled_at, recovery_codes_remaining, required, totp_reenrolment_recommended, webauthn_enrolled; properties: none
@@ -141,6 +144,8 @@ OidcStepUp: constructor (elevation: 'Elevation', return_to: 'str' = '/ui', reaso
 OidcStepUpFlow: constructor (user_id: 'str', return_to: 'str') -> None; fields: return_to, user_id; properties: none
 PasskeyProof: constructor (handle: 'str', response_json: 'str', rp_id: 'str', origin: 'str') -> None; fields: handle, origin, response_json, rp_id; properties: none
 RolesGained: constructor (username: 'str', roles: 'frozenset[str]') -> None; fields: roles, username; properties: none
+STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_ISSUE: attribute: str
+STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_REVOKE: attribute: str
 STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY: attribute: str
 STEP_UP_ACTION_ADMIN_RESET_MFA: attribute: str
 STEP_UP_ACTION_ADMIN_RESET_PASSWORD: attribute: str
@@ -180,13 +185,14 @@ begin_webauthn_assertion: (self, token: 'str | None', *, rp_id: 'str') -> 'str |
 begin_webauthn_registration: (self, identity: 'Identity', *, token: 'str', rp_id: 'str', rp_name: 'str') -> 'str'
 complete_oidc_login: (self, *, flow_id: 'str', state: 'str', code: 'str', client: 'str | None', public_origin: 'str') -> 'LoginOutcome'
 complete_oidc_step_up: (self, *, flow_id: 'str', state: 'str', code: 'str', client: 'str | None', public_origin: 'str', mint_grant: 'bool' = True) -> 'OidcStepUp'
-confirm_mfa_enrollment: (self, identity: 'Identity', code: 'str', *, token: 'str', client: 'str | None' = None) -> 'Elevation'
+confirm_mfa_enrollment: (self, identity: 'Identity', code: 'str', *, token: 'str', client: 'str | None' = None, enrolment_code: 'str | None' = None) -> 'Elevation'
 count_other_sessions: (self, user_id: 'str', current_token_hash: 'str') -> 'int | None'
 delete_webauthn_credential: (self, identity: 'Identity', credential_id_hash: 'str', *, client: 'str | None' = None) -> 'bool'
+enrolment_code_required: (self, token: 'str | None', identity: 'Identity') -> 'bool'
 factor_binding_is_blocked: (self, token: 'str | None', action: 'str') -> 'bool'
 fill_own_notify_email: (self, identity: 'Identity', email: 'str', *, client: 'str | None' = None) -> 'bool'
 finish_webauthn_assertion: (self, token: 'str | None', response_json: 'str', *, client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'Elevation'
-finish_webauthn_registration: (self, identity: 'Identity', response_json: 'str', *, label: 'str', token: 'str', client: 'str | None' = None, rp_id: 'str', origin: 'str', factor_refused: 'bool' = False) -> 'Elevation'
+finish_webauthn_registration: (self, identity: 'Identity', response_json: 'str', *, label: 'str', token: 'str', client: 'str | None' = None, rp_id: 'str', origin: 'str', factor_refused: 'bool' = False, enrolment_code: 'str | None' = None) -> 'Elevation'
 flag_new_client_ip: (self, token: 'str | None', client_ip: 'str | None', *, path: 'str') -> 'bool'
 has_action_step_up: (self, token: 'str | None', action: 'str') -> 'bool'
 has_recent_step_up: (self, token: 'str | None') -> 'bool'
@@ -239,11 +245,12 @@ messagefoundry.api.auth_models.ChannelScope: channels, expected_source
 messagefoundry.api.auth_models.CurrentUser: auth_provider, permissions, roles, user_id, username
 messagefoundry.api.auth_models.CustomRoleInfo: description, display_name, id, permissions
 messagefoundry.api.auth_models.CustomRoleRequest: description, display_name, permissions
+messagefoundry.api.auth_models.EnrolmentCodeResponse: code, expires_at, replaced
 messagefoundry.api.auth_models.ExpectedFederatedPair: expected_issuer, expected_subject
 messagefoundry.api.auth_models.FederatedIdentityRequest: expected_issuer, expected_subject, subject
 messagefoundry.api.auth_models.FederatedIdentityView: auth_provider, bind_issuer, has_directory_object_id, issuer, subject, user_id, username
-messagefoundry.api.auth_models.MfaResetResponse: detail, expires_at, temp_password
-messagefoundry.api.auth_models.MfaStatusResponse: enabled, enrolled_at, recovery_codes_remaining, required, totp_reenrolment_recommended, webauthn_enrolled
+messagefoundry.api.auth_models.MfaResetResponse: detail, enrolment_code, enrolment_code_expires_at, expires_at, temp_password
+messagefoundry.api.auth_models.MfaStatusResponse: enabled, enrolled_at, enrolment_code_required, recovery_codes_remaining, required, totp_reenrolment_recommended, webauthn_enrolled
 messagefoundry.api.auth_models.NotifyEmailRequest: email
 messagefoundry.api.auth_models.PasswordChangeRequest: current_password, new_password
 messagefoundry.api.auth_models.PasswordResetResponse: expires_at, must_change_password, temp_password
@@ -356,6 +363,8 @@ POST /ui/users/{user_id}/roles: messagefoundry_webconsole._service:_service#2c4a
 POST /ui/users/{user_id}/channel-scope: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui_step_up.<locals>.dependency#28bcb0039110(base=gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=False; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=messagefoundry_webconsole._auth:_reauth_refusal.<locals>.refuse#91dd07e92db3(reauth_next=messagefoundry_webconsole.routes.admin:register.<locals>.<lambda>#6eed8acd5837()); new_address_check=False; pending_refusal=None; permissions=[users:manage]; phi=False); reauth_next=messagefoundry_webconsole.routes.admin:register.<locals>.<lambda>#6eed8acd5837())
 POST /ui/users/{user_id}/reset-password: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui_step_up_action.<locals>.dependency#c7e52c4a9f25(action='admin_reset_password'; base=gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=False; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=messagefoundry_webconsole._auth:_reauth_refusal.<locals>.refuse#91dd07e92db3(reauth_next=None); new_address_check=False; pending_refusal=None; permissions=[users:manage]; phi=False); reauth_next=None; repeat=None; spend=True)
 POST /ui/users/{user_id}/reset-mfa: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui_step_up_action.<locals>.dependency#c7e52c4a9f25(action='admin_reset_mfa'; base=gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=False; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=messagefoundry_webconsole._auth:_reauth_refusal.<locals>.refuse#91dd07e92db3(reauth_next=None); new_address_check=False; pending_refusal=None; permissions=[users:manage]; phi=False); reauth_next=None; repeat=None; spend=True)
+POST /ui/users/{user_id}/enrolment-code: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui_step_up_action.<locals>.dependency#c7e52c4a9f25(action='admin_enrolment_code_issue'; base=gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=False; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=messagefoundry_webconsole._auth:_reauth_refusal.<locals>.refuse#91dd07e92db3(reauth_next=None); new_address_check=False; pending_refusal=None; permissions=[users:manage]; phi=False); reauth_next=None; repeat=None; spend=True)
+POST /ui/users/{user_id}/enrolment-code/revoke: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui_step_up_action.<locals>.dependency#c7e52c4a9f25(action='admin_enrolment_code_revoke'; base=gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=False; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=messagefoundry_webconsole._auth:_reauth_refusal.<locals>.refuse#91dd07e92db3(reauth_next=None); new_address_check=False; pending_refusal=None; permissions=[users:manage]; phi=False); reauth_next=None; repeat=None; spend=True)
 GET /ui/users/{user_id}/federated-identity: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui_step_up.<locals>.dependency#28bcb0039110(base=gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=False; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=messagefoundry_webconsole._auth:_reauth_refusal.<locals>.refuse#91dd07e92db3(reauth_next=None); new_address_check=False; pending_refusal=None; permissions=[users:manage]; phi=False); reauth_next=None)
 POST /ui/users/{user_id}/federated-identity/link: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui_step_up_action.<locals>.dependency#c7e52c4a9f25(action='admin_federated_identity'; base=gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=False; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=messagefoundry_webconsole._auth:_reauth_refusal.<locals>.refuse#91dd07e92db3(reauth_next=messagefoundry_webconsole.routes.admin:register.<locals>.<lambda>#e51a51673be9()); new_address_check=False; pending_refusal=None; permissions=[users:manage]; phi=False); reauth_next=messagefoundry_webconsole.routes.admin:register.<locals>.<lambda>#e51a51673be9(); repeat=None; spend=True)
 GET /ui/users/{user_id}/federated-identity/unlink-confirm: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui_step_up.<locals>.dependency#28bcb0039110(base=gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=False; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=messagefoundry_webconsole._auth:_reauth_refusal.<locals>.refuse#91dd07e92db3(reauth_next=None); new_address_check=False; pending_refusal=None; permissions=[users:manage]; phi=False); reauth_next=None)
@@ -377,7 +386,7 @@ POST /ui/account/password: messagefoundry_webconsole._service:_service#2c4a90234
 GET /ui/account/notify-address: gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=False; allow_missing_notify_email=True; allow_must_change=False; mfa_refusal=None; new_address_check=True; pending_refusal=None; permissions=[]; phi=False) + messagefoundry_webconsole._service:_service#2c4a90234a30()
 POST /ui/account/notify-address: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=False; allow_missing_notify_email=True; allow_must_change=False; mfa_refusal=None; new_address_check=True; pending_refusal=None; permissions=[]; phi=False)
 POST /ui/account/mfa/enroll: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui_reauth_only_action.<locals>.dependency#f4b839062c9f(action='mfa_enroll'; base=gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=True; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=None; new_address_check=False; pending_refusal=messagefoundry_webconsole._auth:require_ui_reauth_only_action.<locals>.refuse_pending#f361ec8f7b2a(action='mfa_enroll'; reauth_next=None); permissions=[]; phi=False); reauth_next=None)
-GET /ui/account/mfa/confirm: gate messagefoundry_webconsole._auth:require_ui_reauth_only.<locals>.dependency#343cafa2e7c6(base=gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=True; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=None; new_address_check=False; pending_refusal=None; permissions=[]; phi=False); reauth_next=None)
+GET /ui/account/mfa/confirm: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui_reauth_only.<locals>.dependency#343cafa2e7c6(base=gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=True; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=None; new_address_check=False; pending_refusal=None; permissions=[]; phi=False); reauth_next=None)
 POST /ui/account/mfa/verify: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui_reauth_only_action.<locals>.dependency#f4b839062c9f(action='mfa_confirm'; base=gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=True; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=None; new_address_check=False; pending_refusal=messagefoundry_webconsole._auth:require_ui_reauth_only_action.<locals>.refuse_pending#f361ec8f7b2a(action='mfa_confirm'; reauth_next=messagefoundry_webconsole.routes.account:register.<locals>.<lambda>#2440439b3ef6()); permissions=[]; phi=False); reauth_next=messagefoundry_webconsole.routes.account:register.<locals>.<lambda>#2440439b3ef6())
 POST /ui/account/mfa/disable: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui_step_up_action.<locals>.dependency#c7e52c4a9f25(action='mfa_disable'; base=gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=False; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=messagefoundry_webconsole._auth:_reauth_refusal.<locals>.refuse#91dd07e92db3(reauth_next=None); new_address_check=False; pending_refusal=None; permissions=[]; phi=False); reauth_next=None; repeat=None; spend=True)
 GET /ui/account/sessions: messagefoundry_webconsole._service:_service#2c4a90234a30() + gate messagefoundry_webconsole._auth:require_ui.<locals>.dependency#d415e9149166(activity=True; allow_mfa_pending=False; allow_missing_notify_email=False; allow_must_change=False; mfa_refusal=None; new_address_check=True; pending_refusal=None; permissions=[]; phi=False)

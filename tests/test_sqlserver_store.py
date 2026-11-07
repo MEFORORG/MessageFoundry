@@ -876,6 +876,14 @@ async def test_roles_permissions_contract(store) -> None:
     await _assert_roles_contract(store)
 
 
+async def test_enrolment_code_store_contract(store) -> None:
+    """ADR 0207 on the real SQL Server backend: the enrolment code's conditional issue, revoke,
+    spend and TOTP fold, the disable's clear, and AC-10's race of two spends on one code."""
+    from tests._enrolment_code_store_contract import assert_enrolment_code_store_contract
+
+    await assert_enrolment_code_store_contract(store)
+
+
 async def test_webauthn_store_contract(store) -> None:
     """ADR 0068 §4 webauthn_credentials contract on the real SQL Server backend: multi-row CRUD,
     the 1023-byte credential-id round-trip (NVARCHAR(MAX) body vs the NVARCHAR(128) digest PK),
