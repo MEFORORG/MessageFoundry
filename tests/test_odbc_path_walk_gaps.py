@@ -1284,6 +1284,80 @@ def test_hold_5_a_build_the_loop_shutdown_cancels_is_closed(
     assert len(closed) == 1 and isinstance(closed[0], database.DatabaseDestination)
 
 
+def test_hold_d_a_build_that_outlives_its_loop_logs_that_it_was_not_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A build whose caller was cancelled and whose loop closed before its thread finished cannot
+    be closed. That is logged, never dropped silently. Red (Lander hold 6702318430, item D): the
+    finished build met asyncio's silent return for a closed loop, and nothing named the leak."""
+    from messagefoundry.pipeline import wiring_runner
+
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def slow_build() -> object:
+        entered.set()
+        release.wait(5)
+        try:
+            return object.__new__(database.DatabaseDestination)
+        finally:
+            finished.set()
+
+    caplog.set_level(logging.WARNING, logger=wiring_runner.log.name)
+    loop = asyncio.new_event_loop()
+    try:
+        task = loop.create_task(wiring_runner._build_off_loop(None, slow_build))
+        loop.run_until_complete(asyncio.to_thread(entered.wait, 5))
+        task.cancel()
+        loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+    finally:
+        loop.close()  # shuts the executor down without waiting for the build
+    release.set()
+    assert finished.wait(5)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not any(
+        "could not be closed" in r.getMessage() for r in caplog.records
+    ):
+        time.sleep(0.01)
+    assert any("could not be closed" in r.getMessage() for r in caplog.records)
+
+
+def test_hold_e_an_abandoned_build_that_has_not_started_never_runs() -> None:
+    """A caller cancelled while its build still waits in the executor's queue cancels the build,
+    so nothing walks a folder or reads a key file for a caller that is gone. Red (Lander hold
+    6702318430, item E): the queued build ran to completion and was then closed."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from messagefoundry.pipeline import wiring_runner
+
+    ran: list[bool] = []
+    busy, free = threading.Event(), threading.Event()
+
+    def occupy() -> None:
+        busy.set()
+        free.wait(5)
+
+    def build() -> object:
+        ran.append(True)
+        return object()
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        blocker = loop.run_in_executor(None, occupy)
+        while not busy.is_set():
+            await asyncio.sleep(0.01)
+        task = asyncio.create_task(wiring_runner._build_off_loop(None, build))
+        await asyncio.sleep(0.05)  # the build is queued behind the busy worker
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0.05)
+        free.set()
+        await blocker
+
+    asyncio.run(main())  # waits for the executor's queue before it returns
+    assert ran == []
+
+
 @pytest.mark.parametrize("worker_alive", [True, False], ids=["in-place", "worker-dead"])
 async def test_hold_f2_a_replaced_connector_whose_close_raises_leaves_the_reload_consistent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore, worker_alive: bool
