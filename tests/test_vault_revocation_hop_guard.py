@@ -192,8 +192,8 @@ def _assert_refused(caught: pytest.ExceptionInfo[Exception], entry: EntryPoint) 
     """The provider raised its own fail-closed type. For the secrets hop it is caused by the marked
     refusal, with the refusal's fixed text kept whole, which names this hop's settings pair and no
     other lever. At the store's key resolution and cipher build the refusal is a new one with the
-    store's fixed Vault hop text and no chain (the eighth hold on engine PR 2818), chosen because
-    its cause is exactly the marked refusal; that text names the store's Vault settings. Neither
+    store's fixed Vault revocation text and no chain (the eighth and tenth holds on engine PR
+    2818), chosen because its cause is exactly the marked revocation refusal. Neither
     names any part of the address or the proxy."""
     from messagefoundry.store import base as store_base
     from messagefoundry.transports import strict_requests
@@ -1452,7 +1452,6 @@ def test_a_store_hop_refusal_that_is_not_revocation_offers_no_attestation(
     # The control: the cause is the Vault hop's marked refusal, so the store chose its hop text.
     from messagefoundry.store import base as store_base
 
-    assert str(caught.value).startswith(store_base._KEY_SOURCE), str(caught.value)
-    assert "Vault hop was refused" in str(caught.value), str(caught.value)
+    assert str(caught.value) == store_base._VAULT_HOP_TEXT, str(caught.value)
     assert "vault_revocation_attested" not in str(caught.value), str(caught.value)
     assert dials == []
