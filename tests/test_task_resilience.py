@@ -1110,3 +1110,103 @@ async def test_one_route_handoff_fault_on_a_running_runner_still_delivers_withou
     finally:
         await runner.stop()
         await store.close()
+
+
+# --- Lander hold 6706244756: no worker runs before start() commits ----------------------------------
+
+
+def _yield_before_builds(monkeypatch: pytest.MonkeyPatch, passes: int = 20) -> None:
+    """Make every off-loop build first yield ``passes`` loop passes, so a worker start() spawned
+    before the build gets its turns while start() is still running. Loop passes, not time: a
+    spawned worker reaches its first claim within a pass or two of being scheduled."""
+    real = wiring_runner._build_off_loop
+
+    async def yielding(*args: Any, **kwargs: Any) -> Any:
+        for _ in range(passes):
+            await asyncio.sleep(0)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(wiring_runner, "_build_off_loop", yielding)
+
+
+async def test_a_failed_start_claims_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A start that a fatal step unwinds has claimed no row, so it sent nothing: the delivery
+    worker it spawned before the inbound's build waits for start() to commit to running. Red
+    (Lander hold 6706244756, item 2): the worker claimed during the build, before start() knew
+    it would run."""
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    outdir.mkdir()
+    store = await MessageStore.open(tmp_path / "failed-start.db")
+    runner = RegistryRunner(
+        _pooled_registry(inbox, outdir),
+        store,
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
+    claims: list[bool] = []
+    real_claim = store.claim_next_fifo
+
+    async def claim(*a: Any, **k: Any) -> Any:
+        claims.append(runner._running)
+        return await real_claim(*a, **k)
+
+    def fatal() -> None:
+        raise RuntimeError("injected fatal start step")
+
+    monkeypatch.setattr(store, "claim_next_fifo", claim)
+    monkeypatch.setattr(runner, "_activate_statement_batching", fatal)
+    _yield_before_builds(monkeypatch)
+    try:
+        with pytest.raises(RuntimeError, match="injected fatal start step"):
+            await runner.start()
+        assert claims == []
+        assert not runner._running
+    finally:
+        await runner.stop()
+        await store.close()
+
+
+async def test_a_delivery_worker_that_dies_during_start_is_not_left_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The delivery worker's first run raises. Its lane still delivers once start() returns: the
+    worker runs only after start() commits to running, so its supervisor respawns it. Red (Lander
+    hold 6706244756, item 1): it died during start(), while _running was False, so the supervisor
+    left it dead and the lane stalled."""
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    outdir.mkdir()
+    store = await MessageStore.open(tmp_path / "dies-in-start.db")
+    runner = RegistryRunner(
+        _pooled_registry(inbox, outdir),
+        store,
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
+    real_worker = runner._delivery_worker
+    runs = {"n": 0}
+
+    async def dies_first(name: str) -> None:
+        runs["n"] += 1
+        if runs["n"] == 1:
+            raise RuntimeError("injected death on the first run")
+        await real_worker(name)
+
+    monkeypatch.setattr(runner, "_delivery_worker", dies_first)
+    _yield_before_builds(monkeypatch)
+    try:
+        await runner.start()
+        collector = _Collector()
+        runner._destinations["OB"] = collector  # type: ignore[assignment]
+        await runner._handle_inbound(runner.registry.inbound["IB"], _hl7("M6706244"))
+        await _until_delivered(store, 1, timeout=5.0)
+        assert _control_ids(collector) == ["M6706244"]
+        assert runs["n"] == 2
+    finally:
+        await runner.stop()
+        await store.close()

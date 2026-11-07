@@ -1949,6 +1949,11 @@ class RegistryRunner:
         self._inline_ok: dict[str, bool] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop = asyncio.Event()
+        # Set once start() commits to running, cleared by a teardown. A per-lane worker spawned
+        # before then waits on it before its first turn (:meth:`_after_start`), so a start that
+        # unwinds has claimed nothing and a worker cannot die unsupervised mid-start (Lander hold
+        # 6706244756).
+        self._started = asyncio.Event()
         # Per-stage wake events so a producer wakes only its own downstream consumer class. A single
         # shared auto-clearing event would let an idle worker of one class swallow another class's
         # wakeup (lost wakeup) — masked by poll_interval but defeating the prompt set(). Listener →
@@ -6111,6 +6116,9 @@ class RegistryRunner:
                 await self._teardown_unsafe(TeardownReason.SHUTDOWN)
                 raise
             self._running = True
+            # Release the per-lane workers this start spawned (:meth:`_after_start`). After
+            # _running, so a worker that dies on its first turn is respawned by its supervisor.
+            self._started.set()
             # Vault BACKLOG #3008: after _running is set, so a sink polling /status reads the record
             # the alert names, and before anything else here can raise past it.
             failed_lookups = self.degraded_fhir_lookups()
@@ -6645,6 +6653,7 @@ class RegistryRunner:
         """The teardown sequence itself. Split out ONLY so the ``finally`` above contains no await —
         an external cancel therefore cannot interrupt the one statement that must always run."""
         self._stop.set()
+        self._started.clear()
         # #122 (ADR 0162): unsubscribe from the log guard FIRST, so a record emitted during teardown
         # cannot schedule a stop against a runner that is already stopping. clear_escalation is a
         # no-op unless WE are still the installed responder (a second runner that registered after us
@@ -6939,7 +6948,9 @@ class RegistryRunner:
                 self.registry.shard_id,
             )
             return
-        task = asyncio.create_task(self._delivery_worker(name))
+        task = asyncio.create_task(
+            self._after_start(functools.partial(self._delivery_worker, name))
+        )
         task.add_done_callback(functools.partial(self._on_worker_done, name))
         self._workers[name] = task
         # A fresh worker is what re-arms a lane whose worker a STOP returned, whichever door spawned
@@ -6964,6 +6975,24 @@ class RegistryRunner:
                 exc_info=task.exception(),
             )
             self._spawn_worker(name)
+
+    async def _after_start(self, work: Callable[[], Awaitable[None]]) -> None:
+        """Run a per-lane worker once start() has committed to running, or not at all if a stop
+        comes first. start() spawns workers before it awaits later builds, so without this a worker
+        could claim, and deliver, a recovered row for a start that then unwinds, and one that died
+        meanwhile met a supervisor that respawns nothing while ``_running`` is False (Lander hold
+        6706244756). A worker spawned on a running runner starts at once."""
+        if not self._running and not self._started.is_set():
+            started = asyncio.ensure_future(self._started.wait())
+            stopped = asyncio.ensure_future(self._stop.wait())
+            try:
+                await asyncio.wait({started, stopped}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                started.cancel()
+                stopped.cancel()
+            if self._stop.is_set():
+                return
+        await work()
 
     def _inbound_worker_coro(self, kind: str):  # type: ignore[no-untyped-def]
         """The coroutine factory for an inbound worker ``kind`` (``router`` | ``transform`` |
@@ -7025,7 +7054,9 @@ class RegistryRunner:
     def _spawn_inbound_worker(self, kind: str, name: str) -> None:
         """Start the ``kind`` (router/transform) worker for one inbound connection."""
         workers = self._inbound_worker_dict(kind)
-        task = asyncio.create_task(self._inbound_worker_coro(kind)(name))
+        task = asyncio.create_task(
+            self._after_start(functools.partial(self._inbound_worker_coro(kind), name))
+        )
         task.add_done_callback(functools.partial(self._on_inbound_worker_done, kind, name))
         workers[name] = task
 
