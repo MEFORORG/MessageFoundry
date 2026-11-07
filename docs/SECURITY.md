@@ -5763,7 +5763,8 @@ a lapse row is written, and put that lapse row on it; on `/ui/logout`, which nam
 
 **A refused sign-out audit write is logged, not raised (BACKLOG #3884),** so `/ui/logout` still
 clears the cookie. That row is then missing, with an ERROR log line; the line names the session
-when the sign-out ended one. A failed owner lookup on `/ui/logout`, which names no caller, writes
+when the sign-out ended one. A fault in the revoke itself still raises: that request answers 500,
+the cookie stays set and a live session stays live. A failed owner lookup on `/ui/logout`, which names no caller, writes
 the row with no actor, so it does not reach that user's security-events feed. On a session that
 passed its clock checks it also leaves the temporary credential unchecked, as above.
 
@@ -5787,8 +5788,8 @@ cancelled spends that window's one slot too. A sign-out through `POST /auth/logo
 it. The row's time is when it was written, not when the misses it counts arrived. When only the
 audit writes are refused, the ERROR line each refused row write logs is bounded the same way. When
 the whole store refuses, that bound does not apply: the revoke's own store write raises before any
-row is attempted, so each request with a cookie answers 500, and nothing bounds the errors those
-requests log.
+row is attempted, so each same-origin request with a non-empty session cookie answers 500, the
+cookie stays set and a live session stays live, and nothing bounds the errors those requests log.
 
 **What the count can miss.** A count stays in memory until a later sign-out that names no caller
 and ends nothing arrives after the 60 seconds, so the misses at the end of a flood are written only
@@ -5806,13 +5807,14 @@ be 40 sources by itself and fill the ceiling. The bound and the count are in-pro
 shard keeps its own. Nothing prunes `audit_log` (see [retention](CONFIGURATION.md#retention)), so the
 rows still grow, by at most 121 a minute for each engine process.
 
-**The bound is on the audit row, not on the request.** Every request to `/ui/logout` with a cookie
-still runs the sign-out's revoke, a store write transaction, whether or not it ends a session: on
+**The bound is on the audit row, not on the request.** Every same-origin request to `/ui/logout`
+with a non-empty session cookie still runs the sign-out's revoke, a store write transaction, whether or not it ends a session: on
 SQLite its `UPDATE` takes the store's write lock even when it matches no row, and that competes with
 message ingress commits. Nothing in the engine bounds those requests, so treat `/ui/logout` as an
 unbounded store-write surface to any caller that can reach the console, on the engine's own host or
-beyond it. The sign-out itself is never refused, though one that writes a count row waits for that
-write too. The bound never stops the row of a sign-out that ended a session, or of one that names its
+beyond it. The bound never refuses a sign-out, though one that writes a count row waits for that
+write too; a sign-out whose revoke raises answers 500, the cookie stays set and a live session
+stays live (above). The bound never stops the row of a sign-out that ended a session, or of one that names its
 caller, as `POST /auth/logout` does, though a refused audit write still loses such a row with an
 ERROR line (above). Concurrent `POST /auth/logout` calls on one token each write a row, all but one
 `nothing_to_revoke`, and that is kept on purpose, because each is an authenticated request.
