@@ -648,7 +648,8 @@ def mint_target(
     Refuses as :func:`load_host_custody` does for the settings and, when minting for this account
     (``service_account`` of ``None``), for the account. ``FileExistsError`` when a host blob or a
     handoff is already there: a second mint over a store's key is never made. A handoff is Windows
-    only; a POSIX host mints as the service user itself."""
+    only; a POSIX host mints as the service user itself. Last, :class:`HostCustodyRefused` for a
+    custody directory the write would refuse (PR 2804 eleventh hold)."""
     host, handoff = check_host_custody_settings(settings, environ=environ)
     for path in (host, handoff):
         if os.path.lexists(path):
@@ -658,23 +659,6 @@ def mint_target(
                 "it in place. "
                 f"{keep_the_key_step(settings, new_store=False, service_account=service_account)}"
             )
-    # Before any recovery key is shown: the write refuses a missing directory and a volume that
-    # fails write_restricted_file's local-volume rule only after the ceremony (PR 2804 eleventh hold).
-    from messagefoundry.restricted_file import key_directory_volume_problem
-
-    directory = host.parent
-    if not directory.is_dir():
-        raise HostCustodyRefused(
-            f"the custody directory {directory} does not exist, so no store key was minted and no "
-            "recovery key was shown. Create it, restricted as a secrets directory must be, and run "
-            "the command again"
-        )
-    volume = key_directory_volume_problem(directory)
-    if volume is not None:
-        raise HostCustodyRefused(
-            f"the custody directory {directory} cannot hold a store key: {volume}. No store key "
-            "was minted and no recovery key was shown"
-        )
     if service_account is None:
         # What the write refuses for this account, asked now: the shared and non-local accounts
         # (and on Linux root and nobody).
@@ -685,19 +669,43 @@ def mint_target(
             check_host_writable()
         except CustodyError as exc:
             raise _refused("no store key was minted", exc) from exc
-        return host
-    if sys.platform != "win32":
-        raise HostCustodyRefused(
-            "--service-account writes a Windows handoff; on this host run provision-admin as the "
-            "service user itself, and it writes that account's host file"
-        )
-    from messagefoundry.store.custody import check_handoff_writable
+        target = host
+    else:
+        if sys.platform != "win32":
+            raise HostCustodyRefused(
+                "--service-account writes a Windows handoff; on this host run provision-admin as "
+                "the service user itself, and it writes that account's host file"
+            )
+        from messagefoundry.store.custody import check_handoff_writable
 
-    try:
-        check_handoff_writable(service_account, enforcing=enforcing)
-    except _custody_errors() as exc:
-        raise _refused("no store key was minted", exc) from exc
-    return handoff
+        try:
+            check_handoff_writable(service_account, enforcing=enforcing)
+        except _custody_errors() as exc:
+            raise _refused("no store key was minted", exc) from exc
+        target = handoff
+    _refuse_an_unusable_directory(target.parent)
+    return target
+
+
+def _refuse_an_unusable_directory(directory: Path) -> None:
+    """Refuse, before any recovery key is shown, a custody directory the key file's write would
+    refuse only after the ceremony: one that is not a directory, and one whose volume fails
+    :func:`~messagefoundry.restricted_file.write_restricted_file`'s local-volume rule, asked through
+    that rule's own check (PR 2804 eleventh hold)."""
+    from messagefoundry.restricted_file import key_directory_volume_problem
+
+    if not directory.is_dir():
+        raise HostCustodyRefused(
+            f"the custody directory {directory} is missing, or is not a directory this account can "
+            "read, so no store key was minted and no recovery key was shown. Create it, restricted "
+            "as a secrets directory must be, and run the command again"
+        )
+    volume = key_directory_volume_problem(directory)
+    if volume is not None:
+        raise HostCustodyRefused(
+            f"the custody directory {directory} cannot hold a store key: {volume}. No store key "
+            "was minted and no recovery key was shown"
+        )
 
 
 def _prove_recovery_key(

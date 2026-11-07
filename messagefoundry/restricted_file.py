@@ -78,6 +78,7 @@ __all__ = [
     "custody_non_local_account_problem",
     "delete_through_handle",
     "handoff_grantee_problem",
+    "key_directory_volume_problem",
     "key_file_handle_problem",
     "linux_file_system_problem",
     "linux_file_system_refusal",
@@ -907,7 +908,9 @@ def key_directory_volume_problem(directory: Path) -> str | None:
     if sys.platform != "linux":
         return "a file system is checked before a key file is written on Linux and Windows only"
     try:
-        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        # O_PATH: fstatfs reads through it (Linux 3.12 and later), and it needs no read permission
+        # on the directory, which the write, needing only write and search, does not need either.
+        fd = os.open(directory, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError as exc:
         return f"it could not be opened ({exc.strerror or type(exc).__name__})"
     try:

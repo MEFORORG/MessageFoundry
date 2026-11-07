@@ -1343,7 +1343,7 @@ _CLI_OPENERS = {
     "_provision_admin.administrator_exists",
     # vault BACKLOG #3411: the read-only "does this server database hold a store" probe, under a
     # throwaway host blob, before a store key is minted for it
-    "_provision_admin.server_store_absent",
+    "_provision_admin.server_store_found",
     # vault BACKLOG #3849 B5: the reopen after the codes are shown, so the administrator_granted
     # alert's open instance lands in the store, on the write's verdict and posture. It passes no
     # create; this guard reads only the verdict, so nothing here pins that

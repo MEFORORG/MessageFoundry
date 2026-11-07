@@ -308,7 +308,7 @@ _CENSUS: list[Row] = sorted(
         ("__main__.py", "_provision_admin", "build_store_cipher", "posture"),
         ("__main__.py", "_provision_admin.administrator_exists", "open_store", "posture"),
         ("__main__.py", "_provision_admin.run", "open_store", "posture"),
-        ("__main__.py", "_provision_admin.server_store_absent", "open_store", "posture"),
+        ("__main__.py", "_provision_admin.server_store_found", "open_store", "posture"),
         ("__main__.py", "_renew_api_tls_before_spawning._audit", "open_store", "posture"),
         ("__main__.py", "_rotate_key", "resolve_active_key", "posture"),
         ("__main__.py", "_rotate_key.run", "open_store", "posture"),

@@ -1464,7 +1464,7 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
     # PR 2804 fifth hold, the proof: the texts the one helper's callers emit advise changing
     # nothing that exists. The positive control is the fourth hold's own text. Rendered here are
     # at least the existing-store refusal, the pin refusal, the never-started refusal,
-    # foreign_custody_refusal, mint_target's refusal and both failed-mint warnings. Not here: the
+    # foreign_custody_refusal, mint_target's refusal and the three failed-mint warnings. Not here: the
     # crash rule's handoff refusal, which its own Windows-only test checks, and the pin refusal's
     # race backstop in _load_audit_chain, which prints the same _PIN_NEEDS_THE_WRAP text.
     import asyncio
@@ -1528,13 +1528,19 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         cli._discard_minted_custody(kept, server, StoreIdPinRefusedBeforeWrite("before"))
     held = capsys.readouterr().err
     assert "could not be removed" in held, held
-    # PR 2804 sixth hold: this run minted that key and the store holds no data under it. The
+    # PR 2804 sixth hold: this run minted that key and nothing was written under it. The
     # eleventh hold: so the text says how to remove it, the one change it may advise.
-    assert "This run minted it and the store holds no data under it" in held, held
+    assert "This run minted it and nothing was written under it" in held, held
     assert held.count(cli._REMOVE_THE_VOID_KEY) == 1, held
     assert "cannot tell whose key" not in held, held
     texts.append(held)
-    assert all(text.count("WARNING:") == 1 for text in texts[-2:]), texts[-2:]
+    # PR 2804 eleventh hold: a server store found empty after the failure keeps the key, and says
+    # how to tell that nothing landed under it and how to remove it then.
+    cli._discard_minted_custody(kept, server, RuntimeError("stand-in"), server_found="empty")
+    emptied = capsys.readouterr().err
+    assert kept.exists() and emptied.count(cli._REMOVE_THE_VOID_KEY) == 1, emptied
+    texts.append(emptied)
+    assert all(text.count("WARNING:") == 1 for text in texts[-3:]), texts[-3:]
     # Every text names its own way on, in the order rendered above. The existing-store text
     # names provision-admin through the missing-key text it quotes, so its marker is the fallback.
     fallback = "To go on without it"
@@ -1545,7 +1551,8 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         (fallback, "set [store].key_provider = 'host'"),
         (fallback, "leaves it in place"),
         ("Keep that file and run the command again",),
-        (fallback, "This run minted it and the store holds no data under it"),
+        (fallback, "This run minted it and nothing was written under it"),
+        ("If it stops because the store's audit chain was never started",),
     ]
     # One marker tuple per text this test means to scan, so an empty or short scan fails here
     # rather than passing the absence check below on nothing.
@@ -1559,7 +1566,7 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
                 (_KEY_SETTINGS_OUT,)
                 if text is foreign
                 else (cli._REMOVE_THE_VOID_KEY,)
-                if text is held
+                if text is held or text is emptied
                 else ()
             ),
         )
@@ -1825,7 +1832,7 @@ def test_a_minted_key_that_cannot_be_removed_is_named_as_this_runs_own(
     monkeypatch.setattr(Path, "unlink", _held)
     cli._discard_minted_custody(kept, server, StoreIdPinRefusedBeforeWrite("before"))
     warning = capsys.readouterr().err
-    assert "This run minted it and the store holds no data under it" in warning, warning
+    assert "This run minted it and nothing was written under it" in warning, warning
     assert "the recovery key shown opens nothing" in warning, warning
     # PR 2804 eleventh hold: it says plainly how to remove the file, and advises no other change.
     # The step is one the scan reads, so taking it out is what lets the rest pass.
@@ -1889,7 +1896,7 @@ def test_a_cleanup_that_cannot_remove_the_host_file_keeps_the_original_reason(
 
 
 @host_file_platforms
-@pytest.mark.parametrize("shape", ["missing directory", "refused file system"])
+@pytest.mark.parametrize("shape", ["missing directory", "refused file system", "usable directory"])
 def test_a_custody_directory_the_write_refuses_is_refused_before_the_recovery_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1907,13 +1914,15 @@ def test_a_custody_directory_the_write_refuses_is_refused_before_the_recovery_ke
 
     def _ceremony(*_args: object, **_kwargs: object) -> None:
         shown.append("recovery key shown")
-        raise AssertionError("the ceremony was reached")
+        raise HostCustodyRefused("the ceremony was reached (stand-in)")
 
     monkeypatch.setattr(custody_host, "mint_host_custody", _ceremony)
     # The prompts before the ceremony answer, so a run that does not refuse reaches it.
     monkeypatch.setattr(cli, "_read_new_password", lambda _prompt: "correct horse battery")
     if shape == "missing directory":
         store_path = tmp_path / "missing" / "store.db"
+    elif shape == "usable directory":  # the control: the same run, and nothing to refuse
+        store_path = tmp_path / "store.db"
     else:
         store_path = tmp_path / "store.db"
         if sys.platform == "win32":
@@ -1932,11 +1941,16 @@ def test_a_custody_directory_the_write_refuses_is_refused_before_the_recovery_ke
     argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
     argv.append("--no-totp")
     code = main([*argv, "--db", str(store_path)])
-    assert shown == [], shown  # the recovery-key ceremony was never reached
     refused = " ".join(capsys.readouterr().err.split())
     assert code == 2, refused
+    if shape == "usable directory":
+        # The run this test drives does reach the ceremony when the directory is fine.
+        assert shown == ["recovery key shown"], refused
+        assert "the ceremony was reached (stand-in)" in refused, refused
+        return
+    assert shown == [], shown  # the recovery-key ceremony was never reached
     assert "no recovery key was shown" in refused, refused
-    expected = "does not exist" if shape == "missing directory" else "cannot hold a store key"
+    expected = "is missing" if shape == "missing directory" else "cannot hold a store key"
     assert expected in refused, refused
     assert not (store_path.parent / custody_host.HOST_FILE_NAME).exists()
 
@@ -1946,7 +1960,7 @@ def test_a_custody_directory_the_write_refuses_is_refused_before_the_recovery_ke
     ("shape", "discarded"),
     [
         ("no store", True),
-        ("keyed leftovers", True),
+        ("keyed leftovers", False),
         ("holds data", False),
         ("unreadable", False),
     ],
@@ -1963,10 +1977,12 @@ def test_a_failed_server_create_discards_the_minted_key_only_over_a_store_that_h
     # whatever the database held, so a plain re-run met it and stopped: at the mint's
     # FileExistsError over a database with no store, or at StoreChainNeverStarted over the salt,
     # counter and markers a keyed open commits before its genesis record. After the failure the
-    # pre-check's own probe now reads the database. "no store" and "keyed leftovers" hold no data
-    # under the key, so the file is removed and the re-run mints again. The negative controls keep
-    # it: "holds data" is a store with a row in a data table, "unreadable" a census that cannot be
-    # shown complete.
+    # pre-check's own probe now reads the database. "no store" has no store schema, which a keyed
+    # write needs committed first, so the file is removed and the re-run mints again. "keyed
+    # leftovers" held no data, but the genesis record may have been in flight, so the key is kept
+    # and the warning says how to tell and how to remove it. The negative controls keep it: "holds
+    # data" is a store with a row in a data table, "unreadable" a census that cannot be shown
+    # complete.
     import asyncio
 
     from messagefoundry import __main__ as cli
@@ -2063,23 +2079,27 @@ def test_a_failed_server_create_discards_the_minted_key_only_over_a_store_that_h
     assert code == 2, err
     assert created == [True] and mints == [host_file], err
     assert host_file.exists() is not discarded, err
-    unread = [r.getMessage() for r in caplog.records if "could not be read" in r.getMessage()]
-    # Each negative control keeps the key for its own reason: the census answered "holds data",
-    # or the census was asked and could not be shown complete. Nothing else failed to read.
-    assert unread == (
-        [
-            "whether the store holds data under the minted key could not be read "
-            "(HostCustodyRefused), so the key is kept"
-        ]
-        if shape == "unreadable"
-        else []
-    ), unread
+    unread = [r.getMessage() for r in caplog.records if "is kept" in r.getMessage()]
+    # Each shape keeps or removes the key for its own reason: the census answered, or it was asked
+    # and could not be shown complete, whose remedy the log keeps. Nothing else failed to read.
     assert censused == (["incomplete"] if shape == "unreadable" else []), censused
+    assert len(unread) == (1 if shape == "unreadable" else 0), unread
+    assert all("view definition permission" in message for message in unread), unread
     if not discarded:
         # The key may hold data, so it is kept, unchanged, and named.
         assert host_file.read_bytes() == b"minted (stand-in)"
-        assert f"so that key is kept in {host_file}" in err, err
         assert "was removed from" not in err, err
+        if shape != "keyed leftovers":
+            assert f"so that key is kept in {host_file}" in err, err
+            return
+        assert f"the store key minted for it is kept in {host_file}" in err, err
+        never = "If it stops because the store's audit chain was never started"
+        assert never in err and cli._REMOVE_THE_VOID_KEY in err, err
+        # The re-run stops there, as the warning says it will when nothing landed.
+        assert main(argv) == 2
+        rerun = " ".join(capsys.readouterr().err.split())
+        assert "the store's audit chain was never started" in rerun, rerun
+        assert mints == [host_file] and host_file.exists(), rerun
         return
     assert f"The store key minted for it was removed from {host_file}" in err, err
     # The plain re-run reaches the mint again rather than stopping at a key file.

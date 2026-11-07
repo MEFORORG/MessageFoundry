@@ -57,7 +57,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence  # noqa: E402
 from pathlib import (  # noqa: E402
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
-from typing import TYPE_CHECKING, Any, NamedTuple, cast  # noqa: E402
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast  # noqa: E402
 
 from messagefoundry import __version__  # noqa: E402
 from messagefoundry.cli_common import (  # noqa: E402  # the shared CLI shell and helpers (ADR 0201 slice 1)
@@ -7061,36 +7061,56 @@ class _RecoveryKeyConsole:
         return getpass.getpass("")
 
 
-#: The one place a provision-admin text advises removing a key file: the one this run minted, which
-#: the store holds no data under and no run can start a store under (PR 2804 eleventh hold).
-_REMOVE_THE_VOID_KEY = "once that file can be removed, remove it and run the command again"
+#: The step a failed-mint warning gives for removing the key file this run minted, once the store
+#: holds no data under it and no run can start a store under it (PR 2804 eleventh hold).
+_REMOVE_THE_VOID_KEY = "remove that file and run the command again"
 
 
 def _discard_minted_custody(
-    path: Path, store: StoreSettings, failure: BaseException, *, server_holds_nothing: bool = False
+    path: Path,
+    store: StoreSettings,
+    failure: BaseException,
+    *,
+    server_found: Literal["none", "empty", "held"] | None = None,
 ) -> None:
     """Remove the host blob or handoff ``provision-admin`` minted when the store it was minted for
-    could not be created, so a second run can mint again, but only where the store holds no data
+    could not be created, so a second run can mint again, but only where the open wrote nothing
     under it: the store id pin refused before the open's first write
     (:class:`~messagefoundry.store.store.StoreIdPinRefusedBeforeWrite`; a pin refusal raised later,
     once the salt bind may have run, does not count), a SQLite store whose file was never made, or
-    ``server_holds_nothing``: the caller's probe of a server database, run after the failure, read
-    it as the pre-check reads a database it lets a mint take (PR 2804 eleventh hold). That census
-    counts every table; the only rows it passes are the schema marker and, while the audit chain is
-    empty, the salt, counter and markers a keyed open commits before its genesis record, which hold
-    no operator data and which a new key opens over. Otherwise the store may already hold rows under
-    that key, so the file is kept and named on stderr. Neither text carries the key."""
+    a server database the caller's probe, run after the failure, found no store schema in
+    (``server_found`` of ``none``; PR 2804 eleventh hold). A writable open writes under the key only
+    once its schema transaction has committed, so a database with no schema saw no such write, and
+    a commit still in flight when the create failed can only be that schema's, which holds no key.
+
+    Otherwise the store may already hold rows under that key, so the file is kept and named on
+    stderr. ``server_found`` of ``empty`` (an empty audit chain over a store that held no data) is
+    kept too, since the genesis record may still have been in flight when the create failed, and
+    its warning says how to tell and how to remove the file once nothing landed. Neither text
+    carries the key."""
     from messagefoundry.config.settings import StoreBackend
     from messagefoundry.store.base import _absent_sqlite_store
     from messagefoundry.store.custody_host import keep_the_key_step
     from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
 
-    holds_nothing = (
+    nothing_written = (
         isinstance(failure, StoreIdPinRefusedBeforeWrite)
-        or server_holds_nothing
+        or server_found == "none"
         or (store.backend is StoreBackend.SQLITE and _absent_sqlite_store(store) is not None)
     )
-    if not holds_nothing:
+    if server_found == "empty" and not nothing_written:
+        print(
+            f"WARNING: the store could not be created, so the store key minted for it is kept in "
+            f"{path}. No Administrator was provisioned into it. After the failure the store held "
+            "no data and its audit chain was empty, but the record that starts it under that key "
+            "may still have been on its way, so the file stays for now. Run the command again. "
+            "If it stops because the store's audit chain was never started, nothing landed and that "
+            f"key holds no data, so {_REMOVE_THE_VOID_KEY}. If the store was started under it, the "
+            "run carries on with it",
+            file=sys.stderr,
+        )
+        return
+    if not nothing_written:
         print(
             f"WARNING: the store could not be created, and it may already have been started "
             f"under the store key minted for it, so that key is kept in {path}. No Administrator "
@@ -7115,10 +7135,10 @@ def _discard_minted_custody(
         print(
             f"WARNING: the store could not be created, and the store key minted for it in {path} "
             f"could not be removed ({exc.strerror or type(exc).__name__}). This run minted it and "
-            "the store holds no data under it, so it is no store's key and the recovery key shown "
+            "nothing was written under it, so it is no store's key and the recovery key shown "
             "opens nothing; while it is there, a run here stops at it rather than mint over it. "
             "No run can start a store under it, since only this run held its recovery wrap, so "
-            f"{_REMOVE_THE_VOID_KEY}. {step}",
+            f"once it can be, {_REMOVE_THE_VOID_KEY}. {step}",
             file=sys.stderr,
         )
 
@@ -8763,11 +8783,18 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     async def server_store_absent() -> bool:
         """Under the host key provider with no blob here: whether the server database holds no
-        store yet (vault BACKLOG #3411). Opened read-only under a throwaway blob nothing is written
-        with, so the store id pin answers: no store at all, or an empty audit chain over a store
+        store yet (vault BACKLOG #3411): no store at all, or an empty audit chain over a store
         that holds no data either, is absent; a chain with a genesis record, or data under an empty
-        chain, is a store this mint must not take. Connection and hop
-        refusals surface here, before the prompts, as the ordinary pre-check's do."""
+        chain, is a store this mint must not take. Connection and hop refusals surface here, before
+        the prompts, as the ordinary pre-check's do."""
+        return await server_store_found() != "held"
+
+    async def server_store_found() -> Literal["none", "empty", "held"]:
+        """What the server database holds, read as :func:`server_store_absent` reads it: ``none``,
+        no store schema; ``empty``, an empty audit chain over a store that holds no data; ``held``,
+        anything else. Opened read-only under a throwaway blob nothing is written with, so the
+        store id pin answers. Raises what the open and the census raise, as
+        :class:`HostCustodyRefused` for a census it cannot complete or read."""
         from messagefoundry.store.base import (
             TableCensusIncomplete,
             store_connect_errors,
@@ -8787,12 +8814,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 custody=throwaway,
             )
         except StoreNotFoundError:
-            return True
+            return "none"
         except (StoreIdPinRefused, CipherError):
-            return False
+            return "held"
         try:
             # An empty chain may be a store that ran keyless: one that holds data is not absent.
-            return not await store_holds_data(store)
+            return "held" if await store_holds_data(store) else "empty"
         except TableCensusIncomplete as incomplete:
             # Fail closed, and say why: "the store already holds data" would send the operator to
             # a new store when the store may hold nothing, and the fix is a grant.
@@ -8809,25 +8836,36 @@ def _provision_admin(args: argparse.Namespace) -> int:
         finally:
             await store.close()
 
-    async def failed_create_left_nothing(failure: BaseException) -> bool:
-        """After a server create under the key this run minted failed: whether the database holds
-        no data under that key, read by :func:`server_store_absent`, the probe the pre-check lets
-        a mint take a database on (PR 2804 eleventh hold). ``False`` for SQLite, whose absence
-        ``_discard_minted_custody`` reads itself, for an interrupt, which is not answered with more
-        I/O, and whenever the probe cannot answer, so the key is kept."""
-        if settings.store.backend is StoreBackend.SQLITE or not isinstance(failure, Exception):
-            return False
+    async def failed_create_found(
+        failure: BaseException,
+    ) -> Literal["none", "empty", "held"] | None:
+        """After a server create under the key this run minted failed: what the database holds, by
+        :func:`server_store_found` (PR 2804 eleventh hold). ``None`` where it is not asked: SQLite,
+        whose absence ``_discard_minted_custody`` reads itself, a pin refused before the open's
+        first write, which already settles it, and an interrupt, which is not answered with more
+        I/O. ``None`` too whenever the probe cannot answer, so the key is kept."""
+        from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
+
+        if (
+            settings.store.backend is StoreBackend.SQLITE
+            or isinstance(failure, StoreIdPinRefusedBeforeWrite)
+            or not isinstance(failure, Exception)
+        ):
+            return None
         try:
-            return await server_store_absent()
+            return await server_store_found()
+        except HostCustodyRefused as unread:
+            # The engine's own text, which names the grant or the server fault, never a cell.
+            logging.getLogger(__name__).warning("%s; the store key minted for it is kept", unread)
         except Exception as unread:
-            # Every refusal to read keeps the key, so none is narrowed here. The class only: a
-            # driver's text can quote a cell value.
+            # Every other refusal to read keeps the key too, so none is narrowed here. The class
+            # only: a driver's text can quote a cell value.
             logging.getLogger(__name__).warning(
                 "whether the store holds data under the minted key could not be read (%s), so the"
                 " key is kept",
                 type(unread).__name__,
             )
-            return False
+        return None
 
     # The store key could not be resolved. The texts of these classes name settings, environment
     # variables and files, never a key (see `_key_unresolved`). Exit 2, as `rotate-key` exits on
@@ -9057,12 +9095,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
             )
         except BaseException as exc:
             if minted is not None:
-                _discard_minted_custody(
-                    minted.path,
-                    settings.store,
-                    exc,
-                    server_holds_nothing=await failed_create_left_nothing(exc),
-                )
+                found: Literal["none", "empty", "held"] | None = None
+                try:
+                    found = await failed_create_found(exc)
+                finally:
+                    # Run even when the probe is interrupted, so the key file is always named.
+                    _discard_minted_custody(minted.path, settings.store, exc, server_found=found)
             raise
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:
