@@ -74,10 +74,13 @@ from __future__ import annotations
 import ast
 import importlib.util
 import re
+import re._constants as sre_constants
+import re._parser as sre_parser
 import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -690,8 +693,10 @@ _UNSCANNABLE_RE_PATTERNS = {
     # the only reason the scanner cannot read it. Its literal form, the pattern it compiles to,
     # passes the nested-quantifier detector, and the literal-form test below checks that on every
     # run. The detector fires only when two nested levels are both greedy and unbounded, so one
-    # repetition made greedy again would still pass it. That test therefore also requires every
-    # unbounded repetition in the pattern to be possessive. The detector does not model
+    # repetition made greedy again would still pass it. That test therefore also walks the parsed
+    # pattern and fails on any greedy or lazy repetition with no upper bound, however it is spelled:
+    # ``*``, ``+`` or ``{n,}``. A possessive repetition passes, a bounded one such as ``{4}`` passes,
+    # and an escaped ``\+`` or ``\*`` is a literal, not a repetition. The detector does not model
     # overlapping alternation, so neither check catches every catastrophic edit.
     #
     # Its three kinds of unbounded repetition are possessive: the quoted run, the ' + ' parts and
@@ -754,6 +759,41 @@ def test_the_scanners_blind_spots_are_the_recorded_ones() -> None:
     assert actual == _UNSCANNABLE_RE_PATTERNS
 
 
+def _greedy_unbounded_repeats(pattern: str) -> list[str]:
+    """Every greedy or lazy repetition with no upper bound in ``pattern``, read from its parsed form,
+    so ``*``, ``+`` and ``{n,}`` all count and an escaped ``\\+`` or ``\\*`` does not. A possessive
+    repetition, and one with an upper bound, is not listed."""
+    found: list[str] = []
+
+    def walk(seq: Any) -> None:
+        for op, arg in seq:
+            if op in (
+                sre_constants.MAX_REPEAT,
+                sre_constants.MIN_REPEAT,
+                sre_constants.POSSESSIVE_REPEAT,
+            ):
+                low, high, body = arg
+                if op != sre_constants.POSSESSIVE_REPEAT and high == sre_constants.MAXREPEAT:
+                    found.append(f"{op} {{{low},}}")
+                walk(body)
+            elif op == sre_constants.SUBPATTERN:
+                walk(arg[3])
+            elif op == sre_constants.ATOMIC_GROUP:
+                walk(arg)
+            elif op == sre_constants.BRANCH:
+                for option in arg[1]:
+                    walk(option)
+            elif op in (sre_constants.ASSERT, sre_constants.ASSERT_NOT):
+                walk(arg[1])
+            elif op == sre_constants.GROUPREF_EXISTS:
+                walk(arg[1])
+                if arg[2] is not None:
+                    walk(arg[2])
+
+    walk(sre_parser.parse(pattern))
+    return found
+
+
 def _greedy_twin(pattern: str) -> str:
     """``pattern`` with every possessive group repetition ``)*+`` made greedy ``)*``."""
     greedy = pattern.replace(")*+", ")*")
@@ -772,11 +812,57 @@ def test_the_dr_staging_check_matcher_passes_the_detector_in_literal_form() -> N
     assert _regex_literals(source) == [pattern]
     assert find_nested_quantifiers(source) == []
     # The detector passes a pattern with only one greedy level, so it alone would not notice one
-    # repetition made greedy again. Every unbounded repetition here is a possessive `)*+`.
-    assert "*" not in pattern.replace(")*+", "")
-    assert "+" not in pattern.replace(")*+", "").replace("\\+", "")
+    # repetition made greedy again.
+    assert _greedy_unbounded_repeats(pattern) == []
     greedy = _greedy_twin(pattern)
     assert find_nested_quantifiers(f"import re\nre.compile({greedy!r})\n") == [greedy]
+
+
+def _one_edit(pattern: str, old: str, new: str) -> str:
+    """``pattern`` with its first ``old`` replaced by ``new``, which must be there."""
+    assert old in pattern
+    return pattern.replace(old, new, 1)
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        pytest.param((")*+", "){0,}"), id="greedy-brace-zero"),
+        pytest.param(("[0-9A-F]{4}", "[0-9A-F]{4,}"), id="greedy-brace-four"),
+        pytest.param(("\\Z", "\\\\+\\Z"), id="greedy-escaped-backslash-plus"),
+        pytest.param((")*+", ")*"), id="greedy-star"),
+        pytest.param((")*+", ")*?"), id="lazy-star"),
+    ],
+)
+def test_the_dr_staging_check_matcher_walk_fails_on_one_greedy_repetition(
+    edit: tuple[str, str],
+) -> None:
+    # Red before the parsed walk: the string check it replaced passed the first three, since it
+    # looked only for `*` and `+` and stripped every `\+`, the quantifier after `\\` included.
+    from messagefoundry.pipeline import dr_backup
+
+    pattern = _one_edit(dr_backup._CHECKS_AT_END.pattern, *edit)
+    re.compile(pattern)
+    assert len(_greedy_unbounded_repeats(pattern)) == 1
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        pytest.param(("\\Z", "\\+\\*\\Z"), id="escaped-plus-and-star-are-literals"),
+        pytest.param(("[0-9A-F]{4}", "[0-9A-F]{4,8}"), id="bounded-brace"),
+        pytest.param(("\\Z", "\\Z"), id="unchanged"),
+    ],
+)
+def test_the_dr_staging_check_matcher_walk_passes_what_is_not_greedy_and_unbounded(
+    edit: tuple[str, str],
+) -> None:
+    # The control: a fully possessive pattern, and the same with a literal or bounded edit, pass.
+    from messagefoundry.pipeline import dr_backup
+
+    pattern = _one_edit(dr_backup._CHECKS_AT_END.pattern, *edit)
+    re.compile(pattern)
+    assert _greedy_unbounded_repeats(pattern) == []
 
 
 def test_the_dr_staging_check_matcher_matches_what_its_greedy_form_did() -> None:
