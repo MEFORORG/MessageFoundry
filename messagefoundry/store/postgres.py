@@ -1676,12 +1676,10 @@ def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
     ``codec_safe_str`` rendering: the CRL judge re-raises a codec error as a ``ValueError`` whose
     own text already quotes the byte, which that rendering prints whole. It names no class, as
     :func:`~messagefoundry.store.base._codec_safe_refusal`'s fallback names none (the third hold
-    on engine PR 2818). Every other ``ValueError`` keeps its chain, and its text only when it is
-    exactly a ``ValueError`` an engine ``raise`` statement worded, read from its one ``str``
-    argument (:func:`~messagefoundry.exception_origin.engine_worded_text`); any other gets a fixed
+    on engine PR 2818). Every other ``ValueError`` keeps its chain, and its text only as
+    :func:`~messagefoundry.exception_origin.engine_worded_text` reads it; any other gets a fixed
     text naming the settings. Its ``__str__`` is never called, since in the handler it can raise or
-    print a byte, nor is a subclass's argument read, which its own constructor wrote (the sixth
-    hold).
+    print a byte (the sixth hold).
 
     The class test that comes first, for an ``InsecureHopRefused`` or an ``OSError``, reads the
     class with ``type``, so it runs none of the error's own code (the fourth hold). It runs before

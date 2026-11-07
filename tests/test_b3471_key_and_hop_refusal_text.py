@@ -452,7 +452,7 @@ def test_the_ad_probe_names_a_guard_refusal_it_did_not_word_with_fixed_text(
             AuthSettings(ad_server="ldaps://dc.synthetic.test:636"), tls, None
         )
     assert _ad_why(caught.value) == _AD_GUARD_REFUSAL
-    assert "[auth].ad_tls_crl_file" in _AD_GUARD_REFUSAL
+    assert "revocation guard" in _AD_GUARD_REFUSAL
 
 
 def test_a_hop_refusal_from_the_bind_password_resolution_keeps_no_text(
@@ -1444,3 +1444,105 @@ def test_a_judgement_that_fails_closed_logs_what_it_caught(
     for line in logged:
         _assert_no_key_byte(line)
         assert "synthetic" not in line, line
+
+
+class _SchemeKeySource:
+    """A key source whose active key is read through an engine function that refuses it with an
+    engine-worded ``ValueError`` subclass, ``UnknownSchemeError``."""
+
+    def active_key(self) -> str | None:
+        from messagefoundry.store.crypto import read_scheme_tag
+
+        return read_scheme_tag("zz:synthetic", "aes")
+
+    def retired_keys(self) -> Sequence[str]:
+        return ()
+
+
+def test_the_cipher_build_keeps_an_engine_worded_subclass_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 1 of the sixth hold's review: only an exact ``ValueError`` kept its text, so an
+    engine subclass that defines no constructor or ``__str__`` of its own, such as
+    ``UnknownSchemeError`` or the TLS layer's ``CrlNotInEffect``, lost its diagnosis."""
+    monkeypatch.setattr(
+        store_base, "resolve_key_provider", lambda settings, posture=None: _SchemeKeySource()
+    )
+    escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
+    assert type(escaped) is StoreCipherConfigError, type(escaped)
+    assert "names an unknown scheme" in str(escaped), str(escaped)
+
+
+def test_the_postgres_tls_wrap_keeps_an_engine_worded_text(tmp_path: Path) -> None:
+    """The positive arm of the wrap: a pin file that holds no certificate is refused by an engine
+    ``raise`` naming the setting, and that text is kept."""
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.config.tls_policy import StoreTlsRefused
+    from messagefoundry.store import postgres
+
+    pin = tmp_path / "ca.pem"
+    pin.write_text("synthetic: not a certificate", encoding="ascii")
+    settings = StoreSettings(
+        backend=StoreBackend.POSTGRES,
+        server="db.synthetic.test",
+        database="mefor",
+        username="mefor",
+        ssl_root_cert=str(pin),
+    )
+    escaped = _escaping(lambda: postgres._verifying_context_at_open(settings))
+    assert type(escaped) is StoreTlsRefused, type(escaped)
+    assert "[store].ssl_root_cert" in str(escaped) and "could not be read" in str(escaped)
+
+
+class _OwnStr(ValueError):
+    def __str__(self) -> str:
+        return "synthetic: printed by its own __str__"
+
+
+class _OwnInit(ValueError):
+    def __init__(self, text: str) -> None:
+        super().__init__(f"synthetic: rewritten {text}")
+
+
+class _Plain(ValueError):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("error", "kept"),
+    [
+        (ValueError(_SETTING_TEXT), True),
+        (_Plain(_SETTING_TEXT), True),
+        (_OwnStr(_SETTING_TEXT), False),
+        (_OwnInit(_SETTING_TEXT), False),
+        (KeyError(_SETTING_TEXT), False),
+        (ValueError(_SETTING_TEXT, "second"), False),
+    ],
+    ids=["exact", "plain-subclass", "own-str", "own-init", "not-a-kind", "two-arguments"],
+)
+def test_engine_worded_text_keeps_only_what_a_raise_passed(
+    error: BaseException, kept: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The class rule alone, with the frame rule granted: a class below the base that defines a
+    constructor or ``__str__`` of its own is never read."""
+    from messagefoundry import exception_origin
+
+    monkeypatch.setattr(exception_origin, "worded_by_the_engine", lambda exc: True)
+    text = exception_origin.engine_worded_text(error, ValueError)
+    assert text == (_SETTING_TEXT if kept else None), text
+
+
+def test_a_log_call_that_fails_does_not_replace_the_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 1 of the sixth hold's review: the log call ran inside the fail-closed handler, so one
+    that raised, as at the recursion limit, left in place of the typed refusal."""
+
+    def _log_fails(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("synthetic: the logger failed")
+
+    monkeypatch.setattr(store_base.log, "warning", _log_fails)
+    _with_provider(monkeypatch, _UnreadableReason(f"synthetic: {_decode_error()}"))
+    escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
+    assert type(escaped) is StoreCipherConfigError, type(escaped)
+    assert escaped.__cause__ is None and escaped.__context__ is None

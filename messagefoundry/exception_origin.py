@@ -3,9 +3,10 @@
 """Which code raised an exception, read from its traceback (vault BACKLOG #3765 item 5).
 
 The config loader, ``messagefoundry check-privileges`` and the CLI each read this to decide whether
-to print an exception's text. All three share :func:`raised_by_the_engine`'s frame rule, and only
-the loader also takes the narrower :func:`worded_by_the_engine`, so a builtin's text in engine code
-can still print from the other two. A leaf that imports only the standard library:
+to print an exception's text. All three share :func:`raised_by_the_engine`'s frame rule. The loader
+also takes the narrower :func:`worded_by_the_engine`, and so does :func:`engine_worded_text`, which
+the store's cipher build and PostgreSQL TLS context refusals and the AD probe's guard refusal read
+(the sixth hold on engine PR 2818); a builtin's text in engine code can still print elsewhere. A leaf that imports only the standard library:
 ``privilege_probes`` calls it inside exception handlers without loading ``config.wiring``, and
 ``__main__`` without loading anything else.
 
@@ -20,9 +21,10 @@ The innermost frame says where a traceback ends, not who raised what is on it. `
 X(text).with_traceback(exc.__traceback__)``, an ordinary idiom rather than a forgery, keeps the
 engine's frame innermost. So the loader also reads where the raise happened:
 :func:`raised_only_by_the_engine`. That cannot tell the idiom from a module's ``raise exc`` of the
-refusal it caught, so that is withheld too, which is the cheaper failure. The other two callers keep
-the frame rule alone, because a library raising an engine exception again, as
-``concurrent.futures`` does, must not cost them an engine refusal's text.
+refusal it caught, so that is withheld too, which is the cheaper failure. The CLI and the probes' other
+texts keep the frame rule alone, because a library raising an engine exception again, as
+``concurrent.futures`` does, must not cost them an engine refusal's text. The callers of
+:func:`engine_worded_text` accept that cost: such a refusal reads as their fixed text.
 
 A frame says who raised an instance, not what it prints. A module can catch a refusal and assign its
 ``__class__``, which leaves the engine's frame on it and prints through that class's ``__str__``, so
@@ -31,9 +33,9 @@ the loader also reads the real class (``wiring._is_engine_text``). No frame rule
 the value, still passes.
 
 :func:`engine_worded_text` is that rule applied to text: it reads ``args`` through
-``BaseException``'s own descriptor, and only for an instance of exactly a class whose constructor
-and ``__str__`` are the builtin ones, so a caller can take an engine refusal's text without running
-any of the error's code."""
+``BaseException``'s own descriptor, and only for an instance of a class whose constructor and
+``__str__`` are those of the base the caller names, so a caller can take an engine refusal's text
+without running any of the error's code."""
 
 from __future__ import annotations
 
@@ -140,20 +142,36 @@ def raised_through(exc: BaseException, code: CodeType) -> bool:
 
 #: The builtin descriptor, so reading the arguments runs none of a subclass's code.
 _ARGS_OF: Final[Any] = BaseException.__dict__["args"]
+#: ``type``'s own descriptors, so reading a class's MRO and dict runs no metaclass code.
+_TYPE_MRO: Final[Any] = vars(type)["__mro__"]
+_TYPE_DICT: Final[Any] = vars(type)["__dict__"]
+#: What a class must not define for its arguments to be what ``raise`` passed and ``str`` prints.
+_TEXT_HOOKS: Final = ("__init__", "__new__", "__str__")
 
 
 def engine_worded_text(exc: BaseException, kind: type[BaseException]) -> str | None:
-    """``exc``'s one ``str`` argument when ``exc`` is exactly ``kind`` and :func:`worded_by_the_engine`,
-    else ``None``, read with none of ``exc``'s own code run (the sixth hold on engine PR 2818).
+    """``exc``'s one ``str`` argument when ``exc`` is a ``kind`` and :func:`worded_by_the_engine`,
+    and no class of its own below ``kind`` defines ``__init__``, ``__new__`` or ``__str__``, else
+    ``None``, read with none of ``exc``'s own code run (the sixth hold on engine PR 2818).
 
-    ``kind`` must be a class that defines no constructor or ``__str__`` of its own, such as
+    ``kind`` must be a class whose constructor and ``__str__`` are ``BaseException``'s, such as
     ``ValueError``: then the arguments are what an engine ``raise`` statement passed, and they are
     what ``str(exc)`` prints. A subclass's own ``__init__`` writes its arguments and its own
     ``__str__`` prints what it likes, so either could quote a byte the arguments do not show, and
-    one is never read. Like :func:`worded_by_the_engine`, this proves who wrote the text, not what
-    it holds: an engine ``raise`` can interpolate another error's text. A caller that gets
+    such a one is never read. The class is read with ``type`` and its MRO and dicts through
+    ``type``'s own descriptors. Like :func:`worded_by_the_engine`, this proves who wrote the text,
+    not what it holds: an engine ``raise`` can interpolate another error's text. A caller that gets
     ``None`` says something fixed instead."""
-    if type(exc) is not kind or not worded_by_the_engine(exc):
+    below: list[type] = []
+    for base in _TYPE_MRO.__get__(type(exc)):
+        if base is kind:
+            break
+        below.append(base)
+    else:
+        return None  # not a kind
+    if any(name in _TYPE_DICT.__get__(base) for base in below for name in _TEXT_HOOKS):
+        return None
+    if not worded_by_the_engine(exc):
         return None
     args = _ARGS_OF.__get__(exc)
     if len(args) == 1 and type(args[0]) is str:

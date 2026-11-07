@@ -27,16 +27,18 @@
   cleared, keeps it as its context. The links are cleared through `BaseException`'s own
   descriptors, so an interrupt class's own `__setattr__` does not run. Every other `ValueError`
   from the cipher build is raised as `StoreCipherConfigError` with the error as its cause, as
-  before, and keeps its text only when it is exactly a `ValueError` a `raise` statement in the
-  engine's own code raised, such as a key that is not 32 bytes. Any other, a subclass or one a
-  library or key source raised, now gets a fixed text: its `__str__` is never called and its
-  arguments are never read, since either can quote a byte. Before, its own text was the
-  refusal's. Every other error of another class from the build, and every other provider error
+  before, and keeps its text only when a `raise` statement in the engine's own code raised it and
+  no class of its own defines a constructor or `__str__`, as for a key that is not 32 bytes. Any
+  other, such as one a library or key source raised, now gets a fixed text: its `__str__` is never
+  called and its arguments are never read, since either can quote a byte. Before, its own text was
+  the refusal's. The PostgreSQL store's TLS context refusal at the open, `StoreTlsRefused`, now
+  reads the context builder's `ValueError` the same way, with a fixed text naming the settings
+  where it does not keep the text, at least for one the `ssl` or `cryptography` library raised. Every other error of another class from the build, and every other provider error
   at the key resolution, passes through unchanged.
   (`BACKLOG #4882`, `BACKLOG #3471`)
-- **`check-privileges`' AD bind probe keeps a hop refusal's text only when it is exactly an
-  `InsecureHopRefused` that an engine `raise` statement raised through the LDAPS revocation
-  guard,** by the guard or by anything it calls. Any other raised through the guard reads as a
-  fixed text naming the guard and `[auth].ad_tls_crl_file`. Any other hop refusal on that probe,
+- **`check-privileges`' AD bind probe keeps a hop refusal's text only when it is an
+  `InsecureHopRefused`, or a subclass that defines no constructor or `__str__`, that an engine
+  `raise` statement raised through the LDAPS revocation guard,** by the guard or by anything it
+  calls. Any other raised through the guard reads as a fixed text naming the guard. Any other hop refusal on that probe,
   at least one from resolving a Vault-held bind password, is named by its type, as on the Vault
   probe. (`BACKLOG #4883`, `BACKLOG #3471`)

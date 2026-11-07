@@ -211,14 +211,12 @@ def _ad_why(exc: BaseException) -> str:
 
     That guard (BACKLOG #2193) refuses with an ``InsecureHopRefused`` whose text names the hop,
     the domain controller's host and the setting that clears it, and reads no password.
-    ``provision-admin`` and ``serve`` print the same refusal whole. Here its text is kept only when
-    it is exactly an ``InsecureHopRefused`` an engine ``raise`` statement worded, read from its one
-    ``str`` argument (:func:`~messagefoundry.exception_origin.engine_worded_text`); any other reads
-    as :data:`_AD_GUARD_REFUSAL`, a fixed text naming the guard and the setting. None of the
-    error's code runs (the fifth and sixth holds on engine PR 2818): the class is tested with
-    ``type``, never ``isinstance``, which reads ``__class__``; ``str(exc)``, whose ``__str__`` can
-    raise or print a byte, is never called; and a subclass's arguments, which its own ``__init__``
-    wrote, are never read.
+    ``provision-admin`` and ``serve`` print the same refusal whole. Here its text is kept only as
+    :func:`~messagefoundry.exception_origin.engine_worded_text` reads it; any other reads as
+    :data:`_AD_GUARD_REFUSAL`, a fixed text that names the guard and points at the refusal ``serve``
+    prints. None of the error's code runs (the fifth and sixth holds on engine PR 2818): the class
+    is tested with ``type``, never ``isinstance``, which reads ``__class__``, and ``str(exc)``,
+    whose ``__str__`` can raise or print a byte, is never called.
 
     The test is an ``InsecureHopRefused`` whose traceback passes through
     ``auth.ldap._refuse_ad_revocation`` (:func:`raised_through`). So it accepts one raised by
@@ -240,8 +238,8 @@ def _ad_why(exc: BaseException) -> str:
 #: What the AD probe says of a hop refusal raised through the LDAPS revocation guard whose text it
 #: does not keep (:func:`_ad_why`).
 _AD_GUARD_REFUSAL = (
-    "InsecureHopRefused: the LDAPS bind to AD was refused at its revocation guard; set "
-    "[auth].ad_tls_crl_file, or see the refusal serve prints"
+    "InsecureHopRefused: the LDAPS bind to AD was refused while its revocation guard ran; the "
+    "refusal serve prints names the hop and how to clear it"
 )
 
 
