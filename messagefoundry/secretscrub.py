@@ -133,8 +133,9 @@ before the braced tail began checking for a label; the growth tests in
 ``tests/test_log_redaction_secret_domain.py`` bound the unclosed-label run alone. A review measured
 two shapes they do not cover, on 2026-11-06: a 6 KB ``session={a:1}{a:1}...`` value, which now walks
 because the fast path refuses any "{", 0.83 against 0.045 ms, and a 6 KB braced tail of short words,
-which the tail mask walks word by word, 4.9 against 0.9 ms. Both grew linearly, under the ceiling
-above.
+which the tail mask then walked word by word, 4.9 against 0.9 ms. Both grew linearly, under the
+ceiling above. Every figure in this paragraph predates the allowlist tail, which checks for no label
+and masks with one ``str.translate``; it was not measured again.
 """
 
 from __future__ import annotations
@@ -552,7 +553,7 @@ _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 #
 # THE VALUE STOPS IN FRONT OF THE LABEL AND THEN TAKES IT, THROUGH THE BRACED VALUE, UP TO THE CLOSER.
 # What the old class printed, from the first white space in the braces to the closer, is written back
-# MASKED rather than dropped, by :func:`_mask_member_value`, the connection-string member mask, and the
+# MASKED rather than dropped, by :func:`_braced_tail`, which turns every letter into "x", and the
 # closer stays. So ``MEFOR_X=a;PWD={pp ww}`` becomes ``MEFOR_X=<redacted> xx}``, the old
 # ``MEFOR_X=<redacted> ww}`` with its letters masked, and the label is hidden with the value, as it was
 # before. The tail it takes holds only lower case letters and spaces, as the conditions below
@@ -910,7 +911,10 @@ _MEFOR_SECRET = re.compile(
 #   braced value holds a space followed only by lower case letters and spaces (BACKLOG #2966):
 #   ``MEFOR_STORE_DSN=Server=h;PWD={p w}`` and ``token=a;PWD={p w}`` print the tail masked now,
 #   " x}", where they printed " w}"; its spaces, word lengths and closer still print. That tail is
-#   the only one hidden beyond what the old class hid. Any other braced value, and a label that
+#   the only shape this change was built to hide beyond what the old class hid; the differential
+#   tests are evidence on a sample that it hides nothing else less. Any other braced value, at
+#   least one with a digit, a capital letter or punctuation in its tail, or no single closer, as
+#   ``PWD={p w`` and ``PWD={p w}}}``, and a label that
 #   :data:`_BRACED_RUN_ON`'s conditions refuse, still print all or part of the braced value, as
 #   before, and so does a key-material or token label with one, as in ``token=a;session={p w}``;
 #   the conditions are stated once, on that fragment. On the installed log chain a query-key line,
@@ -1382,7 +1386,7 @@ def _braced_tail(m: re.Match[str]) -> str:
 
 
 #: What :func:`_braced_tail` writes for each letter its tail can hold.
-_BRACED_TAIL_MASK = str.maketrans("abcdefghijklmnopqrstuvwxyz", "x" * 26)
+_BRACED_TAIL_MASK = _MEMBER_ALNUM_MASK
 
 
 # --- ADMISSION GATING: what makes a per-record credential pass affordable --------------------------

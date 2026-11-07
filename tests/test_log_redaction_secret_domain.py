@@ -2444,8 +2444,7 @@ def test_a_plain_value_does_not_print_a_later_braced_password(line: str) -> None
 
 
 def test_the_braced_tail_is_written_back_masked_with_its_closer() -> None:
-    """The tail keeps its spaces and closer, and its words are masked by the connection-string member
-    mask, each letter to "x". Pinned exactly, on both copies and the store path."""
+    """The tail keeps its spaces and closer, and each of its letters is masked to "x". Pinned exactly, on both copies and the store path."""
     assert scrub_credentials("MEFOR_X=a;PWD={pp ww}") == "MEFOR_X=<redacted> xx}"
     assert scrub_credentials("token=a;PWD={pp w  ab} tail") == "token=<redacted> x  xx} tail"
     assert redact_log_line("MEFOR_X=a;PWD={pp ww}") == f"MEFOR_X={REDACTION_PLACEHOLDER} xx}}"
