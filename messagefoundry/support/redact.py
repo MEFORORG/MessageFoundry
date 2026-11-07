@@ -154,16 +154,15 @@ _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 # (BACKLOG #2966), so ``MEFOR_X=a;PWD={pp ww}`` no longer prints " ww}". Why the closer stays, why
 # the braced tail is an allowlist and the label's conditions are what they are, and why the scan stays
 # linear, are stated once, on the same fragments in ``messagefoundry/secretscrub.py``. THIS COPY RUNS
-# BEFORE THE PHI PASS, and the tail is written back masked, which is why the tail takes nothing but
-# lower case letters and spaces: any other character, at least a digit, a capital letter,
-# punctuation, a tab and a character outside ASCII, refuses the braced label, and the line prints as
-# it did before, so the PHI pass reads it as before. A differential that runs the PHI pass after
-# this layer is the measurement for this copy, not the write-time one. ``_MFB64`` runs before this
-# layer and writes ``[REDACTED]`` into the braces, which the allowlist refuses. The tail is a copy of
-# ``secretscrub``'s, and a test holds the two equal.
+# BEFORE THE PHI PASS, and the tail is written back masked, which is the reason for the allowlist; a
+# differential that runs the PHI pass after this layer is the measurement for this copy, not the
+# write-time one. ``_MFB64`` runs before this layer and writes ``[REDACTED]`` into the braces, which
+# the allowlist refuses. The tail is a copy of ``secretscrub``'s, and a test holds the two equal.
 _BRACED_HEAD = r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b[:=]"
 _SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s;,&]|\}\})*+"
-_SPACED_BRACED_TAIL = r" (?: |(?!(?i:bearer|basic|digest) )(?-i:[a-z])++)*+"
+_SPACED_BRACED_TAIL = (
+    r" (?: |(?!(?i:bearer|basic|digest) |(?-i:true|false|null|redacted)(?![a-z]))(?-i:[a-z])++)*+"
+)
 _BRACED_LABEL = _BRACED_HEAD + _SPACED_BRACED_HEAD + _SPACED_BRACED_TAIL + r"\}(?!\})"
 _BRACED_RUN_ON = (
     _BRACED_HEAD

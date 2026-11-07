@@ -131,7 +131,7 @@ Three 6 KB runs built to make every check walk are level within 6 percent: brace
 ``PWD={`` labels, and closed spaced ones, the last 1.21 against 1.15 ms. Those figures were measured
 before the braced tail began checking for a label; the growth tests in
 ``tests/test_log_redaction_secret_domain.py`` bound the unclosed-label run alone. A review measured
-two shapes they do not cover, on 2026-11-07: a 6 KB ``session={a:1}{a:1}...`` value, which now walks
+two shapes they do not cover, on 2026-11-06: a 6 KB ``session={a:1}{a:1}...`` value, which now walks
 because the fast path refuses any "{", 0.83 against 0.045 ms, and a 6 KB braced tail of short words,
 which the tail mask walks word by word, 4.9 against 0.9 ms. Both grew linearly, under the ceiling
 above.
@@ -556,9 +556,11 @@ _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 # closer stays. So ``MEFOR_X=a;PWD={pp ww}`` becomes ``MEFOR_X=<redacted> xx}``, the old
 # ``MEFOR_X=<redacted> ww}`` with its letters masked, and the label is hidden with the value, as it was
 # before. The tail it takes holds only lower case letters and spaces, as the conditions below
-# require, so the mask writes each letter as "x" and keeps every space and the closer, except a word
-# the mask keeps whole for a later pass, at least one ending in ``mrn`` before a space. So the tail's
-# word lengths still print, and so does such a kept word.
+# require, so :func:`_braced_tail` writes each letter as "x" and keeps every space and the closer:
+# the tail's word lengths still print, and nothing else of it. It masks every word, because no later
+# pass can read a word of such a tail: each reader needs a boundary, a digit or punctuation the tail
+# cannot hold. The connection-string member mask kept whole a word ending in ``mrn`` or a scheme word
+# before a space, which printed a password word such as ``hunterbasic`` in full.
 #
 # A FIRST FORM MASKED EVERY LETTER AND DIGIT TO "x" and printed values the old class hid: in
 # ``token=a;PWD={pp Bearer abcdefgh}ijkl`` the later bearer pass no longer saw ``Bearer`` and
@@ -586,7 +588,10 @@ _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 #   the connection-string member pass reads was gone, and "e" printed.
 # * THE TAIL IS AN ALLOWLIST. The first white space is a plain space, U+0020, and after it the
 #   braces hold nothing but lower case ASCII letters and plain spaces, with no scheme word,
-#   ``bearer``, ``basic`` or ``digest``, before a space. Any other character, at least a digit, a
+#   ``bearer``, ``basic`` or ``digest``, before a space, and no word that is a JSON literal the PHI
+#   pass keeps bare, ``true``, ``false``, ``null`` or ``redacted``: that pass scrubs the masked word
+#   to its placeholder instead, and the text it then reads is not the text it read before. Any
+#   other character, at least a digit, a
 #   capital letter, punctuation, a tab or other white space, and a character outside ASCII, refuses
 #   the braced label, and the line prints exactly as it did before the run-on. The old class stopped
 #   at that first white space, so the rest of the braces was still in front of every later pass, and
@@ -597,9 +602,9 @@ _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 #   with a label glued behind it, in ``Bearer abcd.PWD={pp 2024-01-01t09:15private_key=vq9}vq10 rest``,
 #   and a "[" after an ``mrn``, in ``token=a;PWD={pp mrn[vq7code=x}``, each printed a value in the
 #   bundle and on the store path that the old code hid. Lower case letters and spaces hold no label,
-#   which needs a ":" or "=", no placeholder, no digit and no punctuation, and the scheme words are
-#   the lower case reading found; a lower case word read by some other pass is not ruled out by the
-#   rule, only by the differential tests, on a sample. The cost is coverage: a braced tail holding
+#   which needs a ":" or "=", no placeholder, no digit and no punctuation, and the scheme words and
+#   the JSON literals are the lower case readings found; a lower case word read by some other pass is
+#   not ruled out by the rule, only by the differential tests, on a sample. The cost is coverage: a braced tail holding
 #   anything else prints as it did before.
 # * No "{", which keeps the scan linear. A walk from one label's "{" ends at the next "{" at the
 #   latest, so walks started by two labels cannot overlap, and a line of unclosed ``PWD={`` labels costs
@@ -633,7 +638,9 @@ _BRACED_HEAD = (
 #: value then takes, the part from the white space on in the group ``braced_tail``. One walk, so the
 #: two agree at every position.
 _SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s;,&]|\}\})*+"
-_SPACED_BRACED_TAIL = r" (?: |(?!(?i:bearer|basic|digest) )(?-i:[a-z])++)*+"
+_SPACED_BRACED_TAIL = (
+    r" (?: |(?!(?i:bearer|basic|digest) |(?-i:true|false|null|redacted)(?![a-z]))(?-i:[a-z])++)*+"
+)
 _BRACED_LABEL = _BRACED_HEAD + _SPACED_BRACED_HEAD + _SPACED_BRACED_TAIL + r"\}(?!\})"
 _BRACED_RUN_ON = (
     _BRACED_HEAD
@@ -902,14 +909,13 @@ _MEFOR_SECRET = re.compile(
 # * A plain value running on into a later braced value is CLOSED for a ``_CREDENTIAL_KV`` label whose
 #   braced value holds a space followed only by lower case letters and spaces (BACKLOG #2966):
 #   ``MEFOR_STORE_DSN=Server=h;PWD={p w}`` and ``token=a;PWD={p w}`` print the tail masked now,
-#   " x}", where they printed " w}"; its spaces, word lengths and closer still print, and so does a
-#   word the mask keeps whole. That all-lower-case tail is the only one hidden beyond what the old
-#   class hid. A tail holding anything else, at least a digit, a capital letter, punctuation, a tab
-#   or a character outside ASCII, and a label that :data:`_BRACED_RUN_ON`'s conditions refuse, still
-#   print all or part of the braced value, as before, and so does a key-material or token label with
-#   one, as in ``token=a;session={p w}``; the conditions are stated once, on that fragment. On the
-#   installed log chain a ``token=`` line still prints the tail, because the query filter runs first
-#   and takes the head of the braced value before this pass sees it.
+#   " x}", where they printed " w}"; its spaces, word lengths and closer still print. That tail is
+#   the only one hidden beyond what the old class hid. Any other braced value, and a label that
+#   :data:`_BRACED_RUN_ON`'s conditions refuse, still print all or part of the braced value, as
+#   before, and so does a key-material or token label with one, as in ``token=a;session={p w}``;
+#   the conditions are stated once, on that fragment. On the installed log chain a query-key line,
+#   at least ``token=``, ``code=`` and ``state=``, still prints the tail, because the query filter
+#   runs first and takes the head of the braced value before this pass sees it.
 # Each of the residuals above, from the unclosed quote on, printed the same text before BACKLOG
 # #1685's remainder; none is new. The BACKLOG #2966 bullet is the exception: it records a shape that
 # change closed, and its residuals are the shapes the conditions refuse, which print as before it.
@@ -1364,15 +1370,19 @@ def _keep_label(m: re.Match[str], placeholder: str) -> str:
 
 
 def _braced_tail(m: re.Match[str]) -> str:
-    """The ``braced_tail`` of a match that took a braced label after its value, masked by
-    :func:`_mask_member_value`, or "" when it took none. :data:`_BRACED_RUN_ON` says why the tail is
-    written back masked rather than dropped, and why with that mask. A pattern without the group
-    gets "", so a rebuilt pattern without the run-on still works here; the tests that rebuild one are
-    the positive controls, and the exact-output pins are what notice a renamed group."""
+    """The ``braced_tail`` of a match that took a braced label after its value, each letter masked
+    to "x", or "" when it took none. :data:`_BRACED_RUN_ON` says why the tail is written back masked
+    rather than dropped, and why every letter. A pattern without the group gets "", so a rebuilt
+    pattern without the run-on still works here; the tests that rebuild one are the positive
+    controls, and a test holds every shipped stopped pattern of both copies to having the group."""
     if "braced_tail" not in m.re.groupindex:
         return ""
-    start, end = m.span("braced_tail")
-    return "" if start < 0 else _mask_member_value(m.string, start, end)
+    tail = m.group("braced_tail")
+    return "" if tail is None else tail.translate(_BRACED_TAIL_MASK)
+
+
+#: What :func:`_braced_tail` writes for each letter its tail can hold.
+_BRACED_TAIL_MASK = str.maketrans("abcdefghijklmnopqrstuvwxyz", "x" * 26)
 
 
 # --- ADMISSION GATING: what makes a per-record credential pass affordable --------------------------

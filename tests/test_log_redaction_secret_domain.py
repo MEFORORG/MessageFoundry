@@ -2695,6 +2695,15 @@ def _denylist_tail(
     )
 
 
+def _member_masked_tail(m: re.Match[str]) -> str:
+    """The braced tail as the denylist forms wrote it back: masked by the connection-string member
+    mask, which keeps a digit's class and some words whole."""
+    if "braced_tail" not in m.re.groupindex:
+        return ""
+    start, end = m.span("braced_tail")
+    return "" if start < 0 else scrub_mod._mask_member_value(m.string, start, end)
+
+
 def _restore_an_earlier_tail(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -2702,8 +2711,10 @@ def _restore_an_earlier_tail(
     segment_checks: bool = False,
     take_lt: bool = False,
 ) -> None:
-    """Both copies' stopped patterns with the braced tail put back to a denylist form."""
+    """Both copies' stopped patterns with the braced tail put back to a denylist form, and the tail
+    written back by the connection-string member mask, as the denylist forms wrote it."""
     for module in (scrub_mod, redact_mod):
+        monkeypatch.setattr(module, "_braced_tail", _member_masked_tail)
         tail = module._SPACED_BRACED_TAIL
         bare = _denylist_tail(module, run=run, segment_checks=segment_checks, take_lt=take_lt)
         for name in _STOPPED_PATTERNS:
@@ -2746,6 +2757,7 @@ def test_a_braced_tail_outside_the_allowlist_prints_as_before(
     assert scrub_credentials(line) == scrubbed
     assert redact_log_line(line) == bundled
     assert _store_detail(line) == bundled
+    assert safe_text(redact_log_line(line)) == bundled
     assert value not in bundled
 
 
@@ -2768,6 +2780,24 @@ def test_only_lower_case_letters_and_spaces_are_taken_after_the_first_space() ->
         line = f"token=a;PWD={{pp ab{odd}cd}}"
         assert scrub_credentials(line) == f"token=<redacted> ab{odd}cd}}", ascii(line)
     assert scrub_credentials("token=a;PWD={pp\tab}") == "token=<redacted>\tab}"
+    # Every word is masked, a word ending in a scheme word or ``mrn`` included.
+    assert scrub_credentials("MEFOR_X=a;PWD={pp hunterbasic abcmrn dog}") == (
+        "MEFOR_X=<redacted> xxxxxxxxxxx xxxxxx xxx}"
+    )
+    # A scheme word, or a JSON literal the PHI pass keeps bare, refuses the label.
+    for word in ("bearer", "basic", "digest", "true", "false", "null", "redacted"):
+        line = f"token=a;PWD={{pp ab {word} cd}}"
+        assert scrub_credentials(line) == f"token=<redacted> ab {word} cd}}", line
+    assert scrub_credentials("token=a;PWD={pp trueish nullx}") == "token=<redacted> xxxxxxx xxxxx}"
+
+
+def test_every_stopped_pattern_carries_the_braced_tail_group() -> None:
+    """:func:`~messagefoundry.secretscrub._braced_tail` writes nothing back for a pattern without the
+    group, which is the dropped-tail form, so a group renamed in one copy alone must go red here."""
+    for module in (scrub_mod, redact_mod):
+        for name in _STOPPED_PATTERNS:
+            pattern: re.Pattern[str] = getattr(module, name)
+            assert "braced_tail" in pattern.groupindex, f"{module.__name__}.{name} lost the group"
 
 
 #: Braces whose tail holds what the bundle's PHI pass reads by its letters: an XML tag, an HL7
