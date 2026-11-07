@@ -15,10 +15,11 @@ Two tiers, by design (do not route the hot path through this):
   is called — a Handler invokes it **on demand** against a
   :class:`~messagefoundry.parsing.message.RawMessage`, never the engine pipeline.
 
-**Free acknowledgment generation.** pyx12's validator emits a conforming **999** (005010) or **997**
-(004010) Functional Acknowledgment as a by-product of the walk, so :attr:`X12ValidationResult.ack`
-carries a ready-to-return negative ack — no separate ack builder needed. An ack pyx12 did not finish
-is not returned: ``ack`` is then ``None``.
+**Free acknowledgment generation.** pyx12's validator emits a **999** (005010) or **997** (004010)
+Functional Acknowledgment as a by-product of the walk, so :attr:`X12ValidationResult.ack` carries the
+negative ack — no separate ack builder needed. An ack pyx12 did not finish is not returned (``ack`` is
+then ``None``). A returned ack echoes sender values unescaped, so it is complete but not thereby
+well-formed; see :class:`X12ValidationResult`.
 
 **PHI rule (do not break).** A failing X12 element error from pyx12 embeds the *offending data value*
 (potential PHI) in its raw error string. This module **never** surfaces that: each
@@ -50,10 +51,9 @@ __all__ = ["X12SegmentError", "X12ValidationResult", "validate"]
 class X12SegmentError:
     """One conformance violation, reduced to **PHI-safe structural locators only**.
 
-    ``code`` is the X12 error code pyx12 maps it to, preferring the code list of the ack pyx12 picks
-    from the last group's GS08 (997 AK for 004010, also when no ack is generated; 999 IK otherwise;
-    e.g. ``"8"``) and taking the other list's code where pyx12 has only that one, except a 999-only
-    ``I`` code on a 997 pass; pyx12's own error name stands in where no code applies;
+    ``code`` is the X12 error code pyx12 maps it to in one code list, chosen by the last group's GS08:
+    the 997 AK list for 004010, also when no ack is generated, and the 999 IK list otherwise (e.g.
+    ``"8"``). pyx12's own error name stands in where that list has no code for it;
     ``message`` is a synthesized, value-free description;
     ``segment_id`` / ``element_position`` / ``line`` / ``loop`` locate it; ``element_name`` is the
     *schema* data-element label (e.g. ``"Transaction Set Creation Date"``), never the input value."""
@@ -72,8 +72,9 @@ class X12ValidationResult:
     """The outcome of a strict pass. ``valid`` is True iff pyx12 found no errors. ``errors`` is the
     flattened, PHI-safe violation list (empty when valid). ``ack`` is the generated 997/999
     Functional Acknowledgment, complete to its closing IEA, or ``None`` when pyx12 emitted none (e.g.
-    for an already-FA transaction) or its ack writer failed before the closing IEA, leaving a fragment
-    that is dropped with a WARNING. ``ack_transaction`` names which (``"997"``/``"999"``), ``None``
+    for an already-FA transaction) or its ack writer failed before the closing IEA. A fragment such a
+    writer left is dropped, with a WARNING; a writer that failed before writing anything leaves no
+    fragment and no WARNING. ``ack_transaction`` names which (``"997"``/``"999"``), ``None``
     with no ack. A complete ack echoes sender values unescaped, so it is not thereby well-formed."""
 
     valid: bool
