@@ -1461,8 +1461,8 @@ def test_the_advised_reinstall_is_one_the_installer_accepts() -> None:
 #: kept, then deleted only once a run minted a new key, or moved back once a run found the store
 #: started under it.
 _SETTLING_STEPS = (
-    "move that file into another directory on the same volume, keeping it, and run the command "
-    "again",
+    "move that file into another directory on the same volume, restricted as a secrets directory "
+    "must be, keeping it, and run the command again",
     "the moved file",
     "Delete it then",
     "move it back",

@@ -648,9 +648,9 @@ def mint_target(
     Refuses as :func:`load_host_custody` does for the settings and, when minting for this account
     (``service_account`` of ``None``), for the account. ``FileExistsError`` when a host blob or a
     handoff is already there: a second mint over a store's key is never made. A handoff is Windows
-    only; a POSIX host mints as the service user itself. Last, :class:`HostCustodyRefused` for a
-    custody directory that is missing, that this account cannot add a file to, or that is on a
-    file system the write refuses (PR 2804 eleventh and twelfth holds)."""
+    only; a POSIX host mints as the service user itself. Last, :class:`HostCustodyRefused` for at
+    least a custody directory that is missing, that this account cannot add a file to, or that is
+    on a file system the write refuses (PR 2804 eleventh and twelfth holds)."""
     host, handoff = check_host_custody_settings(settings, environ=environ)
     for path in (host, handoff):
         if os.path.lexists(path):
@@ -697,7 +697,7 @@ def _refuse_an_unusable_directory(
     directory: Path, *, service_account: str | None, named: bool
 ) -> None:
     """Refuse, before any recovery key is shown, a custody directory the key file's write would
-    refuse only after the ceremony: one that is missing or not a directory, one this account
+    refuse only after the ceremony, at least: one that is missing or not a directory, one this account
     cannot add a file to (PR 2804 twelfth hold, item 4), and one whose volume fails
     :func:`~messagefoundry.restricted_file.write_restricted_file`'s local-volume rule, asked through
     that rule's own check (PR 2804 eleventh hold). ``named`` is whether ``MEFOR_SECRETS_DIRECTORY``

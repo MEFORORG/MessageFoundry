@@ -7072,8 +7072,8 @@ _REMOVE_THE_VOID_KEY = "remove that file and run the command again"
 #: until a run settles whose key it is: a run that mints again found nothing under it, and a run
 #: that finds the store holds data found the store started under it.
 _MOVE_THE_KEPT_KEY_ASIDE = (
-    "move that file into another directory on the same volume, keeping it, and run the command "
-    "again"
+    "move that file into another directory on the same volume, restricted as a secrets directory "
+    "must be, keeping it, and run the command again"
 )
 
 
@@ -7097,11 +7097,11 @@ def _settle_the_kept_key(
         back = "move it back, and keep it. " + _handoff_kept_step(store, service_account)
     return (
         f"WARNING: the store could not be created, and {why}. So the store key minted for it is "
-        f"kept in {path}. No Administrator was provisioned into it. If nothing was written under "
+        f"kept in {path}. No Administrator was provisioned into it. If no store was started under "
         "that key, that file and the recovery key shown are void. If the store was started under "
         "it, they are the store's only keys. Keep both until this is settled. To settle it, "
         f"{once}{_MOVE_THE_KEPT_KEY_ASIDE}, with every argument it was given{flag}. If that run "
-        "mints a new key, nothing was written under the moved file. Delete it then: the "
+        "mints a new key, no store was started under the moved file. Delete it then: the "
         "recovery key shown with it is void. If that run stops because the store already holds "
         f"data, the store was started under the moved file. Then {back}"
     )
@@ -9209,6 +9209,14 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 found: Literal["none", "empty", "held", "unread"] | None = None
                 try:
                     found = await failed_create_found(exc)
+                except Exception as defect:
+                    # A defect in the probe is reported, and the create's own refusal is still
+                    # the one raised below. The class only: its text may quote a driver's.
+                    logging.getLogger(__name__).error(
+                        "the probe after the failed create raised %s, a defect; the store key "
+                        "minted for it is kept",
+                        type(defect).__name__,
+                    )
                 finally:
                     # Run even when the probe is interrupted, so the key file is always named.
                     _discard_minted_custody(
