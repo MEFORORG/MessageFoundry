@@ -155,8 +155,9 @@ class RowSealUnverifiableError(Exception):
 class RowSealKeyRetiredError(Exception):
     """A store write helper read a SESSION whose seal is genuine but was made under a retired key,
     and did not write over it (owner ruling 2026-11-07 on ADR 0217). Not an integrity failure: the
-    session was minted before the key changed, and the caller ends it quietly, with no report and
-    no further Transit call.
+    session was minted before the key changed. The ruled handling is a quiet end at the callers
+    (owner confirmation 2026-11-07), which is not built yet: until it is, the SQLite session writer
+    turns this type back into :class:`RowSealError`, as main declines such a write.
 
     A sibling of :class:`RowSealError` and :class:`RowSealUnverifiableError`, never a subclass, so
     no Forged fallback runs on it and a catch site that does not name it lets it propagate rather
@@ -310,8 +311,9 @@ class RowSealer:
         active one or a retired one this process holds.
 
         For the records that outlive a key change: a user, which ``rotate-key`` re-seals under the
-        active key and which must keep resolving until it has. A session never uses this; its seal
-        verifies under the active key alone (:meth:`verify`)."""
+        active key and which must keep resolving until it has. A session's READ check never uses
+        this; its seal verifies under the active key alone (:meth:`verify`). The write path's
+        :func:`require_seal_for_write` does, for both, and tells a retired-key session apart."""
         parsed = self._parse(stored)
         if parsed is None:
             return False
@@ -443,7 +445,8 @@ class TransitSealBackend(Protocol):
 #: under the same Transit key: Transit receives only the 32-byte digest, never this label, so that
 #: separation holds only while no other caller asks Transit to MAC a bare 32-byte value under the
 #: audit key. A caller that does, over a value someone else chooses, can mint row seals; this
-#: module does not check that none does.
+#: module does not check that none does. The start probe here is one such caller, over a fixed
+#: digest nobody chooses (``_START_PROBE_DIGEST``), so its MAC is no row's seal.
 _TRANSIT_SEAL_LABEL: Final = b"mefor/row-seal/transit/v1"
 #: The digest length a well-formed Transit seal's MAC decodes to: SHA-256's.
 _TRANSIT_DIGEST_LEN: Final = 32
@@ -518,8 +521,8 @@ def transit_mac_version(mac: str) -> int | None:
     Well-formed is ``vault:v<N>:`` with ``N`` of 1 to 10 ASCII digits and no leading zero, then
     base64 that decodes strictly (``validate=True``) to exactly the SHA-256 digest length (ADR
     0217, *The strict parse*) and re-encodes to the same text, so one seal has one stored form
-    (``validate=True`` alone accepts non-zero pad bits). Parsed by hand; anything else is Forged with no Transit call, so no malformed body
-    reaches Transit to draw a 400."""
+    (``validate=True`` alone accepts non-zero pad bits). Parsed by hand; anything else is Forged
+    with no Transit call, so no malformed body reaches Transit to draw a 400."""
     if not mac.isascii() or not mac.startswith(_TRANSIT_MAC_PREFIX):
         return None
     version, sep, body = mac[len(_TRANSIT_MAC_PREFIX) :].partition(":")
@@ -564,14 +567,16 @@ class TransitRowSealer:
 
     **Retired keys.** ``retired_key_names`` are the store's earlier Transit audit keys. A seal under
     one is checked under that key: :meth:`verify_held_async` accepts it, as ``verify_held`` does;
-    :meth:`verify_async`, the session check, never does, and :meth:`sealed_by_retired_key_async`
-    lets the caller end such a session quietly.
+    :meth:`verify_async`, the session READ check, never does. :meth:`sealed_by_retired_key_async`
+    names such a session, and :func:`require_seal_for_write` raises
+    :class:`RowSealKeyRetiredError` for one on the write path.
 
     **The caches.** A Holds, Forged or Unverifiable answer is reused for
     :data:`TRANSIT_SEAL_CACHE_TTL_SECONDS`, keyed by a digest of the seal input's SHA-256, the key
-    id and the stored Transit string, never by a row id. Both are emptied whenever a probe (a refused
-    check's, or :meth:`probe_async`) names a different latest version than the last one did, and a check that began before
-    that keeps its answer for its own caller only. An Outage is never cached."""
+    id and the stored Transit string, never by a row id. Both are emptied whenever a probe (a
+    refused check's, or :meth:`probe_async`) names a different latest version than the last one
+    did, and a check that began before that keeps its answer for its own caller only. An Outage is
+    never cached."""
 
     __slots__ = (
         "_backend",
@@ -673,8 +678,9 @@ class TransitRowSealer:
         *,
         fresh: bool = False,
     ) -> bool:
-        """The session check: whether ``stored`` holds under the ACTIVE key. A seal under a retired
-        key is ``False`` with no Transit call (:meth:`sealed_by_retired_key_async` tells it apart).
+        """The session READ check: whether ``stored`` holds under the ACTIVE key. A seal under a
+        retired key is ``False`` with no Transit call (:meth:`sealed_by_retired_key_async` tells it
+        apart).
         ``fresh`` skips the cache read, for a check that must ask Transit now; its answer is still
         cached."""
         return await self._check(kind, fields, stored, accept_retired=False, fresh=fresh)
@@ -693,7 +699,7 @@ class TransitRowSealer:
     async def sealed_by_retired_key_async(
         self, kind: str, fields: Iterable[tuple[str, object]], stored: str | None
     ) -> bool:
-        """Whether ``stored`` holds under a RETIRED key: a session the caller ends quietly rather
+        """Whether ``stored`` holds under a RETIRED key: a session the READ path ends quietly rather
         than reports. ``False`` for a seal under the active key or no held key. Unlike the local
         form it can raise :class:`TransitSealUnverifiableError` or
         :class:`TransitSealUnavailableError`, as any Transit check can."""
@@ -854,7 +860,7 @@ async def require_seal_for_write(
     :class:`TransitSealUnavailableError` propagates as itself. Every row is checked under the
     active key or a listed retired one, in one check. A record that holds under a retired key is
     accepted; a SESSION that does raises :class:`RowSealKeyRetiredError`, its own type, so the
-    caller ends it quietly with no further Transit call. No
+    caller can tell it from a Forged one; it costs no further Transit call. No
     sealer means a store that seals nothing, so nothing is refused. The subject is not checked
     here; a whole token hash in it would reach ``args``."""
     if sealer is None:

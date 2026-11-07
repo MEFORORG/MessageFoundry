@@ -32,6 +32,9 @@ class FakeBackend:
         self.forbid: set[str] = set()
         self.other_failure = False
         self.hmac_refused = False
+        # Touch seal_hmac alone, so the start probe's second call can fail while its first holds.
+        self.only_hmac_refused = False
+        self.hmac_reply: str | None = None
         self.hold_mac: str | None = None
         self.entered = threading.Event()
         self.release = threading.Event()
@@ -62,8 +65,10 @@ class FakeBackend:
             raise CipherError("synthetic outage")
         if self.other_failure:
             raise RuntimeError("synthetic library failure")
-        if self.hmac_refused:
+        if self.hmac_refused or self.only_hmac_refused:
             raise TransitSealRefused(403)
+        if self.hmac_reply is not None:
+            return self.hmac_reply
         return self._mac(self.active, self.latest[self.active], digest)
 
     def verify_seal_hmac(self, key_name: str, digest: bytes, mac: str) -> bool:

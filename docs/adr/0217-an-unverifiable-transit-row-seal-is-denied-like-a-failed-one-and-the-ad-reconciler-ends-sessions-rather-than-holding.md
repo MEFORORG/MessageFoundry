@@ -111,12 +111,31 @@ in this file, apart from this section, the status line and *Open findings carrie
    told of both.
 5. The retry paragraph: a sentence that `main`'s `revoke_all_sessions` already raises the global
    epoch first (#5091). It states `main` and changes nothing. The owner was not told.
+6. *The strict parse*: a sentence that a Transit MAC whose body does not re-encode to the same
+   text is Forged. It narrows what is well-formed, so a planted pad-bit variant of a genuine seal
+   is Forged with no Transit call. The owner ruled it on 2026-11-07 (below).
 
 Confirmed 2026-11-06 (UTC): the owner was asked about the five differences above, and about the
 carried findings below, and selected 'Confirm current text (Recommended)'. Record:
 https://github.com/MEFORORG/MessageFoundry/pull/2565#issuecomment-6682609779. Anchors: branch
 anchor/adr0217-owner-ruled-20261106 (94b485c2e1) and branch anchor/adr0217-owner-confirmed-20261106
 (ae898dc817).
+
+**Build rulings, 2026-11-07.** The owner answered three questions the slice 1 build raised, in the
+Manager's chat (`AskUserQuestion`), and the Manager relayed them to the build. No PR comment or
+anchor records them yet; this paragraph is the record in this file.
+
+- **The strict parse:** "add the sentence" -- difference 6 above.
+- **The start probe:** it also makes a fixed-input `transit/verify`, so a token without the verify
+  grant on the audit key is refused at start, not at the first request.
+- **A session sealed under a retired key:** the store's write check reports it as its own type,
+  `RowSealKeyRetiredError`, not `RowSealError`, found in the one check with no further Transit
+  call. Asked where the quiet end happens, the owner selected **"Quiet end at callers"**: the
+  store raises the type, and the four `AuthService` session sites (`_sealed_stamp`,
+  `rotate_session`, `revoke_other_sessions`, `revoke_every_session`) and the store's
+  `_keep_or_end_session` end the session quietly with `key_changed=True`, built with the catch
+  census on all three backends together. Until then the SQLite session writer turns the type back
+  into `RowSealError`, as `main` raises.
 
 ## Context
 

@@ -384,6 +384,21 @@ async def test_the_start_probe() -> None:
     with pytest.raises(TransitSealUnavailableError):
         await sealer.probe_async()
     backend.forbid = set()
+    # A token that may probe but not hmac is refused at start, with no verify sent.
+    backend.only_hmac_refused = True
+    calls = backend.verify_calls
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.probe_async()
+    assert backend.verify_calls == calls
+    backend.only_hmac_refused = False
+    # An hmac in an unexpected shape is an Outage too, again with no verify sent.
+    for reply in ("vault:v1:not-base64!", "plain", "vault:vX:" + "A" * 44):
+        backend.hmac_reply = reply
+        with pytest.raises(TransitSealUnavailableError):
+            await sealer.probe_async()
+        assert backend.verify_calls == calls
+    backend.hmac_reply = None
+    assert await sealer.probe_async() == 1  # control: the same sealer starts once both clear
     # A verify that answers but does not hold is refused too.
     backend.verify_seal_hmac = lambda key_name, digest, mac: False  # type: ignore[method-assign]
     with pytest.raises(TransitSealUnavailableError):

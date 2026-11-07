@@ -1496,7 +1496,8 @@ async def require_session_seal_for_write(
     for a Forged seal, :class:`~messagefoundry.store.row_seal.RowSealUnverifiableError` for an
     Unverifiable one, :class:`~messagefoundry.store.row_seal.TransitSealUnavailableError` for an
     Outage, and :class:`~messagefoundry.store.row_seal.RowSealKeyRetiredError` for a genuine seal
-    under a retired key, which the caller ends quietly."""
+    under a retired key. The SQLite writer turns that last one back into ``RowSealError`` until
+    the ruled quiet end at the callers is built (ADR 0217, *Build rulings*)."""
     await require_seal_for_write(
         sealer, SESSION_KIND, record.seal_fields(), record.seal, subject=""
     )

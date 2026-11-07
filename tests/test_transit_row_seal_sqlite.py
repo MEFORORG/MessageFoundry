@@ -213,7 +213,16 @@ async def test_a_session_under_a_retired_key_is_declined_on_a_write_as_on_main(
         assert await store.create_session(
             token_hash=live, user_id="u-1", expires_at=time.time() + 3600
         )
-        await store.mark_session_reauthed(live)
-        assert _seal_of(path, "SELECT seal FROM sessions WHERE token_hash=?", (live,)) != ""
+        before = _seal_of(path, "SELECT seal FROM sessions WHERE token_hash=?", (live,))
+        await store.mark_session_reauthed(live, now=1234.5)
+        conn = sqlite3.connect(path)
+        try:
+            row = conn.execute(
+                "SELECT revoked_at, reauth_at, seal FROM sessions WHERE token_hash=?", (live,)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] is None and row[1] == 1234.5
+        assert row[2] != before and row[2].startswith(SEAL_PREFIX) and ":vault:v1:" in row[2]
     finally:
         await store.close()
