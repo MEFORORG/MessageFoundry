@@ -8251,11 +8251,18 @@ class RegistryRunner:
                 # a worker to is how a rollback would create two claimers on one lane.
                 for name in list(self._sources):
                     await self._stop_inbound_unsafe(name)
-                for name in old_inbound_names:
-                    try:
-                        await self._checked_inbound_start(name)  # vault BACKLOG #2371
-                    except Exception:
-                        log.exception("rollback: could not restart inbound %r", name)
+                # A reload the executor failed restarts the previous inbounds with their builds on
+                # the loop, so the rollback does not meet the faulted pool again and leave intake
+                # down (Lander hold 6704342060, item 1).
+                on_loop = _BUILD_ON_LOOP.set(_executor_faulted(exc))
+                try:
+                    for name in old_inbound_names:
+                        try:
+                            await self._checked_inbound_start(name)  # vault BACKLOG #2371
+                        except Exception:
+                            log.exception("rollback: could not restart inbound %r", name)
+                finally:
+                    _BUILD_ON_LOOP.reset(on_loop)
                 raise
 
             # The swap committed, so nothing can put the previous graph's executor back any more.
@@ -12559,13 +12566,18 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
     An executor fault, a build it cancelled, failed as a broken pool or refused because it was shut
     down, raises :class:`WiringBuildFault`, a :class:`WiringError`, with the fault as its cause, so no
     caller meets a bare ``RuntimeError`` (Lander hold 6703229134, item 2). A build the pool queued
-    before it failed to start a thread is cancelled, or, if a worker already took it, closed when
-    it finishes as an abandoned build is."""
+    before it failed to start a thread is cancelled, or, if a worker already took it, awaited, and
+    its own result or refusal is the answer.
+
+    While :data:`_BUILD_ON_LOOP` is set, the build runs on the loop instead, as it did before
+    builds left the loop: a reload's rollback after an executor fault sets it."""
 
     def stamped() -> T:
         with active_hop_posture(posture):
             return build()
 
+    if _BUILD_ON_LOOP.get():
+        return stamped()
     loop = asyncio.get_running_loop()
     context = contextvars.copy_context()
     built: concurrent.futures.Future[T] = concurrent.futures.Future()
@@ -12601,18 +12613,40 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
         queued = loop.run_in_executor(None, run)
     except RuntimeError as exc:  # the executor was shut down, or its pool is broken
         # A pool can queue the work item and then fail to start a thread for it, so a later
-        # dequeue must find the build cancelled and build nothing for a caller told it failed. A
-        # worker that already took it builds, and what it builds is closed as an abandoned build.
-        if not built.cancel():
-            built.add_done_callback(functools.partial(_close_abandoned_build, loop))
-        raise _executor_fault(exc) from exc
-    queued.add_done_callback(settle)
+        # dequeue must find the build cancelled and build nothing for a caller told it failed.
+        if built.cancel():
+            raise _executor_fault(exc) from exc
+        # A worker already took it, so the build's own outcome is the answer, awaited below
+        # (Lander hold 6704342060, item 2).
+    else:
+        queued.add_done_callback(settle)
     try:
         # Not shielded: a cancelled caller cancels this wrapper, which cancels a build still queued.
         return await asyncio.wrap_future(built, loop=loop)
     except asyncio.CancelledError:
         built.add_done_callback(functools.partial(_close_abandoned_build, loop))
         raise
+
+
+#: Set while a reload's rollback restarts the previous graph's inbounds after an executor fault, so
+#: :func:`_build_off_loop` builds on the loop rather than through the faulted pool (Lander hold
+#: 6704342060, item 1). A context variable, so it reaches only the rollback's own awaits.
+_BUILD_ON_LOOP: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_BUILD_ON_LOOP", default=False
+)
+
+
+def _executor_faulted(exc: BaseException) -> bool:
+    """Whether ``exc``, or an exception it was raised from or during, is a
+    :class:`WiringBuildFault`: the executor kept a connector build from running."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, WiringBuildFault):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 def _executor_fault(exc: Exception) -> WiringBuildFault:

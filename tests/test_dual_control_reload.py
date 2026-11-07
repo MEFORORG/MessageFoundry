@@ -3001,3 +3001,38 @@ async def test_a_convergence_reload_records_an_executor_fault_as_a_reload_error(
     assert [(d["reason"], d["error"], d["config_version"]) for d in rows] == [
         ("reload_error", "BrokenThreadPool", 7)
     ]
+
+
+async def test_a_reload_executor_fault_leaves_the_previous_inbounds_running(
+    engine: Engine,
+) -> None:
+    """The pool stays broken for the whole reload, its rollback included. The rollback restarts
+    the previous graph's inbounds without the faulted pool, so intake is as it was before the
+    reload. Red (Lander hold 6704342060, item 1): the rollback built through the same pool, so
+    IB_T_ADT failed to start and intake was left down."""
+    from concurrent.futures.thread import BrokenThreadPool
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    loop = asyncio.get_running_loop()
+    real = loop.run_in_executor
+
+    def faulty(executor: Any, fn: Any, *args: Any) -> asyncio.Future[Any]:
+        if "_build_off_loop" not in getattr(fn, "__qualname__", ""):
+            return real(executor, fn, *args)
+        queued: asyncio.Future[Any] = loop.create_future()
+        queued.set_exception(BrokenThreadPool("a thread initializer failed"))
+        return queued
+
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "op")
+        first = await c.post("/config/reload", json={}, headers=headers)
+        assert first.status_code == 200, first.text
+        rr = engine.registry_runner
+        assert rr is not None and rr.inbound_running("IB_T_ADT")
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(loop, "run_in_executor", faulty)
+            r = await c.post("/config/reload", json={}, headers=headers)
+            assert r.status_code == 500, r.text
+            assert rr.inbound_running("IB_T_ADT")
+            assert rr.inbound_failed("IB_T_ADT") is None
