@@ -26,7 +26,7 @@ from messagefoundry.store.row_seal import (
     TransitSealUnavailableError,
 )
 from messagefoundry.store.store import MessageStore
-from tests._transit_seal_fake import FakeBackend
+from tests._transit_seal_fake import FakeBackend, with_version
 
 
 @pytest.fixture
@@ -56,13 +56,6 @@ def _seal_of(path: Path, sql: str, params: tuple[object, ...]) -> str:
         return str(conn.execute(sql, params).fetchone()[0])
     finally:
         conn.close()
-
-
-def _planted(seal: str) -> str:
-    """``seal`` naming a version Transit does not hold, with the same well-formed MAC body."""
-    head, mac = seal[len(SEAL_PREFIX) :].split(":", 1)
-    body = mac.split(":", 2)[2]
-    return f"{SEAL_PREFIX}{head}:vault:v7:{body}"
 
 
 async def _user(store: MessageStore, user_id: str = "u-1") -> None:
@@ -95,13 +88,15 @@ async def test_a_user_write_over_an_unverifiable_seal_is_refused_as_unverifiable
     store, _, path = transit
     await _user(store)
     seal = _seal_of(path, "SELECT authz_seal FROM users WHERE id=?", ("u-1",))
-    _raw(path, "UPDATE users SET authz_seal=? WHERE id=?", (_planted(seal), "u-1"))
+    _raw(path, "UPDATE users SET authz_seal=? WHERE id=?", (with_version(seal, "7"), "u-1"))
     with pytest.raises(RowSealUnverifiableError) as caught:
         await store.set_user_disabled("u-1", disabled=True)
     assert not isinstance(caught.value, RowSealError)
     assert caught.value.stored_version == 7
     # Nothing was written: the planted seal is still there.
-    assert _seal_of(path, "SELECT authz_seal FROM users WHERE id=?", ("u-1",)) == _planted(seal)
+    assert _seal_of(path, "SELECT authz_seal FROM users WHERE id=?", ("u-1",)) == with_version(
+        seal, "7"
+    )
     # Control: a seal over other content is Forged, the sibling type.
     _raw(path, "UPDATE users SET authz_seal=?, disabled=1 WHERE id=?", (seal, "u-1"))
     with pytest.raises(RowSealError):
@@ -143,14 +138,14 @@ async def test_a_session_write_checks_under_the_active_key(
     calls = backend.verify_calls
     await store.mark_session_reauthed(token)
     assert backend.verify_calls == calls + 1
-    _raw(path, "UPDATE sessions SET seal=? WHERE token_hash=?", (_planted(seal), token))
+    _raw(path, "UPDATE sessions SET seal=? WHERE token_hash=?", (with_version(seal, "7"), token))
     with pytest.raises(RowSealUnverifiableError) as caught:
         await store.mark_session_reauthed(token)
     # The exception carries no token hash: its args are the kind and a subject.
     assert caught.value.args == ("session", "")
     # Nothing was written: the planted seal is still there.
-    assert _seal_of(path, "SELECT seal FROM sessions WHERE token_hash=?", (token,)) == _planted(
-        seal
+    assert _seal_of(path, "SELECT seal FROM sessions WHERE token_hash=?", (token,)) == with_version(
+        seal, "7"
     )
 
 
@@ -163,3 +158,21 @@ async def test_a_role_upsert_seals_through_transit(
     assert len(backend.inputs) == before + 1
     seal = _seal_of(path, "SELECT seal FROM roles WHERE id=?", ("r-synthetic",))
     assert ":vault:v1:" in seal
+
+
+async def test_an_hmac_only_outage_after_a_good_check_writes_nothing(
+    transit: tuple[MessageStore, FakeBackend, Path],
+) -> None:
+    store, backend, path = transit
+    await _user(store)
+    seal = _seal_of(path, "SELECT authz_seal FROM users WHERE id=?", ("u-1",))
+    backend.hmac_refused = True  # verify still answers; only the re-seal fails
+    with pytest.raises(TransitSealUnavailableError):
+        await store.set_user_disabled("u-1", disabled=True)
+    backend.hmac_refused = False
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute("SELECT authz_seal, disabled FROM users WHERE id='u-1'").fetchone()
+    finally:
+        conn.close()
+    assert row == (seal, 0)

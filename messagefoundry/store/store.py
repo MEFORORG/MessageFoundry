@@ -16983,11 +16983,12 @@ class MessageStore:
             directory_object_id=directory_object_id,
             now=now,
         )
+        # Sealed before the writer lock: the seal depends on the record alone, and under a Transit
+        # sealer it is a Vault round trip that ingress would otherwise wait behind.
+        sealed = await seal_user_async(self._row_sealer, record)
         async with _writer_guard(self._db, self._lock):
             # BACKLOG #2592: the whole row, sealed, in one INSERT.
-            await self._db.execute(
-                _USER_INSERT, user_insert_params(await seal_user_async(self._row_sealer, record))
-            )
+            await self._db.execute(_USER_INSERT, user_insert_params(sealed))
             # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
             appended = await self._append_audits(audits, now=now)
             await self._commit()
@@ -17029,7 +17030,9 @@ class MessageStore:
         writes every column with a compare on the seal it read, then rewrites the role rows when they
         changed. Returns the new record, or ``None`` when there is no row, ``change`` declined, or
         the compare lost to a concurrent write; nothing is written then. Raises
-        :class:`RowSealError`, and writes nothing, when the record it read does not verify:
+        :class:`RowSealError` (Forged) or, under a Transit sealer, its sibling
+        :class:`RowSealUnverifiableError` or :class:`TransitSealUnavailableError` (Outage), and
+        writes nothing, when the record it read does not verify or cannot be checked:
         re-sealing it would turn a change made outside this helper into a sealed record. A change to
         the roles passes :func:`existing_roles_only` first, so it raises :class:`UnknownRoleError`,
         writing nothing, for an added role id with no ``roles`` row."""
@@ -18476,7 +18479,9 @@ class MessageStore:
         Reads the unrevoked row, verifies its seal, applies ``change``, seals the result and writes
         every sealed column with a compare on the seal it read. Returns the new row, or ``None`` when
         there is no unrevoked row or the compare lost to a concurrent write. Raises
-        :class:`RowSealError`, and writes nothing, when the row it read does not verify: re-sealing
+        :class:`RowSealError` (Forged) or, under a Transit sealer, its sibling
+        :class:`RowSealUnverifiableError` or :class:`TransitSealUnavailableError` (Outage), and
+        writes nothing, when the row it read does not verify or cannot be checked: re-sealing
         it would turn a change made outside this helper into a sealed row."""
         cur = await self._db.execute("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
         row = await cur.fetchone()

@@ -811,9 +811,9 @@ async def require_seal_for_write(
     here; a whole token hash in it would reach ``args``."""
     if sealer is None:
         return
-    if stored is not None and not isinstance(stored, str):
-        # A stored seal that is not text (a BLOB a writer put there) is no seal: Forged, as main's
-        # record checks read it, and never a raw TypeError from the parse.
+    if kind != SESSION_KIND and stored is not None and not isinstance(stored, str):
+        # A record's stored seal that is not text (a BLOB a writer put there) is no seal: Forged,
+        # as main's record checks read it. A session's propagates as a TypeError, as on main.
         raise RowSealError(kind, subject)
     fields = list(fields)
     if kind != SESSION_KIND:

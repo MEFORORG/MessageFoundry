@@ -11,6 +11,7 @@ import hmac as hmac_lib
 import threading
 
 from messagefoundry.store.crypto import CipherError, TransitSealRefused
+from messagefoundry.store.row_seal import SEAL_PREFIX
 
 ACTIVE = "mefor-audit-2"
 RETIRED = "mefor-audit-1"
@@ -104,3 +105,10 @@ class Clock:
 
     def __call__(self) -> float:
         return self.now
+
+
+def with_version(stored: str, version: str) -> str:
+    """``stored`` naming another version with the same well-formed MAC body."""
+    head, mac = stored[len(SEAL_PREFIX) :].split(":", 1)
+    body = mac.split(":", 2)[2]
+    return f"{SEAL_PREFIX}{head}:vault:v{version}:{body}"

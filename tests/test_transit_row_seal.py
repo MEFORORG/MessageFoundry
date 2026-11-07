@@ -35,7 +35,7 @@ from messagefoundry.store.row_seal import (
     transit_mac_version,
     transit_seal_key_id,
 )
-from tests._transit_seal_fake import ACTIVE, RETIRED, Clock, FakeBackend
+from tests._transit_seal_fake import ACTIVE, RETIRED, Clock, FakeBackend, with_version
 
 # A synthetic token hash, so a test can show it never reaches Transit or an exception.
 TOKEN_HASH = "ab" * 32
@@ -44,13 +44,6 @@ FIELDS: list[tuple[str, object]] = [("token_hash", TOKEN_HASH), ("user_id", "u-1
 
 def _sealer(backend: FakeBackend, clock: Clock | None = None, **kw: Any) -> TransitRowSealer:
     return TransitRowSealer(backend, clock=clock or Clock(), **kw)
-
-
-def _with_version(stored: str, version: str) -> str:
-    """``stored`` naming another version with the same well-formed MAC body."""
-    head, mac = stored[len(SEAL_PREFIX) :].split(":", 1)
-    body = mac.split(":", 2)[2]
-    return f"{SEAL_PREFIX}{head}:vault:v{version}:{body}"
 
 
 async def test_holds_and_forged() -> None:
@@ -69,9 +62,9 @@ async def test_holds_and_forged() -> None:
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda s: _with_version(s, "01"),  # leading zero
-        lambda s: _with_version(s, "12345678901"),  # eleven digits
-        lambda s: _with_version(s, "1x"),
+        lambda s: with_version(s, "01"),  # leading zero
+        lambda s: with_version(s, "12345678901"),  # eleven digits
+        lambda s: with_version(s, "1x"),
         lambda s: s[:-4] + "!!!!",  # not strict base64
         lambda s: s[:-8] + "====",  # decodes short
         lambda s: s + "AAAA",  # decodes long
@@ -101,7 +94,7 @@ async def test_a_seal_naming_an_unheld_key_id_is_forged_with_no_transit_call() -
 async def test_a_version_transit_will_not_check_is_unverifiable(planted: str) -> None:
     backend = FakeBackend()
     sealer = _sealer(backend)
-    stored = _with_version(await sealer.seal_async(USER_KIND, FIELDS), planted)
+    stored = with_version(await sealer.seal_async(USER_KIND, FIELDS), planted)
     with pytest.raises(TransitSealUnverifiableError) as caught:
         await sealer.verify_held_async(USER_KIND, FIELDS, stored)
     assert caught.value.args == (USER_KIND, int(planted), 1)
@@ -145,7 +138,7 @@ async def test_an_outage_is_never_cached_and_never_a_seal_failure() -> None:
 async def test_a_400_the_probe_cannot_clear_is_an_outage(probe: str) -> None:
     backend = FakeBackend()
     sealer = _sealer(backend)
-    stored = _with_version(await sealer.seal_async(USER_KIND, FIELDS), "7")
+    stored = with_version(await sealer.seal_async(USER_KIND, FIELDS), "7")
     if probe == "down":
         backend.probe_down = True
     else:
@@ -202,7 +195,7 @@ async def test_the_success_cache_expires_and_empties_when_the_probe_moves() -> N
     assert backend.verify_calls == 2
     # A refused check whose probe names a new latest version empties the cache.
     backend.latest[ACTIVE] = 2
-    planted = _with_version(stored, "5")
+    planted = with_version(stored, "5")
     with pytest.raises(TransitSealUnverifiableError):
         await sealer.verify_held_async(USER_KIND, FIELDS, planted)
     calls = backend.verify_calls
@@ -221,17 +214,17 @@ async def test_a_probe_naming_the_same_version_keeps_the_cache() -> None:
     sealer = _sealer(backend)
     stored = await sealer.seal_async(USER_KIND, FIELDS)
     with pytest.raises(TransitSealUnverifiableError):  # the first probe records version 1
-        await sealer.verify_held_async(USER_KIND, FIELDS, _with_version(stored, "5"))
+        await sealer.verify_held_async(USER_KIND, FIELDS, with_version(stored, "5"))
     assert await sealer.verify_held_async(USER_KIND, FIELDS, stored)
     with pytest.raises(TransitSealUnverifiableError):  # this probe names version 1 again
-        await sealer.verify_held_async(USER_KIND, FIELDS, _with_version(stored, "4"))
+        await sealer.verify_held_async(USER_KIND, FIELDS, with_version(stored, "4"))
     calls = backend.verify_calls
     assert await sealer.verify_held_async(USER_KIND, FIELDS, stored)
     assert backend.verify_calls == calls  # still cached: the version did not move again
     # Control: a probe that names a new version empties it.
     backend.latest[ACTIVE] = 2
     with pytest.raises(TransitSealUnverifiableError):
-        await sealer.verify_held_async(USER_KIND, FIELDS, _with_version(stored, "6"))
+        await sealer.verify_held_async(USER_KIND, FIELDS, with_version(stored, "6"))
     assert await sealer.verify_held_async(USER_KIND, FIELDS, stored)
     assert backend.verify_calls == calls + 2
 
@@ -241,13 +234,13 @@ async def test_a_check_that_began_before_the_cache_emptied_is_not_cached() -> No
     sealer = _sealer(backend)
     stored = await sealer.seal_async(USER_KIND, FIELDS)
     with pytest.raises(TransitSealUnverifiableError):  # records version 1 as the probed version
-        await sealer.verify_held_async(USER_KIND, FIELDS, _with_version(stored, "5"))
+        await sealer.verify_held_async(USER_KIND, FIELDS, with_version(stored, "5"))
     backend.hold_mac = stored.split(":", 3)[3]
     slow = asyncio.create_task(sealer.verify_held_async(USER_KIND, FIELDS, stored))
     assert await asyncio.to_thread(backend.entered.wait, 5)
     backend.latest[ACTIVE] = 2  # a rotation lands while the slow check is in Transit
     with pytest.raises(TransitSealUnverifiableError):
-        await sealer.verify_held_async(USER_KIND, FIELDS, _with_version(stored, "6"))
+        await sealer.verify_held_async(USER_KIND, FIELDS, with_version(stored, "6"))
     backend.release.set()
     assert await slow is True  # its own caller still gets its answer
     backend.hold_mac = None
@@ -280,7 +273,7 @@ async def test_a_defect_in_a_call_is_not_reported_as_an_outage() -> None:
     with pytest.raises(RuntimeError):
         await sealer.verify_held_async(USER_KIND, FIELDS, stored)
     backend.other_failure = False
-    planted = _with_version(stored, "5")
+    planted = with_version(stored, "5")
     original = backend.seal_probe
 
     def failing_probe() -> str:
@@ -318,7 +311,7 @@ async def test_transit_calls_run_on_their_own_bounded_pool() -> None:
     assert await sealer.verify_held_async(USER_KIND, FIELDS, stored)
     assert backend.thread_names
     with pytest.raises(TransitSealUnverifiableError):  # a refusal runs the probe on it too
-        await sealer.verify_held_async(USER_KIND, FIELDS, _with_version(stored, "5"))
+        await sealer.verify_held_async(USER_KIND, FIELDS, with_version(stored, "5"))
     assert backend.probe_calls == 1
     assert all(n.startswith("mefor-transit-seal") for n in backend.thread_names)
     # The bound, measured: more concurrent checks than workers never run more than that at once.
@@ -400,7 +393,7 @@ async def test_require_seal_for_write_names_each_cause() -> None:
     assert forged.value.__cause__ is None and forged.value.__context__ is None
     with pytest.raises(RowSealUnverifiableError) as unverifiable:
         await require_seal_for_write(
-            sealer, USER_KIND, FIELDS, _with_version(stored, "5"), subject=subject
+            sealer, USER_KIND, FIELDS, with_version(stored, "5"), subject=subject
         )
     assert unverifiable.value.args == (USER_KIND, subject)
     assert (unverifiable.value.stored_version, unverifiable.value.probe_version) == (5, 1)
@@ -429,15 +422,12 @@ async def test_require_seal_for_write_names_each_cause() -> None:
             local_key, USER_KIND, unreadable, local_key.seal(USER_KIND, FIELDS), subject="u"
         )
 
-    # A stored seal that is not text is Forged, not a raw TypeError.
+    # A record's stored seal that is not text is Forged; a session's is a TypeError, as on main.
+    blob: Any = stored.encode()
     with pytest.raises(RowSealError):
-        await require_seal_for_write(
-            sealer,
-            SESSION_KIND,
-            FIELDS,
-            stored.encode(),  # type: ignore[arg-type]
-            subject="s",
-        )
+        await require_seal_for_write(sealer, USER_KIND, FIELDS, blob, subject=subject)
+    with pytest.raises(TypeError):
+        await require_seal_for_write(sealer, SESSION_KIND, FIELDS, blob, subject="s")
 
     # A TypeError from a defect in the check itself is not a Forged row: it propagates.
     def broken_verify(key_name: str, digest: bytes, mac: str) -> bool:
@@ -491,7 +481,7 @@ async def test_re_storing_an_answer_does_not_evict_another(monkeypatch: pytest.M
 async def test_an_unverifiable_answer_is_cached_only_when_no_probe_moved_meanwhile() -> None:
     backend = FakeBackend()
     sealer = _sealer(backend)
-    planted = _with_version(await sealer.seal_async(USER_KIND, FIELDS), "5")
+    planted = with_version(await sealer.seal_async(USER_KIND, FIELDS), "5")
     for expected_calls in (1, 2, 2):  # the first probe moved the version, so it is not stored
         with pytest.raises(TransitSealUnverifiableError):
             await sealer.verify_held_async(USER_KIND, FIELDS, planted)
