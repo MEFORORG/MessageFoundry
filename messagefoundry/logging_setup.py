@@ -57,7 +57,7 @@ from messagefoundry.config.tls_policy import (
 # controlchars, which imports only the standard library and is therefore reachable from
 # ``logging_guard`` too. That
 # module's docstring carries the reasoning; this is now an ordinary import of a leaf.
-from messagefoundry.controlchars import scrub_control_chars
+from messagefoundry.controlchars import escape_lone_surrogates, scrub_control_chars
 from messagefoundry.keywrap import load_checked_cert_chain
 from messagefoundry.log_spool import LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_guard import (
@@ -1282,7 +1282,11 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             level = logging.getLevelName(entry.level)
             replayed = logging.makeLogRecord(
                 {
-                    "msg": entry.line,
+                    # A line from a raw LogSpool caller may hold a lone surrogate, which the send's
+                    # UTF-8 encode refuses, and the entry would be dropped as undeliverable
+                    # (BACKLOG #2279 item 2a). Only surrogates are escaped: the full scrub would
+                    # also escape the line breaks a text-format traceback block keeps.
+                    "msg": escape_lone_surrogates(entry.line),
                     "levelname": entry.level,
                     "levelno": level if isinstance(level, int) else logging.WARNING,
                 }
@@ -1441,7 +1445,9 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
       filtered; :func:`_install_phi_filters` states what that second pass can break.
 
     **The formatter is on this side too**, and the socket handler is left with an identity formatter,
-    so the object on the queue is the exact line that goes on the wire. That is the strongest available
+    so the object on the queue is the exact line that goes on the wire. (A spooled line replayed with a
+    lone surrogate in it, which only a raw ``LogSpool`` caller writes, goes with that surrogate
+    escaped; BACKLOG #2279.) That is the strongest available
     statement about queue contents: not "a record that will be redacted later" but "the redacted text".
     It also keeps the rendering cost exactly where it is today — inline on the caller — so the only
     thing this change moves off that thread is the network.

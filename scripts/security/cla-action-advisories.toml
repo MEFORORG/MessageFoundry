@@ -10,11 +10,13 @@
 # The script prints what to check first.
 #
 # AN ENTRY WITH NO TRIAGE COMMENT ABOVE IT HAS NOT BEEN TRIAGED. The first 35 are the whole result
-# of the first audit, run 2026-09-29 with npm 11.5.2, recorded as found. Nobody has yet judged
-# whether each is reachable in the bundle's runtime path, and listing them here is not that
-# judgement. Some affect packages the lockfile marks `dev` only (the @babel packages, for example).
-# Others do not: lodash, lodash.set and js-yaml are among the packages the lockfile does not mark
-# `dev`.
+# of the first audit, run 2026-09-29 with npm 11.5.2, recorded as found. Listing an entry here is
+# not a judgement of whether it is reachable in the bundle's runtime path; only a triage comment
+# above it is. Some affect packages the lockfile marks `dev` only (the @babel packages, for
+# example). Others do not: lodash, lodash.set and js-yaml are among the packages the lockfile does
+# not mark `dev`. A TRIAGE COMMENT COVERS ONLY THE ADVISORY IDS IT NAMES. An entry whose id no
+# triage comment above it names has not been triaged, wherever it sits. Each run of entries the
+# 2026-11-05 triage left recorded as found also starts with a comment saying NOT TRIAGED.
 #
 # TWO ENTRIES WERE REMOVED ON 2026-10-24, BECAUSE GITHUB WITHDREW BOTH ADVISORIES. They were braces
 # GHSA-vfj7-8cjw-p6xm and sprintf-js GHSA-hp3w-g68c-fv3c. PR 2112 (commit 713d32a0d) added them on
@@ -28,8 +30,12 @@
 #
 # A BUNDLE MEASUREMENT FROM THAT TRIAGE IS KEPT. It bears on the js-yaml entries and on braces
 # GHSA-grv7-fg5c-xmjg. That advisory sits on braces 3.0.2, the node the withdrawn GHSA-vfj7-8cjw-p6xm
-# was also reported against. NONE OF THOSE ENTRIES WAS TRIAGED ON THIS MEASUREMENT. They are
-# recorded as found, like the rest of the first 35.
+# was also reported against. NONE OF THOSE ENTRIES WAS TRIAGED ON THIS MEASUREMENT ALONE. The
+# 2026-11-05 triage below took it again and triaged those entries. It showed sprintf,
+# ArgumentParser, YAMLException, safeLoad and CHAR_ZERO_WIDTH_NOBREAK_SPACE discriminate at their
+# upstream tags. Toolkit's discrimination it takes from the minimatch triage at the end of this
+# file. toRegexRange's it could not show: no fill-range 7.0.1 tag was found, so the braces entry
+# does not rest on it.
 #
 # dist/index.js is not minified, so a package's own identifiers survive in it. Its NAME often does
 # not, because the bundler replaces require paths with module ids. So the probes are identifiers,
@@ -50,8 +56,66 @@
 # the bundle. tests/test_cla_action_advisory_gate.py re-runs these probes and the control. A
 # re-vendored bundle that carries any of this code reds there, and the reading must be taken again.
 #
+# THE 2026-11-05 TRIAGE (BACKLOG #2492, slices a and b; dates in it are UTC). TRIAGED BY Claude,
+# an AI agent working as the batch 608 Builder, a subagent of the batch 608 Manager. It covers 29
+# entries in 12 comments. Each comment names by id every advisory it covers, says what was found,
+# and ends with their acceptance status under the owner's ruling of 2026-11-05, recorded as
+# decision d20261105T044506837-0038dd. That ruling was given in the batch 608 Manager's chat, and
+# the batch 608 Builder read it as the Manager relayed it in its brief, not from the owner: a
+# Manager may accept, under class B, an entry proven dev-only, or absent from the bundle by
+# discriminating probes; an entry present in the bundle keeps the owner's per-entry acceptance. This
+# triage found none of its 29 present, and rests none of them on lockfile marks alone. The bundle
+# carries code Babel compiled into other packages' pre-built files (Babel's _interopRequireDefault
+# helper appears 39 times), so each was probed. THE BATCH 608 MANAGER ACCEPTED ALL 29 on 2026-11-06,
+# as decision d20261106T103129535-f83e0e, and a later Builder recorded that here as the Manager
+# relayed it in its brief. The entries on packages that are not dev-only, brace-expansion,
+# cross-spawn, flatted, js-yaml, minimatch and semver, were accepted as absent from the bundle by
+# discriminating probes, not as dev-only. The other nine are dev-only, and their comments record
+# them absent by probes as well; GHSA-968p-4wvh-cqc8's comment says why its lockfile marks do not
+# bound it, so it rests on its probes.
+# The triage follows the deepmerge and minimatch triages at the end of this file, and these words
+# hold for every comment that cites this paragraph:
+#   MARKS. Every lockfile node of the package was read for `dev`, `peer` and `optional`, and every
+#   lockfile package naming it in `dependencies`, `peerDependencies` or `optionalDependencies` was
+#   traced. npm marks a node `dev` when only devDependencies reach it. DEV-ONLY means every node of
+#   the package is marked `dev`. The lockfile does not bound what the bundle holds, so each package
+#   was probed as well, dev-only or not.
+#   PROBES. Identifiers, counted in dist/index.js at engine commit aba973b28. action.yml's main is
+#   that file, the action's only JavaScript file. Each probe a comment offers as evidence returned
+#   0 there, and returned the count the comment gives, at least 1, in the package's own source
+#   at the upstream git tag of its locked version, read over the GitHub API. That is a reading of
+#   the tag, not of the npm tarball. The @actions/core control returned 2. "isMatch" is not a probe.
+#   ABSENT means absent under those identifiers, so not reachable on this reading.
+#   LIMIT. Identifier counts do not see code minified or renamed inside another package's pre-built
+#   file, today or after a re-vendor.
+#   NO FIX IS APPLIED. A patched release cannot be applied, because the bundle cannot be rebuilt
+#   here.
+# tests/test_cla_action_advisory_gate.py re-runs the probes each comment names as re-run, so a
+# re-vendored bundle that carries one of those identifiers reds there.
+#
 # Each entry is one advisory id and the package npm reported it against. Only those two fields are
 # compared. Severity and title are printed live from the audit.
+
+# TRIAGED 2026-11-05 by Claude, the batch 608 Builder, by the 2026-11-05 paragraph in the header:
+# these three @babel entries. DEV-ONLY, AND ABSENT FROM THE BUNDLE. @babel/core 7.22.17,
+# @babel/helpers 7.22.15 and @babel/traverse 7.22.17 are each marked `dev` and `peer`, and every
+# package naming one of them is marked `dev`, among them jest-config, @jest/transform, babel-jest
+# and ts-jest, a root devDependency. @babel/helpers' one parent is @babel/core; @babel/traverse's
+# are @babel/core and @babel/helpers. Probes, each 0 in the bundle: loadPartialConfig (2, in
+# packages/babel-core/src/config/partial.ts at tag v7.22.17) and transformFromAst (15, in
+# src/transform-ast.ts there) for @babel/core; NodePath (61, in
+# packages/babel-traverse/src/path/index.ts at v7.22.17) for @babel/traverse; getDependencies (4)
+# and minVersion (6), in packages/babel-helpers/src/index.ts at v7.22.15, for @babel/helpers.
+# GHSA-4x5r-pxfx-6jf8 is a file read through a sourceMappingURL comment, and GHSA-67hx-6x53-jw92
+# code execution while compiling crafted code. Each needs Babel itself to run. GHSA-968p-4wvh-cqc8
+# is different: it is inefficient RegExp complexity in the _wrapRegExp helper that Babel writes
+# INTO the code it compiles, so it can run with no Babel present, in any pre-built file Babel
+# compiled. So it was probed by that helper too: wrapRegExp and BabelRegExp each returned 0 in the
+# bundle (9 together in packages/babel-helpers/src/helpers/wrapRegExp.js at v7.22.15). Re-run in
+# the gate test: loadPartialConfig, NodePath and wrapRegExp. The other @babel/helpers names are
+# generic, so they are not.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-4x5r-pxfx-6jf8"
@@ -65,6 +129,9 @@ package = "@babel/helpers"
 id = "GHSA-67hx-6x53-jw92"
 package = "@babel/traverse"
 
+# NOT TRIAGED. The three @octokit entries below are recorded as found. The 2026-11-05 triage did
+# not cover them (BACKLOG #2492).
+
 [[advisory]]
 id = "GHSA-h5c3-5r3r-rr8q"
 package = "@octokit/plugin-paginate-rest"
@@ -76,6 +143,23 @@ package = "@octokit/request"
 [[advisory]]
 id = "GHSA-xx4v-prfh-6cgc"
 package = "@octokit/request-error"
+
+# TRIAGED 2026-11-05 by Claude, the batch 608 Builder, by the 2026-11-05 paragraph in the header:
+# these five brace-expansion entries, and the three recorded 2026-09-30 further down. NOT DEV-ONLY;
+# ABSENT FROM THE BUNDLE. The lockfile holds one brace-expansion, 1.1.11, marked neither `dev`,
+# `peer` nor `optional`. Its one parent is minimatch 3.1.2, whose chain to actions-toolkit, a root
+# runtime dependency, the separate minimatch GHSA-g3hv-75wg-m249 triage at the end of this file
+# traces; this comment does not cover GHSA-g3hv-75wg-m249. Probes, each 0 in the bundle:
+# expandTop (2, in index.js at tag v1.1.11) and balanced (4 there; the name brace-expansion gives
+# balanced-match, its own dependency); braceExpand, minimatch's call into it, and the rest of that
+# minimatch triage's probes, each 0 again on this reading. Re-run in the gate test: expandTop. All
+# eight advisories are denials of service on a pattern brace-expansion expands, through mechanisms
+# including ReDoS, a hang, quadratic, exponential or unbounded expansion, and recursion. Each needs
+# brace-expansion code to run. The eight are GHSA-3jxr-9vmj-r5cp, GHSA-f886-m6hf-6m8v,
+# GHSA-mh99-v99m-4gvg, GHSA-rgw5-rvv9-x895 and GHSA-v6h2-p8h4-qcjw below, and
+# GHSA-6j4f-fj2g-mc7p, GHSA-q2hr-2g5m-vwhr and GHSA-qhr7-859c-m2p7 further down.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-3jxr-9vmj-r5cp"
@@ -97,9 +181,35 @@ package = "brace-expansion"
 id = "GHSA-v6h2-p8h4-qcjw"
 package = "brace-expansion"
 
+# TRIAGED 2026-11-05 by Claude, the batch 608 Builder, by the 2026-11-05 paragraph in the header.
+# DEV-ONLY, AND ABSENT FROM THE BUNDLE. braces 3.0.2 is marked `dev` and `peer`. Its one parent,
+# micromatch 4.0.5, is marked `dev` and `peer` too, and the comment above micromatch's entry says
+# what reaches it. Probes, each 0 in the bundle: CHAR_ZERO_WIDTH_NOBREAK_SPACE (1, in
+# lib/constants.js at tag 3.0.2) and braces, case-insensitive (40, in index.js there). The first
+# is one of the header's 2026-10-07 probes, taken again. toRegexRange, the other, for fill-range
+# 7.0.1, braces' own dependency, also returned 0, but no 7.0.1 tag was found upstream, so it is not
+# offered as evidence. Re-run in the gate test: CHAR_ZERO_WIDTH_NOBREAK_SPACE, as before.
+# GHSA-grv7-fg5c-xmjg is uncontrolled resource consumption in braces, which needs braces code to
+# run.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
+
 [[advisory]]
 id = "GHSA-grv7-fg5c-xmjg"
 package = "braces"
+
+# TRIAGED 2026-11-05 by Claude, the batch 608 Builder, by the 2026-11-05 paragraph in the header:
+# these two browserslist entries. DEV-ONLY, AND ABSENT FROM THE BUNDLE. browserslist 4.21.10 is
+# marked `dev` and `peer`. The two packages naming it, @babel/helper-compilation-targets and
+# update-browserslist-db, are both marked `dev`, on the @babel chain the comment above the @babel
+# entries traces. Probes, each 0 in the bundle: browserslist, case-insensitive (82, in index.js at
+# tag 4.21.10), BrowserslistError (15 there), and, in node.js at that tag, normalizeStats (3), the
+# function GHSA-73wf-gq98-2v4g names, and caniuse, case-insensitive (8). Re-run in the gate test:
+# browserslist. GHSA-c83g-rgw3-j3cx is unbounded memory growth over distinct query results, and
+# GHSA-73wf-gq98-2v4g a crash or prototype write from a custom stats file. Each needs browserslist
+# code to run.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-73wf-gq98-2v4g"
@@ -109,9 +219,46 @@ package = "browserslist"
 id = "GHSA-c83g-rgw3-j3cx"
 package = "browserslist"
 
+# TRIAGED 2026-11-05 by Claude, the batch 608 Builder, by the 2026-11-05 paragraph in the header.
+# NOT DEV-ONLY; ABSENT FROM THE BUNDLE. npm reports two nodes: cross-spawn 6.0.5, marked neither
+# `dev`, `peer` nor `optional`, and 7.0.3 under jest-changed-files, marked `dev` and `peer`.
+# 6.0.5's one parent is execa 1.0.0, also unmarked. execa's parents are actions-toolkit 2.2.0, a
+# root runtime dependency, and windows-release 3.2.0. windows-release's parent is os-name 3.1.0.
+# The universal-user-agent 4.0.x copies nested under @octokit/endpoint, @octokit/request and
+# @octokit/rest need os-name, and so does the top-level universal-user-agent 2.1.0, which
+# @octokit/graphql 2.1.3 resolves to. @octokit/rest 16.43.2 is a root runtime dependency too. So
+# the lockfile alone does not rule it out. Probes, each 0 in the bundle, with the count at the
+# upstream tag: for cross-spawn v6.0.5, hookChildProcess (2) and verifyENOENT (5) in lib/enoent.js,
+# parseNonShell (2) and resolveCommand (4) in lib/parse.js, and escapeArgument (2) in
+# lib/util/escape.js; for execa v1.0.0, handleArgs (3), npmRunPath (2) and joinCmd (3) in index.js;
+# windowsRelease (2) in windows-release v3.2.0's index.js; osName (2) in os-name v3.1.0's
+# index.js; and Toolkit for actions-toolkit, as the minimatch triage at the end of this file
+# records. Both cross-spawn's and execa's index.js require child_process (1 and 2 hits there), and
+# "child_process" returned 0 in the bundle. Its 16 literal require() calls name assert, crypto,
+# events, fs, http, https, net, os, path, punycode, stream, tls, url, util (twice) and zlib, and
+# its one eval("require")("encoding"), which the minimatch triage records, names no spawn
+# helper either. The bundle's
+# one getUserAgent definition reads navigator and process and calls no os-name. Re-run in the
+# gate test: hookChildProcess, verifyENOENT, joinCmd, windowsRelease and osName.
+# GHSA-3xgq-45jj-v275 is a ReDoS in cross-spawn, which needs cross-spawn code to run.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
+
 [[advisory]]
 id = "GHSA-3xgq-45jj-v275"
 package = "cross-spawn"
+
+# TRIAGED 2026-11-05 by Claude, the batch 608 Builder, by the 2026-11-05 paragraph in the header:
+# these two flatted entries. NOT DEV-ONLY; ABSENT FROM THE BUNDLE. The lockfile holds one flatted,
+# 2.0.1, marked neither `dev`, `peer` nor `optional`. Its one parent, flat-cache 2.0.1, also
+# unmarked, comes from actions-toolkit 2.2.0, a root runtime dependency. Probes, each 0 in the
+# bundle: Flatted, and flatted case-insensitive (4 each, in cjs/index.js at tag v2.0.1); and
+# Toolkit for actions-toolkit, as the minimatch triage at the end of this file records. That
+# triage also records why its flat-cache zeros are not offered as evidence. Re-run in the gate
+# test: flatted, case-insensitive. GHSA-25h7-pfq9-p65f is unbounded recursion in parse(), and
+# GHSA-rf6f-7fwh-wjgh prototype pollution through parse(). Each needs flatted code to run.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-25h7-pfq9-p65f"
@@ -120,6 +267,21 @@ package = "flatted"
 [[advisory]]
 id = "GHSA-rf6f-7fwh-wjgh"
 package = "flatted"
+
+# TRIAGED 2026-11-05 by Claude, the batch 608 Builder, by the 2026-11-05 paragraph in the header:
+# these five js-yaml entries. NOT DEV-ONLY; ABSENT FROM THE BUNDLE. The lockfile holds one js-yaml,
+# 3.13.1, marked neither `dev`, `peer` nor `optional`. Two packages name it: @istanbuljs/load-nyc-
+# config, marked `dev` and `peer`, and actions-toolkit 2.2.0, a root runtime dependency. Probes,
+# each 0 in the bundle: YAMLException (7, in lib/js-yaml/exception.js at tag 3.13.1) and safeLoad
+# (4, in lib/js-yaml.js there); ArgumentParser (43, in lib/argument_parser.js at tag 1.0.10) for
+# argparse 1.0.10, js-yaml's own dependency; sprintf, case-insensitive (29, in src/sprintf.js at
+# tag 1.0.3), for sprintf-js 1.0.3, argparse's; and Toolkit for actions-toolkit, as the minimatch
+# triage at the end of this file records. All of them are the header's 2026-10-07 probes, taken
+# again, and the gate test already re-runs each. GHSA-mh29-5h37-fv8m is prototype pollution through
+# merge keys. GHSA-h67p-54hq-rp68, GHSA-52cp-r559-cp3m, GHSA-5p4m-2wfm-xmqj and GHSA-2883-xcg3-v3hh
+# are CPU amplification in merge-key and !!omap handling. Each needs js-yaml's loader to run.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-2883-xcg3-v3hh"
@@ -141,6 +303,9 @@ package = "js-yaml"
 id = "GHSA-mh29-5h37-fv8m"
 package = "js-yaml"
 
+# NOT TRIAGED. The three lodash entries and the lodash.set entry below are recorded as found. The
+# 2026-11-05 triage did not cover them (BACKLOG #2492).
+
 [[advisory]]
 id = "GHSA-f23m-r3pf-42rh"
 package = "lodash"
@@ -157,9 +322,31 @@ package = "lodash"
 id = "GHSA-p6mc-m468-83gw"
 package = "lodash.set"
 
+# TRIAGED 2026-11-05 by Claude, the batch 608 Builder, by the 2026-11-05 paragraph in the header.
+# DEV-ONLY, AND ABSENT FROM THE BUNDLE. micromatch 4.0.5 is marked `dev` and `peer`. Five packages
+# name it, @jest/core, @jest/transform, jest-config, jest-haste-map and jest-message-util, and each
+# is marked `dev` and `peer`. Probe, 0 in the bundle: micromatch, case-insensitive (40, in index.js
+# at tag 4.0.5). Re-run in the gate test: micromatch. GHSA-952p-6rrq-rcjv is a ReDoS in
+# micromatch, which needs micromatch code to run.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
+
 [[advisory]]
 id = "GHSA-952p-6rrq-rcjv"
 package = "micromatch"
+
+# TRIAGED 2026-11-05 by Claude, the batch 608 Builder, by the 2026-11-05 paragraph in the header:
+# these three minimatch entries. NOT DEV-ONLY; ABSENT FROM THE BUNDLE, on the reading the separate
+# minimatch GHSA-g3hv-75wg-m249 triage at the end of this file records for the same node, minimatch
+# 3.1.2, and the same chain to actions-toolkit; this comment does not cover GHSA-g3hv-75wg-m249,
+# which that triage covers. That reading was taken again for this triage: every
+# identifier it lists returned 0 in the bundle, and the control 2. Its probes' discrimination at
+# the upstream tags is recorded there and is not repeated here. The gate test already re-runs some
+# of them. GHSA-3ppc-4f35-3m26 and GHSA-7r86-cg39-jmmj are ReDoS through repeated wildcards and
+# through several GLOBSTAR segments, fixed in 3.1.3, and GHSA-23c5-xmqv-rm74 is a ReDoS through
+# nested extglobs, fixed in 3.1.4. Each needs minimatch code to run.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-23c5-xmqv-rm74"
@@ -173,6 +360,17 @@ package = "minimatch"
 id = "GHSA-7r86-cg39-jmmj"
 package = "minimatch"
 
+# TRIAGED 2026-11-05 by Claude, the batch 608 Builder, by the 2026-11-05 paragraph in the header:
+# these two picomatch entries. DEV-ONLY, AND ABSENT FROM THE BUNDLE. picomatch 2.3.1 is marked
+# `dev`. Three packages name it: anymatch and micromatch, marked `dev` and `peer`, and jest-util,
+# marked `dev`. Probes, each 0 in the bundle: picomatch, case-insensitive (60, in lib/picomatch.js
+# at tag 2.3.1), and CHAR_ZERO_WIDTH_NOBREAK_SPACE (1, in lib/constants.js there). Re-run in the
+# gate test: picomatch, and CHAR_ZERO_WIDTH_NOBREAK_SPACE, as before. GHSA-3v7f-55p6-f55p is
+# method injection in POSIX character classes, and GHSA-c2c7-rcm5-vvqj a ReDoS through extglob
+# quantifiers. Each needs picomatch code to run.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
+
 [[advisory]]
 id = "GHSA-3v7f-55p6-f55p"
 package = "picomatch"
@@ -181,9 +379,26 @@ package = "picomatch"
 id = "GHSA-c2c7-rcm5-vvqj"
 package = "picomatch"
 
+# TRIAGED 2026-11-05 by Claude, the batch 608 Builder, by the 2026-11-05 paragraph in the header.
+# NOT DEV-ONLY; ABSENT FROM THE BUNDLE. npm reports two nodes: semver 5.7.1 at the top level,
+# marked neither `dev`, `peer` nor `optional`, and 7.3.8 under ts-jest, marked `dev`. Of the
+# packages naming semver, every one but cross-spawn 6.0.5 resolves to a nested copy, under itself
+# or under its parent, and cross-spawn 6.0.5 resolves to the top-level 5.7.1. That puts 5.7.1 on
+# the execa chain the comment above cross-spawn's entry traces to root runtime dependencies.
+# Probes, each 0 in the bundle: semver, case-insensitive (74, in semver.js at tag v5.7.1), SemVer
+# (43), compareIdentifiers (11) and MAX_SAFE_COMPONENT_LENGTH (4), and the chain's probes in the
+# cross-spawn comment. Re-run in the gate test:
+# compareIdentifiers and MAX_SAFE_COMPONENT_LENGTH, with the chain's. GHSA-c2qf-rxjj-qqgw is a
+# ReDoS in semver, which needs semver code to run.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
+
 [[advisory]]
 id = "GHSA-c2qf-rxjj-qqgw"
 package = "semver"
+
+# NOT TRIAGED. The uuid and yaml entries below are recorded as found. The 2026-11-05 triage did not
+# cover them (BACKLOG #2492).
 
 [[advisory]]
 id = "GHSA-w5hq-g745-h8pq"
@@ -195,8 +410,12 @@ package = "yaml"
 
 # THREE MORE, RECORDED 2026-09-30, and they are the gate's first live catch. The audit script's own
 # run while this baseline was being built reported them as NEW ADVISORY and exited 1, a day after the
-# first 35 were read. Recorded as found, NOT triaged, like the 35 above. brace-expansion 1.1.11 is
-# not marked `dev` in the lockfile.
+# first 35 were read. They were recorded as found then. TRIAGED 2026-11-05 by Claude, the batch 608
+# Builder: GHSA-6j4f-fj2g-mc7p, GHSA-q2hr-2g5m-vwhr and GHSA-qhr7-859c-m2p7, with the five
+# brace-expansion entries above, on the reading in the comment above them. NOT DEV-ONLY; ABSENT
+# FROM THE BUNDLE.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-6j4f-fj2g-mc7p"
@@ -262,8 +481,9 @@ package = "deepmerge"
 # tests/test_cla_action_advisory_gate.py re-runs some of these probes, so a re-vendored bundle
 # carrying this chain unminified reds there. The first patched release is 11.0.1, outside the
 # ^3.0.4 both parents ask for, and it cannot be applied, because the bundle cannot be rebuilt here.
-# This reading bears on minimatch's three earlier entries, but they were not triaged on it and stay
-# recorded as found. ACCEPTED BY THE OWNER on 2026-10-31 in the Lander's chat, as the Lander relayed
+# This reading bears on minimatch's three earlier entries. The 2026-11-05 triage took it again and
+# triaged them on it, in the comment above them. ACCEPTED BY THE OWNER on 2026-10-31 in the
+# Lander's chat, as the Lander relayed
 # it to the Builder writing this. Asked: "Accept minimatch in the CLA action's baseline (PR 2697)".
 # Answer: "accept".
 

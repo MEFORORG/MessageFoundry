@@ -443,9 +443,8 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
     and the anonymous FTPS ``tls_verify=false`` context, **and — since #329 —** the SFTP
     unknown-host-key acceptance for a login with no ``password``
-    (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
-    cleartext-``http`` hops. The credential hops it no longer reaches are named once, in
-    docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*. Pass the construction-time
+    (:mod:`messagefoundry.transports.remotefile`). The credential hops it no longer reaches are
+    named once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*. Pass the construction-time
     :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
     :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
     out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
@@ -10225,7 +10224,8 @@ def security_loosenings(
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
     ``tls_allow_expired`` (#129 / ADR 0094), ``hostname_unchecked_hops`` declares
     ``tls_check_hostname=false`` (ASVS 12.3.2), ``query_credential_hops`` is an outbound or
-    ``FhirLookup`` whose literal ``url`` carries a credential-like query parameter (ASVS 14.2.1),
+    ``FhirLookup`` whose ``url`` carries a credential-like query parameter (ASVS 14.2.1), read as
+    ``config.wiring.query_credential_hops`` says,
     ``unverified_db_hops`` is a
     generic-ODBC ``DATABASE``
     connection whose ``odbc_params`` set no usable TLS mode its driver family reads, or set one to

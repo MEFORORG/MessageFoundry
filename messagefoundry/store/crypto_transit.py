@@ -160,10 +160,11 @@ class TransitCipher(_UnmarkedPolicy):
             return self._pass_unmarked(stored, aad, allow_unmarked)
         if not stored.startswith(_V3_PREFIX):
             # An mfenc:v1/v2/v4 value is in-process AES-GCM; Transit holds no key that can read it. Fail
-            # closed (rotate the store into Transit before reading it in Transit mode) — never mis-decrypt.
+            # closed, never mis-decrypt. No command moves such a value into Transit (BACKLOG #2109), so
+            # the refusal names none.
             raise CipherError(
-                "value was encrypted in-process (mfenc:v1, v2 or v4); the Transit cipher cannot read it — "
-                "rotate the store to the Transit provider before serving in this mode"
+                "value was encrypted in-process (mfenc:v1, v2 or v4); the Transit cipher cannot read it, "
+                "and no command moves it into Transit (BACKLOG #2109)"
             )
         ciphertext = stored[len(_V3_PREFIX) :]  # the full "vault:v1:…" blob (may contain ':')
         assoc = self._associated_data(aad)
