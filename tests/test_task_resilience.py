@@ -968,8 +968,12 @@ async def test_a_dead_per_lane_worker_is_respawned_and_its_lane_delivers(
         assert armed == {"claim_faults": 1, "sleep_raises": 1}
         exc = first.exception()
         assert isinstance(exc, RuntimeError) and "injected death" in str(exc), exc
-        # The supervisor names the worker it respawned; the three kinds share the suffix only.
-        assert f"{kind} worker '{key}' exited unexpectedly; respawning" in caplog.text
+        # The supervisor names the worker it respawned; the three kinds share the suffix only. The
+        # supervisor is the dead task's done-callback, which the loop runs on a LATER pass than the
+        # one that finished the task, and _until can return on that same pass, so wait for its line
+        # rather than read it at once (engine PR 2815, Lander hold 6705921002).
+        respawned = f"{kind} worker '{key}' exited unexpectedly; respawning"
+        await _until(lambda: respawned in caplog.text, timeout=5.0)
 
         control_id = f"M1614{kind[:3]}"
         if not respawn:
