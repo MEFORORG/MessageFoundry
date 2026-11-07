@@ -1092,8 +1092,8 @@ def test_no_depth_near_the_recursion_limit_leaves_the_judged_error_on_a_chain(
                 results.append(escaped)
     finally:
         sys.setrecursionlimit(old_limit)
-    assert any(isinstance(e, KeyProviderError | StoreCipherConfigError) for e in results)
     assert len(results) > 0, "no depth produced an escaping error, so the leak check sees nothing"
+    assert any(isinstance(e, KeyProviderError | StoreCipherConfigError) for e in results)
     leaks = [e for e in results if any(link is error for link in _links(e))]
     assert not leaks, [[type(link).__name__ for link in _links(e)] for e in leaks]
 
