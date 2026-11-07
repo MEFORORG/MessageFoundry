@@ -45,6 +45,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.config.secretprovider import SecretProviderError
 from messagefoundry.config.settings import AlertsSettings, AuthSettings
 from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
+from messagefoundry.store import base as store_base
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import (
     LOGIN_ADDRESS_RESET_MARKER,
@@ -1162,7 +1163,8 @@ def test_a_key_provider_that_cannot_resolve_is_refused_before_the_prompt(
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc == 2, error
     # The Vault refusal itself, with this command's line after it, not the dispatch floor's report.
-    assert "MEFOR_STORE_VAULT_TRANSIT_KEY" in error, error
+    # A fixed text since the eighth hold on engine PR 2818.
+    assert store_base._KEY_SOURCE in error, error
     assert error.endswith("Refusing to provision; nothing was written"), error
     assert db.exists() is (store == "existing"), "a refused fresh provision left a store behind"
 

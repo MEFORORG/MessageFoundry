@@ -610,7 +610,10 @@ def test_a_key_that_does_not_resolve_exits_2(
     captured = capsys.readouterr()
     assert rc == 2, (captured.out, captured.err)
     text = _refusal_text(command, captured.out, captured.err)
-    assert "MEFOR_STORE_TRANSIT_KEY" in text, text
+    from messagefoundry.store import base as store_base
+
+    # A fixed text since the eighth hold on engine PR 2818.
+    assert store_base._KEY_SOURCE in text, text
 
 
 @pytest.mark.parametrize("command", [*_KEY_REFUSING_COMMANDS, "admin-reset-totp", "rotate-key"])

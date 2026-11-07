@@ -27,6 +27,7 @@ All key bytes, hosts and tokens here are synthetic. Severity is conditional (CLA
 
 from __future__ import annotations
 
+import logging
 import re
 import sys
 import traceback
@@ -152,17 +153,17 @@ def test_build_store_cipher_renders_a_codec_error_without_its_bytes(
     assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
-def test_any_other_build_error_keeps_its_chain_under_a_fixed_text(
+def test_any_other_build_error_gets_the_fixed_text_and_no_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The control: a ValueError that holds no codec error keeps its chain. One no engine ``raise``
-    worded, as here, gets a fixed text since the sixth hold on engine PR 2818."""
+    """A ValueError that holds no codec error gets the fixed text, and since the eighth hold on
+    engine PR 2818 no chain: nothing is passed through."""
     error = ValueError("[store].synthetic_setting is not valid")
     _with_provider(monkeypatch, error)
     with pytest.raises(StoreCipherConfigError) as caught:
         build_store_cipher(StoreSettings())
-    assert str(caught.value) == store_base._UNTEXTED
-    assert caught.value.__cause__ is error
+    assert str(caught.value) == store_base._KEY_SEAM_TEXTS[3]
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
 
 
 def test_a_key_with_a_character_that_is_not_ascii_leaves_no_codec_error_on_the_chain(
@@ -196,7 +197,7 @@ def test_the_four_commands_print_no_byte_of_the_key(
     captured = capsys.readouterr()
     _assert_no_key_byte(captured.out + captured.err)
     assert rc == 2, (captured.out, captured.err)
-    assert "not ASCII" in captured.out + captured.err
+    assert "[store].encryption_key_file" in captured.out + captured.err  # the site's fixed text
 
 
 # --- item 3: a key arm on backup, restore-verify and restore -----------------------------------
@@ -547,15 +548,18 @@ def test_a_runtime_error_that_chains_a_codec_error_prints_no_byte(
     assert kind.__name__ not in str(caught.value), str(caught.value)  # no class name (seventh hold)
 
 
-def test_a_runtime_error_with_no_codec_error_passes_through(
+def test_a_runtime_error_with_no_codec_error_is_replaced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The control: the same object, untouched."""
+    """Since the eighth hold on engine PR 2818 nothing passes through: a new KeyProviderError with
+    the site's fixed text, and no chain."""
     own = KeyProviderError("synthetic: the provider's own refusal")
     _with_provider(monkeypatch, own)
     with pytest.raises(KeyProviderError) as caught:
         build_store_cipher(StoreSettings())
-    assert caught.value is own
+    assert caught.value is not own
+    assert str(caught.value) == store_base._BUILD_TEXTS[4]
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
 
 
 def test_a_holder_of_another_class_reads_as_the_fixed_text(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1185,18 +1189,23 @@ def _host_fault_from_a_codec_error() -> _HostFault:
     ],
     ids=["oserror-and-valueerror", "insecure-hop-refused", "host-fault-with-a-codec-error"],
 )
-def test_the_postgres_tls_wrap_passes_a_real_host_fault_or_hop_refusal_through(
+def test_the_postgres_tls_wrap_replaces_a_host_fault_or_hop_refusal_by_class(
     make: Callable[[], ValueError], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The control for the class test above: an error whose real type is one of the two leaves
-    as itself, untyped, as the docstring says, a codec error on its chain included."""
+    """The control for the class test above: an error whose real type is one of the two is
+    replaced by a new one of that kind with a fixed text and no chain (the eighth hold on engine
+    PR 2818), a codec error on its chain included."""
     from messagefoundry.store import postgres
 
     error = make()
     monkeypatch.setattr(postgres, "_verifying_context", _raising(error))
     with pytest.raises(ValueError) as caught:
         postgres._verifying_context_at_open(StoreSettings())
-    assert caught.value is error
+    assert caught.value is not error
+    assert isinstance(caught.value, InsecureHopRefused) == isinstance(error, InsecureHopRefused)
+    assert isinstance(caught.value, OSError) == isinstance(error, OSError)
+    _assert_no_key_byte(_whole(caught.value))
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
 
 
 class _ClassSaysTyped(ValueError):
@@ -1220,8 +1229,8 @@ def test_the_cipher_build_tests_the_class_with_type(monkeypatch: pytest.MonkeyPa
     else:
         escaped = AssertionError("nothing was raised")
     assert type(escaped) is StoreCipherConfigError, repr(escaped)
-    assert str(escaped) == store_base._UNTEXTED
-    assert escaped.__cause__ is error
+    assert str(escaped) == store_base._KEY_SEAM_TEXTS[3]
+    assert escaped.__cause__ is None and escaped.__suppress_context__
 
 
 # --- the fifth hold on engine PR 2818: the text is read without running the error's own code ----
@@ -1272,7 +1281,7 @@ def test_the_cipher_build_reads_the_text_without_the_errors_str(
     _with_provider(monkeypatch, kind(_SETTING_TEXT))
     escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
     assert type(escaped) is StoreCipherConfigError, type(escaped)
-    assert str(escaped) == store_base._UNTEXTED
+    assert str(escaped) == store_base._KEY_SEAM_TEXTS[3]
 
 
 @pytest.mark.parametrize("args", [(), (_SETTING_TEXT, "second"), (42,)], ids=["none", "two", "int"])
@@ -1355,8 +1364,8 @@ def test_the_cipher_build_reads_no_argument_of_the_error(monkeypatch: pytest.Mon
     escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
     assert type(escaped) is StoreCipherConfigError, type(escaped)
     _assert_no_key_byte(str(escaped))
-    assert str(escaped) == store_base._UNTEXTED
-    assert escaped.__cause__ is error
+    assert str(escaped) == store_base._KEY_SEAM_TEXTS[3]
+    assert escaped.__cause__ is None and escaped.__suppress_context__
 
 
 def test_the_ad_probe_reads_no_argument_of_the_guard_refusal(
@@ -1397,7 +1406,7 @@ def test_the_postgres_tls_wrap_reads_no_text_of_the_error(
     _assert_no_key_byte(text)
     assert _SETTING_TEXT not in text, text
     assert "[store].ssl_root_cert" in text and "text is not shown" in text, text
-    assert escaped.__cause__ is error
+    assert escaped.__cause__ is None and escaped.__suppress_context__
 
 
 class _ClassChangesOnRereading(ValueError):
@@ -1477,8 +1486,8 @@ def test_the_cipher_build_gives_an_engine_subclass_the_fixed_text(
     )
     escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
     assert type(escaped) is StoreCipherConfigError, type(escaped)
-    assert str(escaped) == store_base._UNTEXTED, str(escaped)
-    assert "names an unknown scheme" in str(escaped.__cause__)
+    assert str(escaped) == store_base._KEY_SEAM_TEXTS[3], str(escaped)
+    assert escaped.__cause__ is None and escaped.__suppress_context__
 
 
 def test_the_postgres_tls_wrap_gives_the_fixed_text(tmp_path: Path) -> None:
@@ -1501,7 +1510,7 @@ def test_the_postgres_tls_wrap_gives_the_fixed_text(tmp_path: Path) -> None:
     escaped = _escaping(lambda: postgres._verifying_context_at_open(settings))
     assert type(escaped) is StoreTlsRefused, type(escaped)
     assert str(escaped) == postgres._TLS_REFUSED, str(escaped)
-    assert "could not be read" in str(escaped.__cause__)
+    assert escaped.__cause__ is None and escaped.__suppress_context__
 
 
 def test_a_log_call_that_fails_does_not_replace_the_refusal(
@@ -1572,15 +1581,18 @@ def test_a_refusal_subclass_with_its_own_str_is_not_passed_bare(
     _with_provider(monkeypatch, error)
     escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
     assert type(escaped) is StoreCipherConfigError, type(escaped)
-    assert str(escaped) == store_base._UNTEXTED
-    assert escaped.__cause__ is error
+    assert str(escaped) == store_base._KEY_SEAM_TEXTS[3]
+    assert escaped.__cause__ is None and escaped.__suppress_context__
 
 
-def test_an_exact_refusal_passes_as_it_is(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The control for attack 2: one exactly of the refusal type is not wrapped again."""
+def test_an_exact_refusal_is_replaced_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The eighth hold: even one exactly of the refusal type is replaced, since its arguments
+    could have been reassigned after it was built."""
     error = StoreCipherConfigError("synthetic: already typed")
     _with_provider(monkeypatch, error)
-    assert _escaping(lambda: build_store_cipher(StoreSettings())) is error
+    escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
+    assert escaped is not error and type(escaped) is StoreCipherConfigError
+    assert str(escaped) == store_base._KEY_SEAM_TEXTS[3]
 
 
 class _RewritingCall(type):
@@ -1610,11 +1622,9 @@ def test_arguments_rewritten_by_a_metaclass_call_are_not_read(
     )
     escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
     assert type(escaped) is StoreCipherConfigError, type(escaped)
-    assert str(escaped) == store_base._UNTEXTED
+    assert str(escaped) == store_base._KEY_SEAM_TEXTS[3]
     _assert_no_key_byte(str(escaped))
-    # The positive control: the engine raised the rewriting class, and its arguments hold the byte.
-    assert type(escaped.__cause__) is _RewrittenScheme, type(escaped.__cause__)
-    assert any(s in str(escaped.__cause__) for s in _BYTE_SPELLINGS), str(escaped.__cause__)
+    assert escaped.__cause__ is None and escaped.__suppress_context__
 
 
 def test_a_failed_log_call_is_logged_with_fixed_text(
@@ -1652,3 +1662,125 @@ def test_a_broken_logger_does_not_replace_the_refusal(monkeypatch: pytest.Monkey
     assert len(fired) == 2, fired  # the control: the WARNING and the fallback ERROR both failed
     assert type(escaped) is StoreCipherConfigError, type(escaped)
     assert escaped.__cause__ is None and escaped.__context__ is None
+
+
+# --- the eighth hold on engine PR 2818: nothing is passed through -----------------------------
+
+
+def _reassigned(kind: type[Exception]) -> Exception:
+    """A ``kind`` whose arguments were reassigned to quote a codec error after it was built."""
+    error = kind("synthetic: built clean")
+    error.args = (f"synthetic: reassigned {_decode_error()}",)
+    return error
+
+
+@pytest.mark.parametrize(
+    "entry", ["build_store_cipher", "resolve_active_key", "resolve_decrypt_keys"]
+)
+@pytest.mark.parametrize(
+    "kind", [StoreCipherConfigError, KeyProviderError, DpapiError, InsecureHopRefused]
+)
+def test_reassigned_arguments_are_not_passed_through(
+    entry: str, kind: type[Exception], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 1 of the eighth hold: an error of the refusal type itself, with its ``args``
+    reassigned, passed through as it was and printed the byte."""
+    error = _reassigned(kind)
+    assert any(b in str(error) for b in _BYTE_SPELLINGS), "the fixture holds none"
+    _with_provider(monkeypatch, error)
+    escaped = _escaping(lambda: getattr(store_base, entry)(StoreSettings()))
+    assert escaped is not error
+    assert isinstance(escaped, kind if kind is not StoreCipherConfigError else ValueError)
+    _assert_no_key_byte(_whole(escaped))
+    assert escaped.__cause__ is None and escaped.__suppress_context__
+
+
+def test_an_engine_refusal_keeps_its_recorded_text_not_its_reassigned_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The key seam's own codec refusal reaches the cipher build as it was recorded, even when the
+    arguments of the instance were reassigned on the way."""
+    original = store_base._refused(ValueError, "synthetic: the recorded refusal")
+    original.args = (f"synthetic: reassigned {_decode_error()}",)
+    _with_provider(monkeypatch, original)
+    escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
+    assert type(escaped) is StoreCipherConfigError, type(escaped)
+    assert str(escaped) == "synthetic: the recorded refusal"
+
+
+class _KeyStrSaysTheByte(KeyProviderError):
+    def __str__(self) -> str:
+        return f"synthetic: {_decode_error()}"
+
+
+def test_a_byte_printing_key_error_is_not_printed_by_rotate_key(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Item 1 of the eighth hold, at the key seam: ``rotate-key`` resolves the key itself, and a
+    provider's ``KeyProviderError`` subclass passed through and printed its own ``__str__``."""
+    db = shell / "keyed.db"
+    key = generate_key()
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    _with_provider(monkeypatch, _KeyStrSaysTheByte("synthetic"))
+    rc = main(_argv("rotate-key", db, shell))
+    captured = capsys.readouterr()
+    _assert_no_key_byte(captured.out + captured.err)
+    assert rc == 2, (captured.out, captured.err)
+
+
+class _HopStrPrintsTheByte(InsecureHopRefused):
+    def __str__(self) -> str:
+        return f"synthetic hop: {_decode_error()}"
+
+
+class _HostFaultPrintsTheByte(OSError, ValueError):
+    def __str__(self) -> str:
+        return f"synthetic host fault: {_decode_error()}"
+
+
+@pytest.mark.parametrize("kind", [_HopStrPrintsTheByte, _HostFaultPrintsTheByte])
+def test_the_postgres_tls_wrap_passes_no_hop_or_host_fault_subclass(
+    kind: type[ValueError], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 1 of the eighth hold, at the PostgreSQL hop: a hop refusal or a host fault passed
+    through as it was, so a subclass's own ``__str__`` printed the byte."""
+    from messagefoundry.store import postgres
+
+    error = kind("synthetic")
+    monkeypatch.setattr(postgres, "_verifying_context", _raising(error))
+    escaped = _escaping(lambda: postgres._verifying_context_at_open(StoreSettings()))
+    assert escaped is not error
+    _assert_no_key_byte(_whole(escaped))
+    assert escaped.__cause__ is None and escaped.__suppress_context__
+
+
+class _RaisingHandler(logging.Handler):
+    """A handler whose ``emit`` fails as the standard ones do: it reports through ``handleError``,
+    which prints the exception being handled, and with it every error that one is chained to."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            raise RuntimeError("synthetic: the handler failed")
+        except RuntimeError:
+            self.handleError(record)
+
+
+def test_a_failing_log_handler_prints_no_judged_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Item 2 of the eighth hold: the WARNING was logged while the judged error was being handled,
+    so a handler whose ``emit`` failed printed it, byte included, as the context of its own
+    error."""
+    handler = _RaisingHandler()
+    store_base.log.addHandler(handler)
+    monkeypatch.setattr(logging, "raiseExceptions", True)
+    try:
+        _with_provider(monkeypatch, _UnreadableReason(f"synthetic: {_decode_error()}"))
+        escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
+    finally:
+        store_base.log.removeHandler(handler)
+    assert type(escaped) is StoreCipherConfigError, type(escaped)
+    printed = capsys.readouterr().err
+    assert "synthetic: the handler failed" in printed  # the control: the handler did fail
+    _assert_no_key_byte(printed)

@@ -270,10 +270,10 @@ def test_default_cipher_provider_is_unchanged() -> None:
 def test_unknown_cipher_provider_fails_closed() -> None:
     with pytest.raises(ValueError) as caught:
         build_store_cipher(StoreSettings(cipher_provider="nope"))
-    # The refusal's text is fixed and names the setting (engine PR 2818's seventh hold); the
-    # build's own text is its cause.
+    # The refusal's text is fixed and names the setting (engine PR 2818's seventh hold), and since
+    # the eighth hold it is raised from None: the build's own text is not kept as its cause.
     assert "check [store].cipher_provider" in str(caught.value)
-    assert "not a known cipher provider" in str(caught.value.__cause__)
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
 
 
 # --- fail-closed build paths ----------------------------------------------------------------------

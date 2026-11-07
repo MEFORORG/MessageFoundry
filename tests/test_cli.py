@@ -806,7 +806,9 @@ def test_rotate_key_unbuilt_provider_fails_closed(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "aws_kms")
     assert main(["rotate-key", "--db", str(tmp_path / "any.db")]) == 2
-    assert "aws_kms" in capsys.readouterr().err  # the message names the offending provider
+    # The key resolution refuses with a fixed text since the eighth hold on engine PR 2818: it names
+    # the setting to check, not the provider's own message.
+    assert "check [store].key_provider" in capsys.readouterr().err
 
 
 def test_serve_refuses_without_key_when_require_encryption(

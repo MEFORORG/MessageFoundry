@@ -437,10 +437,11 @@ def test_postgres_pinned_ca_context_asserts(every_suite_looks_weak: None, tmp_pa
 
     cert, _key = _self_signed(tmp_path)
     settings = _pg_settings(ssl_root_cert=str(cert))
-    # The open's refusal text is fixed (engine PR 2818's seventh hold); the assertion is its cause.
+    # The open's refusal text is fixed (engine PR 2818's seventh hold) and raised from None (the
+    # eighth hold), so the assertion's own text is not kept as its cause.
     with pytest.raises(ValueError, match="suites must narrow to the approved list") as caught:
         postgres._build_ssl(settings)
-    assert "Postgres store (pinned CA)" in str(caught.value.__cause__)
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
 
 
 def test_postgres_trust_server_certificate_context_asserts(
@@ -462,10 +463,11 @@ def test_postgres_default_arm_context_asserts(every_suite_looks_weak: None) -> N
     object existed in engine code for the assertion to run against. The engine builds it now, so the
     arm is asserted like its two siblings."""
 
-    # The open's refusal text is fixed (engine PR 2818's seventh hold); the assertion is its cause.
+    # The open's refusal text is fixed (engine PR 2818's seventh hold) and raised from None (the
+    # eighth hold), so the assertion's own text is not kept as its cause.
     with pytest.raises(ValueError, match="suites must narrow to the approved list") as caught:
         postgres._build_ssl(_pg_settings())
-    assert "Postgres store (system trust)" in str(caught.value.__cause__)
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
 
 
 # --- the AD LDAPS bind: auth/ldap.py --------------------------------------------------------------

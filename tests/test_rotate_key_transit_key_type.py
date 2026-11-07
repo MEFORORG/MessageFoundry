@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.__main__ import main
+from messagefoundry.store import base as store_base
 from messagefoundry.store import crypto_transit
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
@@ -83,7 +84,8 @@ def test_rotate_key_on_a_refused_transit_key_type_exits_2_without_a_traceback(
     assert main(["rotate-key", "--db", str(db)]) == 2
     captured = capsys.readouterr()
     assert transit.read_calls == ["mefor-store"], "the check under test never ran"
-    assert "'aes128-gcm96'" in captured.err, captured.err
-    assert "no command moves Transit ciphertext" in captured.err, captured.err
+    # The cipher build refuses with a fixed text since the eighth hold on engine PR 2818, so the
+    # key type and the provider's advice are not shown.
+    assert store_base._KEY_SOURCE in captured.err, captured.err
     assert "Traceback" not in captured.err, captured.err
     assert "OK:" not in captured.out, captured.out

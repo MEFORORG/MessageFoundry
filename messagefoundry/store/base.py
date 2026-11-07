@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+import weakref
 from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache, partial
@@ -38,9 +40,14 @@ from messagefoundry.config.settings import (
     StoreBackend,
     StoreSettings,
 )
-from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    InsecureHopRefused,
+    is_vault_hop_refusal,
+)
 from messagefoundry.exception_origin import exception_chain
 from messagefoundry.redaction import prints_a_codec_error
+from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT,
@@ -3357,8 +3364,10 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
     fixed text, no byte and no chain (BACKLOG #4882), as by :func:`build_store_cipher`: one that is
     a codec error, holds one, or has one on a link :func:`_codec_error_on` reaches; one whose chain
     cannot be read whole, whether or not it holds a codec error; and one whose judgement raised an
-    ``Exception``, whose text names no class. Any other provider error passes through untouched.
-    Either way, a ``BaseException`` that is not an ``Exception``, such as a ``KeyboardInterrupt``,
+    ``Exception``, whose text names no class. Any other provider error is replaced by a new one
+    from :func:`_fresh_refusal`, with a fixed text chosen by its class and no chain: none is passed
+    through (the eighth hold on engine PR 2818). Either way, a ``BaseException`` that is not an
+    ``Exception``, such as a ``KeyboardInterrupt``,
     raised by the judgement's own code, and anything the fallback refusal itself raises, such as
     a ``RecursionError``, propagate in place of the refusal or the error, with no cause and no
     context. This covers at least the callers that resolve the key without
@@ -3367,12 +3376,15 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
     try:
         key = resolve_key_provider(settings, posture=posture).active_key()
     except Exception as exc:
-        refusal = _codec_safe_refusal(exc)
-        if refusal is None:
-            raise
+        caught, refusal = exc, _codec_safe_refusal(exc)
     else:
         return _checked_active_key(key, settings)
-    raise refusal
+    # Outside the handler, so nothing raised here, at the recursion limit included, has the
+    # caught error as its context.
+    if refusal is None:
+        refusal = _fresh_refusal(caught, _KEY_SEAM_TEXTS)
+    _flush_unjudged()
+    raise refusal from None
 
 
 def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
@@ -3413,7 +3425,7 @@ def resolve_decrypt_keys(
     The three refusals there apply here too, and here also to the key check (BACKLOG #4882): an
     error from the provider or the key check that has a codec error on it, whose chain cannot be
     read whole whether or not it holds one, or whose judgement raised an ``Exception``, is raised
-    as :func:`_codec_safe_refusal` gives it. Any other passes through untouched. Either way, a
+    as :func:`_codec_safe_refusal` gives it. Any other is replaced as there. Either way, a
     ``BaseException`` that is not an ``Exception``, raised by the judgement's own code, and
     anything the fallback refusal itself raises propagate in place of the refusal or the error,
     with no cause and no context."""
@@ -3423,12 +3435,15 @@ def resolve_decrypt_keys(
         # Copied here, so a provider whose sequence reads as it is iterated is refused here too.
         retired_keys = list(provider.retired_keys())
     except Exception as exc:
-        refusal = _codec_safe_refusal(exc)
-        if refusal is None:
-            raise
+        caught, refusal = exc, _codec_safe_refusal(exc)
     else:
         return _keyring(active, retired_keys)
-    raise refusal
+    # Outside the handler, so nothing raised here, at the recursion limit included, has the
+    # caught error as its context.
+    if refusal is None:
+        refusal = _fresh_refusal(caught, _KEY_SEAM_TEXTS)
+    _flush_unjudged()
+    raise refusal from None
 
 
 def _keyring(active: str | None, retired_keys: Sequence[str]) -> list[str]:
@@ -3472,24 +3487,82 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     text would put key material in the refusal and in any traceback of it. An error from the build
     of any class with a codec error on it is raised as :func:`_codec_safe_refusal` gives it, with
     no byte and no chain, and so is one whose chain cannot be read whole or whose judgement raised
-    an ``Exception``. Every other ``ValueError`` keeps its chain under the fixed text
-    :data:`_UNTEXTED`, which reads nothing from the error (the seventh hold on engine PR 2818),
-    except one that is exactly a :class:`StoreCipherConfigError`, already typed, which passes as it
-    is. Every other error, such as a ``KeyProviderError`` or ``DpapiError``, passes through
-    untouched."""
+    an ``Exception``. Every other error is replaced by a new one from :func:`_fresh_refusal`, with
+    no chain: a ``ValueError`` as :class:`StoreCipherConfigError` with :data:`_UNTEXTED`, and
+    another class with a fixed text chosen by its class. A refusal the engine built itself keeps
+    the text the engine recorded for it, never read from the instance. Nothing is passed through,
+    and nothing is read from the error (the seventh and eighth holds on engine PR 2818)."""
     try:
         return _build_store_cipher(settings, posture)
     except Exception as exc:
-        refusal = _codec_safe_refusal(exc)
-        if refusal is None:
-            # One already typed, as the key seam refuses a codec error, is not wrapped again, but
-            # only when it is exactly that type: a subclass's own ``__str__`` could print a byte
-            # (the seventh hold on engine PR 2818). The text is fixed and reads nothing from exc.
-            kind = type(exc)
-            if issubclass(kind, ValueError) and kind is not StoreCipherConfigError:
-                raise StoreCipherConfigError(_UNTEXTED) from exc
-            raise
-    raise refusal
+        caught, refusal = exc, _codec_safe_refusal(exc)
+    if refusal is None:
+        refusal = _fresh_refusal(caught, _BUILD_TEXTS)
+    # Outside the handler, so nothing raised here, at the recursion limit included, has the
+    # caught error as its context.
+    if refusal is None:
+        refusal = _fresh_refusal(caught, _KEY_SEAM_TEXTS)
+    _flush_unjudged()
+    raise refusal from None
+
+
+#: The fixed texts :func:`_fresh_refusal` chooses from, by the replaced error's class: a hop
+#: refusal, a DPAPI error, DPAPI unavailable, a ``ValueError``, and any other class.
+_SiteTexts = tuple[str, str, str, str, str]
+
+
+def _fresh_refusal(exc: Exception, texts: _SiteTexts) -> Exception:
+    """A new refusal in ``exc``'s place, for a site where :func:`_codec_safe_refusal` gave none,
+    of the class its callers expect, chosen by ``exc``'s class as read with ``type``: an
+    ``InsecureHopRefused``, a ``DpapiError``, a ``DpapiUnavailable``, a
+    :class:`StoreCipherConfigError` for any other ``ValueError``, else a ``KeyProviderError``. Its
+    text is the matching one of the site's ``texts``, or, for a refusal the engine built itself
+    (:func:`_recorded_text`), the text recorded when it was built. Nothing is read from ``exc``:
+    not its text, its arguments or its class name (the eighth hold on engine PR 2818).
+
+    One more text is chosen by exact type, :data:`_VAULT_HOP_TEXT`: where ``exc`` or its cause,
+    read through ``BaseException``'s own descriptor, is exactly the Vault hop's marked refusal
+    (:func:`~messagefoundry.config.tls_policy.is_vault_hop_refusal`), so a Vault hop the engine
+    refused still names its levers and stays apart from one that crossed and failed later."""
+    kind = type(exc)
+    recorded = _recorded_text(exc)
+    hop, dpapi, unavailable, value, other = texts
+    if is_vault_hop_refusal(exc) or is_vault_hop_refusal(_CAUSE.__get__(exc)):
+        hop = value = other = _VAULT_HOP_TEXT
+    made: type[Exception]
+    if issubclass(kind, InsecureHopRefused):
+        made, text = InsecureHopRefused, hop
+    elif issubclass(kind, DpapiError):
+        made, text = DpapiError, dpapi
+    elif issubclass(kind, DpapiUnavailable):
+        made, text = DpapiUnavailable, unavailable
+    elif issubclass(kind, ValueError):
+        made, text = StoreCipherConfigError, value
+    else:
+        made, text = KeyProviderError, other
+    text = recorded or text
+    return _recorded(made(text), text)
+
+
+#: Each refusal the engine built here, by ``id``, with the text it was built with. Keyed by
+#: identity and checked by identity, so an error cannot claim an entry through its own ``__eq__``
+#: or ``__hash__``; an entry leaves when its refusal is collected.
+_BUILT: dict[int, tuple[weakref.ref[Exception], str]] = {}
+
+
+def _recorded(refusal: Exception, text: str) -> Exception:
+    """``refusal``, recorded as built by the engine with ``text``."""
+    key = id(refusal)
+    _BUILT[key] = (weakref.ref(refusal, lambda _gone: _BUILT.pop(key, None)), text)
+    return refusal
+
+
+def _recorded_text(exc: BaseException) -> str | None:
+    """The text the engine built ``exc`` with, when ``exc`` is itself one of its refusals, else
+    ``None``. The instance's own ``args`` are never read: code that caught the refusal could have
+    reassigned them."""
+    entry = _BUILT.get(id(exc))
+    return entry[1] if entry is not None and entry[0]() is exc else None
 
 
 def _codec_safe_refusal(exc: Exception) -> Exception | None:
@@ -3572,6 +3645,33 @@ _KEY_SOURCE = (
 #: The fallback refusal's text. Like every refusal text here it reads nothing from the error.
 _UNJUDGED = f"{_KEY_SOURCE}: an error that could not be judged, its class and text not shown"
 
+#: :func:`_fresh_refusal`'s text, at both sites, for the Vault hop's marked refusal. It names the
+#: store's own levers and reads nothing from the refusal.
+_VAULT_HOP_TEXT = (
+    f"{_KEY_SOURCE}: the store's Vault hop was refused by the engine's own hop checks, its text "
+    "not shown; check MEFOR_STORE_VAULT_ADDR and any proxy variable, and, for an off-box Vault "
+    "whose certificate revocation is covered outside the engine, set "
+    "[store].vault_revocation_attested = true with a [store].vault_revocation_attested_reason"
+)
+
+#: :func:`_fresh_refusal`'s texts at the key seam (``resolve_active_key``, ``resolve_decrypt_keys``).
+_KEY_SEAM_TEXTS: _SiteTexts = (
+    f"{_KEY_SOURCE}: the hop to the key source was refused, its text not shown; check the key "
+    "provider's address, its TLS settings and the instance posture",
+    f"{_KEY_SOURCE}: the protected store key file ([store].encryption_key_file) could not be "
+    "read as a key, its text not shown; check that it was protected for this account and holds "
+    "an ASCII base64 key",
+    f"{_KEY_SOURCE}: DPAPI is not available on this platform; use another key source",
+    f"{_KEY_SOURCE}: a key was refused, its text not shown; every store key must be valid base64 "
+    "of 32 bytes (generate one with `messagefoundry gen-key`)",
+    f"{_KEY_SOURCE}: the key source failed, its text not shown; check [store].key_provider and "
+    "its settings",
+)
+
+#: :func:`_fresh_refusal`'s texts at ``build_store_cipher``: the key seam's, with
+#: :data:`_UNTEXTED` for a ``ValueError``.
+_BUILD_TEXTS: _SiteTexts = (*_KEY_SEAM_TEXTS[:3], _UNTEXTED, _KEY_SEAM_TEXTS[4])
+
 #: The log line when the log call for a fail-closed judgement itself failed. It has no argument.
 _LOG_FAILED = "store: a codec judgement failed closed, and its log line could not be written"
 
@@ -3579,16 +3679,38 @@ _LOG_FAILED = "store: a codec judgement failed closed, and its log line could no
 _NAME_OF_A_TYPE: Any = vars(type)["__name__"]
 
 
+#: Log lines :func:`_log_unjudged` holds until a site has left its handler, per thread.
+_UNLOGGED = threading.local()
+
+
 def _log_unjudged(what: str, swallowed: type[BaseException]) -> None:
-    """Log the class of an error the codec judgement caught to fail closed (CLAUDE.md section 6),
-    by its name alone: never its text, nor the judged error's, either of which may quote the byte.
-    A name that is not an ASCII identifier is not printed, as one a class built from data could
-    carry it. Called once the handler is left. If that log call fails, :data:`_LOG_FAILED` is
-    logged as an ERROR instead, with no argument, so the failure is not silent. If that fails too,
-    the logger itself is broken and nothing is left to report with; it is not raised, so the
-    refusal is not replaced, and the refusal is then the only record."""
+    """Hold a log line for the class of an error the codec judgement caught to fail closed
+    (CLAUDE.md section 6), by its name alone: never its text, nor the judged error's, either of
+    which may quote the byte. A name that is not an ASCII identifier is not printed, as one a class
+    built from data could carry it. The line is written by :func:`_flush_unjudged`, which each site
+    calls once it has left its ``except`` block, so no log call runs while the judged error is
+    being handled: a handler that fails would print it as the context of its own error (the eighth
+    hold on engine PR 2818)."""
     name = _NAME_OF_A_TYPE.__get__(swallowed)
     shown = name if type(name) is str and name.isascii() and name.isidentifier() else "unnamed"
+    held: list[tuple[str, str]] = getattr(_UNLOGGED, "lines", [])
+    held.append((what, shown))
+    _UNLOGGED.lines = held
+
+
+def _flush_unjudged() -> None:
+    """Write the lines :func:`_log_unjudged` held, as WARNINGs with no ``exc_info``. If a log call
+    fails, :data:`_LOG_FAILED` is logged as an ERROR instead, with no argument, so the failure is
+    not silent. If that fails too, the logger itself is broken and nothing is left to report with;
+    it is not raised, so the refusal is not replaced, and the refusal is then the only record."""
+    held: list[tuple[str, str]] = getattr(_UNLOGGED, "lines", [])
+    _UNLOGGED.lines = []
+    for what, shown in held:
+        _write_unjudged(what, shown)
+
+
+def _write_unjudged(what: str, shown: str) -> None:
+    """One held line, as :func:`_flush_unjudged` says."""
     try:
         log.warning("%s (%s); refused with a fixed text", what, shown)
     except Exception:  # noqa: BLE001 -- the log call is what failed; say so with fixed text
@@ -3629,7 +3751,8 @@ def _refused(kind: type[Exception], text: str) -> Exception:
     """``text`` as :class:`StoreCipherConfigError` for a ``ValueError`` ``kind``, else as
     ``KeyProviderError``. ``kind`` is the judged error's class as read with ``type``, which runs none
     of its code."""
-    return StoreCipherConfigError(text) if issubclass(kind, ValueError) else KeyProviderError(text)
+    made = StoreCipherConfigError if issubclass(kind, ValueError) else KeyProviderError
+    return _recorded(made(text), text)
 
 
 def _codec_error_on(exc: BaseException) -> tuple[BaseException | None, bool]:
@@ -3677,12 +3800,11 @@ def _codec_chain_reading(exc: BaseException) -> str | None:
 
 class StoreCipherConfigError(ValueError):
     """The store cipher could not be built from the settings; see :func:`build_store_cipher`. A
-    ``ValueError`` from the build is raised as one with the error as its cause and the fixed text
-    :data:`_UNTEXTED` (the seventh hold on engine PR 2818); except for
-    three kinds, which are refused with :func:`_codec_safe_refusal`'s fixed text and no chain
-    instead (BACKLOG #3471, #4882): one with a codec error on it, one whose chain cannot be read
-    whole, whether or not it holds a codec error, and one whose judgement raised an
-    ``Exception``."""
+    ``ValueError`` from the build is replaced by a new one with a fixed text and no chain (the
+    eighth hold on engine PR 2818): :data:`_UNTEXTED`, or the text the key resolution recorded for
+    its own refusal. Three kinds get :func:`_codec_safe_refusal`'s fixed text instead (BACKLOG
+    #3471, #4882): one with a codec error on it, one whose chain cannot be read whole, whether or
+    not it holds a codec error, and one whose judgement raised an ``Exception``."""
 
 
 def _build_store_cipher(settings: StoreSettings, posture: HopPosture | None) -> Cipher:

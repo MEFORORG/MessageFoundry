@@ -2124,12 +2124,12 @@ class StoreTlsRefused(InsecureHopRefused):
     that caught it as one.
 
     Its text names at least the setting, and reads no value from the server. The SQL Server and
-    weakened-hop texts are the engine's own. The PostgreSQL wrap carries a fixed text naming the
-    settings in place of the context builder's ``ValueError`` text, and keeps that error as the
-    cause, whose text can quote the ``ssl`` or ``cryptography`` library's message and what was read
-    from the operator's pin or CRL file, such as its dates. Where that ``ValueError`` is, holds or
-    was raised from a codec error, the wrap keeps no chain, so the byte it met is not quoted (the
-    PostgreSQL store's ``_verifying_context_at_open``). Print it through ``codec_safe_str``, as
+    weakened-hop texts are the engine's own. The PostgreSQL wrap raises a new refusal with a fixed
+    text naming the settings in place of the context builder's error, from ``None``, so it keeps
+    no chain and a traceback does not print that error's text, which can quote the ``ssl`` or
+    ``cryptography`` library's message, what was read from the operator's pin or CRL file, or a
+    byte a codec error met (the eighth hold on engine PR 2818; the PostgreSQL store's
+    ``_verifying_context_at_open``). Print it through ``codec_safe_str``, as
     ``_open_store_or_refuse`` in the CLI does."""
 
 

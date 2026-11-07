@@ -191,7 +191,10 @@ _FAIL_CLOSED = (SecretProviderError, KeyProviderError)
 def _assert_refused(caught: pytest.ExceptionInfo[Exception], entry: EntryPoint) -> None:
     """The provider raised its own fail-closed type, caused by the marked refusal, with the
     refusal's fixed text kept whole. The text names this hop's settings pair and no other lever,
-    and no part of the address or the proxy."""
+    and no part of the address or the proxy. At the store's key resolution and cipher build the
+    refusal is a new one with the store's fixed Vault hop text and no chain (the eighth hold on
+    engine PR 2818), chosen because its cause is exactly the marked refusal."""
+    from messagefoundry.store import base as store_base
     from messagefoundry.transports import strict_requests
 
     own, connector, section = _HOPS[entry]
@@ -200,9 +203,13 @@ def _assert_refused(caught: pytest.ExceptionInfo[Exception], entry: EntryPoint) 
         "secrets": strict_requests._SECRETS_REVOCATION_LEVER,
     }[section]
     assert type(caught.value) is own
-    assert type(caught.value.__cause__) is strict_requests.VaultHopRefused
     text = str(caught.value)
-    assert text == f"{connector}: {strict_requests._UNREVOKED_VAULT_HOP} {lever}"
+    if section == "store":
+        assert caught.value.__cause__ is None and caught.value.__suppress_context__
+        assert text == store_base._VAULT_HOP_TEXT
+    else:
+        assert type(caught.value.__cause__) is strict_requests.VaultHopRefused
+        assert text == f"{connector}: {strict_requests._UNREVOKED_VAULT_HOP} {lever}"
     assert f"[{section}].vault_revocation_attested = true" in text
     assert f"[{section}].vault_revocation_attested_reason" in text
     other = "secrets" if section == "store" else "store"
@@ -378,11 +385,19 @@ def test_an_unset_address_refuses_and_vault_addr_is_never_judged_or_dialled(
     this guard judged that address. There is no fallback now, so the provider refuses on the unset
     variable before any client is built, whatever ``VAULT_ADDR`` holds: an off-box one is not the
     hop the guard judges, and an on-box one is not dialled."""
+    from messagefoundry.store import base as store_base
+
     own, _, section = _HOPS[entry]
     monkeypatch.setenv("VAULT_ADDR", vault_addr)
-    with pytest.raises(_FAIL_CLOSED, match=f"MEFOR_{section.upper()}_VAULT_ADDR is not set") as c:
+    with pytest.raises(_FAIL_CLOSED) as c:
         entry(monkeypatch, None)
     assert type(c.value) is own
+    # The store's key resolution and cipher build replace the provider's text with a fixed one
+    # (the eighth hold on engine PR 2818); the secrets provider keeps its own.
+    if section == "store":
+        assert str(c.value) == store_base._KEY_SEAM_TEXTS[4]
+    else:
+        assert f"MEFOR_{section.upper()}_VAULT_ADDR is not set" in str(c.value)
     assert dials == []
 
 
