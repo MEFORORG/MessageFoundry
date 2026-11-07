@@ -291,6 +291,7 @@ from messagefoundry.store.store import (
     SessionRecord,
     SignCountAnswer,
     Stage,
+    StoreCreateBatchFailedBeforeKeyUse,
     TotpUsable,
     UserAuthzRecord,
     UserChange,
@@ -340,6 +341,7 @@ from messagefoundry.store.store import (
     lockout_clear,
     lockout_increment,
     mfa_stamp,
+    minting_open,
     new_approval_row,
     new_session_record,
     new_user_record,
@@ -2390,9 +2392,17 @@ class PostgresStore:
                 except Exception as exc:
                     # 55P03 is lock_not_available (asyncpg's LockNotAvailableError), read off the
                     # error rather than by importing the lazy driver.
+                    failure: Exception = exc
                     if driver_sqlstate(exc) == _LOCK_NOT_AVAILABLE:
-                        raise SchemaDdlLockTimeout(self.backend, lock, wait) from exc
-                    raise
+                        failure = SchemaDdlLockTimeout(self.backend, lock, wait)
+                        failure.__cause__ = exc
+                    if minting_open():
+                        # Raised inside the transaction, before its commit, so the batch rolls
+                        # back and nothing was sealed under the minted key (PR 2804 hold 17).
+                        raise StoreCreateBatchFailedBeforeKeyUse(failure) from failure
+                    if failure is exc:
+                        raise
+                    raise failure from exc
         log.info("postgres: schema DDL batch applied (%s…)", expected[:12])
         return True
 

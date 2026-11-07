@@ -7090,7 +7090,9 @@ def _discard_minted_custody(
     could not be created, so a second run can mint again, but only where this run can prove the
     open wrote nothing under it: the store id pin refused before the open's first write
     (:class:`~messagefoundry.store.store.StoreIdPinRefusedBeforeWrite`; a pin refusal raised later,
-    once the salt bind may have run, does not count), or a SQLite store whose file was never made.
+    once the salt bind may have run, does not count), a server create batch that failed before its
+    commit (:class:`~messagefoundry.store.store.StoreCreateBatchFailedBeforeKeyUse`, PR 2804 hold
+    17), or a SQLite store whose file was never made.
 
     Otherwise the file is kept, and the warning names it and says to keep it and the recovery key
     shown, deleting neither: the store may hold data sealed under it, and no check this run or an
@@ -7100,11 +7102,14 @@ def _discard_minted_custody(
     from messagefoundry.config.settings import StoreBackend
     from messagefoundry.store.base import _absent_sqlite_store
     from messagefoundry.store.custody_host import keep_the_key_step
-    from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
-
-    nothing_written = isinstance(failure, StoreIdPinRefusedBeforeWrite) or (
-        store.backend is StoreBackend.SQLITE and _absent_sqlite_store(store) is not None
+    from messagefoundry.store.store import (
+        StoreCreateBatchFailedBeforeKeyUse,
+        StoreIdPinRefusedBeforeWrite,
     )
+
+    nothing_written = isinstance(
+        failure, (StoreIdPinRefusedBeforeWrite, StoreCreateBatchFailedBeforeKeyUse)
+    ) or (store.backend is StoreBackend.SQLITE and _absent_sqlite_store(store) is not None)
     if not nothing_written:
         if service_account is None:
             # A re-run with the host file in place carries on with a store started under it, and
@@ -8820,8 +8825,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         """``none`` once the server database's catalog shows no table under a store table name in
         the schemas the open resolves (PR 2804 fourteenth and fifteenth holds). An open's "no
         store" is only what its login may see there, so a store it cannot see reads the same.
-        Raises :class:`HostCustodyRefused` for such a table there, a store the login cannot
-        reach or one partly created, and for a catalog it cannot show, a search_path it cannot
+        Raises :class:`HostCustodyRefused` for such a table there, whoever made it, and for a
+        catalog it cannot show, a search_path it cannot
         read included: neither is minted over. What the catalog read cannot see, at least, is in
         :func:`~messagefoundry.store.base.server_store_schema_found_anywhere`."""
         from messagefoundry.store import base as store_base
@@ -8861,10 +8866,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
             )
         if anywhere:
             raise HostCustodyRefused(
-                "the schemas this login resolves hold tables this store builds, which its open "
-                "did not read as a store: a store this login cannot reach, or one partly created. "
-                "No key was minted over them. Grant this login that store's schema if it is one, "
-                "or point [store] at a new database or schema, then run the command again"
+                "the schemas this login resolves already hold objects under names this store "
+                "creates, so no key was minted. Point [store] at a new database or schema, or "
+                "grant this login the store's schema if they are a store it cannot reach, then "
+                "run the command again"
             )
         return "none"
 
@@ -8930,7 +8935,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
         keep_the_key_step,
         mint_target,
     )
-    from messagefoundry.store.store import StoreChainNeverStarted
+    from messagefoundry.store.store import (
+        StoreChainNeverStarted,
+        StoreCreateBatchFailedBeforeKeyUse,
+    )
 
     host_custody = settings.store.key_provider == HOST_PROVIDER
     if args.service_account is not None and not host_custody:
@@ -9136,6 +9144,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
         # Under the host key provider the store is created with the blob minted above, so its
         # genesis record carries that blob's store id (vault BACKLOG #3411).
+        batch_failure: Exception | None = None
         try:
             store = await open_store(
                 settings.store,
@@ -9150,7 +9159,13 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 kept_key = _discard_minted_custody(
                     minted.path, settings.store, exc, service_account=args.service_account
                 )
-            raise
+            if not isinstance(exc, StoreCreateBatchFailedBeforeKeyUse):
+                raise
+            # The key is dealt with (PR 2804 hold 17); the batch's own error is what the operator
+            # is told, raised outside this arm so its own cause is kept.
+            batch_failure = exc.failure
+        if batch_failure is not None:
+            raise batch_failure
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:
                 # BACKLOG #1905: the settings name a key but the store opened keyless. Refuse before

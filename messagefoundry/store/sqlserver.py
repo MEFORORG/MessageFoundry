@@ -293,6 +293,7 @@ from messagefoundry.store.store import (
     SessionRecord,
     SignCountAnswer,
     Stage,
+    StoreCreateBatchFailedBeforeKeyUse,
     TotpUsable,
     UserAuthzRecord,
     UserChange,
@@ -345,6 +346,7 @@ from messagefoundry.store.store import (
     lockout_clear,
     lockout_increment,
     mfa_stamp,
+    minting_open,
     new_approval_row,
     new_session_record,
     new_user_record,
@@ -4905,9 +4907,18 @@ class SqlServerStore:
                         )
                         await cur.execute(_LOCK_TIMEOUT_RESET)
                     except Exception as exc:
+                        failure: Exception = exc
                         if _is_lock_timeout(exc):
-                            raise SchemaDdlLockTimeout(self.backend, _SCHEMA_LOCK, wait) from exc
-                        raise
+                            failure = SchemaDdlLockTimeout(self.backend, _SCHEMA_LOCK, wait)
+                            failure.__cause__ = exc
+                        if minting_open():
+                            # Before the commit: the rollback below undoes the batch, and nothing
+                            # was sealed under the minted key (PR 2804 hold 17). A rollback that
+                            # fails raises its own error instead, and the key is kept.
+                            raise StoreCreateBatchFailedBeforeKeyUse(failure) from failure
+                        if failure is exc:
+                            raise
+                        raise failure from exc
                     await self._commit(conn)
                     log.info("sqlserver: schema DDL batch applied (%s…)", expected[:12])
                     return True

@@ -5424,11 +5424,31 @@ class StoreChainNeverStarted(StoreIdPinRefusedBeforeWrite):
     that can name the host blob in the way (``provision-admin``, PR 2804) asks for this class."""
 
 
+class StoreCreateBatchFailedBeforeKeyUse(Exception):
+    """A minting open's create batch failed before its commit (PR 2804 hold 17). The batch is one
+    transaction on each server backend, and the store key is first used after it commits, in
+    ``bind_store_salt``, so nothing was sealed under the key: a minting command may remove the key
+    it minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the batch's own error,
+    also the cause. Raised only on a minting open (:func:`minting_open`), so no other caller sees a
+    new class; a failure at or after the commit is never this."""
+
+    def __init__(self, failure: Exception) -> None:
+        super().__init__(str(failure))
+        self.failure = failure
+
+
 #: The pin of the store open in progress, set by ``store.base.open_store`` around the backend open
 #: and read by :func:`_load_audit_chain`, which all three backends share. A context variable rather
 #: than a parameter of each backend's open, as the hop posture is held during connector
 #: construction; ``None`` for every open that is not under the ``host`` key provider.
 OPEN_STORE_PIN: ContextVar[StorePin | None] = ContextVar("mefor_open_store_pin", default=None)
+
+
+def minting_open() -> bool:
+    """Whether the open in progress is a minting command's, the one open that carries a recovery
+    wrap for a new genesis record (PR 2804 hold 17)."""
+    pin = OPEN_STORE_PIN.get()
+    return pin is not None and bool(pin.recovery_wrap)
 
 
 def store_pin_problem(genesis: Mapping[str, Any] | None, pin: StorePin) -> str | None:

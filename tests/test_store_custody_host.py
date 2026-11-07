@@ -26,7 +26,7 @@ from typing import Any
 import pytest
 
 from messagefoundry import custody_posture, restricted_file
-from messagefoundry.config.settings import StoreBackend, StoreSettings
+from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.custody_posture import KeyCustodyPosture, key_custody_loosenings
 from messagefoundry.store import custody, custody_host
@@ -2112,13 +2112,13 @@ def test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none(
     assert "no key was minted" in err.lower(), err
     assert not (secrets / custody_host.HOST_FILE_NAME).exists()
     # Fifteenth hold, review round 1: the text names only this backend's cause, and a found
-    # store is not said to be unreachable, which a partly created one in the login's own schema
-    # is not. Neither advises changing what exists.
+    # store is not said to be unreachable. Hold 17: nor partly created, which invites dropping
+    # tables another application may own. Neither advises changing what exists.
     if anywhere is None:
         other = "view definition" if backend is StoreBackend.POSTGRES else "search_path"
         assert other not in err.lower(), err
     else:
-        assert "cannot reach, so" not in err and "partly created" in err, err
+        assert "partly created" not in err and "already hold objects" in err, err
     assert not _advises_changing(err), err
 
 
@@ -2582,6 +2582,209 @@ def test_a_custody_directory_the_write_refuses_is_refused_before_the_recovery_ke
     }[shape]
     assert expected in refused, refused
     assert not (store_path.parent / custody_host.HOST_FILE_NAME).exists()
+
+
+def _collision() -> Exception:
+    from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
+
+    return ServerSchemaMismatchError("postgres", "mefor", ["table 'users' is taken (stand-in)"])
+
+
+def _minting_pin(minting: bool) -> Any:
+    from messagefoundry.store.store import StorePin
+
+    return StorePin(b"id", frozenset({b"id"}), b"wrap" if minting else b"")
+
+
+def _postgres_batch_store(monkeypatch: pytest.MonkeyPatch, fail: Exception) -> Any:
+    """A PostgresStore whose create batch runs against a stand-in connection and fails, inside
+    the batch's transaction, at the live-schema check, as a name collision does."""
+    import contextlib
+
+    from messagefoundry.store.postgres import PostgresStore
+
+    class _Conn:
+        def transaction(self) -> Any:
+            return _Tx()
+
+        async def execute(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    class _Tx:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *_exc: object) -> bool:
+            return False  # rolls back: the exception propagates
+
+    @contextlib.asynccontextmanager
+    async def _acquire(_self: object, *, record: bool = True) -> Any:
+        yield _Conn()
+
+    async def _false(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    async def _nothing(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def _fail(*_args: object, **_kwargs: object) -> None:
+        raise fail
+
+    monkeypatch.setattr(PostgresStore, "_timed_acquire", _acquire)
+    monkeypatch.setattr(PostgresStore, "_schema_marker_current", staticmethod(_false))
+    monkeypatch.setattr(PostgresStore, "_advisory_lock", _nothing)
+    monkeypatch.setattr(PostgresStore, "_migrate_lease_columns", _nothing)
+    monkeypatch.setattr(PostgresStore, "_verify_live_schema", _fail)
+    store = object.__new__(PostgresStore)
+    store._settings = StoreSettings().model_copy(
+        update={"backend": StoreBackend.POSTGRES, "schema_management": SchemaManagement.AUTO}
+    )
+    return store
+
+
+def _sqlserver_batch_store(monkeypatch: pytest.MonkeyPatch, fail: Exception) -> Any:
+    """A SqlServerStore whose create batch runs on a stand-in cursor and fails, before the commit,
+    at the live-schema check, as a name collision does."""
+    import contextlib
+
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    class _Conn:
+        async def rollback(self) -> None:
+            return None
+
+    class _Cur:
+        async def execute(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    @contextlib.asynccontextmanager
+    async def _acquire(_self: object) -> Any:
+        yield _Conn()
+
+    @contextlib.asynccontextmanager
+    async def _cursor(_self: object, _conn: object) -> Any:
+        yield _Cur()
+
+    async def _false(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    async def _nothing(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def _fail(*_args: object, **_kwargs: object) -> None:
+        raise fail
+
+    monkeypatch.setattr(SqlServerStore, "_acquire", _acquire)
+    monkeypatch.setattr(SqlServerStore, "_cursor", _cursor)
+    monkeypatch.setattr(SqlServerStore, "_schema_marker_current", staticmethod(_false))
+    monkeypatch.setattr(SqlServerStore, "_applock", _nothing)
+    monkeypatch.setattr(SqlServerStore, "_reset_lock_timeout", _nothing)
+    monkeypatch.setattr(SqlServerStore, "_verify_live_schema", _fail)
+    store = object.__new__(SqlServerStore)
+    store._settings = StoreSettings().model_copy(
+        update={"backend": StoreBackend.SQLSERVER, "schema_management": SchemaManagement.AUTO}
+    )
+    return store
+
+
+@pytest.mark.parametrize("backend", [StoreBackend.POSTGRES, StoreBackend.SQLSERVER])
+@pytest.mark.parametrize("minting", [True, False])
+def test_a_create_batch_that_fails_before_commit_is_typed_on_a_minting_open(
+    monkeypatch: pytest.MonkeyPatch, backend: StoreBackend, minting: bool
+) -> None:
+    # PR 2804 hold 17, item 1: the create batch is one transaction, and the key is first used
+    # after it commits, in bind_store_salt. So a failure raised inside the batch proves nothing
+    # was sealed under the key a minting open carries, and the open says so with a typed error.
+    # Any other open keeps the error it had, so no caller's handling changes.
+    import asyncio
+
+    from messagefoundry.store.store import OPEN_STORE_PIN, StoreCreateBatchFailedBeforeKeyUse
+
+    collision = _collision()
+    build = _postgres_batch_store if backend is StoreBackend.POSTGRES else _sqlserver_batch_store
+    store = build(monkeypatch, collision)
+    pinned = OPEN_STORE_PIN.set(_minting_pin(minting))
+    try:
+        with pytest.raises(Exception) as raised:
+            asyncio.run(store._ensure_schema(create=True))
+    finally:
+        OPEN_STORE_PIN.reset(pinned)
+    if minting:
+        assert isinstance(raised.value, StoreCreateBatchFailedBeforeKeyUse), raised.value
+        assert raised.value.failure is collision and raised.value.__cause__ is collision
+    else:
+        assert raised.value is collision
+
+
+@host_file_platforms
+@pytest.mark.parametrize("backend", [StoreBackend.POSTGRES, StoreBackend.SQLSERVER])
+@pytest.mark.parametrize("where", ["batch", "bind_store_salt"])
+def test_a_create_that_fails_in_its_batch_removes_the_key_and_one_after_it_keeps_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    backend: StoreBackend,
+    where: str,
+) -> None:
+    # PR 2804 hold 17, item 1: a create whose batch failed before its commit wrote nothing under
+    # the key, so the key is void and is removed, as a pin refusal before the first write is. A
+    # failure after the commit, the first being bind_store_salt's, may follow a sealed value, so
+    # the key is kept, as before.
+    from messagefoundry import __main__ as cli
+    from messagefoundry.__main__ import main
+    from messagefoundry.store import base
+    from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.custody_host import MintedCustody
+    from messagefoundry.store.store import StoreCreateBatchFailedBeforeKeyUse
+
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    if sys.platform != "win32":
+        secrets.chmod(0o700)
+    monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
+    host_file = secrets / custody_host.HOST_FILE_NAME
+    collision = _collision()
+
+    async def _open(settings: StoreSettings, **kwargs: object) -> Store:
+        if kwargs.get("create"):
+            if where == "batch":
+                raise StoreCreateBatchFailedBeforeKeyUse(collision) from collision
+            raise CipherError("bind_store_salt failed (stand-in)")
+        if kwargs.get("custody") is None:
+            raise HostCustodyMissing("no host blob and no handoff here (stand-in)")
+        raise base.StoreNotFoundError.server_schema(backend, "mefor")
+
+    def _ceremony(*_args: object, **_kwargs: object) -> MintedCustody:
+        host_file.write_bytes(b"minted (stand-in)")
+        return MintedCustody(HostBlob(MasterKey.mint(), StoreId.mint()), host_file, b"wrap")
+
+    async def _none_anywhere(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    monkeypatch.setattr(base, "open_store", _open)
+    monkeypatch.setattr(base, "server_store_schema_found_anywhere", _none_anywhere)
+    monkeypatch.setattr(custody_host, "mint_host_custody", _ceremony)
+    monkeypatch.setattr(cli, "_read_new_password", lambda _prompt: "correct horse battery")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text(
+        f'[store]\nbackend = "{backend.value}"\nkey_provider = "host"\n'
+        'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
+        "[security]\nrequire_mfa = false\n"
+    )
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    code = main([*argv, "--no-totp"])
+    err = " ".join(capsys.readouterr().err.split())
+    assert code == 2, err
+    if where == "batch":
+        assert not host_file.exists(), err
+        assert "was removed from" in err and "Keep both" not in err, err
+        assert "is taken (stand-in)" in err, (
+            err
+        )  # the batch's own refusal still reaches the operator
+    else:
+        assert host_file.read_bytes() == b"minted (stand-in)", err
+        assert "Keep both, and do not delete either" in err, err
 
 
 @host_file_platforms
