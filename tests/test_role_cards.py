@@ -1546,7 +1546,8 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
 
     def test_the_agreement_retires_the_steward_rather_than_going_quiet(self):
         text = read(AGREEMENT)
-        flat = " ".join(text.split())
+        # The Manager row repeats the caveat below; drop it, so this pins the notice's own copy.
+        flat = " ".join(self._MANAGER_ROW.sub("", text).split())
         self.assertIsNone(self._ROW.search(text), "CLAUDE.md keeps a Steward row")
         self.assertIn(
             "The STEWARD is retired too",
@@ -1561,52 +1562,99 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
             "CLAUDE.md no longer says the usage controls bind where watch.py prints nothing",
         )
 
-    #: The hook or its settings file named as what HOLDS the levels or triggers, within one clause
-    #: (a clause ends at a period or semicolon followed by a space, so `~/.claude/` does not end it).
-    #: Korus COMMON.md, *The three usage states*, is that source, and wins where the hook disagrees.
-    _HOOK_AS_SOURCE = re.compile(
-        r"(?:watch\.py|thresholds\.json)(?:(?![.;]\s).)*?\bholds?\b"
-        r"(?:(?![.;]\s).)*?\b(?:levels?|triggers?)\b",
-        re.I,
-    )
     _MANAGER_ROW = re.compile(r"^\|\s*\*\*Manager\*\*\s*\|.*$", re.M)
+    _HOOK = re.compile(r"watch\.py|thresholds\.json")
+    #: A clause ends at a period or semicolon followed by a space, so `~/.claude/` does not end it.
+    _CLAUSE_END = re.compile(r"[.;]\s")
+    _ROW_CAVEAT = "for example in a cloud session or on an unwired root, they bind all the same"
 
-    def _manager_texts(self) -> dict[str, str]:
-        row = self._MANAGER_ROW.search(read(AGREEMENT))
-        self.assertIsNotNone(row, "CLAUDE.md has no Manager row to check")
-        assert row is not None
-        card = " ".join(read(CARD_DIR / "manager.card.md").split())
-        return {"CLAUDE.md Manager row": row.group(0), "manager.card.md": card}
+    @staticmethod
+    def _usage_text(text: str) -> str:
+        """The usage-limits text of the Manager row or card: from 'Usage limits' to ASVS work."""
+        start = text.find("Usage limits")
+        if start == -1:
+            return ""
+        end = text.find("ASVS record work", start)
+        return text[start : end if end != -1 else None]
+
+    @classmethod
+    def _hook_as_source(cls, text: str, *, row: bool) -> list[str]:
+        """What a Manager's usage text gets wrong about where the states come from.
+
+        Korus COMMON.md, *The three usage states*, holds the states, levels and triggers and wins
+        where the hook disagrees. AT LEAST these wrongs are caught: a clause naming the hook beside
+        a level or trigger, in any verb or voice; the binding HOLD defined by what the hook
+        prints; COMMON or the section left unnamed; and, in the row, the cloud caveat dropped.
+        """
+        usage = " ".join(text.split())
+        if not usage:
+            return ["no 'Usage limits' text"]
+        wrongs = []
+        for clause in cls._CLAUSE_END.split(usage):
+            if cls._HOOK.search(clause) and re.search(r"\b(?:level|trigger)", clause, re.I):
+                wrongs.append(f"names the hook beside a level or trigger: {clause!r}")
+            if cls._HOOK.search(clause) and "HOLD NEW WORK" in clause and "bind" in clause:
+                wrongs.append(f"defines the binding HOLD by the hook: {clause!r}")
+        if "COMMON.md" not in usage or "*The three usage states*" not in usage:
+            wrongs.append("does not name COMMON.md, *The three usage states*")
+        if row and cls._ROW_CAVEAT not in usage:
+            wrongs.append("drops the cloud and unwired-root caveat")
+        return wrongs
 
     def test_the_manager_reads_the_states_from_common_not_from_the_hook(self):
         """A Manager reads its own row and card first, so both must name COMMON as the source."""
-        for where, text in self._manager_texts().items():
+        row = self._MANAGER_ROW.search(read(AGREEMENT))
+        self.assertIsNotNone(row, "CLAUDE.md has no Manager row to check")
+        assert row is not None
+        texts = {
+            "CLAUDE.md Manager row": (row.group(0), True),
+            "manager.card.md": (read(CARD_DIR / "manager.card.md"), False),
+        }
+        for where, (text, is_row) in texts.items():
             with self.subTest(where=where):
-                hit = self._HOOK_AS_SOURCE.search(text)
-                self.assertIsNone(
-                    hit,
-                    f"{where} names the hook as holding the levels or triggers: "
-                    f"{hit.group(0) if hit else ''!r}",
-                )
-                self.assertIn("roles/COMMON.md", text, f"{where} never names korus COMMON.md")
-                self.assertIn(
-                    "The three usage states", text, f"{where} never names The three usage states"
-                )
+                wrongs = self._hook_as_source(self._usage_text(text), row=is_row)
+                self.assertEqual([], wrongs, f"{where} points the Manager at the hook")
 
     def test_the_hook_as_source_scan_fires_on_the_wording_it_forbids(self):
-        """Positive control: the Manager row's text before this check, and the new wording."""
-        old = (
-            "`watch.py` and the `thresholds.json` beside it, in `~/.claude/mefor-usage/`, "
-            "hold the levels and triggers, and korus `roles/COMMON.md` states the gate."
+        """Positive controls: the wording before this check, rewordings of it, and the fix."""
+        good_row = (
+            "Usage limits still bind, at least the weekly HOLD NEW WORK state, and the gate; korus "
+            "`roles/COMMON.md`, *The three usage states*, holds the states, levels and triggers. "
+            "The hook `watch.py` is a copy that prints the current state only on a config root "
+            "that wires it; where nothing prints them, " + self._ROW_CAVEAT + "."
         )
-        self.assertIsNotNone(self._HOOK_AS_SOURCE.search(old))
-        self.assertIsNotNone(self._HOOK_AS_SOURCE.search("thresholds.json holds the triggers"))
-        new = (
-            "korus `roles/COMMON.md`, *The three usage states*, holds the states, levels and "
-            "triggers. The user-scope usage watch hook `watch.py` is a copy that prints them only "
-            "on a config root that wires it; where nothing prints them, they bind all the same."
+        self.assertEqual([], self._hook_as_source(good_row, row=True))
+        self.assertEqual(
+            [],
+            self._hook_as_source(
+                "Usage limits bind (`COMMON.md`, *The three usage states*).", row=False
+            ),
         )
-        self.assertIsNone(self._HOOK_AS_SOURCE.search(new))
+        old_row = (
+            "Usage limits still bind, at least the weekly HOLD NEW WORK state that the hook "
+            "`watch.py` prints, and the gate; `watch.py` and the `thresholds.json` beside it, in "
+            "`~/.claude/mefor-usage/`, hold the levels and triggers, and korus `roles/COMMON.md` "
+            "states the gate."
+        )
+        self.assertEqual(4, len(self._hook_as_source(old_row, row=True)))
+        for mutated in (
+            good_row.replace(
+                "a copy that prints", "the authority for the levels and triggers; it prints"
+            ),
+            good_row + " The levels and triggers are held in `thresholds.json`.",
+            good_row.replace(self._ROW_CAVEAT, "they apply"),
+        ):
+            with self.subTest(mutated=mutated[-60:]):
+                self.assertNotEqual([], self._hook_as_source(mutated, row=True))
+        old_card = "Usage limits still bind (`watch.py`, CLAUDE.md section 5)."
+        self.assertNotEqual([], self._hook_as_source(old_card, row=False))
+        self.assertNotEqual(
+            [],
+            self._hook_as_source(
+                "Usage limits bind (`watch.py`, *The three usage states*).", row=False
+            ),
+        )
+        self.assertEqual(["no 'Usage limits' text"], self._hook_as_source("", row=False))
 
 
 if __name__ == "__main__":
