@@ -225,7 +225,7 @@ pytest-xdist==3.8.0
     # via messagefoundry
 python-dateutil==2.9.0.post0
     # via fhirpathpy
-pyx12==4.0.0
+pyx12==4.0.1
     # via messagefoundry
 pyyaml==6.0.3
     # via messagefoundry
