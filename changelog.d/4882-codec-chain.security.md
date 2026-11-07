@@ -12,14 +12,15 @@
   `original_error`, and tests each link's class with `isinstance`, so a link's own properties run.
   An error whose chain cannot be read whole, too long or raising as it is read, is refused the same
   way, and says so, whether or not it holds a codec error. One whose judgement raised is refused as
-  the same two classes with another fixed text, unless that fallback refusal itself raises; what
-  the judgement raised is logged as a WARNING by its class name alone, with no `exc_info`, once the
-  site has left its handler, so an error the log call raises is not chained to the judged one. If
-  that log call fails, a fixed ERROR line with no argument is logged instead. At least these are not detected, and keep
-  the byte in their own text: an error whose text was built from a codec error that has since left
-  the chain; one that holds a codec error deep inside a container argument, past the scan's budget;
-  and a provider `BaseException` that is not an `Exception`, such as a `SystemExit`, which is never
-  judged. A `BaseException` that is not an `Exception`, such as a `KeyboardInterrupt` or
+  the same two classes with another fixed text, unless that fallback refusal itself raises; what the
+  judgement raised is logged as a WARNING by its class name alone, with no `exc_info`, once the site
+  has left its handler, so an error the log call raises is not chained to the judged one. If that
+  log call fails, a fixed ERROR line with no argument is logged instead. At least these are not
+  detected, and keep the byte in their own text: an error whose text was built from a codec error
+  that has since left the chain; one that holds a codec error deep inside a container argument, past
+  the scan's budget; and a provider `BaseException` that is not an `Exception`, such as a
+  `SystemExit`, which is never judged. A `BaseException` that is not an `Exception`, such as a
+  `KeyboardInterrupt` or
   `SystemExit`, raised by the judgement's own code, and anything the fallback refusal itself
   raises, such as a `RecursionError` at the recursion limit, still propagate, in place of the
   refusal, with no cause and no context. That cuts only those two links: at least one whose own

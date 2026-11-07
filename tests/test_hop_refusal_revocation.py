@@ -655,8 +655,8 @@ def test_the_default_path_refuses_a_crl_bundle_that_adds_a_trust_anchor(crl_bund
         _build_ssl(_pg(ssl_crl_file=crl_bundle))
     assert "[store].ssl_crl_file" in str(exc.value)
     # The open's refusal text is fixed (engine PR 2818's seventh hold) and, since the eighth hold,
-    # raised from None: the builder's text is not kept as its cause.
-    assert exc.value.__cause__ is None and exc.value.__suppress_context__
+    # raised after its handler has exited: the builder's error is on neither chain link.
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
     # The control: the builder itself, unwrapped, refuses for the trust-anchor reason, so the open's
     # fixed refusal above is this check's and not some other failure's.
     from messagefoundry.store.postgres import _verifying_context

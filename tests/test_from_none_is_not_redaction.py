@@ -116,10 +116,11 @@ _UPLOAD_MISS = (
 
 #: The four store refusal sites of engine PR 2818's eighth hold: each raises outside its own
 #: handler, so the error it caught is on neither chain link; ``from None`` there suppresses at most
-#: an exception a caller is handling, and the refusal's fixed text is read from no error.
+#: an exception a caller is handling. The refusal's text is fixed, or recorded from the settings
+#: alone, and never read from the caught error.
 _RAISED_AFTER_HANDLER = (
     _SAFE + "raised after its own handler exited, so the caught error is on neither chain link; "
-    "from None suppresses at most a caller's handled exception, and the text is fixed"
+    "from None suppresses at most a caller's handled exception; the text is never read from it"
 )
 
 #: One entry per (site key, count). Read the module docstring before adding one.

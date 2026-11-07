@@ -173,7 +173,7 @@ def test_any_other_build_error_gets_the_fixed_text_and_no_chain(
     with pytest.raises(StoreCipherConfigError) as caught:
         build_store_cipher(StoreSettings())
     assert str(caught.value) == store_base._KEY_SEAM_TEXTS[3]
-    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 def test_a_key_with_a_character_that_is_not_ascii_leaves_no_codec_error_on_the_chain(
@@ -569,7 +569,7 @@ def test_a_runtime_error_with_no_codec_error_is_replaced(
         build_store_cipher(StoreSettings())
     assert caught.value is not own
     assert str(caught.value) == store_base._BUILD_TEXTS[4]
-    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 def test_a_holder_of_another_class_reads_as_the_fixed_text(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1215,7 +1215,7 @@ def test_the_postgres_tls_wrap_replaces_a_host_fault_or_hop_refusal_by_class(
     assert isinstance(caught.value, InsecureHopRefused) == isinstance(error, InsecureHopRefused)
     assert isinstance(caught.value, OSError) == isinstance(error, OSError)
     _assert_no_key_byte(_whole(caught.value))
-    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 class _ClassSaysTyped(ValueError):
@@ -1240,7 +1240,7 @@ def test_the_cipher_build_tests_the_class_with_type(monkeypatch: pytest.MonkeyPa
         escaped = AssertionError("nothing was raised")
     assert type(escaped) is StoreCipherConfigError, repr(escaped)
     assert str(escaped) == store_base._KEY_SEAM_TEXTS[3]
-    assert escaped.__cause__ is None and escaped.__suppress_context__
+    assert escaped.__cause__ is None and escaped.__context__ is None
 
 
 # --- the fifth hold on engine PR 2818: the text is read without running the error's own code ----
@@ -1375,7 +1375,7 @@ def test_the_cipher_build_reads_no_argument_of_the_error(monkeypatch: pytest.Mon
     assert type(escaped) is StoreCipherConfigError, type(escaped)
     _assert_no_key_byte(str(escaped))
     assert str(escaped) == store_base._KEY_SEAM_TEXTS[3]
-    assert escaped.__cause__ is None and escaped.__suppress_context__
+    assert escaped.__cause__ is None and escaped.__context__ is None
 
 
 def test_the_ad_probe_reads_no_argument_of_the_guard_refusal(
@@ -1416,7 +1416,7 @@ def test_the_postgres_tls_wrap_reads_no_text_of_the_error(
     _assert_no_key_byte(text)
     assert _SETTING_TEXT not in text, text
     assert "[store].ssl_root_cert" in text and "text is not shown" in text, text
-    assert escaped.__cause__ is None and escaped.__suppress_context__
+    assert escaped.__cause__ is None and escaped.__context__ is None
 
 
 class _ClassChangesOnRereading(ValueError):
@@ -1497,7 +1497,7 @@ def test_the_cipher_build_gives_an_engine_subclass_the_fixed_text(
     escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
     assert type(escaped) is StoreCipherConfigError, type(escaped)
     assert str(escaped) == store_base._KEY_SEAM_TEXTS[3], str(escaped)
-    assert escaped.__cause__ is None and escaped.__suppress_context__
+    assert escaped.__cause__ is None and escaped.__context__ is None
 
 
 def test_the_postgres_tls_wrap_gives_the_fixed_text(tmp_path: Path) -> None:
@@ -1520,7 +1520,7 @@ def test_the_postgres_tls_wrap_gives_the_fixed_text(tmp_path: Path) -> None:
     escaped = _escaping(lambda: postgres._verifying_context_at_open(settings))
     assert type(escaped) is StoreTlsRefused, type(escaped)
     assert str(escaped) == postgres._TLS_REFUSED, str(escaped)
-    assert escaped.__cause__ is None and escaped.__suppress_context__
+    assert escaped.__cause__ is None and escaped.__context__ is None
 
 
 def test_a_log_call_that_fails_does_not_replace_the_refusal(
@@ -1592,7 +1592,7 @@ def test_a_refusal_subclass_with_its_own_str_is_not_passed_bare(
     escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
     assert type(escaped) is StoreCipherConfigError, type(escaped)
     assert str(escaped) == store_base._KEY_SEAM_TEXTS[3]
-    assert escaped.__cause__ is None and escaped.__suppress_context__
+    assert escaped.__cause__ is None and escaped.__context__ is None
 
 
 def test_an_exact_refusal_is_replaced_too(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1634,7 +1634,7 @@ def test_arguments_rewritten_by_a_metaclass_call_are_not_read(
     assert type(escaped) is StoreCipherConfigError, type(escaped)
     assert str(escaped) == store_base._KEY_SEAM_TEXTS[3]
     _assert_no_key_byte(str(escaped))
-    assert escaped.__cause__ is None and escaped.__suppress_context__
+    assert escaped.__cause__ is None and escaped.__context__ is None
 
 
 def test_a_failed_log_call_is_logged_with_fixed_text(
@@ -1705,7 +1705,7 @@ def test_reassigned_arguments_are_not_passed_through(
     expected = ValueError if kind is StoreCipherConfigError or built_as_value else kind
     assert isinstance(escaped, expected), type(escaped)
     _assert_no_key_byte(_whole(escaped))
-    assert escaped.__cause__ is None and escaped.__suppress_context__
+    assert escaped.__cause__ is None and escaped.__context__ is None
 
 
 def test_an_engine_refusal_keeps_its_recorded_text_not_its_reassigned_args(
@@ -1765,7 +1765,7 @@ def test_the_postgres_tls_wrap_passes_no_hop_or_host_fault_subclass(
     escaped = _escaping(lambda: postgres._verifying_context_at_open(StoreSettings()))
     assert escaped is not error
     _assert_no_key_byte(_whole(escaped))
-    assert escaped.__cause__ is None and escaped.__suppress_context__
+    assert escaped.__cause__ is None and escaped.__context__ is None
 
 
 class _RaisingHandler(logging.Handler):

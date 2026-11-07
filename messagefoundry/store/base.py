@@ -3760,9 +3760,9 @@ _UNJUDGED = f"{_KEY_SOURCE}: an error that could not be judged, its class and te
 _VAULT_HOP_TEXT = (
     f"{_KEY_SOURCE}: the store's Vault hop was refused by the engine's own hop checks, its text "
     "not shown; check that MEFOR_STORE_VAULT_ADDR is an https:// address, any proxy variable, the "
-    "Vault CA and client settings, and the hop's certificate revocation coverage, which "
-    "[store].vault_revocation_attested, set with a [store].vault_revocation_attested_reason, "
-    "attests"
+    "Vault CA and client settings; and, only where the hop checks no certificate revocation, "
+    "[store].vault_revocation_attested = true with a [store].vault_revocation_attested_reason that "
+    "covers the Vault server's certificate and any https:// proxy's the hop goes through"
 )
 
 #: :func:`_fresh_refusal`'s texts at the key seam (``resolve_active_key``, ``resolve_decrypt_keys``).

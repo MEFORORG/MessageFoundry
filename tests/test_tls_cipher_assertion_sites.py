@@ -437,11 +437,11 @@ def test_postgres_pinned_ca_context_asserts(every_suite_looks_weak: None, tmp_pa
 
     cert, _key = _self_signed(tmp_path)
     settings = _pg_settings(ssl_root_cert=str(cert))
-    # The open's refusal text is fixed (engine PR 2818's seventh hold) and raised from None (the
-    # eighth hold), so the assertion's own text is not kept as its cause.
+    # The open's refusal text is fixed (engine PR 2818's seventh hold) and raised after its
+    # handler has exited (the eighth hold), so the assertion's error is on neither chain link.
     with pytest.raises(ValueError, match="suites must narrow to the approved list") as caught:
         postgres._build_ssl(settings)
-    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
     # The control: the unwrapped builder fails on this arm's own assertion.
     with pytest.raises(ValueError, match=r"Postgres store \(pinned CA\)"):
         postgres._verifying_context(settings)
@@ -466,11 +466,11 @@ def test_postgres_default_arm_context_asserts(every_suite_looks_weak: None) -> N
     object existed in engine code for the assertion to run against. The engine builds it now, so the
     arm is asserted like its two siblings."""
 
-    # The open's refusal text is fixed (engine PR 2818's seventh hold) and raised from None (the
-    # eighth hold), so the assertion's own text is not kept as its cause.
+    # The open's refusal text is fixed (engine PR 2818's seventh hold) and raised after its
+    # handler has exited (the eighth hold), so the assertion's error is on neither chain link.
     with pytest.raises(ValueError, match="suites must narrow to the approved list") as caught:
         postgres._build_ssl(_pg_settings())
-    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
     # The control: the unwrapped builder fails on this arm's own assertion.
     with pytest.raises(ValueError, match=r"Postgres store \(system trust\)"):
         postgres._verifying_context(_pg_settings())
