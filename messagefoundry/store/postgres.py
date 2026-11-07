@@ -103,7 +103,6 @@ from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS,
-    STORE_MARKER_TABLES,
     UPLOAD_RESERVATION_STALE_AFTER,
     ConnectionFlagLockTimeout,
     Row,
@@ -1437,7 +1436,9 @@ def _search_path_schemas(path: str, role: str) -> list[str] | None:
     caller reads a path it cannot parse as "cannot show" (PR 2804 fifteenth hold)."""
     schemas: list[str] = []
     for element in path.split(","):
-        item = element.strip()
+        # Postgres skips ASCII whitespace alone (PR 2804 sixteenth hold); any other space stays in
+        # the element, so it fails the name patterns and reads as "cannot show".
+        item = element.strip(" \t\n\r\f")
         if not item:
             continue
         if item in ("$user", '"$user"'):
@@ -2207,9 +2208,9 @@ class PostgresStore:
     async def schema_meta_anywhere(
         cls, settings: StoreSettings, *, posture: HopPosture | None = None
     ) -> bool | None:
-        """Whether a schema this connection's search_path names holds one of
-        :data:`STORE_MARKER_TABLES` (PR 2804 fourteenth and fifteenth holds), or ``None`` when that
-        cannot be shown. The path is ``db_schema`` when it is set, else the role's own path, read
+        """Whether a schema this connection's search_path names holds a table under any name
+        :func:`_declared_schema` declares (PR 2804 fourteenth to sixteenth holds), or ``None`` when
+        that cannot be shown. The path is ``db_schema`` when it is set, else the role's own path, read
         by :func:`_search_path_schemas`; an element it cannot read as one schema name, or a path
         that names none, is ``None``. Names are bound as ``text[]`` and cast to ``name[]`` in SQL,
         which truncates as Postgres does, where a bound ``name`` too long is refused.
@@ -2235,7 +2236,7 @@ class PostgresStore:
                 " WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::text[]::name[])"
                 " AND c.relname = ANY($2::text[]::name[])) AS found",
                 schemas,
-                list(STORE_MARKER_TABLES),
+                sorted(_declared_schema().columns),
             )
         if row is None or row["found"] is None:
             return None

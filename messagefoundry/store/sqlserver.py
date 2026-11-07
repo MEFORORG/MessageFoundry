@@ -92,7 +92,6 @@ from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS,
     PROVISION_SCHEMA_COMMAND,
-    STORE_MARKER_TABLES,
     UPLOAD_RESERVATION_STALE_AFTER,
     ConnectionFlagLockTimeout,
     ReferenceKeyCollision,
@@ -5200,15 +5199,15 @@ class SqlServerStore:
         cls, settings: StoreSettings, *, posture: HopPosture | None = None
     ) -> bool | None:
         """Whether the schemas ``OBJECT_ID`` resolves through, the login's default schema and
-        ``dbo``, hold one of :data:`STORE_MARKER_TABLES` (PR 2804 fourteenth and fifteenth
-        holds), or ``None`` when this login cannot show that. A missing
+        ``dbo``, hold a table under any name :func:`_declared_schema` declares (PR 2804
+        fourteenth to sixteenth holds), or ``None`` when this login cannot show that. A missing
         row is ``None``. ``sys.objects`` lists only what the login may see, so its answer counts
         only where ``HAS_PERMS_BY_NAME`` shows ``VIEW DEFINITION`` held on both schemas; a NULL,
         an answer that could not be given, counts as not shown. Even then, at least a table-level
-        ``DENY`` of ``VIEW DEFINITION`` on a marker table itself can still hide one. Reads
+        ``DENY`` of ``VIEW DEFINITION`` on such a table itself can still hide one. Reads
         only."""
         found: bool | None = None
-        tables = STORE_MARKER_TABLES
+        tables = tuple(sorted(_declared_schema().columns))
         async with (
             cls._one_connection_store(settings, posture=posture) as probe,
             probe._acquire() as conn,

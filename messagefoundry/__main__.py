@@ -8817,10 +8817,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
         return await server_store_found() != "held"
 
     async def no_store_anywhere() -> Literal["none"]:
-        """``none`` once the server database's catalog shows none of the store's marker tables in
+        """``none`` once the server database's catalog shows no table under a store table name in
         the schemas the open resolves (PR 2804 fourteenth and fifteenth holds). An open's "no
         store" is only what its login may see there, so a store it cannot see reads the same.
-        Raises :class:`HostCustodyRefused` for marker tables there, a store the login cannot
+        Raises :class:`HostCustodyRefused` for such a table there, a store the login cannot
         reach or one partly created, and for a catalog it cannot show, a search_path it cannot
         read included: neither is minted over. What the catalog read cannot see, at least, is in
         :func:`~messagefoundry.store.base.server_store_schema_found_anywhere`."""

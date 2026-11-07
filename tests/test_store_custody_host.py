@@ -30,7 +30,7 @@ from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.custody_posture import KeyCustodyPosture, key_custody_loosenings
 from messagefoundry.store import custody, custody_host
-from messagefoundry.store.base import STORE_MARKER_TABLES, Store, open_store
+from messagefoundry.store.base import Store, open_store
 from messagefoundry.store.custody import (
     HostBlob,
     MasterKey,
@@ -2169,6 +2169,15 @@ def _postgres_catalog(
         ('"a,b"', None),  # a quoted name with a comma splits, and cannot be read
         ("", None),  # names no schema: a check that asked about nothing cannot show none
         (" , ", None),
+        # PR 2804 sixteenth hold, item 1: Postgres skips only ASCII whitespace, so a Unicode space
+        # is part of the name. Read as another name, the check would ask about the wrong schema.
+        ("\xa0mefor", None),
+        ("mefor\xa0", None),
+        ("\x85mefor", None),
+        ("mefor\x85", None),
+        ("\x0bmefor", None),
+        ("mefor\x0b", None),
+        (" mefor\t", ["mefor"]),  # the control: ASCII whitespace is still skipped
     ],
 )
 def test_the_postgres_catalog_check_reads_only_search_path_names_it_can_parse(
@@ -2218,7 +2227,7 @@ def test_the_postgres_catalog_check_asks_for_store_tables_as_well(
 ) -> None:
     # PR 2804 fifteenth hold, item 5 (R4): a schema holding the store's tables but no schema_meta
     # read as "no store", and the create adopted that data under a new key. The check now asks
-    # for the store's own marker tables, not schema_meta alone.
+    # for every store table name, not schema_meta alone.
     import asyncio
 
     from messagefoundry.store.postgres import PostgresStore
@@ -2226,23 +2235,99 @@ def test_the_postgres_catalog_check_asks_for_store_tables_as_well(
     conn = _postgres_catalog(monkeypatch, [{"path": "public", "who": "mefor"}, {"found": True}])
     settings = StoreSettings().model_copy(update={"backend": StoreBackend.POSTGRES})
     assert asyncio.run(PostgresStore.schema_meta_anywhere(settings)) is True
-    tables = list(conn.calls[1][1][1])  # type: ignore[call-overload]
-    assert tables == list(STORE_MARKER_TABLES), tables
-
-
-def test_the_store_marker_tables_are_declared_and_not_generic() -> None:
-    # PR 2804 fifteenth hold, review round 1: every declared table counted as a store, so an
-    # unrelated application's users or messages table in a shared schema refused a mint. The
-    # markers are tables only this store builds, each declared on both server backends.
     from messagefoundry.store.postgres import _declared_schema as postgres_schema
-    from messagefoundry.store.sqlserver import _declared_schema as sqlserver_schema
 
-    assert "schema_meta" in STORE_MARKER_TABLES and "cipher_meta" in STORE_MARKER_TABLES
-    for declared in (postgres_schema().columns, sqlserver_schema().columns):
-        assert set(STORE_MARKER_TABLES) <= set(declared), set(STORE_MARKER_TABLES) - set(declared)
-    generic = {"users", "sessions", "roles", "messages", "queue", "state", "nodes", "reference"}
-    generic |= {"audit_log", "keyring", "webauthn_credentials", "message_events", "resend_log"}
-    assert not generic & set(STORE_MARKER_TABLES)
+    tables = list(conn.calls[1][1][1])  # type: ignore[call-overload]
+    # PR 2804 sixteenth hold, item 2: every table name the store builds, whoever built the table.
+    assert tables == sorted(postgres_schema().columns), tables
+
+
+class _PresentTablesConn(_CatalogConn):
+    """A Postgres catalog stand-in that answers the table query from the tables ``present`` in
+    ``schema``, as ``pg_class`` would, rather than from a queued answer."""
+
+    def __init__(self, schema: str, present: set[str]) -> None:
+        super().__init__([{"path": schema, "who": "mefor"}])
+        self.schema = schema
+        self.present = present
+
+    async def fetchrow(self, query: str, *args: object) -> dict[str, object] | None:
+        if not self.rows:
+            self.calls.append((query, args))
+            schemas, tables = args
+            asked = set(tables)  # type: ignore[call-overload]
+            return {"found": self.schema in schemas and bool(asked & self.present)}  # type: ignore[operator]
+        return await super().fetchrow(query, *args)
+
+
+@host_file_platforms
+@pytest.mark.parametrize("present", [{"users"}, {"messages"}, set()])
+def test_a_schema_holding_one_store_table_without_schema_meta_refuses_and_mints_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    present: set[str],
+) -> None:
+    # PR 2804 sixteenth hold, item 2 (F1): a table under one of the store's own names, with no
+    # schema_meta, passed the pre-check, so the run minted and the create then failed over that
+    # table, keeping the key on every re-run. Any store table name present now refuses before the
+    # mint. The empty schema is the control: it mints.
+    from messagefoundry import __main__ as cli
+    from messagefoundry.__main__ import main
+    from messagefoundry.store import base
+    from messagefoundry.store.postgres import PostgresStore
+
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    if sys.platform != "win32":
+        secrets.chmod(0o700)
+    monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
+    shown: list[str] = []
+    import contextlib
+
+    conn = _PresentTablesConn("mefor", present)
+
+    class _Store:
+        @contextlib.asynccontextmanager
+        async def _timed_acquire(self, *, record: bool = True) -> Any:
+            yield conn
+
+    @contextlib.asynccontextmanager
+    async def _one(_settings: StoreSettings, *, posture: object = None) -> Any:
+        yield _Store()
+
+    monkeypatch.setattr(PostgresStore, "_one_connection_store", staticmethod(_one))
+
+    async def _open(settings: StoreSettings, **kwargs: object) -> Store:
+        if kwargs.get("custody") is None:
+            raise HostCustodyMissing("no host blob and no handoff here (stand-in)")
+        raise base.StoreNotFoundError.server_schema(StoreBackend.POSTGRES, "mefor")
+
+    def _ceremony(*_args: object, **_kwargs: object) -> None:
+        shown.append("recovery key shown")
+        raise HostCustodyRefused("the ceremony was reached (stand-in)")
+
+    monkeypatch.setattr(base, "open_store", _open)
+    monkeypatch.setattr(custody_host, "mint_host_custody", _ceremony)
+    monkeypatch.setattr(cli, "_read_new_password", lambda _prompt: "correct horse battery")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[store]\nbackend = "postgres"\nkey_provider = "host"\n'
+        'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
+        "[security]\nrequire_mfa = false\n"
+    )
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    code = main([*argv, "--no-totp"])
+    err = " ".join(capsys.readouterr().err.split())
+    assert code == 2, err
+    assert len(conn.calls) == 2, conn.calls  # the catalog was asked
+    if not present:
+        assert shown == ["recovery key shown"], err
+        return
+    assert shown == [], err  # refused before any recovery key was shown
+    assert "no key was minted" in err.lower(), err
+    assert not (secrets / custody_host.HOST_FILE_NAME).exists()
 
 
 class _SqlServerCursor:
@@ -2320,7 +2405,9 @@ def test_the_sqlserver_catalog_check_asks_for_store_tables_as_well(
     query, args = cur.calls[1]
     names = args[0]
     assert isinstance(names, tuple) and query.count("?") == len(names), (query, args)
-    assert names == STORE_MARKER_TABLES, (query, args)
+    from messagefoundry.store.sqlserver import _declared_schema as sqlserver_schema
+
+    assert names == tuple(sorted(sqlserver_schema().columns)), (query, args)
 
 
 @host_file_platforms

@@ -178,7 +178,6 @@ __all__ = [
     "open_store",
     "probe_store_privileges",
     "server_store_schema_found_anywhere",
-    "STORE_MARKER_TABLES",
     "provision_store_schema",
     "seed_filter_clause",
     "sqlite_settings",
@@ -4272,35 +4271,18 @@ def _server_store_class(backend: StoreBackend) -> type[SqlServerStore] | type[Po
     raise NotImplementedError(f"store backend {backend.value!r} is not implemented yet")
 
 
-#: The tables whose presence the catalog check reads as a store, whole or partly built (PR 2804
-#: fifteenth hold). ``schema_meta`` and tables only this store builds, so an unrelated
-#: application's ``users`` or ``messages`` in a shared schema does not refuse a mint; a partial
-#: create that left any of these without ``schema_meta`` does. Each is a declared table on both
-#: server backends, which a test pins.
-STORE_MARKER_TABLES: tuple[str, ...] = (
-    "authority_set_seal",
-    "cipher_meta",
-    "global_session_epoch",
-    "keyed_surface",
-    "schema_meta",
-    "secret_rotation_meta",
-    "store_salt",
-    "transit_bound_attestation",
-)
-
-
 async def server_store_schema_found_anywhere(
     settings: StoreSettings, *, posture: HopPosture | None = None
 ) -> bool | None:
-    """Whether a schema the open resolves holds any of :data:`STORE_MARKER_TABLES`, a store
-    whole or partly built, read from the catalog rather than through the login's own name
-    resolution, or ``None`` when the login cannot show that (PR 2804 fourteenth and fifteenth
-    holds). Postgres: the
+    """Whether a schema the open resolves holds a table under any name the store builds,
+    whoever built it, read from the catalog rather than through the login's own name resolution,
+    or ``None`` when the login cannot show that (PR 2804 fourteenth to sixteenth holds). A table
+    under a store table's name breaks the create, so a mint beside one is refused too. Postgres: the
     search_path's schemas, in ``pg_class``, which every role reads whatever its schema
     privileges. SQL Server: the login's default schema and ``dbo``, in ``sys.objects``, counted
     only where the login holds ``VIEW DEFINITION`` on both. A schema outside those, such as
     another install's ``db_schema``, is not asked. What it cannot see, at least: on SQL Server a
-    table-level ``DENY`` of ``VIEW DEFINITION`` on a marker table itself. A read-only check on a
+    table-level ``DENY`` of ``VIEW DEFINITION`` on such a table itself. A read-only check on a
     one-connection pool. Raises what the connection and the driver raise."""
     return await _server_store_class(settings.backend).schema_meta_anywhere(
         settings, posture=posture
