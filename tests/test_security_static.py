@@ -689,29 +689,25 @@ _UNSCANNABLE_RE_PATTERNS = {
     ),
     # BACKLOG #2420 -- the DR staging refusal's trailing checks. Unresolvable BY CONSTRUCTION: the
     # matcher is spliced from constants the refusal also writes with (_CHECKS_LEAD, _TEST_PATH,
-    # _PS_QUOTES), so those three cannot drift between the text and the split. The splicing is
-    # the only reason the scanner cannot read it. Its literal form, the pattern it compiles to,
-    # passes the nested-quantifier detector, and the literal-form test below checks that on every
-    # run. The detector fires only when two nested levels are both greedy and unbounded, so one
-    # repetition made greedy again would still pass it. That test therefore also walks the parsed
-    # pattern. It fails on any greedy or lazy repetition whose count is not fixed, at least ``*``,
-    # ``+``, ``?``, ``{n,}``, ``{,}`` and ``{n,m}`` with any bound, so ``{4}`` passes and an escaped
-    # ``\+`` or ``\*``, a literal, is not read. It fails too on an opcode it does not know that
-    # holds a sub-pattern at any depth. It also requires the greedy twin the differential test
-    # below compares against to hold no possessive repetition, so every one is compared with its
-    # greedy form. It reads the pattern with the flags it was compiled with. The detector does
-    # not model overlapping alternation, so neither check catches every catastrophic edit.
+    # _PS_QUOTES), so the scanner cannot read it. Its literal form, the possessive pattern it
+    # compiles to, passes the nested-quantifier detector, and the literal-form test below checks
+    # that. The detector fires only when two nested levels are both greedy and unbounded, so that
+    # test also walks the parsed pattern, read with the flags it was compiled with. The walk fails
+    # on a greedy or lazy repetition whose count is not fixed, and on an opcode it does not know
+    # that holds a sub-pattern. It does not judge at least these: a possessive repetition, a fixed
+    # count such as ``{4}`` or ``{4}+``, and a lazy repetition alone inside an atomic group, such
+    # as ``(?>a*?)``, which it reads as possessive. Neither the detector nor the walk models
+    # overlapping alternation.
     #
     # Its three kinds of unbounded repetition are possessive: the quoted run, the ' + ' parts and
-    # the ' ; ' checks. Possessive does not change what it matches, because giving an iteration
-    # back never yields a match. A quoted run given back ends at a character the ASCII closing
-    # quote cannot match, or at the first quote of a doubled '' pair, whose second quote is not
-    # ' ; ', ' + ', ')' or the end. A ' + ' or ' ; ' iteration given back leaves a space where ')'
-    # or the end must follow. The branches of each choice differ at their first character. That
-    # rests on those conditions, so the differential test below compares the possessive and
-    # greedy forms on seeded texts, with a planted variant to show it can see a difference.
-    # The caller uses the unanchored ``.search``, which starts again only where the literal lead
-    # occurs.
+    # the ' ; ' checks. Possessive does not change what it matches here, because giving an
+    # iteration back does not yield a match. A quoted run given back ends at a character the ASCII
+    # closing quote cannot match, or at the first quote of a doubled '' pair, whose second quote
+    # is not ' ; ', ' + ', ')' or the end. A ' + ' or ' ; ' iteration given back leaves a space
+    # where ')' or the end must follow. The branches of each choice differ at their first
+    # character. Measured once against the greedy form, and not by a test: no difference in span
+    # or group on the 36 texts the DR tests split and on 300,000 seeded texts. The caller uses the
+    # unanchored ``.search``, which starts again only where the literal lead occurs.
     #
     # At least these spellings are NOT coupled: the [char] spelling, the parentheses and ' + ' of
     # _ps_path, the quote around a literal, the space after the check, and the ' ; '
@@ -819,13 +815,6 @@ def _backtracking_repeats(pattern: str, flags: int = 0) -> list[str]:
     return [what for kind, what in _repeats(pattern, flags) if kind == "backtracking"]
 
 
-def _greedy_twin(pattern: str) -> str:
-    """``pattern`` with every possessive group repetition ``)*+`` made greedy ``)*``."""
-    greedy = pattern.replace(")*+", ")*")
-    assert greedy != pattern
-    return greedy
-
-
 def test_the_dr_staging_check_matcher_passes_the_detector_in_literal_form() -> None:
     # The pin above exempts _CHECKS_AT_END from the scan only because it is spliced. The pattern
     # it compiles to, written out as a literal, must pass the same detector, so a sub-pattern edit
@@ -840,11 +829,8 @@ def test_the_dr_staging_check_matcher_passes_the_detector_in_literal_form() -> N
     # repetition made greedy again.
     flags = dr_backup._CHECKS_AT_END.flags
     assert _backtracking_repeats(pattern, flags) == []
-    # `_greedy_twin` must turn every possessive repetition greedy, so the differential test below
-    # compares each one with its greedy form.
-    greedy = _greedy_twin(pattern)
-    twin = _repeats(greedy, flags)
-    assert [kind for kind, _what in twin] == ["backtracking"] * len(_repeats(pattern, flags))
+    # The detector's control: the same pattern with its repetitions made greedy is flagged.
+    greedy = pattern.replace(")*+", ")*")
     assert find_nested_quantifiers(f"import re\nre.compile({greedy!r})\n") == [greedy]
 
 
@@ -900,27 +886,6 @@ def test_the_dr_staging_check_matcher_walk_passes_what_cannot_backtrack(
 
 
 @pytest.mark.parametrize(
-    "edit",
-    [
-        pytest.param((")*+", ")++"), id="possessive-plus"),
-        pytest.param(("[0-9A-F]{4}", "[0-9A-F]{4,}+"), id="possessive-brace"),
-        pytest.param(("[0-9A-F]{4}", "[0-9A-F)*+]{4}x++"), id="possessive-beside-a-decoy"),
-    ],
-)
-def test_the_dr_staging_check_matcher_walk_finds_a_possessive_the_twin_cannot_turn(
-    edit: tuple[str, str],
-) -> None:
-    # A possessive spelled other than `)*+` is no backtracking risk, but `_greedy_twin` leaves it
-    # possessive, so the differential test would compare it with itself. The twin's parsed form
-    # shows it, where a count of `)*+` substrings can be matched by a decoy.
-    from messagefoundry.pipeline import dr_backup
-
-    pattern = _one_edit(dr_backup._CHECKS_AT_END.pattern, *edit)
-    assert _backtracking_repeats(pattern) == []
-    assert "possessive" in [kind for kind, _what in _repeats(_greedy_twin(pattern))]
-
-
-@pytest.mark.parametrize(
     ("opcode", "pattern"),
     [
         pytest.param("BRANCH", "x(?:a|b*)y", id="branch"),
@@ -956,77 +921,6 @@ def test_the_parsed_walk_descends_every_container(pattern: str, backtracking: in
     # The real matcher has no lookaround, conditional or atomic group, so these plant one each, to
     # show the walk reads inside them.
     assert len(_backtracking_repeats(pattern)) == backtracking
-
-
-def test_the_dr_staging_check_matcher_matches_what_its_greedy_form_did() -> None:
-    # Possessive repetitions commit to their first parse, so they match what the greedy form did
-    # only while giving an iteration back never yields a match. The pin above argues that holds.
-    # This compares the two forms on seeded texts: checks on paths `_ps_path` spells, the same
-    # with one piece swapped, and random runs of the pieces a check is built from.
-    import random
-
-    from messagefoundry.pipeline import dr_backup
-
-    possessive = dr_backup._CHECKS_AT_END
-    greedy = re.compile(_greedy_twin(possessive.pattern))
-    lead, check = dr_backup._CHECKS_LEAD, dr_backup._TEST_PATH
-    name_pieces = [
-        *"a +;()'",
-        *dr_backup._PS_QUOTES,
-        "\u2028",
-        "\u00a0",
-        "\udc80",
-        "\n",
-    ]
-    atoms = [
-        lead,
-        check + " ",
-        " ; ",
-        " + ",
-        "(",
-        ")",
-        "'",
-        "''",
-        "\u2019",
-        "\u201b\u201b",
-        "a",
-        " ",
-        "[char]0x2028",
-        "[char]0xdc80",
-        "('' + ",
-    ]
-    rng = random.Random(2420)
-    real: list[str] = []
-    swapped: list[str] = []
-    noise: list[str] = []
-    for _ in range(4000):
-        paths = (
-            dr_backup._ps_path("".join(rng.choice(name_pieces) for _ in range(rng.randint(0, 6))))
-            for _ in range(rng.randint(1, 3))
-        )
-        text = "head" + lead + " ; ".join(f"{check} {path}" for path in paths)
-        real.append(text)
-        i = rng.randrange(len(text))
-        swapped.append(text[:i] + rng.choice(atoms) + text[i + 1 :])
-        noise.append("".join(rng.choice(atoms) for _ in range(rng.randint(1, 16))))
-
-    def found(pattern: re.Pattern[str], text: str) -> tuple[tuple[int, int], str] | None:
-        match = pattern.search(text)
-        return None if match is None else (match.span(), match.group(1))
-
-    for texts in (real, swapped, noise):
-        assert [t for t in texts if found(possessive, t) != found(greedy, t)] == []
-    assert all(found(possessive, t) for t in real)
-    for texts in (swapped, noise):
-        assert 0 < sum(1 for t in texts if found(possessive, t)) < len(texts)
-    # The control: a variant whose possessive and greedy forms do differ, an optional quote before
-    # the end, must show a difference on these same texts, or they could not see one at all.
-    assert possessive.pattern.endswith("\\Z")
-    planted = possessive.pattern[:-2] + "'?\\Z"
-    planted_possessive, planted_greedy = re.compile(planted), re.compile(_greedy_twin(planted))
-    assert any(
-        found(planted_possessive, t) != found(planted_greedy, t) for t in [*real, *swapped, *noise]
-    )
 
 
 def test_the_blind_spot_pin_records_expressions_not_just_counts() -> None:
