@@ -26,9 +26,13 @@ the frame rule alone, because a library raising an engine exception again, as
 
 A frame says who raised an instance, not what it prints. A module can catch a refusal and assign its
 ``__class__``, which leaves the engine's frame on it and prints through that class's ``__str__``, so
-the loader also reads the real class (``wiring._is_engine_text``). No rule here reads ``args``, so a
-module that rewrites them, with text or with an object whose own ``__str__`` holds the value, still
-passes."""
+the loader also reads the real class (``wiring._is_engine_text``). No frame rule here reads
+``args``, so a module that rewrites them, with text or with an object whose own ``__str__`` holds
+the value, still passes.
+
+:func:`argument_text` is not a frame rule. It reads ``args`` through ``BaseException``'s own
+descriptor, so a caller can take an error's text without running the error's code, and the store's
+cipher build (``store.base``) and the AD probe's refusal text call it."""
 
 from __future__ import annotations
 

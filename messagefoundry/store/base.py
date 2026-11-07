@@ -3636,7 +3636,9 @@ class StoreCipherConfigError(ValueError):
     kinds of ``ValueError``, which are refused with :func:`_codec_safe_refusal`'s fixed text
     instead (BACKLOG #3471, #4882): one with a codec error on it, one whose chain cannot be read
     whole, whether or not it holds a codec error, and one whose judgement raised an
-    ``Exception``."""
+    ``Exception``. The build error's text is its one ``str`` argument, read with none of its code
+    run; one whose arguments are not exactly one ``str``, as a pydantic ``ValidationError``'s are
+    not, gets a fixed text in its place (the fifth hold on engine PR 2818)."""
 
 
 def _build_store_cipher(settings: StoreSettings, posture: HopPosture | None) -> Cipher:
