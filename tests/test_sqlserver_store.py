@@ -1275,7 +1275,10 @@ async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(st
         await cur.close()
     # Positive controls: the plant took, so the run below has something to repair.
     assert await _untrusted() == dict.fromkeys(keys.values(), True)
-    assert all(await _rows(table) == {"kept", "ghost"} for table in keys)
+    # Awaited one by one: an await inside a generator expression makes an async generator,
+    # which all() cannot iterate.
+    for table in keys:
+        assert await _rows(table) == {"kept", "ghost"}, table
 
     assert await store._ensure_schema() is True  # pre-marker DB: the full batch really ran
     assert await _untrusted() == dict.fromkeys(keys.values(), False)
@@ -1301,7 +1304,8 @@ async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(st
         await conn.commit()
         await cur.close()
     assert await store._ensure_schema() is True
-    assert all(await _rows(table) == {"kept"} for table in keys)
+    for table in keys:
+        assert await _rows(table) == {"kept"}, table
 
 
 async def test_a_session_for_a_missing_account_is_refused(store) -> None:
