@@ -1572,10 +1572,9 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
     def _usage_text(text: str) -> str:
         """The usage-limits text of the Manager row or card: from 'Usage limits' to ASVS work."""
         start = text.find("Usage limits")
-        if start == -1:
-            return ""
-        end = text.find("ASVS record work", start)
-        return text[start : end if end != -1 else None]
+        end = text.find("ASVS record work", start) if start != -1 else -1
+        # A missing end marker reads as no usage text, not as the rest of the file.
+        return text[start:end] if end != -1 else ""
 
     @classmethod
     def _hook_as_source(cls, text: str, *, row: bool) -> list[str]:
@@ -1591,9 +1590,12 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
             return ["no 'Usage limits' text"]
         wrongs = []
         for clause in cls._CLAUSE_END.split(usage):
-            if cls._HOOK.search(clause) and re.search(r"\b(?:level|trigger)", clause, re.I):
+            if not cls._HOOK.search(clause):
+                continue
+            if re.search(r"\b(?:level|trigger)", clause, re.I):
                 wrongs.append(f"names the hook beside a level or trigger: {clause!r}")
-            if cls._HOOK.search(clause) and "HOLD NEW WORK" in clause and "bind" in clause:
+            # The opening clause says what binds, whatever its verb.
+            if clause.startswith("Usage limits") and "HOLD NEW WORK" in clause:
                 wrongs.append(f"defines the binding HOLD by the hook: {clause!r}")
         if "COMMON.md" not in usage or "*The three usage states*" not in usage:
             wrongs.append("does not name COMMON.md, *The three usage states*")
@@ -1636,16 +1638,32 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
             "`~/.claude/mefor-usage/`, hold the levels and triggers, and korus `roles/COMMON.md` "
             "states the gate."
         )
-        self.assertEqual(4, len(self._hook_as_source(old_row, row=True)))
-        for mutated in (
-            good_row.replace(
+        # Each check fires on its own, so a dead check cannot hide behind another firing twice.
+        self.assertEqual(
+            [
+                "defines the binding HOLD by the hook",
+                "names the hook beside a level or trigger",
+                "does not name COMMON.md, *The three usage states*",
+                "drops the cloud and unwired-root caveat",
+            ],
+            [w.split(":")[0] for w in self._hook_as_source(old_row, row=True)],
+        )
+        mutations = {
+            "the hook as the authority": good_row.replace(
                 "a copy that prints", "the authority for the levels and triggers; it prints"
             ),
-            good_row + " The levels and triggers are held in `thresholds.json`.",
-            good_row.replace(self._ROW_CAVEAT, "they apply"),
-        ):
-            with self.subTest(mutated=mutated[-60:]):
+            "passive voice": good_row + " The levels and triggers are held in `thresholds.json`.",
+            "the caveat dropped": good_row.replace(self._ROW_CAVEAT, "they apply"),
+            "the HOLD defined by the hook, another verb": good_row.replace(
+                "Usage limits still bind, at least the weekly HOLD NEW WORK state,",
+                "Usage limits still apply, at least the weekly HOLD NEW WORK state `watch.py` "
+                "prints,",
+            ),
+        }
+        for name, mutated in mutations.items():
+            with self.subTest(mutation=name):
                 self.assertNotEqual([], self._hook_as_source(mutated, row=True))
+        self.assertEqual("", self._usage_text("Usage limits bind (`watch.py`). No end marker."))
         old_card = "Usage limits still bind (`watch.py`, CLAUDE.md section 5)."
         self.assertNotEqual([], self._hook_as_source(old_card, row=False))
         self.assertNotEqual(
