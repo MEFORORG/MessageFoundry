@@ -2124,8 +2124,8 @@ class UserRecord:
     # one, and a session resolves only while its own ``user_epoch`` equals it. Both copies are
     # sealed: the session's in the session seal, this one in the account's own seal.
     session_epoch: int = 0
-    # THE DIRECTORY ACCOUNT'S ENROLMENT CODE (ADR 0207). The ``hash_token`` digest of the one code an
-    # Administrator issued, when it expires, and the issuing Administrator's account id (``None`` for
+    # THE DIRECTORY ACCOUNT'S ENROLMENT CODE (ADR 0207). The ``hash_token`` digest of the one code
+    # outstanding, when it expires, and the issuing Administrator's account id (``None`` for
     # one the host command issued). All three are NULL with no code outstanding, and every write that
     # clears the digest clears the other two (``enrolment_code_cleared``). Never the code itself.
     enrolment_code_digest: str | None = None

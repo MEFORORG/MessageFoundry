@@ -5912,8 +5912,8 @@ class AuthService:
         #
         # Under require_mfa a minimum-minted directory session reaches nothing outside
         # api/security.py's MFA-exempt set and the enrolment ceremonies. Since ADR 0207 those
-        # ceremonies bind the account's FIRST factor only with a single-use enrolment code an
-        # Administrator issued, so a directory password alone binds nothing: the lockout this
+        # ceremonies bind the account's FIRST factor only with a single-use issued enrolment
+        # code, so a directory password alone binds nothing: the lockout this
         # minimum would otherwise be is an onboarding step, and the pending-MFA page says so.
         return await self._complete_ad_login(
             principal,
@@ -15057,9 +15057,11 @@ class AuthService:
         self, user_id: str, *, actor: str, issuer_id: str | None, via: str
     ) -> IssuedEnrolmentCode:
         """Issue an enrolment code for a directory account's first engine factor, returned ONCE
-        (ADR 0207 sections 4 to 6). ``actor`` is the issuing Administrator's username, or the OS user
-        for the host command; ``issuer_id`` is that Administrator's account id, ``None`` from the
-        host. ``via`` is ``api``, ``ui``, ``reset`` or ``host``.
+        (ADR 0207 sections 4 and 5). ``actor`` is the issuing Administrator's username and
+        ``issuer_id`` that Administrator's account id; ``via`` is ``api`` or ``ui`` from the issue
+        routes, or ``reset`` from :meth:`admin_reset_mfa`. The host command (section 6) does not
+        call this: it calls :func:`write_enrolment_code` with no issuer and writes its own
+        ``auth.enrolment_code_issued`` row, with ``via`` ``host``, and sends no notice.
 
         Refuses, with :class:`EnrolmentCodeIssueRefused`, a local account, a disabled account and an
         account that holds an engine factor; raises :class:`ValueError` ``no such user`` for an

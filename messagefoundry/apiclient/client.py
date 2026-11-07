@@ -1232,7 +1232,7 @@ class EngineClient:
         ``_decode`` rather than clearing the session. That is a property of a different file, not of
         the rule, and the rule is the one thing all three sites must share.
 
-        ``enrolment_code`` is the single-use code an Administrator issued (ADR 0207), which a
+        ``enrolment_code`` is the single-use issued enrolment code (ADR 0207), which a
         directory account's first factor needs on a session its identity provider did not stamp.
         It is sent only when given."""
         body: dict[str, str] = {"code": code}

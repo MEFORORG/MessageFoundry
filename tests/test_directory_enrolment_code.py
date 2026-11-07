@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """ADR 0207: a directory account's first engine factor is bound only with a single-use enrolment
-code an Administrator issued. The acceptance criteria AC-1 to AC-19 are named on each test.
+code issued for it. The acceptance criteria AC-1 to AC-19 are named on each test.
 
 Synthetic accounts and codes only. The store contract is shared with the Postgres and SQL Server
 suites (``tests/_enrolment_code_store_contract.py``); this file runs it on SQLite, keyed and keyless.

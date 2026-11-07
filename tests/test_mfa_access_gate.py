@@ -1276,7 +1276,7 @@ async def test_a_directory_session_minted_at_the_minimum_is_confined_until_it_en
         assert refused.headers.get("X-MFA-Required") == "1"
 
     # The confinement is survivable: the ceremony accepts the directory account, with the
-    # enrolment code an Administrator issues for its first factor (ADR 0207).
+    # enrolment code issued for its first factor (ADR 0207).
     enroll = await service.begin_mfa_enrollment(out.identity)
     confirmed = await service.confirm_mfa_enrollment(
         out.identity,

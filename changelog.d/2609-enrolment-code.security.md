@@ -1,7 +1,7 @@
 - **A directory account's first engine factor binds only with a single-use enrolment code.** Before
   this, whoever held a directory password could sign in by Windows SSO and enrol the account's first
   authenticator, shutting the real holder out of it. Now the TOTP confirm and the passkey finish ask
-  a code an Administrator issued whenever the session is not stamped MFA-verified, with
+  an issued code whenever the session is not stamped MFA-verified, with
   `[security].require_mfa` on or off. An Administrator issues it from `POST /users/{id}/enrolment-code`
   or the console's user page (revoked with `DELETE`), an MFA reset of an enabled directory account
   issues one in its reply, and `messagefoundry issue-enrolment-code` issues one from the host. The

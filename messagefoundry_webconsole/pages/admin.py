@@ -576,8 +576,8 @@ def user_detail_page(
             class_="ctl",
         )
     )
-    # ADR 0207 section 4: a directory account's first factor binds only with an enrolment code an
-    # Administrator issues. Never offered on the caller's own account, which the route refuses too.
+    # ADR 0207 section 4: a directory account's first factor binds only with an issued enrolment code,
+    # which an Administrator may issue here. Never offered on the caller's own account, which the route refuses too.
     if user.auth_provider == "ad" and not is_self:
         danger.append(
             el(

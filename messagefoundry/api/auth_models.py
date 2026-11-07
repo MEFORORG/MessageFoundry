@@ -437,7 +437,7 @@ class MfaConfirmRequest(RequestModel):
     """Confirm a staged enrollment by proving a live TOTP code from the authenticator app."""
 
     code: str = Field(max_length=16)
-    #: ADR 0207: the enrolment code an Administrator issued, which a directory account's first
+    #: ADR 0207: the issued enrolment code, which a directory account's first
     #: factor needs on a session not stamped MFA-verified. Ignored where none is owed.
     enrolment_code: str | None = Field(default=None, max_length=64)
 
