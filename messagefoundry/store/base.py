@@ -2798,6 +2798,29 @@ class AuthStore(Protocol):
         the same."""
         ...
 
+    async def set_user_roles_if_held(
+        self,
+        user_id: str,
+        role_ids: Sequence[str],
+        *,
+        expected_role_ids: Iterable[str],
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """:meth:`set_user_roles` as a COMPARE-AND-SET on the roles the caller read, reporting
+        whether it wrote (vault BACKLOG #3085).
+
+        The directory reconciler decides a role write from a row it read earlier, and another
+        writer, such as a second reconciler or a directory sign-in, may have written the roles in
+        between. So the write compares the record's roles, as sets, with ``expected_role_ids`` in
+        its own transaction, under the row's lock. If they differ, or the row is gone, nothing is
+        written and this returns ``False``. Of two calls that read one set and write another,
+        only the first writes. The compare is on the set, not the record, so a newer write
+        of the same set is not detected.
+        Otherwise it writes as :meth:`set_user_roles` does, with the same ``UnknownRoleError`` and
+        seal refusals."""
+        ...
+
     async def remove_unless_last_admin(
         self,
         user_id: str,

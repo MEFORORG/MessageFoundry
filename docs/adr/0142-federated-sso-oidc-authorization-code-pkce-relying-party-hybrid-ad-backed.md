@@ -542,7 +542,11 @@ B.1 left the verification of what comes back to the build. These are its criteri
   #3174). IF a role stored on the account is
   not among the roles its current directory groups map to, THEN THE SYSTEM SHALL refuse with
   `directory_roles_demoted`, write no roles, and leave the session as it was (BACKLOG #2154). Only a
-  lost role refuses, and channel scope is not compared.
+  lost role refuses on the roles. **Amended 2026-11-06 (vault BACKLOG #3081 item 4):** this criterion
+  said "and channel scope is not compared". IF the account's current groups would narrow its stored
+  channel scope, THEN THE SYSTEM SHALL refuse with `directory_scope_narrowed`, or with
+  `directory_scope_map_unsealed` when the group-to-channel map fails its seal, and write no scope;
+  `docs/SECURITY.md` states the rule.
 - **AC-17 (flow kinds do not cross)** — A step-up flow SHALL NOT mint a session, and a sign-in flow
   SHALL NOT elevate one. Either completion refuses the other kind with `flow_purpose_mismatch`.
 - **AC-18 (the same elevation)** — WHEN the proof holds, THE SYSTEM SHALL elevate through the password

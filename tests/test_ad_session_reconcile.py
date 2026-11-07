@@ -3788,6 +3788,7 @@ async def test_a_rename_already_applied_by_another_caller_is_not_told_twice(
             new_username="jdoe-married",
             held=held,
             from_plan=True,
+            audit_soft=True,
         )
 
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
@@ -3882,6 +3883,7 @@ async def test_a_sign_in_rename_is_not_skipped_when_a_pass_wrote_an_older_name_f
             new_username="jdoe-remarried",
             held=None,
             from_plan=False,
+            audit_soft=False,
         )
 
         after = await store.get_user(user_id)
@@ -3930,6 +3932,7 @@ async def test_a_stale_plan_is_skipped_not_filed_as_a_conflict_when_another_row_
             new_username="jdoe-married",
             held=held,
             from_plan=True,
+            audit_soft=True,
         )
 
         after = await store.get_user(user_id)
@@ -3965,6 +3968,7 @@ async def test_a_row_deleted_before_the_apply_is_refused_without_a_write_or_a_no
             new_username="jdoe-married",
             held=None,
             from_plan=True,
+            audit_soft=True,
         )
 
         assert writes == [], "the refresh wrote to a row it had just read as gone"
@@ -4053,6 +4057,7 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
             new_username="jdoe-married",
             held=held,
             from_plan=False,
+            audit_soft=False,
         )
 
         [conflict] = [
@@ -4094,6 +4099,7 @@ async def test_a_stale_held_row_is_not_a_conflict_when_this_row_already_has_the_
             new_username="jdoe-married",
             held=stale_held,
             from_plan=True,
+            audit_soft=True,
         )
 
         assert not [
@@ -4334,6 +4340,95 @@ async def test_a_holder_that_fails_its_seal_by_the_re_read_is_refused_with_the_l
         await store.close()
 
 
+@pytest.mark.parametrize("shape", ["write_noop", "write_race"])
+async def test_a_holder_that_fails_its_seal_on_the_write_path_is_refused_with_the_lockout_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, shape: str
+) -> None:
+    """Vault BACKLOG #3069 note T3, on a keyed store. No ``held`` is passed, so the pre-check is
+    skipped and the write finds the new name taken by a row whose record was then changed outside
+    the store. That row still holds the name, so the refusal is the lockout one, with no verified
+    id to name and ``held_by_refused`` on the audit row. RED when the write path reads the holder
+    as absent: the warning then says no row holds the name and a later pass retries it, which is
+    false while that holder fails its seal."""
+    path = tmp_path / "sealed.db"
+    store, _ldap, service, notifier, user_id = await _renamed_service(path)
+    try:
+
+        async def _taken(*a: object, **kw: object) -> bool:
+            await store.create_user(
+                user_id="squatter",
+                username="jdoe-married",
+                auth_provider="ad",
+                password_generated=False,
+                audits=(),
+            )
+            await _raw_for(path)("UPDATE users SET display_name=? WHERE id=?", ("bent", "squatter"))
+            if shape == "write_race":
+                raise sqlite3.IntegrityError("UNIQUE constraint failed: users.username")
+            return False
+
+        store.set_user_username = _taken  # type: ignore[method-assign]
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        caplog.clear()
+
+        await service._refresh_cached_username(
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-married",
+            held=None,
+            from_plan=True,
+            audit_soft=True,
+        )
+
+        [conflict] = await _rename_audits(store)
+        detail = json.loads(conflict["detail"])
+        assert detail["detected"] == shape
+        assert detail["held_by_user_id"] is None and detail["held_by_refused"] is True
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert [m for m in messages if "refused at its next sign-in" in m], (
+            f"a seal-failed holder on the {shape} path lost the lockout warning"
+        )
+        assert not [m for m in messages if "no row holds the new name" in m]
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+    finally:
+        await store.close()
+
+
+async def test_a_row_that_fails_its_seal_is_not_refused_as_gone(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3069 note T3, the renamed row itself. Its record is changed outside the store
+    after the plan, so the refresh's pre-read refuses it. The row is still there, so the refresh
+    files no ``row_gone`` conflict saying it was removed, writes nothing and tells nobody; the
+    loader has already reported the seal failure. RED when a seal failure reads as a gone row."""
+    path = tmp_path / "sealed.db"
+    store, _ldap, service, notifier, user_id = await _renamed_service(path)
+    try:
+        await _raw_for(path)("UPDATE users SET display_name=? WHERE id=?", ("bent", user_id))
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        caplog.clear()
+
+        await service._refresh_cached_username(
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-married",
+            held=None,
+            from_plan=True,
+            audit_soft=True,
+        )
+
+        assert not await _rename_audits(store), "a seal-failed row was filed as a rename refusal"
+        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+        raw = await store.get_user(user_id)
+        assert raw is not None and raw.username == "jdoe"
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert [m for m in messages if "fails its integrity check" in m and "BACKLOG #3069" in m]
+        assert not [m for m in messages if "removed" in m]
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+    finally:
+        await store.close()
+
+
 async def test_a_store_fault_on_the_holder_re_read_skips_only_that_rename(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -4418,6 +4513,7 @@ async def test_a_store_fault_on_the_holder_re_read_still_raises_off_the_reconcil
                 new_username="jdoe-married",
                 held=replace(row, id="gone-holder", username="jdoe-married"),
                 from_plan=False,
+                audit_soft=False,
             )
         after = await store.get_user(user_id)
         assert after is not None and after.username == "jdoe"
@@ -4442,6 +4538,7 @@ async def test_a_row_gone_refusal_does_not_warn_of_a_lockout(
             new_username="jdoe-married",
             held=None,
             from_plan=False,
+            audit_soft=False,
         )
         [warning] = [r for r in caplog.records if r.name == "messagefoundry.auth.service"]
         assert "removed" in warning.getMessage()
@@ -4481,6 +4578,7 @@ async def test_a_lost_write_with_no_holder_left_does_not_warn_of_a_lockout(
             new_username="jdoe-married",
             held=None,
             from_plan=False,
+            audit_soft=False,
         )
         [warning] = [r for r in caplog.records if r.name == "messagefoundry.auth.service"]
         assert "no row holds the new name" in warning.getMessage()
@@ -4549,6 +4647,7 @@ async def test_two_refreshes_of_one_rename_at_once_write_audit_and_notify_once(
                         new_username="jdoe-married",
                         held=None,
                         from_plan=from_plan,
+                        audit_soft=from_plan,
                     )
                 )
 
@@ -5488,6 +5587,7 @@ async def test_the_login_path_rename_still_fails_on_a_refused_audit_write(
                 new_username="jdoe-new",
                 held=None,
                 from_plan=False,
+                audit_soft=False,
             )
         assert refused == ["jdoe-new"]
         after = await store.get_user(jdoe.id)
@@ -6031,6 +6131,105 @@ async def test_a_role_revocation_another_reconciler_applied_first_is_quiet() -> 
         )
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
         assert len(_revoked_rows(await store.list_audit())) == 2
+    finally:
+        await store.close()
+
+
+async def test_two_reconcilers_that_both_read_the_old_roles_report_the_change_once() -> None:
+    """Vault BACKLOG #3085, the role-half race. Two applies of one role revocation both read the
+    old roles before either writes. Only the first write counts the change: one apply reports and
+    tells the user, the other is quiet, and both still write their row ("audit always").
+
+    **The barrier is what makes this the race.** Without it ``asyncio.gather`` can run one apply
+    to its write before the other reads, and the second would read the new roles and skip, which
+    passed before the compare-and-set too. Neither apply may go past its first read of the account
+    until both have made it. The sessions are ended first, so neither apply's session count can
+    decide its report: only the role write can."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        await store.revoke_user_sessions(user.id)
+        target = () if await store.get_user_role_ids(user.id) else (Role.OPERATOR.value,)
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=target
+        )
+        barrier = asyncio.Barrier(2)
+        reads = 0
+        load_user = service._load_user
+
+        async def _read_then_wait(user_id: str) -> VerifiedUser | None:
+            nonlocal reads
+            row = await load_user(user_id)
+            reads += 1
+            if reads <= 2:
+                await barrier.wait()
+            return row
+
+        service._load_user = _read_then_wait  # type: ignore[method-assign]
+        writes: list[bool] = []
+        write = store.set_user_roles_if_held
+
+        async def _count_write(*a: Any, **kw: Any) -> bool:
+            wrote = await write(*a, **kw)
+            writes.append(wrote)
+            return wrote
+
+        store.set_user_roles_if_held = _count_write  # type: ignore[method-assign]
+        watermark = await service._audit_watermark()
+        async with asyncio.timeout(10):
+            outcomes = await asyncio.gather(
+                service._apply_reconcile_revocation(revocation, watermark=watermark),
+                service._apply_reconcile_revocation(revocation, watermark=watermark),
+            )
+
+        assert sorted(writes) == [False, True], "both applies must reach the write"
+        assert sorted(outcomes) == ["quiet", "reported"], outcomes
+        assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
+        assert [r["sessions"] for r in _revoked_rows(await store.list_audit())] == [0, 0]
+        assert sorted(await store.get_user_role_ids(user.id)) == sorted(target)
+    finally:
+        await store.close()
+
+
+async def test_a_stale_role_plan_does_not_overwrite_a_newer_role_write() -> None:
+    """Vault BACKLOG #3085, the compare-and-set's other half. Between the apply's read of the roles
+    and its write, another writer (a directory sign-in, here a bare store write standing in for
+    one) moves the roles to a third set. The apply writes nothing over it, counts no role change,
+    and, ending no session, is quiet. RED when the write compares on the plan's target rather
+    than on what the apply read: it would then write the stale set and report it."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        await store.revoke_user_sessions(user.id)
+        await store.set_user_roles(user.id, [Role.VIEWER.value])
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=(Role.OPERATOR.value,)
+        )
+        load_user = service._load_user
+
+        async def _read_then_sign_in(user_id: str) -> VerifiedUser | None:
+            row = await load_user(user_id)
+            await store.set_user_roles(user_id, [Role.ADMINISTRATOR.value])
+            return row
+
+        service._load_user = _read_then_sign_in  # type: ignore[method-assign]
+
+        outcome = await service._apply_reconcile_revocation(
+            revocation, watermark=await service._audit_watermark()
+        )
+
+        assert outcome == "quiet"
+        assert await store.get_user_role_ids(user.id) == [Role.ADMINISTRATOR.value], (
+            "a stale reconciler plan overwrote a newer role write"
+        )
+        assert notifier.sent == []
+        assert [r["sessions"] for r in _revoked_rows(await store.list_audit())] == [0]
     finally:
         await store.close()
 

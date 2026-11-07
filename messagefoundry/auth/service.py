@@ -1006,6 +1006,21 @@ DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
 #: re-saving the map (BACKLOG #3082). Audited as :data:`DIRECTORY_ROLES_DEMOTED` is.
 DIRECTORY_ROLE_MAP_UNSEALED = "directory_role_map_unsealed"
 
+#: The outcome :meth:`AuthService._directory_roles_lost` gives, on every leg that calls it, an
+#: account whose stored channel scope its current groups would narrow (vault BACKLOG #3081 item
+#: 4); that method's docstring states the rule. Audited as :data:`DIRECTORY_ROLES_DEMOTED` is, and
+#: its fix is the same, a new sign-in, which writes the scope the groups grant now.
+DIRECTORY_SCOPE_NARROWED = "directory_scope_narrowed"
+
+#: The outcome :meth:`AuthService._directory_roles_lost` gives, on every leg that calls it, an
+#: account holding a channel scope when the AD group-to-channel map fails its seal, so no scope can
+#: be judged (vault BACKLOG #3081 item 4). Not :data:`DIRECTORY_SCOPE_NARROWED`, for the reason
+#: :data:`DIRECTORY_ROLE_MAP_UNSEALED` is not a demotion: the fix is an administrator re-saving the
+#: map. A new sign-in reads the same failing map. It keeps a scope an administrator set, so this
+#: refusal stands, and withdraws a directory-set scope to NULL, which grants no channel, so the
+#: step-up then passes with no channels.
+DIRECTORY_SCOPE_MAP_UNSEALED = "directory_scope_map_unsealed"
+
 
 class DirectoryRefusal(Enum):
     """Which fix clears a second-factor, enrolment or password re-bind leg's directory refusal,
@@ -1015,8 +1030,9 @@ class DirectoryRefusal(Enum):
 
     ``UNCONFIRMED``: every other directory refusal. A later try, or an administrator, clears it.
     ``DEMOTED``: the account is present and enabled, but lost a role in the directory (BACKLOG
-    #2240; the rule is in ``AuthService._directory_roles_lost``). A new sign-in clears it, because
-    it takes the roles the groups grant now. The precise cause stays on the audit row; a caller
+    #2240), or its groups would narrow its channel scope (vault BACKLOG #3081 item 4); the rule is
+    in ``AuthService._directory_roles_lost``. A new sign-in clears it, because it takes the roles
+    and the scope the groups grant now. The precise cause stays on the audit row; a caller
     says only which fix."""
 
     UNCONFIRMED = DIRECTORY_UNCONFIRMED
@@ -1024,10 +1040,10 @@ class DirectoryRefusal(Enum):
 
 
 def _directory_refusal(outcome: str) -> DirectoryRefusal:
-    """The fix a ``_directory_step_up_refusal`` outcome needs: a lost role is a demotion, and every
-    other outcome, an outage or a role map that failed its seal included, is an account the
-    directory did not confirm."""
-    if outcome == DIRECTORY_ROLES_DEMOTED:
+    """The fix a ``_directory_step_up_refusal`` outcome needs: a lost role or a narrowed channel
+    scope is a demotion, which a new sign-in clears, and every other outcome, an outage or a role
+    map that failed its seal included, is an account the directory did not confirm."""
+    if outcome in (DIRECTORY_ROLES_DEMOTED, DIRECTORY_SCOPE_NARROWED):
         return DirectoryRefusal.DEMOTED
     return DirectoryRefusal.UNCONFIRMED
 
@@ -1110,11 +1126,22 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
             "Your directory groups no longer grant the roles this session holds. Sign out, then"
             " sign in again to take the roles your groups grant now."
         ),
+        # The same fix as a lost role: a new sign-in writes the scope the groups grant now (vault
+        # BACKLOG #3081 item 4).
+        DIRECTORY_SCOPE_NARROWED: (
+            "Your directory groups no longer grant the channels this session holds. Sign out, then"
+            " sign in again to take the channels your groups grant now."
+        ),
         # Not a demotion: a new sign-in reads the same failing map, so it is never told to sign
         # out (BACKLOG #3082).
         DIRECTORY_ROLE_MAP_UNSEALED: (
             "Your directory roles could not be confirmed. Try again later. If it is still refused,"
             " ask an administrator."
+        ),
+        # The scope map's twin of the line above (vault BACKLOG #3081 item 4).
+        DIRECTORY_SCOPE_MAP_UNSEALED: (
+            "Your directory channels could not be confirmed. Try again later. If it is still"
+            " refused, ask an administrator."
         ),
     }
 )
@@ -6972,7 +6999,7 @@ class AuthService:
         fresh = await self._load_user(user.id)
         if fresh is None:
             return await refuse("session_gone", lost=True)
-        refusal = await self._directory_roles_lost(fresh.role_ids, principal.groups)
+        refusal = await self._directory_roles_lost(fresh, principal.groups)
         if refusal is not None:
             return await refuse(refusal)
         purpose = flow.step_up_purpose
@@ -7797,6 +7824,7 @@ class AuthService:
                     new_username=principal.username,
                     held=by_name,
                     from_plan=False,
+                    audit_soft=False,
                     client=client,
                 )
             # BACKLOG #1139. AN ABSENT DIRECTORY ATTRIBUTE IS NOT AN INSTRUCTION TO ERASE.
@@ -9126,8 +9154,8 @@ class AuthService:
         new_username: str,
         held: UserRecord | None,
         from_plan: bool,
+        audit_soft: bool,
         client: str | None = None,
-        audit_soft: bool = False,
     ) -> None:
         """Copy a directory-reported rename down onto a row's cached ``username`` (BACKLOG #1532).
 
@@ -9135,7 +9163,9 @@ class AuthService:
         is at the skip below, and only there). True for the reconciler: a row that holds neither
         the plan's old name nor its new one is skipped. False for the login, which writes.
 
-        ``audit_soft`` is passed by the reconciler alone (BACKLOG #3018), so its conflict rows go
+        ``audit_soft`` is required too, for the same reason (vault BACKLOG #3069 note T4): a
+        default would let a caller that plans like the reconciler fail like a sign-in. It is True
+        for the reconciler alone (BACKLOG #3018), so its conflict rows go
         through :meth:`_audit_reconciler_row`, and a refused append of the rename's own row, which
         commits with the write (step 7), rolls the rename back and is logged rather than raised.
         The login path leaves it off, so there a refused write still fails the sign-in, as it always
@@ -9182,7 +9212,9 @@ class AuthService:
 
         write_audit = self._audit_reconciler_row if audit_soft else self._audit
 
-        async def _refuse(held_by: str | None, detected: str, holds: str) -> None:
+        async def _refuse(
+            held_by: str | None, detected: str, holds: str, *, holder_refused: bool = False
+        ) -> None:
             # A DIFFERENT ROW ALREADY HOLDS THE NAME. Two accounts cannot share one; refusing the
             # write is the only safe move, and it is audited rather than logged-and-forgotten because
             # an operator has to resolve it. The likely cause is a stale row for a departed operator
@@ -9229,6 +9261,11 @@ class AuthService:
             # never ``old_username``: passing that would bring back the #2291 defect on the login
             # path, an audit row naming an account that no longer exists. The one exception is the
             # ``row_gone`` refusal at the pre-read, where no row was read to hold a name.
+            #
+            # ``holder_refused`` (vault BACKLOG #3069 note T3): a row holds the name but fails its
+            # seal, so its id is not verified and ``held_by`` is None. It still holds the name, so
+            # this is the lockout, not the "no row holds the new name" case, and the audit says
+            # so with ``held_by_refused`` rather than naming an unverified id.
             await write_audit(
                 "auth.ad_username_refresh_conflict",
                 actor=holds,
@@ -9238,6 +9275,7 @@ class AuthService:
                         "held_by_user_id": held_by,
                         "detected": detected,
                         "source": "directory",
+                        **({"held_by_refused": True} if holder_refused else {}),
                     }
                 ),
                 client=client,
@@ -9249,7 +9287,7 @@ class AuthService:
                     scrub_log_argument(holds),
                 )
                 return
-            if held_by is None:
+            if held_by is None and not holder_refused:
                 # The write lost to another writer, but the re-read found no row holding the name
                 # now. Nothing is locked out, and a later sign-in or a pass that probes the account
                 # copies the name down again, so the lockout warning below would be false (BACKLOG
@@ -9270,7 +9308,9 @@ class AuthService:
                 "the stale row is removed; the session it holds now survives only to the absolute "
                 "cap (BACKLOG #1532)",
                 scrub_log_argument(holds),
-                held_by,
+                held_by
+                if held_by is not None
+                else "not verified: its record fails its integrity check",
                 detected,
             )
 
@@ -9293,8 +9333,28 @@ class AuthService:
         # new name, so about once per directory rename, not once per sign-in. Keeping one read site
         # for both callers keeps them on one path, which is the point of this method; the
         # post-write read-back the item also counted went with BACKLOG #2290.
-        before = await self._load_user(user_id)
+        async def _own_row_refused(found: _UserLookup) -> bool:
+            # Vault BACKLOG #3069 note T3. A row that fails its seal is still there, so only a
+            # gone row is ``row_gone``: filing a refused one as removed would be false. The loader
+            # has already reported the seal failure, and the store refuses to write a failing
+            # record, so nothing is written, and nothing more is filed. The next read that finds
+            # the record verifying retries it. ``refused`` also reads true for a row deleted
+            # between the lookup's row and role reads, which the loader does not report, so a
+            # refused lookup is asked once more whether the row is there.
+            if not found.refused or not await self._user_id_held(user_id):
+                return False
+            _log.warning(
+                "AD account %s was renamed in the directory, but its record fails its integrity "
+                "check, so the new name was not written (BACKLOG #3069)",
+                user_id,
+            )
+            return True
+
+        found = await self._lookup_user(user_id)
+        before = found.user
         if before is None:
+            if await _own_row_refused(found):
+                return
             # Deleted between the plan and the apply. Refused as a write that finds the row gone is
             # refused below, without an UPDATE that can only match nothing. With no row there is
             # no name it holds, so the caller's is the last one known for it. No holder either:
@@ -9365,10 +9425,12 @@ class AuthService:
             # as the caller's read would have been, with the lockout warning, not left to the
             # write-path refusal's "a later pass retries it", which is false while that holder
             # stays seal-failed. Its id is not verified, so the audit names ``held``, the last
-            # verified holder. NOT CLOSED HERE: the reconciler's own ``held`` read, and at least
-            # the two write-path holder reads below, still read a seal-failed holder as None; and
-            # ``refused`` also reads true for a holder deleted or re-keyed between the re-read's
-            # own row and role reads, a narrow window that still files this refusal.
+            # verified holder. The two write-path holder reads below read it the same way (vault
+            # BACKLOG #3069 note T3), with no verified id to name. NOT CLOSED HERE: the reconciler's
+            # own ``held`` read still reads a seal-failed holder as None, so the pre-check is
+            # skipped and the write's guard catches it instead; and ``refused`` also reads true for
+            # a holder deleted or re-keyed between the re-read's own row and role reads, a narrow
+            # window that still files this refusal.
             #
             # On the reconciler's path (``audit_soft``) a store fault on this re-read skips this
             # one rename for this pass rather than raising: a raise would end the pass before the
@@ -9462,9 +9524,15 @@ class AuthService:
             if not _is_integrity_refusal(exc):
                 raise
             # Re-read rather than guess who won: this is an error path, the cost is irrelevant, and an
-            # audit row naming the holder is what makes the collision actionable.
-            winner = await self._load_user_by_username(new_username)
-            await _refuse(winner.id if winner is not None else None, "write_race", before.username)
+            # audit row naming the holder is what makes the collision actionable. A holder that
+            # fails its seal still holds the name (vault BACKLOG #3069 note T3).
+            winner = await self._lookup_by_username(new_username)
+            await _refuse(
+                winner.user.id if winner.user is not None else None,
+                "write_race",
+                before.username,
+                holder_refused=winner.refused,
+            )
             return
         if refused is not None:
             # A sign-in raises the append's own error, as a refused row always failed it. The
@@ -9521,13 +9589,18 @@ class AuthService:
         #     names when that read comes, does not order these: it stops only a reconciler plan
         #     that a write overtook before this pre-read. Logged at INFO so the skipped write is visible without paging anyone.
         if not written:
-            after = await self._load_user(user_id)
+            found = await self._lookup_user(user_id)
+            after = found.user
             if after is None:
-                await _refuse(None, "row_gone", before.username)
+                if not await _own_row_refused(found):
+                    await _refuse(None, "row_gone", before.username)
             elif after.username == before.username:
-                holder = await self._load_user_by_username(new_username)
+                holder = await self._lookup_by_username(new_username)
                 await _refuse(
-                    holder.id if holder is not None else None, "write_noop", before.username
+                    holder.user.id if holder.user is not None else None,
+                    "write_noop",
+                    before.username,
+                    holder_refused=holder.refused,
                 )
             else:
                 _log.info(
@@ -10083,7 +10156,18 @@ class AuthService:
         So a disabled or absent account's revocation reports even when it ended nothing, as when
         the user signed out mid-pass, unless :meth:`_already_revoked_elsewhere` finds a verified
         row showing another pass already revoked it (owner ruling B258-R7). That method states the
-        rule."""
+        rule.
+
+        A role change counts only when THIS call's write made it: the write is a compare-and-set on
+        the roles this call read (vault BACKLOG #3085), so of two reconcilers that both read the old
+        roles only the first counts it, and the second, ending no session, is quiet. A write whose
+        roles another writer moved to a different set after this call's read writes nothing. **Not
+        closed, at least:** a sign-in that wrote between the pass's plan and this call's read, since
+        the plan's roles are not carried to compare on; and a newer write of the same set this call
+        read, since the compare is on the set, not the record. **Residual, at least:** the second
+        can still end a session the first had not yet ended, when its whole apply runs between the
+        first's role write and the first's own session revocation. Both then report, the first for
+        the roles and the second for the session."""
         user = await self._load_user(revocation.user_id)
         if revocation.reason == reconcile.SCOPE_CHANGED and (
             user is None or user.channel_scope != revocation.scope_from
@@ -10101,33 +10185,50 @@ class AuthService:
         # No role write for an account that is gone or fails its seal (BACKLOG #2592): the store would
         # refuse it, and ending the sessions below needs no write to the account. None either when
         # the stored roles already match, as they do once another reconciler wrote them (BACKLOG
-        # #3085). Read before the write, so two reconcilers that both read the old roles before
-        # either wrote both count it as a change, and both report.
+        # #3085). That read is not the decision: two reconcilers can both read the old roles before
+        # either writes. So the write is a compare-and-set on the roles read here (vault BACKLOG
+        # #3085): only the first of them writes and counts a change, and a write that finds the
+        # roles moved since this read writes nothing and counts none.
         roles_changed = False
         if (
             revocation.role_ids is not None
             and user is not None
             and set(user.role_ids) != set(revocation.role_ids)
         ):
-            roles_changed = True
-            await self._store.set_user_roles(
-                revocation.user_id, list(revocation.role_ids), assigned_by="ad-reconcile"
+            roles_changed = await self._store.set_user_roles_if_held(
+                revocation.user_id,
+                list(revocation.role_ids),
+                expected_role_ids=user.role_ids,
+                assigned_by="ad-reconcile",
             )
-            # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a demotion of
-            # the last enabled Administrator is applied, never refused. It alerts and audits
-            # instead, right after the write, so no later step's failure can skip it. The ruling
-            # accepts the cost, noted with vault BACKLOG #2711.
-            # `user` was read through its seal at the top of this method, not taken from the plan,
-            # whose roles can be a pass old: the report judges what THIS write took away.
-            await self._report_directory_admin_loss(
-                user, before=user.role_ids, after=revocation.role_ids, via="ad-reconcile"
-            )
-            # Vault BACKLOG #3141. The gain side, from the same sealed read and at the same point,
-            # so a later step's failure cannot lose the page. The next sign-in finds the role
-            # already written and gains nothing, so this pass is the only chance to raise it.
-            self._report_directory_admin_grant(
-                user, before=user.role_ids, after=revocation.role_ids
-            )
+            if not roles_changed:
+                # The roles moved after the read above, or the row went. The writer that moved
+                # them, a second reconciler or a directory sign-in, owns that change and its report;
+                # a stale plan must not write over a newer write either. The next pass plans from
+                # what is stored then.
+                _log.info(
+                    "directory reconcile: the roles of %s changed after this pass read them, or "
+                    "the account went, so this revocation wrote no role (BACKLOG #3085)",
+                    scrub_log_argument(revocation.username),
+                )
+            else:
+                # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a
+                # demotion of the last enabled Administrator is applied, never refused. It alerts
+                # and audits instead, right after the write, so no later step's failure can skip
+                # it. The ruling accepts the cost, noted with vault BACKLOG #2711.
+                # `user` was read through its seal at the top of this method, not taken from the
+                # plan, whose roles can be a pass old, and the write landed only while the record
+                # still held those roles: the report judges exactly what THIS write took away.
+                await self._report_directory_admin_loss(
+                    user, before=user.role_ids, after=revocation.role_ids, via="ad-reconcile"
+                )
+                # Vault BACKLOG #3141. The gain side, from the same sealed read and at the same
+                # point, so a later step's failure cannot lose the page. The next sign-in finds the
+                # role already written and gains nothing, so this pass is the only chance to raise
+                # it.
+                self._report_directory_admin_grant(
+                    user, before=user.role_ids, after=revocation.role_ids
+                )
         revoked = (await self._store.revoke_user_sessions(revocation.user_id)).count
         # Owner ruling 2026-10-17 narrows "audit always": a disabled or absent account whose
         # revocation ended nothing still reports, unless a verified row shows another pass revoked
@@ -10963,12 +11064,19 @@ class AuthService:
 
     async def _load_user(self, user_id: str) -> VerifiedUser | None:
         """The account ``user_id`` names, its integrity seal checked, or ``None``. With
-        :meth:`_lookup_by_username`, :meth:`_lookup_by_directory_object_id`,
+        :meth:`_lookup_user`, :meth:`_lookup_by_username`, :meth:`_lookup_by_directory_object_id`,
         :meth:`_load_user_by_federated_subject`, :meth:`_load_users` and :meth:`_verified`, the
         ONLY readers of the store's user readers in this service, beside the two existence
         questions; ``tests/test_user_seal.py`` holds that. See
         :meth:`_verified` for what ``None`` covers."""
-        return await self._verified(await self._store.get_user(user_id))
+        return (await self._lookup_user(user_id)).user
+
+    async def _lookup_user(self, user_id: str) -> _UserLookup:
+        """The read behind :meth:`_load_user`, also saying whether the row is there at all, so a
+        caller can tell a record that fails its seal from one that is gone (vault BACKLOG #3069).
+        ``refused`` also reads true for a row deleted between the row and role reads."""
+        raw = await self._store.get_user(user_id)
+        return _UserLookup(await self._verified(raw), raw is not None)
 
     async def _load_user_by_username(self, username: str) -> VerifiedUser | None:
         """:meth:`_load_user`, by username."""
@@ -12537,7 +12645,7 @@ class AuthService:
             ):
                 refusal = DIRECTORY_IDENTITY_CONFLICT
             else:
-                refusal = await self._directory_roles_lost(current.role_ids, groups)
+                refusal = await self._directory_roles_lost(current, groups)
             if refusal is not None:
                 return _Reproof(ok=False, user=current, reason=refusal, directory_unconfirmed=True)
         if not clear:
@@ -14807,7 +14915,8 @@ class AuthService:
         row. The Windows SSO sign-in and the password step-up refuse the same row the same way.
         This leg used to ask an id-less row with no binding by its name.
 
-        **A present account that lost a role in the directory is refused too (BACKLOG #2240),** by
+        **A present account that lost a role in the directory is refused too (BACKLOG #2240), and so
+        is one whose channel scope its groups would narrow (vault BACKLOG #3081 item 4),** by
         :meth:`_directory_roles_lost`, whose docstring states the rule.
         """
         answer = await self._directory_presence(user)
@@ -14819,16 +14928,17 @@ class AuthService:
         fresh = await self._load_user(user.id)
         if fresh is None:
             return ACCOUNT_REFUSED
-        return await self._directory_roles_lost(fresh.role_ids, answer.groups)
+        return await self._directory_roles_lost(fresh, answer.groups)
 
-    async def _directory_roles_lost(
-        self, role_ids: Iterable[str], groups: Iterable[str]
-    ) -> str | None:
-        """Why a stored role in ``role_ids`` is not among the roles ``groups`` map to, or ``None``
-        when every one is: the demotion test the directory step-up and enrolment legs refuse on
-        (BACKLOG #2240, #2154, #3061, #3081), shared by every leg that refuses on it (BACKLOG #3081
-        item 6). This docstring is where the rule and its reasons live; a caller cites it rather
-        than restating it. An account with no roles has none to lose.
+    async def _directory_roles_lost(self, user: VerifiedUser, groups: Iterable[str]) -> str | None:
+        """Why the stored authority of directory account ``user`` exceeds what ``groups`` grant,
+        or ``None`` when it does not: the demotion test the directory step-up and enrolment legs
+        refuse on (BACKLOG #2240, #2154, #3061, #3081), shared by every leg that refuses on it
+        (BACKLOG #3081 item 6). This docstring is where the rule and its reasons live; a caller
+        cites it rather than restating it. ``user`` is the row the caller read after its directory
+        answer, through the loader, so what is judged is what the account's seal covers. An
+        account with no roles has none to lose, and the role test reads no role map for it (vault
+        BACKLOG #3081 item 7).
 
         Every stored role must be among the roles the account's current groups map to, the same
         pair the reconciler diffs. Without the test, an operator demoted in the directory since
@@ -14845,20 +14955,60 @@ class AuthService:
 
         Only a LOST role counts: an added role leaves the account holding fewer roles than the
         directory grants, not more. Roles are compared by id, not by permission, so a move from one
-        role to another counts even when the new role grants more. Channel scope is not compared.
-        At least three role decisions ask a different question and do not call this: sign-in and
-        the reconciler ask whether the roles CHANGED at all, because they re-sync or revoke, and
+        role to another counts even when the new role grants more. At least three role decisions
+        ask a different question and do not call this: sign-in and the reconciler ask whether the
+        roles CHANGED at all, because they re-sync or revoke, and
         :meth:`identity_for_cert_user_id` keeps the stored roles still mapped, because it narrows
-        rather than refuses."""
-        held = set(role_ids)
-        if not held:
+        rather than refuses.
+
+        **A narrowed channel scope refuses too (vault BACKLOG #3081 item 4),** as
+        :data:`DIRECTORY_SCOPE_NARROWED`, after the role test passes. The question is the
+        reconciler's scope re-diff (ADR 0198): would
+        :func:`~messagefoundry.auth.channel_scope.decide_ad_channel_scope` take a channel away from
+        the stored scope? The reconciler revokes for exactly that, so without this test an account
+        whose directory groups lost a scope-mapped group would step up with the channels it no
+        longer holds until the next pass. A stored scope that grants nothing cannot narrow, so no
+        map is read for it. An account whose groups grant Administrator is not asked, because the
+        role reaches every channel; that is decided from the roles the groups grant, as sign-in and
+        the reconciler decide it. A new sign-in clears the refusal: it writes the scope the groups
+        grant now. When the AD group-to-channel map fails its seal, no scope can be judged, so an
+        account with a scope that grants something is refused with
+        :data:`DIRECTORY_SCOPE_MAP_UNSEALED`, whether or not it would narrow, as the role map's
+        failure is refused. A new sign-in reads the same failing map. It keeps a scope an
+        administrator set, so that refusal stands, and withdraws a directory-set scope to NULL,
+        which grants no channel, so the step-up then passes with no channels. Neither restores
+        the scope, so it is not told to sign in again. The role map is still read here, for
+        the Administrator question, when the account holds no role but a scope that grants
+        something."""
+        groups = frozenset(groups)  # read more than once below
+        held = set(user.role_ids)
+        role_map: AdMap | None = None
+        if held:
+            role_map = await self._sealed_ad_map(AD_ROLE_MAP)
+            if role_map is None:
+                return DIRECTORY_ROLE_MAP_UNSEALED
+            if not held <= role_map.values_for(groups):
+                return DIRECTORY_ROLES_DEMOTED
+        # Compared with the empty set, not by truth: a wildcard grant reads as None, every channel,
+        # and can narrow.
+        if channel_scope.scope_channels(user.channel_scope) == frozenset():
             return None
-        role_map = await self._sealed_ad_map(AD_ROLE_MAP)
         if role_map is None:
-            return DIRECTORY_ROLE_MAP_UNSEALED
-        if not held <= role_map.values_for(groups):
-            return DIRECTORY_ROLES_DEMOTED
-        return None
+            role_map = await self._ad_map(AD_ROLE_MAP)
+        if Role.ADMINISTRATOR.value in role_map.values_for(groups):
+            return None
+        scope_map = await self._sealed_ad_map(AD_SCOPE_MAP)
+        if scope_map is None:
+            return DIRECTORY_SCOPE_MAP_UNSEALED
+        decision = channel_scope.decide_ad_channel_scope(
+            channel_scope.ScopeInput(
+                stored_scope=user.channel_scope,
+                stored_source=user.channel_scope_source,
+                mapped=frozenset(scope_map.values_for(groups)),
+                administrator=False,
+            )
+        )
+        return DIRECTORY_SCOPE_NARROWED if decision.narrows else None
 
     async def _directory_presence(self, user: UserRecord) -> reconcile.Probe | str:
         """Ask the directory whether AD row ``user`` is a present, enabled account. Returns the

@@ -4065,6 +4065,28 @@ def without_role(role_id: str) -> UserChange:
     return apply
 
 
+def roles_if_held(
+    role_ids: Sequence[str],
+    *,
+    expected_role_ids: Iterable[str],
+    assigned_by: str | None,
+    now: float,
+) -> UserChange:
+    """``set_user_roles_if_held``'s compare-and-set (vault BACKLOG #3085): the account's roles
+    replaced with ``role_ids``, only while the record still holds exactly ``expected_role_ids``,
+    compared as sets. Each backend runs it on the record its write read under the row's lock, so
+    a write decided from an older read of the roles writes nothing once another writer has moved
+    them."""
+    expected = frozenset(expected_role_ids)
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if frozenset(r.role_ids) != expected:
+            return None
+        return r.with_roles(role_ids, assigned_by=assigned_by, now=now)
+
+    return apply
+
+
 class UnknownRoleError(LookupError):
     """A role write named a role id with no ``roles`` row; nothing was written (BACKLOG #2592).
 
@@ -18528,6 +18550,26 @@ class MessageStore:
                 user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
             )
             await self._commit()
+
+    async def set_user_roles_if_held(
+        self,
+        user_id: str,
+        role_ids: Sequence[str],
+        *,
+        expected_role_ids: Iterable[str],
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """The compare-and-set role write (vault BACKLOG #3085); see ``AuthStore``. Under the one
+        writer lock, so no other write to the row lands between the compare and the write."""
+        now = time.time() if now is None else now
+        change = roles_if_held(
+            role_ids, expected_role_ids=expected_role_ids, assigned_by=assigned_by, now=now
+        )
+        async with _writer_txn(self._db, self._lock):
+            written = await self._write_user(user_id, change)
+            await self._commit()
+        return written is not None
 
     async def set_user_channel_scope(
         self,

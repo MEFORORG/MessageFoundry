@@ -839,6 +839,22 @@ async def test_concurrent_admin_removals_leave_one(store) -> None:
     await assert_concurrent_removals_leave_one(store)
 
 
+async def test_role_write_if_held_contract(store) -> None:
+    """Vault BACKLOG #3085 on SQL Server: the reconciler's compare-and-set role write writes only
+    while the record holds the set the caller read."""
+    from tests._role_write_if_held_contract import assert_role_write_if_held_contract
+
+    await assert_role_write_if_held_contract(store)
+
+
+async def test_concurrent_role_writes_from_one_read_write_once(store) -> None:
+    """Vault BACKLOG #3085 on SQL Server: two writes from one read on two pooled connections, at
+    once. The ``UPDLOCK, ROWLOCK`` read serializes them; one writes."""
+    from tests._role_write_if_held_contract import assert_concurrent_role_writes_write_once
+
+    await assert_concurrent_role_writes_write_once(store)
+
+
 async def test_first_admin_grant_contract(store) -> None:
     """BACKLOG #3078 on SQL Server: the first-administrator grant refuses while another enabled
     administrator exists, and over credentials the caller did not write."""
