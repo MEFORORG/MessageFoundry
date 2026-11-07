@@ -7146,7 +7146,9 @@ def _discard_minted_custody(
         # A new store location only where the pin refused: a store another key made is there.
         step = keep_the_key_step(
             store,
-            new_store=isinstance(failure, StoreIdPinRefusedBeforeWrite),
+            new_store=isinstance(
+                failure, (StoreIdPinRefusedBeforeWrite, StoreCreateBatchFailedBeforeKeyUse)
+            ),
             service_account=service_account,
         )
         print(
@@ -9138,9 +9140,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     # The store key a failed create kept, for the closing line (PR 2804 fourteenth hold).
     kept_key: Path | None = None
+    # A create batch that failed before its commit (PR 2804 hold 17): no write started, so its
+    # error is never read as a refused write.
+    batch_failed = False
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
-        nonlocal write_started, kept_key
+        nonlocal write_started, kept_key, batch_failed
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
         # Under the host key provider the store is created with the blob minted above, so its
         # genesis record carries that blob's store id (vault BACKLOG #3411).
@@ -9164,6 +9169,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # The key is dealt with (PR 2804 hold 17); the batch's own error is what the operator
             # is told, raised outside this arm so its own cause is kept.
             batch_failure = exc.failure
+            batch_failed = True
         if batch_failure is not None:
             raise batch_failure
         try:
@@ -9312,7 +9318,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except Exception as exc:
         # The server backends' integrity refusals, which share no class with sqlite3's. Matched by
         # MRO name as the service matches them; anything else propagates as it did before.
-        if not _is_integrity_refusal(exc):
+        if not _is_integrity_refusal(exc) or batch_failed:
             raise
         return refused_write(exc)
 

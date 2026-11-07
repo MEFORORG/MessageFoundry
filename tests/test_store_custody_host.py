@@ -2716,9 +2716,64 @@ def test_a_create_batch_that_fails_before_commit_is_typed_on_a_minting_open(
         assert raised.value is collision
 
 
+class UniqueViolationError(Exception):
+    """Named as asyncpg names it, which is how the CLI recognises an integrity refusal."""
+
+
+class _LockWaitTimedOut(Exception):
+    """A driver's lock-wait timeout as both backends read one: SQLSTATE 55P03 on asyncpg, native
+    error 1222 in the text on pyodbc."""
+
+    sqlstate = "55P03"
+
+    def __str__(self) -> str:
+        return "lock request time out period exceeded (1222) (stand-in)"
+
+
+@pytest.mark.parametrize("backend", [StoreBackend.POSTGRES, StoreBackend.SQLSERVER])
+@pytest.mark.parametrize("minting", [True, False])
+def test_a_lock_timeout_inside_the_batch_is_translated_and_typed_on_a_minting_open(
+    monkeypatch: pytest.MonkeyPatch, backend: StoreBackend, minting: bool
+) -> None:
+    # PR 2804 hold 17, review round 1: the backend's own lock-timeout name is kept, chained to the
+    # driver's error, and on a minting open it is the failure the typed error carries.
+    import asyncio
+
+    from messagefoundry.store.base import SchemaDdlLockTimeout
+    from messagefoundry.store.store import OPEN_STORE_PIN, StoreCreateBatchFailedBeforeKeyUse
+
+    driver = _LockWaitTimedOut()
+    build = _postgres_batch_store if backend is StoreBackend.POSTGRES else _sqlserver_batch_store
+    store = build(monkeypatch, driver)
+    pinned = OPEN_STORE_PIN.set(_minting_pin(minting))
+    try:
+        with pytest.raises(Exception) as raised:
+            asyncio.run(store._ensure_schema(create=True))
+    finally:
+        OPEN_STORE_PIN.reset(pinned)
+    failure = raised.value
+    if minting:
+        assert isinstance(failure, StoreCreateBatchFailedBeforeKeyUse), failure
+        assert failure.__cause__ is failure.failure
+        failure = failure.failure
+    assert isinstance(failure, SchemaDdlLockTimeout), failure
+    assert failure.__cause__ is driver and failure.__traceback__ is not None
+
+
+def test_the_typed_batch_failure_survives_a_copy() -> None:
+    # Review round 1: an exception is rebuilt from its args, so the failure must be the argument.
+    import copy
+
+    from messagefoundry.store.store import StoreCreateBatchFailedBeforeKeyUse
+
+    collision = _collision()
+    copied = copy.copy(StoreCreateBatchFailedBeforeKeyUse(collision))
+    assert copied.failure is collision
+
+
 @host_file_platforms
 @pytest.mark.parametrize("backend", [StoreBackend.POSTGRES, StoreBackend.SQLSERVER])
-@pytest.mark.parametrize("where", ["batch", "bind_store_salt"])
+@pytest.mark.parametrize("where", ["batch", "batch integrity", "bind_store_salt"])
 def test_a_create_that_fails_in_its_batch_removes_the_key_and_one_after_it_keeps_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2749,6 +2804,11 @@ def test_a_create_that_fails_in_its_batch_removes_the_key_and_one_after_it_keeps
         if kwargs.get("create"):
             if where == "batch":
                 raise StoreCreateBatchFailedBeforeKeyUse(collision) from collision
+            if where == "batch integrity":
+                # A unique index the batch builds over a colliding table's duplicate rows: a
+                # driver integrity error, which must not read as a refused account write.
+                duplicate = UniqueViolationError("duplicate key (stand-in)")
+                raise StoreCreateBatchFailedBeforeKeyUse(duplicate) from duplicate
             raise CipherError("bind_store_salt failed (stand-in)")
         if kwargs.get("custody") is None:
             raise HostCustodyMissing("no host blob and no handoff here (stand-in)")
@@ -2773,6 +2833,15 @@ def test_a_create_that_fails_in_its_batch_removes_the_key_and_one_after_it_keeps
     )
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    if where == "batch integrity":
+        # Reaches the last-resort floor as the driver's error, as an unmapped batch error did
+        # before, never as a refused write that says the Administrator may be partly written.
+        code = main([*argv, "--no-totp"])
+        err = " ".join(capsys.readouterr().err.split())
+        assert code != 0, err
+        assert not host_file.exists(), err
+        assert "may be missing or incomplete" not in err, err
+        return
     code = main([*argv, "--no-totp"])
     err = " ".join(capsys.readouterr().err.split())
     assert code == 2, err

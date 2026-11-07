@@ -5433,7 +5433,8 @@ class StoreCreateBatchFailedBeforeKeyUse(Exception):
     new class; a failure at or after the commit is never this."""
 
     def __init__(self, failure: Exception) -> None:
-        super().__init__(str(failure))
+        # The failure itself is the one argument, so a copy or an unpickle rebuilds it whole.
+        super().__init__(failure)
         self.failure = failure
 
 
@@ -5449,6 +5450,22 @@ def minting_open() -> bool:
     wrap for a new genesis record (PR 2804 hold 17)."""
     pin = OPEN_STORE_PIN.get()
     return pin is not None and bool(pin.recovery_wrap)
+
+
+def create_batch_failure(raised: Exception, translated: Exception | None = None) -> Exception:
+    """What a server backend raises for ``raised``, caught inside its create batch before the
+    commit: ``translated`` (a lock timeout the backend names) when given, chained to ``raised`` and
+    carrying its traceback, else ``raised``; wrapped as :class:`StoreCreateBatchFailedBeforeKeyUse`
+    on a minting open (PR 2804 hold 17). Shared, so both backends answer the same way."""
+    failure = raised
+    if translated is not None:
+        translated.__cause__ = raised
+        failure = translated.with_traceback(raised.__traceback__)
+    if not minting_open():
+        return failure
+    wrapped = StoreCreateBatchFailedBeforeKeyUse(failure)
+    wrapped.__cause__ = failure
+    return wrapped
 
 
 def store_pin_problem(genesis: Mapping[str, Any] | None, pin: StorePin) -> str | None:
