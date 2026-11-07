@@ -6491,9 +6491,9 @@ class AuthService:
         # BACKLOG #2301 (ASVS 2.4.2): the minimum-elapsed floor, only when the person signed in at
         # the IdP during THIS flow, which the verified auth_time says. An IdP holding a live single
         # sign-on session answers with no human step, so there is nothing to floor, and flooring it
-        # would refuse that sign-in on every retry. auth_time is whole seconds, so it is compared
-        # with the flow's start rounded down: a sign-in in the same second as the start is the fast
-        # case this floor exists for. An IdP clock that runs ahead can make an older sign-on look
+        # would refuse that sign-in on every retry. auth_time is compared with the flow's start
+        # rounded down, so a sign-in in the same second as the start counts as the fast case this
+        # floor exists for. An IdP clock that runs ahead can make an older sign-on look
         # fresh; the refusal then clears once the skew has passed, and it never lets a flow through.
         signed_in_during_flow = principal_claims.auth_time >= math.floor(flow.issued_at)
         # BACKLOG #2388: an IdP that re-authenticates with no human step (an amr the operator named
@@ -6800,8 +6800,8 @@ class AuthService:
 
     def _oidc_callback_too_early(self, flow: PendingFlow) -> bool:
         """Whether ``flow``'s callback came back sooner than ``[auth].oidc_callback_min_elapsed_seconds``
-        after the flow started, on the flow cache's own clock (BACKLOG #2301). The caller decides
-        whether the floor applies."""
+        after the flow started, on the flow cache's own clock, measured to the instant the flow was
+        consumed (BACKLOG #2301, #3221). The caller decides whether the floor applies."""
         floor = self._settings.oidc_callback_min_elapsed_seconds
         flows = self._oidc_flows
         return floor > 0 and flows is not None and flows.age(flow) < floor
@@ -6922,8 +6922,10 @@ class AuthService:
 
         Checks, in order, each failing CLOSED with nothing elevated: the flow exists and ``state``
         matches; it is a step-up flow; the callback is not too soon after the flow started (BACKLOG
-        #2301), a check that moves after the exchange when ``oidc_callback_floor_exempt_amr`` is set,
-        because only the exchange yields the ``amr`` it exempts by (BACKLOG #2388), so a too-early
+        #2301), its age measured to the flow's consume so no later store read counts as the
+        person's time (BACKLOG #3221), a check that moves after the exchange when
+        ``oidc_callback_floor_exempt_amr`` is set, because only the exchange yields the ``amr`` it
+        exempts by (BACKLOG #2388), so a too-early
         callback whose exchange fails is then refused with that failure's reason, not ``too_early``,
         on a row that carries ``callback_floor_deferred`` (BACKLOG #3728);
         the code exchange and the whole claims ladder pass (the nonce, the pinned issuer,
@@ -6970,7 +6972,9 @@ class AuthService:
         )
         # BACKLOG #2301 (ASVS 2.4.2): max_age=0 and prompt=login make the person authenticate at the
         # IdP, so a step-up callback faster than a person can do that is refused. Before the code is
-        # redeemed, so the refused flow spends nothing at the token endpoint.
+        # redeemed, so the refused flow spends nothing at the token endpoint. The age ends at the
+        # flow's consume, which the flow cache stamps, so the actor lookup's store reads above never
+        # count as the person's time (BACKLOG #3221).
         # BACKLOG #2388: with oidc_callback_floor_exempt_amr set, the exemption needs the verified
         # amr, which only the exchange yields, so an opted-in site pays for the exchange and the
         # refusal waits for it below. With the list empty (the default) nothing changes here.
@@ -14861,6 +14865,32 @@ class AuthService:
         )
         return True
 
+    def _mfa_floor_holds(self, session: SessionRecord, now: float) -> bool:
+        """Whether the login-to-MFA floor still holds ``session`` at ``now``: the floor is on, the
+        session's factor is not yet stamped, and less than ``[auth].mfa_verify_min_elapsed_seconds``
+        has passed since its mint, which is the sign-in (BACKLOG #2301). Both floor helpers read it,
+        so the verify and enrolment legs share one rule (BACKLOG #3194)."""
+        return (
+            self._mfa_floor_on()
+            and session.mfa_verified_at is None
+            and now - session.created_at < self._settings.mfa_verify_min_elapsed_seconds
+        )
+
+    def _mfa_floor_on(self) -> bool:
+        """Whether the login-to-MFA floor is on: ``[auth].mfa_verify_min_elapsed_seconds`` above 0.
+        :meth:`_mfa_floor_holds` reads it, and :meth:`_enrolment_too_early` reads it first to spare
+        a session read on a site with the floor off."""
+        return self._settings.mfa_verify_min_elapsed_seconds > 0
+
+    async def _audit_mfa_too_early(
+        self, user: UserRecord, *, event: str, client: str | None, phase: str | None
+    ) -> None:
+        """The audit row of a floor refusal, ``reason=too_early``. An enrolment leg names its phase,
+        as its own wrong-code row does, so an investigator can tell someone binding a NEW
+        authenticator from someone proving an enrolled one."""
+        detail = {"reason": TOO_EARLY} if phase is None else {"reason": TOO_EARLY, "phase": phase}
+        await self._audit(event, actor=user.username, detail=_json(detail), client=client)
+
     async def _second_factor_too_early(
         self,
         session: SessionRecord,
@@ -14869,34 +14899,30 @@ class AuthService:
         *,
         event: str,
         client: str | None,
-        phase: str | None = None,
     ) -> bool:
         """Whether a second factor arrived too soon after sign-in, auditing the refusal if so.
 
         The ASVS 2.4.2 floor on the login-then-MFA pair (BACKLOG #2301), measured from the session's
         mint, which is the sign-in. It never applies with the floor at ``0``, or to a session whose
-        factor is already satisfied, so a step-up there is not floored. Those are not the only
-        exemptions: through :meth:`_enrolment_too_early` an enrolment leg also skips it on a session
-        that owes no factor. The caller answers with its leg's ordinary failure, so the refusal says
-        nothing about timing. The caller spends and charges nothing it would have spent past the
-        floor, such as a lockout count, a TOTP step, a recovery code, a passkey challenge, a
-        directory lookup, or on an enrolment leg minted recovery codes or a stored credential. The
-        floor and why it sits where it does: ``[auth].mfa_verify_min_elapsed_seconds``.
+        factor is already satisfied, so a step-up there is not floored. The caller answers with its
+        leg's ordinary failure, so the refusal says nothing about timing. The caller spends and
+        charges nothing it would have spent past the floor, such as a lockout count, a TOTP step, a
+        recovery code, a passkey challenge or a directory lookup. The floor and why it sits where it
+        does: ``[auth].mfa_verify_min_elapsed_seconds``.
 
         Called by :meth:`verify_mfa` and :meth:`finish_webauthn_assertion`, the legs that prove an
-        ENROLLED factor, and through :meth:`_enrolment_too_early` by the two enrolment legs,
-        :meth:`confirm_mfa_enrollment` and :meth:`finish_webauthn_registration`, which can also
-        satisfy a pending session (BACKLOG #2389). A new leg that can satisfy a pending session
-        calls one of the two."""
-        floor = self._settings.mfa_verify_min_elapsed_seconds
-        if floor <= 0 or session.mfa_verified_at is not None:
+        ENROLLED factor. The two enrolment legs, :meth:`confirm_mfa_enrollment` and
+        :meth:`finish_webauthn_registration`, which can also satisfy a pending session (BACKLOG
+        #2389), call :meth:`_enrolment_too_early` instead, which reads the same predicate and also
+        skips a session that owes no factor. A new leg that can satisfy a pending session calls
+        one of the two. ``tests/test_second_step_time_floors.py`` reads this module's syntax
+        tree and fails on a function here that calls ``mark_session_mfa_verified`` itself without a
+        top-level ``if await`` of either, which refuses, ahead of the call. It reads source order,
+        not every path, and does not follow a stamp made through a helper, so a new leg is still
+        checked by hand."""
+        if not self._mfa_floor_holds(session, now):
             return False
-        if now - session.created_at >= floor:
-            return False
-        # An enrolment leg names its phase, as its own wrong-code row does, so an investigator can
-        # tell someone binding a NEW authenticator from someone proving an enrolled one.
-        detail = {"reason": TOO_EARLY} if phase is None else {"reason": TOO_EARLY, "phase": phase}
-        await self._audit(event, actor=user.username, detail=_json(detail), client=client)
+        await self._audit_mfa_too_early(user, event=event, client=client, phase=None)
         return True
 
     async def _enrolment_too_early(
@@ -14929,19 +14955,15 @@ class AuthService:
         ``[auth].require_action_step_up``, the route in front of ``POST /me/mfa/confirm`` has
         already spent its single-use password step-up, exactly as it has for a wrong code, so a
         refusal there costs the person one password re-proof."""
-        floor = self._settings.mfa_verify_min_elapsed_seconds
-        if floor <= 0:
-            return False
+        if not self._mfa_floor_on():
+            return False  # spares the session read; the rule is _mfa_floor_holds
         session = await self._load_session(hash_token(token))
-        if session is None or session.mfa_verified_at is not None:
-            return False
-        if now - session.created_at >= floor:
+        if session is None or not self._mfa_floor_holds(session, now):
             return False
         if not await self._unverified_session_owes_factor(user):
             return False
-        return await self._second_factor_too_early(
-            session, user, now, event=event, client=client, phase="enroll"
-        )
+        await self._audit_mfa_too_early(user, event=event, client=client, phase="enroll")
+        return True
 
     async def _mfa_lapsed(
         self,

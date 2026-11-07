@@ -57,6 +57,7 @@ from messagefoundry.parsing.tree import ParseTreeTooLargeError
 
 from .. import pages
 from .._auth import (
+    _REAUTH_NEXT_MAX,
     CLEAR_SITE_DATA_HEADER,
     CLEAR_SITE_DATA_VALUE,
     ENROL_FIRST_PAGE,
@@ -1880,7 +1881,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     @public_route("the re-authentication page a step-up gate sends the browser to")
     async def ui_reauth_form(
         request: Request,
-        next_: str = Query("", alias="next", max_length=512),
+        # The cap _new_address_continuation sizes a continuation to (vault BACKLOG #3052).
+        next_: str = Query("", alias="next", max_length=_REAUTH_NEXT_MAX),
     ) -> Response:
         # next MUST be a registered /ui action — a body-less POST the re-auth may auto-retry
         # (is_safe_ui_action) OR a GET admin form page it may unlock (is_unlock_action). Never an
