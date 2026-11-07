@@ -2942,9 +2942,11 @@ def test_the_undrained_row_wait_fits_inside_the_engine_stop_reserve() -> None:
 async def test_an_executor_fault_in_a_reload_build_is_a_fault_row_not_an_invalid_config(
     engine: Engine, tmp_path: Path, cause: str
 ) -> None:
-    """A reload whose outbound rebuild the executor fails, by a broken pool, answers the reload's
-    generic 500 and writes a reload_fault row, as any fault inside the reload does: nothing is
-    wrong with the config. Red (Lander hold 6703767989): _build_off_loop raised a plain
+    """A reload whose connector build the executor fails, by a broken pool, answers the reload's
+    generic 500 and writes a reload_fault row naming the executor's fault, as any fault inside the
+    reload does: nothing is wrong with the config. The build that meets it is the restart of the
+    running inbound, which every reload makes through _build_off_loop before it rebuilds an
+    outbound. Red (Lander hold 6703767989): _build_off_loop raised a plain
     WiringError, which the route answered 422 invalid configuration with reason invalid_config.
     The control is a config that really is wrong, which still answers 422 invalid_config."""
     from concurrent.futures.thread import BrokenThreadPool
@@ -2966,10 +2968,7 @@ async def test_an_executor_fault_in_a_reload_build_is_a_fault_row_not_an_invalid
         first = await c.post("/config/reload", json={}, headers=headers)
         assert first.status_code == 200, first.text
         cfg = tmp_path / "cfg"
-        if cause == "executor-fault":
-            # The outbound moves, so the reload rebuilds it through _build_off_loop.
-            _write_valid_config(cfg, tmp_path / "in", tmp_path / "out2")
-        else:
+        if cause == "invalid-config":
             text = (cfg / "cfg.py").read_text(encoding="utf-8")
             (cfg / "cfg.py").write_text(text.replace("router='r'", "router='nope'"), "utf-8")
         with pytest.MonkeyPatch.context() as patch:
@@ -2979,7 +2978,26 @@ async def test_an_executor_fault_in_a_reload_build_is_a_fault_row_not_an_invalid
     if cause == "executor-fault":
         assert r.status_code == 500, r.text
         assert r.json() == {"detail": _FAULT_DETAIL}
-        assert [(d["reason"], d["error"]) for d in rows] == [("reload_fault", "WiringBuildFault")]
+        assert [(d["reason"], d["error"]) for d in rows] == [("reload_fault", "BrokenThreadPool")]
     else:
         assert r.status_code == 422, r.text
         assert [d["reason"] for d in rows] == ["invalid_config"]
+
+
+async def test_a_convergence_reload_records_an_executor_fault_as_a_reload_error(
+    engine: Engine,
+) -> None:
+    """A convergence reload records an executor fault with reason reload_error and the executor
+    fault's type, as it did before the fault was a WiringBuildFault, not as a refused reload."""
+    from concurrent.futures.thread import BrokenThreadPool
+
+    from messagefoundry.api.app import _audit_failed_convergence
+    from messagefoundry.config.wiring import WiringBuildFault
+
+    fault = WiringBuildFault("connector build failed: a thread initializer failed")
+    fault.__cause__ = BrokenThreadPool("a thread initializer failed")
+    await _audit_failed_convergence(engine, fault, 7, set())
+    rows = await _failed_reload_rows(engine)
+    assert [(d["reason"], d["error"], d["config_version"]) for d in rows] == [
+        ("reload_error", "BrokenThreadPool", 7)
+    ]
