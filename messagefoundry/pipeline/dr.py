@@ -529,7 +529,9 @@ class DrCoordinator:
             "vip_hook_ran": progress.hook_ran,
         }
         if step_failures:
-            detail["failures"] = dict(step_failures)
+            # Step labels only, as the config_reload row records them. The detail text, which
+            # names a lane and an error, stays in the server log (the row is forwarded off the box).
+            detail["failed_steps"] = sorted(step_failures)
         self._unrecorded_activation = (detail, actor, now)
         # Provenance is read only once the profile is applied and the row is owed, so a cancellation
         # while it is read still leaves the box recorded as active (vault BACKLOG #3067). Its fields

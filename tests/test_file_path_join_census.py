@@ -830,9 +830,9 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/transports/database.py::_capath_folder_clear": Site(
         1,
-        REVIEWED,
-        "A name from listing the sslcapath folder the operator configured, joined only to probe the "
-        "entry with lstat or the path walk; nothing is opened or read through it.",
+        OPERATOR,
+        "A name from listing the sslcapath folder the operator configured, joined to judge the "
+        "entry before the driver is given that folder.",
     ),
     "messagefoundry/transports/file.py::FileDestination._write": Site(
         1, GUARDED, _DEST_NAME, "messagefoundry/transports/file.py::render_filename", called=True

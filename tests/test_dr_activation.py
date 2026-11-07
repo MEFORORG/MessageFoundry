@@ -123,9 +123,7 @@ async def test_a_profile_step_that_did_not_finish_is_on_the_result_and_the_row(
         assert result.failures == ("outbound_close",)
         rows = [r for r in await store.list_audit(limit=50) if r["action"] == "dr.activate"]
         assert len(rows) == 1
-        assert json.loads(rows[0]["detail"])["failures"] == {
-            "outbound_close": "outbound 'out': OSError: synthetic close failure"
-        }
+        assert json.loads(rows[0]["detail"])["failed_steps"] == ["outbound_close"]
     finally:
         await store.close()
 

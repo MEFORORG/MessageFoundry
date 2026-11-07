@@ -10576,7 +10576,9 @@ def create_app(
         not touched first (vault BACKLOG #2581).
         ``{"dba_attests_restored": true}`` is the operator's per-activation attestation that
         the DBA restored the server-DB ``mefor`` database (REQUIRED on postgres/sqlserver, ignored on
-        SQLite — BACKLOG #102). Aborts return a 4xx/5xx with the failing phase; the box stays passive."""
+        SQLite — BACKLOG #102). Aborts return a 4xx/5xx with the failing phase; the box stays passive.
+        A 200 with ``degraded`` true is not a clean activation: the box is active, and ``failures``
+        names each follow-on step that did not complete, such as ``outbound_close``."""
         coord = engine.dr_coordinator
         if coord is None:
             raise HTTPException(503, "this deployment is not a DR standby ([dr].enabled is false)")
