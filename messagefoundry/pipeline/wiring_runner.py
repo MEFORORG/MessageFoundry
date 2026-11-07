@@ -12580,7 +12580,9 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
 
     def settle(queued: asyncio.Future[None]) -> None:
         # A work item the executor cancelled or failed before run() began leaves ``built`` pending;
-        # settle it so the caller is not left waiting.
+        # settle it so the caller is not left waiting. The fault is read even when ``built`` is
+        # already done, so asyncio never logs it as an exception that was never retrieved.
+        exc = None if queued.cancelled() else queued.exception()
         if built.done():
             return
         if queued.cancelled():
@@ -12588,7 +12590,7 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
             built.set_exception(
                 _executor_fault(RuntimeError("the executor cancelled the connector build"))
             )
-        elif (exc := queued.exception()) is not None:
+        elif exc is not None:
             # Only the executor fails ``queued`` with run() not begun, so this is never the build's
             # own failure. A BaseException that is not an Exception passes through unchanged.
             built.set_exception(_executor_fault(exc) if isinstance(exc, Exception) else exc)
@@ -12596,6 +12598,9 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
     try:
         queued = loop.run_in_executor(None, run)
     except RuntimeError as exc:  # the executor was shut down, or its pool is broken
+        # A pool can queue the work item and then fail to start a thread for it, so a later
+        # dequeue must find the build cancelled and build nothing for a caller told it failed.
+        built.cancel()
         raise _executor_fault(exc) from exc
     queued.add_done_callback(settle)
     try:

@@ -14,6 +14,7 @@ import asyncio
 import errno
 import json
 import logging
+import threading
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures.thread import BrokenThreadPool
 from datetime import UTC, datetime, time
@@ -374,22 +375,6 @@ async def test_a_gate_refused_window_open_alerts_once_over_three_ticks(
 # --- Lander hold 6703229134, item 2: an executor fault on the inbound build -----------------------
 
 
-def _down_loopback_listener() -> Registry:
-    """One MLLP listener on loopback, left down at start, that every start gate passes, so an
-    operator start reaches the connector build."""
-    reg = Registry()
-    reg.add_inbound(
-        InboundConnection(
-            "IB_DOWN",
-            ConnectionSpec(ConnectorType.MLLP, {"port": 0}),
-            router="r",
-            auto_start=False,
-        )
-    )
-    reg.add_router("r", lambda m: [])
-    return reg
-
-
 @pytest.mark.parametrize("fault", ["cancelled", "broken", "shut-down"])
 @pytest.mark.parametrize("action", ["start", "restart"])
 async def test_an_executor_fault_on_an_operator_start_answers_409_and_is_audited(
@@ -406,7 +391,8 @@ async def test_an_executor_fault_on_an_operator_start_answers_409_and_is_audited
         hop_posture=HopPosture(enforcing=False),
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    engine.add_registry(_down_loopback_listener())
+    # Bound to loopback, so every start gate passes and the start reaches the connector build.
+    engine.add_registry(_down_cleartext_listener())
     await engine.start()
     loop = asyncio.get_running_loop()
     real = loop.run_in_executor
@@ -443,7 +429,12 @@ async def test_an_executor_fault_on_an_operator_start_answers_409_and_is_audited
         assert r.status_code == 409, r.text
         assert len(faults) == 1 and isinstance(faults[0], WiringError), faults
         cause = faults[0].__cause__
-        assert isinstance(cause, BrokenThreadPool if fault == "broken" else RuntimeError), cause
+        expected = {
+            "cancelled": (RuntimeError, "the executor cancelled the connector build"),
+            "broken": (BrokenThreadPool, "a thread initializer failed"),
+            "shut-down": (RuntimeError, "Executor shutdown has been called"),
+        }[fault]
+        assert type(cause) is expected[0] and str(cause) == expected[1], repr(cause)
         rows = await store.list_audit(action="connection_control", limit=10)
         assert len(rows) == 1
         assert json.loads(rows[0]["detail"] or "{}") == {
@@ -457,3 +448,23 @@ async def test_an_executor_fault_on_an_operator_start_answers_409_and_is_audited
         assert rr is not None and not rr.inbound_running("IB_DOWN")
     finally:
         await engine.stop()
+
+
+async def test_a_build_the_pool_queued_before_it_failed_to_start_a_thread_never_runs() -> None:
+    """A pool can queue the work item and then raise from its thread start. The caller is told
+    the build failed, so a later dequeue must build nothing that no caller would close."""
+    loop = asyncio.get_running_loop()
+    ran = threading.Event()
+    queued_items: list[Callable[[], object]] = []
+
+    def queue_then_raise(_executor: Any, fn: Callable[[], object], *_args: Any) -> Any:
+        queued_items.append(fn)
+        raise RuntimeError("can't start new thread")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(loop, "run_in_executor", queue_then_raise)
+        with pytest.raises(WiringError):
+            await wiring_runner._build_off_loop(None, ran.set)
+    assert len(queued_items) == 1
+    queued_items[0]()  # the late dequeue
+    assert not ran.is_set()
