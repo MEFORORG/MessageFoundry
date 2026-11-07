@@ -861,6 +861,55 @@ async def test_a_label_differing_only_by_case_is_refused_on_every_backend() -> N
         await store.close()
 
 
+async def test_a_passkey_row_that_does_not_parse_refuses_the_label_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The case-blind label check reads the account's passkeys through the sealed loader, so a row
+    that does not parse refuses the registration rather than reading as no label held. The row is
+    spoiled at the credential-id check, the read just before the label check, so every guard in
+    front has already passed. RED when: the label check reads the passkeys raw and takes a row
+    that does not parse as no label held (BACKLOG #2733, pass F)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token)
+        opts = json.loads(
+            await service.begin_webauthn_registration(
+                identity, token=token, rp_id=RP, rp_name="MessageFoundry"
+            )
+        )
+        original = store.get_webauthn_credential
+
+        async def spoil_first(credential_id_hash: str) -> WebAuthnCredential | None:
+            await store._db.execute(
+                "UPDATE webauthn_credentials SET transports=? WHERE user_id=?",
+                ('["not json', identity.user_id),
+            )
+            await store._db.commit()
+            return await original(credential_id_hash)
+
+        monkeypatch.setattr(store, "get_webauthn_credential", spoil_first)
+        with pytest.raises(ValueError, match="no such user"):
+            await service.finish_webauthn_registration(
+                identity,
+                SoftAuthenticator(rp_id=RP, origin=ORIGIN).create_response(
+                    base64url_to_bytes(opts["challenge"])
+                ),
+                label="a new label",
+                token=token,
+                rp_id=RP,
+                origin=ORIGIN,
+            )
+        async with store._db.execute(
+            "SELECT COUNT(*) FROM webauthn_credentials WHERE user_id=?", (identity.user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row is not None and row[0] == 1
+    finally:
+        await store.close()
+
+
 async def test_a_label_is_capped_in_utf16_code_units() -> None:
     # BACKLOG #2733, pass F finding 4: SQL Server's NVARCHAR(100) counts UTF-16 code units, so 51
     # astral-plane characters (102 units) passed a code-point cap and then failed the column there.

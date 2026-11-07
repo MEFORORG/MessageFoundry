@@ -15951,16 +15951,17 @@ class AuthService:
         await self._audit("auth.webauthn_enroll_started", actor=identity.username)
         return options
 
-    async def _passkey_label_held(self, user_id: str, label: str) -> bool:
-        """Whether a passkey of ``user_id`` already carries ``label``, compared without case, as
-        SQL Server's collation compares the (user_id, label) index (BACKLOG #2733, pass F)."""
+    async def _passkey_label_held(self, user: VerifiedUser, label: str) -> bool:
+        """Whether a passkey of ``user`` already carries ``label``, compared without case, as
+        SQL Server's collation compares the (user_id, label) index (BACKLOG #2733, pass F).
+
+        Read through :meth:`_verified_passkeys`, so only a checked set is judged. A set that fails
+        its seal or holds a row that does not parse refuses the registration, as every other
+        passkey read does, rather than reading as no label held."""
+        held = await self._verified_passkeys(user)
+        if held is None:
+            raise ValueError("no such user")
         wanted = label.casefold()
-        try:
-            held = await self._store.list_webauthn_credentials(user_id)
-        except PasskeyRowMalformed as exc:
-            # Read as no label held: the store's own index still refuses a real clash.
-            _log.warning("a passkey row of user %s did not parse (%s)", user_id, exc)
-            return False
         return any(cred.label.casefold() == wanted for cred in held)
 
     async def finish_webauthn_registration(
@@ -16166,7 +16167,7 @@ class AuthService:
         # nothing about the account's labels; the cost is a used ceremony. A check before the
         # insert, so two enrolments racing case variants can still both land on SQLite and
         # Postgres, whose indexes keep case.
-        if await self._passkey_label_held(user.id, label):
+        if await self._passkey_label_held(user, label):
             raise ValueError("label already in use")
         spent: EnrolmentCodeOutcome | None = None
         if code_digest is not None:
@@ -16252,7 +16253,7 @@ class AuthService:
             # Pass F findings 3 and 5: the label clash is told apart the same way, by a passkey of
             # this account now holding the label. Anything else, such as a competing row deleted
             # before these re-reads, or another integrity refusal, is not called a label clash.
-            if await self._passkey_label_held(user.id, label):
+            if await self._passkey_label_held(user, label):
                 raise ValueError("label already in use") from exc
             raise ValueError(_PASSKEY_NOT_STORED) from exc
         if not bound:
