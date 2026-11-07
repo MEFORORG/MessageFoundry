@@ -381,7 +381,7 @@ def test_a_4010_pass_with_no_ack_reports_the_4010_codes(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(_X12_VALIDATE, "json_loads_or_refusal", splice)
     result = validate(msg)
-    assert result.ack is None
+    assert result.ack is None and result.ack_transaction is None
     assert [e.code for e in result.errors if e.segment_id == "REF"] == ["2"]
 
 

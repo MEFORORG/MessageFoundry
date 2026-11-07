@@ -131,6 +131,10 @@ def _mute_pyx12_logger() -> None:
             logger.setLevel(_MUTED)
 
 
+# pyx12's ack choice by the last GS08's first six characters; any other version gets no ack.
+_ACK_FOR_VERSION = {"004010": "997", "005010": "999"}
+
+
 def _last_group_version(report: dict[str, Any]) -> str:
     """The GS08 of the last group pyx12 walked, from its report. pyx12 picks the ack from exactly that
     value (a 997 when it starts ``004010``, a 999 when ``005010``, none for a GS01 of ``FA``), so the
@@ -265,8 +269,9 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     ack_text = fd_ack.getvalue().strip()
     ack = ack_text or None
     version = _last_group_version(report)
-    ack_transaction = {"004010": "997", "005010": "999"}.get(version[:6]) if ack else None
-    errors = tuple(_flatten_errors(report, resolve, prefer_5010=not version.startswith("004010")))
+    ack_transaction = _ACK_FOR_VERSION.get(version[:6]) if ack else None
+    prefer_5010 = _ACK_FOR_VERSION.get(version[:6]) != "997"
+    errors = tuple(_flatten_errors(report, resolve, prefer_5010=prefer_5010))
     return X12ValidationResult(
         valid=valid and not errors,
         errors=errors,
