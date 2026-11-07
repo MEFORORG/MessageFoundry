@@ -445,6 +445,30 @@ async def test_transit_calls_run_on_their_own_bounded_pool() -> None:
     assert peak == workers
 
 
+async def test_a_pool_that_will_not_take_a_call_is_an_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    backend = FakeBackend()
+    sealer = _sealer(backend)
+    stored = await sealer.seal_async(USER_KIND, FIELDS)
+    closed = ThreadPoolExecutor(max_workers=1)
+    closed.shutdown()
+    monkeypatch.setattr(row_seal, "_transit_pool", lambda: closed)
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.seal_async(USER_KIND, FIELDS)
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.verify_held_async(USER_KIND, FIELDS, stored, fresh=True)
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.probe_async()
+    # Control: a RuntimeError raised BY the call, not the hand-off, is a defect.
+    monkeypatch.undo()
+    backend.other_failure = True
+    with pytest.raises(RuntimeError):
+        await sealer.seal_async(USER_KIND, FIELDS)
+
+
 async def test_the_start_probe() -> None:
     backend = FakeBackend()
     sealer = _sealer(backend)
@@ -493,7 +517,23 @@ async def test_require_seal_for_write_names_each_cause() -> None:
     with pytest.raises(RowSealError):
         await require_seal_for_write(sealer, USER_KIND, unreadable, stored, subject=subject)
     with pytest.raises(RowSealError):
-        await require_seal_for_write(RowSealer(b"k" * 32), USER_KIND, unreadable, "", subject="u")
+        local_key = RowSealer(b"k" * 32)
+        await require_seal_for_write(
+            local_key, USER_KIND, unreadable, local_key.seal(USER_KIND, FIELDS), subject="u"
+        )
+
+    # A TypeError from a defect in the check itself is not a Forged row: it propagates.
+    def broken_verify(key_name: str, digest: bytes, mac: str) -> bool:
+        raise TypeError("a synthetic defect in the backend")
+
+    original_verify = backend.verify_seal_hmac
+    backend.verify_seal_hmac = broken_verify  # type: ignore[method-assign]
+    with pytest.raises(TypeError, match="synthetic defect"):
+        await require_seal_for_write(sealer, USER_KIND, FIELDS, stored, subject=subject)
+    backend.verify_seal_hmac = original_verify  # type: ignore[method-assign]
+    # A session's encoding error propagates, as on main's session check.
+    with pytest.raises(TypeError):
+        await require_seal_for_write(sealer, SESSION_KIND, unreadable, stored, subject="s")
     # A refused hmac is an Outage, never a raw refusal.
     backend.hmac_refused = True
     with pytest.raises(TransitSealUnavailableError):
