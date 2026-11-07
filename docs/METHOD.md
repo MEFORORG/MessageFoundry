@@ -66,7 +66,7 @@ Manager, Process Improvement and ASVS Tracker. **An eighth went on 2026-09-05**,
 `reviewed` label and `review-gate.yml`; it is deliberately unnamed, here and everywhere else in this
 repository, by owner instruction 2026-09-16. **The CONSOLE went on 2026-09-10, and the Manager above
 replaces it.** **The STEWARD is retired too**, by the owner's statement of 2026-11-05; its notice is
-under *Retired CLAUDE.md notices*. If a document names one, treat that naming as stale, not the whole document.
+under *Retired CLAUDE.md notices*. If a document names a retired seat, treat that naming as stale, not the whole document.
 *Count note, 2026-10-07:* the blocks under *Retired CLAUDE.md notices* call the Console the eighth,
 because that file never counted the unnamed seat; the note at the head of that section says the same.
 
