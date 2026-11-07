@@ -1187,3 +1187,120 @@ def test_the_cipher_build_tests_the_class_with_type(monkeypatch: pytest.MonkeyPa
     assert type(escaped) is StoreCipherConfigError, repr(escaped)
     assert str(escaped) == "[store].synthetic_setting is not valid"
     assert escaped.__cause__ is error
+
+
+# --- the fifth hold on engine PR 2818: the text is read without running the error's own code ----
+
+_SETTING_TEXT = "[store].synthetic_setting is not valid"
+
+
+class _StrRaises(ValueError):
+    """A ``__str__`` that raises, so a handler that calls it leaves with this in place of a refusal."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("synthetic: __str__ ran")
+
+
+class _StrSaysTheByte(ValueError):
+    """A ``__str__`` that prints a byte its arguments do not hold, so no scan of them sees it."""
+
+    def __str__(self) -> str:
+        return "synthetic key source refused: byte 0xd7 (\xd7)"
+
+
+class _HopStrRaises(InsecureHopRefused):
+    def __str__(self) -> str:
+        raise RuntimeError("synthetic: __str__ ran")
+
+
+class _HopStrSaysTheByte(InsecureHopRefused):
+    def __str__(self) -> str:
+        return "synthetic hop refused: byte 0xd7 (\xd7)"
+
+
+def _escaping(call: Callable[[], object]) -> BaseException:
+    """What ``call`` raises, read with ``type`` by the caller: ``pytest.raises`` would let a
+    ``__str__`` that raises fail the test from inside pytest's own report."""
+    try:
+        call()
+    except Exception as exc:  # noqa: BLE001 -- the class that leaves is what is measured
+        return exc
+    return AssertionError("nothing was raised")
+
+
+@pytest.mark.parametrize("kind", [_StrRaises, _StrSaysTheByte], ids=["raises", "says-the-byte"])
+def test_the_cipher_build_reads_the_text_without_the_errors_str(
+    kind: type[ValueError], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pass-through keeps a ValueError's text from its arguments, never its ``__str__``, so a
+    subclass's ``__str__`` neither replaces the refusal by raising nor prints a byte."""
+    _with_provider(monkeypatch, kind(_SETTING_TEXT))
+    escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
+    assert type(escaped) is StoreCipherConfigError, type(escaped)
+    assert str(escaped) == _SETTING_TEXT
+    _assert_no_key_byte(str(escaped))
+
+
+@pytest.mark.parametrize("args", [(), (_SETTING_TEXT, "second"), (42,)], ids=["none", "two", "int"])
+def test_the_cipher_build_gives_fixed_text_for_arguments_that_are_not_one_string(
+    args: tuple[object, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Arguments that are not exactly one ``str`` are not rendered: their ``str()`` could run code."""
+    _with_provider(monkeypatch, _StrSaysTheByte(*args))
+    escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
+    assert type(escaped) is StoreCipherConfigError, type(escaped)
+    text = str(escaped)
+    assert _SETTING_TEXT not in text and "42" not in text, text
+    _assert_no_key_byte(text)
+
+
+def _ad_refusal(monkeypatch: pytest.MonkeyPatch, refusal: ValueError) -> BaseException:
+    """``refusal`` as the LDAPS guard raises it, through ``_refuse_ad_revocation``."""
+    from messagefoundry.auth import ldap
+    from messagefoundry.config.settings import AuthSettings
+    from messagefoundry.config.tls_policy import RevocationHopGuard
+
+    monkeypatch.setattr(RevocationHopGuard, "capture", _raising(refusal))
+    tls: Any = SimpleNamespace(handshake_context=lambda: None)
+    settings = AuthSettings(ad_server="ldaps://dc.synthetic.test:636")
+    escaped = _escaping(lambda: ldap._refuse_ad_revocation(settings, tls, None))
+    assert escaped is refusal
+    return escaped
+
+
+@pytest.mark.parametrize(
+    "kind", [_HopStrRaises, _HopStrSaysTheByte], ids=["raises", "says-the-byte"]
+)
+def test_the_ad_probe_reads_the_guard_refusal_without_its_str(
+    kind: type[InsecureHopRefused], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The LDAPS guard's refusal keeps the text its arguments hold, never its ``__str__``."""
+    from messagefoundry.privilege_probes import _ad_why
+
+    text = f"synthetic hop to {_HOST}: refused"
+    why = _ad_why(_ad_refusal(monkeypatch, kind(text)))
+    assert why == text
+    _assert_no_key_byte(why)
+
+
+def test_the_ad_probe_gives_fixed_text_for_a_guard_refusal_with_no_one_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.privilege_probes import _ad_why
+
+    assert _ad_why(_ad_refusal(monkeypatch, _HopStrSaysTheByte())) == "InsecureHopRefused"
+
+
+class _ClaimsToBeAHopRefusal(ValueError):
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # the read is the point
+        return InsecureHopRefused
+
+
+def test_the_ad_probe_tests_the_class_with_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ValueError that claims to be a hop refusal is not kept as the guard's: ``isinstance``
+    reads ``__class__``, which a class can answer as it likes."""
+    from messagefoundry.privilege_probes import _ad_why
+
+    text = f"synthetic: names {_HOST}"
+    assert _ad_why(_ad_refusal(monkeypatch, _ClaimsToBeAHopRefusal(text))) != text

@@ -39,7 +39,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.config.tls_policy import HopPosture
-from messagefoundry.exception_origin import exception_chain
+from messagefoundry.exception_origin import argument_text, exception_chain
 from messagefoundry.redaction import codec_safe_line, prints_a_codec_error
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.content_search import (
@@ -3473,7 +3473,9 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     of any class with a codec error on it is raised as :func:`_codec_safe_refusal` gives it, with
     no byte and no chain, and so is one whose chain cannot be read whole or whose judgement raised
     an ``Exception``. Every other
-    ``ValueError`` keeps its text and its chain, and every other error, such as a
+    ``ValueError`` keeps its chain, and its text as its one ``str`` argument holds it, never as its
+    own ``__str__`` renders it, or a fixed text where its arguments are not exactly one ``str``.
+    Every other error, such as a
     ``KeyProviderError`` or ``DpapiError``, passes through untouched."""
     try:
         return _build_store_cipher(settings, posture)
@@ -3481,11 +3483,13 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
         refusal = _codec_safe_refusal(exc)
         if refusal is None:
             # One already typed, as the key seam refuses a codec error, is not wrapped again. The
-            # class test reads the class with ``type``, as ``_refused`` does, so it runs none of
-            # exc's own code; ``str(exc)`` below still runs its ``__str__``.
+            # class test reads the class with ``type``, as ``_refused`` does, and the text is read
+            # from the arguments, never with ``str(exc)``, so neither runs any of exc's own code
+            # (the fifth hold on engine PR 2818): a ``__str__`` can raise here, or print a byte.
             kind = type(exc)
             if issubclass(kind, ValueError) and not issubclass(kind, StoreCipherConfigError):
-                raise StoreCipherConfigError(str(exc)) from exc
+                text = argument_text(exc)
+                raise StoreCipherConfigError(_UNTEXTED if text is None else text) from exc
             raise
     raise refusal
 
@@ -3549,6 +3553,9 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
 
 #: The fallback refusal's text. It names no class: reading the name may be what raised.
 _UNJUDGED = "an error that could not be judged, its class and text not shown"
+
+#: The pass-through's text for a ``ValueError`` whose arguments are not exactly one ``str``.
+_UNTEXTED = "the store cipher could not be built from the settings, the error's text not shown"
 
 #: ``BaseException``'s own link descriptors, which ``BaseException.__cause__`` and its siblings
 #: resolve to, so clearing a link runs no subclass code (the third hold on engine PR 2818). Read

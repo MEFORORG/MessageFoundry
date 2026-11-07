@@ -40,6 +40,7 @@ from typing import Any, Final
 
 __all__ = [
     "ExceptionChainTooLong",
+    "argument_text",
     "exception_chain",
     "raise_statement_file",
     "raised_by_the_engine",
@@ -130,6 +131,22 @@ def raised_through(exc: BaseException, code: CodeType) -> bool:
     function ran (BACKLOG #4883). Read by code object, so a function of the same name elsewhere
     does not count, and an exception never raised has no frame and answers ``False``."""
     return any(tb.tb_frame.f_code is code for tb in _entries(exc))
+
+
+#: The builtin descriptor, so reading the arguments runs none of a subclass's code.
+_ARGS_OF: Final[Any] = BaseException.__dict__["args"]
+
+
+def argument_text(exc: BaseException) -> str | None:
+    """``exc``'s one argument when it is exactly a ``str``, else ``None``, read with none of
+    ``exc``'s own code run (the fifth hold on engine PR 2818). ``str(exc)`` runs a subclass's
+    ``__str__``, which can raise inside a caller's handler or print what its arguments do not
+    hold, and ``str()`` of any other argument runs that argument's. A caller that gets ``None``
+    says something fixed instead."""
+    args = _ARGS_OF.__get__(exc)
+    if len(args) == 1 and type(args[0]) is str:
+        return str(args[0])
+    return None
 
 
 def raise_statement_file(exc: BaseException) -> str | None:
