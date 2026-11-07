@@ -3595,8 +3595,8 @@ second factor with a TOTP code or a recovery code. `DELETE /me/mfa` disables it,
 account `[security].require_mfa` covers that holds no passkey recorded as discoverable: TOTP is then
 its only way past the sign-in lock, so it keeps it (ADR 0197 Amendment A). Such an account's first
 factor must be TOTP or a discoverable passkey, too.
-An administrator clears a
-lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user's sessions).
+An administrator clears a lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes
+the user's sessions).
 A confirm turns TOTP on only while the row still holds the staged secret the confirm verified,
 and TOTP is still off (BACKLOG #2224, #3025): the enable is a compare-and-set on the stored
 `totp_secret` cell the code was checked against. If a reset clears the secret during the confirm,
@@ -3616,16 +3616,15 @@ the session MFA-verified before it rotates it, so the rotated session is stamped
 the moment it exists. It can stay live until its own timers end it in at least these cases: the
 revoke does not land, because the first attempt is refused and the retry does not land either, or
 because the first attempt meets a cancellation or a raise the helper does not answer False, so no
-second attempt runs;
-`enable_totp` itself raises, so no revoke runs; the `auth.session_rotated` audit write raises,
-after the rotation and before `enable_totp`; a cancellation lands during the session-cap run that
-follows the rotation, also before `enable_totp`; or the `auth.mfa_enrolled` audit write raises,
-after `enable_totp` turned TOTP on. In each case but the last, TOTP is still off, so the live
-session is stamped MFA-verified on a factor that is not enabled. While it lives, it counts as a
-full session under `[auth].max_sessions_per_user`. Its token is not handed back in any case.
-The compare is
-on the stored ciphertext, so at least a store-key rotation that re-encrypts the column inside the
-window refuses too. That refusal reads as `secret_replaced` although no second enrolment started.
+second attempt runs; `enable_totp` itself raises, so no revoke runs; the `auth.session_rotated`
+audit write raises, after the rotation and before `enable_totp`; a cancellation lands during the
+session-cap run that follows the rotation, also before `enable_totp`; or the `auth.mfa_enrolled`
+audit write raises, after `enable_totp` turned TOTP on. Whether TOTP is on in these cases depends
+on whether the enable committed, which a raise or cancellation does not always tell. While the
+session lives, it counts as a full session under `[auth].max_sessions_per_user`. Its token is not
+handed back in any case. The compare is on the stored ciphertext, so at least a store-key rotation
+that re-encrypts the column inside the window refuses too. That refusal reads as `secret_replaced`
+although no second enrolment started.
 `write_lost` means the row still held the verified secret with TOTP off, so the enable lost to
 some other concurrent write. After a `write_lost` or a store-key rotation the staged secret still
 stands. The user signs in again, because the refused confirm hands no token back and asks the
