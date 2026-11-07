@@ -1011,6 +1011,21 @@ def test_the_refusal_ends_in_its_check_and_holds_no_line_break(
     _head(refusal, literal)
 
 
+@pytest.mark.parametrize("odd", [" ", "\x85", "\n", "​"])
+def test_a_name_that_is_not_printable_gets_no_command_and_stays_printable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, odd: str
+) -> None:
+    """A name can hold a character that fails `str.isprintable`, a line break among them, which
+    would turn off `redact`'s encoded-HL7 pass for the whole message. Red before the fix: the
+    refusal carried the raw character, three times."""
+    refusal = _refusal_for(f"mefor-backup-x{odd}y.", tmp_path, monkeypatch)
+    assert refusal.isprintable()
+    assert "Test-Path" not in refusal
+    assert "Remove-Item" not in refusal
+    assert f"\\u{ord(odd):04x}" in refusal
+    assert refusal.endswith("so no removal can be named for it here; leave it in place")
+
+
 def test_a_caller_adds_its_text_before_the_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

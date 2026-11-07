@@ -128,6 +128,7 @@ __all__ = [
     "RESTORE_NEEDS_A_DESTINATION",
     "run_restore",
     "run_restore_verify",
+    "join_before_checks",
 ]
 
 log = logging.getLogger(__name__)
@@ -2445,23 +2446,27 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
     two-step control: the same ``Test-Path`` command prints ``True`` before the removal and
     ``False`` after, since a ``False`` before it cannot tell a command that names nothing from a
     directory that is gone or cannot be read. The command ends this text, after ``_CHECKS_LEAD``,
-    and the text holds no line break: one fails ``str.isprintable``, and :func:`redact` then skips
-    its encoded-HL7 pass for the whole message. A caller that adds to a message holding this text
-    adds before the checks, through :func:`join_before_checks`, so nothing follows a check and a
-    copy of one to the message's end runs only checks, joined by `` ; ``. At least the run's and
-    the build's errors, ``_verify_and_publish``'s, and ``pipeline/dr.py``'s cold-seed
-    restore-verify aborts do. With two refusals in one message both checks end it, so the text
-    points at the check on this same path, not at the last one. The ``Remove-Item`` command is set
-    off by a colon before it and a `` ;`` after it, and text follows it. No ``cmd.exe`` form is
-    given: interactive ``cmd.exe`` expands ``%VAR%`` even inside double quotes. A screen fault's detail comes before the commands and after the verbatim
-    path, since it can carry the plain path.
+    and every character of the text passes ``str.isprintable``, which :func:`redact` requires
+    before its encoded-HL7 pass (:func:`join_before_checks` says why that binds). A name holding a
+    character that does not, a line break among them, gets no command: its path is shown with
+    escapes (:func:`_shown`) and the text says to leave it in place. A caller that adds to a
+    message holding this text adds before the checks, through :func:`join_before_checks`. At least
+    the run's and the build's errors, ``_verify_and_publish``'s, and ``pipeline/dr.py``'s
+    ``KEY_MISMATCH`` and failed restore-verify aborts do; its errored and timed-out aborts carry no
+    refusal at all. With two refusals in one message both checks end it, joined by `` ; ``, so the
+    text points at the check on this same path, not at the last one. The ``Remove-Item`` command
+    is set off by a colon before it and a `` ;`` after it, and text follows it. No ``cmd.exe``
+    form is given: interactive ``cmd.exe`` expands ``%VAR%`` even inside double quotes. A screen
+    fault's detail comes before the commands and after the verbatim path, since it can carry the
+    plain path.
 
     Measured on Windows 11 build 26300, with synthetic files: a removal by the plain path, by
     ``rd /s /q`` or ``Remove-Item -Recurse``, removes the OTHER directory and leaves this one, and
-    reports nothing. The printed ``Remove-Item`` line, run from a script in Windows PowerShell 5.1
-    and in PowerShell 7 on a name ending in ``%PATH%`` and a space, removed only this directory,
-    rewritten names inside it included, and left the other; the printed ``Test-Path`` line read
-    ``True`` before it and ``False`` after. With no other directory there, that check read ``True``
+    reports nothing. The printed ``Remove-Item`` command, run from a script in Windows PowerShell
+    5.1 and in PowerShell 7 on a name ending in ``%PATH%`` and a space, removed only this
+    directory, rewritten names inside it included, and left the other; the printed ``Test-Path``
+    command, taken from after ``_CHECKS_LEAD``, read ``True`` before it and ``False`` after, and
+    two checks joined by `` ; `` and run as one line printed one value each. With no other directory there, that check read ``True``
     where the same check by the plain path read ``False``; with a file in it held open, the removal
     printed its errors and the check still read ``True``. On an existing path it could not read,
     ``Test-Path`` printed ``False`` and an access-denied error, even with ``-ErrorAction Stop``,
@@ -2485,15 +2490,24 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
         if trailing
         else ""
     )
+    fault = _shown(fault)
     try:
         literal = _ps_literal(_win_verbatim(staging))
     except Exception as exc:  # never raise over the verdict or the error in flight
         # No command: one assembled by hand from a name and a parent is the mistake this prevents.
         return (
-            f"{ban}; it is named {_ps_literal(staging.name)}{ends}, in "
-            f"{_ps_literal(str(staging.parent))}, and since its verbatim path could not be formed, "
-            f"no removal can be named for it here; leave it in place{fault} (forming the path "
-            f"failed: {safe_exc(exc)})"
+            f"{ban}; it is named {_shown(_ps_literal(staging.name))}{ends}, in "
+            f"{_shown(_ps_literal(str(staging.parent)))}, and since its verbatim path could not be "
+            f"formed, no removal can be named for it here; leave it in place{fault} (forming the "
+            f"path failed: {_shown(safe_exc(exc))})"
+        )
+    if not literal.isprintable():
+        # No command: a copy of an escaped path names another one, and the raw one would put a
+        # character in the message that turns off redact's encoded-HL7 pass.
+        return (
+            f"{ban}; it is {_shown(literal)}{ends}{fault}, where each \\u or \\U escape stands for "
+            "a character that cannot be shown here, so no removal can be named for it here; leave "
+            "it in place"
         )
     return (
         f"{ban}; it is {literal}{ends}{fault}; a path here that shows <redacted>, [redacted] "
@@ -2513,17 +2527,22 @@ _TEST_PATH = "Test-Path -LiteralPath"
 #: What sets the checks off at the end of a message, ahead of the first.
 _CHECKS_LEAD = "; to check, in PowerShell: "
 #: One check as :func:`_rewritten_staging_refusal` writes it, on a :func:`_ps_literal` literal.
+#: Each character PowerShell reads as a single quote, which :func:`_ps_literal` doubles.
+_PS_QUOTES = "'\u2018\u2019\u201a\u201b"
 _CHECK = re.compile(
     re.escape(_TEST_PATH)
-    + " '(?:[^'\u2018\u2019\u201a\u201b]|''|\u2018\u2018|\u2019\u2019|\u201a\u201a|\u201b\u201b)*'"
+    + f" '(?:[^{_PS_QUOTES}]|"
+    + "|".join(re.escape(q * 2) for q in _PS_QUOTES)
+    + ")*'"
 )
 _CHECKS = re.compile(f"{re.escape(_CHECKS_LEAD)}(?:{_CHECK.pattern})(?: ; (?:{_CHECK.pattern}))*")
 
 
 def _split_checks(text: str) -> tuple[str, list[str]]:
     """``text`` without the checks that end it, and those checks; ``(text, [])`` when none do.
-    The first lead from which the rest of ``text`` is checks alone is the one, so a lead written
-    inside a path, which a planted name can hold, is not taken for it."""
+    The first lead from which the rest of ``text`` is checks alone is the one, so a lead inside a
+    path is not taken for it. A Windows name cannot hold the lead, whose colon NTFS refuses, but
+    the split does not rest on that."""
     for lead in re.finditer(re.escape(_CHECKS_LEAD), text):
         if _CHECKS.fullmatch(text, lead.start()):
             tail = text[lead.end() :]
@@ -2533,9 +2552,9 @@ def _split_checks(text: str) -> tuple[str, list[str]]:
 
 def join_before_checks(text: str, sep: str, more: str) -> str:
     """``text``, ``sep`` and ``more``, with the ``Test-Path`` checks either ends in moved to the end
-    of the whole, after ``_CHECKS_LEAD`` and joined by `` ; ``. So no text ever follows a check, and
-    the message needs no line break: one would fail ``str.isprintable``, and :func:`redact` skips
-    its encoded-HL7 pass on a text that fails it."""
+    of the whole, after ``_CHECKS_LEAD`` and joined by `` ; ``, so no text this joins follows a
+    check. The message needs no line break for that, which matters: :func:`redact` skips its
+    encoded-HL7 pass on a whole text that fails ``str.isprintable``, and a line break fails it."""
     head, checks = _split_checks(text)
     more_head, more_checks = _split_checks(more)
     joined = f"{head}{sep}{more_head}"
@@ -2547,9 +2566,18 @@ def _ps_literal(text: str) -> str:
     """``text`` as a PowerShell single-quoted string literal: nothing in it expands, and each
     character PowerShell reads as a single quote is doubled, the escape PowerShell's own
     ``EscapeSingleQuotedStringContent`` applies."""
-    for quote in "'\u2018\u2019\u201a\u201b":
+    for quote in _PS_QUOTES:
         text = text.replace(quote, quote * 2)
     return f"'{text}'"
+
+
+def _shown(text: str) -> str:
+    """``text`` with each character that fails ``str.isprintable`` written as a ``\\u`` or
+    ``\\U`` escape, for a message that must stay printable and names no command on it."""
+    return "".join(
+        c if c.isprintable() else (f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}")
+        for c in text
+    )
 
 
 def _discard_verify_staging(staging: Path) -> str | None:
