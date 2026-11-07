@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import functools
+import json
 import logging
 import os
 import re
@@ -1540,7 +1541,7 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
     account = "NT SERVICE\\MessageFoundry"
     cli._discard_minted_custody(kept, server, RuntimeError("stand-in"), service_account=account)
     handed = capsys.readouterr().err
-    assert kept.exists() and handed.count(cli._CHECK_BEFORE_REMOVING) == 1, handed
+    assert kept.exists() and "Keep both until this is settled" in handed, handed
     texts.append(handed)
     assert all(text.count("WARNING:") == 1 for text in texts[-3:]), texts[-3:]
     # Every text names its own way on, in the order rendered above. The existing-store text
@@ -1569,8 +1570,6 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
                 if text is foreign
                 else (cli._REMOVE_THE_VOID_KEY,)
                 if text is held
-                else (cli._CHECK_BEFORE_REMOVING,)
-                if text is kept_text or text is handed
                 else ()
             ),
         )
@@ -1809,9 +1808,9 @@ def test_a_minted_key_is_kept_when_the_pin_refused_after_a_write(
     warning = capsys.readouterr().err
     assert str(kept) in warning and "run the command again" in warning.lower(), warning
     flat = " ".join(warning.split())
-    assert "remove" not in flat.replace(cli._CHECK_BEFORE_REMOVING, "").lower(), warning
+    assert "remove" not in flat.lower(), warning
     assert "another store's" not in warning, warning
-    assert not _advises_changing(flat, allowed=(cli._CHECK_BEFORE_REMOVING,)), warning
+    assert not _advises_changing(flat), warning
     assert "cannot tell whose key" not in warning, warning
     removed = tmp_path / "removed.key"
     removed.write_bytes(b"k")
@@ -1875,8 +1874,8 @@ def test_a_kept_key_names_the_manual_check_and_moves_nothing(
     warning = " ".join(capsys.readouterr().err.split())
     assert kept.read_bytes() == b"k", warning
     assert f"so that key is kept in {kept}" in warning, warning
-    assert cli._CHECK_BEFORE_REMOVING in warning, warning
-    assert not _advises_changing(warning, allowed=(cli._CHECK_BEFORE_REMOVING,)), warning
+    assert "Keep both until this is settled" in warning, warning
+    assert not _advises_changing(warning), warning
     if service_account is None:
         assert "Run the command again with that file in place" in warning, warning
         return
@@ -1926,7 +1925,7 @@ def test_a_key_kept_over_a_sqlite_store_file_names_no_hand_check(
     cli._discard_minted_custody(kept, sqlite, CipherError("stand-in"))
     warning = " ".join(capsys.readouterr().err.split())
     assert kept.read_bytes() == b"k" and f"so that key is kept in {kept}" in warning, warning
-    assert cli._CHECK_BEFORE_REMOVING not in warning, warning
+    assert "Keep both until this is settled" in warning, warning
     assert not _advises_changing(warning), warning
 
 
@@ -2013,6 +2012,65 @@ def test_a_custody_directory_that_grants_folders_but_not_files_is_refused_before
     assert "cannot add a file to the custody directory" in refused, refused
     assert not (folders_only / custody_host.HOST_FILE_NAME).exists()
     assert cleaned.returncode == 0, cleaned.stderr
+
+
+@host_file_platforms
+@pytest.mark.parametrize("anywhere", [None, True, False])
+def test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    anywhere: bool | None,
+) -> None:
+    # PR 2804 fourteenth hold, item 4: the pre-check read a server open's "no store" as absent and
+    # minted. That open sees only what its login resolves (a search_path, a default schema, the
+    # objects it may see), so a store the login cannot see read as none. Now the database's
+    # catalog, read whole, decides: no store schema anywhere mints; one this login does not
+    # resolve, or a catalog this login cannot show whole, refuses before any key is shown.
+    from messagefoundry import __main__ as cli
+    from messagefoundry.__main__ import main
+    from messagefoundry.store import base
+
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    if sys.platform != "win32":
+        secrets.chmod(0o700)
+    monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
+    shown: list[str] = []
+
+    async def _open(settings: StoreSettings, **kwargs: object) -> Store:
+        if kwargs.get("custody") is None:
+            raise HostCustodyMissing("no host blob and no handoff here (stand-in)")
+        raise base.StoreNotFoundError.server_schema(StoreBackend.POSTGRES, "mefor")
+
+    async def _anywhere(*_args: object, **_kwargs: object) -> bool | None:
+        return anywhere
+
+    def _ceremony(*_args: object, **_kwargs: object) -> None:
+        shown.append("recovery key shown")
+        raise HostCustodyRefused("the ceremony was reached (stand-in)")
+
+    monkeypatch.setattr(base, "open_store", _open)
+    monkeypatch.setattr(base, "server_store_schema_found_anywhere", _anywhere, raising=False)
+    monkeypatch.setattr(custody_host, "mint_host_custody", _ceremony)
+    monkeypatch.setattr(cli, "_read_new_password", lambda _prompt: "correct horse battery")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[store]\nbackend = "postgres"\nkey_provider = "host"\n'
+        'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
+        "[security]\nrequire_mfa = false\n"
+    )
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    code = main([*argv, "--no-totp"])
+    err = " ".join(capsys.readouterr().err.split())
+    assert code == 2, err
+    if anywhere is False:  # the control: the whole catalog shows no store, so the mint runs
+        assert shown == ["recovery key shown"], err
+        return
+    assert shown == [], err  # refused before any recovery key was shown
+    assert "no key was minted" in err, err
+    assert not (secrets / custody_host.HOST_FILE_NAME).exists()
 
 
 @host_file_platforms
@@ -2157,12 +2215,14 @@ def test_a_custody_directory_the_write_refuses_is_refused_before_the_recovery_ke
 
 
 @host_file_platforms
+@pytest.mark.parametrize("as_json", [False, True])
 @pytest.mark.parametrize("shape", ["no store", "keyed leftovers"])
 def test_a_failed_server_create_keeps_the_minted_key_and_names_the_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     shape: str,
+    as_json: bool,
 ) -> None:
     # PR 2804 thirteenth hold. The eleventh hold removed the key after a server create that failed
     # over a database a probe read as holding no store schema, and the twelfth told the operator
@@ -2209,7 +2269,11 @@ def test_a_failed_server_create_keeps_the_minted_key_and_names_the_check(
         mints.append(host_file)
         return MintedCustody(HostBlob(MasterKey.mint(), StoreId.mint()), host_file, b"wrap")
 
+    async def _none_anywhere(*_args: object, **_kwargs: object) -> bool:
+        return False  # the database's catalog, read whole, holds no store schema
+
     monkeypatch.setattr(base, "open_store", _open)
+    monkeypatch.setattr(base, "server_store_schema_found_anywhere", _none_anywhere, raising=False)
     monkeypatch.setattr(custody_host, "mint_host_custody", _ceremony)
     monkeypatch.setattr(cli, "_read_new_password", lambda _prompt: "correct horse battery")
     monkeypatch.chdir(tmp_path)
@@ -2221,19 +2285,31 @@ def test_a_failed_server_create_keeps_the_minted_key_and_names_the_check(
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
     argv.append("--no-totp")
+    if as_json:
+        argv.append("--json")
     code = main(argv)
-    err = " ".join(capsys.readouterr().err.split())
+    captured = capsys.readouterr()
+    err = " ".join(captured.err.split())
     assert code == 2, err
     assert created == [True] and mints == [host_file], err
-    # Kept, unchanged, and named, with the manual check and no step that moves or removes it.
+    # Kept, unchanged, and named, and the text says to keep it and the recovery key, removing
+    # nothing (PR 2804 fourteenth hold, item 1).
     assert host_file.read_bytes() == b"minted (stand-in)", err
     assert f"so that key is kept in {host_file}" in err, err
     assert "was removed from" not in err, err
-    assert cli._CHECK_BEFORE_REMOVING in err, err
+    assert "Keep both until this is settled" in err, err
     warning = err[err.index("WARNING:") :]
-    assert not _advises_changing(warning, allowed=(cli._CHECK_BEFORE_REMOVING,)), warning
+    assert not _advises_changing(warning), warning
+    # The closing line never says nothing was written over a kept key, as text or as the --json
+    # error object, and names the kept file (fourteenth hold, item 2).
+    closing = captured.out if as_json else err[err.index("error:") :]
+    if as_json:
+        closing = json.loads(closing)["error"]
+    closing = " ".join(closing.split())
+    assert "nothing was written" not in closing, closing
+    assert f"the store key minted for it is kept at {host_file}" in closing, closing
     # A re-run does not mint over the kept key.
-    assert main(argv) == 2
+    assert main([a for a in argv if a != "--json"]) == 2
     rerun = " ".join(capsys.readouterr().err.split())
     assert mints == [host_file] and host_file.read_bytes() == b"minted (stand-in)", rerun
     # It stops at the kept file, or at the store's never-started chain, as the warning says.

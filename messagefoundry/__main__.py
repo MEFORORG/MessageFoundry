@@ -7062,19 +7062,9 @@ class _RecoveryKeyConsole:
 
 
 #: The step a failed-mint warning gives for removing the key file this run minted, once the store
-#: holds no data under it and no run can start a store under it (PR 2804 eleventh hold).
-_REMOVE_THE_VOID_KEY = "remove that file and run the command again"
-
-#: The manual check a kept-key warning names before the operator removes the key file by hand
-#: (PR 2804 thirteenth hold). The engine moves and removes nothing it cannot prove it made over a
-#: store that holds nothing under it, so it names the file and this check and stops.
-_CHECK_BEFORE_REMOVING = (
-    "Before you remove that file by hand, check, with a login that can read every table in the "
-    "store's database, that the database holds no audit_log table or that its audit_log table "
-    "holds no row. Check once no session this command opened is left on the server, since a "
-    "record it sent may still land until then. A row there means a store was started, and that "
-    "file may be its key"
-)
+#: holds no data under it and no run can start a store under it (PR 2804 eleventh hold). It
+#: promises no re-run: a store made at that address meanwhile refuses one (fourteenth hold).
+_REMOVE_THE_VOID_KEY = "remove that file"
 
 
 def _handoff_kept_step(store: StoreSettings, service_account: str) -> str:
@@ -7095,18 +7085,18 @@ def _discard_minted_custody(
     failure: BaseException,
     *,
     service_account: str | None = None,
-) -> None:
+) -> Path | None:
     """Remove the host blob or handoff ``provision-admin`` minted when the store it was minted for
     could not be created, so a second run can mint again, but only where this run can prove the
     open wrote nothing under it: the store id pin refused before the open's first write
     (:class:`~messagefoundry.store.store.StoreIdPinRefusedBeforeWrite`; a pin refusal raised later,
     once the salt bind may have run, does not count), or a SQLite store whose file was never made.
 
-    Otherwise the file is kept, and the warning names it and says the store may hold nothing under
-    it; for a server store it also names the check to make before removing it by hand, while over
-    a SQLite store file that exists removing it gains nothing. Nothing else is moved or removed: a
-    server database read through a login that may not see every schema cannot prove it holds
-    nothing (PR 2804 thirteenth hold). Neither text carries the key."""
+    Otherwise the file is kept, and the warning names it and says to keep it and the recovery key
+    shown, deleting neither: the store may hold data sealed under it, and no check this run or an
+    operator can make proves it does not (PR 2804 thirteenth and fourteenth holds). Returns the
+    kept file's path, so the closing line names it rather than say nothing was written, or
+    ``None`` when nothing is kept. Neither text carries the key."""
     from messagefoundry.config.settings import StoreBackend
     from messagefoundry.store.base import _absent_sqlite_store
     from messagefoundry.store.custody_host import keep_the_key_step
@@ -7116,9 +7106,6 @@ def _discard_minted_custody(
         store.backend is StoreBackend.SQLITE and _absent_sqlite_store(store) is not None
     )
     if not nothing_written:
-        # A SQLite store file is there, so removing the key gains nothing: a run with no key
-        # refuses a store that exists. The hand check is named for a server store only.
-        check = "" if store.backend is StoreBackend.SQLITE else f"{_CHECK_BEFORE_REMOVING}. "
         if service_account is None:
             # A re-run with the host file in place carries on with a store started under it, and
             # otherwise names a way on that keeps the file.
@@ -7131,12 +7118,14 @@ def _discard_minted_custody(
         print(
             "WARNING: the store could not be created, and this run cannot prove that no store "
             f"was started under the store key minted for it, so that key is kept in {path}. No "
-            "Administrator was provisioned into it. If a store was started under that key, that "
-            "file and the recovery key shown are its only keys. If none was, both are void, and "
-            f"a run here stops at that file rather than mint over it. {check}{then}",
+            "Administrator was provisioned into it. The store at that address may hold data "
+            "sealed under that key, and that file and the recovery key shown may be its only "
+            "keys. Keep both until this is settled: losing either may lose that store. A run here "
+            "stops at that "
+            f"file rather than mint over it. {then}",
             file=sys.stderr,
         )
-        return
+        return path
     try:
         path.unlink()
         print(
@@ -7147,6 +7136,7 @@ def _discard_minted_custody(
     except FileNotFoundError:
         pass
     except OSError as exc:
+        # Kept, but void: nothing was written under it, so the closing line stays as it is.
         # A new store location only where the pin refused: a store another key made is there.
         step = keep_the_key_step(
             store,
@@ -7162,6 +7152,7 @@ def _discard_minted_custody(
             f"once it can be, {_REMOVE_THE_VOID_KEY}. {step}",
             file=sys.stderr,
         )
+    return None
 
 
 def _read_new_password(prompt: str) -> str:
@@ -8520,15 +8511,29 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     return left
 
 
-def _provision_open_refusal(exc: BaseException, store: StoreSettings) -> str:
+def _provision_open_refusal(
+    exc: BaseException, store: StoreSettings, *, kept: Path | None = None
+) -> str:
     """``provision-admin``'s text for a refused store open: the refusal, then what it left
     behind (:func:`_open_refusal_left_behind`, BACKLOG #5067). Through ``codec_safe_str``, as
     every other command prints an open refusal: a key source's codec error quotes a byte of what
-    it decoded (BACKLOG #2532)."""
+    it decoded (BACKLOG #2532). ``kept`` is the store key a failed create kept: the text then
+    names it, and never says nothing was written (PR 2804 fourteenth hold)."""
     from messagefoundry.redaction import codec_safe_str
 
     left = _open_refusal_left_behind(exc, store)
-    tail = _NOTHING_PROVISIONED if left is None else f"Refusing to provision. {left}"
+    if kept is not None:
+        held = (
+            "No Administrator was provisioned, and the store key minted for it is kept at "
+            f"{kept} (see the warning above)"
+        )
+        tail = (
+            f"Refusing to provision. {held}"
+            if left is None
+            else (f"Refusing to provision. {_sentence(left)} {held}")
+        )
+    else:
+        tail = _NOTHING_PROVISIONED if left is None else f"Refusing to provision. {left}"
     return f"{_sentence(codec_safe_str(exc))} {tail}"
 
 
@@ -8810,6 +8815,44 @@ def _provision_admin(args: argparse.Namespace) -> int:
         the prompts, as the ordinary pre-check's do."""
         return await server_store_found() != "held"
 
+    async def no_store_anywhere() -> Literal["none"]:
+        """``none`` once the server database's catalog, read whole, holds no store schema (PR 2804
+        fourteenth hold). An open's "no store" is only what its login resolves, through a
+        search_path, a default schema and the objects it may see, so a store it cannot see reads
+        the same. Raises :class:`HostCustodyRefused` for a store schema the login does not
+        resolve, and for a catalog it cannot show whole: neither is minted over."""
+        from messagefoundry.store import base as store_base
+        from messagefoundry.store.base import store_connect_errors, store_driver_errors
+        from messagefoundry.store.custody_host import HostCustodyRefused
+
+        try:
+            anywhere = await store_base.server_store_schema_found_anywhere(
+                settings.store, posture=posture
+            )
+        except (*store_driver_errors(), *store_connect_errors()) as unread:
+            # The class only: a driver's text can quote a value.
+            raise HostCustodyRefused(
+                "whether the database holds a store this login cannot see could not be read "
+                f"({type(unread).__name__}), so no key was minted. Check that this login can "
+                "read the database's catalog and that the server answers, then run the command "
+                "again"
+            ) from unread
+        if anywhere is None:
+            raise HostCustodyRefused(
+                "this login reads no store in the database, but cannot show that none is there: "
+                "it cannot see every object in it (on SQL Server it does not hold VIEW DEFINITION "
+                "on the database), so no key was minted. Grant that, or run with a login that "
+                "holds it, then run the command again"
+            )
+        if anywhere:
+            raise HostCustodyRefused(
+                "the database holds a store schema (a schema_meta table) that this login does not "
+                "resolve through its search_path or default schema, so no key was minted over "
+                "it. Point [store] at that store's own login and schema, or at a new database, "
+                "then run the command again"
+            )
+        return "none"
+
     async def server_store_found() -> Literal["none", "empty", "held"]:
         """What the server database holds, read as :func:`server_store_absent` reads it: ``none``,
         no store schema; ``empty``, an empty audit chain over a store that holds no data; ``held``,
@@ -8835,7 +8878,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 custody=throwaway,
             )
         except StoreNotFoundError:
-            return "none"
+            return await no_store_anywhere()
         except (StoreIdPinRefused, CipherError):
             return "held"
         try:
@@ -9069,6 +9112,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
             "shows a new key."
         )
 
+    # The store key a failed create kept, for the closing line (PR 2804 fourteenth hold).
+    kept_key: list[Path] = []
+
     async def run() -> tuple[ProvisionedAdministrator, str]:
         nonlocal write_started
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
@@ -9085,9 +9131,11 @@ def _provision_admin(args: argparse.Namespace) -> int:
             )
         except BaseException as exc:
             if minted is not None:
-                _discard_minted_custody(
+                kept = _discard_minted_custody(
                     minted.path, settings.store, exc, service_account=args.service_account
                 )
+                if kept is not None:
+                    kept_key.append(kept)
             raise
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:
@@ -9210,7 +9258,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # short server schema (#1720) can first arrive here: with no `schema_meta` table the
         # pre-check finds no store, and only this create=True open runs the DDL batch. The text
         # says what the open may have changed, and that the shown key's entry has no seed (#5067).
-        text = after_the_key(codec_safe_str(exc), _provision_open_refusal(exc, settings.store))
+        kept = kept_key[0] if kept_key else None
+        text = after_the_key(
+            codec_safe_str(exc), _provision_open_refusal(exc, settings.store, kept=kept)
+        )
         _emit_error(text, as_json=args.json)
         return 2
     except (StoreKeylessError, CipherError) as exc:
@@ -9219,7 +9270,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # write itself may follow a row it wrote, so it reaches the floor as it did.
         if write_started:
             raise
-        text = after_the_key(codec_safe_str(exc), _provision_open_refusal(exc, settings.store))
+        kept = kept_key[0] if kept_key else None
+        text = after_the_key(
+            codec_safe_str(exc), _provision_open_refusal(exc, settings.store, kept=kept)
+        )
         _emit_error(text, as_json=args.json)
         return 2
     except sqlite3.IntegrityError as exc:

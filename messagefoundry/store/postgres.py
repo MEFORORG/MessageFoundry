@@ -2174,6 +2174,25 @@ class PostgresStore:
             await store.close()
 
     @classmethod
+    async def schema_meta_anywhere(
+        cls, settings: StoreSettings, *, posture: HopPosture | None = None
+    ) -> bool | None:
+        """Whether a ``schema_meta`` table is in any schema of this database (PR 2804 fourteenth
+        hold). Read from ``pg_catalog.pg_class``, which lists every relation to every role whatever
+        its search_path or its schema privileges, where ``to_regclass`` resolves through the
+        search_path and skips a schema the role has no USAGE on. Never ``None`` here: a catalog
+        this role may not read raises the driver's error. Reads only."""
+        async with (
+            cls._one_connection_store(settings, posture=posture) as store,
+            store._timed_acquire() as conn,
+        ):
+            row = await conn.fetchrow(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class"
+                " WHERE relname = 'schema_meta' AND relkind IN ('r', 'p')) AS found"
+            )
+        return bool(row is not None and row["found"])
+
+    @classmethod
     async def probe_privileges(
         cls, settings: StoreSettings, *, posture: HopPosture | None = None
     ) -> StorePrivilegeReport:

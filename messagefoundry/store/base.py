@@ -4270,6 +4270,20 @@ def _server_store_class(backend: StoreBackend) -> type[SqlServerStore] | type[Po
     raise NotImplementedError(f"store backend {backend.value!r} is not implemented yet")
 
 
+async def server_store_schema_found_anywhere(
+    settings: StoreSettings, *, posture: HopPosture | None = None
+) -> bool | None:
+    """Whether the server database holds a store schema (a ``schema_meta`` table) anywhere, read
+    from a catalog this login sees whole rather than through its own name resolution, or ``None``
+    when the login cannot show the whole catalog (PR 2804 fourteenth hold). A read-only check on a
+    one-connection pool, for a caller whose open read "no store": that open resolves names through
+    the login's search_path or default schema, so a store elsewhere reads the same. Raises what the
+    connection and the driver raise."""
+    return await _server_store_class(settings.backend).schema_meta_anywhere(
+        settings, posture=posture
+    )
+
+
 async def probe_store_privileges(
     settings: StoreSettings, *, posture: HopPosture | None = None
 ) -> StorePrivilegeReport:

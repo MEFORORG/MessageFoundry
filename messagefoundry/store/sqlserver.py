@@ -5195,6 +5195,40 @@ class SqlServerStore:
             await store.close()
 
     @classmethod
+    async def schema_meta_anywhere(
+        cls, settings: StoreSettings, *, posture: HopPosture | None = None
+    ) -> bool | None:
+        """Whether a ``schema_meta`` table is in any schema of this database (PR 2804 fourteenth
+        hold), or ``None`` when this login cannot show that. ``sys.objects`` lists only what the
+        login may see, so its answer counts only where the login holds ``VIEW DEFINITION`` on the
+        database. Even then, at least a ``DENY`` of ``VIEW DEFINITION`` on a schema or a table can
+        still hide one. ``OBJECT_ID`` resolves through the login's default schema only. Reads
+        only."""
+        found: bool | None = None
+        async with (
+            cls._one_connection_store(settings, posture=posture) as probe,
+            probe._acquire() as conn,
+            probe._cursor(conn) as cur,
+        ):
+            try:
+                await cur.execute(
+                    "SELECT HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'VIEW DEFINITION')"
+                )
+                row = await cur.fetchone()
+                if row is not None and row[0] == 1:
+                    await cur.execute(
+                        "SELECT COUNT(*) FROM sys.objects"
+                        " WHERE name = N'schema_meta' AND type = N'U'"
+                    )
+                    counted = await cur.fetchone()
+                    found = bool(counted is not None and counted[0])
+                await probe._commit_read(conn)  # a read snapshot: not a counted write txn
+            except Exception:
+                await conn.rollback()
+                raise
+        return found
+
+    @classmethod
     async def probe_privileges(
         cls, settings: StoreSettings, *, posture: HopPosture | None = None
     ) -> StorePrivilegeReport:
