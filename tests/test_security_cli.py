@@ -114,24 +114,80 @@ def test_set_preview_reads_the_session_limits_after_the_edit(
     assert switch not in [lo["switch"] for lo in res["loosenings"]]
 
 
+def _entries(res: dict, switch: str) -> list[dict]:
+    return [lo for lo in res["loosenings"] if lo["switch"] == switch]
+
+
 def test_the_session_limits_are_reported_as_the_file_sets_them(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Both commands print the file's [security] in `values`, so the two session-limit entries are
-    read from it too, never from a shell variable that only the whole-file load sees (vault BACKLOG
+    """Both commands print the file's [security] in `values`, so a session limit the file sets
+    looser is named once, as the file's, even while a shell variable tightens it (vault BACKLOG
     #2600). The variable is a valid one, so the load succeeds and nothing reads as partial."""
     toml = tmp_path / "mf.toml"
     monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", "12")
     rc, res = _set(toml, {"max_session_hours": 24}, capsys)
     assert rc == 0 and res["loosenings_partial"] is False
-    assert "max_session_hours" in [lo["switch"] for lo in res["loosenings"]]
-    # The reverse: the shell variable is looser, the file is at the default, and `values` says 12.
-    rc, _ = _set(toml, {"max_session_hours": None}, capsys)
-    assert rc == 0
-    monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", "48")
+    (entry,) = _entries(res, "max_session_hours")
+    assert "MEFOR_SECURITY" not in entry["risk"]
+
+
+@pytest.mark.parametrize(
+    ("switch", "looser"), [("max_session_hours", "48"), ("sign_out_after_idle_minutes", "240")]
+)
+def test_a_session_limit_only_the_environment_loosens_is_named_as_the_environments(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    switch: str,
+    looser: str,
+) -> None:
+    """The file leaves the limit at its default and a MEFOR_SECURITY_* variable in this shell sets
+    it looser. `show` and the `set` preview still name it, as origin/main did, labelled with the
+    variable, since `values` prints the file's default (vault BACKLOG #2600). The control is the
+    same file with no variable: nothing is named."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nrequire_mfa = true\n", encoding="utf-8")
+    assert _entries(_show(toml, capsys), switch) == []
+    variable = f"{_ENV_PREFIX}SECURITY_{switch.upper()}"
+    monkeypatch.setenv(variable, looser)
     data = _show(toml, capsys)
-    assert data["loosenings_partial"] is False and data["values"]["max_session_hours"] == 12
-    assert "max_session_hours" not in [lo["switch"] for lo in data["loosenings"]]
+    assert data["loosenings_partial"] is False
+    assert data["values"][switch] == data["defaults"][switch]
+    rc, res = _set(toml, {"block_unlisted_outbound": True}, capsys)
+    assert rc == 0 and res["loosenings_partial"] is False
+    for report in (data, res):
+        (entry,) = _entries(report, switch)
+        assert entry["risk"].startswith(f"set by {variable} in this command's environment")
+
+
+@pytest.mark.parametrize("error", ["security_edit", "os"])
+def test_set_preview_does_not_refuse_an_edit_whose_candidate_read_raises(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    error: str,
+) -> None:
+    """The preview's read of the candidate is for the report only, so a SecurityEditError or an
+    OSError from it falls back to the pre-check view rather than refusing an edit the whole-file
+    load accepted (vault BACKLOG #2600). Only the candidate's read raises; the live file reads."""
+    from messagefoundry.config import security_edit
+
+    real = security_edit.read_security
+    toml = tmp_path / "mf.toml"
+
+    def failing_candidate(service_config: str | Path) -> dict:
+        if Path(service_config) != toml:
+            if error == "os":
+                raise OSError("unreadable")
+            raise security_edit.SecurityEditError("unreadable")
+        return real(service_config)
+
+    monkeypatch.setattr(security_edit, "read_security", failing_candidate)
+    rc, res = _set(toml, {"max_session_hours": 48}, capsys)
+    assert rc == 0, res
+    assert "max_session_hours = 48" in toml.read_text(encoding="utf-8")
+    assert _entries(res, "max_session_hours")
 
 
 def test_an_unset_session_limit_reads_the_auth_default(

@@ -12012,6 +12012,7 @@ def _security(args: argparse.Namespace) -> int:
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
         _SECURITY_PASSTHROUGH,
+        AuthSettings,
         SecuritySettings,
         ServiceSettings,
         _auth_default,
@@ -12037,11 +12038,18 @@ def _security(args: argparse.Namespace) -> int:
         The registry reads the two session limits off those copies, and the load fills them from
         the file AND the environment, while ``sec`` is an authored [security] with no environment
         layer: the file's for `show`, the saved candidate's for `set`. Unmatched, a shell variable
-        or the shipped-default fallback named a limit `values` did not show, or hid one it did, and
+        named a limit `values` did not show with nothing saying where it came from, a shell variable
+        or the shipped-default fallback hid one `values` did show, and
         a `set` preview paired with the pre-edit load missed a new loosening. A switch ``sec``
         leaves unset takes the [auth] field's shipped default, as a load with no MEFOR_SECURITY_*
         variable leaves it, not ``sec``'s default: the two are separate literals, which
-        tests/test_security_cli.py pins equal for the session limits."""
+        tests/test_security_cli.py pins equal for the session limits.
+
+        A loosening that only the environment layer delivers is still named, after the authored
+        ones and labelled as coming from that variable (vault BACKLOG #2600): at least a session
+        limit set looser by a MEFOR_SECURITY_* variable in this shell while the file leaves it
+        alone. It is found by comparing the loaded [auth] copies with the authored ones, so only a
+        load that succeeded can surface one; a partial report cannot, and says it is partial."""
         full: ServiceSettings | None = saved
         partial_reason: str | None = None
         # An ABSENT file is not a degraded read -- the shipped defaults ARE the effective posture
@@ -12050,6 +12058,8 @@ def _security(args: argparse.Namespace) -> int:
             # The shared load: its catch is the specific ways a settings file fails to resolve, and
             # anything else is a programming error that surfaces.
             full, partial_reason = _load_service_settings(path)
+        # Only a real load carries the environment layer; the fallback below is shipped defaults.
+        loaded = full is not None
         if full is None:
             full = ServiceSettings()
         auth = full.auth.model_copy(
@@ -12061,6 +12071,7 @@ def _security(args: argparse.Namespace) -> int:
                 if section == "auth"
             }
         )
+
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
         # store — so it can see NEITHER the per-connection declarations NOR the two store
         # observations (#1008 privilege, #1905 audit-chain keying). It passes empty lists and None and
@@ -12071,12 +12082,11 @@ def _security(args: argparse.Namespace) -> int:
         # BACKLOG #2700), the start-up reading (vault BACKLOG #2701) and the service-environment
         # reading (vault BACKLOG #2595) are facts about the ENGINE process, and this command is
         # another process, so it passes None for those too.
-        loosenings = [
-            {"switch": s, "risk": r}
-            for s, r in security_loosenings(
+        def registry(auth_view: AuthSettings) -> list[tuple[str, str]]:
+            return security_loosenings(
                 sec,
                 full.store,
-                auth,
+                auth_view,
                 full.alerts,
                 full.secret_rotation,
                 cleartext_hops=(),
@@ -12100,7 +12110,29 @@ def _security(args: argparse.Namespace) -> int:
                 startup=None,
                 service_env=None,
             )
-        ]
+
+        loosenings = [{"switch": s, "risk": r} for s, r in registry(auth)]
+        # A switch whose loaded [auth] copy differs from the authored one was set by the
+        # environment, the only layer the load adds over the file here. Name what that value
+        # loosens, so a variable in this shell is disclosed rather than silently dropped.
+        from_env = {
+            switch
+            for switch, section, field in _SECURITY_PASSTHROUGH
+            if section == "auth" and loaded and getattr(full.auth, field) != getattr(auth, field)
+        }
+        if from_env:
+            named = {entry["switch"] for entry in loosenings}
+            loosenings.extend(
+                {
+                    "switch": s,
+                    "risk": (
+                        f"set by MEFOR_SECURITY_{s.upper()} in this command's environment, not by "
+                        f"the file, so `values` does not show it and the service may not carry it: {r}"
+                    ),
+                }
+                for s, r in registry(full.auth)
+                if s in from_env and s not in named
+            )
         # Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
         # degraded or settings-only report for a complete one. `partial` means the sections outside
         # [security] could not be read at all (the file did not load), so they report shipped defaults; the scope string is the standing limitation above. It names
@@ -12136,11 +12168,13 @@ def _security(args: argparse.Namespace) -> int:
                 "reading, its start-up reading (launch flags, start-up code, writable site "
                 "directories) and its Windows service-environment reading: this command is a separate "
                 "process (GET /security/posture reports them). "
-                "The [security] switches, the two session limits included, are the AUTHORED "
-                "values, so a MEFOR_SECURITY_* variable the service carries is NOT reflected "
-                "here, and neither is a `serve --host` bind override on a "
-                "running engine — see `messagefoundry check` or "
-                "GET /security/posture. The other sections are read as the whole-file load "
+                "The [security] switches are the AUTHORED values, so a MEFOR_SECURITY_* "
+                "variable the service carries is NOT reflected here, and neither is a "
+                "`serve --host` bind override on a running engine — see `messagefoundry check` or "
+                "GET /security/posture. A MEFOR_SECURITY_* variable in THIS command's environment "
+                "that loosens a switch read off its [auth] copy, at least either session limit, is "
+                "named after the authored entries and labelled with the variable, when the "
+                "whole-file load succeeds. The other sections are read as the whole-file load "
                 "resolves them, so a MEFOR_<SECTION>_<KEY> variable in THIS command's environment "
                 "counts there, which may not be the service's. One entry is not read from the "
                 "file at all: "
@@ -12180,12 +12214,13 @@ def _security(args: argparse.Namespace) -> int:
         # concurrent edit between the pre-check read below and the lock cannot pair a stale
         # [security] with this candidate's other sections. This read is for the report only and
         # must not refuse an edit the whole-file load accepted, so a [security] that fails alone
-        # (a MEFOR_SECURITY_* variable overrides its bad value) falls back to the pre-check view.
+        # (a MEFOR_SECURITY_* variable overrides its bad value), or a read of the candidate that
+        # raises, falls back to the pre-check view.
         try:
             saved_sec.append(
                 SecuritySettings.model_validate(security_edit.read_security(candidate))
             )
-        except ValidationError:
+        except (ValidationError, security_edit.SecurityEditError, OSError):
             saved_sec.append(None)
 
     try:
