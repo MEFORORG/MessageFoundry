@@ -2578,7 +2578,9 @@ def _ps_path(text: str) -> str:
         if run:
             parts.append(_ps_literal(run))
             run = ""
-        units = char.encode("utf-16-le")
+        # surrogatepass: a Windows name can hold an unpaired UTF-16 unit, which Python keeps as a
+        # lone surrogate and strict encoding refuses; passed through, it is that same unit.
+        units = char.encode("utf-16-le", errors="surrogatepass")
         parts.extend(
             f"[char]0x{int.from_bytes(units[i : i + 2], 'little'):04X}"
             for i in range(0, len(units), 2)

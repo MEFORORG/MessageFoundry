@@ -1038,6 +1038,23 @@ def test_a_name_that_is_not_printable_is_named_exactly_and_stays_printable(
     assert f"Remove-Item -LiteralPath {path} -Recurse -Force ;" in refusal
 
 
+def test_a_lone_surrogate_in_the_name_is_spelled_and_does_not_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Windows name can hold an unpaired UTF-16 unit, which Python keeps as a lone surrogate
+    and strict UTF-16 encoding refuses. Red before the fix: `_ps_path` raised UnicodeEncodeError
+    on it, out of the teardown's refusal. It now spells the unit as PowerShell holds it."""
+    odd = "\udc80"
+    name = f"mefor-backup-{odd}."
+    refusal = _refusal_for(name, tmp_path, monkeypatch)
+    assert refusal.isprintable()
+    verbatim = dr_backup._win_verbatim(tmp_path / name)
+    head, _, tail = verbatim.rpartition(odd)
+    path = f"('' + {dr_backup._ps_literal(head)} + [char]0xDC80 + {dr_backup._ps_literal(tail)})"
+    assert dr_backup._ps_path(verbatim) == path
+    _head(refusal, path)
+
+
 def test_a_caller_adds_its_text_before_the_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
