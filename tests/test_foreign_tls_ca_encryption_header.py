@@ -347,9 +347,9 @@ def test_a_pgsslrootcert_on_another_host_is_refused_unread(
     """Red with the ``names_another_host`` branch dropped: the build would read a share on the
     event loop. The refusal names the way out."""
     monkeypatch.setenv("PGSSLROOTCERT", "//db.synthetic.test/share/root.crt")
-    with pytest.raises(ValueError, match="not a plain local path") as refused:
+    with pytest.raises(ValueError, match=_NOT_CLEARED) as refused:
         _build_psql()
-    assert "set PGSSLROOTCERT to a local path" in str(refused.value)
+    assert "point PGSSLROOTCERT at a copy on a local drive" in str(refused.value)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the path walk runs on Windows only")
@@ -390,20 +390,40 @@ def test_a_local_root_certificate_the_walk_cannot_read_is_refused_as_unread(
     text = str(refused.value)
     assert "a name in the path could not be read" in text
     assert "set PGSSLROOTCERT to a readable local path" in text
-    assert "not a plain local path" not in text
+    assert "must be a plain local path" not in text
+
+
+#: The refusal of a path the host check does not clear, worded as ``_refuse_remote_path`` words
+#: it, naming both causes.
+_NOT_CLEARED = (
+    "root certificate file must be a plain local path on this host: not a share, a network "
+    "drive, a link to one, or a path it cannot read"
+)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the path walk runs on Windows only")
-@pytest.mark.parametrize("shape", ["through a file", "a reparse point not followed"])
-def test_a_root_certificate_the_walk_stops_in_without_a_read_failure_is_not_local(
+@pytest.mark.parametrize(
+    "shape", ["through a file", "a reparse point not followed", "a drive target unread"]
+)
+def test_a_root_certificate_the_walk_stops_in_without_a_read_failure_is_not_cleared(
     _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch, shape: str
 ) -> None:
     """The controls for the test above: a walk that stops for any cause but a name the system
-    could not read keeps the "not a plain local path" refusal. A path through a file is one, as
-    is ``_win_probe``'s own refusal of a reparse point it does not follow, which carries no
-    errno."""
+    could not read gets the refusal that names both causes, not a plain local path or a path it
+    cannot read. Each shape here is a local path: a path through a file, ``_win_probe``'s own
+    refusal of a reparse point it does not follow, which carries no errno, and a drive whose
+    ``QueryDosDeviceW`` target could not be read. So the remedy must not be to set a local path.
+    Red when the refusal said only "not a plain local path ... set PGSSLROOTCERT to a local
+    path"."""
     if shape == "through a file":
         monkeypatch.setenv("PGSSLROOTCERT", os.path.join(_write(_no_libpq_root, "x", "a"), "r"))
+    elif shape == "a drive target unread":
+        monkeypatch.setenv("PGSSLROOTCERT", _write(_no_libpq_root, _certificate(), "root.crt"))
+
+        def unread_target(drive: str) -> str | None:
+            raise OSError(f"the drive {drive} could not be read (winerror 31)")
+
+        monkeypatch.setattr(database, "_windows_drive_target", unread_target)
     else:
         root = _write(_no_libpq_root, _certificate(), "root.crt")
         monkeypatch.setenv("PGSSLROOTCERT", root)
@@ -415,8 +435,11 @@ def test_a_root_certificate_the_walk_stops_in_without_a_read_failure_is_not_loca
             return real_probe(path)
 
         monkeypatch.setattr(database, "_win_probe", not_followed)
-    with pytest.raises(ValueError, match="not a plain local path on this host"):
+    with pytest.raises(ValueError, match=_NOT_CLEARED) as refused:
         _build_psql()
+    text = str(refused.value)
+    assert "check the path and the folders above it" in text
+    assert "set PGSSLROOTCERT to a local path" not in text
 
 
 @pytest.mark.parametrize("source", ["default", "PGSSLROOTCERT"])
