@@ -369,7 +369,7 @@ def test_a_4010_pass_with_no_ack_reports_the_4010_codes(monkeypatch: pytest.Monk
     # not-used segment is spliced into pyx12's real report: 004010 says "2", only the 999 says "I4".
     isa = _ISA_270
     gs = "GS*FA*SENDERAPP*RECVAPP*20060501*1200*1*X*004010~"
-    msg = isa + gs + "ST*997*0001~AK1*HS*1~AK9*A*1*1*1~SE*5*0001~GE*1*1~IEA*1*000000001~"
+    msg = isa + gs + "ST*997*0001~AK1*HS*1~AK9*A*1*1*1~SE*4*0001~GE*1*1~IEA*1*000000001~"
     real_loads = _X12_VALIDATE.json_loads_or_refusal
 
     def splice(raw: str) -> tuple[object, object]:
@@ -383,3 +383,24 @@ def test_a_4010_pass_with_no_ack_reports_the_4010_codes(monkeypatch: pytest.Monk
     result = validate(msg)
     assert result.ack is None
     assert [e.code for e in result.errors if e.segment_id == "REF"] == ["2"]
+
+
+def test_sender_separators_cannot_forge_the_acks_st_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With "|" and newline as the sender's separators, a GS03 of "X~ST" and a GS02 of "999" put a
+    # whole "~ST*999" segment boundary into the 997's GS line, ahead of its real ST*997.
+    msg = _conformant_270(dob="19431399").replace("GS*HS*SENDERAPP*RECVAPP*", "GS*HS*999*X#ST*")
+    msg = msg.replace("*", "|").replace("~", chr(10)).replace("#", "~")
+    real = load_x12_code_resolver()
+    seen: list[bool] = []
+
+    def recording(err_cde: str, prefer_5010: bool = True) -> str | None:
+        seen.append(prefer_5010)
+        return real(err_cde, prefer_5010=prefer_5010)
+
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_code_resolver", lambda: recording)
+    result = validate(msg)
+    assert result.ack is not None and "~ST*999" in result.ack and "ST*997" in result.ack
+    assert result.ack_transaction == "997"
+    assert seen and not any(seen)
