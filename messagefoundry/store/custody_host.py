@@ -703,8 +703,7 @@ def _refuse_an_unusable_directory(
     that rule's own check (PR 2804 eleventh hold). ``named`` is whether ``MEFOR_SECRETS_DIRECTORY``
     names the directory, rather than a SQLite store's own data directory, so each refusal names
     the setting that moves it."""
-    from messagefoundry import startupcode
-    from messagefoundry.restricted_file import key_directory_volume_problem
+    from messagefoundry.restricted_file import can_add_a_file, key_directory_volume_problem
 
     none_shown = "so no store key was minted and no recovery key was shown"
     if sys.platform not in ("linux", "win32"):
@@ -745,7 +744,7 @@ def _refuse_an_unusable_directory(
             f"account cannot search, {none_shown}. Create it, {secrets_directory}, or let this "
             "account search the directories above it, and run the command again"
         )
-    if startupcode._can_add_files(directory) is False:
+    if can_add_a_file(directory) is False:
         raise HostCustodyRefused(
             f"this account cannot add a file to the custody directory {directory}, {none_shown}. "
             f"Let this account add files there, or {move_on('a directory ' + secrets_directory)}, "

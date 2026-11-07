@@ -78,6 +78,7 @@ __all__ = [
     "custody_non_local_account_problem",
     "delete_through_handle",
     "handoff_grantee_problem",
+    "can_add_a_file",
     "key_directory_volume_problem",
     "key_file_handle_problem",
     "linux_file_system_problem",
@@ -864,6 +865,52 @@ def _read_handle_volume(handle: int) -> _HandleVolume:
         device_type=int(device.device_type),
         characteristics=int(device.characteristics),
     )
+
+
+def can_add_a_file(directory: Path) -> bool | None:
+    """Whether this process may create a FILE in ``directory``, as a key file's write must, or
+    ``None`` when that cannot be told (PR 2804 thirteenth hold).
+
+    Windows: the directory is opened asking for the add-file right alone, so the system runs its
+    own access check against this process's token. A right to add a folder does not answer yes,
+    as it does for :func:`messagefoundry.startupcode._can_add_files`, which asks about planting
+    start-up code. Access denied is no; any other failure to open is ``None``. Elsewhere
+    ``os.access`` asks the kernel for write and search, with the effective ids where the platform
+    supports that."""
+    if sys.platform != "win32":
+        try:
+            effective = os.access in os.supports_effective_ids
+            return os.access(directory, os.W_OK | os.X_OK, effective_ids=effective)
+        except OSError:
+            return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.CreateFileW(
+        str(directory),
+        0x0002,  # FILE_ADD_FILE, and nothing else
+        0x07,  # share read, write and delete
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS: a directory opens only with it
+        None,
+    )
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        return False if ctypes.get_last_error() == 5 else None  # 5: ERROR_ACCESS_DENIED
+    kernel32.CloseHandle(handle)
+    return True
 
 
 def key_directory_volume_problem(directory: Path) -> str | None:

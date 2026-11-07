@@ -7065,46 +7065,14 @@ class _RecoveryKeyConsole:
 #: holds no data under it and no run can start a store under it (PR 2804 eleventh hold).
 _REMOVE_THE_VOID_KEY = "remove that file and run the command again"
 
-#: The step a kept-key warning gives when the store may hold nothing under the key this run minted
-#: and this run cannot tell (PR 2804 twelfth hold). The file is moved, not renamed, since a
-#: secrets directory refuses a file no setting names, and on the same volume, since a move across
-#: volumes on Windows replaces the access list the key file is read under. It is never deleted
-#: until a run settles whose key it is: a run that mints again found nothing under it, and a run
-#: that finds the store holds data found the store started under it.
-_MOVE_THE_KEPT_KEY_ASIDE = (
-    "move that file into another directory on the same volume, restricted as a secrets directory "
-    "must be, keeping it, and run the command again"
+#: The manual check a kept-key warning names before the operator removes the key file by hand
+#: (PR 2804 thirteenth hold). The engine moves and removes nothing it cannot prove it made over a
+#: store that holds nothing under it, so it names the file and this check and stops.
+_CHECK_BEFORE_REMOVING = (
+    "Before you remove that file by hand, check, with a login that can read every table in the "
+    "store's database, that the database holds no audit_log table or that its audit_log table "
+    "holds no row. A row there means a store was started, and that file may be its key"
 )
-
-
-def _settle_the_kept_key(
-    path: Path,
-    store: StoreSettings,
-    service_account: str | None,
-    *,
-    why: str,
-    once: str = "",
-) -> str:
-    """The warning for a key file a failed server create kept although the store may hold nothing
-    under it (PR 2804 twelfth hold, items 1, 2 and 5): ``why`` it is kept, whether the recovery key
-    shown is void or the store's only other key, and the step that settles which. The step moves
-    the file aside rather than re-running over it, since under ``--service-account`` the file is a
-    handoff a run here cannot convert. Names no key."""
-    flag = "" if service_account is None else f', --service-account "{service_account}" among them'
-    if service_account is None:
-        back = "move it back and run the command again, which carries on with that store"
-    else:
-        back = "move it back, and keep it. " + _handoff_kept_step(store, service_account)
-    return (
-        f"WARNING: the store could not be created, and {why}. So the store key minted for it is "
-        f"kept in {path}. No Administrator was provisioned into it. If no store was started under "
-        "that key, that file and the recovery key shown are void. If the store was started under "
-        "it, they are the store's only keys. Keep both until this is settled. To settle it, "
-        f"{once}{_MOVE_THE_KEPT_KEY_ASIDE}, with every argument it was given{flag}. If that run "
-        "mints a new key, no store was started under the moved file. Delete it then: the "
-        "recovery key shown with it is void. If that run stops because the store already holds "
-        f"data, the store was started under the moved file. Then {back}"
-    )
 
 
 def _handoff_kept_step(store: StoreSettings, service_account: str) -> str:
@@ -7124,68 +7092,43 @@ def _discard_minted_custody(
     store: StoreSettings,
     failure: BaseException,
     *,
-    server_found: Literal["none", "empty", "held", "unread"] | None = None,
     service_account: str | None = None,
 ) -> None:
     """Remove the host blob or handoff ``provision-admin`` minted when the store it was minted for
-    could not be created, so a second run can mint again, but only where the open wrote nothing
-    under it: the store id pin refused before the open's first write
+    could not be created, so a second run can mint again, but only where this run can prove the
+    open wrote nothing under it: the store id pin refused before the open's first write
     (:class:`~messagefoundry.store.store.StoreIdPinRefusedBeforeWrite`; a pin refusal raised later,
-    once the salt bind may have run, does not count), a SQLite store whose file was never made, or
-    a server database the caller's probe, run after the failure, found no store schema in
-    (``server_found`` of ``none``; PR 2804 eleventh hold). A writable open writes under the key only
-    once its schema transaction has committed, so a database with no schema saw no such write, and
-    a commit still in flight when the create failed can only be that schema's, which holds no key.
+    once the salt bind may have run, does not count), or a SQLite store whose file was never made.
 
-    Otherwise the store may already hold rows under that key, so the file is kept and named on
-    stderr. ``server_found`` of ``empty`` (an empty audit chain over a store that held no data) is
-    kept too, since the genesis record may still have been in flight when the create failed, and
-    so is ``unread``, a probe that could not read the store; both warnings say how to tell whether
-    anything landed, with steps that hold under ``service_account`` too (PR 2804 twelfth hold).
-    Neither text carries the key."""
+    Otherwise the file is kept, and the warning names it, says the store may hold nothing under it,
+    and names the check to make before removing it by hand. Nothing else is moved or removed: a
+    server database read through a login that may not see every schema cannot prove it holds
+    nothing (PR 2804 thirteenth hold). Neither text carries the key."""
     from messagefoundry.config.settings import StoreBackend
     from messagefoundry.store.base import _absent_sqlite_store
     from messagefoundry.store.custody_host import keep_the_key_step
     from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
 
-    nothing_written = (
-        isinstance(failure, StoreIdPinRefusedBeforeWrite)
-        or server_found == "none"
-        or (store.backend is StoreBackend.SQLITE and _absent_sqlite_store(store) is not None)
+    nothing_written = isinstance(failure, StoreIdPinRefusedBeforeWrite) or (
+        store.backend is StoreBackend.SQLITE and _absent_sqlite_store(store) is not None
     )
-    if server_found == "empty" and not nothing_written:
-        why = (
-            "after the failure the store held no data and its audit chain was empty, but the "
-            "record that starts it under that key may still have been on its way"
-        )
-        print(_settle_the_kept_key(path, store, service_account, why=why), file=sys.stderr)
-        return
-    if server_found == "unread" and not nothing_written:
-        why = "whether anything was written under that key could not be read"
-        print(
-            _settle_the_kept_key(
-                path, store, service_account, why=why, once="once the store can be read, "
-            ),
-            file=sys.stderr,
-        )
-        return
     if not nothing_written:
-        if service_account is not None:
-            # A re-run over a handoff stops at its conversion, never carries on (twelfth hold).
-            print(
-                "WARNING: the store could not be created, and it may already have been started "
-                f"under the store key minted for it, so that key is kept in {path}. No "
-                "Administrator was provisioned into it. Keep that file. "
-                + _handoff_kept_step(store, service_account),
-                file=sys.stderr,
+        if service_account is None:
+            # A re-run with the host file in place carries on with a store started under it, and
+            # otherwise names a way on that keeps the file.
+            then = (
+                "Run the command again with that file in place: if a store was started under it, "
+                "the run carries on with it, and if not, it names a way on that keeps the file"
             )
-            return
+        else:
+            then = _handoff_kept_step(store, service_account)
         print(
-            f"WARNING: the store could not be created, and it may already have been started "
-            f"under the store key minted for it, so that key is kept in {path}. No Administrator "
-            "was provisioned into it. Keep that file and run the command again: if the store was "
-            "started under that key, it carries on with it, and if not, it names a way on that "
-            "keeps the file",
+            "WARNING: the store could not be created, and this run cannot prove that no store "
+            f"was started under the store key minted for it, so that key is kept in {path}. No "
+            "Administrator was provisioned into it. If a store was started under that key, that "
+            "file and the recovery key shown are its only keys. If none was, both are void, and "
+            "a run here stops at that file rather than mint over it. "
+            f"{_CHECK_BEFORE_REMOVING}. {then}",
             file=sys.stderr,
         )
         return
@@ -7205,25 +7148,13 @@ def _discard_minted_custody(
             new_store=isinstance(failure, StoreIdPinRefusedBeforeWrite),
             service_account=service_account,
         )
-        made = ""
-        if store.backend is StoreBackend.SQLITE and not isinstance(
-            failure, StoreIdPinRefusedBeforeWrite
-        ):
-            # A serve can make the SQLite file under the key while it stays, and the re-run then
-            # meets a store that exists (PR 2804 twelfth hold, item 3).
-            db = Path(store.path).resolve()
-            made = (
-                f" If a serve made the store file {db} meanwhile, its audit chain cannot be "
-                "started under this key, so it holds nothing under it: remove it too, with any "
-                f"{db.name}-wal and {db.name}-shm beside it, before that run."
-            )
         print(
             f"WARNING: the store could not be created, and the store key minted for it in {path} "
             f"could not be removed ({exc.strerror or type(exc).__name__}). This run minted it and "
             "nothing was written under it, so it is no store's key and the recovery key shown "
             "opens nothing; while it is there, a run here stops at it rather than mint over it. "
             "No run can start a store under it, since only this run held its recovery wrap, so "
-            f"once it can be, {_REMOVE_THE_VOID_KEY}.{made} {step}",
+            f"once it can be, {_REMOVE_THE_VOID_KEY}. {step}",
             file=sys.stderr,
         )
 
@@ -8866,19 +8797,13 @@ def _provision_admin(args: argparse.Namespace) -> int:
             store_slot.current = None
             await store.close()
 
-    # What the pre-check's probe found, so the probe after a failed create discards a key only
-    # where both found no store schema: a probe's "none" is only what its login can see.
-    precheck_found: Literal["none", "empty", "held"] | None = None
-
     async def server_store_absent() -> bool:
         """Under the host key provider with no blob here: whether the server database holds no
         store yet (vault BACKLOG #3411): no store at all, or an empty audit chain over a store
         that holds no data either, is absent; a chain with a genesis record, or data under an empty
         chain, is a store this mint must not take. Connection and hop refusals surface here, before
         the prompts, as the ordinary pre-check's do."""
-        nonlocal precheck_found
-        precheck_found = await server_store_found()
-        return precheck_found != "held"
+        return await server_store_found() != "held"
 
     async def server_store_found() -> Literal["none", "empty", "held"]:
         """What the server database holds, read as :func:`server_store_absent` reads it: ``none``,
@@ -8926,57 +8851,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
             ) from unread
         finally:
             await store.close()
-
-    async def failed_create_found(
-        failure: BaseException,
-    ) -> Literal["none", "empty", "held", "unread"] | None:
-        """After a server create under the key this run minted failed: what the database holds, by
-        :func:`server_store_found` (PR 2804 eleventh hold). ``None`` where it is not asked: SQLite,
-        whose absence ``_discard_minted_custody`` reads itself, a pin refused before the open's
-        first write, which already settles it, and an interrupt, which is not answered with more
-        I/O. ``unread`` whenever the probe cannot read the store, so the key is kept. ``None``, so
-        the key is kept with no settling step, for ``none`` where the pre-check found a store
-        schema: the schema may only be hidden from this login, which a re-run's pre-check would
-        read the same way. Only the refusals a store read can raise are read as ``unread``; any
-        other exception, a defect in the probe, propagates (PR 2804 twelfth hold, item 1)."""
-        from messagefoundry.store.base import store_connect_errors, store_driver_errors
-        from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
-
-        if (
-            settings.store.backend is StoreBackend.SQLITE
-            or isinstance(failure, StoreIdPinRefusedBeforeWrite)
-            or not isinstance(failure, Exception)
-        ):
-            return None
-        # What a store open or read refuses with: the engine's own refusals, a driver's, a
-        # connection's, a key's and a hop's.
-        refusals: tuple[type[Exception], ...] = (
-            *store_driver_errors(),
-            *store_connect_errors(),
-            *key_unresolved,
-            RuntimeError,
-            InsecureHopRefused,
-        )
-        try:
-            found = await server_store_found()
-            if found == "none" and precheck_found != "none":
-                logging.getLogger(__name__).warning(
-                    "the store schema the pre-check found is not visible after the failed create,"
-                    " so the store key minted for it is kept"
-                )
-                return None
-            return found
-        except HostCustodyRefused as unread:
-            # The engine's own text, which names the grant or the server fault, never a cell.
-            logging.getLogger(__name__).warning("%s; the store key minted for it is kept", unread)
-        except refusals as unread:
-            # The class only: a driver's text can quote a cell value.
-            logging.getLogger(__name__).warning(
-                "whether the store holds data under the minted key could not be read (%s), so the"
-                " key is kept",
-                type(unread).__name__,
-            )
-        return "unread"
 
     # The store key could not be resolved. The texts of these classes name settings, environment
     # variables and files, never a key (see `_key_unresolved`). Exit 2, as `rotate-key` exits on
@@ -9206,26 +9080,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
             )
         except BaseException as exc:
             if minted is not None:
-                found: Literal["none", "empty", "held", "unread"] | None = None
-                try:
-                    found = await failed_create_found(exc)
-                except Exception as defect:
-                    # A defect in the probe is reported, and the create's own refusal is still
-                    # the one raised below. The class only: its text may quote a driver's.
-                    logging.getLogger(__name__).error(
-                        "the probe after the failed create raised %s, a defect; the store key "
-                        "minted for it is kept",
-                        type(defect).__name__,
-                    )
-                finally:
-                    # Run even when the probe is interrupted, so the key file is always named.
-                    _discard_minted_custody(
-                        minted.path,
-                        settings.store,
-                        exc,
-                        server_found=found,
-                        service_account=args.service_account,
-                    )
+                _discard_minted_custody(
+                    minted.path, settings.store, exc, service_account=args.service_account
+                )
             raise
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:

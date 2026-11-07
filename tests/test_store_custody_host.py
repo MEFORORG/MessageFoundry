@@ -20,7 +20,7 @@ import sys
 import types
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import pytest
 
@@ -1457,18 +1457,6 @@ def test_the_advised_reinstall_is_one_the_installer_accepts() -> None:
     assert never in step, step
 
 
-#: The kept-key warning's steps (PR 2804 twelfth hold): the file moved aside on its volume and
-#: kept, then deleted only once a run minted a new key, or moved back once a run found the store
-#: started under it.
-_SETTLING_STEPS = (
-    "move that file into another directory on the same volume, restricted as a secrets directory "
-    "must be, keeping it, and run the command again",
-    "the moved file",
-    "Delete it then",
-    "move it back",
-)
-
-
 @host_file_platforms
 def test_no_keep_the_key_text_advises_changing_what_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -1546,13 +1534,13 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
     assert held.count(cli._REMOVE_THE_VOID_KEY) == 1, held
     assert "cannot tell whose key" not in held, held
     texts.append(held)
-    # PR 2804 eleventh hold: a server store found empty after the failure keeps the key, and says
-    # how to tell that nothing landed under it. The twelfth hold: by moving the file aside and
-    # keeping it, and only then deleting it, or moving it back, by what that run found.
-    cli._discard_minted_custody(kept, server, RuntimeError("stand-in"), server_found="empty")
-    emptied = capsys.readouterr().err
-    assert kept.exists() and emptied.count(cli._MOVE_THE_KEPT_KEY_ASIDE) == 1, emptied
-    texts.append(emptied)
+    # PR 2804 thirteenth hold: under --service-account the kept handoff names the manual check and
+    # the handoff's way on, and advises moving or removing nothing.
+    account = "NT SERVICE\\MessageFoundry"
+    cli._discard_minted_custody(kept, server, RuntimeError("stand-in"), service_account=account)
+    handed = capsys.readouterr().err
+    assert kept.exists() and handed.count(cli._CHECK_BEFORE_REMOVING) == 1, handed
+    texts.append(handed)
     assert all(text.count("WARNING:") == 1 for text in texts[-3:]), texts[-3:]
     # Every text names its own way on, in the order rendered above. The existing-store text
     # names provision-admin through the missing-key text it quotes, so its marker is the fallback.
@@ -1563,9 +1551,9 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         (fallback,),
         (fallback, "set [store].key_provider = 'host'"),
         (fallback, "leaves it in place"),
-        ("Keep that file and run the command again",),
+        ("Run the command again with that file in place",),
         (fallback, "This run minted it and nothing was written under it"),
-        ("If that run mints a new key",),
+        (fallback, "cannot provision the Administrator from a handoff"),
     ]
     # One marker tuple per text this test means to scan, so an empty or short scan fails here
     # rather than passing the absence check below on nothing.
@@ -1580,9 +1568,7 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
                 if text is foreign
                 else (cli._REMOVE_THE_VOID_KEY,)
                 if text is held
-                else _SETTLING_STEPS
-                if text is emptied
-                else ()
+                else (cli._CHECK_BEFORE_REMOVING,)
             ),
         )
     ]
@@ -1815,12 +1801,15 @@ def test_a_minted_key_is_kept_when_the_pin_refused_after_a_write(
     # PR 2804 fourth and sixth holds: whether the store holds anything under the key is not
     # proved here, so the text keeps it and sends the operator to the re-run in place, which
     # carries on with a store started under it or names a way on. This run minted the key, so the
-    # text does not call it possibly another store's.
+    # text does not call it possibly another store's. The thirteenth hold: it also names the check
+    # to make before removing the file by hand, and that is the only removal it mentions.
     warning = capsys.readouterr().err
     assert str(kept) in warning and "run the command again" in warning.lower(), warning
-    assert "remove" not in warning.lower(), warning
+    flat = " ".join(warning.split())
+    assert "remove" not in flat.replace(cli._CHECK_BEFORE_REMOVING, "").lower(), warning
     assert "another store's" not in warning, warning
-    assert not _advises_changing(warning) and "cannot tell whose key" not in warning, warning
+    assert not _advises_changing(flat, allowed=(cli._CHECK_BEFORE_REMOVING,)), warning
+    assert "cannot tell whose key" not in warning, warning
     removed = tmp_path / "removed.key"
     removed.write_bytes(b"k")
     cli._discard_minted_custody(removed, server, StoreIdPinRefusedBeforeWrite("before"))
@@ -1858,35 +1847,38 @@ def test_a_minted_key_that_cannot_be_removed_is_named_as_this_runs_own(
     assert "Copy into it every secret file" in " ".join(warning.split()), warning
 
 
-@pytest.mark.parametrize("found", ["empty", "unread", "held"])
-def test_a_kept_handoff_names_steps_that_work_under_the_service_account_flag(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], found: Literal["empty", "unread", "held"]
+@pytest.mark.parametrize("service_account", [None, "NT SERVICE\\MessageFoundry"])
+def test_a_kept_key_names_the_manual_check_and_moves_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], service_account: str | None
 ) -> None:
-    # PR 2804 twelfth hold, item 2: under --service-account the kept file is a handoff the
-    # administrator cannot convert, so a re-run with it in place stops at the conversion. The
-    # warning was not told the flag, so its step re-ran with the file in place, and its fallback
-    # left the flag out. The step now moves the file aside, and the flag is carried.
+    # PR 2804 twelfth hold, item 2, and thirteenth hold: a key a failed create kept is named, with
+    # the check to make before removing it by hand, and no step that moves or removes a file. Under
+    # --service-account the kept file is a handoff a run here cannot convert, so the text never
+    # says a re-run carries on over it, and its fallback carries the flag.
     from messagefoundry import __main__ as cli
     from messagefoundry.store.crypto import CipherError
-
-    assert _SETTLING_STEPS[0] == cli._MOVE_THE_KEPT_KEY_ASIDE
 
     server = StoreSettings().model_copy(
         update={"backend": StoreBackend.POSTGRES, "key_provider": "host"}
     )
-    account = "NT SERVICE\\MessageFoundry"
-    kept = tmp_path / custody_host.HANDOFF_FILE_NAME
+    name = (
+        custody_host.HOST_FILE_NAME if service_account is None else custody_host.HANDOFF_FILE_NAME
+    )
+    kept = tmp_path / name
     kept.write_bytes(b"k")
     cli._discard_minted_custody(
-        kept, server, CipherError("stand-in"), server_found=found, service_account=account
+        kept, server, CipherError("stand-in"), service_account=service_account
     )
     warning = " ".join(capsys.readouterr().err.split())
-    assert kept.exists(), warning
-    # "held" may be a started store: no settling step, and no re-run over the handoff.
-    assert (cli._MOVE_THE_KEPT_KEY_ASIDE in warning) is (found != "held"), warning
-    assert "Keep that file and run the command again" not in warning, warning
-    assert f'--service-account "{account}" among them' in warning, warning
-    assert "If it stops because the store's audit chain was never started" not in warning
+    assert kept.read_bytes() == b"k", warning
+    assert f"so that key is kept in {kept}" in warning, warning
+    assert cli._CHECK_BEFORE_REMOVING in warning, warning
+    assert not _advises_changing(warning, allowed=(cli._CHECK_BEFORE_REMOVING,)), warning
+    if service_account is None:
+        assert "Run the command again with that file in place" in warning, warning
+        return
+    assert "Run the command again with that file in place" not in warning, warning
+    assert f'--service-account "{service_account}" among them' in warning, warning
     assert "cannot provision the Administrator from a handoff" in warning, warning
 
 
@@ -1915,12 +1907,12 @@ def test_a_minted_key_that_cannot_be_removed_carries_the_service_account_flag(
     assert f'--service-account "{account}" among them' in warning, warning
 
 
-def test_a_void_sqlite_key_that_cannot_be_removed_names_the_store_file_a_serve_may_make(
+def test_a_void_sqlite_key_that_cannot_be_removed_names_no_store_file_for_removal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # PR 2804 twelfth hold, item 3: while the void key file stays, a serve can make the SQLite
-    # store file under it, and the removal step then meets a store that exists. The step names
-    # that file too.
+    # PR 2804 thirteenth hold, round-3 finding 2: the twelfth hold's text named the SQLite store
+    # file for removal if "a serve made it meanwhile", which this run cannot prove; a store
+    # re-created at that path would be deleted. Only the key this run minted is named.
     from messagefoundry import __main__ as cli
     from messagefoundry.store.crypto import CipherError
     from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
@@ -1934,16 +1926,59 @@ def test_a_void_sqlite_key_that_cannot_be_removed_names_the_store_file_a_serve_m
         raise PermissionError(13, "Access is denied")
 
     monkeypatch.setattr(Path, "unlink", _held)
-    cli._discard_minted_custody(kept, sqlite, CipherError("the create failed (stand-in)"))
-    warning = " ".join(capsys.readouterr().err.split())
-    assert cli._REMOVE_THE_VOID_KEY in warning, warning
-    assert f"If a serve made the store file {db.resolve()} meanwhile" in warning, warning
-    assert f"{db.name}-wal" in warning and f"{db.name}-shm" in warning, warning
-    # Where the pin refused before the write, a store another key made is at that path: it is
-    # never named for removal.
-    cli._discard_minted_custody(kept, sqlite, StoreIdPinRefusedBeforeWrite("before"))
-    pinned = " ".join(capsys.readouterr().err.split())
-    assert cli._REMOVE_THE_VOID_KEY in pinned and "If a serve made" not in pinned, pinned
+    for failure in (CipherError("stand-in"), StoreIdPinRefusedBeforeWrite("before")):
+        cli._discard_minted_custody(kept, sqlite, failure)
+        warning = " ".join(capsys.readouterr().err.split())
+        assert cli._REMOVE_THE_VOID_KEY in warning, warning
+        assert db.name not in warning, warning
+        assert not _advises_changing(warning, allowed=(cli._REMOVE_THE_VOID_KEY,)), warning
+
+
+@windows_only
+def test_a_custody_directory_that_grants_folders_but_not_files_is_refused_before_the_recovery_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # PR 2804 thirteenth hold, round-3 finding 1: the twelfth hold's check asked whether a file OR
+    # a folder could be added, so a directory that denies this account the add-file right alone
+    # passed it, and the write refused only after the recovery key was shown.
+    import getpass
+    import subprocess
+
+    from messagefoundry import __main__ as cli
+    from messagefoundry.__main__ import main
+
+    shown: list[str] = []
+
+    def _ceremony(*_args: object, **_kwargs: object) -> None:
+        shown.append("recovery key shown")
+        raise HostCustodyRefused("the ceremony was reached (stand-in)")
+
+    monkeypatch.setattr(custody_host, "mint_host_custody", _ceremony)
+    monkeypatch.setattr(cli, "_read_new_password", lambda _prompt: "correct horse battery")
+    folders_only = tmp_path / "folders-only"
+    folders_only.mkdir()
+    user = getpass.getuser()
+    # WD on a directory is the add-file right; the add-folder right (AD) stays granted.
+    subprocess.run(
+        ["icacls", str(folders_only), "/deny", f"{user}:(WD)"], check=True, capture_output=True
+    )
+    try:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "messagefoundry.toml").write_text(
+            '[store]\nkey_provider = "host"\n[security]\nrequire_mfa = false\n'
+        )
+        monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+        argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+        code = main([*argv, "--no-totp", "--db", str(folders_only / "store.db")])
+    finally:
+        subprocess.run(
+            ["icacls", str(folders_only), "/remove:d", user], check=True, capture_output=True
+        )
+    refused = " ".join(capsys.readouterr().err.split())
+    assert code == 2, refused
+    assert shown == [], refused  # the recovery-key ceremony was never reached
+    assert "cannot add a file to the custody directory" in refused, refused
+    assert not (folders_only / custody_host.HOST_FILE_NAME).exists()
 
 
 @host_file_platforms
@@ -2038,16 +2073,14 @@ def test_a_custody_directory_the_write_refuses_is_refused_before_the_recovery_ke
         store_path = locked / "store.db"
         if sys.platform == "win32":
             # Windows: the access check the engine asks, answered no for this directory alone.
-            from messagefoundry import startupcode
-
-            real_can_add = startupcode._can_add_files
+            real_can_add = restricted_file.can_add_a_file
 
             def _can_add(directory: Path) -> bool | None:
                 if Path(directory).resolve() == locked.resolve():
                     return False
                 return real_can_add(directory)
 
-            monkeypatch.setattr(startupcode, "_can_add_files", _can_add)
+            monkeypatch.setattr(restricted_file, "can_add_a_file", _can_add)
         else:
             if os.geteuid() == 0:
                 pytest.skip("root writes a directory whatever its mode")
@@ -2090,41 +2123,20 @@ def test_a_custody_directory_the_write_refuses_is_refused_before_the_recovery_ke
 
 
 @host_file_platforms
-@pytest.mark.parametrize(
-    ("shape", "discarded"),
-    [
-        ("no store", True),
-        ("keyed leftovers", False),
-        ("holds data", False),
-        ("unreadable", False),
-        ("schema hidden", False),
-        ("unreachable", False),
-    ],
-)
-def test_a_failed_server_create_discards_the_minted_key_only_over_a_store_that_holds_nothing(
+@pytest.mark.parametrize("shape", ["no store", "keyed leftovers"])
+def test_a_failed_server_create_keeps_the_minted_key_and_names_the_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    caplog: pytest.LogCaptureFixture,
     shape: str,
-    discarded: bool,
 ) -> None:
-    # PR 2804 eleventh hold, B: a server create that failed under a minted key kept the key file
-    # whatever the database held, so a plain re-run met it and stopped: at the mint's
-    # FileExistsError over a database with no store, or at StoreChainNeverStarted over the salt,
-    # counter and markers a keyed open commits before its genesis record. After the failure the
-    # pre-check's own probe now reads the database. "no store" has no store schema, which a keyed
-    # write needs committed first, so the file is removed and the re-run mints again. "keyed
-    # leftovers" held no data, but the genesis record may have been in flight, so the key is kept
-    # and the warning says how to tell and how to remove it. The negative controls keep it: "holds
-    # data" is a store with a row in a data table, "unreadable" a census that cannot be shown
-    # complete, and "schema hidden" a database whose schema the pre-check saw and the probe after
-    # the failure cannot: a probe's "no store" is only what its login can see, so it does not
-    # discard a key over a store the pre-check found. "unreachable" is a server the probe after the
-    # failure cannot reach (PR 2804 twelfth hold, item 1). Each kept key whose store may hold
-    # nothing names the step that settles it, and the test takes that step.
-    import asyncio
-
+    # PR 2804 thirteenth hold. The eleventh hold removed the key after a server create that failed
+    # over a database a probe read as holding no store schema, and the twelfth told the operator
+    # to move a kept key aside and judge it by whether a re-run minted. Both rest on a "no store"
+    # that a login which cannot see every schema also reads (round-3 finding 4), and the move could
+    # overwrite another store's key (finding 3). Now a server create's failure keeps the key
+    # whatever the database holds, names it and the manual check, and moves or removes nothing. A
+    # re-run then stops at the file rather than mint over it, or stops at the never-started chain.
     from messagefoundry import __main__ as cli
     from messagefoundry.__main__ import main
     from messagefoundry.store import base
@@ -2139,37 +2151,8 @@ def test_a_failed_server_create_discards_the_minted_key_only_over_a_store_that_h
         secrets.chmod(0o700)
     monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
     host_file = secrets / custody_host.HOST_FILE_NAME
-    held = tmp_path / "held.db"
-    if shape == "keyed leftovers":
-        asyncio.run(_failed_mint_leftovers(held, tmp_path))
-    elif shape in ("holds data", "unreadable", "schema hidden"):
-
-        async def _seed() -> None:
-            store = await _keyless_store(held)
-            try:
-                if shape == "holds data":
-                    await store.record_connection_event(
-                        connection="IB_TEST_ADT",
-                        transport="mllp",
-                        direction="inbound",
-                        kind="established",
-                    )
-            finally:
-                await store.close()
-
-        asyncio.run(_seed())
-    real_open = base.open_store
     created: list[bool] = []
     mints: list[Path] = []
-    reachable: list[bool] = []
-
-    censused: list[str] = []
-
-    async def _incomplete() -> dict[str, bool]:
-        censused.append("incomplete")
-        raise base.TableCensusIncomplete(
-            "this login does not hold the view definition permission on schema 'app' (stand-in)"
-        )
 
     def _no_store() -> base.StoreNotFoundError:
         return base.StoreNotFoundError.server_schema(StoreBackend.POSTGRES, "mefor")
@@ -2181,27 +2164,11 @@ def test_a_failed_server_create_discards_the_minted_key_only_over_a_store_that_h
         if kwargs.get("custody") is None:  # an open that resolves the host blob itself
             if not host_file.exists():
                 raise HostCustodyMissing("no host blob and no handoff here (stand-in)")
-            # A re-run over a kept key, answered as the real open answers it for each shape.
+            # A re-run over the kept key, answered as the real open answers it for each shape.
             if shape == "keyed leftovers":
                 raise StoreChainNeverStarted("refusing to open the store: never started (stand-in)")
-            raise _no_store()
-        # The server probe, under its throwaway blob: no store before the create, then the shape.
-        # "schema hidden" is found before the create and not after it.
-        if created and shape == "unreachable" and not reachable:
-            raise ConnectionRefusedError(111, "connection refused (stand-in)")
-        if (not created and shape != "schema hidden") or (
-            created and shape in ("no store", "schema hidden", "unreachable")
-        ):
-            raise _no_store()
-        with monkeypatch.context() as probing:
-            # The stand-in's own open must not meet the minted file, which is no part of it.
-            probing.delenv("MEFOR_SECRETS_DIRECTORY")
-            store = await real_open(
-                StoreSettings(path=str(held)), read_only=True, keyless_chain_refusal=None
-            )
-        if shape == "unreadable" and not reachable:  # until the grant is given
-            monkeypatch.setattr(store, "table_occupancy", _incomplete)
-        return store
+        # The pre-check's probe under its throwaway blob, and a re-run: no store schema seen.
+        raise _no_store()
 
     def _ceremony(*_args: object, **_kwargs: object) -> MintedCustody:
         host_file.write_bytes(b"minted (stand-in)")
@@ -2224,51 +2191,14 @@ def test_a_failed_server_create_discards_the_minted_key_only_over_a_store_that_h
     err = " ".join(capsys.readouterr().err.split())
     assert code == 2, err
     assert created == [True] and mints == [host_file], err
-    assert host_file.exists() is not discarded, err
-    unread = [r.getMessage() for r in caplog.records if "is kept" in r.getMessage()]
-    # Each shape keeps or removes the key for its own reason: the census answered, or it was asked
-    # and could not be shown complete, whose remedy the log keeps. Nothing else failed to read.
-    assert censused == (["incomplete"] if shape == "unreadable" else []), censused
-    unsettled = ("unreadable", "schema hidden", "unreachable")
-    assert len(unread) == (1 if shape in unsettled else 0), unread
-    reason = {
-        "unreadable": "view definition permission",
-        "schema hidden": "not visible after",
-        "unreachable": "ConnectionRefusedError",
-    }.get(shape, "")
-    assert all(reason in message for message in unread), unread
-    if not discarded:
-        # The key may hold data, so it is kept, unchanged, and named.
-        assert host_file.read_bytes() == b"minted (stand-in)"
-        assert "was removed from" not in err, err
-        if shape in ("holds data", "schema hidden"):
-            # "schema hidden": a re-run's pre-check reads the store as this probe did, so no step
-            # that rests on a re-run's mint is given.
-            assert f"so that key is kept in {host_file}" in err, err
-            assert cli._MOVE_THE_KEPT_KEY_ASIDE not in err, err
-            return
-        assert f"the store key minted for it is kept in {host_file}" in err, err
-        why = "could not be read" if shape in ("unreadable", "unreachable") else "on its way"
-        assert why in err, err
-        # Whether the shown recovery key is void, or is the store's only other key, is said.
-        assert "that file and the recovery key shown are void" in err, err
-        assert "they are the store's only keys" in err, err
-        assert cli._MOVE_THE_KEPT_KEY_ASIDE in err and "If that run mints a new key" in err, err
-        assert "--service-account" not in err, err
-        # The step, taken: the file moved aside on its volume, and the run again, once the server
-        # answers. A secrets directory refuses a file no setting names, so a rename in place fails.
-        (tmp_path / "aside").mkdir()
-        aside = tmp_path / "aside" / host_file.name
-        host_file.rename(aside)
-        reachable.append(True)
-        assert main(argv) == 2
-        rerun = " ".join(capsys.readouterr().err.split())
-        # The run minted a new key, which the warning reads as nothing under the moved file.
-        assert mints == [host_file, host_file], rerun
-        assert aside.read_bytes() == b"minted (stand-in)"
-        return
-    assert f"The store key minted for it was removed from {host_file}" in err, err
-    # The plain re-run reaches the mint again rather than stopping at a key file.
+    # Kept, unchanged, and named, with the manual check and no step that moves or removes it.
+    assert host_file.read_bytes() == b"minted (stand-in)", err
+    assert f"so that key is kept in {host_file}" in err, err
+    assert "was removed from" not in err, err
+    assert cli._CHECK_BEFORE_REMOVING in err, err
+    warning = err[err.index("WARNING:") :]
+    assert not _advises_changing(warning, allowed=(cli._CHECK_BEFORE_REMOVING,)), warning
+    # A re-run does not mint over the kept key.
     assert main(argv) == 2
     rerun = " ".join(capsys.readouterr().err.split())
-    assert mints == [host_file, host_file], rerun
+    assert mints == [host_file] and host_file.read_bytes() == b"minted (stand-in)", rerun
