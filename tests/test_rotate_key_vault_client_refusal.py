@@ -92,7 +92,7 @@ def test_rotate_key_exits_2_when_the_vault_client_build_refuses(
     assert builds == 1, "the client build under test never ran, or ran past the first check"
     assert _KEY_CHECK_LINE in captured.err, captured.err
     # A fixed text since the eighth hold on engine PR 2818.
-    assert store_base._KEY_SOURCE in captured.err, captured.err
+    assert store_base._KEY_SEAM_TEXTS[4] in captured.err, captured.err
     assert _REFUSAL not in captured.err, captured.err
     assert "Traceback" not in captured.err, captured.err
     assert "OK:" not in captured.out, captured.out
@@ -116,7 +116,7 @@ def test_a_unicode_error_at_the_key_check_does_not_print_the_byte_it_failed_on(
     captured = capsys.readouterr()
     assert _KEY_CHECK_LINE in captured.err, captured.err
     # A fixed text since the eighth hold on engine PR 2818.
-    assert store_base._KEY_SOURCE in captured.err, captured.err
+    assert store_base._KEY_SEAM_TEXTS[4] in captured.err, captured.err
     assert "0x9c" not in captured.err.lower(), captured.err
 
 
@@ -140,6 +140,6 @@ def test_rotate_key_exits_2_on_a_real_client_build_refusal(
     captured = capsys.readouterr()
     assert _KEY_CHECK_LINE in captured.err, captured.err
     # A fixed text since the eighth hold on engine PR 2818.
-    assert store_base._KEY_SOURCE in captured.err, captured.err
+    assert store_base._KEY_SEAM_TEXTS[4] in captured.err, captured.err
     assert token not in captured.err + captured.out
     assert "Traceback" not in captured.err, captured.err

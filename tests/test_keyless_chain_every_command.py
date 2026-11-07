@@ -613,7 +613,7 @@ def test_a_key_that_does_not_resolve_exits_2(
     from messagefoundry.store import base as store_base
 
     # A fixed text since the eighth hold on engine PR 2818.
-    assert store_base._KEY_SOURCE in text, text
+    assert store_base._TRANSIT_BUILD_TEXTS[4] in text, text
 
 
 @pytest.mark.parametrize("command", [*_KEY_REFUSING_COMMANDS, "admin-reset-totp", "rotate-key"])

@@ -474,7 +474,7 @@ def test_provision_admin_with_a_vault_provider_is_not_refused_as_keyless(
     assert "no store key is set in this shell" not in error, "a Vault key is a configured key"
     # The refusal is the store key resolution's -- not some unrelated failure that also leaves no
     # store. Its text is fixed since the eighth hold on engine PR 2818, so it names no variable.
-    assert store_base._KEY_SOURCE in error, error
+    assert store_base._KEY_SEAM_TEXTS[4] in error, error
     assert not db.exists(), "a refused open must not leave a store behind"
 
 

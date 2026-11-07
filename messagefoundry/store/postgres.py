@@ -1679,12 +1679,14 @@ def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
     on engine PR 2818). Every other ``ValueError`` is refused with a fixed text naming the
     settings and what they must hold (the seventh hold).
 
-    NOTHING IS PASSED THROUGH (the eighth hold). Every refusal here is a new exception, raised
-    outside the handler ``from None``, with a fixed text chosen by the builder's error's class as
-    read with ``type``: a hop refusal as an ``InsecureHopRefused``, a ``StoreTlsRefused`` kept as
-    one with the settings text, and a host fault as :class:`_TlsHostFault`. Nothing is read from the error and no chain is
-    kept, so the builder's own text, the ``ssl`` or ``cryptography`` library's included, is not
-    printed from here."""
+    NO ``ValueError`` IS PASSED THROUGH (the eighth hold). Every refusal of one here is a new
+    exception, raised outside the handler ``from None``, with a fixed text chosen by the builder's
+    error's class as read with ``type``: a hop refusal as an ``InsecureHopRefused``, a
+    ``StoreTlsRefused`` kept as one with the settings text, and a host fault that is also a
+    ``ValueError`` as :class:`_TlsHostFault`. Nothing is read from the error and no chain is kept,
+    so its text, the ``ssl`` or ``cryptography`` library's included, is not printed from here. At
+    least an error of the builder's that is not a ``ValueError``, such as a plain ``OSError`` or an
+    ``ssl.SSLError``, is not caught here and leaves as it is."""
     try:
         try:
             return _verifying_context(settings)
@@ -1726,11 +1728,11 @@ _TLS_UNBUILT = (
     "[store].ssl_crl_file or the system trust store"
 )
 
-#: The text of a hop refusal the builder raised, replaced at the open (the eighth hold).
+#: The text of a hop refusal the builder raised, replaced at the open (the eighth hold). The
+#: builder takes no posture, so this names the settings it reads, not a posture lever.
 _TLS_HOP_REFUSED = (
-    f"{_TLS_UNBUILT}: the store hop was refused under the instance's posture, at least where it "
-    "checks no certificate revocation (set [store].ssl_crl_file); the refusal's own text is not "
-    "shown"
+    f"{_TLS_UNBUILT}: the store hop was refused by the engine's TLS checks on those settings; the "
+    "refusal's own text is not shown"
 )
 
 #: The text of a host fault the builder raised, replaced at the open (the eighth hold).

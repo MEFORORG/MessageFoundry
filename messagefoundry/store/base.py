@@ -3383,8 +3383,10 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
         # Outside the handler, so nothing raised here, at the recursion limit included, has the
         # caught error as its context; and the caught error is dropped, so the refusal's traceback
         # holds no frame local that reaches it.
-        refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
-        del caught
+        try:
+            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
+        finally:
+            del caught  # dropped even where the call raises, at the recursion limit included
         raise refusal from None
     finally:
         _flush_unjudged()
@@ -3447,8 +3449,10 @@ def resolve_decrypt_keys(
         else:
             return _keyring(active, retired_keys)
         # As at :func:`resolve_active_key`.
-        refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
-        del caught
+        try:
+            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
+        finally:
+            del caught  # dropped even where the call raises, at the recursion limit included
         raise refusal from None
     finally:
         _flush_unjudged()
@@ -3508,8 +3512,10 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
             caught, refusal = exc, _codec_safe_refusal(exc)
         # As at :func:`resolve_active_key`. A hop refusal is a ``StoreCipherConfigError`` here, as
         # every ``ValueError`` from the build is, so each command's key arm still reports it.
-        refusal = _in_place_of(caught, refusal, texts, StoreCipherConfigError)
-        del caught
+        try:
+            refusal = _in_place_of(caught, refusal, texts, StoreCipherConfigError)
+        finally:
+            del caught  # as at resolve_active_key
         raise refusal from None
     finally:
         _flush_unjudged()
@@ -3525,6 +3531,11 @@ def _in_place_of(
         return refusal
     if _recorded_text(caught) is None:  # one the engine built is not news
         _log_unjudged("an error was replaced with a fixed text", type(caught))
+        # Its cause's class too, read through the descriptor, since a provider wraps most
+        # failures in one class and the cause is what tells them apart.
+        cause = _CAUSE.__get__(caught)
+        if cause is not None:
+            _log_unjudged("the replaced error's cause", type(cause))
     return _fresh_refusal(caught, texts, hop_as)
 
 
@@ -3674,9 +3685,9 @@ _UNJUDGED = f"{_KEY_SOURCE}: an error that could not be judged, its class and te
 #: store's own levers and reads nothing from the refusal.
 _VAULT_HOP_TEXT = (
     f"{_KEY_SOURCE}: the store's Vault hop was refused by the engine's own hop checks, its text "
-    "not shown; check MEFOR_STORE_VAULT_ADDR and any proxy variable, and, for an off-box Vault "
-    "whose certificate revocation is covered outside the engine, set "
-    "[store].vault_revocation_attested = true with a [store].vault_revocation_attested_reason"
+    "not shown; check that MEFOR_STORE_VAULT_ADDR is an https:// address, any proxy variable, the "
+    "Vault CA and client settings, and the hop's certificate revocation coverage, which "
+    "[store].vault_revocation_attested speaks to and nothing else does"
 )
 
 #: :func:`_fresh_refusal`'s texts at the key seam (``resolve_active_key``, ``resolve_decrypt_keys``).

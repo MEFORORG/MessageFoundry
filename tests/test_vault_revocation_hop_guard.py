@@ -210,8 +210,9 @@ def _assert_refused(caught: pytest.ExceptionInfo[Exception], entry: EntryPoint) 
     else:
         assert type(caught.value.__cause__) is strict_requests.VaultHopRefused
         assert text == f"{connector}: {strict_requests._UNREVOKED_VAULT_HOP} {lever}"
-    assert f"[{section}].vault_revocation_attested = true" in text
-    assert f"[{section}].vault_revocation_attested_reason" in text
+        assert f"[{section}].vault_revocation_attested = true" in text
+        assert f"[{section}].vault_revocation_attested_reason" in text
+    assert f"[{section}].vault_revocation_attested" in text
     other = "secrets" if section == "store" else "store"
     for absent in (
         f"[{other}].",
@@ -1003,6 +1004,7 @@ def test_verify_judges_its_secrets_vault_hop_as_strictly_as_its_store_opens(
     under ``warn``, where ``serve`` would cross (vault BACKLOG #3619). Mutation: pass
     ``posture=hop_posture_from_ai(...)`` to ``resolve_secret_provider`` in
     ``_client_credential_row``; the ``warn`` case then dials."""
+    from messagefoundry.store import base as store_base
     from messagefoundry.verify.federation import _client_credential_row
     from messagefoundry.verify.model import Status
     from messagefoundry.verify.smoke import check_store_connectivity
@@ -1019,7 +1021,8 @@ def test_verify_judges_its_secrets_vault_hop_as_strictly_as_its_store_opens(
     assert secret.status is expected, secret.detail
     assert "[secrets].vault_revocation_attested = true" in (secret.evidence or secret.detail)
     assert opened.status is Status.FAIL, opened.detail
-    assert "[store].vault_revocation_attested = true" in opened.detail
+    # The store's refusal is the fixed Vault hop text since the eighth hold on engine PR 2818.
+    assert store_base._VAULT_HOP_TEXT in opened.detail
     assert dials == []
 
     # The control, on the same address: the hop's own pair, with its reason, is the way across.

@@ -1164,7 +1164,7 @@ def test_a_key_provider_that_cannot_resolve_is_refused_before_the_prompt(
     assert rc == 2, error
     # The Vault refusal itself, with this command's line after it, not the dispatch floor's report.
     # A fixed text since the eighth hold on engine PR 2818.
-    assert store_base._KEY_SOURCE in error, error
+    assert store_base._KEY_SEAM_TEXTS[4] in error, error
     assert error.endswith("Refusing to provision; nothing was written"), error
     assert db.exists() is (store == "existing"), "a refused fresh provision left a store behind"
 

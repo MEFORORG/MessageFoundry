@@ -31,7 +31,7 @@ import logging
 import re
 import sys
 import traceback
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -129,9 +129,12 @@ def _decode_error() -> UnicodeDecodeError:
 
 
 @pytest.fixture(autouse=True)
-def _no_held_log_line() -> None:
+def _no_held_log_line() -> Iterator[None]:
     """A test that calls the judgement directly leaves its log line held for the next site on the
-    thread; start every test with none, so a count of log calls is this test's own."""
+    thread; start and end every test with none, so a count of log calls is this test's own and no
+    line reaches a later module."""
+    store_base._UNLOGGED.lines = []
+    yield
     store_base._UNLOGGED.lines = []
 
 

@@ -86,6 +86,6 @@ def test_rotate_key_on_a_refused_transit_key_type_exits_2_without_a_traceback(
     assert transit.read_calls == ["mefor-store"], "the check under test never ran"
     # The cipher build refuses with a fixed text since the eighth hold on engine PR 2818, so the
     # key type and the provider's advice are not shown.
-    assert store_base._KEY_SOURCE in captured.err, captured.err
+    assert store_base._TRANSIT_BUILD_TEXTS[4] in captured.err, captured.err
     assert "Traceback" not in captured.err, captured.err
     assert "OK:" not in captured.out, captured.out

@@ -31,7 +31,7 @@
 - **Every other error from the store cipher build or the store key resolution is replaced by a new
   refusal with a fixed text the site chooses, raised from `None`, and nothing is passed through.**
   The new refusal's class follows the error's: an `InsecureHopRefused`, a `DpapiError` or a
-  `DpapiUnavailable` is replaced by one of its own class, any other `ValueError` by a
+  `DpapiUnavailable` is replaced by one of that base class, not of a subclass it may be, any other `ValueError` by a
   `StoreCipherConfigError`, and any other `Exception` by a `KeyProviderError`; at the cipher build
   a hop refusal is a `StoreCipherConfigError` too, as every `ValueError` there. Its text names the
   settings for that case, such as `[store].cipher_provider`, `[store].key_provider`,
@@ -44,8 +44,8 @@
   is exactly the Vault hop's marked refusal gets a fixed text naming the store's Vault levers,
   `[store].vault_revocation_attested` among them. The refusal keeps no cause and no context, so a
   traceback of it does not print the error's own text, and the site drops the error, so no frame
-  local of the refusal's traceback holds it. The replaced error's class is logged as a WARNING by
-  its name alone. Before, a `ValueError` from the build was
+  local of the refusal's traceback holds the error itself. The class of a replaced error the engine
+  did not build, and of its cause, is logged as a WARNING by name alone. Before, a `ValueError` from the build was
   refused with its own text, and an error of any other class passed through as it was.
   (`BACKLOG #4882`)
 - **The PostgreSQL store's TLS context refusal at the open, `StoreTlsRefused`, carries a fixed text
@@ -53,8 +53,10 @@
   nothing from the context builder's `ValueError`.** Before, it carried that error's text, which
   can quote the `ssl` or `cryptography` library's message. The refusal is raised from `None`, so
   a traceback no longer prints that error. An `InsecureHopRefused` is replaced by a new one with a
-  fixed text naming `[store].ssl_crl_file`, and an `OSError` by a new error that is both an
-  `OSError` and a `ValueError`, with a fixed text; neither passes through as it is. At least one
+  fixed text, and an `OSError` that is also a `ValueError` by a new error that is both, with a
+  fixed text; neither passes through as it is. At least an error from the builder that is not a
+  `ValueError`, such as a plain `OSError` or an `ssl.SSLError`, is not caught there and still
+  leaves with its own text. At least one
   leak remains: a `[store].ssl_crl_file` that does not parse puts the `cryptography` asn1 parse
   error's text into the CRL judge's own `ValueError` (`pki.judge_every_crl`,
   `tls_policy.judge_crl_bytes`), which the pool's per-connection rebuild raises untyped and whole.
