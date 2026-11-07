@@ -26,6 +26,7 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     RowSealer,
     RowSealError,
+    RowSealKeyRetiredError,
     RowSealUnverifiableError,
     TransitRowSealer,
     TransitSealRefused,
@@ -373,7 +374,18 @@ async def test_the_start_probe() -> None:
     backend = FakeBackend()
     sealer = _sealer(backend)
     assert await sealer.probe_async() == 1
+    assert backend.verify_calls == 1  # the start check verifies its own MAC (owner ruling)
     backend.probe_down = True
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.probe_async()
+    backend.probe_down = False
+    # A token without the verify grant is refused at start: Transit answers verify with a 403.
+    backend.forbid = {ACTIVE}
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.probe_async()
+    backend.forbid = set()
+    # A verify that answers but does not hold is refused too.
+    backend.verify_seal_hmac = lambda key_name, digest, mac: False  # type: ignore[method-assign]
     with pytest.raises(TransitSealUnavailableError):
         await sealer.probe_async()
 
@@ -404,14 +416,32 @@ async def test_require_seal_for_write_names_each_cause() -> None:
     with pytest.raises(TransitSealUnavailableError):
         await require_seal_for_write(sealer, USER_KIND, FIELDS, stored, subject=subject)
     backend.down = False
-    # The kind picks the check: a record holds under a listed retired key, a session never does.
+    # A record holds under a listed retired key; a session under one is its own result, in ONE
+    # Transit check (owner ruling 2026-11-07), neither Forged nor Unverifiable.
     with_retired = _sealer(backend, retired_key_names=[RETIRED])
     old_backend = FakeBackend(active=RETIRED)
     old_user = await _sealer(old_backend).seal_async(USER_KIND, FIELDS)
     await require_seal_for_write(with_retired, USER_KIND, FIELDS, old_user, subject=subject)
     old_session = await _sealer(old_backend).seal_async(SESSION_KIND, FIELDS)
-    with pytest.raises(RowSealError):
+    calls = backend.verify_calls
+    with pytest.raises(RowSealKeyRetiredError) as quiet:
         await require_seal_for_write(with_retired, SESSION_KIND, FIELDS, old_session, subject="s")
+    assert backend.verify_calls == calls + 1
+    assert quiet.value.args == (SESSION_KIND, "s")
+    assert not isinstance(quiet.value, RowSealError | RowSealUnverifiableError)
+    assert pickle.loads(pickle.dumps(quiet.value)).args == (SESSION_KIND, "s")
+    # Control: a forged session under the retired key is still Forged, not a quiet end.
+    with pytest.raises(RowSealError):
+        await require_seal_for_write(
+            with_retired, SESSION_KIND, [*FIELDS, ("x", 1)], old_session, subject="s"
+        )
+    # And the local sealer gives the same result for its own retired key.
+    local_old = RowSealer(b"r" * 32)
+    local_new = RowSealer(b"k" * 32, retired_keys=[b"r" * 32])
+    with pytest.raises(RowSealKeyRetiredError):
+        await require_seal_for_write(
+            local_new, SESSION_KIND, FIELDS, local_old.seal(SESSION_KIND, FIELDS), subject="s"
+        )
     # A stored value the encoder cannot read fails its seal on both sealers.
     unreadable: list[tuple[str, object]] = [("token_hash", object())]
     with pytest.raises(RowSealError):

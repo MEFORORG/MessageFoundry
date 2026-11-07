@@ -173,7 +173,8 @@ so out of any Transit error text a chained exception carries (item 12).
 **The strict parse.** A stored seal is well-formed only when it is `mfseal:v1:<key id>:` then
 `vault:v<N>:` with `N` of 1 to 10 digits and no leading zero, then base64 that decodes **strictly**
 (`validate=True`) to exactly the SHA-256 digest length. Anything else is Forged with no Transit
-call, so no malformed body reaches Transit to draw a 400.
+call, so no malformed body reaches Transit to draw a 400. A Transit MAC whose body does not
+re-encode to the same text is Forged (owner ruling 2026-11-07).
 
 **The key id, and a retired key.** `<key id>` is `row_seal_key_id` of the SHA-256 of the Transit
 mount and the audit key's name, which is not secret. A seal naming another key id is checked as the

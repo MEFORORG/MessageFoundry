@@ -192,6 +192,7 @@ from messagefoundry.store.row_seal import (
     AnyRowSealer,
     RowSealer,
     RowSealError,
+    RowSealKeyRetiredError,
     require_seal_for_write,
     seal_bytes,
 )
@@ -1492,8 +1493,10 @@ async def require_session_seal_for_write(
 ) -> None:
     """Refuse a write over ``record`` unless its seal holds under the active key: the write path's
     form of :func:`session_seal_ok` (ADR 0217 (c) step 1). Raises ``RowSealError(SESSION_KIND)``
-    for a failed seal, a seal under a retired key included, as ``main``'s write path does; the
-    quiet end of a retired-key session is the reader's (``AuthService``), not this write's."""
+    for a Forged seal, :class:`~messagefoundry.store.row_seal.RowSealUnverifiableError` for an
+    Unverifiable one, :class:`~messagefoundry.store.row_seal.TransitSealUnavailableError` for an
+    Outage, and :class:`~messagefoundry.store.row_seal.RowSealKeyRetiredError` for a genuine seal
+    under a retired key, which the caller ends quietly."""
     await require_seal_for_write(
         sealer, SESSION_KIND, record.seal_fields(), record.seal, subject=""
     )
@@ -18478,7 +18481,8 @@ class MessageStore:
 
         Reads the unrevoked row, verifies its seal, applies ``change``, seals the result and writes
         every sealed column with a compare on the seal it read. Returns the new row, or ``None`` when
-        there is no unrevoked row or the compare lost to a concurrent write. Raises
+        there is no unrevoked row, the compare lost to a concurrent write, or the row was sealed
+        under a retired key, which it ends (revokes) quietly instead. Raises
         :class:`RowSealError` (Forged) or, under a Transit sealer, its sibling
         :class:`RowSealUnverifiableError` or :class:`TransitSealUnavailableError` (Outage), and
         writes nothing, when the row it read does not verify or cannot be checked: re-sealing
@@ -18490,7 +18494,19 @@ class MessageStore:
         current = SessionRecord.from_mapping(dict(row))
         if current.revoked_at is not None:
             return None
-        await require_session_seal_for_write(self._row_sealer, current)
+        retired = False
+        try:
+            await require_session_seal_for_write(self._row_sealer, current)
+        except RowSealKeyRetiredError:
+            retired = True
+        if retired:
+            # Owner ruling 2026-11-07: a session sealed under a retired key ends quietly, with no
+            # report and no further Transit call, as revoke_session ends one.
+            await self._db.execute(
+                "UPDATE sessions SET revoked_at=?, seal='' WHERE token_hash=? AND revoked_at IS NULL",
+                (time.time(), token_hash),
+            )
+            return None
         updated = await seal_session_async(self._row_sealer, change(current))
         cur = await self._db.execute(_SESSION_RESEAL, session_reseal_params(updated, current))
         return updated if cur.rowcount == 1 else None

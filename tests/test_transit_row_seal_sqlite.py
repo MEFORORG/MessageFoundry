@@ -26,7 +26,7 @@ from messagefoundry.store.row_seal import (
     TransitSealUnavailableError,
 )
 from messagefoundry.store.store import MessageStore
-from tests._transit_seal_fake import FakeBackend, with_version
+from tests._transit_seal_fake import RETIRED, FakeBackend, with_version
 
 
 @pytest.fixture
@@ -176,3 +176,32 @@ async def test_an_hmac_only_outage_after_a_good_check_writes_nothing(
     finally:
         conn.close()
     assert row == (seal, 0)
+
+
+async def test_a_session_under_a_retired_key_ends_quietly_on_a_write(tmp_path: Path) -> None:
+    """Owner ruling 2026-11-07: the write path ends it, with no RowSealError and no extra call."""
+    path = tmp_path / "retired.db"
+    store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
+    try:
+        old = FakeBackend(active=RETIRED)
+        store._row_sealer = TransitRowSealer(old)  # type: ignore[assignment]
+        await _user(store)
+        token = "ef" * 32
+        assert await store.create_session(
+            token_hash=token, user_id="u-1", expires_at=time.time() + 3600
+        )
+        # The audit key changes; the old one is listed as retired.
+        new = FakeBackend()
+        store._row_sealer = TransitRowSealer(new, retired_key_names=[RETIRED])  # type: ignore[assignment]
+        await store.mark_session_reauthed(token)
+        assert new.verify_calls == 1
+        conn = sqlite3.connect(path)
+        try:
+            revoked, seal = conn.execute(
+                "SELECT revoked_at, seal FROM sessions WHERE token_hash=?", (token,)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert revoked is not None and seal == ""
+    finally:
+        await store.close()
