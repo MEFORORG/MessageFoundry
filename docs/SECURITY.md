@@ -5396,15 +5396,21 @@ When the hold's, the breaker's and the referral's alerts resolve themselves, and
 once, in [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-alerts-resolve-themselves).
 
 Revocation is therefore bounded by *interval × strikes* (10 minutes at the recommended 300 s) within
-one process's life, not immediate. A restart starts every strike count again, so an engine that
-restarts more often than that never revokes an account it must strike, such as a disabled or absent
-one, through the reconciler, and it also forgets the hold. A present principal whose
-roles or scope the directory would change takes no strike and is still revoked on the one pass that
-sees it, so a restart loses that revocation only when it comes more often than one interval and no
-pass runs
-([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md),
-*What a restart does to the hold*; vault BACKLOG #3689). One LDAP bind per signed-in directory user
-per pass is the cost —
+one process's life, while each pass probes the account; it is not immediate.
+
+**What a restart loses** (vault BACKLOG #3689). The strike counts, the hold and the record of when
+each account was last probed are process memory, and a process runs its first pass one interval
+after it starts. So, at least: a process that restarts more often than *interval × strikes* never
+revokes, through the reconciler, an account that must strike, such as a disabled or absent one; one
+that restarts more often than one interval runs no pass and revokes nothing; and while
+`ad_session_recheck_max_users` is below the number of signed-in accounts, a fresh process starts
+its rotation again in user-id order, so an account the rotation does not reach before the next
+restart is never probed, and neither its disable nor its role or scope change reaches its sessions through the reconciler.
+What a restart does to the hold is in
+[ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md),
+*What a restart does to the hold*.
+
+One LDAP bind per signed-in directory user per pass is the cost —
 `ad_session_recheck_max_users` (200) caps it, and it is zero when nobody is signed in. An off-loopback
 PHI deployment serving AD accounts gets `ad_session_recheck_seconds = 300` by default; setting it to `0` is a declared loosening, not a neutral choice.
 
@@ -5416,16 +5422,16 @@ revoked. A pass with any referral audits `auth.ad_reconcile_referred` and raises
 `directory-reconciler-referral`. So it is its own instance, apart from the breaker's, and
 acknowledging or suspending one does not silence the other. An `[alerts]` rule keyed on the event
 type alone matches at least the breaker, the referral, the probe fault, the configuration refusal,
-each paging refusal, the lasting outage and each account the directory keeps failing to answer
-for while it answers others (`directory-reconciler-unreached:<username>`, reason
-`account_unreachable`, audited as `auth.ad_reconcile_unreached`, vault BACKLOG #3100; where more
-than five such accounts stand at once, those entering page once, under the bare
-`directory-reconciler-unreached` source), and so does a source glob such as `directory-reconciler*`, which also matches the hold's
+each paging refusal, the lasting outage and each account the directory keeps failing to answer for
+while it answers others (`directory-reconciler-unreached:<username>`, reason `account_unreachable`,
+audited as `auth.ad_reconcile_unreached`, vault BACKLOG #3100; where more than five such accounts
+stand at once, those entering page once, under the bare `directory-reconciler-unreached` source),
+and so does a source glob such as `directory-reconciler*`, which also matches the hold's
 `ad_reconcile_held`. To mute only the referral, a rule names its source exactly. The alert's text
 names `ad_user_search_base`, `ad_group_search_base` and `ad_bind_dn`. A bind response that carries a
-referral, the service account's included, is a referral too (BACKLOG #3010). ldap3 cannot decode
-its hosts, so the ERROR line names none. A service-account bind answered with the referral code
-and no referral field is refused as a referral as well (BACKLOG #3017). When it resolves itself is
+referral, the service account's included, is a referral too (BACKLOG #3010). ldap3 cannot decode its
+hosts, so the ERROR line names none. A service-account bind answered with the referral code and no
+referral field is refused as a referral as well (BACKLOG #3017). When it resolves itself is
 stated once, in
 [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-alerts-resolve-themselves).
 Referred accounts stay in the mass-revoke breaker's count, as unreachable ones do. Left out, a referring group base would
