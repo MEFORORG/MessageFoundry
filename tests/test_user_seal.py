@@ -28,6 +28,7 @@ from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthServic
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
     PASSKEY_DIGEST_EXCLUDED,
     USER_SEAL_EXCLUDED,
@@ -84,6 +85,11 @@ async def _user(store: MessageStore, user_id: str) -> None:
     )
 
 
+async def _holds(*_: object) -> bool:
+    """A seal check switched off: every row holds."""
+    return True
+
+
 async def test_the_user_seal_contract_holds_on_sqlite(keyed: tuple[MessageStore, Path]) -> None:
     store, path = keyed
     await assert_user_seal_contract(store, _raw_for(path))
@@ -97,7 +103,7 @@ async def test_the_contract_fails_when_the_service_checks_no_seal(
     import messagefoundry.auth.service as service_module
 
     store, path = keyed
-    monkeypatch.setattr(service_module, "user_seal_ok", lambda sealer, record: True)
+    monkeypatch.setattr(service_module, "user_seal_ok_async", _holds)
     with pytest.raises(AssertionError):
         await assert_user_seal_contract(store, _raw_for(path))
 
@@ -582,7 +588,7 @@ async def test_a_record_that_fails_is_not_resealed_by_a_check(
     """``user_seal_ok`` is a pure check: a record whose seal fails stays failing after it."""
     store, _ = keyed
     sealer = store.row_sealer()
-    assert sealer is not None
+    assert isinstance(sealer, RowSealer)  # a local key: the sync check is the one under test
     row = UserRow(**{f.name: _sample(f.type) for f in fields(UserRow)})
     record = UserAuthzRecord(row=row)
     assert not user_seal_ok(sealer, record)

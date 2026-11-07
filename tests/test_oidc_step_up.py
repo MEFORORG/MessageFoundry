@@ -896,7 +896,7 @@ async def test_a_role_map_that_fails_its_seal_is_not_called_a_demotion(
         )
         token = await _oidc_session(service, monkeypatch, rsa_key)
         flow_id, _url = await _begin(service, token)
-        monkeypatch.setattr(service_module, "ad_map_seal_ok", lambda _sealer, _current: False)
+        monkeypatch.setattr(service_module, "ad_map_seal_ok_async", _map_fails)
 
         out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id)
 
@@ -1690,3 +1690,8 @@ async def test_the_step_up_return_audit_budget_goes_with_the_login_limiter_switc
         )
     finally:
         await store.close()
+
+
+async def _map_fails(*_: object) -> bool:
+    """The service's map seal check, switched to fail (ADR 0217 slice 1b: it is awaitable now)."""
+    return False

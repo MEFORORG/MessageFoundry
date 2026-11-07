@@ -80,7 +80,7 @@ from messagefoundry.store.row_seal import (
     RowSealError,
     SealFailureThrottle,
 )
-from messagefoundry.store.store import ApprovalRow, AuditAppend, approval_seal_ok
+from messagefoundry.store.store import ApprovalRow, AuditAppend, approval_seal_ok_async
 
 log = logging.getLogger(__name__)
 
@@ -2582,7 +2582,7 @@ class ApprovalGate:
             if report:
                 await self._approval_seal_failed(str(found["id"]))
             return None
-        if approval_seal_ok(self._store.row_sealer(), row):
+        if await approval_seal_ok_async(self._store.row_sealer(), row):
             return row
         if report:
             await self._approval_seal_failed(row.id)

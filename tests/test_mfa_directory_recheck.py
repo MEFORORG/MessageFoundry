@@ -417,7 +417,7 @@ async def test_a_role_map_that_fails_its_seal_is_not_called_a_demotion(
     # failed directly, as tests/test_role_seal.py does.
     from messagefoundry.auth import service as service_module
 
-    monkeypatch.setattr(service_module, "ad_map_seal_ok", lambda _sealer, _current: False)
+    monkeypatch.setattr(service_module, "ad_map_seal_ok_async", _map_fails)
     assert await e.service._ad_roles_for_groups([_OPERATORS]) == set(), "control: it fails"
 
     refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
@@ -1264,3 +1264,8 @@ def test_the_second_factor_legs_ask_no_revoked_at_of_a_loaded_session(method: st
         and node.value.id in loaded
     ]
     assert reads == []
+
+
+async def _map_fails(*_: object) -> bool:
+    """The service's map seal check, switched to fail (ADR 0217 slice 1b: it is awaitable now)."""
+    return False

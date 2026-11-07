@@ -34,7 +34,7 @@ async def transit(tmp_path: Path) -> AsyncIterator[tuple[MessageStore, FakeBacke
     path = tmp_path / "transit.db"
     store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
     backend = FakeBackend()
-    store._row_sealer = TransitRowSealer(backend)  # type: ignore[assignment]
+    store._row_sealer = TransitRowSealer(backend)
     try:
         yield store, backend, path
     finally:
@@ -188,7 +188,7 @@ async def test_a_session_under_a_retired_key_is_declined_on_a_write_as_on_main(
     store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
     try:
         old = FakeBackend(active=RETIRED)
-        store._row_sealer = TransitRowSealer(old)  # type: ignore[assignment]
+        store._row_sealer = TransitRowSealer(old)
         await _user(store)
         token = "ef" * 32
         assert await store.create_session(
@@ -196,7 +196,7 @@ async def test_a_session_under_a_retired_key_is_declined_on_a_write_as_on_main(
         )
         seal = _seal_of(path, "SELECT seal FROM sessions WHERE token_hash=?", (token,))
         new = FakeBackend()
-        store._row_sealer = TransitRowSealer(new, retired_key_names=[RETIRED])  # type: ignore[assignment]
+        store._row_sealer = TransitRowSealer(new, retired_key_names=[RETIRED])
         with pytest.raises(RowSealError):
             await store.mark_session_reauthed(token)
         assert new.verify_calls == 1  # one check, no second Transit call

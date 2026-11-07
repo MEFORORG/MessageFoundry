@@ -1680,7 +1680,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
-            # BACKLOG #2592: session_seal_ok checks a session row's seal (RowSealer.verify).
+            # BACKLOG #2592: session_seal_ok checks a session row's seal (RowSealer.verify), and
+            # session_seal_ok_async the same through either sealer's verify_async (ADR 0217).
+            "sign_verify:.verify_async()",
             "sign_verify:.verify()",
         }
     ),

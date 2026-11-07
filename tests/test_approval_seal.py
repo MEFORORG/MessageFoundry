@@ -89,6 +89,11 @@ async def _request(gate: ApprovalGate, nonce: str) -> str:
     return filed
 
 
+async def _holds(*_: object, **__: object) -> bool:
+    """A seal check switched off: every row holds, and a write-path refusal refuses nothing."""
+    return True
+
+
 async def test_the_approval_seal_contract_holds_on_sqlite(keyed: tuple[MessageStore, Path]) -> None:
     store, path = keyed
     await assert_approval_seal_contract(store, _raw_for(path))
@@ -97,8 +102,10 @@ async def test_the_approval_seal_contract_holds_on_sqlite(keyed: tuple[MessageSt
 @pytest.mark.parametrize(
     ("module", "name"),
     [
-        ("messagefoundry.api.approvals", "approval_seal_ok"),
-        ("messagefoundry.store.store", "approval_seal_ok"),
+        ("messagefoundry.api.approvals", "approval_seal_ok_async"),
+        ("messagefoundry.store.store", "approval_seal_ok_async"),
+        # The store's update check runs through the shared write-path refusal (ADR 0217 slice 1b).
+        ("messagefoundry.store.store", "require_seal_for_write"),
     ],
 )
 async def test_the_contract_fails_when_a_seal_check_is_switched_off(
@@ -109,8 +116,9 @@ async def test_the_contract_fails_when_a_seal_check_is_switched_off(
     import importlib
 
     store, path = keyed
-    monkeypatch.setattr(importlib.import_module(module), name, lambda sealer, row: True)
-    with pytest.raises(AssertionError):
+    monkeypatch.setattr(importlib.import_module(module), name, _holds)
+    # A contract step built on pytest.raises fails with pytest.fail.Exception, not AssertionError.
+    with pytest.raises((AssertionError, pytest.fail.Exception)):
         await assert_approval_seal_contract(store, _raw_for(path))
 
 
@@ -199,7 +207,7 @@ async def test_rotation_leaves_a_failing_request_as_it_is(
     wrote, which still verifies beside it."""
     store, path = keyed
     sealer = store.row_sealer()
-    assert sealer is not None
+    assert isinstance(sealer, RowSealer)  # a local key: the sync check is the one under test
     gate = _gate(store)
     good = await _request(gate, "good")
     bad = await _request(gate, "bad")
