@@ -841,6 +841,7 @@ example, and `messagefoundry.parsing.x12` for the codec a Router/Handler uses.
   validation *is* built as an on-demand library — `messagefoundry.parsing.x12.validate` behind the
   `[x12]` extra (pyx12's bundled HIPAA IG maps, BACKLOG #32) — and its walk emits a conforming **999**
   (005010) / **997** (004010) as a by-product a Handler may return; it is never run by the connector.
+  An ack pyx12 did not finish to its closing IEA is not returned: `ack` is then `None`.
 
 ### HTTP web-service listener — `Http(...)` (inbound only, ADR 0023)
 

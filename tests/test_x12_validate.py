@@ -421,12 +421,16 @@ def test_a_997_pass_never_reports_a_999_only_code() -> None:
     assert not [e.code for e in result.errors if e.code in ik_only]
 
 
-def test_a_fragment_from_an_ack_writer_that_failed_is_not_labelled() -> None:
+def test_a_fragment_from_an_ack_writer_that_failed_is_not_returned(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     # An ST with no ST02 makes pyx12's 997 writer raise after its AK1, and pyx12 swallows the error;
-    # the fragment it leaves has no closing IEA, so it is no 997.
-    result = validate(_conformant_270().replace("ST*270*0001~", "ST*270~"))
-    assert result.ack is not None and "IEA" not in result.ack
+    # the fragment it leaves has no closing IEA, so it is no 997 and is not returned to send.
+    with caplog.at_level(logging.WARNING, logger=_X12_VALIDATE.__name__):
+        result = validate(_conformant_270().replace("ST*270*0001~", "ST*270~"))
+    assert result.ack is None
     assert result.ack_transaction is None
+    assert "before the closing IEA" in caplog.text
 
 
 def test_sender_text_cannot_forge_the_closing_iea_of_a_fragment() -> None:
@@ -437,6 +441,5 @@ def test_sender_text_cannot_forge_the_closing_iea_of_a_fragment() -> None:
     pipes = pipes.replace("GE|1|1~", "GE|1|1#IEA*1*000000001~")
     msg = pipes.replace("~", chr(10)).replace("#", "~")
     result = validate(msg)
-    assert result.ack is not None and result.ack.rstrip().endswith("IEA*1*000000001~")
-    assert "AK9" not in result.ack
+    assert result.ack is None
     assert result.ack_transaction is None

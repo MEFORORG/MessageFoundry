@@ -17,7 +17,8 @@ Two tiers, by design (do not route the hot path through this):
 
 **Free acknowledgment generation.** pyx12's validator emits a conforming **999** (005010) or **997**
 (004010) Functional Acknowledgment as a by-product of the walk, so :attr:`X12ValidationResult.ack`
-carries a ready-to-return negative ack — no separate ack builder needed.
+carries a ready-to-return negative ack — no separate ack builder needed. An ack pyx12 did not finish
+is not returned: ``ack`` is then ``None``.
 
 **PHI rule (do not break).** A failing X12 element error from pyx12 embeds the *offending data value*
 (potential PHI) in its raw error string. This module **never** surfaces that: each
@@ -70,12 +71,10 @@ class X12SegmentError:
 class X12ValidationResult:
     """The outcome of a strict pass. ``valid`` is True iff pyx12 found no errors. ``errors`` is the
     flattened, PHI-safe violation list (empty when valid). ``ack`` is the generated 997/999
-    Functional Acknowledgment ready to return to the sender (``None`` only if pyx12 emitted none, e.g.
-    for an already-FA transaction); ``ack_transaction`` names which (``"997"``/``"999"``), and is ``None``
-    with no ack or with a fragment pyx12's ack writer left when it failed before the closing IEA. Such
-    a fragment is still returned in ``ack``, and is not a complete ack; ``ack_transaction`` being
-    ``None`` beside a non-``None`` ``ack`` marks it. A complete ack is not thereby well-formed: it
-    echoes sender values unescaped."""
+    Functional Acknowledgment, complete to its closing IEA, or ``None`` when pyx12 emitted none (e.g.
+    for an already-FA transaction) or its ack writer failed before the closing IEA, leaving a fragment
+    that is dropped with a WARNING. ``ack_transaction`` names which (``"997"``/``"999"``), ``None``
+    with no ack. A complete ack echoes sender values unescaped, so it is not thereby well-formed."""
 
     valid: bool
     errors: tuple[X12SegmentError, ...] = ()
@@ -295,14 +294,15 @@ def validate(raw: str | bytes) -> X12ValidationResult:
         raise X12ValidationError("strict X12 validation produced an unreadable error report")
 
     ack_text = fd_ack.getvalue().strip()
-    ack = ack_text or None
     version = _last_group_version(report)
     ack_for_version = _ACK_FOR_VERSION.get(version[:6])
     # A writer that raises partway is caught and logged by pyx12 (muted here), leaving a fragment;
-    # only an ack whose last write was its closing IEA is labelled.
-    ack_transaction = ack_for_version if fd_ack.complete() else None
-    if ack and ack_transaction is None:
-        _log.warning("pyx12's ack writer stopped before the closing IEA; the ack is incomplete")
+    # only an ack whose last write was its closing IEA is returned and labelled.
+    complete = fd_ack.complete()
+    ack = ack_text if ack_text and complete else None
+    ack_transaction = ack_for_version if ack else None
+    if ack_text and not complete:
+        _log.warning("pyx12's ack writer stopped before the closing IEA; no ack is returned")
     prefer_5010 = ack_for_version != "997"
     errors = tuple(_flatten_errors(report, resolve, prefer_5010=prefer_5010))
     return X12ValidationResult(
