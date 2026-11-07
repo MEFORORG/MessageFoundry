@@ -911,6 +911,9 @@ def test_a_quote_in_the_name_is_doubled_in_the_literal(
     name = "mefor-backup-o'\u2018\u2019\u201a\u201bx."
     refusal = _refusal_for(name, tmp_path, monkeypatch)
     assert "mefor-backup-o''\u2018\u2018\u2019\u2019\u201a\u201a\u201b\u201bx.'" in refusal
+    literal = dr_backup._ps_path(dr_backup._win_verbatim(tmp_path / name))
+    joined = dr_backup.join_before_checks(refusal, "; ", "the run failed: synthetic")
+    assert _head(joined, literal).endswith("no error; the run failed: synthetic")
 
 
 def test_the_refusal_names_the_exact_path_to_check(
@@ -1036,6 +1039,7 @@ def test_a_name_that_is_not_printable_is_named_exactly_and_stays_printable(
     assert dr_backup._ps_path(verbatim) == path
     _head(refusal, path)
     assert f"Remove-Item -LiteralPath {path} -Recurse -Force ;" in refusal
+    assert dr_backup._split_checks(refusal)[1] == f"Test-Path -LiteralPath {path}"
 
 
 def test_a_lone_surrogate_in_the_name_is_spelled_and_does_not_raise(
@@ -1056,6 +1060,7 @@ def test_a_lone_surrogate_in_the_name_is_spelled_and_does_not_raise(
     assert dr_backup._ps_path(verbatim) == path
     _head(refusal, path)
     assert f"Remove-Item -LiteralPath {path} -Recurse -Force ;" in refusal
+    assert dr_backup._split_checks(refusal)[1] == f"Test-Path -LiteralPath {path}"
 
 
 def test_a_lone_surrogate_in_the_name_does_not_raise_from_the_fallback(

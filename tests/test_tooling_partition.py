@@ -214,7 +214,6 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_sandbox_worker_logging.py",
         "test_scan_forbidden.py",
         "test_scan_tokens_source.py",
-        "test_security_static.py",
         # NOT engine source, so this entry WIDENS the list's stated rule and the claim is spelled
         # out for review, as test_conftest_name_collision_guard.py and
         # test_risky_component_designation.py above do. Its subject is `.well-known/security.txt`,
