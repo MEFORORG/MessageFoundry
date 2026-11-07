@@ -23,7 +23,6 @@ from messagefoundry.api.models import (
     ClusterStatus,
     ConnectionEventList,
     DbInfo,
-    DrActionResult,
     DrStatus,
     GraphResponse,
     IntegrityResult,
@@ -47,7 +46,6 @@ from ._common import (
 
 __all__ = [
     "alerts",
-    "dr_activation_result",
     "events",
     "flow_and_trends",
     "flow_and_trends_fragment",
@@ -739,6 +737,8 @@ def status(
             ["Active", _yn(dr.active)],
             ["Threshold", dr.threshold],
             ["Activation", dr.activation_mode],
+            # What a degraded activation left unfinished (engine PR 2815), for the operator to do.
+            *([["Unfinished steps", ", ".join(dr.failures)]] if dr.failures else []),
         ],
         adjustable=False,
     )
@@ -824,24 +824,6 @@ def integrity_result(result: IntegrityResult) -> Markup:
         class_="card",
     )
     return page("Integrity check", body, active="status")
-
-
-def dr_activation_result(result: DrActionResult) -> Markup:
-    """The outcome of a /ui DR activation that is live but not finished: the box is active, and
-    each follow-on step that did not complete is named, as a degraded reload names its own."""
-    body = el(
-        "div",
-        el("h1", "DR activation"),
-        el(
-            "p",
-            "The box is active, and at least one follow-on step failed: "
-            f"{', '.join(result.failures)}. Finish those steps by hand.",
-            class_="banner",
-        ),
-        el("p", el("a", "Back to Status", href="/ui/status")),
-        class_="card",
-    )
-    return page("DR activation", body, active="status")
 
 
 # --- Flow & trends (BACKLOG #76, ADR 0065 amendment) -----------------------------------------------

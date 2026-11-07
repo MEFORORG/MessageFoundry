@@ -12565,7 +12565,17 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
         else:
             built.set_result(result)
 
-    loop.run_in_executor(None, run)
+    def settle(queued: asyncio.Future[None]) -> None:
+        # A work item the executor cancelled or failed before run() began leaves ``built`` pending;
+        # settle it so the caller is not left waiting.
+        if built.done():
+            return
+        if queued.cancelled():
+            built.cancel()
+        elif (exc := queued.exception()) is not None:
+            built.set_exception(exc)
+
+    loop.run_in_executor(None, run).add_done_callback(settle)
     try:
         # Not shielded: a cancelled caller cancels this wrapper, which cancels a build still queued.
         return await asyncio.wrap_future(built, loop=loop)

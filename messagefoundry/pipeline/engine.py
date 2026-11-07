@@ -1730,9 +1730,10 @@ class Engine:
         next message); at startup it honors ``[reference].sync_on_startup``. A sync failure is isolated
         per-set (last-good kept) and never blocks start/reload.
 
-        Nothing is synced or started once :meth:`stop` has begun: it stops the loop, so a reload a
-        stop overtakes must not start it again against a store being closed (engine PR 2815, Lander
-        hold 6702318430 item C). Read again after the sync, which awaits."""
+        No sync begins, and the loop is not started, once :meth:`stop` has begun: it stops the loop,
+        so a reload a stop overtakes must not start it again against a store being closed (engine
+        PR 2815, Lander hold 6702318430 item C). A sync already under way is not cut short; the
+        stop is read again after it, before the start."""
         if self._stopping:
             return
         if self._reference_runner is None:

@@ -298,6 +298,12 @@ class DrCoordinator:
         return self._active
 
     @property
+    def activation_failures(self) -> tuple[str, ...]:
+        """The steps the activation that made the box active left unfinished, such as
+        ``outbound_close``; empty while the box is not active (Lander hold 6702318430, item B)."""
+        return self._activation_failures if self._active else ()
+
+    @property
     def settings(self) -> DrSettings:
         return self._settings
 

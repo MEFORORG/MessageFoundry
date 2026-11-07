@@ -1399,6 +1399,9 @@ class DrStatus(BaseModel):
     active: bool
     threshold: str
     activation_mode: str
+    #: The steps the activation that made the box active left unfinished, such as
+    #: ``outbound_close`` (engine PR 2815); empty while the box is not active.
+    failures: list[str] = []
 
 
 class ServiceStatusInfo(BaseModel):
