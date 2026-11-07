@@ -2240,12 +2240,12 @@ async def test_a_passkey_row_that_does_not_parse_names_the_account_in_the_census
 
 
 async def _refused_totp_beside_a_passkey(
-    store: MessageStore,
+    store: MessageStore, *, way_past_rp_id: str | None = RP
 ) -> tuple[AuthService, Identity, list[int]]:
     """A covered Administrator holding a discoverable passkey and a refused-marker TOTP, so only
     the passkey can be the way past. Returns the service, the identity and a list that grows by
     one on every argon2 hash the service runs."""
-    service = _service(store)
+    service = _service(store, way_past_rp_id=way_past_rp_id)
     identity, token, _ = await login_admin(service)
     await _register(service, identity, token)
     await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
@@ -2293,18 +2293,24 @@ async def test_without_the_webauthn_extra_a_passkey_does_not_open_the_rotation(
         await store.close()
 
 
-@pytest.mark.parametrize("corrupt", [True, False], ids=["malformed", "control"])
+@pytest.mark.parametrize(
+    ("corrupt", "rp_id"),
+    [(True, RP), (True, None), (False, RP)],
+    ids=["malformed", "malformed-no-rp-id", "control"],
+)
 async def test_a_passkey_row_that_does_not_parse_refuses_the_rotation_before_the_hash(
-    corrupt: bool,
+    corrupt: bool, rp_id: str | None
 ) -> None:
     """The rotation reads the passkey set through the service's verified read, so a row that does
     not parse counts for nothing and is never an exception: beside a refused TOTP the change is
-    the enrolment refusal, before any argon2 hash. The control: the same account with its row
-    intact rotates. RED when: the set is read only in the store's write, which raises after the
-    hash."""
+    the enrolment refusal, before any argon2 hash, and so where no relying party is configured
+    and no passkey could count anyway. The control: the same account with its row intact
+    rotates. RED when: the set is read only in the store's write, which raises after the hash."""
     store = await MessageStore.open(":memory:")
     try:
-        service, identity, hashes = await _refused_totp_beside_a_passkey(store)
+        service, identity, hashes = await _refused_totp_beside_a_passkey(
+            store, way_past_rp_id=rp_id
+        )
         if not corrupt:
             assert await service.change_password(identity, _NEW_PASSWORD) == []
             assert hashes == [1]

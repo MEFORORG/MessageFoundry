@@ -13442,15 +13442,19 @@ class AuthService:
         parse is no exception and a set that fails its seal is reported. Such a set counts for
         nothing, so only the TOTP can pass, and it is judged here, a second open of the cell, but
         only on an account whose passkey set did not verify. Otherwise a TOTP that is on is left
-        to the write's own judgement (BACKLOG #3948 finding 13)."""
-        held: list[WebAuthnCredential] | None = []
-        if self._way_past_rp_id is not None and user.has_passkeys and webauthn.available():
-            held = await self._verified_passkeys(user)
+        to the write's own judgement (BACKLOG #3948 finding 13).
+
+        The set is read wherever the account's sealed record names a passkey, even where no
+        passkey can count (no configured relying party, or no ``[webauthn]`` extra): the store's
+        write reads it too, and would raise on a row that does not parse after the hash."""
+        held = await self._verified_passkeys(user) if user.has_passkeys else []
         if held is None:
             if not await self._totp_way_past(user):
                 raise FactorEnrolmentRequired()
             return
-        if not user.totp_enabled and not any(self._gate_counts(c) for c in held):
+        if user.totp_enabled:
+            return
+        if not (webauthn.available() and any(self._gate_counts(c) for c in held)):
             raise FactorEnrolmentRequired()
 
     # --- MFA: native TOTP second factor (every account, WP-14, ASVS 6.3.3) -----
