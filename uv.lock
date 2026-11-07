@@ -1459,7 +1459,7 @@ requires-dist = [
     { name = "pytest-rerunfailures", marker = "extra == 'dev'", specifier = ">=16.0" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.3.1" },
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.6.1" },
-    { name = "pyx12", marker = "extra == 'x12'", specifier = ">=4.0.0" },
+    { name = "pyx12", marker = "extra == 'x12'", specifier = ">=4.0.1" },
     { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0.3" },
     { name = "requests", marker = "extra == 'vault'", specifier = ">=2.32.2" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4,<0.16" },
@@ -2340,14 +2340,14 @@ wheels = [
 
 [[package]]
 name = "pyx12"
-version = "4.0.0"
+version = "4.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "defusedxml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1b/7f/5faae65f7b41a1ab1d26fc8753a24635f0961609eb48ac1eab9d9a169497/pyx12-4.0.0.tar.gz", hash = "sha256:d45c572e19971f7f67d65227bc7da158b01179ece2947a7038412dd935c59660", size = 540895, upload-time = "2026-05-05T22:34:08.73Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/dc/d5/f6c55537f397bb721d0da5a8eba6fb68e27f42dba8afd640a68282cd9789/pyx12-4.0.1.tar.gz", hash = "sha256:d7fbe4e367be6405c724f7109306bf46f319557406035ea2cac2c403cc4f6296", size = 551910, upload-time = "2026-10-31T21:24:44.039Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/84/6a/f8c18811c912f2a287f684f731a1031a24490f6d780e95ee17e5d601baf7/pyx12-4.0.0-py3-none-any.whl", hash = "sha256:8e983b5a3a76a307bea3be9203fb32f0ea1580e13cb66ed60d8b028dc015d1cc", size = 633962, upload-time = "2026-05-05T22:34:06.808Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/d2/1dd9b5071cfc11bcabb9de8de3504e9303afe0c4538fef61a05ac3a93b56/pyx12-4.0.1-py3-none-any.whl", hash = "sha256:30241f4427f0db03675df55edba5b02cc38998114b34c03bf9bbe1bd92ec3314", size = 644538, upload-time = "2026-10-31T21:24:42.42Z" },
 ]
 
 [[package]]
