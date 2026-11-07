@@ -571,7 +571,8 @@ def test_a_server_backend_whose_store_is_unreachable_could_not_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A PostgreSQL store the open cannot reach: exit 2, could not start, never PASS's 0 or FAIL's
-    1. It was exit 3, NOT COVERED, while this command read SQLite only (BACKLOG #1719)."""
+    1. Exit 3 meant NOT COVERED for every server store while this command read SQLite only; it
+    now means a server cell the catalog hides (BACKLOG #1719)."""
 
     async def unreachable(settings: StoreSettings, **_kw: Any) -> object:
         raise ConnectionRefusedError("synthetic: no server")
@@ -1666,6 +1667,72 @@ def test_a_failure_in_a_visible_server_cell_leads_a_hidden_one(
     _hide_from_catalog(monkeypatch, "search_presets")
     rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "sqlserver")
     assert rc == 1 and payload["status"] == "FAIL", out
+
+
+def test_a_hidden_keyed_surface_is_not_covered_never_a_pass(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Without ``keyed_surface`` in the catalog read, a keyed surface reads as never sealed, so a
+    planted plain value there would pass as legacy plaintext. Control: visible, it is a FAIL.
+    Hidden, it is exit 3 naming the table, never the PASS it read as."""
+    db, settings = _copy(_template, tmp_path)
+    _plant(db, "UPDATE state SET value = ?", ("SYNTH-PLAIN",))
+    _serve_from(monkeypatch, db, build_store_cipher(settings))
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 1 and payload["status"] == "FAIL", out
+    _hide_from_catalog(monkeypatch, "keyed_surface")
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 3 and payload["status"] == "NOT_COVERED", out
+    assert "keyed_surface" in payload["reason"], payload
+
+
+@pytest.mark.parametrize("shape", ["unmarked", "key_mismatch"])
+def test_every_other_verdict_leads_a_hidden_cell_and_still_names_it(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    shape: str,
+) -> None:
+    """An unmarked value on a sealed surface is still exit 1, and a keyless shell exit 4, with a
+    cell hidden; and the hidden cell is named in that same run, not left for a second one."""
+    db, settings = _copy(_template, tmp_path)
+    if shape == "unmarked":
+        rowid, _value = _first_sealed(db, "messages", "raw")
+        _set(db, "messages", "raw", rowid, "SYNTH-PLAIN")
+        cipher = build_store_cipher(settings)
+        expected = (1, "FAIL")
+    else:
+        cipher = build_store_cipher(StoreSettings(path=str(db)))
+        expected = (4, "KEY_MISMATCH")
+    _serve_from(monkeypatch, db, cipher)
+    _hide_from_catalog(monkeypatch, "search_presets")
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "sqlserver")
+    assert (rc, payload["status"]) == expected, out
+    assert "search_presets.criteria" in payload["reason"], payload
+
+
+def test_a_hidden_server_cell_reads_as_hidden_in_text_mode(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The text rendering names a hidden server cell as not visible, never as not in the store."""
+    db, settings = _copy(_template, tmp_path)
+    _serve_from(monkeypatch, db, build_store_cipher(settings))
+    _hide_from_catalog(monkeypatch, "search_presets")
+    cfg = tmp_path / "server.toml"
+    cfg.write_text(_SERVER_TOML["postgres"], encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    rc = main(["cipher-audit", "--service-config", str(cfg)])
+    out = capsys.readouterr().out
+    assert rc == 3 and out.startswith("NOT_COVERED: "), out
+    assert "search_presets.criteria not visible to this login, not read" in out, out
+    assert "not in this store" not in out, out
 
 
 # --- round-1 review repairs: what reaches each exit (BACKLOG #1719) ---------

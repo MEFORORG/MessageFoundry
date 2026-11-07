@@ -1747,7 +1747,7 @@ def _verify_archive_blocking(
     table and every column its tag binds. A cell that only a later migration adds or renames is not
     read, by the walk or after the open: at least ``queue.payload`` on a schema without ``body_ref``,
     ``search_presets.criteria`` on one without ``owner_user_id``, and a value the outbox fold moves into
-    ``queue``. That leg returns its own
+    ``queue``. The full leg returns its own
     ``KEY_MISMATCH`` when the settings resolve no key for a snapshot that holds sealed cells or is
     recorded as keyed (see :func:`_full_open_check`), so an archive that is fine and a key
     configuration that is not are not both reported as ``FAIL``.
