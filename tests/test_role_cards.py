@@ -1581,9 +1581,11 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
         """What a Manager's usage text gets wrong about where the states come from.
 
         Korus COMMON.md, *The three usage states*, holds the states, levels and triggers and wins
-        where the hook disagrees. AT LEAST these wrongs are caught: a clause naming the hook beside
-        a level or trigger, in any verb or voice; the binding HOLD defined by what the hook
-        prints; COMMON or the section left unnamed; and, in the row, the cloud caveat dropped.
+        where the hook disagrees. AT LEAST these wrongs are caught: a clause saying the hook or its
+        settings file holds the states, levels, triggers or numbers; a clause naming the hook
+        beside a level or trigger, unless the hook is only what a tool reads FROM; the binding HOLD
+        defined by what the hook prints; COMMON or the section left unnamed; and, in the row, the
+        cloud caveat dropped.
         """
         usage = " ".join(text.split())
         if not usage:
@@ -1592,7 +1594,12 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
         for clause in cls._CLAUSE_END.split(usage):
             if not cls._HOOK.search(clause):
                 continue
-            if re.search(r"\b(?:level|trigger)", clause, re.I):
+            # Lowercase only, so the state name HOLD does not read as the verb.
+            holds = re.search(r"\b(?:hold|holds|held|holding)\b", clause)
+            if holds and re.search(r"\b(?:state|level|trigger|number)s?\b", clause, re.I):
+                wrongs.append(f"says the hook holds the states or levels: {clause!r}")
+            read_from = re.search(r"\bfrom `[^`]*(?:watch\.py|thresholds\.json)`", clause)
+            if re.search(r"\b(?:level|trigger)", clause, re.I) and not (read_from and not holds):
                 wrongs.append(f"names the hook beside a level or trigger: {clause!r}")
             # The opening clause says what binds, whatever its verb.
             if clause.startswith("Usage limits") and "HOLD NEW WORK" in clause:
@@ -1642,6 +1649,7 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
         self.assertEqual(
             [
                 "defines the binding HOLD by the hook",
+                "says the hook holds the states or levels",
                 "names the hook beside a level or trigger",
                 "does not name COMMON.md, *The three usage states*",
                 "drops the cloud and unwired-root caveat",
@@ -1673,6 +1681,33 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
             ),
         )
         self.assertEqual(["no 'Usage limits' text"], self._hook_as_source("", row=False))
+
+    #: The row's warning that one tool reads its HOLD number from the hook's settings file. It says
+    #: what decision.ps1 reads, not that the file holds the levels, so the scan must accept it.
+    _READS_FROM = (
+        "`decision.ps1` grades the class B HOLD level from `~/.claude/mefor-usage/thresholds.json` "
+        "wherever that file sets one (`scripts/coord/_decisionlog.ps1`, `Get-DecisionRungLevels`), "
+        "so it can grade against a number other than COMMON's."
+    )
+
+    def test_the_scan_accepts_what_a_tool_reads_and_refuses_what_a_file_holds(self):
+        """Control: the reads-from sentence passes; the same fact in the holds form fires."""
+        good_row = (
+            "Usage limits still bind; korus `roles/COMMON.md`, *The three usage states*, holds the "
+            "states, levels and triggers. Where nothing prints them, " + self._ROW_CAVEAT + ". "
+        )
+        self.assertEqual([], self._hook_as_source(good_row + self._READS_FROM, row=True))
+        holds = {
+            "holds the levels": "`~/.claude/mefor-usage/thresholds.json` holds the class B HOLD "
+            "levels, so `decision.ps1` can grade against a number other than COMMON's.",
+            "reads from, but holds the numbers": self._READS_FROM.replace(
+                "wherever that file sets one", "which holds the numbers"
+            ),
+            "holds the states": "`watch.py` holds the states.",
+        }
+        for name, sentence in holds.items():
+            with self.subTest(form=name):
+                self.assertNotEqual([], self._hook_as_source(good_row + sentence, row=True))
 
 
 if __name__ == "__main__":
