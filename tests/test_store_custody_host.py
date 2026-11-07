@@ -1536,7 +1536,7 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
     assert held.count(cli._REMOVE_THE_VOID_KEY) == 1, held
     assert "cannot tell whose key" not in held, held
     texts.append(held)
-    # PR 2804 thirteenth hold: under --service-account the kept handoff names the manual check and
+    # PR 2804 thirteenth hold: under --service-account the kept handoff says to keep it and
     # the handoff's way on, and advises moving or removing nothing.
     account = "NT SERVICE\\MessageFoundry"
     cli._discard_minted_custody(kept, server, RuntimeError("stand-in"), service_account=account)
@@ -1850,7 +1850,7 @@ def test_a_minted_key_that_cannot_be_removed_is_named_as_this_runs_own(
 
 
 @pytest.mark.parametrize("service_account", [None, "NT SERVICE\\MessageFoundry"])
-def test_a_kept_key_names_the_manual_check_and_moves_nothing(
+def test_a_kept_key_says_to_keep_both_and_moves_nothing(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], service_account: str | None
 ) -> None:
     # PR 2804 twelfth hold, item 2, and thirteenth hold: a key a failed create kept is named, with
@@ -1909,11 +1909,11 @@ def test_a_minted_key_that_cannot_be_removed_carries_the_service_account_flag(
     assert f'--service-account "{account}" among them' in warning, warning
 
 
-def test_a_key_kept_over_a_sqlite_store_file_names_no_hand_check(
+def test_a_key_kept_over_a_sqlite_store_file_says_to_keep_both(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # PR 2804 thirteenth hold, review round 1: a SQLite store file is there, so removing the key
-    # gains nothing, since a run with no key refuses a store that exists. No hand check is named.
+    # PR 2804 thirteenth and fourteenth holds: a key kept over a SQLite store file is kept and
+    # named, with no step that removes anything.
     from messagefoundry import __main__ as cli
     from messagefoundry.store.crypto import CipherError
 
@@ -2217,7 +2217,7 @@ def test_a_custody_directory_the_write_refuses_is_refused_before_the_recovery_ke
 @host_file_platforms
 @pytest.mark.parametrize("as_json", [False, True])
 @pytest.mark.parametrize("shape", ["no store", "keyed leftovers"])
-def test_a_failed_server_create_keeps_the_minted_key_and_names_the_check(
+def test_a_failed_server_create_keeps_the_minted_key_and_names_it_to_the_end(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -2229,7 +2229,7 @@ def test_a_failed_server_create_keeps_the_minted_key_and_names_the_check(
     # to move a kept key aside and judge it by whether a re-run minted. Both rest on a "no store"
     # that a login which cannot see every schema also reads (round-3 finding 4), and the move could
     # overwrite another store's key (finding 3). Now a server create's failure keeps the key
-    # whatever the database holds, names it and the manual check, and moves or removes nothing. A
+    # whatever the database holds, names it, says to keep it, and moves or removes nothing. A
     # re-run then stops at the file rather than mint over it, or stops at the never-started chain.
     from messagefoundry import __main__ as cli
     from messagefoundry.__main__ import main

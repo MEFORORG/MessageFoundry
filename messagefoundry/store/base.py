@@ -4273,12 +4273,15 @@ def _server_store_class(backend: StoreBackend) -> type[SqlServerStore] | type[Po
 async def server_store_schema_found_anywhere(
     settings: StoreSettings, *, posture: HopPosture | None = None
 ) -> bool | None:
-    """Whether the server database holds a store schema (a ``schema_meta`` table) anywhere, read
-    from a catalog this login sees whole rather than through its own name resolution, or ``None``
-    when the login cannot show the whole catalog (PR 2804 fourteenth hold). A read-only check on a
-    one-connection pool, for a caller whose open read "no store": that open resolves names through
-    the login's search_path or default schema, so a store elsewhere reads the same. Raises what the
-    connection and the driver raise."""
+    """Whether a schema the open resolves holds a store schema (a ``schema_meta`` table) this
+    login may not see, read from the catalog rather than through the login's own name resolution,
+    or ``None`` when the login cannot show that (PR 2804 fourteenth hold). Postgres: the
+    search_path's schemas, in ``pg_class``, which every role reads whatever its schema
+    privileges. SQL Server: the login's default schema and ``dbo``, in ``sys.objects``, counted
+    only where the login holds ``VIEW DEFINITION`` on both. A schema outside those, such as
+    another install's ``db_schema``, is not asked. What it cannot see, at least: on SQL Server a
+    table-level ``DENY`` of ``VIEW DEFINITION`` on ``schema_meta`` itself. A read-only check on a
+    one-connection pool. Raises what the connection and the driver raise."""
     return await _server_store_class(settings.backend).schema_meta_anywhere(
         settings, posture=posture
     )
