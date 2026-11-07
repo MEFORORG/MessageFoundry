@@ -3129,16 +3129,9 @@ def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
         return False
     # Lazy: a leaf module of the auth package (stdlib only), imported where the rule is asked so
     # the store module takes no import-time dependency on the auth package.
-    from messagefoundry.auth.tokens import (
-        CREDENTIAL_ID_HASH_SCHEME,
-        CredentialHashSchemeError,
-        credential_id_hash_scheme,
-    )
+    from messagefoundry.auth.tokens import credential_id_hash_is_current
 
-    try:
-        return credential_id_hash_scheme(cred.credential_id_hash) == CREDENTIAL_ID_HASH_SCHEME
-    except CredentialHashSchemeError:
-        return False
+    return credential_id_hash_is_current(cred.credential_id_hash)
 
 
 #: The caller's rule for which passkey counts as a way past at a factor-drop gate (BACKLOG #3937):

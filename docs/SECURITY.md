@@ -3793,16 +3793,19 @@ the enrol-first confinement does not reach the TOTP removal. Nor does the last-f
 such a TOTP as a factor beside the last passkey, and such a TOTP does not escalate the sign-in
 lock; a discoverable passkey under the configured relying party beside it still does
 (BACKLOG #3937).
-The census names an account holding one beside a working
-discoverable passkey whatever the requirement covers, and says that a factor reset would remove
-that passkey (BACKLOG #3948 finding 11): the
+The census names an account holding one beside a passkey that may still sign it in,
+whatever the requirement covers, and says that a factor reset would remove that passkey (BACKLOG
+#3948 finding 11). For a local account that is a passkey its combined passkey sign-in accepts; for
+a directory account, a passkey its second factor accepts, discoverable or not. The next list says
+which passkey each counts. A non-discoverable passkey a local account uses as its second factor
+after its password is not counted, so the census does not warn that a reset would remove it. The
 cure is the holder removing the authenticator app and enrolling it again. **Only a KNOWN refusal
 changes a decision.** A TOTP the engine cannot judge, because its cell does not open (a store-key
 fault, or a cipher service such as Transit that does not answer) or its value will not compute, is
 **unknown**: every gate then applies the plain enabled-TOTP rule, so it still counts as a way past
 and as a factor, its removal is refused as before, and the sign-in lock still escalates. The census
 names such an account as unknown, never as refused, and still says when a factor reset would remove
-its discoverable passkey; its lock notice names the passkey sign-in beside the code sign-in. The
+its passkey; its lock notice names the passkey sign-in beside the code sign-in. The
 lock escalation's own judgement of the TOTP, which under Transit is a decrypt, runs only for the
 wrong password that sets a lock past the first of its cycle count, so a wrong password below the
 threshold costs that path no cell open; the combined sign-in still opens the cell per attempt.
@@ -3825,9 +3828,13 @@ write races.
   account keeps its TOTP, removing any discoverable passkey needs a TOTP that is a way past, and
   a passkey-only account must enrol TOTP before it rotates and is named in `no_way_past`. That is
   the shipped default on a loopback bind. The census's reset warning
-  (`reset_would_remove_a_passkey`) counts a passkey under the configured `rp_id` too, and any
-  discoverable passkey when none is configured, since it asks whether a reset would remove one that
-  may sign the holder in. After a change from one configured origin to another
+  (`reset_would_remove_a_passkey`) counts a passkey under the configured `rp_id` too, and one
+  under any `rp_id` when none is configured, since it asks whether a reset would remove one that
+  may sign the holder in. It counts only a passkey stored under today's credential-id hash
+  scheme, the only key the sign-in finds one by; for a local account the passkey must also be
+  recorded as discoverable, and for a directory account it need not be, since its second factor
+  names the credential itself. At least these are not counted for either: a passkey under
+  another configured `rp_id`, and one the start-up rehash has not moved to today's scheme. After a change from one configured origin to another
   ([ADR 0068 section 7](adr/0068-browser-webauthn-passkeys-offloopback.md) makes such a passkey
   visibly unusable) a passkey under the old `rp_id` no longer counts at the gates, so the census
   names an account whose only way past it was.
@@ -5764,8 +5771,12 @@ the console, through `POST /ui/reauth/webauthn`, because the JSON plane has no p
 JSON-only client cannot rotate it. Before this change such a client could rotate it and then do
 nothing else. Its next sign-in was pending, with no way to prove a passkey there. Under
 `[security].require_mfa` a covered passkey-only account rotates only once it holds a way past
-the sign-in lock: `_has_way_past` counts TOTP or a passkey recorded as discoverable under the
-configured `rp_id` (ADR 0197 Amendment A, wave 2; BACKLOG #3937). One whose passkeys are not discoverable must also enrol a factor that is
+the sign-in lock. The route's courtesy check, `must_enrol_before_rotating`, asks before the
+current password: `_has_way_past` counts TOTP or a passkey recorded as discoverable under the
+configured `rp_id` (ADR 0197 Amendment A, wave 2; BACKLOG #3937). The rotation itself refuses an account with no
+TOTP on and no such passkey before it hashes, and otherwise leaves the TOTP to the store's
+conditional write, which judges the cell it writes against and refuses a KNOWN refusal there
+(BACKLOG #3948 finding 13). One whose passkeys are not discoverable must also enrol a factor that is
 before it rotates, so after the passkey it goes to the enrolment page, and only then to the password
 page. Such an account exists only where its passkey came before the requirement covered it, or
 before wave 2: a store from before ADR 0197 Amendment A, a site that turned `require_mfa` on or

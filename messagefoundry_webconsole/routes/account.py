@@ -228,7 +228,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     }
     # ADR 0197 Amendment A: an account the requirement covers that holds no factor with a way past
     # the sign-in lock enrols one first: TOTP, or from wave 2 a passkey the browser stores as
-    # discoverable. ``must_enrol_before_rotating`` is the rotation refusal's own predicate.
+    # discoverable. ``must_enrol_before_rotating`` is the rotation's courtesy check, asked first;
+    # the rotation's own conditional write judges the TOTP itself (BACKLOG #3948 finding 13).
     _ENROL_TOTP_FIRST_NOTICE = (
         "That action requires MFA: enroll an authenticator app (TOTP) or a passkey to continue."
     )

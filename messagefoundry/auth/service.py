@@ -129,6 +129,7 @@ from messagefoundry.auth.policy import (
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import (
     CREDENTIAL_ID_HASH_SCHEME,
+    credential_id_hash_is_current,
     credential_id_hash_scheme,
     enrolment_code_digest,
     enrolment_code_matches,
@@ -2549,10 +2550,13 @@ class LockableAccountCensus:
     #: Every account in ``undecryptable_totp`` that holds a passkey it may still sign in with, read
     #: from the set its seal covers: ``reset-mfa`` would also remove that passkey. Any account the
     #: requirement does not cover included, since the reset removes every passkey whatever the
-    #: scope (BACKLOG #3948 finding 11). A local account counts a discoverable passkey (the
-    #: combined passkey sign-in); a directory account counts any passkey, its second factor. The
-    #: cure is the store key for a cell that does not open, and removing and enrolling the app
-    #: again for an enrolment this release refuses.
+    #: scope (BACKLOG #3948 finding 11). A local account counts a passkey its combined passkey
+    #: sign-in accepts (discoverable, under the configured relying party, today's hash scheme), so
+    #: a non-discoverable one it uses as the second factor after its password is not counted. A
+    #: directory account counts a passkey its second factor accepts: under the configured relying
+    #: party and today's hash scheme, discoverable or not. The cure is the store key for a cell
+    #: that does not open, and removing and enrolling the app again for an enrolment this release
+    #: refuses.
     reset_would_remove_a_passkey: tuple[str, ...] = ()
 
     @property
@@ -2788,6 +2792,15 @@ async def lockable_account_census(
     # discoverable one where there is none (the sign-in then takes the request's rp_id).
     sign_in_counts = passkey_is_way_past if way_past_rp_id is None else gate_counts
 
+    def second_factor_counts(cred: WebAuthnCredential) -> bool:
+        # A directory account's passkey second factor: offered only under the request's rp_id,
+        # and found at the finish only by a credential-id hash in today's scheme. The rp_id rule
+        # is ``sign_in_counts``'s; the discoverable record is not asked, since the second-factor
+        # ceremony names the credential itself.
+        return (
+            way_past_rp_id is None or cred.rp_id == way_past_rp_id
+        ) and credential_id_hash_is_current(cred.credential_id_hash)
+
     for user in await store.list_users():
         # Disabled accounts are read too: one re-enabled later is lockable at once, and the census
         # runs only at startup and in verify.
@@ -2842,17 +2855,22 @@ async def lockable_account_census(
             )
             creds = []
         digest = user.row.cred_digest if user.row is not None else ""
-        # Two questions, two rules (BACKLOG #3937). Whether a reset would remove a passkey that
-        # may still sign the holder in asks ``sign_in_counts``. Whether the account holds a way
-        # past the GATES count asks the configured rp_id, as the gates do. One digest check.
+        # Two questions, two rules (BACKLOG #3937). Whether the account may still sign in with a
+        # passkey asks ``sign_in_counts`` (a local account) or ``second_factor_counts`` (a
+        # directory account), and that answer feeds ``passkey_only``, ``unknown_beside_a_passkey``
+        # and the reset list. Whether the account holds a way past the GATES count asks the
+        # configured rp_id, as the gates do. One digest check.
         trusted = not sealed or constant_time_equal(passkey_digest(creds), digest)
         signs_in = trusted and any(sign_in_counts(c) for c in creds)
         # The reset list asks how THIS account can still sign in with a passkey (BACKLOG #3948
         # finding 11). A local row with a password: the combined passkey sign-in, so the same
-        # rule. A directory account: its sign-in, then any passkey as the second factor. A local
-        # row with no password hash signs nobody in, so a reset costs it nothing.
+        # rule; a non-discoverable passkey it uses as the second factor after its password is not
+        # counted here. A directory account: its sign-in, then a passkey as the second factor,
+        # which needs no discoverable record but does need the relying party and the hash scheme
+        # the ceremony finds it by. A local row with no password hash signs nobody in, so a reset
+        # costs it nothing.
         if _is_directory_account(user):
-            reset_signs_in = trusted and bool(creds)
+            reset_signs_in = trusted and any(second_factor_counts(c) for c in creds)
         else:
             reset_signs_in = signs_in and user.password_hash is not None
         if reset_signs_in and state is not None:

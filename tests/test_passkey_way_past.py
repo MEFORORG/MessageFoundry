@@ -965,6 +965,8 @@ async def _directory_account_with_a_passkey(
     user_id: str = "dir-u1",
     auth_provider: str = "ad",
     discoverable: bool = True,
+    rp_id: str = RP,
+    id_hash: str | None = None,
 ) -> str:
     """An account with a refused TOTP and a passkey under :data:`RP`, by default a directory
     account and a discoverable passkey: never lockable, so read by the census for the reset list
@@ -985,8 +987,8 @@ async def _directory_account_with_a_passkey(
         _cred(
             user_id,
             "resident",
-            id_hash=credential_id_hash(f"{user_id}-resident".encode()),
-            rp_id=RP,
+            id_hash=id_hash or credential_id_hash(f"{user_id}-resident".encode()),
+            rp_id=rp_id,
             discoverable=discoverable,
         )
     )
@@ -1010,6 +1012,35 @@ async def test_the_reset_list_names_a_directory_account() -> None:
         assert census.undecryptable_totp == tuple(sorted((username, plain, hashless)))
         assert census.passkey_only == () and census.no_way_past == ()
         assert census.reset_would_remove_a_passkey == tuple(sorted((username, plain)))
+    finally:
+        await store.close()
+
+
+async def test_the_reset_list_names_a_directory_passkey_only_where_it_can_sign_in() -> None:
+    """BACKLOG #3948 finding 11: a directory account's passkey counts for the reset list only where
+    its second factor could accept it, under the configured relying party and today's credential-id
+    hash scheme. One under another rp_id, or one stored as a bare pre-scheme digest the rehash has
+    not moved, cannot sign the holder in, so a reset costs it nothing and it is not named; naming it
+    would steer the operator away from the reset that is the way out. RED on the rule that counted
+    any trusted passkey. The control: a usable passkey on the same kind of account is named."""
+    from messagefoundry.auth.tokens import hash_bytes
+
+    store = await MessageStore.open(":memory:")
+    try:
+        usable = await _directory_account_with_a_passkey(store, discoverable=False)
+        elsewhere = await _directory_account_with_a_passkey(
+            store, user_id="dir-other-rp", rp_id="old.example"
+        )
+        stale = await _directory_account_with_a_passkey(
+            store, user_id="dir-stale", id_hash=hash_bytes(b"dir-stale-resident")
+        )
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
+        assert census.undecryptable_totp == tuple(sorted((usable, elsewhere, stale)))
+        assert census.reset_would_remove_a_passkey == (usable,)
+        # With no configured relying party the rp_id rule is the sign-in's (any one), and the
+        # hash scheme still holds.
+        open_rp = await lockable_account_census(store, AuthSettings(), way_past_rp_id=None)
+        assert open_rp.reset_would_remove_a_passkey == tuple(sorted((usable, elsewhere)))
     finally:
         await store.close()
 
