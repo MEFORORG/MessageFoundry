@@ -76,6 +76,11 @@ _USER_SEALED_CHANGES: tuple[tuple[str, Any], ...] = (
     ("password_generated", True),
     ("session_epoch", 9),
     ("cred_digest", "not-the-digest"),
+    # ADR 0207 Amendment A: each enrolment-code column enters the seal only when non-null, so a
+    # value planted outside the store, on an account that held no code, still fails the seal.
+    ("enrolment_code_digest", "0" * 64),
+    ("enrolment_code_expires_at", 4102444800.0),
+    ("enrolment_code_issuer", "planted-issuer"),
 )
 
 

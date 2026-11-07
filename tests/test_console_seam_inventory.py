@@ -370,7 +370,8 @@ def _core(*ops: str) -> Field:
 
 
 #: Every ``CoreHandlers`` and ``AdminHandlers`` field. 66 endpoints by identity, as ADR 0215
-#: slice 1 measured, 15 cores a JSON route runs past its gate, 2 sharing a helper with a JSON
+#: slice 1 measured (ADR 0207 moved one to a core and added one), 17 cores a JSON route runs
+#: past its gate, 2 sharing a helper with a JSON
 #: route, and 3 with no JSON route that carries the console's use.
 _SEAM_FIELDS: dict[str, Field] = {
     "core.list_connections": _endpoint("GET /connections"),
@@ -454,6 +455,9 @@ _SEAM_FIELDS: dict[str, Field] = {
     "admin.refuse_own_channel_scope": _core("PUT /users/{user_id}/channel-scope"),
     "admin.reset_user_password": _endpoint("POST /users/{user_id}/reset-password"),
     "admin.reset_user_mfa": _endpoint("POST /users/{user_id}/reset-mfa"),
+    # ADR 0207: the issue past its route's gate, so the console's own render can say ``via=ui``.
+    "admin.issue_user_enrolment_code": _core("POST /users/{user_id}/enrolment-code"),
+    "admin.revoke_user_enrolment_code": _endpoint("DELETE /users/{user_id}/enrolment-code"),
     "admin.bind_user_federated_identity": _endpoint("PUT /users/{user_id}/federated-identity"),
     "admin.unbind_user_federated_identity": _endpoint("DELETE /users/{user_id}/federated-identity"),
     "admin.admin_revoke_user_sessions": _endpoint("DELETE /users/{user_id}/sessions"),
@@ -465,7 +469,8 @@ _SEAM_FIELDS: dict[str, Field] = {
     "admin.get_ad_group_scope_map": _endpoint("GET /ad-group-scope-map"),
     "admin.set_ad_group_map": _core("PUT /ad-group-map"),
     "admin.set_ad_group_scope_map": _core("PUT /ad-group-scope-map"),
-    "admin.my_mfa": _endpoint("GET /me/mfa"),
+    # ADR 0207: the core that takes the console's session token for the code-owed answer.
+    "admin.my_mfa": _core("GET /me/mfa"),
     "admin.change_password": _endpoint("POST /me/password"),
     "admin.enroll_mfa": _endpoint("POST /me/mfa/enroll"),
     "admin.disable_my_mfa": _core("DELETE /me/mfa"),
@@ -539,6 +544,8 @@ _AUTH_SERVICE: dict[str, AuthUse] = {
     "complete_oidc_step_up": _C,
     "confirm_mfa_enrollment": AuthUse("read", ("POST /me/mfa/confirm",)),
     "count_other_sessions": AuthUse("read", ("GET /me/sessions",)),
+    # ADR 0207: the code-owed answer, which GET /me/mfa's status reply carries.
+    "enrolment_code_required": AuthUse("read", ("GET /me/mfa",)),
     "delete_webauthn_credential": _C,
     "factor_binding_is_blocked": _G,
     "fill_own_notify_email": AuthUse("read", ("POST /me/notify-email",)),
@@ -632,7 +639,7 @@ def _J(authority: str, reach: str) -> Ui:
 _AS = "AuthService"
 _E = "get_engine"
 
-#: Every ``/ui`` operation of ``create_app(serve_ui=True, oidc_enabled=True)``: 127 with OIDC off,
+#: Every ``/ui`` operation of ``create_app(serve_ui=True, oidc_enabled=True)``: 129 with OIDC off,
 #: as ADR 0215 measured, and the 4 OIDC legs. A write's authority is its write route alone: under
 #: ADR 0215 section 2 a write makes one sub-request and redirects, and the page it re-renders on an
 #: error today is read on the following GET.
@@ -671,6 +678,16 @@ _UI_ROUTES: dict[str, Ui] = {
     "POST /ui/users/{user_id}/reset-mfa": _J(
         "POST /users/{user_id}/reset-mfa",
         f"{_AS} admin.federated_identity_view admin.list_roles admin.reset_user_mfa "
+        "admin.user_summary service.store.get_user service.store.get_user_role_ids",
+    ),
+    "POST /ui/users/{user_id}/enrolment-code": _J(
+        "POST /users/{user_id}/enrolment-code",
+        f"{_AS} admin.federated_identity_view admin.issue_user_enrolment_code admin.list_roles "
+        "admin.user_summary service.store.get_user service.store.get_user_role_ids",
+    ),
+    "POST /ui/users/{user_id}/enrolment-code/revoke": _J(
+        "DELETE /users/{user_id}/enrolment-code",
+        f"{_AS} admin.federated_identity_view admin.list_roles admin.revoke_user_enrolment_code "
         "admin.user_summary service.store.get_user service.store.get_user_role_ids",
     ),
     "GET /ui/users/{user_id}/federated-identity": _J(
@@ -744,13 +761,14 @@ _UI_ROUTES: dict[str, Ui] = {
     "POST /ui/account/mfa/enroll": _J(
         "POST /me/mfa/enroll",
         f"{_AS} admin.current_user admin.enroll_mfa admin.my_mfa "
-        "service.store.list_webauthn_credentials",
+        "service.enrolment_code_required service.store.list_webauthn_credentials",
     ),
-    "GET /ui/account/mfa/confirm": Ui("confinement", "", ""),
+    "GET /ui/account/mfa/confirm": Ui("confinement", "", f"{_AS} service.enrolment_code_required"),
     "POST /ui/account/mfa/verify": _J(
         "POST /me/mfa/confirm",
         f"{_AS} admin.current_user admin.my_mfa service.confirm_mfa_enrollment "
-        "service.count_other_sessions service.store.list_webauthn_credentials",
+        "service.count_other_sessions service.enrolment_code_required "
+        "service.store.list_webauthn_credentials",
     ),
     "POST /ui/account/mfa/disable": _J(
         "DELETE /me/mfa",
@@ -767,7 +785,8 @@ _UI_ROUTES: dict[str, Ui] = {
     "POST /ui/account/webauthn/enroll": Ui(
         "ceremony",
         "",
-        f"{_AS} admin.current_user admin.my_mfa service.store.list_webauthn_credentials",
+        f"{_AS} admin.current_user admin.my_mfa service.enrolment_code_required "
+        "service.store.list_webauthn_credentials",
     ),
     "POST /ui/account/webauthn/verify": Ui("ceremony", "", _AS),
     "POST /ui/account/webauthn/{credential_id_hash}/delete": Ui(
@@ -1349,7 +1368,7 @@ def test_every_seam_field_is_classified_as_the_app_holds(live: _Live) -> None:
 def test_the_seam_field_counts_are_the_measured_ones() -> None:
     """ADR 0215 slice 1 measured 86 fields, 66 of them a JSON route's endpoint by identity."""
     counts = Counter(f.kind for f in _SEAM_FIELDS.values())
-    assert counts == {"endpoint": 66, "core": 15, "shared": 2, "helper": 3}, counts
+    assert counts == {"endpoint": 66, "core": 17, "shared": 2, "helper": 3}, counts
 
 
 def test_every_ui_deps_field_is_classified() -> None:
@@ -1400,12 +1419,13 @@ def test_every_ui_route_is_classified_by_the_json_route_carrying_its_authority(
 
 
 def test_the_ui_route_counts_are_the_measured_ones() -> None:
-    """127 ``/ui`` operations with OIDC off, as ADR 0215 measured, and 4 OIDC legs."""
+    """129 ``/ui`` operations with OIDC off: the 127 ADR 0215 measured and ADR 0207's two
+    enrolment-code writes, and 4 OIDC legs."""
     default = set(_ui_routes(create_app(serve_ui=True)))
-    assert len(default) == 127
+    assert len(default) == 129
     assert set(_UI_ROUTES) == default | _OIDC_ONLY
     counts = Counter(u.kind for u in _UI_ROUTES.values())
-    assert counts == {"json": 107, "public": 15, "confinement": 3, "ceremony": 3, "check": 3}, (
+    assert counts == {"json": 109, "public": 15, "confinement": 3, "ceremony": 3, "check": 3}, (
         counts
     )
 

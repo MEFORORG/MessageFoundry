@@ -155,3 +155,25 @@ def test_the_timeout_matches_the_ides_sign_in_timeout() -> None:
     )
     milliseconds = int(line.split("=", 1)[1].strip().rstrip(";").replace("_", ""))
     assert milliseconds == SIGN_IN_TIMEOUT_SECONDS * 1000
+
+
+def test_confirm_mfa_sends_the_enrolment_code_only_when_given() -> None:
+    """ADR 0207: a directory account's first factor needs the Administrator's code on an
+    unstamped session, so the shared client must be able to carry it. RED when it cannot."""
+    import json
+
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return _reply(request)
+
+    client = EngineClient(_BASE)
+    client._http.close()
+    client._http = httpx.Client(base_url=_BASE, transport=httpx.MockTransport(handler))
+    try:
+        client.confirm_mfa("123456")
+        client.confirm_mfa("123456", enrolment_code="ABCD-EFGH")
+    finally:
+        client.close()
+    assert bodies == [{"code": "123456"}, {"code": "123456", "enrolment_code": "ABCD-EFGH"}]

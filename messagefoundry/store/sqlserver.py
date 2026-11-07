@@ -255,6 +255,7 @@ from messagefoundry.store.store import (
     DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
+    EnrolmentCodeOutcome,
     EpochBump,
     EpochRaise,
     FailOutcome,
@@ -321,6 +322,9 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    enrolment_code_issue,
+    enrolment_code_revoke,
+    enrolment_code_spend,
     escalation_passkeys,
     escalation_verdict,
     existing_roles_only,
@@ -384,12 +388,14 @@ from messagefoundry.store.store import (
     should_record_event,
     tee_audits,
     totp_enable,
+    totp_enable_spending_code,
     totp_removal,
     totp_replace,
     totp_stage,
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
+    user_disabled_change,
     user_insert_params,
     user_reseal_params,
     user_seal_ok,
@@ -769,8 +775,9 @@ _MSSQL_USER_INSERT: Final = (
     " totp_enabled, totp_enrolled_at, totp_recovery_codes, last_totp_step, oidc_issuer,"
     " oidc_subject, directory_object_id, password_claimed_at, channel_scope_source, lock_cycles,"
     " second_step_failed_attempts, second_step_locked_until, second_step_lock_cycles,"
-    " password_generated, session_epoch, cred_digest, authz_seal)"
-    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    " password_generated, session_epoch, cred_digest, enrolment_code_digest,"
+    " enrolment_code_expires_at, enrolment_code_issuer, authz_seal)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 #: store.py's ``_USER_RESEAL`` reporting through ``OUTPUT`` (BACKLOG #2592), which a session-wide
 #: ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283). Used only by ``_write_user``.
@@ -782,7 +789,8 @@ _MSSQL_USER_RESEAL: Final = (
     " last_totp_step=?, oidc_issuer=?, oidc_subject=?, directory_object_id=?,"
     " password_claimed_at=?, channel_scope_source=?, lock_cycles=?,"
     " second_step_failed_attempts=?, second_step_locked_until=?, second_step_lock_cycles=?,"
-    " password_generated=?, session_epoch=?, cred_digest=?, authz_seal=?"
+    " password_generated=?, session_epoch=?, cred_digest=?, enrolment_code_digest=?,"
+    " enrolment_code_expires_at=?, enrolment_code_issuer=?, authz_seal=?"
     " OUTPUT inserted.id WHERE id=? AND authz_seal=?"
 )
 # The approval statements (BACKLOG #2592); store.py's twins state the contract. The writes are used
@@ -2407,6 +2415,10 @@ _SCHEMA: list[str] = [
         -- BACKLOG #2592: the digest of the account's passkeys, and the integrity seal over the
         -- account's row and role rows. Both written only by the store's user write helper.
         cred_digest NVARCHAR(64) NOT NULL DEFAULT '',
+        -- ADR 0207: the outstanding enrolment code's hash_token digest (64 hex characters), its
+        -- expiry, and the issuing Administrator's account id (NULL for a host-issued code).
+        enrolment_code_digest NVARCHAR(64) NULL, enrolment_code_expires_at FLOAT NULL,
+        enrolment_code_issuer NVARCHAR(256) NULL,
         authz_seal NVARCHAR(256) NOT NULL DEFAULT '')""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
@@ -2464,6 +2476,15 @@ _SCHEMA: list[str] = [
         ALTER TABLE users ADD cred_digest NVARCHAR(64) NOT NULL DEFAULT ''""",
     """IF COL_LENGTH('users','authz_seal') IS NULL
         ALTER TABLE users ADD authz_seal NVARCHAR(256) NOT NULL DEFAULT ''""",
+    # ADR 0207: the enrolment code's digest, expiry and issuer, for a users table created before
+    # them. NULL on an existing row is "no code outstanding", and a NULL column stays out of the user
+    # seal (store.py's USER_SEAL_WHEN_SET), so the add re-seals nobody.
+    """IF COL_LENGTH('users','enrolment_code_digest') IS NULL
+        ALTER TABLE users ADD enrolment_code_digest NVARCHAR(64) NULL""",
+    """IF COL_LENGTH('users','enrolment_code_expires_at') IS NULL
+        ALTER TABLE users ADD enrolment_code_expires_at FLOAT NULL""",
+    """IF COL_LENGTH('users','enrolment_code_issuer') IS NULL
+        ALTER TABLE users ADD enrolment_code_issuer NVARCHAR(256) NULL""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -14451,6 +14472,54 @@ class SqlServerStore:
         change = totp_enable(recovery_code_hashes, now, expected_secret_cell=expected_secret_cell)
         return await self._write_user_txn(user_id, change) is not None
 
+    # --- ADR 0207: the directory account's enrolment code (Store protocol states the contract) ---
+    # One conditional sealed write each, through ``_write_user`` in a transaction of its own, with
+    # the account row locked; store.py's change builders hold every condition.
+
+    async def issue_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        code_digest: str,
+        expires_at: float,
+        issuer_id: str | None,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = enrolment_code_issue(
+            code_digest=code_digest, expires_at=expires_at, issuer_id=issuer_id, now=now
+        )
+        return change.outcome(await self._write_user_txn(user_id, change))
+
+    async def revoke_enrolment_code(self, user_id: str, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        return await self._write_user_txn(user_id, enrolment_code_revoke(now)) is not None
+
+    async def spend_enrolment_code(
+        self, user_id: str, *, code_digest: str, now: float | None = None
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = enrolment_code_spend(code_digest=code_digest, now=now)
+        return change.outcome(await self._write_user_txn(user_id, change))
+
+    async def enable_totp_spending_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        code_digest: str,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = totp_enable_spending_code(
+            recovery_code_hashes,
+            now,
+            expected_secret_cell=expected_secret_cell,
+            code_digest=code_digest,
+        )
+        return change.outcome(await self._write_user_txn(user_id, change))
+
     async def replace_totp_enrolment(
         self,
         user_id: str,
@@ -14745,7 +14814,7 @@ class SqlServerStore:
     ) -> None:
         now = time.time() if now is None else now
         await self._write_user_txn(
-            user_id, lambda r: r.changed(disabled=bool(disabled), updated_at=float(now))
+            user_id, lambda r: user_disabled_change(r, disabled=disabled, now=now)
         )
 
     async def update_user_profile(
@@ -14890,7 +14959,7 @@ class SqlServerStore:
                             return False
                     if change is AdminRemoval.DISABLE:
                         await self._write_user(
-                            cur, user_id, lambda r: r.changed(disabled=True, updated_at=float(now))
+                            cur, user_id, lambda r: user_disabled_change(r, disabled=True, now=now)
                         )
                     elif change is AdminRemoval.DELETE:
                         await self._delete_user_rows(cur, user_id)

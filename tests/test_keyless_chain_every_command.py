@@ -1352,6 +1352,9 @@ _CLI_OPENERS = {
     "_backup.run",
     # BACKLOG #2337: record or withdraw the vault_transit bound attestation, with its audit row
     "_store_transit_bound.run",
+    # vault BACKLOG #2609, ADR 0207 section 6: issue a directory account's enrolment code from the
+    # host, with its audit row
+    "_issue_enrolment_code.run",
 }
 _CLI_DEFAULT = {"_rotate_key.run"}
 
