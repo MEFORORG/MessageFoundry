@@ -245,7 +245,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> Response:
         assert_same_origin(request)
-        await core.dr_activate(engine=engine, identity=identity, body=None)
+        result = await core.dr_activate(engine=engine, identity=identity, body=None)
+        # A degraded activation is shown, not redirected past, so its unfinished steps reach the
+        # operator (Lander hold 6702318430, item B). A clean one goes back to the status page.
+        if result.degraded:
+            return HTMLResponse(pages.dr_activation_result(result))
         return RedirectResponse("/ui/status", status_code=303)
 
     @app.post("/ui/dr/release")
