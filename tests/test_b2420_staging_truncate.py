@@ -907,7 +907,7 @@ def test_a_quote_in_the_name_is_doubled_in_the_literal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A single quote, or any of the four characters PowerShell also reads as one, would end the
-    literal early."""
+    literal early. The join below checks that the split still finds the check on such a literal."""
     name = "mefor-backup-o'\u2018\u2019\u201a\u201bx."
     refusal = _refusal_for(name, tmp_path, monkeypatch)
     assert "mefor-backup-o''\u2018\u2018\u2019\u2019\u201a\u201a\u201b\u201bx.'" in refusal
