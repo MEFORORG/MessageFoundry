@@ -2431,7 +2431,13 @@ def test_a_plain_value_does_not_print_a_later_braced_password(line: str) -> None
     first = line.split()[2].split("=")[0]
     for surface, apply in _SWALLOW_SURFACES:
         out = apply(line)
-        printed = [word for word in _BRACED_WORDS if word in out]
+        # Each "-" or "_" piece of the words, not the whole words, so a tail printed in part counts.
+        pieces = {piece for word in _BRACED_WORDS for piece in re.split(r"[-_]", word)}
+        printed = sorted(
+            piece
+            for piece in pieces
+            if re.search(rf"(?<![A-Za-z0-9]){piece}(?![A-Za-z0-9])", out) and piece not in first
+        )
         assert not printed, f"{surface}: {printed} printed -- got {out!r}"
         assert f"{first}=" in out, f"{surface}: the label {first} was lost -- got {out!r}"
 
@@ -2511,8 +2517,9 @@ def test_a_label_inside_the_braces_is_left_to_the_passes(line: str, value: str) 
 
 
 def test_a_placeholder_and_a_line_break_in_a_braced_value_survive() -> None:
-    """The tail mask keeps a placeholder an earlier pass wrote, and the run-on does not cross a line
-    break before the separator."""
+    """A tail holding the bundle's ``[REDACTED]`` or a later label is refused by the run-on, so the
+    line reads as before and the placeholder stays, and the run-on does not cross a line break before
+    the separator. A taken tail keeps the PHI pass's lowercase placeholder, pinned last."""
     bundled = redact_log_line("token=a;PWD={p mfb64:v1:QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=} next")
     assert bundled == f"token={REDACTION_PLACEHOLDER} {REDACTION_PLACEHOLDER}}} next"
     assert (
@@ -2524,6 +2531,24 @@ def test_a_placeholder_and_a_line_break_in_a_braced_value_survive() -> None:
     # A record break the log and bundle readers split at is not white space the run-on may cross.
     for brk in ("\v", "\f", "\x1c", "\x85", "\u2028", "\u2029"):
         assert scrub_credentials(f"token=a;PWD={{pp{brk}ww}}") == f"token=<redacted>{brk}ww}}"
+    assert scrub_credentials("token=a;PWD={p [redacted] vq9}") == "token=<redacted> [redacted] xx0}"
+
+
+def test_the_bundle_copy_of_the_braced_tail_is_the_write_time_one() -> None:
+    """The bundle restates the braced fragments so the regex scanner can read them. Its tail is the
+    write-time tail with its own label refusal spliced in, its braced head the same, and its braced
+    label takes the same credential words, so a refusal added to one copy alone goes red here."""
+    assert redact_mod._SPACED_BRACED_HEAD == scrub_mod._SPACED_BRACED_HEAD
+    assert scrub_mod._RUN_ON_LABEL in scrub_mod._SPACED_BRACED_TAIL
+    assert (
+        scrub_mod._SPACED_BRACED_TAIL.replace(scrub_mod._RUN_ON_LABEL, redact_mod._RUN_ON_LABEL)
+        == redact_mod._SPACED_BRACED_TAIL
+    )
+    heads = [re.compile(module._BRACED_HEAD) for module in (scrub_mod, redact_mod)]
+    for word in (*scrub_mod._CREDENTIAL_WORDS, "token", "session", "pwds", "xpwd", "PWD"):
+        for sep in ("=", ":", " =", "'="):
+            readings = {head.fullmatch(word + sep) is not None for head in heads}
+            assert len(readings) == 1, f"the copies disagree on {word + sep!r}"
 
 
 def test_white_space_after_the_separator_gives_the_old_result_on_both_paths() -> None:
@@ -2537,7 +2562,17 @@ def test_white_space_after_the_separator_gives_the_old_result_on_both_paths() ->
 #: White space between a braced label's keyword and its separator. The log and bundle readers split
 #: a record at most of these, and the run-on would delete them.
 _BRACED_HEAD_BREAKS = (
-    *(" ", "\t", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029", "\u00a0"),
+    " ",
+    "\t",
+    "\v",
+    "\f",
+    "\x1c",
+    "\x1d",
+    "\x1e",
+    "\x85",
+    "\u2028",
+    "\u2029",
+    "\u00a0",
 )
 
 

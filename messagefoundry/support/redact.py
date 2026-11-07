@@ -166,7 +166,11 @@ _RUN_ON_LABEL = (
 # letters in the braces no longer sees them; the tail refuses the readers found doing so, an XML tag
 # and a word ending in a segment-shaped triple (``MSH`` and a segment ID glued behind digits among
 # them), and a differential that runs the PHI pass after this layer is the measurement for this
-# copy, not the write-time one.
+# copy, not the write-time one. ``_MFB64`` runs before this layer and
+# writes ``[REDACTED]`` into the braces, which ends in a segment-shaped triple, so a tail holding it is
+# refused here and prints as before, where ``secretscrub`` masks it. The tail is a copy of
+# ``secretscrub``'s, its label refusal spelled with this copy's ``_RUN_ON_LABEL``; a test holds the two
+# equal on that substitution.
 _BRACED_HEAD = r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b[:=]"
 _SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s;,&]|\}\})*+"
 _SPACED_BRACED_TAIL = (

@@ -536,9 +536,11 @@ _MEFOR_LABEL_HEAD = r"\b(?-i:" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]++)\b['\"]?
 _QUOTED_LABEL = _LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 
-#: A label of any family up to where its value starts, for :data:`_KV_QUOTED_VALUE`. Unlike
-#: :data:`_LABEL_HEAD` it takes no quote after the keyword and no line break, so a run-on can never
-#: cross a line or end on a ``'label'=`` echo's own quote.
+#: A label of any family up to where its value starts, for :data:`_KV_QUOTED_VALUE` and for the
+#: label refusal in :data:`_SPACED_BRACED_TAIL`. Unlike :data:`_LABEL_HEAD` it takes no quote after
+#: the keyword and no line break, so a run-on can never cross a line or end on a ``'label'=`` echo's
+#: own quote. Narrowing it narrows what the braced tail refuses, so a later label in the braces would
+#: be taken out of the text its own pass scans; the braced tail tests are what notice.
 _RUN_ON_LABEL = (
     r"(?:(?=(?i:[" + _KEYWORD_INITIALS + r"]))"
     r"(?:(?i:" + _alternation(_CREDENTIAL_WORDS + _KEY_MATERIAL_WORDS) + r")\b"
@@ -561,15 +563,20 @@ _RUN_ON_LABEL = (
 # MASKED rather than dropped, by :func:`_mask_member_value`, the connection-string member mask, and the
 # closer stays. So ``MEFOR_X=a;PWD={pp ww}`` becomes ``MEFOR_X=<redacted> xx}``, the old
 # ``MEFOR_X=<redacted> ww}`` with its letters masked, and the label is hidden with the value, as it was
-# before. That mask keeps each word's length and the class of each character, and keeps whole what a
-# later pass reads: a placeholder an earlier pass wrote, the bundle's ``mfb64:v1:`` marker, and a scheme
-# word such as ``Bearer`` before a space. So every later CREDENTIAL pass reads text of the shape
-# the old class left. A PHI pass does not: the mask changes the letters it reads, an XML tag name, a
-# segment ID or the ``MSH`` that declares a line's delimiters, and in the support bundle the PHI pass
-# runs after this one. The braces' conditions below refuse those shapes instead. A first form masked every letter and digit to "x" and printed values the old class hid: in
-# ``token=a;PWD={pp Bearer abcdefgh}ijkl`` the later bearer pass no longer saw ``Bearer`` and "}ijkl"
-# printed, and a placeholder in the tail stopped being one. Both simpler forms were built first and
-# measured printing values the old class hid, by changing that shape:
+# before. That mask keeps each word's length and the class of each character, so the tail's word
+# lengths, digit positions and punctuation still print, and it keeps whole what a later pass reads:
+# a placeholder an earlier pass wrote, a word holding one of the member mask's keep words before a
+# ":" or "=", as ``Passw0rd=`` in ``PWD={p1 Passw0rd=v}``, and a scheme word such as ``Bearer``
+# before a space. So every later CREDENTIAL pass reads text of the shape the old class left. A PHI
+# pass does not: the mask changes the letters it reads, an XML tag name, a segment ID or the ``MSH``
+# that declares a line's delimiters, and in the support bundle the PHI pass runs after this one. The
+# braces' conditions below refuse those shapes instead.
+#
+# A FIRST FORM MASKED EVERY LETTER AND DIGIT TO "x" and printed values the old class hid: in
+# ``token=a;PWD={pp Bearer abcdefgh}ijkl`` the later bearer pass no longer saw ``Bearer`` and
+# "}ijkl" printed, and a placeholder in the tail stopped being one. Two forms simpler than the
+# run-on were built first too, and each printed values the old class hid by changing the shape of
+# the text a later pass reads:
 #
 # * Leaving the label to ``_CREDENTIAL_KV`` let it take the closer, so a braced value under an EARLIER
 #   label, which the old text closed on that "}", ran to the end of the line and fell back to its plain
@@ -755,8 +762,8 @@ _KV_QUOTED_VALUE = (
 # because a stop is impossible whenever this lookahead passes. What it saves an ordinary credential
 # line is measured once, in the module docstring. A run holding a "{", or followed by one, never takes
 # it, because the stop before a braced label (BACKLOG #2966) needs a "{" right after a ":" or "=" in the
-# run, or after white space that the lookahead already refuses; such a run walks, which the run-on
-# walk tests time.
+# run; such a run walks, which the run-on walk tests time. That refuses more than the stop needs, so a
+# value such as a dict repr walks too; the cost is measured in the module docstring.
 _NO_QUOTED_LABEL_AFTER = r"(?!\s*+[:='\"]|\s++(?i:bearer|basic|digest)\s)"
 
 # The plain value classes. Each pattern keeps the terminator set it always had, stated once here and
@@ -912,14 +919,11 @@ _MEFOR_SECRET = re.compile(
 #   braced value holds white space (BACKLOG #2966): ``MEFOR_STORE_DSN=Server=h;PWD={p w}`` and
 #   ``token=a;PWD={p w}`` print the tail's letters and digits masked now, " x}", where they printed
 #   " w}"; its punctuation, white space and closer still print as before, and so does what the mask
-#   keeps whole. A label or braced value that :data:`_BRACED_RUN_ON`'s
-#   conditions refuse still prints all or part of the braced value, as before, and so does a
-#   key-material or token label with one, as in ``token=a;session={p w}``. At least these shapes are
-#   among them: ``PWD= {p w}`` and ``PWD ={p w}``, with white space after or before the separator, a
-#   URL-encoded separator as in ``%3BPWD={p w}``, and braces holding a label or a character outside
-#   ASCII after their first white space. On the installed log chain a ``token=`` line still prints
-#   the tail, because the query filter runs first and takes the head of the braced value before
-#   this pass sees it.
+#   keeps whole. A label or braced value that :data:`_BRACED_RUN_ON`'s conditions refuse still
+#   prints all or part of the braced value, as before, and so does a key-material or token label
+#   with one, as in ``token=a;session={p w}``; the conditions, stated once on that fragment, are the
+#   list. On the installed log chain a ``token=`` line still prints the tail, because the query
+#   filter runs first and takes the head of the braced value before this pass sees it.
 # Each of the residuals above, from the unclosed quote on, printed the same text before BACKLOG
 # #1685's remainder; none is new.
 _CREDENTIAL_KV = re.compile(
@@ -1376,7 +1380,8 @@ def _braced_tail(m: re.Match[str]) -> str:
     """The ``braced_tail`` of a match that took a braced label after its value, masked by
     :func:`_mask_member_value`, or "" when it took none. :data:`_BRACED_RUN_ON` says why the tail is
     written back masked rather than dropped, and why with that mask. A pattern without the group
-    gets "", so a rebuilt pattern without the run-on still works here."""
+    gets "", so a rebuilt pattern without the run-on still works here; the tests that rebuild one are
+    the positive controls, and the exact-output pins are what notice a renamed group."""
     if "braced_tail" not in m.re.groupindex:
         return ""
     start, end = m.span("braced_tail")
