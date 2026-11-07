@@ -252,8 +252,9 @@ class ConfigDirUnlistable(WiringError):
 class WiringBuildFault(WiringError):
     """A connector build the executor kept from running: it cancelled the build, failed it as a
     broken pool, or refused it because it was shut down. Nothing is wrong with the config. Its own
-    type, so a reload audits it as ``reload_fault``, a fault inside the reload, not as a config to
-    fix (Lander hold 6703767989). Still a ``WiringError``, so an operator start or restart that
+    type, so a reload audits it as a fault inside the reload, not as a config to fix: at least an
+    operator's reload as ``reload_fault`` and a convergence reload as ``reload_error`` (Lander hold
+    6703767989). Still a ``WiringError``, so an operator start or restart that
     meets it answers and audits it as a refused start (Lander hold 6703229134, item 2)."""
 
 

@@ -1867,7 +1867,7 @@ def _build_approval_gate(
                 # NULL client, so this line names the release too. Type name only, never the text:
                 # for a 404 or 422 refusal, or a reload_fault, _audit_refused_reload logs the
                 # redacted text itself.
-                _log.warning("released config reload refused: %s", type(exc).__name__)
+                _log.warning("released config reload refused: %s", _fault_type_name(exc))
                 _status, answer = await _audit_refused_reload(
                     engine, exc, actor=actor, requested=config_dir, dry_run=False
                 )
@@ -2864,9 +2864,10 @@ async def _audit_failed_convergence(
     The row is the one an operator's refused reload writes, as :data:`_CONVERGENCE_ACTOR` with
     ``initiator`` and the shared ``config_version`` the node could not converge on. ``requested``
     is ``null``: a convergence reload loads the node's startup directory. A refusal goes through
-    :func:`_audit_refused_reload`, whose status and answer nobody reads here. A fault that is none
-    of :data:`_RELOAD_REFUSALS` has no reason there, so it is recorded with reason
-    ``reload_error`` and its type name, never its text, which the convergence runner logs. Nothing
+    :func:`_audit_refused_reload`, whose status and answer nobody reads here. A fault that is no
+    refusal (:func:`_is_reload_refusal`), a ``WiringBuildFault`` included, has no reason there, so
+    it is recorded with reason ``reload_error`` and its type name (:func:`_fault_type_name`), never
+    its text, which the convergence runner logs. Nothing
     was swapped either way: the reload raises only before its swap commits, and the node keeps its
     running graph and retries.
 
