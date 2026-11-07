@@ -688,9 +688,10 @@ _UNSCANNABLE_RE_PATTERNS = {
     # matcher that finds the checks ending a message is spliced from the constants the refusal
     # names its lead, its check and its quotes with (_CHECKS_LEAD, _TEST_PATH, _PS_QUOTES), so
     # those three cannot drift between the text and the split. Writing them out as literals would
-    # restore static scannability and lose that coupling. The rest is NOT coupled: the [char]
-    # spelling, the parentheses and ' + ' of _ps_path, and the ' ; ' join_before_checks writes are
-    # spelled on both sides by hand and can drift apart. The shape is non-catastrophic by
+    # restore static scannability and lose that coupling. At least these are NOT coupled: the
+    # [char] spelling, the parentheses and ' + ' of _ps_path, the quote around a literal, the space
+    # after the check, and the ' ; ' join_before_checks writes. Each is spelled on both sides by
+    # hand and can drift apart. The shape is non-catastrophic by
     # inspection: a literal lead, then checks joined by the literal ' ; ', anchored at \Z. A check
     # opens with the literal 'Test-Path -LiteralPath ' and is one quoted literal or one
     # parenthesised run of parts joined by ' + '. A quoted literal is one quote, then a run whose

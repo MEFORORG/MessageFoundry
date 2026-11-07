@@ -1043,7 +1043,9 @@ def test_a_lone_surrogate_in_the_name_is_spelled_and_does_not_raise(
 ) -> None:
     """A Windows name can hold an unpaired UTF-16 unit, which Python keeps as a lone surrogate
     and strict UTF-16 encoding refuses. Red before the fix: `_ps_path` raised UnicodeEncodeError
-    on it, out of the teardown's refusal. It now spells the unit as PowerShell holds it."""
+    on it, out of the teardown's refusal. It now spells the unit as a .NET string holds it. That
+    PowerShell's path layer reaches such a directory is unmeasured; the two-step check reads False
+    if it does not, and a False means run nothing."""
     odd = "\udc80"
     name = f"mefor-backup-{odd}."
     refusal = _refusal_for(name, tmp_path, monkeypatch)
