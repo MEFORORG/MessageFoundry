@@ -12011,13 +12011,13 @@ def _security(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
-        _ENV_PREFIX,
         _SECURITY_PASSTHROUGH,
         AuthSettings,
         SecuritySettings,
         ServiceSettings,
         _auth_default,
         _auth_limit_loosenings,
+        _env_overrides,
         security_loosenings,
     )
 
@@ -12047,14 +12047,9 @@ def _security(args: argparse.Namespace) -> int:
         variable leaves it, not ``sec``'s default: the two are separate literals, which
         tests/test_security_cli.py pins equal for the session limits.
 
-        Only the two session limits are also read off the load (vault BACKLOG #2600). Where the
-        load read one as a value other than ``sec``'s, and that value is itself a loosening, it is
-        named after the authored entries: labelled with the MEFOR_SECURITY_* variable when one is
-        set, and otherwise as the two reads disagreeing. A variable equal to ``sec``'s value, or
-        one whose value is no loosening, adds no entry, and no other switch's variable is named.
-        Only a load that ran and succeeded can surface one: `show` on an absent file runs none,
-        while `set` on a new file loads the candidate it wrote. docs/SECURITY-LOOSENING.md, the
-        idle-limit entry, says the same for an operator."""
+        The two session limits are also read off the load, and a loosening only the load sees is
+        named after the authored entries (vault BACKLOG #2600). docs/SECURITY-LOOSENING.md, the
+        idle-limit entry, says when one is named and how it is labelled."""
         full: ServiceSettings | None = saved
         partial_reason: str | None = None
         # An ABSENT file is not a degraded read -- the shipped defaults ARE the effective posture
@@ -12137,18 +12132,17 @@ def _security(args: argparse.Namespace) -> int:
             for s, r in _auth_limit_loosenings(full.auth):
                 if s not in differs:
                     continue
-                # The names the load reads as this switch, by _env_overrides' rule: the prefix
-                # matched as written, the rest in any case. On Windows os.environ holds every name
-                # upper-cased, so the same rule reads there as the loader reads.
-                variables = sorted(
+                # The names the load reads as this switch, asked of _env_overrides itself so the
+                # rule cannot drift from the loader's. It folds them in environ order, later
+                # winning, so the last is the one that took effect.
+                variables = [
                     name
                     for name in os.environ
-                    if name.startswith(_ENV_PREFIX)
-                    and name[len(_ENV_PREFIX) :].lower() == f"security_{s}"
-                )
+                    if s in _env_overrides({name: ""}).get("security", {})
+                ]
                 source = (
-                    f"set by {', '.join(variables)} in this command's environment, which "
-                    "overrides the file and may not be the service's"
+                    f"set by {variables[-1]} in this command's environment, which the whole-file "
+                    "load reads over the file's [security], and which may not be the service's"
                     if variables
                     else "read differently by the whole-file load than by the [security] read "
                     "this report shows, as a concurrent edit between the two leaves it"

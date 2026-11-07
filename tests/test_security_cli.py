@@ -191,12 +191,23 @@ def test_two_reads_that_disagree_with_no_variable_are_not_blamed_on_one(
     assert entry["risk"].startswith("read differently by the whole-file load")
 
 
+def _clear_security_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove every spelling of a MEFOR_SECURITY_* variable from this test's environment, so a
+    developer shell's own cannot change what the test reads."""
+    import os
+
+    for name in list(os.environ):
+        if name.upper().startswith(f"{_ENV_PREFIX}SECURITY_"):
+            monkeypatch.delenv(name)
+
+
 def test_a_variable_equal_to_the_file_adds_no_entry(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A MEFOR_SECURITY_* variable that sets a session limit to the file's own value adds nothing:
     the limit is named once, as the file's, unlabelled (vault BACKLOG #2600). The control is the
     same file with the variable one hour looser: a second, labelled entry appears."""
+    _clear_security_env(monkeypatch)
     toml = tmp_path / "mf.toml"
     toml.write_text("[security]\nmax_session_hours = 48\n", encoding="utf-8")
     variable = f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS"
@@ -214,6 +225,7 @@ def test_set_on_a_new_file_names_the_variable_show_on_an_absent_one_does_not(
     """`show` on a file that does not exist runs no load, so a variable that loosens a session
     limit is not named there; `set` on that path writes a new file and loads it, so its preview
     names the variable (vault BACKLOG #2600). Each arm is the other's control."""
+    _clear_security_env(monkeypatch)
     toml = tmp_path / "mf.toml"
     variable = f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS"
     monkeypatch.setenv(variable, "48")
@@ -225,17 +237,18 @@ def test_set_on_a_new_file_names_the_variable_show_on_an_absent_one_does_not(
 
 
 @pytest.mark.parametrize(
-    ("name", "read_by_the_load"),
+    ("names", "read_by_the_load"),
     [
-        ("MEFOR_security_max_session_hours", True),
-        ("mefor_SECURITY_MAX_SESSION_HOURS", False),
+        (("MEFOR_security_max_session_hours",), True),
+        (("mefor_SECURITY_MAX_SESSION_HOURS",), False),
+        (("MEFOR_SECURITY_MAX_SESSION_HOURS", "MEFOR_security_max_session_hours"), True),
     ],
 )
 def test_the_label_names_a_variable_by_the_loaders_rule(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
-    name: str,
+    names: tuple[str, ...],
     read_by_the_load: bool,
 ) -> None:
     """The label names a variable only as the loader reads one: the MEFOR_ prefix matched as
@@ -244,12 +257,17 @@ def test_the_label_names_a_variable_by_the_loaders_rule(
     so the two reads disagree whether or not the variable is read.
 
     A name the loader reads is named as written. One whose prefix is lower case the loader skips,
-    so the label must not blame it; an upper-casing lookup did."""
+    so the label must not blame it; an upper-casing lookup did. Of two spellings the loader reads,
+    the later one in the environment takes effect, and the label names that one alone: the earlier
+    is set to a stricter 12, so a label naming it would carry the wrong value."""
     import os
 
     from messagefoundry.config import security_edit
 
     environ = {k: v for k, v in os.environ.items() if not k.upper().startswith("MEFOR_SECURITY_")}
+    for name in names[:-1]:
+        environ[name] = "12"
+    name = names[-1]
     environ[name] = "49"
     monkeypatch.setattr(os, "environ", environ)
     monkeypatch.setattr(security_edit, "read_security", lambda service_config: {})
@@ -257,8 +275,9 @@ def test_the_label_names_a_variable_by_the_loaders_rule(
     toml.write_text("[security]\nmax_session_hours = 48\n", encoding="utf-8")
     (entry,) = _entries(_show(toml, capsys), "max_session_hours")
     if read_by_the_load:
-        assert entry["risk"].startswith(f"set by {name} in this command's environment"), entry
+        assert entry["risk"].startswith(f"set by {name} in this command's environment,"), entry
         assert "49 hour" in entry["risk"], entry
+        assert all(other not in entry["risk"] for other in names[:-1]), entry
     else:
         assert entry["risk"].startswith("read differently by the whole-file load"), entry
         assert "48 hour" in entry["risk"], entry
@@ -363,7 +382,7 @@ def test_set_preview_reads_the_security_it_saved(
     assertion on the `fresh` arm cannot pass on a stale view."""
     from messagefoundry.config import security_edit
 
-    monkeypatch.delenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", raising=False)
+    _clear_security_env(monkeypatch)
     real = security_edit.read_security
     calls: list[str] = []
 

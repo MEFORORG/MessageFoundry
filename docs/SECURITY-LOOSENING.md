@@ -515,7 +515,9 @@ false premise.
   both limits from the file's `[security]`, the authored values `show` prints. When a
   `MEFOR_SECURITY_*` variable in the operator's shell sets a limit to a value other than the
   file's, and that value is itself a loosening, it is named too, after the authored entries and
-  beside any entry for the file's own value, with a risk that starts by naming the variable. A
+  beside any entry for the file's own value, with a risk that starts by naming the variable. Where
+  the load and the `[security]` read disagree with no such variable set, as a concurrent edit
+  between the two reads leaves them, the entry says the two reads disagreed instead. A
   variable equal to the file's value, or one whose value is no loosening, adds no entry. Only the
   two session limits get this: a `MEFOR_SECURITY_*` variable for another switch, at least
   `require_mfa` and `block_unlisted_outbound`, is not named. It needs a whole-file load that ran
