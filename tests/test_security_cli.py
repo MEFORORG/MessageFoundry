@@ -98,10 +98,11 @@ def test_set_rejects_a_file_that_still_has_a_relocated_legacy_key(
 def test_set_preview_reads_the_session_limits_after_the_edit(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], switch: str, looser: int
 ) -> None:
-    """Vault BACKLOG #2600: the two [security] session limits are reported off the [auth] copy the
-    desugar writes, so the preview must read the settings WITH the edit applied. Before the fix it
-    paired the edited [security] with the [auth] loaded before the edit, which missed a new
-    loosening (the first assertion) and kept one the edit had just removed (the second)."""
+    """Vault BACKLOG #2600: the two [security] session limits are reported off their [auth] copies,
+    so the preview must name a limit the edit sets looser (the first assertion) and drop one the
+    edit removes (the second), as the saved file reads back. Before the fix it paired the edited
+    [security] with the [auth] loaded before the edit and did neither. The pairing with the
+    pre-edit load itself is guarded by test_set_preview_scope_is_read_after_the_edit."""
     toml = tmp_path / "mf.toml"
     rc, res = _set(toml, {switch: looser}, capsys)
     assert rc == 0
@@ -178,6 +179,46 @@ def test_set_preview_reads_the_security_it_saved(
     assert rc == 0 and len(calls) >= 2
     assert "max_session_hours = 48" in toml.read_text(encoding="utf-8")
     assert "max_session_hours" in [lo["switch"] for lo in res["loosenings"]]
+
+
+@pytest.mark.parametrize(
+    ("switch", "field"),
+    [
+        ("sign_out_after_idle_minutes", "session_idle_timeout_minutes"),
+        ("max_session_hours", "session_absolute_hours"),
+    ],
+)
+def test_the_session_limit_defaults_agree(switch: str, field: str) -> None:
+    """`show` prints the [security] default, the IDE marks a value above it, and the engine names a
+    value above the [auth] default. They are separate literals, so this pins them equal."""
+    from messagefoundry.config.settings import AuthSettings, SecuritySettings
+
+    assert SecuritySettings.model_fields[switch].default == AuthSettings.model_fields[field].default
+
+
+def test_set_preview_does_not_refuse_a_saved_edit_over_its_own_read(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preview's read of the saved [security] must not refuse an edit the whole-file load
+    accepted (vault BACKLOG #2600). A file value that fails on its own while a MEFOR_SECURITY_*
+    variable overrides it loads; the stale first read stands in for the concurrent edit that put it
+    there after the pre-check."""
+    from messagefoundry.config import security_edit
+
+    real = security_edit.read_security
+    calls: list[str] = []
+
+    def stale_first(service_config: str | Path) -> dict:
+        calls.append(str(service_config))
+        return {} if len(calls) == 1 else real(service_config)
+
+    monkeypatch.setattr(security_edit, "read_security", stale_first)
+    monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", "12")
+    toml = tmp_path / "mf.toml"
+    toml.write_text('[security]\nmax_session_hours = "x"\n', encoding="utf-8")
+    rc, res = _set(toml, {"block_unlisted_outbound": True}, capsys)
+    assert rc == 0, res
+    assert "block_unlisted_outbound = true" in toml.read_text(encoding="utf-8")
 
 
 def test_set_preview_scope_is_read_after_the_edit(

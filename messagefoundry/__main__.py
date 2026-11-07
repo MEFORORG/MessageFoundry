@@ -12012,9 +12012,9 @@ def _security(args: argparse.Namespace) -> int:
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
         _SECURITY_PASSTHROUGH,
-        AuthSettings,
         SecuritySettings,
         ServiceSettings,
+        _auth_default,
         security_loosenings,
     )
 
@@ -12035,11 +12035,13 @@ def _security(args: argparse.Namespace) -> int:
 
         The [auth] copies of the [security] switches are taken from ``sec`` (vault BACKLOG #2600).
         The registry reads the two session limits off those copies, and the load fills them from
-        the file AND the environment, while ``sec`` is the file's [security] alone. Unmatched, a
-        shell variable or the shipped-default fallback named a limit `values` did not show, or hid
-        one it did, and a `set` preview paired with the pre-edit load missed a new loosening. A
-        switch the file leaves unset takes the [auth] field's own default, as the load leaves it,
-        not ``sec``'s: the two defaults are separate literals."""
+        the file AND the environment, while ``sec`` is an authored [security] with no environment
+        layer: the file's for `show`, the saved candidate's for `set`. Unmatched, a shell variable
+        or the shipped-default fallback named a limit `values` did not show, or hid one it did, and
+        a `set` preview paired with the pre-edit load missed a new loosening. A switch ``sec``
+        leaves unset takes the [auth] field's shipped default, as a load with no MEFOR_SECURITY_*
+        variable leaves it, not ``sec``'s default: the two are separate literals, which
+        tests/test_security_cli.py pins equal for the session limits."""
         full: ServiceSettings | None = saved
         partial_reason: str | None = None
         # An ABSENT file is not a degraded read -- the shipped defaults ARE the effective posture
@@ -12050,13 +12052,10 @@ def _security(args: argparse.Namespace) -> int:
             full, partial_reason = _load_service_settings(path)
         if full is None:
             full = ServiceSettings()
-        auth_defaults = AuthSettings()
         auth = full.auth.model_copy(
             update={
                 field: (
-                    getattr(sec, switch)
-                    if switch in sec.model_fields_set
-                    else getattr(auth_defaults, field)
+                    getattr(sec, switch) if switch in sec.model_fields_set else _auth_default(field)
                 )
                 for switch, section, field in _SECURITY_PASSTHROUGH
                 if section == "auth"
@@ -12138,8 +12137,9 @@ def _security(args: argparse.Namespace) -> int:
                 "directories) and its Windows service-environment reading: this command is a separate "
                 "process (GET /security/posture reports them). "
                 "The [security] switches, the two session limits included, are the AUTHORED "
-                "values, so a `serve --host` bind override on a "
-                "running engine is not reflected here either — see `messagefoundry check` or "
+                "values, so a MEFOR_SECURITY_* variable the service carries is NOT reflected "
+                "here, and neither is a `serve --host` bind override on a "
+                "running engine — see `messagefoundry check` or "
                 "GET /security/posture. The other sections are read as the whole-file load "
                 "resolves them, so a MEFOR_<SECTION>_<KEY> variable in THIS command's environment "
                 "counts there, which may not be the service's. One entry is not read from the "
@@ -12171,15 +12171,22 @@ def _security(args: argparse.Namespace) -> int:
 
     # Also how a relocated legacy key is refused at edit time rather than at the next start.
     saved: list[ServiceSettings] = []
-    saved_sec: list[SecuritySettings] = []
+    saved_sec: list[SecuritySettings | None] = []
     check_candidate = _post_write_settings_check(security_edit.SecurityEditError, keep=saved)
 
     def validate(candidate: Path) -> None:
         check_candidate(candidate)
         # The [security] of the very text that was validated, read under the edit lock, so a
         # concurrent edit between the pre-check read below and the lock cannot pair a stale
-        # [security] with this candidate's other sections.
-        saved_sec.append(SecuritySettings.model_validate(security_edit.read_security(candidate)))
+        # [security] with this candidate's other sections. This read is for the report only and
+        # must not refuse an edit the whole-file load accepted, so a [security] that fails alone
+        # (a MEFOR_SECURITY_* variable overrides its bad value) falls back to the pre-check view.
+        try:
+            saved_sec.append(
+                SecuritySettings.model_validate(security_edit.read_security(candidate))
+            )
+        except ValidationError:
+            saved_sec.append(None)
 
     try:
         data = args.data if args.data is not None else sys.stdin.read()
@@ -12201,10 +12208,8 @@ def _security(args: argparse.Namespace) -> int:
             return _emit_error(f"invalid [security] value: {exc}", as_json=args.json)
         result = security_edit.set_security(path, updates, validate=validate)
         # The candidate the write validated, so the preview reports the posture the edit left.
-        if saved and saved_sec:
-            result.update(_posture(saved_sec[-1], saved[-1]))
-        else:
-            result.update(_posture(sec))
+        view = saved_sec[-1] if saved_sec and saved_sec[-1] is not None else sec
+        result.update(_posture(view, saved[-1] if saved else None))
     except _OperatorJsonError as exc:
         return _emit_error(str(exc), as_json=args.json)
     except (security_edit.SecurityEditError, FileNotFoundError, ValueError, OSError) as exc:
