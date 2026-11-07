@@ -5779,8 +5779,9 @@ the 120 ceiling, and then no source writes its own row until earlier rows age ou
 
 A sign-out past either limit is not written as its own row but counted. The count is written in an
 `auth.logout` row with no actor and no client, `outcome` `unrecorded` and `"count": N`, the
-sign-outs left unwritten since the last such row, and at most one such row is written in any 60
-seconds. A WARNING log line gives the same N once the row is written. Its own outcome keeps a reader
+sign-outs left unwritten since the last such row, and at most one such row is begun in any 60
+seconds. The slot is spent when the write starts, so count-row writes that stall can land together.
+A WARNING log line gives the same N once the row is written. Its own outcome keeps a reader
 that counts `nothing_to_revoke` rows from reading it as one sign-out. Only a sign-out that names no
 caller and ends nothing writes the count: the first one past a limit writes it at once, unless a
 count row was attempted in the 60 seconds before, since a count-row write that is refused or
@@ -5788,8 +5789,9 @@ cancelled spends that window's one slot too. A sign-out through `POST /auth/logo
 it. The row's time is when it was written, not when the misses it counts arrived. When only the
 audit writes are refused, the ERROR line each refused row write logs is bounded the same way. When
 the whole store refuses, that bound does not apply: the revoke's own store write raises before any
-row is attempted, so each same-origin request with a non-empty session cookie answers 500, the
-cookie stays set and a live session stays live, and nothing bounds the errors those requests log.
+row is attempted, so each request that passes the route's origin check (`assert_same_origin`) and
+carries a non-empty session cookie answers 500, the cookie stays set and a live session stays
+live, and nothing bounds the errors those requests log.
 
 **What the count can miss.** A count stays in memory until a later sign-out that names no caller
 and ends nothing arrives after the 60 seconds, so the misses at the end of a flood are written only
@@ -5805,10 +5807,13 @@ address reads `unknown`, which shares the no-address source. Three misses from a
 the count records the others. The source is the whole address, so an IPv6 host that holds a /64 can
 be 40 sources by itself and fill the ceiling. The bound and the count are in-process, so each engine
 shard keeps its own. Nothing prunes `audit_log` (see [retention](CONFIGURATION.md#retention)), so the
-rows still grow, by at most 121 a minute for each engine process.
+rows still grow, by at most 121 rows begun a minute for each engine process. Each bound is charged
+when a row's write starts, not when it lands, so the rows of writes that stall can land together,
+more than 121 in one minute.
 
-**The bound is on the audit row, not on the request.** Every same-origin request to `/ui/logout`
-with a non-empty session cookie still runs the sign-out's revoke, a store write transaction, whether or not it ends a session: on
+**The bound is on the audit row, not on the request.** Every request to `/ui/logout` that passes
+the route's origin check (`assert_same_origin`) and carries a non-empty session cookie still runs
+the sign-out's revoke, a store write transaction, whether or not it ends a session: on
 SQLite its `UPDATE` takes the store's write lock even when it matches no row, and that competes with
 message ingress commits. Nothing in the engine bounds those requests, so treat `/ui/logout` as an
 unbounded store-write surface to any caller that can reach the console, on the engine's own host or
