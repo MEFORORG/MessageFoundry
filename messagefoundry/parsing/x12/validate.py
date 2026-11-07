@@ -73,8 +73,9 @@ class X12ValidationResult:
     Functional Acknowledgment ready to return to the sender (``None`` only if pyx12 emitted none, e.g.
     for an already-FA transaction); ``ack_transaction`` names which (``"997"``/``"999"``), and is ``None``
     with no ack or with a fragment pyx12's ack writer left when it failed before the closing IEA. Such
-    a fragment is still returned in ``ack`` but is not a ready-to-return ack: send ``ack`` only when
-    ``ack_transaction`` is set."""
+    a fragment is still returned in ``ack``, and is not a complete ack; ``ack_transaction`` being
+    ``None`` beside a non-``None`` ``ack`` marks it. A complete ack is not thereby well-formed: it
+    echoes sender values unescaped."""
 
     valid: bool
     errors: tuple[X12SegmentError, ...] = ()
@@ -82,10 +83,10 @@ class X12ValidationResult:
     ack_transaction: str | None = None
 
 
-#: The one handler the ``pyx12`` logger tree ends at. A single module-level instance, because
-#: ``Logger.addHandler`` skips a handler already attached, under logging's own lock.
 _log = logging.getLogger(__name__)
 
+#: The one handler the ``pyx12`` logger tree ends at. A single module-level instance, because
+#: ``Logger.addHandler`` skips a handler already attached, under logging's own lock.
 _PYX12_SINK = logging.NullHandler()
 #: Above CRITICAL, so a logger at this level builds no record at all.
 _MUTED = logging.CRITICAL + 1
