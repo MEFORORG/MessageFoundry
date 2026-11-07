@@ -1449,9 +1449,60 @@ def test_a_store_hop_refusal_that_is_not_revocation_offers_no_attestation(
         monkeypatch.setenv("HTTPS_PROXY", f"http://user:synthetic@{_PROXY_HOST}:3128")
         with pytest.raises(KeyProviderError) as caught:
             entry(monkeypatch, _OFF_BOX, attested=True)
-    # The control: the cause is the Vault hop's marked refusal, so the store chose its hop text.
+    # The exact hop text shows the store took the marked-refusal path and not its revocation text.
     from messagefoundry.store import base as store_base
 
     assert str(caught.value) == store_base._VAULT_HOP_TEXT, str(caught.value)
     assert "vault_revocation_attested" not in str(caught.value), str(caught.value)
     assert dials == []
+
+
+def _store_text_for(cause: BaseException) -> str:
+    """The store key seam's fixed text for a provider error caused by ``cause``."""
+    from messagefoundry.store import base as store_base
+
+    error = KeyProviderError("synthetic: the provider's wrapper")
+    error.__cause__ = cause
+    return str(store_base._fresh_refusal(error, store_base._KEY_SEAM_TEXTS))
+
+
+def test_the_store_proxy_leg_revocation_refusal_keeps_the_attestation_offer() -> None:
+    """Round 1 of the tenth hold's review: the proxy leg's revocation refusal is crossed by the
+    attestation too, so the store must not give it the text that offers none."""
+    from messagefoundry.store import base as store_base
+    from messagefoundry.transports.strict_requests import VaultHopRefused
+
+    with pytest.raises(VaultHopRefused) as caught:
+        _proxy_leg(posture=_ENFORCING, attestation_section="store")
+    assert _store_text_for(caught.value) == store_base._VAULT_REVOCATION_TEXT
+    # The control: the [secrets] section's proxy-leg refusal is not the store's.
+    with pytest.raises(VaultHopRefused) as other:
+        _proxy_leg(posture=_ENFORCING, attestation_section="secrets")
+    assert _store_text_for(other.value) == store_base._VAULT_HOP_TEXT
+
+
+class _StrRaises:
+    def __str__(self) -> str:
+        raise RuntimeError("synthetic: this argument's own code ran")
+
+
+def test_a_reassigned_argument_runs_no_code_and_a_raising_judge_offers_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 1 of the tenth hold's review: the classifier's guards. An argument that is not an
+    exact str is never rendered, and a judge that raises falls to the text with no offer."""
+    from messagefoundry.store import base as store_base
+    from messagefoundry.transports import strict_requests
+
+    with pytest.raises(strict_requests.VaultHopRefused) as caught:
+        _proxy_leg(posture=_ENFORCING, attestation_section="store")
+    caught.value.args = (_StrRaises(),)
+    assert _store_text_for(caught.value) == store_base._VAULT_HOP_TEXT
+
+    def _judge_raises(exc: object, section: object) -> bool:
+        raise RuntimeError("synthetic: the judge failed")
+
+    monkeypatch.setattr(strict_requests, "is_unrevoked_vault_hop_refusal", _judge_raises)
+    with pytest.raises(strict_requests.VaultHopRefused) as vault_leg:
+        _refuse(_OFF_BOX, None, attestation_section="store")
+    assert _store_text_for(vault_leg.value) == store_base._VAULT_HOP_TEXT

@@ -32,32 +32,31 @@
 - **Every other error from the store cipher build or the store key resolution is replaced by a new
   refusal with a fixed text the site chooses, raised after the handler has exited, and nothing is
   passed through.** The class of every refusal at these sites, the previous bullet's included,
-  depends on the codec judgement. An error the judgement refuses, one with a codec error on it,
-  one whose chain cannot be read whole or one whose judgement raised, takes the previous bullet's
-  two classes, so a hop refusal holding a codec error is a `StoreCipherConfigError` and a
-  `DpapiError` holding one a `KeyProviderError`. Otherwise the new refusal's class follows the
-  error's: an `InsecureHopRefused`, a `DpapiError` or a `DpapiUnavailable` is replaced by one of
-  that base class, not of a subclass it may be, any other `ValueError` by a
-  `StoreCipherConfigError`, and any other `Exception` by a `KeyProviderError`; at the cipher build
-  a hop refusal is a `StoreCipherConfigError` too, as every `ValueError` there. Its text names the
-  settings for that case, such as `[store].cipher_provider`, `[store].key_provider`,
-  `[store].encryption_key_file` or, under `vault_transit`, the Transit cipher's own settings, and
-  reads nothing from the error: an exact `StoreCipherConfigError` or `KeyProviderError` is
-  replaced too, since its arguments could have been reassigned, and so is a subclass, since its
-  own `__str__` could print a byte. A refusal the key resolution raised keeps the text it recorded
-  when it was built, the key check's refusals built from the settings alone among them, and one
-  whose error or cause is exactly the Vault hop's marked refusal gets a fixed text naming the
-  store's Vault settings. Which of two fixed texts it gets is chosen by reading that marked
-  refusal's argument, the one argument read here. Only the store's Vault leg revocation refusal
-  gets a text offering `[store].vault_revocation_attested` with its reason, on the condition, for
-  the operator to judge, that revocation for the hop is covered outside the engine; every other
-  marked refusal, at least an http:// address or a proxy's cleartext credentials, gets none. The
-  refusal
-  keeps no cause and no context, so a traceback of it does not print the error's own text, and the
-  site drops the error, so no frame local of the refusal's traceback holds the error itself. The
-  class of a replaced error the engine did not build, and of its cause, is logged as a WARNING by
-  name alone. Before, a `ValueError` from the build was refused with its own text, and an error of
-  any other class passed through as it was. (`BACKLOG #4882`)
+  depends on the codec judgement. An error the judgement refuses, one with a codec error on it, one
+  whose chain cannot be read whole or one whose judgement raised, takes the previous bullet's two
+  classes, so a hop refusal holding a codec error is a `StoreCipherConfigError` and a `DpapiError`
+  holding one a `KeyProviderError`. Otherwise the new refusal's class follows the error's: an
+  `InsecureHopRefused`, a `DpapiError` or a `DpapiUnavailable` is replaced by one of that base
+  class, not of a subclass it may be, any other `ValueError` by a `StoreCipherConfigError`, and any
+  other `Exception` by a `KeyProviderError`; at the cipher build a hop refusal is a
+  `StoreCipherConfigError` too, as every `ValueError` there. Its text names the settings for that
+  case, such as `[store].cipher_provider`, `[store].key_provider`, `[store].encryption_key_file` or,
+  under `vault_transit`, the Transit cipher's own settings, and reads nothing from the error: an
+  exact `StoreCipherConfigError` or `KeyProviderError` is replaced too, since its arguments could
+  have been reassigned, and so is a subclass, since its own `__str__` could print a byte. A refusal
+  the key resolution raised keeps the text it recorded when it was built, the key check's refusals
+  built from the settings alone among them, and one whose error or cause is exactly the Vault hop's
+  marked refusal gets a fixed text naming the store's Vault settings. Which of two fixed texts it
+  gets is chosen by also reading that marked refusal's argument. Only the store's revocation
+  refusals, of the Vault leg or the proxy leg, get a text offering
+  `[store].vault_revocation_attested` with its reason, after the loopback remedy and on the
+  condition, for the operator to judge, that revocation for the hop is covered outside the engine;
+  every other marked refusal, at least an http:// address or a proxy's cleartext credentials, gets
+  none. The refusal keeps no cause and no context, so a traceback of it does not print the error's
+  own text, and the site drops the error, so no frame local of the refusal's traceback holds the
+  error itself. The class of a replaced error the engine did not build, and of its cause, is logged
+  as a WARNING by name alone. Before, a `ValueError` from the build was refused with its own text,
+  and an error of any other class passed through as it was. (`BACKLOG #4882`)
 - **The PostgreSQL store's TLS context refusal at the open, `StoreTlsRefused`, carries a fixed text
   that names `[store].ssl_root_cert`, `[store].ssl_crl_file` and the hop's suites, and reads
   nothing from the context builder's `ValueError`.** Before, it carried that error's text, which

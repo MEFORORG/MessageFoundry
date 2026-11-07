@@ -3634,8 +3634,8 @@ def _fresh_refusal(
     Two more texts are chosen where ``exc`` or its cause, read through ``BaseException``'s own
     descriptor, is exactly the Vault hop's marked refusal
     (:func:`~messagefoundry.config.tls_policy.is_vault_hop_refusal`), so a Vault hop the engine
-    refused stays apart from one that crossed and failed later. The store's Vault leg revocation
-    refusal (:func:`_is_vault_revocation_refusal`, which reads that refusal's argument to choose)
+    refused stays apart from one that crossed and failed later. A store revocation refusal
+    (:func:`_is_vault_revocation_refusal`, which reads that refusal's argument to choose)
     gets :data:`_VAULT_REVOCATION_TEXT`, which offers the attestation; any other marked refusal gets
     :data:`_VAULT_HOP_TEXT`, which does not (the tenth hold on engine PR 2818)."""
     kind = type(exc)
@@ -3766,8 +3766,8 @@ _KEY_SOURCE = (
 #: The fallback refusal's text. Like every refusal text here it reads nothing from the error.
 _UNJUDGED = f"{_KEY_SOURCE}: an error that could not be judged, its class and text not shown"
 
-#: :func:`_fresh_refusal`'s text, at both sites, for a Vault hop marked refusal that is not the
-#: store's Vault leg revocation refusal, at least an http:// address, a proxy's cleartext
+#: :func:`_fresh_refusal`'s text, at both sites, for a Vault hop marked refusal that is not one of
+#: the store's revocation refusals, at least an http:// address, a proxy's cleartext
 #: credentials or an unchecked client key. It offers no attestation and reads nothing from the
 #: refusal.
 _VAULT_HOP_TEXT = (
@@ -3776,35 +3776,56 @@ _VAULT_HOP_TEXT = (
     "the Vault CA and client settings"
 )
 
-#: :func:`_fresh_refusal`'s text, at both sites, for the store's Vault leg revocation refusal. The
-#: attestation is offered only on the precondition that refusal's own lever states
-#: (``strict_requests._STORE_REVOCATION_LEVER``), which only the operator can judge.
+#: :func:`_fresh_refusal`'s text, at both sites, for the store's revocation refusals, of the Vault
+#: leg or the proxy leg. It keeps the remedy that needs no attestation, and offers the attestation
+#: only on the precondition those refusals' own levers state (``strict_requests``'
+#: ``_STORE_REVOCATION_LEVER`` and ``_STORE_PROXY_LEG_LEVER``), which only the operator can judge.
 _VAULT_REVOCATION_TEXT = (
     f"{_KEY_SOURCE}: the store's Vault hop was refused because it checks no certificate "
-    "revocation, its text not shown; if revocation for this hop is covered outside the engine, "
-    "set [store].vault_revocation_attested = true with a [store].vault_revocation_attested_reason "
-    "that covers the Vault server's certificate and any https:// proxy's the hop goes through"
+    "revocation, its text not shown; a loopback Vault reached with no proxy crosses without an "
+    "attestation, so check MEFOR_STORE_VAULT_ADDR and any proxy variable; otherwise, if revocation "
+    "for this hop is covered outside the engine, set [store].vault_revocation_attested = true with "
+    "a [store].vault_revocation_attested_reason that covers the Vault server's certificate and any "
+    "https:// proxy's the hop goes through"
 )
 
 
 def _is_vault_revocation_refusal(refusal: BaseException) -> bool:
-    """Whether ``refusal``, already exactly the Vault hop's marked refusal, is the store's Vault
-    leg revocation refusal, as ``strict_requests.is_unrevoked_vault_hop_refusal`` with ``"store"``
-    answers it: the same section-aware test ``verify`` uses, so the two surfaces agree, and a
-    ``[secrets]`` or proxy-leg refusal answers ``False``.
+    """Whether ``refusal``, already exactly the Vault hop's marked refusal, is one of the store's
+    two revocation refusals: the Vault leg's, as ``strict_requests.is_unrevoked_vault_hop_refusal``
+    with ``"store"`` answers it, or the proxy leg's, whose text after the connector label is
+    exactly ``_UNREVOKED_PROXY_LEG`` and ``_STORE_PROXY_LEG_LEVER``. A ``[secrets]`` refusal
+    answers ``False``.
 
-    That test reads the refusal's text, so it is called only on one whose single argument is an
-    exact ``str``, read through ``BaseException``'s own descriptor, and so runs none of the
-    refusal's code. The answer only chooses between two fixed texts and nothing read is printed,
-    but the argument can have been reassigned after the refusal was built: a reassigned one can at
-    most choose the other fixed text. The module is read from ``sys.modules``, as
-    ``is_vault_hop_refusal`` reads it, and a judge that is missing answers ``False``."""
+    Both tests read the refusal's text, so they run only on one whose single argument is an exact
+    ``str``, read through ``BaseException``'s own descriptor, and so run none of the refusal's
+    code. The answer only chooses between two fixed texts and nothing read is printed, but the
+    argument can have been reassigned after the refusal was built: a reassigned one can at most
+    choose the other fixed text. The module is read from ``sys.modules``, as
+    ``is_vault_hop_refusal`` reads it; a judge or constant that is missing, or a judge that
+    raises, answers ``False``, so the refusal is never replaced by the judge's own error."""
     args = _ARGS.__get__(refusal)
     if len(args) != 1 or type(args[0]) is not str:
         return False
     module = sys.modules.get(_VAULT_HOP_MODULE)
-    judge = getattr(module, "is_unrevoked_vault_hop_refusal", None) if module else None
-    return judge is not None and judge(refusal, "store") is True
+    if module is None:
+        return False
+    proxy_leg = getattr(module, "_UNREVOKED_PROXY_LEG", None)
+    proxy_lever = getattr(module, "_STORE_PROXY_LEG_LEVER", None)
+    store_proxy_leg = (
+        f"{proxy_leg} {proxy_lever}"
+        if type(proxy_leg) is str and type(proxy_lever) is str
+        else None
+    )
+    if store_proxy_leg is not None and args[0].partition(": ")[2] == store_proxy_leg:
+        return True
+    judge = getattr(module, "is_unrevoked_vault_hop_refusal", None)
+    if judge is None:
+        return False
+    try:
+        return judge(refusal, "store") is True
+    except Exception:  # noqa: BLE001 -- fail to the text that offers no attestation
+        return False
 
 
 #: :func:`_fresh_refusal`'s texts at the key seam (``resolve_active_key``, ``resolve_decrypt_keys``).
@@ -3887,9 +3908,12 @@ def _write_unjudged(what: str, shown: str) -> None:
 #: through ``vars``, since the stubs give ``BaseException.__cause__`` the instance attribute's
 #: type, which has no ``__set__``.
 _CAUSE: Any = vars(BaseException)["__cause__"]
-_ARGS: Any = vars(BaseException)["args"]
 _CONTEXT: Any = vars(BaseException)["__context__"]
 _SUPPRESS_CONTEXT: Any = vars(BaseException)["__suppress_context__"]
+
+#: ``BaseException``'s own ``args`` descriptor. Not a link and never cleared: it is only read, by
+#: :func:`_is_vault_revocation_refusal`, so the read runs no subclass code.
+_ARGS: Any = vars(BaseException)["args"]
 
 
 def _refusal_for(exc: Exception) -> Exception | None:
