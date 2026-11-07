@@ -111,7 +111,8 @@ from messagefoundry.store.base import (
     SchemaProvisionResult,
     StoreGrantsMissingError,
     StoreNotFoundError,
-    _carries_a_codec_error,
+    _codec_chain_reading,
+    _flush_unjudged,
     acquire_pooled,
     driver_sqlstate,
     warm_pool_connections,
@@ -1713,30 +1714,90 @@ def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
     The builder refuses the hop's own TLS settings with a ``ValueError``, at least for the pin
     file, the CRL file and its dates, and the suites; typed, such a refusal is could not start
     rather than the CLI floor's exit 1. Not an ``OSError`` that is also a ``ValueError``, such as a
-    CRL staging copy that failed: that is a fault of the host, not a verdict on the settings, and
-    keeps its own type. Nor an ``OSError`` alone, such as a CRL file the engine may not read, which
-    this does not catch (a pin file it may not read arrives as a ``ValueError`` naming the setting,
-    and is typed).
+    CRL staging copy that failed: that is a fault of the host, not a verdict on the settings, and is
+    raised as a :class:`_TlsHostFault`, which has both bases. Nor an ``OSError`` alone, such as a
+    CRL file the engine may not read, which this does not catch (a pin file it may not read arrives
+    as a ``ValueError`` naming the setting, and is typed).
 
     **A codec error is neither quoted nor chained**, as
     :func:`~messagefoundry.store.base.build_store_cipher` does not chain one (BACKLOG #2532,
     #3471): its text names a byte of what it decoded. A ``ValueError`` that is one, holds one, or
-    has one on its chain is refused with a fixed text naming the settings and the class, raised
-    outside the handler. Not its ``codec_safe_str`` rendering: the CRL judge re-raises a codec
-    error as a ``ValueError`` whose own text already quotes the byte, which that rendering prints
-    whole. Every other ``ValueError`` keeps its text and its chain."""
+    has one on its chain, or whose chain cannot be read whole, is refused with a fixed text naming
+    the settings and which of the two it is, raised outside the handler (BACKLOG #4882). Not its
+    ``codec_safe_str`` rendering: the CRL judge re-raises a codec error as a ``ValueError`` whose
+    own text already quotes the byte, which that rendering prints whole. It names no class, as
+    :func:`~messagefoundry.store.base._codec_safe_refusal`'s fallback names none (the third hold
+    on engine PR 2818). Every other ``ValueError`` is refused with a fixed text naming the
+    settings and what they must hold (the seventh hold).
+
+    NO ``ValueError`` IS PASSED THROUGH (the eighth hold). Every refusal of one here is a new
+    exception, raised outside the handler ``from None``, with a fixed text chosen by the builder's
+    error's class as read with ``type``: a hop refusal as an ``InsecureHopRefused``, a
+    ``StoreTlsRefused`` kept as one with the settings text, and a host fault that is also a
+    ``ValueError`` as :class:`_TlsHostFault`. Nothing is read from the error and no chain is kept,
+    so its text, the ``ssl`` or ``cryptography`` library's included, is not printed from here. At
+    least an error of the builder's that is not a ``ValueError``, such as a plain ``OSError`` or an
+    ``ssl.SSLError``, is not caught here and leaves as it is."""
     try:
-        return _verifying_context(settings)
-    except ValueError as exc:
-        if isinstance(exc, (InsecureHopRefused, OSError)):
-            raise
-        if not _carries_a_codec_error(exc):
-            raise StoreTlsRefused(str(exc)) from exc
-        kind = type(exc).__name__
-    raise StoreTlsRefused(
-        "the PostgreSQL store's TLS context could not be built from [store].ssl_root_cert, "
-        f"[store].ssl_crl_file or the system trust store: a {kind} from a codec error, not quoted"
-    )
+        try:
+            return _verifying_context(settings)
+        except ValueError as exc:
+            kind = type(exc)
+            judged = not issubclass(kind, (InsecureHopRefused, OSError))
+            reading = _codec_chain_reading(exc) if judged else None
+        # Built outside the handler, so nothing raised here has the builder's error as its
+        # context; chosen by the class alone, read with ``type``, so nothing is read from the error.
+        # A ``StoreTlsRefused`` is a refusal of the settings, not of the posture.
+        refusal: ValueError
+        if issubclass(kind, StoreTlsRefused):
+            refusal = StoreTlsRefused(_TLS_REFUSED)
+        elif issubclass(kind, InsecureHopRefused):
+            refusal = InsecureHopRefused(_TLS_HOP_REFUSED)
+        elif issubclass(kind, OSError):
+            refusal = _TlsHostFault(_TLS_HOST_FAULT)
+        elif reading is None:
+            refusal = StoreTlsRefused(_TLS_REFUSED)
+        else:
+            refusal = StoreTlsRefused(f"{_TLS_UNBUILT}: an error {reading}, not quoted")
+        raise refusal from None
+    finally:
+        # In ``finally``, so a line held for a judgement that an interrupt escaped is still written
+        # here, not by a later, unrelated refusal on this thread.
+        _flush_unjudged()
+
+
+class _TlsHostFault(OSError, ValueError):
+    """A fault of the host while :func:`_verifying_context` built the context, such as a CRL
+    staging copy that failed, raised in place of the builder's own with a fixed text (the eighth
+    hold on engine PR 2818). Both bases, as the builder's ``_CrlStagingFailed`` has, so a caller
+    catching either still catches it."""
+
+
+#: What every :class:`StoreTlsRefused` from :func:`_verifying_context_at_open`'s handler opens with.
+_TLS_UNBUILT = (
+    "the PostgreSQL store's TLS context could not be built from [store].ssl_root_cert, "
+    "[store].ssl_crl_file or the system trust store"
+)
+
+#: The text of a hop refusal the builder raised, replaced at the open (the eighth hold). The
+#: builder takes no posture, so this names the settings it reads, not a posture lever.
+_TLS_HOP_REFUSED = (
+    f"{_TLS_UNBUILT}: the store hop was refused by the engine's TLS checks on those settings; the "
+    "refusal's own text is not shown"
+)
+
+#: The text of a host fault the builder raised, replaced at the open (the eighth hold).
+_TLS_HOST_FAULT = (
+    f"{_TLS_UNBUILT}: the host could not stage or read a file those settings name; the error's "
+    "own text is not shown"
+)
+
+#: The refusal of every other ``ValueError`` the builder raises at the open (the seventh hold).
+_TLS_REFUSED = (
+    f"{_TLS_UNBUILT}: the pin file must hold a readable CA certificate, the CRL file readable CRLs "
+    "in effect from a CA the hop already trusts, and the hop's suites must narrow to the approved "
+    "list; the error's own text is not shown"
+)
 
 
 def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:

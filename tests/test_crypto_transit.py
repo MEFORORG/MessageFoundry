@@ -270,8 +270,12 @@ def test_default_cipher_provider_is_unchanged() -> None:
 
 
 def test_unknown_cipher_provider_fails_closed() -> None:
-    with pytest.raises(ValueError, match="not a known cipher provider"):
+    with pytest.raises(ValueError) as caught:
         build_store_cipher(StoreSettings(cipher_provider="nope"))
+    # The refusal's text is fixed and names the setting (engine PR 2818's seventh hold), and since
+    # the eighth hold it is raised after the handler exits: the build's error is on no chain link.
+    assert "check [store].cipher_provider" in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 # --- fail-closed build paths ----------------------------------------------------------------------
