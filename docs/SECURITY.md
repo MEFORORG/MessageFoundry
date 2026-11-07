@@ -4942,14 +4942,14 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   found for BACKLOG #4974, each resolve the caller in their gate, and then each route's handler
   calls
   `AuthService.revoke_other_sessions` with that identity, which it does not resolve again. The
-  API route's gate is `require_reauth_only_action` (`messagefoundry/api/auth_routes.py:1155`),
+  API route's gate is `require_reauth_only_action` (`messagefoundry/api/auth_routes.py`),
   which resolves through `identity_for_token` in `_session_caller` in
   `messagefoundry/api/security.py`, and its handler `revoke_my_other_sessions` makes the
-  call (`messagefoundry/api/auth_routes.py:1158`). The console route's gate is
-  `require_ui_reauth_only_action` (`messagefoundry_webconsole/routes/account.py:692`), which
+  call (`messagefoundry/api/auth_routes.py`). The console route's gate is
+  `require_ui_reauth_only_action` (`messagefoundry_webconsole/routes/account.py`), which
   resolves through `identity_for_token` in `require_ui` in `messagefoundry_webconsole/_auth.py`,
   and its handler `ui_revoke_other_sessions` makes
-  the call (`messagefoundry_webconsole/routes/account.py:697`). That resolution refuses an
+  the call (`messagefoundry_webconsole/routes/account.py`). That resolution refuses an
   account whose record fails its seal. It is run on such an account only as a store call, where
   it ends that session too, by the body in
   `tests/_session_seal_contract.py`, which `test_session_seal_contract` runs on both server legs.
