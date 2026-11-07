@@ -859,7 +859,7 @@ class BackupRunner:
             if isinstance(exc, BackupError):
                 # First, so the 200-character cut the failure record applies keeps the directory.
                 raise BackupError(
-                    exc.kind, _then(leftover, "; ", f"the run failed: {exc}")
+                    exc.kind, join_before_checks(leftover, "; ", f"the run failed: {exc}")
                 ) from exc
             exc.add_note(leftover)
             raise
@@ -879,7 +879,7 @@ class BackupRunner:
             # The staging teardown failed too; that must not ride only in the log. It leads, so the
             # 200-character cut the failure record applies keeps the directory.
             raise BackupError(
-                exc.kind, _then(staging_leftover, "; ", f"the run failed: {exc}")
+                exc.kind, join_before_checks(staging_leftover, "; ", f"the run failed: {exc}")
             ) from exc
 
         # keep-N prune runs only after that rename, so the candidate set contains this archive and
@@ -957,7 +957,7 @@ class BackupRunner:
                 kept = self._keep_failed_archive(staging_path, archive_path)
                 raise BackupError(
                     "verify",
-                    _then(
+                    join_before_checks(
                         f"restore-verify {verify.status}: "
                         f"{verify.reason or 'archive did not verify'}",
                         " ",
@@ -1116,14 +1116,14 @@ class BackupRunner:
                 # A refusal the build raised itself (vault BACKLOG #5220): the leftover leads for the
                 # same reason, and a note would not reach the audit row or the alert.
                 raise BackupError(
-                    exc.kind, _then(leftover, "; ", f"the build failed: {exc}")
+                    exc.kind, join_before_checks(leftover, "; ", f"the build failed: {exc}")
                 ) from exc
             if isinstance(exc, OSError | BackupCodecError):
                 # Named in the error itself, first, so the audit row and the alert carry it; a note
                 # would not survive the loop wrapping this into a BackupError.
                 kind = "write" if isinstance(exc, OSError) else "encrypt"
                 raise BackupError(
-                    kind, _then(leftover, "; ", f"the build failed: {safe_exc(exc)}")
+                    kind, join_before_checks(leftover, "; ", f"the build failed: {safe_exc(exc)}")
                 ) from exc
             exc.add_note(leftover)
             raise
@@ -2442,19 +2442,18 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
     (:func:`_ps_literal`), whose closing quote shows a trailing space and in which nothing expands,
     names any trailing dot or space in words, and names ``Remove-Item -LiteralPath`` and
     ``Test-Path -LiteralPath`` on that literal as the only removal and its check. The check is a
-    two-step control: the same ``Test-Path`` line prints ``True`` before the removal and ``False``
-    after, since a ``False`` before it cannot tell a line that names nothing from a directory that
-    is gone or cannot be read. The text points at that line as the one right after it that names
-    the same path, not as the one that ends the message, since a caller can append a second
-    refusal. The line ends this text, alone on a line of its own. At least the appends in this
-    module, to the run's and the build's errors and to ``_verify_and_publish``'s, go through
-    :func:`_then`, which starts the appended text on a new line. Not every caller does:
-    ``pipeline/dr.py``'s cold-seed restore-verify aborts append after a verify's reason directly.
-    A surface that escapes a line break, as the log does, shows it as a literal backslash-n, so
-    the line is not a line of its own there: appended text follows on the same physical line, and
-    a traceback block prefixes each line. The ``Remove-Item`` command is set off by a colon before
-    it and a `` ;`` after it, and text follows it on its line. No ``cmd.exe`` form is given: interactive ``cmd.exe`` expands ``%VAR%`` even
-    inside double quotes. A screen fault's detail comes before the commands and after the verbatim
+    two-step control: the same ``Test-Path`` command prints ``True`` before the removal and
+    ``False`` after, since a ``False`` before it cannot tell a command that names nothing from a
+    directory that is gone or cannot be read. The command ends this text, after ``_CHECKS_LEAD``,
+    and the text holds no line break: one fails ``str.isprintable``, and :func:`redact` then skips
+    its encoded-HL7 pass for the whole message. A caller that adds to a message holding this text
+    adds before the checks, through :func:`join_before_checks`, so nothing follows a check and a
+    copy of one to the message's end runs only checks, joined by `` ; ``. At least the run's and
+    the build's errors, ``_verify_and_publish``'s, and ``pipeline/dr.py``'s cold-seed
+    restore-verify aborts do. With two refusals in one message both checks end it, so the text
+    points at the check on this same path, not at the last one. The ``Remove-Item`` command is set
+    off by a colon before it and a `` ;`` after it, and text follows it. No ``cmd.exe`` form is
+    given: interactive ``cmd.exe`` expands ``%VAR%`` even inside double quotes. A screen fault's detail comes before the commands and after the verbatim
     path, since it can carry the plain path.
 
     Measured on Windows 11 build 26300, with synthetic files: a removal by the plain path, by
@@ -2500,25 +2499,48 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
         f"{ban}; it is {literal}{ends}{fault}; a path here that shows <redacted>, [redacted] "
         "or any other redaction marker was rewritten by redaction and is not the "
         "directory's path, so run no command here; otherwise, in PowerShell, not cmd.exe, first "
-        "run the Test-Path line that comes right after this text and names this same path; it "
-        "must print True, and a False means that line does not reach this directory, whether it "
-        "is gone, cannot be read or is named wrong, so run nothing more; only after a True, "
-        f"remove it only with this command: Remove-Item -LiteralPath {literal} -Recurse -Force ; then "
-        f"run that Test-Path line again, which must print False and no error:\n{_TEST_PATH} {literal}"
+        "run the Test-Path command on this same path that ends this message, and only that "
+        "command; it must print True, and a False means that command does not reach this "
+        "directory, whether it is gone, cannot be read or is named wrong, so run nothing more; "
+        "only after a True, remove it only with this command: Remove-Item -LiteralPath "
+        f"{literal} -Recurse -Force ; then run that Test-Path command again, which must print "
+        f"False and no error{_CHECKS_LEAD}{_TEST_PATH} {literal}"
     )
 
 
-#: The check :func:`_rewritten_staging_refusal` names, which ends its text on a line of its own.
+#: The check :func:`_rewritten_staging_refusal` names, last in its text and in any message holding it.
 _TEST_PATH = "Test-Path -LiteralPath"
+#: What sets the checks off at the end of a message, ahead of the first.
+_CHECKS_LEAD = "; to check, in PowerShell: "
+#: One check as :func:`_rewritten_staging_refusal` writes it, on a :func:`_ps_literal` literal.
+_CHECK = re.compile(
+    re.escape(_TEST_PATH)
+    + " '(?:[^'\u2018\u2019\u201a\u201b]|''|\u2018\u2018|\u2019\u2019|\u201a\u201a|\u201b\u201b)*'"
+)
+_CHECKS = re.compile(f"{re.escape(_CHECKS_LEAD)}(?:{_CHECK.pattern})(?: ; (?:{_CHECK.pattern}))*")
 
 
-def _then(text: str, sep: str, more: str) -> str:
-    """``text``, ``sep`` and ``more``. Where ``text`` ends in the ``Test-Path`` line of a
-    :func:`_rewritten_staging_refusal`, ``more`` starts a line of its own instead, so that line
-    still holds the command alone and a copy of it to the line's end runs nothing else."""
-    if text.rpartition("\n")[2].startswith(_TEST_PATH + " "):
-        return f"{text}\n{more}"
-    return f"{text}{sep}{more}"
+def _split_checks(text: str) -> tuple[str, list[str]]:
+    """``text`` without the checks that end it, and those checks; ``(text, [])`` when none do.
+    The first lead from which the rest of ``text`` is checks alone is the one, so a lead written
+    inside a path, which a planted name can hold, is not taken for it."""
+    for lead in re.finditer(re.escape(_CHECKS_LEAD), text):
+        if _CHECKS.fullmatch(text, lead.start()):
+            tail = text[lead.end() :]
+            return text[: lead.start()], [m.group(0) for m in _CHECK.finditer(tail)]
+    return text, []
+
+
+def join_before_checks(text: str, sep: str, more: str) -> str:
+    """``text``, ``sep`` and ``more``, with the ``Test-Path`` checks either ends in moved to the end
+    of the whole, after ``_CHECKS_LEAD`` and joined by `` ; ``. So no text ever follows a check, and
+    the message needs no line break: one would fail ``str.isprintable``, and :func:`redact` skips
+    its encoded-HL7 pass on a text that fails it."""
+    head, checks = _split_checks(text)
+    more_head, more_checks = _split_checks(more)
+    joined = f"{head}{sep}{more_head}"
+    every = checks + more_checks
+    return f"{joined}{_CHECKS_LEAD}{' ; '.join(every)}" if every else joined
 
 
 def _ps_literal(text: str) -> str:
