@@ -100,6 +100,7 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.gcm_bound import bounded_cipher
 from messagefoundry.store.schema_verify import SchemaMismatchError
+from messagefoundry.terminal_text import escape_for_terminal
 from messagefoundry.transports.file import (
     _FLAG_BACKUP_SEMANTICS,
     _FLAG_OPEN_REPARSE_POINT,
@@ -2440,16 +2441,19 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
     ``redact_log_line``'s whole-line credential pass, and engine prose must not choose that.
 
     It names the directory by its verbatim path only, as a PowerShell single-quoted literal
-    (:func:`_ps_literal`), whose closing quote shows a trailing space and in which nothing expands,
+    (:func:`_ps_literal`, through :func:`_ps_path`), whose closing quote shows a trailing space
+    and in which nothing expands,
     names any trailing dot or space in words, and names ``Remove-Item -LiteralPath`` and
     ``Test-Path -LiteralPath`` on that literal as the only removal and its check. The check is a
     two-step control: the same ``Test-Path`` command prints ``True`` before the removal and
     ``False`` after, since a ``False`` before it cannot tell a command that names nothing from a
     directory that is gone or cannot be read. The command ends this text, after ``_CHECKS_LEAD``,
     and every character of the text passes ``str.isprintable``, which :func:`redact` requires
-    before its encoded-HL7 pass (:func:`join_before_checks` says why that binds). A name holding a
-    character that does not, a line break among them, gets no command: its path is shown with
-    escapes (:func:`_shown`) and the text says to leave it in place. A caller that adds to a
+    before its encoded-HL7 pass (:func:`join_before_checks` says why that binds). A path holding a
+    character that does not, a line break among them, is named by :func:`_ps_path`'s exact
+    expression, which spells that character as ``[char]0x....``. Text that names no command, the
+    fault's detail and the fallback's names, is escaped (``escape_for_terminal``). A caller that
+    adds to a
     message holding this text adds before the checks, through :func:`join_before_checks`. At least
     the run's and the build's errors, ``_verify_and_publish``'s, and ``pipeline/dr.py``'s
     ``KEY_MISMATCH`` and failed restore-verify aborts do; its errored and timed-out aborts carry no
@@ -2466,7 +2470,8 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
     5.1 and in PowerShell 7 on a name ending in ``%PATH%`` and a space, removed only this
     directory, rewritten names inside it included, and left the other; the printed ``Test-Path``
     command, taken from after ``_CHECKS_LEAD``, read ``True`` before it and ``False`` after, and
-    two checks joined by `` ; `` and run as one line printed one value each. With no other directory there, that check read ``True``
+    two checks joined by `` ; `` and run as one line printed one value each. The same held for
+    names holding U+2028 and U+00A0, spelled by :func:`_ps_path`'s ``[char]`` expression. With no other directory there, that check read ``True``
     where the same check by the plain path read ``False``; with a file in it held open, the removal
     printed its errors and the check still read ``True``. On an existing path it could not read,
     ``Test-Path`` printed ``False`` and an access-denied error, even with ``-ErrorAction Stop``,
@@ -2490,24 +2495,16 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
         if trailing
         else ""
     )
-    fault = _shown(fault)
+    fault = escape_for_terminal(fault, single_line=True)
     try:
-        literal = _ps_literal(_win_verbatim(staging))
+        literal = _ps_path(_win_verbatim(staging))
     except Exception as exc:  # never raise over the verdict or the error in flight
         # No command: one assembled by hand from a name and a parent is the mistake this prevents.
         return (
-            f"{ban}; it is named {_shown(_ps_literal(staging.name))}{ends}, in "
-            f"{_shown(_ps_literal(str(staging.parent)))}, and since its verbatim path could not be "
-            f"formed, no removal can be named for it here; leave it in place{fault} (forming the "
-            f"path failed: {_shown(safe_exc(exc))})"
-        )
-    if not literal.isprintable():
-        # No command: a copy of an escaped path names another one, and the raw one would put a
-        # character in the message that turns off redact's encoded-HL7 pass.
-        return (
-            f"{ban}; it is {_shown(literal)}{ends}{fault}, where each \\u or \\U escape stands for "
-            "a character that cannot be shown here, so no removal can be named for it here; leave "
-            "it in place"
+            f"{ban}; it is named {_ps_path(staging.name)}{ends}, in "
+            f"{_ps_path(str(staging.parent))}, and since its verbatim path could not be formed, "
+            f"no removal can be named for it here; leave it in place{fault} (forming the path "
+            f"failed: {escape_for_terminal(safe_exc(exc), single_line=True)})"
         )
     return (
         f"{ban}; it is {literal}{ends}{fault}; a path here that shows <redacted>, [redacted] "
@@ -2526,28 +2523,22 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
 _TEST_PATH = "Test-Path -LiteralPath"
 #: What sets the checks off at the end of a message, ahead of the first.
 _CHECKS_LEAD = "; to check, in PowerShell: "
-#: One check as :func:`_rewritten_staging_refusal` writes it, on a :func:`_ps_literal` literal.
 #: Each character PowerShell reads as a single quote, which :func:`_ps_literal` doubles.
 _PS_QUOTES = "'\u2018\u2019\u201a\u201b"
-_CHECK = re.compile(
-    re.escape(_TEST_PATH)
-    + f" '(?:[^{_PS_QUOTES}]|"
-    + "|".join(re.escape(q * 2) for q in _PS_QUOTES)
-    + ")*'"
-)
-_CHECKS = re.compile(f"{re.escape(_CHECKS_LEAD)}(?:{_CHECK.pattern})(?: ; (?:{_CHECK.pattern}))*")
+_PS_LITERAL = f"'(?:[^{_PS_QUOTES}]|" + "|".join(re.escape(q * 2) for q in _PS_QUOTES) + ")*'"
+_PS_PART = rf"(?:{_PS_LITERAL}|\[char\]0x[0-9A-F]{{4}})"
+#: One check as :func:`_rewritten_staging_refusal` writes it, on a :func:`_ps_path` path.
+_CHECK = rf"{re.escape(_TEST_PATH)} (?:{_PS_LITERAL}|\({_PS_PART}(?: \+ {_PS_PART})*\))"
+#: The checks that end a message, from the first lead after which nothing else follows. The search
+#: takes the leftmost such lead, so one inside a path is not taken for it. A Windows name cannot
+#: hold the lead, whose colon NTFS refuses, but the split does not rest on that.
+_CHECKS_AT_END = re.compile(rf"{re.escape(_CHECKS_LEAD)}({_CHECK}(?: ; {_CHECK})*)\Z")
 
 
-def _split_checks(text: str) -> tuple[str, list[str]]:
-    """``text`` without the checks that end it, and those checks; ``(text, [])`` when none do.
-    The first lead from which the rest of ``text`` is checks alone is the one, so a lead inside a
-    path is not taken for it. A Windows name cannot hold the lead, whose colon NTFS refuses, but
-    the split does not rest on that."""
-    for lead in re.finditer(re.escape(_CHECKS_LEAD), text):
-        if _CHECKS.fullmatch(text, lead.start()):
-            tail = text[lead.end() :]
-            return text[: lead.start()], [m.group(0) for m in _CHECK.finditer(tail)]
-    return text, []
+def _split_checks(text: str) -> tuple[str, str]:
+    """``text`` without the checks that end it, and those checks; ``(text, "")`` when none do."""
+    found = _CHECKS_AT_END.search(text)
+    return (text, "") if found is None else (text[: found.start()], found.group(1))
 
 
 def join_before_checks(text: str, sep: str, more: str) -> str:
@@ -2558,8 +2549,8 @@ def join_before_checks(text: str, sep: str, more: str) -> str:
     head, checks = _split_checks(text)
     more_head, more_checks = _split_checks(more)
     joined = f"{head}{sep}{more_head}"
-    every = checks + more_checks
-    return f"{joined}{_CHECKS_LEAD}{' ; '.join(every)}" if every else joined
+    every = " ; ".join(c for c in (checks, more_checks) if c)
+    return f"{joined}{_CHECKS_LEAD}{every}" if every else joined
 
 
 def _ps_literal(text: str) -> str:
@@ -2571,13 +2562,30 @@ def _ps_literal(text: str) -> str:
     return f"'{text}'"
 
 
-def _shown(text: str) -> str:
-    """``text`` with each character that fails ``str.isprintable`` written as a ``\\u`` or
-    ``\\U`` escape, for a message that must stay printable and names no command on it."""
-    return "".join(
-        c if c.isprintable() else (f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}")
-        for c in text
-    )
+def _ps_path(text: str) -> str:
+    """``text`` as an exact PowerShell expression whose own characters all pass
+    ``str.isprintable``: :func:`_ps_literal` where ``text`` does, and otherwise a parenthesised
+    concatenation of literals with each other UTF-16 code unit spelled ``[char]0x....``, since a
+    message that holds the raw character turns off :func:`redact`'s encoded-HL7 pass."""
+    if text.isprintable():
+        return _ps_literal(text)
+    parts = ["''"]
+    run = ""
+    for char in text:
+        if char.isprintable():
+            run += char
+            continue
+        if run:
+            parts.append(_ps_literal(run))
+            run = ""
+        units = char.encode("utf-16-le")
+        parts.extend(
+            f"[char]0x{int.from_bytes(units[i : i + 2], 'little'):04X}"
+            for i in range(0, len(units), 2)
+        )
+    if run:
+        parts.append(_ps_literal(run))
+    return "(" + " + ".join(parts) + ")"
 
 
 def _discard_verify_staging(staging: Path) -> str | None:

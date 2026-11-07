@@ -1011,19 +1011,31 @@ def test_the_refusal_ends_in_its_check_and_holds_no_line_break(
     _head(refusal, literal)
 
 
-@pytest.mark.parametrize("odd", [" ", "\x85", "\n", "​"])
-def test_a_name_that_is_not_printable_gets_no_command_and_stays_printable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, odd: str
+@pytest.mark.parametrize(
+    ("odd", "spelled"),
+    [
+        ("\u2028", "[char]0x2028"),
+        ("\x85", "[char]0x0085"),
+        ("\n", "[char]0x000A"),
+        ("\u200b", "[char]0x200B"),
+        ("\u00a0", "[char]0x00A0"),
+    ],
+)
+def test_a_name_that_is_not_printable_is_named_exactly_and_stays_printable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, odd: str, spelled: str
 ) -> None:
     """A name can hold a character that fails `str.isprintable`, a line break among them, which
     would turn off `redact`'s encoded-HL7 pass for the whole message. Red before the fix: the
-    refusal carried the raw character, three times."""
-    refusal = _refusal_for(f"mefor-backup-x{odd}y.", tmp_path, monkeypatch)
+    refusal carried the raw character, three times. It now spells it as PowerShell evaluates it."""
+    name = f"mefor-backup-x{odd}y."
+    refusal = _refusal_for(name, tmp_path, monkeypatch)
     assert refusal.isprintable()
-    assert "Test-Path" not in refusal
-    assert "Remove-Item" not in refusal
-    assert f"\\u{ord(odd):04x}" in refusal
-    assert refusal.endswith("so no removal can be named for it here; leave it in place")
+    verbatim = dr_backup._win_verbatim(tmp_path / name)
+    head, _, tail = verbatim.rpartition(odd)
+    path = f"('' + {dr_backup._ps_literal(head)} + {spelled} + {dr_backup._ps_literal(tail)})"
+    assert dr_backup._ps_path(verbatim) == path
+    _head(refusal, path)
+    assert f"Remove-Item -LiteralPath {path} -Recurse -Force ;" in refusal
 
 
 def test_a_caller_adds_its_text_before_the_check(
