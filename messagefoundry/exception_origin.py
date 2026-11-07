@@ -30,9 +30,10 @@ the loader also reads the real class (``wiring._is_engine_text``). No frame rule
 ``args``, so a module that rewrites them, with text or with an object whose own ``__str__`` holds
 the value, still passes.
 
-:func:`argument_text` is not a frame rule. It reads ``args`` through ``BaseException``'s own
-descriptor, so a caller can take an error's text without running the error's code, and the store's
-cipher build (``store.base``) and the AD probe's refusal text call it."""
+:func:`engine_worded_text` is that rule applied to text: it reads ``args`` through
+``BaseException``'s own descriptor, and only for an instance of exactly a class whose constructor
+and ``__str__`` are the builtin ones, so a caller can take an engine refusal's text without running
+any of the error's code."""
 
 from __future__ import annotations
 
@@ -44,7 +45,7 @@ from typing import Any, Final
 
 __all__ = [
     "ExceptionChainTooLong",
-    "argument_text",
+    "engine_worded_text",
     "exception_chain",
     "raise_statement_file",
     "raised_by_the_engine",
@@ -141,12 +142,19 @@ def raised_through(exc: BaseException, code: CodeType) -> bool:
 _ARGS_OF: Final[Any] = BaseException.__dict__["args"]
 
 
-def argument_text(exc: BaseException) -> str | None:
-    """``exc``'s one argument when it is exactly a ``str``, else ``None``, read with none of
-    ``exc``'s own code run (the fifth hold on engine PR 2818). ``str(exc)`` runs a subclass's
-    ``__str__``, which can raise inside a caller's handler or print what its arguments do not
-    hold, and ``str()`` of any other argument runs that argument's. A caller that gets ``None``
-    says something fixed instead."""
+def engine_worded_text(exc: BaseException, kind: type[BaseException]) -> str | None:
+    """``exc``'s one ``str`` argument when ``exc`` is exactly ``kind`` and :func:`worded_by_the_engine`,
+    else ``None``, read with none of ``exc``'s own code run (the sixth hold on engine PR 2818).
+
+    ``kind`` must be a class that defines no constructor or ``__str__`` of its own, such as
+    ``ValueError``: then the arguments are what an engine ``raise`` statement passed, and they are
+    what ``str(exc)`` prints. A subclass's own ``__init__`` writes its arguments and its own
+    ``__str__`` prints what it likes, so either could quote a byte the arguments do not show, and
+    one is never read. Like :func:`worded_by_the_engine`, this proves who wrote the text, not what
+    it holds: an engine ``raise`` can interpolate another error's text. A caller that gets
+    ``None`` says something fixed instead."""
+    if type(exc) is not kind or not worded_by_the_engine(exc):
+        return None
     args = _ARGS_OF.__get__(exc)
     if len(args) == 1 and type(args[0]) is str:
         return str(args[0])

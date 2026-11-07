@@ -39,8 +39,8 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.config.tls_policy import HopPosture
-from messagefoundry.exception_origin import argument_text, exception_chain
-from messagefoundry.redaction import codec_safe_line, prints_a_codec_error
+from messagefoundry.exception_origin import engine_worded_text, exception_chain
+from messagefoundry.redaction import _HOLDER_TEXT, prints_a_codec_error, safe_exc
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT,
@@ -3473,9 +3473,11 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     of any class with a codec error on it is raised as :func:`_codec_safe_refusal` gives it, with
     no byte and no chain, and so is one whose chain cannot be read whole or whose judgement raised
     an ``Exception``. Every other
-    ``ValueError`` keeps its chain, and its text as its one ``str`` argument holds it, never as its
-    own ``__str__`` renders it, or a fixed text where its arguments are not exactly one ``str``.
-    Every other error, such as a
+    ``ValueError`` keeps its chain. Its text is kept only when it is exactly a ``ValueError`` an
+    engine ``raise`` statement raised, read from its one ``str`` argument
+    (:func:`~messagefoundry.exception_origin.engine_worded_text`); any other gets a fixed text,
+    since a subclass's ``__str__`` or constructor can put a byte in what it prints (the sixth hold
+    on engine PR 2818). Every other error, such as a
     ``KeyProviderError`` or ``DpapiError``, passes through untouched."""
     try:
         return _build_store_cipher(settings, posture)
@@ -3483,12 +3485,13 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
         refusal = _codec_safe_refusal(exc)
         if refusal is None:
             # One already typed, as the key seam refuses a codec error, is not wrapped again. The
-            # class test reads the class with ``type``, as ``_refused`` does, and the text is read
-            # from the arguments, never with ``str(exc)``, so neither runs any of exc's own code
-            # (the fifth hold on engine PR 2818): a ``__str__`` can raise here, or print a byte.
+            # class test reads the class with ``type``, as ``_refused`` does, and the text is an
+            # engine ``raise``'s own or fixed, so neither runs any of exc's own code (the fifth and
+            # sixth holds on engine PR 2818): a ``__str__`` can raise here or print a byte, and a
+            # subclass's own ``__init__`` wrote its arguments, so they can hold one too.
             kind = type(exc)
             if issubclass(kind, ValueError) and not issubclass(kind, StoreCipherConfigError):
-                text = argument_text(exc)
+                text = engine_worded_text(exc, ValueError)
                 raise StoreCipherConfigError(_UNTEXTED if text is None else text) from exc
             raise
     raise refusal
@@ -3501,11 +3504,11 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
     ``__cause__`` and ``__context__`` both, a suppressed context included, since a text can be
     built from it, and each member of an exception group.
 
-    - One that is or holds a codec error reads as its
-      :func:`~messagefoundry.redaction.codec_safe_line`: its class, and no byte.
+    - One that is or holds a codec error reads as :func:`_codec_line` renders it: its class, and
+      no byte.
     - One that only has one on its chain is named by its class with a fixed text and the codec
-      error's ``codec_safe_line``, never its own text, which may have been built from the codec
-      error's and quote the byte.
+      error as :func:`_codec_line` renders it, never its own text, which may have been built from
+      the codec error's and quote the byte.
     - A chain that cannot be read whole, too long or raising as it is read, is refused the same
       way, so it is never judged clean.
 
@@ -3515,7 +3518,8 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
 
     An ``Exception`` the judgement's own code raises, as from reading ``exc``'s class name or
     rendering the codec error, is refused the same way, as one that could not be judged, with a
-    fixed text that names no class, so the fallback runs none of ``exc``'s code. A
+    fixed text that names no class, so the fallback runs none of ``exc``'s code, and the error it
+    caught is logged by its class name (:func:`_log_unjudged`). A
     ``BaseException`` that is not an ``Exception``, such as a ``KeyboardInterrupt`` from a link's
     own code or from an attribute read of the codec error, and anything the fallback itself
     raises, such as a ``MemoryError``, propagate in place of any refusal, with no cause and no
@@ -3542,8 +3546,9 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
     try:
         try:
             return _refusal_for(exc)
-        except Exception:  # noqa: BLE001 -- fail closed: the judgement ran exc's own code
-            return _refused(exc, _UNJUDGED)
+        except Exception as judging:  # noqa: BLE001 -- fail closed: the judgement ran exc's own code
+            _log_unjudged("an error could not be judged for a codec error", judging)
+            return _refused(type(exc), _UNJUDGED)
     except BaseException as escaping:
         _CONTEXT.__set__(escaping, None)
         _CAUSE.__set__(escaping, None)
@@ -3554,8 +3559,24 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
 #: The fallback refusal's text. It names no class: reading the name may be what raised.
 _UNJUDGED = "an error that could not be judged, its class and text not shown"
 
-#: The pass-through's text for a ``ValueError`` whose arguments are not exactly one ``str``.
+#: The pass-through's text for a ``ValueError`` from the build that is not exactly one an engine
+#: ``raise`` statement worded. Fixed: the error's own ``__str__`` and arguments are not read (the
+#: sixth hold on engine PR 2818).
 _UNTEXTED = "the store cipher could not be built from the settings, the error's text not shown"
+
+#: ``type``'s own ``__name__`` descriptor, so naming a class runs no metaclass code.
+_NAME_OF_A_TYPE: Any = vars(type)["__name__"]
+
+
+def _log_unjudged(what: str, swallowed: Exception) -> None:
+    """Log ``swallowed``, an error the codec judgement caught to fail closed (CLAUDE.md section 6),
+    by its class name alone: never its text, nor the judged error's, either of which may quote the
+    byte. A name that is not an ASCII identifier is not printed, as one a class built from data
+    could carry it."""
+    name = _NAME_OF_A_TYPE.__get__(type(swallowed))
+    shown = name if type(name) is str and name.isascii() and name.isidentifier() else "unnamed"
+    log.warning("%s (%s); refused with a fixed text", what, shown)
+
 
 #: ``BaseException``'s own link descriptors, which ``BaseException.__cause__`` and its siblings
 #: resolve to, so clearing a link runs no subclass code (the third hold on engine PR 2818). Read
@@ -3567,28 +3588,43 @@ _SUPPRESS_CONTEXT: Any = vars(BaseException)["__suppress_context__"]
 
 
 def _refusal_for(exc: Exception) -> Exception | None:
-    """:func:`_codec_safe_refusal`'s judgement, which may run ``exc``'s own code."""
-    name = type(exc).__name__
+    """:func:`_codec_safe_refusal`'s judgement, which may run ``exc``'s own code. ``exc``'s class
+    is read once, with ``type``, and only that read is judged (the sixth hold on engine PR 2818):
+    ``codec_safe_line`` would read ``__class__`` again, and a property there can answer differently
+    the second time."""
+    kind = type(exc)
+    name = kind.__name__
     codec, read_whole = _codec_error_on(exc)
     if not read_whole:
         text = f"a {name} whose chain cannot be read whole, its own text not shown"
     elif codec is None:
         return None
     elif codec is exc:
-        text = codec_safe_line(exc)
+        text = _codec_line(exc, kind)
     else:
         text = (
             f"a {name} whose chain holds a codec error, its own text not shown "
-            f"({codec_safe_line(codec)})"
+            f"({_codec_line(codec, type(codec))})"
         )
-    return _refused(exc, text)
+    return _refused(kind, text)
 
 
-def _refused(exc: Exception, text: str) -> Exception:
-    """``text`` as :class:`StoreCipherConfigError` for a ``ValueError``, else as
-    ``KeyProviderError``. The class is read with ``type``, which runs none of ``exc``'s code."""
-    is_value_error = issubclass(type(exc), ValueError)
-    return StoreCipherConfigError(text) if is_value_error else KeyProviderError(text)
+def _codec_line(error: BaseException, kind: type[BaseException]) -> str:
+    """``error``, which :func:`_codec_error_on` found to be or hold a codec error, as
+    ``codec_safe_line`` renders it, but judged on ``kind``, its class as read once with ``type``. A
+    codec error renders through :func:`~messagefoundry.redaction.safe_exc`, with no byte; any other
+    class as its name and a fixed note, its own text never read, since whether it holds a codec
+    error is not asked again here, where it could answer differently."""
+    if issubclass(kind, UnicodeError):
+        return safe_exc(error)
+    return f"{kind.__name__}: {_HOLDER_TEXT}"
+
+
+def _refused(kind: type[Exception], text: str) -> Exception:
+    """``text`` as :class:`StoreCipherConfigError` for a ``ValueError`` ``kind``, else as
+    ``KeyProviderError``. ``kind`` is the judged error's class as read with ``type``, which runs none
+    of its code."""
+    return StoreCipherConfigError(text) if issubclass(kind, ValueError) else KeyProviderError(text)
 
 
 def _codec_error_on(exc: BaseException) -> tuple[BaseException | None, bool]:
@@ -3606,7 +3642,8 @@ def _codec_error_on(exc: BaseException) -> tuple[BaseException | None, bool]:
             ),
             None,
         )
-    except Exception:  # noqa: BLE001 -- fail closed: ExceptionChainTooLong, or a link's own code
+    except Exception as walking:  # noqa: BLE001 -- fail closed: too long, or a link's own code
+        _log_unjudged("an error's chain could not be read whole for a codec error", walking)
         return None, False
     return codec, True
 
@@ -3631,14 +3668,14 @@ def _codec_chain_reading(exc: BaseException) -> str | None:
 
 
 class StoreCipherConfigError(ValueError):
-    """The store cipher could not be built from the settings; see :func:`build_store_cipher`. Its
-    text is the build error's, which names settings and variables, never a key, except for three
-    kinds of ``ValueError``, which are refused with :func:`_codec_safe_refusal`'s fixed text
+    """The store cipher could not be built from the settings; see :func:`build_store_cipher`. A
+    ``ValueError`` from the build is raised as one with the error as its cause, and its text only
+    when it is exactly a ``ValueError`` an engine ``raise`` statement worded, else a fixed text, its
+    own ``__str__`` and arguments not read (the sixth hold on engine PR 2818); except for
+    three kinds, which are refused with :func:`_codec_safe_refusal`'s fixed text and no chain
     instead (BACKLOG #3471, #4882): one with a codec error on it, one whose chain cannot be read
     whole, whether or not it holds a codec error, and one whose judgement raised an
-    ``Exception``. The build error's text is its one ``str`` argument, read with none of its code
-    run; one whose arguments are not exactly one ``str``, as a pydantic ``ValidationError``'s are
-    not, gets a fixed text in its place (the fifth hold on engine PR 2818)."""
+    ``Exception``."""
 
 
 def _build_store_cipher(settings: StoreSettings, posture: HopPosture | None) -> Cipher:

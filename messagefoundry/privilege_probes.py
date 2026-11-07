@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Any
 from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
 from messagefoundry.exception_origin import (
     ExceptionChainTooLong,
-    argument_text,
+    engine_worded_text,
     exception_chain,
     raised_by_the_engine,
     raised_through,
@@ -207,28 +207,42 @@ def _why(exc: BaseException) -> str:
 
 
 def _ad_why(exc: BaseException) -> str:
-    """:func:`_why` for the AD bind probe, which keeps the LDAPS revocation guard's refusal whole.
+    """:func:`_why` for the AD bind probe, which names the LDAPS revocation guard's refusal.
 
-    That guard (BACKLOG #2193) is an ``InsecureHopRefused`` whose text names the hop, the domain
-    controller's host and the setting that clears it, and reads no password. ``provision-admin``
-    and ``serve`` print the same refusal whole. Only one the guard raised keeps its text: its
-    traceback passes through ``auth.ldap._refuse_ad_revocation``. Any other ``InsecureHopRefused``
-    on this probe, at least one from resolving a Vault-held bind password, takes :func:`_why`'s
-    rule, as on the Vault probe (BACKLOG #3471, #4883).
+    That guard (BACKLOG #2193) refuses with an ``InsecureHopRefused`` whose text names the hop,
+    the domain controller's host and the setting that clears it, and reads no password.
+    ``provision-admin`` and ``serve`` print the same refusal whole. Here its text is kept only when
+    it is exactly an ``InsecureHopRefused`` an engine ``raise`` statement worded, read from its one
+    ``str`` argument (:func:`~messagefoundry.exception_origin.engine_worded_text`); any other reads
+    as :data:`_AD_GUARD_REFUSAL`, a fixed text naming the guard and the setting. None of the
+    error's code runs (the fifth and sixth holds on engine PR 2818): the class is tested with
+    ``type``, never ``isinstance``, which reads ``__class__``; ``str(exc)``, whose ``__str__`` can
+    raise or print a byte, is never called; and a subclass's arguments, which its own ``__init__``
+    wrote, are never read.
 
-    The guard's refusal is judged and read with none of its own code run (the fifth hold on engine
-    PR 2818): the class with ``type``, never ``isinstance``, which reads ``__class__``, and the text
-    from its one ``str`` argument, never ``str(exc)``, whose ``__str__`` can raise or print what
-    the arguments do not hold. Arguments that are not exactly one ``str`` read as the type."""
+    The test is an ``InsecureHopRefused`` whose traceback passes through
+    ``auth.ldap._refuse_ad_revocation`` (:func:`raised_through`). So it accepts one raised by
+    anything that function calls, the guard and the TLS context factory included, not only the
+    guard's own. Any other ``InsecureHopRefused`` on this probe, at least one from resolving a
+    Vault-held bind password, takes :func:`_why`'s rule, as on the Vault probe (BACKLOG #3471,
+    #4883)."""
     from messagefoundry.auth.ldap import _refuse_ad_revocation
     from messagefoundry.config.tls_policy import InsecureHopRefused
 
     if issubclass(type(exc), InsecureHopRefused) and raised_through(
         exc, _refuse_ad_revocation.__code__
     ):
-        text = argument_text(exc)
-        return "InsecureHopRefused" if text is None else strip_control_chars(text)
+        text = engine_worded_text(exc, InsecureHopRefused)
+        return _AD_GUARD_REFUSAL if text is None else strip_control_chars(text)
     return _why(exc)
+
+
+#: What the AD probe says of a hop refusal raised through the LDAPS revocation guard whose text it
+#: does not keep (:func:`_ad_why`).
+_AD_GUARD_REFUSAL = (
+    "InsecureHopRefused: the LDAPS bind to AD was refused at its revocation guard; set "
+    "[auth].ad_tls_crl_file, or see the refusal serve prints"
+)
 
 
 def _strings(value: object) -> tuple[str, ...]:
