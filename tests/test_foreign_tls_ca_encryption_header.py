@@ -349,7 +349,7 @@ def test_a_pgsslrootcert_on_another_host_is_refused_unread(
     monkeypatch.setenv("PGSSLROOTCERT", "//db.synthetic.test/share/root.crt")
     with pytest.raises(ValueError, match=_NOT_CLEARED) as refused:
         _build_psql()
-    assert "point PGSSLROOTCERT at a copy on a local drive" in str(refused.value)
+    assert "point PGSSLROOTCERT at a readable copy in another folder" in str(refused.value)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the path walk runs on Windows only")
@@ -403,30 +403,43 @@ _NOT_CLEARED = (
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the path walk runs on Windows only")
 @pytest.mark.parametrize(
-    "shape", ["through a file", "a reparse point not followed", "a drive target unread"]
+    "shape",
+    [
+        "through a file",
+        "a reparse point not followed",
+        "the default file through a reparse point not followed",
+        "a drive target unread",
+        "a drive type unknown",
+    ],
 )
 def test_a_root_certificate_the_walk_stops_in_without_a_read_failure_is_not_cleared(
     _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch, shape: str
 ) -> None:
     """The controls for the test above: a walk that stops for any cause but a name the system
     could not read gets the refusal that names both causes, not a plain local path or a path it
-    cannot read. Each shape here is a local path: a path through a file, ``_win_probe``'s own
-    refusal of a reparse point it does not follow, which carries no errno, and a drive whose
-    ``QueryDosDeviceW`` target could not be read. So the remedy must not be to set a local path.
-    Red when the refusal said only "not a plain local path ... set PGSSLROOTCERT to a local
-    path"."""
+    cannot read. None of these shapes shows the path leads off the host, and at least the first
+    three are local: a path through a file, and ``_win_probe``'s own refusal of a reparse point
+    it does not follow, which carries no errno, for ``PGSSLROOTCERT`` and for libpq's default
+    file. The last two are a drive whose ``QueryDosDeviceW`` target, or whose type, could not be
+    read. So the remedy is to check the path, or to point ``PGSSLROOTCERT`` at a readable copy,
+    and never only to set a local path. Red when the refusal said only "not a plain local path
+    ... set PGSSLROOTCERT to a local path"."""
     if shape == "through a file":
         monkeypatch.setenv("PGSSLROOTCERT", os.path.join(_write(_no_libpq_root, "x", "a"), "r"))
-    elif shape == "a drive target unread":
+    elif shape.startswith("a drive"):
         monkeypatch.setenv("PGSSLROOTCERT", _write(_no_libpq_root, _certificate(), "root.crt"))
+        if shape == "a drive target unread":
 
-        def unread_target(drive: str) -> str | None:
-            raise OSError(f"the drive {drive} could not be read (winerror 31)")
+            def unread_target(drive: str) -> str | None:
+                raise OSError(f"the drive {drive} could not be read (winerror 31)")
 
-        monkeypatch.setattr(database, "_windows_drive_target", unread_target)
+            monkeypatch.setattr(database, "_windows_drive_target", unread_target)
+        else:
+            monkeypatch.setattr(database, "_windows_drive_type", lambda root: 0)  # DRIVE_UNKNOWN
     else:
         root = _write(_no_libpq_root, _certificate(), "root.crt")
-        monkeypatch.setenv("PGSSLROOTCERT", root)
+        if not shape.startswith("the default file"):
+            monkeypatch.setenv("PGSSLROOTCERT", root)
         real_probe = anchor_path._win_probe
 
         def not_followed(path: str) -> tuple[str, str | None]:
@@ -438,7 +451,8 @@ def test_a_root_certificate_the_walk_stops_in_without_a_read_failure_is_not_clea
     with pytest.raises(ValueError, match=_NOT_CLEARED) as refused:
         _build_psql()
     text = str(refused.value)
-    assert "check the path and the folders above it" in text
+    assert "point PGSSLROOTCERT at a readable copy in another folder on this host" in text
+    assert "could not be read to check" not in text  # not the unread refusal
     assert "set PGSSLROOTCERT to a local path" not in text
 
 

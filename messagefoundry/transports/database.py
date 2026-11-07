@@ -1422,7 +1422,7 @@ def _refuse_encrypted_libpq_root_cert(
     before the file is judged. It refuses at least a folder the system could not read or resolve,
     saying the file could not be read, and a chain of links it will not follow further or a path
     through a file, saying it must be a plain local path, not a share, a network drive, a link to
-    one, or a path it cannot read (``docs/CONNECTIONS.md``, Generic ODBC). A ``stat``
+    one, or a path the check cannot read (``docs/CONNECTIONS.md``, Generic ODBC). A ``stat``
     failure that says no file is there, or that libpq could not ``stat`` it either, is left to
     libpq (:func:`_libpq_cannot_stat_either`): at least a missing name other than a share Windows
     could not reach, and off Windows a permission denial. Every other ``stat`` failure is judged
@@ -1464,19 +1464,21 @@ def _refuse_encrypted_libpq_root_cert(
         cause = unread.get(path.strip())
         if cause is not None and True not in verdicts.values():
             # The walk stopped at a name the system could not read, before anything showed the
-            # path leads off the host, so the refusal below would misname the fault.
+            # path leads off the host, so this refusal names the walk's cause, which the general
+            # one below does not.
             raise ValueError(
                 f"{setting}: the {what} could not be read to check {_CA_CHECKED_FOR}: {cause}; "
                 "check the path and the folders above it, or set PGSSLROOTCERT to a readable "
                 "local path"
             )
         # Worded as _refuse_remote_path words it: the walk may have stopped on a local path it
-        # could not finish, so the remedy cannot be only to name a local path.
+        # could not finish, so the remedy cannot be only to name a local path. The remedy comes
+        # before the scope clause, since a bounded rendering keeps the front.
         raise ValueError(
             f"{setting}: the {what} must be a plain local path on this host: not a share, a "
-            "network drive, a link to one, or a path it cannot read, so it was not read to check "
-            f"{_CA_CHECKED_FOR}; check the path and the folders above it, and for a share or "
-            "network drive point PGSSLROOTCERT at a copy on a local drive"
+            "network drive, a link to one, or a path it cannot read; check the path and the "
+            "folders above it, or point PGSSLROOTCERT at a readable copy in another folder on "
+            f"this host. It was not read to check {_CA_CHECKED_FOR}"
         )
     data = _read_driver_file(path, setting, what, _CA_CHECKED_FOR, leave_unstatable=True)
     if data is not None:
