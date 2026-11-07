@@ -1533,12 +1533,6 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
     assert "cannot tell whose key" not in held, held
     texts.append(held)
     assert all(text.count("WARNING:") == 1 for text in texts[-2:]), texts[-2:]
-    offending = [
-        text
-        for text in texts
-        if _advises_changing(text, allowed=(_KEY_SETTINGS_OUT,) if text is foreign else ())
-    ]
-    assert not offending, offending
     # Every text names its own way on, in the order rendered above. The existing-store text
     # names provision-admin through the missing-key text it quotes, so its marker is the fallback.
     fallback = "To go on without it"
@@ -1551,6 +1545,15 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         ("Keep that file and run the command again",),
         (fallback, "This run minted it and nothing was written under it"),
     ]
+    # One marker tuple per text this test means to scan, so an empty or short scan fails here
+    # rather than passing the absence check below on nothing.
+    assert len(texts) >= len(markers), texts
+    offending = [
+        text
+        for text in texts
+        if _advises_changing(text, allowed=(_KEY_SETTINGS_OUT,) if text is foreign else ())
+    ]
+    assert not offending, offending
     assert len(markers) == len(texts)
     for text, needed in zip(texts, markers, strict=True):
         flat = " ".join(text.split())
