@@ -3624,9 +3624,10 @@ class AuthSettings(_Section):
     # How many CONSECUTIVE passes must fail to find a principal before its sessions are revoked. A
     # single ambiguous result never revokes: "the search returned nothing" cannot tell deleted from
     # moved out of the search base, and a set disabled bit or an unreadable userAccountControl strikes
-    # the same way, so requiring two agreeing probes costs at most one extra interval of exposure and
-    # buys immunity to a single flaky search. Strike state is process-local (the rate-limiter
-    # precedent), so a restart resets it — biased toward NOT revoking.
+    # the same way, so requiring two agreeing probes costs at most one extra interval of exposure
+    # within one process's life, and buys immunity to a single flaky search. Strike state is
+    # process-local (the rate-limiter precedent); what a restart loses is stated once, in
+    # docs/SECURITY.md, "What a restart loses" (vault BACKLOG #3689).
     ad_session_recheck_strikes: int = 2
     # Per-pass bind budget. A pass probes at most this many distinct users; the remainder are picked up
     # by the following passes (least-recently-probed first), so a very large estate degrades to a longer
@@ -5555,8 +5556,10 @@ _ALERT_EVENT_TYPES = frozenset(
         # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
         "audit_write_failed",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
-        # a pass left accounts unrevoked (the breaker tripped, or probes were referred, BACKLOG
-        # #2538), and one principal's sessions were revoked.
+        # a pass left accounts unrevoked, and one principal's sessions were revoked. The first is
+        # raised for at least a breaker trip, a referral (BACKLOG #2538), a configuration refusal
+        # (#3010), a probe fault (#3100), a paging refusal (vault #3696), a lasting outage (#3709)
+        # and an account the directory keeps failing for (#3100), each under its own source.
         "ad_reconcile_aborted",
         "ad_session_revoked",
         # ADR 0195: the reconciler held accounts whose userAccountControl it could not read.
@@ -9619,7 +9622,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"{_auth_default('ad_reconcile_outage_passes')}: it comes after {floor} at the "
                     "configured interval. Until it does, a directory account disabled or deleted "
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
-                    "per pass to show for it",
+                    "per pass to show for it. The same count bounds one account the directory "
+                    "keeps failing for while it answers others, so that page waits longer too",
                 )
             )
         strikes = auth.ad_session_recheck_strikes

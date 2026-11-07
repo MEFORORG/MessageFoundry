@@ -1030,17 +1030,19 @@ def test_authenticate_by_id_never_binds_the_password_as_an_entry_that_is_not_the
     _install_directory(monkeypatch, _directory_entry(guid), binds)
     bind = _authenticator().authenticate("jsmith", "synthetic-user-pw", object_id=GUID_A_TEXT)
     principal = bind.principal
-    # The service connection auto-binds and never calls bind(), so these are the password binds.
+    # The service account's bind comes first; the rest are the password binds.
+    service, *password_binds = binds
+    assert service == "CN=svc,DC=x"
     if found:
         assert principal is not None and principal.directory_object_id == GUID_A_TEXT
-        assert binds == ["CN=jsmith,DC=x"]
+        assert password_binds == ["CN=jsmith,DC=x"]
     else:
         assert principal is None
         # BACKLOG #2434: the answer says no entry is this account, so no password was judged.
         assert bind.answer is DirectoryAnswer.NOT_FOUND
         # Exactly the equalizing bind: the refusal costs the same round trips, and the typed
         # password goes to no real entry.
-        assert binds == ["CN=mf-nonexistent-timing-equalizer,DC=x"]
+        assert password_binds == ["CN=mf-nonexistent-timing-equalizer,DC=x"]
 
 
 def test_probe_by_id_answers_no_match_for_another_objects_entry(

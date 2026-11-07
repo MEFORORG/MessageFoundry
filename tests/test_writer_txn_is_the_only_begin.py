@@ -65,8 +65,10 @@ STORE = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry" / "store"
 #: and reds, even though the function is exempt from the ban itself.
 _ALLOWED: dict[str, tuple[int, str]] = {
     "_writer_txn": (
-        1,
-        "the writer-transaction helper itself -- unwinds on BaseException, under the lock, bounded",
+        2,
+        "the writer-transaction helper itself -- unwinds on BaseException, under the lock, bounded;"
+        " a deferred BEGIN, or BEGIN IMMEDIATE for the one caller that must decide on a read across"
+        " processes (BACKLOG #3078 F5), in the same guarded region",
     ),
     "MessageStore._read": (
         1,
