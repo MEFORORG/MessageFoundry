@@ -7136,7 +7136,8 @@ def _discard_minted_custody(
     except FileNotFoundError:
         pass
     except OSError as exc:
-        # Void, but still on disk, so the closing line names it as well.
+        # Void: nothing was written under it, so the closing line's "nothing was written"
+        # stays true, and it is not named there as a key to keep.
         # A new store location only where the pin refused: a store another key made is there.
         step = keep_the_key_step(
             store,
@@ -7152,7 +7153,6 @@ def _discard_minted_custody(
             f"once it can be, {_REMOVE_THE_VOID_KEY}. {step}",
             file=sys.stderr,
         )
-        return path
     return None
 
 

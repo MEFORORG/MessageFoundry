@@ -177,6 +177,7 @@ __all__ = [
     "make_spec",
     "open_store",
     "probe_store_privileges",
+    "server_store_schema_found_anywhere",
     "provision_store_schema",
     "seed_filter_clause",
     "sqlite_settings",

@@ -2179,9 +2179,10 @@ class PostgresStore:
     ) -> bool | None:
         """Whether a ``schema_meta`` table is in a schema this connection's search_path names
         (PR 2804 fourteenth hold): ``db_schema`` when it is set, else the role's own path, with
-        ``$user`` read as the role. Read from ``pg_catalog.pg_class``, which lists every relation
-        to every role whatever its schema privileges, where ``to_regclass`` skips a schema the role
-        has no USAGE on. A schema the path does not name, such as another install's ``db_schema``,
+        ``$user`` read as the role, and each other name read by ``parse_ident`` so an unquoted
+        one folds to lower case as Postgres folds it. Read from ``pg_catalog.pg_class``, which
+        lists every relation to every role whatever its schema privileges, where ``to_regclass``
+        skips a schema the role has no USAGE on. A schema the path does not name, such as another install's ``db_schema``,
         is not asked. Never ``None`` here: a catalog this role may not read raises the driver's
         error. Reads only."""
         async with (
@@ -2190,9 +2191,11 @@ class PostgresStore:
         ):
             row = await conn.fetchrow(
                 "WITH path AS ("
-                " SELECT CASE WHEN p = '$user' THEN current_user::text ELSE p END AS nspname"
-                " FROM (SELECT btrim(btrim(x), '\"') AS p"
-                " FROM unnest(string_to_array(current_setting('search_path'), ',')) AS x) AS s)"
+                " SELECT CASE WHEN p IN ('$user', '\"$user\"') THEN current_user::text"
+                " ELSE (pg_catalog.parse_ident(p))[1] END AS nspname"
+                " FROM (SELECT btrim(x) AS p"
+                " FROM unnest(string_to_array(current_setting('search_path'), ',')) AS x) AS s"
+                " WHERE p <> '')"
                 " SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c"
                 " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
                 " WHERE c.relname = 'schema_meta' AND c.relkind IN ('r', 'p')"

@@ -2051,7 +2051,7 @@ def test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none(
         raise HostCustodyRefused("the ceremony was reached (stand-in)")
 
     monkeypatch.setattr(base, "open_store", _open)
-    monkeypatch.setattr(base, "server_store_schema_found_anywhere", _anywhere, raising=False)
+    monkeypatch.setattr(base, "server_store_schema_found_anywhere", _anywhere)
     monkeypatch.setattr(custody_host, "mint_host_custody", _ceremony)
     monkeypatch.setattr(cli, "_read_new_password", lambda _prompt: "correct horse battery")
     monkeypatch.chdir(tmp_path)
@@ -2273,7 +2273,7 @@ def test_a_failed_server_create_keeps_the_minted_key_and_names_it_to_the_end(
         return False  # the database's catalog, read whole, holds no store schema
 
     monkeypatch.setattr(base, "open_store", _open)
-    monkeypatch.setattr(base, "server_store_schema_found_anywhere", _none_anywhere, raising=False)
+    monkeypatch.setattr(base, "server_store_schema_found_anywhere", _none_anywhere)
     monkeypatch.setattr(custody_host, "mint_host_custody", _ceremony)
     monkeypatch.setattr(cli, "_read_new_password", lambda _prompt: "correct horse battery")
     monkeypatch.chdir(tmp_path)

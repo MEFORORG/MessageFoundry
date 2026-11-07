@@ -219,7 +219,9 @@ Vault and LDAP*.
 > **Under `[store].key_provider = "host"`, the login `provision-admin` connects as also needs
 > `VIEW DEFINITION` on the store's schema.** Before it mints a store key, `provision-admin` reads the
 > catalog to show that the database holds no store yet, and SQL Server lists a table in `sys.tables`
-> only to a login that may see its metadata. `SELECT`, which `db_datareader` grants on the database,
+> and `sys.objects` only to a login that may see its metadata. On a database with no store yet it
+> asks this of the login's default schema and of `dbo`, the schemas a store's tables resolve
+> through, so grant it on both where they differ. `SELECT`, which `db_datareader` grants on the database,
 > is not enough: under it alone a table-level `DENY` of `SELECT` hides that table. Without the grant
 > the mint is refused and the refusal names it. Grant it on the schema that holds `schema_meta` to
 > the login that runs `provision-admin`, for example
