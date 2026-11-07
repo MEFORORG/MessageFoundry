@@ -666,10 +666,11 @@ reads that follow cannot drop it. A cancel before the row is written writes none
 then refused, and no refusal writes a second clone row. The reasons a gone passkey is refused
 with, audited `auth.webauthn_failed`, include at least `factor_removed`, `factor_unverified` when
 the passkey set read after the write fails its seal, `session_lost` when the session or the
-account went with it, and `locked` when a second-step lock landed. A store fault in the passkey
-set read after the write, on any sign-count answer, is refused with `store_error` (BACKLOG #3775):
-at least a driver `DatabaseError` other than SQLite's `ProgrammingError`, pyodbc's `Error` root, a
-lost connection and a pool acquire timeout, and, since 2026-11-06 (vault BACKLOG #4728 finding 3),
+account went with it, and `locked` when a second-step lock landed. Some store faults in the
+passkey set read after the write, on any sign-count answer, are refused with `store_error`, and
+others still raise (BACKLOG #3775). The refused ones include at least a driver `DatabaseError`
+other than SQLite's `ProgrammingError`, pyodbc's `Error` root, a lost connection and a pool acquire
+timeout, and, since 2026-11-06 (vault BACKLOG #4728 finding 3),
 every `ValueError` and every `RuntimeError` other than the audit-write defects, which takes a
 closed SQLite connection and the engine's other refusals, and also a defect that raises either,
 audited as `store_error` too. At least SQLite's `ProgrammingError` and `InterfaceError` still raise
