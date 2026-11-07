@@ -11657,9 +11657,11 @@ class AuthService:
         - ``"epoch"``: a whole-account revoke raised the account's epoch, or an every-account
           revoke raised the store's global epoch, after this session was sealed, so the session
           belongs to sessions that were ended (BACKLOG #2592, #5091). That revoke
-          blanked every seal it reached under the account's lock. On SQL Server its sweep can miss
-          a row a rotation moved mid-scan, and that row stays live with a valid seal and the old
-          epoch (BACKLOG #2738). It is ended and reported like a row that fails its seal;
+          blanked every seal it reached under the account's lock. A row it did not reach stays
+          live with a valid seal and the old epoch: at least, on SQL Server, a session of an
+          account the every-account revoke's list read did not return, rotated while its sweep ran
+          (BACKLOG #4974 ordered a rotation against every account that read returned, and against
+          the per-account sweeps). It is ended and reported like a row that fails its seal;
           docs/SECURITY.md, *Limits of the session sweep*, states what that costs.
 
         :meth:`logout` and :meth:`_supersede_session_hash` act on ``"credential"`` only. They read
@@ -17100,14 +17102,14 @@ class AuthService:
         used to say a first bind "adds a way in and withdraws none" and revoked nothing.
 
         The sweep is the write's own transaction (``Store.set_user_federated_subject``), so there
-        is no moment at which the pair is written and the earlier sessions are live, with the one
-        SQL Server exception at the end of this paragraph. A Windows SSO
+        is no moment at which the pair is written and the earlier sessions are live. A Windows SSO
         sign-in that read the row unbound either inserts its session before that transaction,
         which ends it, or after, and then its guarded insert in :meth:`_complete_ad_login` finds
         the row bound and is refused. The account's own session never performs the bind: both
-        routes refuse a caller binding its own account. One limit (BACKLOG #2738): on SQL Server
-        the sweep can miss a session rotated mid-scan. docs/SECURITY.md, *Limits of the session
-        sweep*, states what becomes of that session.
+        routes refuse a caller binding its own account. A session rotated while the bind runs is
+        swept too (BACKLOG #4974): on SQL Server the rotation and the bind take the account row
+        first, so one waits for the other, and on Postgres the sweep follows the rotated row.
+        docs/SECURITY.md, *Limits of the session sweep*, says how.
 
         Emits ``auth.federated_subject_bound`` or ``auth.federated_subject_rebound`` naming the
         actor, and notifies the account holder naming the issuer but not the subject (ASVS 6.3.7).

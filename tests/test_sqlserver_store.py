@@ -1169,6 +1169,14 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
         _assert_bind_and_user_delete_take_one_lock_order,
     )
 
+    await _assert_bind_and_user_delete_take_one_lock_order(store, **_lock_wait_probes(store))
+
+
+def _lock_wait_probes(store: Any) -> dict[str, Any]:
+    """The lock-order tests' probes on this backend: ``holder_of`` names a cursor's server
+    session, and ``is_blocking`` reads ``sys.dm_exec_requests`` for a request whose
+    ``blocking_session_id`` is that session."""
+
     async def _session_id(cur: Any) -> object:
         await cur.execute("SELECT @@SPID")
         rows = await cur.fetchall()
@@ -1180,9 +1188,25 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
         )
         return bool(row and row["n"])
 
-    await _assert_bind_and_user_delete_take_one_lock_order(
-        store, holder_of=_session_id, is_blocking=_is_blocking
+    return {"holder_of": _session_id, "is_blocking": _is_blocking}
+
+
+async def test_rotation_racing_a_sweep_is_swept(store) -> None:
+    """BACKLOG #4974 (#2738 step 2) on the real SQL Server backend: a session rotated while a bind,
+    an unbind, a revoke of the user's sessions or the every-account revoke runs is swept under its
+    new hash, and a rotation started while a bind holds the account row waits for it and re-keys
+    nothing.
+
+    ``rotate_session`` takes the account's ``users`` row before its session row, so the rotation
+    and the sweep take one lock order. The shared body is the one the Postgres suite runs, plus
+    the second order, which only this store's rotation has. Probes as the lock-order test above."""
+    from tests._federated_unbind_store_contract import (
+        _assert_rotation_racing_a_sweep_is_swept,
+        _assert_rotation_waits_for_a_bind,
     )
+
+    await _assert_rotation_racing_a_sweep_is_swept(store, **_lock_wait_probes(store))
+    await _assert_rotation_waits_for_a_bind(store, **_lock_wait_probes(store))
 
 
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:

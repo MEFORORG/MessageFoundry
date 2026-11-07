@@ -2302,7 +2302,37 @@ Two limits follow from this:
 - **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
   libpq still reads its CA from its default location or from the `PGSSLROOTCERT` environment
-  variable of the service.
+  variable of the service. The engine checks that file when it builds a psqlODBC connection
+  (BACKLOG #3090). It skips the check when `SSLmode` is `disable` or unset, because psqlODBC
+  then sends `disable` to libpq. It checks the file as it checks an `sslca`. So it refuses the
+  build in at least these cases:
+  - the file holds an encryption header or a private key;
+  - the path names another host;
+  - the engine can `stat` the file, but cannot read it, or it is over 1 MiB.
+
+  Off Windows, a `stat` failure that says no file is there, or that libpq could not `stat` it
+  either, is left to libpq, which loads no such file. That covers at least a missing name, a path
+  through a file, a name too long, a link loop and a permission denial. Other `stat` failures are
+  refused unless they say no file is there, at least an I/O fault such as `EIO`, `ETIMEDOUT` or
+  `ESTALE`. libpq stats the file again at every connect, so it may load the file once the fault
+  clears. A network fault the system reports as a denial or as a missing name is still left.
+
+  On Windows, the host check first walks the path, reading each name in it, before the file
+  itself is judged. The walk refuses at least a folder in the path the system could not read or
+  resolve, as on a denial or a device, sharing or network fault, and then says the file could not
+  be read. It also refuses at least a chain of links it will not follow further, a path through a
+  file and a share Windows could not reach, saying the file must be a plain local path, not a
+  share, a network drive, a link to one, or a path the check cannot read. A denial or fault on the
+  file's own name can pass the walk, since Windows answers it from the folder's listing; the
+  read then refuses it as a file that could not be read. A missing name, other than such a share,
+  ends the walk and is left to libpq.
+
+  The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
+  application-data folder. Elsewhere it is under `~/.postgresql`. The engine finds this home as
+  libpq 15 and later do. Another libpq version may read a different home. With libpq 16 and
+  later, `PGSSLROOTCERT=system` names no file, so the engine reads nothing. The check reads the
+  environment of the process that builds. So `messagefoundry check` judges its own machine's file.
+  The check runs at build, not at each connect. No ACL check covers the file.
 
 ##### Values on the generic dialect
 
