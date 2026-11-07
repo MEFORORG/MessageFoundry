@@ -1522,7 +1522,8 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
     def _held(self: Path, missing_ok: bool = False) -> None:
         raise PermissionError(13, "Access is denied")
 
-    texts.append(capsys.readouterr().err)
+    kept_text = capsys.readouterr().err
+    texts.append(kept_text)
     with monkeypatch.context() as patched:
         patched.setattr(Path, "unlink", _held)
         cli._discard_minted_custody(kept, server, StoreIdPinRefusedBeforeWrite("before"))
@@ -1569,6 +1570,8 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
                 else (cli._REMOVE_THE_VOID_KEY,)
                 if text is held
                 else (cli._CHECK_BEFORE_REMOVING,)
+                if text is kept_text or text is handed
+                else ()
             ),
         )
     ]
@@ -1907,6 +1910,26 @@ def test_a_minted_key_that_cannot_be_removed_carries_the_service_account_flag(
     assert f'--service-account "{account}" among them' in warning, warning
 
 
+def test_a_key_kept_over_a_sqlite_store_file_names_no_hand_check(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # PR 2804 thirteenth hold, review round 1: a SQLite store file is there, so removing the key
+    # gains nothing, since a run with no key refuses a store that exists. No hand check is named.
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store.crypto import CipherError
+
+    db = tmp_path / "made.db"
+    db.write_bytes(b"")
+    sqlite = StoreSettings().model_copy(update={"path": str(db), "key_provider": "host"})
+    kept = tmp_path / custody_host.HOST_FILE_NAME
+    kept.write_bytes(b"k")
+    cli._discard_minted_custody(kept, sqlite, CipherError("stand-in"))
+    warning = " ".join(capsys.readouterr().err.split())
+    assert kept.read_bytes() == b"k" and f"so that key is kept in {kept}" in warning, warning
+    assert cli._CHECK_BEFORE_REMOVING not in warning, warning
+    assert not _advises_changing(warning), warning
+
+
 def test_a_void_sqlite_key_that_cannot_be_removed_names_no_store_file_for_removal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1941,7 +1964,7 @@ def test_a_custody_directory_that_grants_folders_but_not_files_is_refused_before
     # PR 2804 thirteenth hold, round-3 finding 1: the twelfth hold's check asked whether a file OR
     # a folder could be added, so a directory that denies this account the add-file right alone
     # passed it, and the write refused only after the recovery key was shown.
-    import getpass
+    import csv
     import subprocess
 
     from messagefoundry import __main__ as cli
@@ -1957,7 +1980,11 @@ def test_a_custody_directory_that_grants_folders_but_not_files_is_refused_before
     monkeypatch.setattr(cli, "_read_new_password", lambda _prompt: "correct horse battery")
     folders_only = tmp_path / "folders-only"
     folders_only.mkdir()
-    user = getpass.getuser()
+    # This token's own SID, never a name from the environment.
+    whoami = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"], check=True, capture_output=True, text=True
+    )
+    user = "*" + next(csv.reader([whoami.stdout.strip()]))[1]
     # WD on a directory is the add-file right; the add-folder right (AD) stays granted.
     subprocess.run(
         ["icacls", str(folders_only), "/deny", f"{user}:(WD)"], check=True, capture_output=True
@@ -1971,14 +1998,16 @@ def test_a_custody_directory_that_grants_folders_but_not_files_is_refused_before
         argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
         code = main([*argv, "--no-totp", "--db", str(folders_only / "store.db")])
     finally:
-        subprocess.run(
-            ["icacls", str(folders_only), "/remove:d", user], check=True, capture_output=True
+        # Not checked here, so a failed cleanup never hides the test's own failure.
+        cleaned = subprocess.run(
+            ["icacls", str(folders_only), "/remove:d", user], check=False, capture_output=True
         )
     refused = " ".join(capsys.readouterr().err.split())
     assert code == 2, refused
     assert shown == [], refused  # the recovery-key ceremony was never reached
     assert "cannot add a file to the custody directory" in refused, refused
     assert not (folders_only / custody_host.HOST_FILE_NAME).exists()
+    assert cleaned.returncode == 0, cleaned.stderr
 
 
 @host_file_platforms
@@ -2202,3 +2231,6 @@ def test_a_failed_server_create_keeps_the_minted_key_and_names_the_check(
     assert main(argv) == 2
     rerun = " ".join(capsys.readouterr().err.split())
     assert mints == [host_file] and host_file.read_bytes() == b"minted (stand-in)", rerun
+    # It stops at the kept file, or at the store's never-started chain, as the warning says.
+    stop = "already exists" if shape == "no store" else "the store's audit chain was never started"
+    assert stop in rerun, rerun

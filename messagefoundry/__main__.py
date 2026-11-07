@@ -7071,7 +7071,9 @@ _REMOVE_THE_VOID_KEY = "remove that file and run the command again"
 _CHECK_BEFORE_REMOVING = (
     "Before you remove that file by hand, check, with a login that can read every table in the "
     "store's database, that the database holds no audit_log table or that its audit_log table "
-    "holds no row. A row there means a store was started, and that file may be its key"
+    "holds no row. Check once no session this command opened is left on the server, since a "
+    "record it sent may still land until then. A row there means a store was started, and that "
+    "file may be its key"
 )
 
 
@@ -7113,6 +7115,9 @@ def _discard_minted_custody(
         store.backend is StoreBackend.SQLITE and _absent_sqlite_store(store) is not None
     )
     if not nothing_written:
+        # A SQLite store file is there, so removing the key gains nothing: a run with no key
+        # refuses a store that exists. The hand check is named for a server store only.
+        check = "" if store.backend is StoreBackend.SQLITE else f"{_CHECK_BEFORE_REMOVING}. "
         if service_account is None:
             # A re-run with the host file in place carries on with a store started under it, and
             # otherwise names a way on that keeps the file.
@@ -7127,8 +7132,7 @@ def _discard_minted_custody(
             f"was started under the store key minted for it, so that key is kept in {path}. No "
             "Administrator was provisioned into it. If a store was started under that key, that "
             "file and the recovery key shown are its only keys. If none was, both are void, and "
-            "a run here stops at that file rather than mint over it. "
-            f"{_CHECK_BEFORE_REMOVING}. {then}",
+            f"a run here stops at that file rather than mint over it. {check}{then}",
             file=sys.stderr,
         )
         return

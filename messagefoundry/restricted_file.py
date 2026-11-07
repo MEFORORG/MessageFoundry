@@ -73,12 +73,12 @@ __all__ = [
     "WINERROR_SHARING_VIOLATION",
     "RestrictedFileError",
     "broad_access_problem",
+    "can_add_a_file",
     "custody_account_problem",
     "custody_engine_problem",
     "custody_non_local_account_problem",
     "delete_through_handle",
     "handoff_grantee_problem",
-    "can_add_a_file",
     "key_directory_volume_problem",
     "key_file_handle_problem",
     "linux_file_system_problem",
@@ -876,7 +876,12 @@ def can_add_a_file(directory: Path) -> bool | None:
     as it does for :func:`messagefoundry.startupcode._can_add_files`, which asks about planting
     start-up code. Access denied is no; any other failure to open is ``None``. Elsewhere
     ``os.access`` asks the kernel for write and search, with the effective ids where the platform
-    supports that."""
+    supports that.
+
+    What it does not see, at least: Windows adds the rights to read attributes and to wait on the
+    handle to every open, so a directory that grants add-file without them answers no; and a
+    token with the restore privilege switched on is granted the open whatever the access list
+    says, a yes that is true of the process."""
     if sys.platform != "win32":
         try:
             effective = os.access in os.supports_effective_ids
