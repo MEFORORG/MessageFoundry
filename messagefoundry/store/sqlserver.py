@@ -5198,14 +5198,16 @@ class SqlServerStore:
     async def schema_meta_anywhere(
         cls, settings: StoreSettings, *, posture: HopPosture | None = None
     ) -> bool | None:
-        """Whether a ``schema_meta`` table is in the schemas ``OBJECT_ID`` resolves through, the
-        login's default schema and ``dbo`` (PR 2804 fourteenth hold), or ``None`` when this login
-        cannot show that. ``sys.objects`` lists only what the login may see, so its answer counts
+        """Whether the schemas ``OBJECT_ID`` resolves through, the login's default schema and
+        ``dbo``, hold a ``schema_meta`` table or any other table the store builds (PR 2804
+        fourteenth and fifteenth holds), or ``None`` when this login cannot show that. A missing
+        row is ``None``. ``sys.objects`` lists only what the login may see, so its answer counts
         only where ``HAS_PERMS_BY_NAME`` shows ``VIEW DEFINITION`` held on both schemas; a NULL,
         an answer that could not be given, counts as not shown. Even then, at least a table-level
         ``DENY`` of ``VIEW DEFINITION`` on ``schema_meta`` itself can still hide one. Reads
         only."""
         found: bool | None = None
+        tables = sorted({"schema_meta", *_declared_schema().columns})
         async with (
             cls._one_connection_store(settings, posture=posture) as probe,
             probe._acquire() as conn,
@@ -5219,13 +5221,15 @@ class SqlServerStore:
                 )
                 row = await cur.fetchone()
                 if row is not None and row[0] == 1 and row[1] == 1:
+                    marks = ", ".join("?" for _ in tables)
                     await cur.execute(
                         "SELECT COUNT(*) FROM sys.objects"
-                        " WHERE name = N'schema_meta' AND type = N'U'"
-                        " AND schema_id IN (SCHEMA_ID(), SCHEMA_ID(N'dbo'))"
+                        f" WHERE type = N'U' AND name IN ({marks})"
+                        " AND schema_id IN (SCHEMA_ID(), SCHEMA_ID(N'dbo'))",
+                        tuple(tables),
                     )
                     counted = await cur.fetchone()
-                    found = bool(counted is not None and counted[0])
+                    found = None if counted is None else bool(counted[0])
                 await probe._commit_read(conn)  # a read snapshot: not a counted write txn
             except Exception:
                 await conn.rollback()

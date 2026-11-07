@@ -7120,7 +7120,7 @@ def _discard_minted_custody(
             f"was started under the store key minted for it, so that key is kept in {path}. No "
             "Administrator was provisioned into it. The store at that address may hold data "
             "sealed under that key, and that file and the recovery key shown may be its only "
-            "keys. Keep both until this is settled: if a store was started under that key, "
+            "keys. Keep both, and do not delete either: if a store was started under that key, "
             "either one opens it. A run here stops at that file rather than mint over it. "
             f"{then}",
             file=sys.stderr,
@@ -8842,13 +8842,14 @@ def _provision_admin(args: argparse.Namespace) -> int:
         if anywhere is None:
             raise HostCustodyRefused(
                 "this login reads no store in the database, but cannot show that none is there: "
-                "on SQL Server, VIEW DEFINITION on its default schema and on dbo is not shown as "
-                "held, so no key was minted. Grant it there, or run with a login that holds it, "
-                "then run the command again"
+                "on SQL Server, the view definition permission on its default schema and on dbo is "
+                "not shown as held, and on PostgreSQL the search_path holds a name this check does "
+                "not read, so no key was minted. Grant that permission there, or set a plain "
+                "search_path, or run with a login that holds it, then run the command again"
             )
         if anywhere:
             raise HostCustodyRefused(
-                "the schemas this login resolves hold a store schema (a schema_meta table) that "
+                "the schemas this login resolves hold store tables (schema_meta or another) that "
                 "the login cannot reach, so no key was minted over it. Grant this login that "
                 "store's schema, or point [store] at a new database or schema, then run the "
                 "command again"
@@ -9112,8 +9113,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             return before_write
         return (
             f"{_sentence(before_write)} If you added the entry this run showed to the "
-            "authenticator app, delete it: its seed was never stored, and a run that succeeds "
-            "shows a new key."
+            "authenticator app, delete it: its seed was never stored."
         )
 
     # The store key a failed create kept, for the closing line (PR 2804 fourteenth hold).

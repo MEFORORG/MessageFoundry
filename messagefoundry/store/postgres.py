@@ -54,6 +54,7 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import ssl
 import time
@@ -1423,6 +1424,34 @@ def _relkind_label(kind: str | None, wanted: tuple[str, ...], label: str) -> str
     return label if kind in wanted else _RELKINDS.get(kind, f"relation of kind {kind!r}")
 
 
+#: A search_path element that names one schema: an unquoted simple name, or a quoted one.
+_SIMPLE_SCHEMA_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+_QUOTED_SCHEMA_NAME = re.compile(r'"((?:[^"]|"")+)"')
+
+
+def _search_path_schemas(path: str, role: str) -> list[str] | None:
+    """The schemas a ``search_path`` setting names, read as Postgres reads them: ``$user`` as
+    ``role``, an unquoted simple name folded to lower case, a quoted one as written. ``None`` for
+    any other element, such as a hyphenated or dotted name or a quoted name a comma split, so a
+    caller reads a path it cannot parse as "cannot show" (PR 2804 fifteenth hold)."""
+    schemas: list[str] = []
+    for element in path.split(","):
+        item = element.strip()
+        if not item:
+            continue
+        if item in ("$user", '"$user"'):
+            schemas.append(role)
+            continue
+        quoted = _QUOTED_SCHEMA_NAME.fullmatch(item)
+        if quoted is not None:
+            schemas.append(quoted.group(1).replace('""', '"'))
+            continue
+        if _SIMPLE_SCHEMA_NAME.fullmatch(item) is None:
+            return None
+        schemas.append(item.lower())
+    return schemas
+
+
 def _declared_schema() -> ServerSchemaShape:
     """What the live-schema check expects: the batch, then every index the migration builds or drops,
     with each column's type and nullability as PostgreSQL's catalog spells them."""
@@ -2177,31 +2206,39 @@ class PostgresStore:
     async def schema_meta_anywhere(
         cls, settings: StoreSettings, *, posture: HopPosture | None = None
     ) -> bool | None:
-        """Whether a ``schema_meta`` table is in a schema this connection's search_path names
-        (PR 2804 fourteenth hold): ``db_schema`` when it is set, else the role's own path, with
-        ``$user`` read as the role, and each other name read by ``parse_ident`` so an unquoted
-        one folds to lower case as Postgres folds it. Read from ``pg_catalog.pg_class``, which
-        lists every relation to every role whatever its schema privileges, where ``to_regclass``
-        skips a schema the role has no USAGE on. A schema the path does not name, such as another install's ``db_schema``,
-        is not asked. Never ``None`` here: a catalog this role may not read raises the driver's
-        error. Reads only."""
+        """Whether a schema this connection's search_path names holds a ``schema_meta`` table or
+        any other table the store builds (PR 2804 fourteenth and fifteenth holds), or ``None`` when
+        that cannot be shown. The path is ``db_schema`` when it is set, else the role's own path,
+        read by :func:`_search_path_schemas`; an element it cannot read as one schema name is
+        ``None``. Names reach the catalog through ``::name``, which truncates as Postgres does.
+        Read from ``pg_catalog.pg_class``, which lists every relation to every role whatever its
+        schema privileges, where ``to_regclass`` skips a schema the role has no USAGE on. A schema
+        the path does not name, such as another install's ``db_schema``, is not asked. A missing
+        row is ``None``. Reads only."""
+        tables = sorted({"schema_meta", *_declared_schema().columns})
         async with (
             cls._one_connection_store(settings, posture=posture) as store,
             store._timed_acquire() as conn,
         ):
-            row = await conn.fetchrow(
-                "WITH path AS ("
-                " SELECT CASE WHEN p IN ('$user', '\"$user\"') THEN current_user::text"
-                " ELSE (pg_catalog.parse_ident(p))[1] END AS nspname"
-                " FROM (SELECT btrim(x) AS p"
-                " FROM unnest(string_to_array(current_setting('search_path'), ',')) AS x) AS s"
-                " WHERE p <> '')"
-                " SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c"
-                " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
-                " WHERE c.relname = 'schema_meta' AND c.relkind IN ('r', 'p')"
-                " AND n.nspname IN (SELECT nspname FROM path)) AS found"
+            setting = await conn.fetchrow(
+                "SELECT current_setting('search_path') AS path, current_user::text AS who"
             )
-        return bool(row is not None and row["found"])
+            if setting is None:
+                return None
+            schemas = _search_path_schemas(str(setting["path"]), str(setting["who"]))
+            if schemas is None:
+                return None
+            row = await conn.fetchrow(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c"
+                " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+                " WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::name[])"
+                " AND c.relname = ANY($2::name[])) AS found",
+                schemas,
+                tables,
+            )
+        if row is None or row["found"] is None:
+            return None
+        return bool(row["found"])
 
     @classmethod
     async def probe_privileges(

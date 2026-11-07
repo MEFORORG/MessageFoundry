@@ -1263,7 +1263,7 @@ async def _never_started_pin_text(directory: Path) -> str:
 
 
 #: Phrases the guard takes out first: one reports what failed, and one changes only a setting.
-_NOT_CHANGING_WHAT_EXISTS = ("could not be removed",)
+_NOT_CHANGING_WHAT_EXISTS = ("could not be removed", "do not delete either")
 
 #: foreign_custody_refusal's own remedy, which changes settings only. Allowed for that text alone.
 _KEY_SETTINGS_OUT = "remove every other store key setting"
@@ -1541,7 +1541,7 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
     account = "NT SERVICE\\MessageFoundry"
     cli._discard_minted_custody(kept, server, RuntimeError("stand-in"), service_account=account)
     handed = capsys.readouterr().err
-    assert kept.exists() and "Keep both until this is settled" in handed, handed
+    assert kept.exists() and "Keep both, and do not delete either" in handed, handed
     texts.append(handed)
     assert all(text.count("WARNING:") == 1 for text in texts[-3:]), texts[-3:]
     # Every text names its own way on, in the order rendered above. The existing-store text
@@ -1874,7 +1874,7 @@ def test_a_kept_key_says_to_keep_both_and_moves_nothing(
     warning = " ".join(capsys.readouterr().err.split())
     assert kept.read_bytes() == b"k", warning
     assert f"so that key is kept in {kept}" in warning, warning
-    assert "Keep both until this is settled" in warning, warning
+    assert "Keep both, and do not delete either" in warning, warning
     assert not _advises_changing(warning), warning
     if service_account is None:
         assert "Run the command again with that file in place" in warning, warning
@@ -1925,7 +1925,7 @@ def test_a_key_kept_over_a_sqlite_store_file_says_to_keep_both(
     cli._discard_minted_custody(kept, sqlite, CipherError("stand-in"))
     warning = " ".join(capsys.readouterr().err.split())
     assert kept.read_bytes() == b"k" and f"so that key is kept in {kept}" in warning, warning
-    assert "Keep both until this is settled" in warning, warning
+    assert "Keep both, and do not delete either" in warning, warning
     assert not _advises_changing(warning), warning
 
 
@@ -2071,6 +2071,189 @@ def test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none(
     assert shown == [], err  # refused before any recovery key was shown
     assert "no key was minted" in err, err
     assert not (secrets / custody_host.HOST_FILE_NAME).exists()
+
+
+class _CatalogConn:
+    """A Postgres connection stand-in that answers ``fetchrow`` from a queue and keeps each call."""
+
+    def __init__(self, rows: list[dict[str, object] | None]) -> None:
+        self.rows = list(rows)
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+    async def fetchrow(self, query: str, *args: object) -> dict[str, object] | None:
+        self.calls.append((query, args))
+        return self.rows.pop(0)
+
+
+def _postgres_catalog(
+    monkeypatch: pytest.MonkeyPatch, rows: list[dict[str, object] | None]
+) -> _CatalogConn:
+    """Point PostgresStore's one-connection store at a stand-in connection answering ``rows``."""
+    import contextlib
+
+    from messagefoundry.store.postgres import PostgresStore
+
+    conn = _CatalogConn(rows)
+
+    class _Store:
+        @contextlib.asynccontextmanager
+        async def _timed_acquire(self, *, record: bool = True) -> Any:
+            yield conn
+
+    @contextlib.asynccontextmanager
+    async def _one(_settings: StoreSettings, *, posture: object = None) -> Any:
+        yield _Store()
+
+    monkeypatch.setattr(PostgresStore, "_one_connection_store", staticmethod(_one))
+    return conn
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ('"$user", public', ["mefor", "public"]),
+        ("MeforStore", ["meforstore"]),
+        ('"Mefor Store"', ["Mefor Store"]),
+        ("mefor-prod", None),  # hyphenated: not a simple name, so it cannot be shown
+        ("app.mefor", None),  # dotted: not a schema name the check can read
+        ("a" * 70, ["a" * 70]),  # long: kept whole, and ::name truncates it as Postgres does
+        ('"a,b"', None),  # a quoted name with a comma splits, and cannot be read
+    ],
+)
+def test_the_postgres_catalog_check_reads_only_search_path_names_it_can_parse(
+    monkeypatch: pytest.MonkeyPatch, path: str, expected: list[str] | None
+) -> None:
+    # PR 2804 fifteenth hold, item 2: parse_ident raised on a hyphenated name, did not truncate a
+    # long one, and read a dotted one as the wrong schema, so the check could read "no store"
+    # over a store it never asked about. Now a search_path element the check cannot parse reads
+    # as "cannot show" (None), which refuses, and names reach the catalog through ::name.
+    import asyncio
+
+    from messagefoundry.store.postgres import PostgresStore
+
+    conn = _postgres_catalog(monkeypatch, [{"path": path, "who": "mefor"}, {"found": False}])
+    settings = StoreSettings().model_copy(update={"backend": StoreBackend.POSTGRES})
+    found = asyncio.run(PostgresStore.schema_meta_anywhere(settings))
+    if expected is None:
+        assert found is None, conn.calls
+        assert len(conn.calls) == 1, conn.calls  # no catalog read over a path it cannot parse
+        return
+    assert found is False, conn.calls
+    query, args = conn.calls[1]
+    assert "::name[]" in query, query
+    assert list(args[0]) == expected, args  # type: ignore[call-overload]
+
+
+@pytest.mark.parametrize("missing", ["path", "found"])
+def test_a_missing_postgres_catalog_row_reads_as_cannot_show(
+    monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    # PR 2804 fifteenth hold, item 3: a missing row read as False, "no store", so the mint ran.
+    import asyncio
+
+    from messagefoundry.store.postgres import PostgresStore
+
+    rows: list[dict[str, object] | None] = (
+        [None] if missing == "path" else [{"path": "public", "who": "mefor"}, None]
+    )
+    _postgres_catalog(monkeypatch, rows)
+    settings = StoreSettings().model_copy(update={"backend": StoreBackend.POSTGRES})
+    assert asyncio.run(PostgresStore.schema_meta_anywhere(settings)) is None
+
+
+def test_the_postgres_catalog_check_asks_for_store_tables_as_well(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # PR 2804 fifteenth hold, item 5 (R4): a schema holding the store's tables but no schema_meta
+    # read as "no store", and the create adopted that data under a new key. The check now asks
+    # for every table the store builds, not schema_meta alone.
+    import asyncio
+
+    from messagefoundry.store.postgres import PostgresStore
+
+    conn = _postgres_catalog(monkeypatch, [{"path": "public", "who": "mefor"}, {"found": True}])
+    settings = StoreSettings().model_copy(update={"backend": StoreBackend.POSTGRES})
+    assert asyncio.run(PostgresStore.schema_meta_anywhere(settings)) is True
+    tables = list(conn.calls[1][1][1])  # type: ignore[call-overload]
+    assert "schema_meta" in tables and "audit_log" in tables, tables
+
+
+class _SqlServerCursor:
+    """A SQL Server cursor stand-in answering ``fetchone`` from a queue and keeping each call."""
+
+    def __init__(self, rows: list[tuple[object, ...] | None]) -> None:
+        self.rows = list(rows)
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+    async def execute(self, query: str, *args: object) -> None:
+        self.calls.append((query, args))
+
+    async def fetchone(self) -> tuple[object, ...] | None:
+        return self.rows.pop(0)
+
+
+def _sqlserver_catalog(
+    monkeypatch: pytest.MonkeyPatch, rows: list[tuple[object, ...] | None]
+) -> _SqlServerCursor:
+    """Point SqlServerStore's one-connection store at a stand-in cursor answering ``rows``."""
+    import contextlib
+
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    cur = _SqlServerCursor(rows)
+
+    class _Conn:
+        async def rollback(self) -> None:
+            return None
+
+    class _Probe:
+        @contextlib.asynccontextmanager
+        async def _acquire(self) -> Any:
+            yield _Conn()
+
+        @contextlib.asynccontextmanager
+        async def _cursor(self, _conn: object) -> Any:
+            yield cur
+
+        async def _commit_read(self, _conn: object) -> None:
+            return None
+
+    @contextlib.asynccontextmanager
+    async def _one(_settings: StoreSettings, *, posture: object = None) -> Any:
+        yield _Probe()
+
+    monkeypatch.setattr(SqlServerStore, "_one_connection_store", staticmethod(_one))
+    return cur
+
+
+def test_a_missing_sqlserver_catalog_row_reads_as_cannot_show(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # PR 2804 fifteenth hold, item 3: a missing count row read as False, "no store".
+    import asyncio
+
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    _sqlserver_catalog(monkeypatch, [(1, 1), None])
+    settings = StoreSettings().model_copy(update={"backend": StoreBackend.SQLSERVER})
+    assert asyncio.run(SqlServerStore.schema_meta_anywhere(settings)) is None
+
+
+def test_the_sqlserver_catalog_check_asks_for_store_tables_as_well(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # PR 2804 fifteenth hold, item 5 (R4), as the Postgres test above.
+    import asyncio
+
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    cur = _sqlserver_catalog(monkeypatch, [(1, 1), (0,)])
+    settings = StoreSettings().model_copy(update={"backend": StoreBackend.SQLSERVER})
+    assert asyncio.run(SqlServerStore.schema_meta_anywhere(settings)) is False
+    query, args = cur.calls[1]
+    names = args[0]
+    assert isinstance(names, tuple) and query.count("?") == len(names), (query, args)
+    assert "schema_meta" in names and "audit_log" in names, (query, args)
 
 
 @host_file_platforms
@@ -2297,7 +2480,7 @@ def test_a_failed_server_create_keeps_the_minted_key_and_names_it_to_the_end(
     assert host_file.read_bytes() == b"minted (stand-in)", err
     assert f"so that key is kept in {host_file}" in err, err
     assert "was removed from" not in err, err
-    assert "Keep both until this is settled" in err, err
+    assert "Keep both, and do not delete either" in err, err
     warning = err[err.index("WARNING:") :]
     assert not _advises_changing(warning), warning
     # The closing line never says nothing was written over a kept key, as text or as the --json
