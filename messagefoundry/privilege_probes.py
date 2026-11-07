@@ -214,7 +214,8 @@ def _ad_why(exc: BaseException) -> str:
     :data:`_AD_GUARD_REFUSAL`, a fixed text naming the guard and its setting, which reads nothing
     from the error (the seventh hold on engine PR 2818): the class is tested with ``type``, never
     ``isinstance``, which reads ``__class__``, and neither its text, arguments nor class name is
-    read. The traceback test runs guarded: if it raises, the refusal reads as its type name.
+    read. The traceback test runs guarded: if it raises, the refusal reads as the fixed text
+    ``InsecureHopRefused``, whatever its subclass.
 
     The test is an ``InsecureHopRefused`` whose traceback passes through
     ``auth.ldap._refuse_ad_revocation`` (:func:`raised_through`). So it accepts one raised by

@@ -919,7 +919,8 @@ def test_an_error_from_rendering_the_codec_error_is_refused_as_not_judged(
     entry: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Round two of the repair's review: an Exception from the judgement's code is refused with a
-    fixed text, as a chain that cannot be read is, never raised in its place. Forced at the walk."""
+    fixed text, as a chain that cannot be read is, never raised in its place. Forced by replacing
+    the walk, since the walk catches its own errors."""
 
     def _judgement_fails(exc: BaseException) -> tuple[BaseException | None, bool]:
         raise RuntimeError(f"synthetic judgement failure: {exc}")
@@ -1547,6 +1548,7 @@ def test_a_class_name_that_quotes_the_byte_is_not_read(
         raise _ByteNamedError("synthetic key source refused") from decode_error
     except _ByteNamedError as exc:
         error = exc
+    assert any(s in type(error).__name__ for s in _BYTE_SPELLINGS), "the fixture holds none"
     _with_provider(monkeypatch, error)
     escaped = _escaping(lambda: getattr(store_base, entry)(StoreSettings()))
     assert type(escaped) is StoreCipherConfigError, type(escaped)
@@ -1610,6 +1612,9 @@ def test_arguments_rewritten_by_a_metaclass_call_are_not_read(
     assert type(escaped) is StoreCipherConfigError, type(escaped)
     assert str(escaped) == store_base._UNTEXTED
     _assert_no_key_byte(str(escaped))
+    # The positive control: the engine raised the rewriting class, and its arguments hold the byte.
+    assert type(escaped.__cause__) is _RewrittenScheme, type(escaped.__cause__)
+    assert any(s in str(escaped.__cause__) for s in _BYTE_SPELLINGS), str(escaped.__cause__)
 
 
 def test_a_failed_log_call_is_logged_with_fixed_text(
@@ -1632,7 +1637,10 @@ def test_a_broken_logger_does_not_replace_the_refusal(monkeypatch: pytest.Monkey
     """Round 1 of the seventh hold's review: with both log calls failing, as under a filter that
     raises, the fallback ERROR call raised in place of the typed refusal."""
 
+    fired: list[object] = []
+
     def _logging_is_broken(record: object) -> bool:
+        fired.append(record)
         raise RuntimeError("synthetic: logging is broken")
 
     store_base.log.addFilter(_logging_is_broken)
@@ -1641,5 +1649,6 @@ def test_a_broken_logger_does_not_replace_the_refusal(monkeypatch: pytest.Monkey
         escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
     finally:
         store_base.log.removeFilter(_logging_is_broken)
+    assert len(fired) == 2, fired  # the control: the WARNING and the fallback ERROR both failed
     assert type(escaped) is StoreCipherConfigError, type(escaped)
     assert escaped.__cause__ is None and escaped.__context__ is None

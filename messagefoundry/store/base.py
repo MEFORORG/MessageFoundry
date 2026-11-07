@@ -3508,9 +3508,10 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
     ``KeyProviderError``, which at least every CLI command with a key arm reports as a key that
     could not be resolved.
 
-    An ``Exception`` the judgement's own code raises, as from the walk, is refused the same way, as one that could not be judged, with a
-    fixed text that names no class, so the fallback runs none of ``exc``'s code, and the error it
-    caught is logged by its class name (:func:`_log_unjudged`). A
+    An ``Exception`` the judgement's own code raises outside the walk, which catches its own,
+    such as a ``RecursionError`` at the recursion limit, is refused the same way, as one that could
+    not be judged, with a fixed text that names no class, so the fallback runs none of ``exc``'s
+    code, and the error it caught is logged by its class name (:func:`_log_unjudged`). A
     ``BaseException`` that is not an ``Exception``, such as a ``KeyboardInterrupt`` from a link's
     own code or from an attribute read of the codec error, and anything the fallback itself
     raises, such as a ``MemoryError``, propagate in place of any refusal, with no cause and no
@@ -3554,23 +3555,22 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
 #: and the failure modes the build checks, and reads nothing from the error (the seventh hold on
 #: engine PR 2818); the error stays on the chain as the cause.
 _UNTEXTED = (
-    "the store cipher could not be built from the settings: check [store].cipher_provider, the "
-    "Vault Transit settings when it is vault_transit, and every store key, active or retired, from "
-    "MEFOR_STORE_ENCRYPTION_KEY, its key file, MEFOR_STORE_ENCRYPTION_KEYS_RETIRED or "
-    "[store].key_provider, each of which must be valid base64 of 32 bytes; the error's own text "
-    "is not shown"
+    "the store cipher could not be built from the settings: check [store].cipher_provider "
+    "('aesgcm' or 'vault_transit'), the Vault Transit settings when it is vault_transit, and every "
+    "store key, active or retired, from MEFOR_STORE_ENCRYPTION_KEY, its key file, "
+    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED or [store].key_provider, each of which must be valid "
+    "base64 of 32 bytes (generate one with `messagefoundry gen-key`); the error's own text is not "
+    "shown"
 )
 
 #: What each refusal :func:`_refusal_for` gives opens with: the settings it may come from.
 _KEY_SOURCE = (
-    "the store key or cipher could not be resolved from the settings ([store].key_provider, "
-    "[store].cipher_provider and the keys or Vault settings they read)"
+    "the store key or cipher settings ([store].key_provider, [store].cipher_provider and the keys "
+    "or Vault settings they read) were refused"
 )
 
 #: The fallback refusal's text. Like every refusal text here it reads nothing from the error.
-_UNJUDGED = (
-    f"{_KEY_SOURCE}: a key source error that could not be judged, its class and text not shown"
-)
+_UNJUDGED = f"{_KEY_SOURCE}: an error that could not be judged, its class and text not shown"
 
 #: The log line when the log call for a fail-closed judgement itself failed. It has no argument.
 _LOG_FAILED = "store: a codec judgement failed closed, and its log line could not be written"
@@ -3615,17 +3615,13 @@ def _refusal_for(exc: Exception) -> Exception | None:
     ``__class__``, and reads each link's arguments."""
     codec, read_whole = _codec_error_on(exc)
     if not read_whole:
-        text = f"{_KEY_SOURCE}: a key source error whose chain cannot be read whole, its text not shown"
+        text = f"{_KEY_SOURCE}: an error whose chain cannot be read whole, its text not shown"
     elif codec is None:
         return None
     elif codec is exc:
-        text = (
-            f"{_KEY_SOURCE}: a key source error that is or holds a codec error, its text not shown"
-        )
+        text = f"{_KEY_SOURCE}: an error that is or holds a codec error, its text not shown"
     else:
-        text = (
-            f"{_KEY_SOURCE}: a key source error whose chain holds a codec error, its text not shown"
-        )
+        text = f"{_KEY_SOURCE}: an error whose chain holds a codec error, its text not shown"
     return _refused(type(exc), text)
 
 
