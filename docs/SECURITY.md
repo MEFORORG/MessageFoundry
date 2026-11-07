@@ -3611,11 +3611,19 @@ so a `reason` points an operator at the likely cause rather than proving it. The
 a cancellation that lands after the store committed the revoke still reads false.
 `AuthService.confirm_mfa_enrollment` tries a refused revoke once more (BACKLOG #3025). It retries
 a raise in `audit_write_errors()` (`messagefoundry/store/base.py`) that is not in
-`AUDIT_WRITE_DEFECTS` (`messagefoundry/audit_write.py`), and nothing else. So the rotated session
-can stay live until its own timers end it when neither attempt lands. If `enable_totp` itself
-raises after the rotation, no revoke runs, and the rotated session stays live and stamped
-MFA-verified the same way. While it lives, it counts as a full session under `[auth].max_sessions_per_user`. Its
-token is not handed back in any case. The compare is
+`AUDIT_WRITE_DEFECTS` (`messagefoundry/audit_write.py`), and nothing else. The confirm stamps
+the session MFA-verified before it rotates it, so the rotated session is stamped MFA-verified from
+the moment it exists. It can stay live until its own timers end it in at least these cases: the
+revoke does not land, because the first attempt is refused and the retry does not land either, or
+because the first attempt meets a cancellation or a raise the helper does not answer False, so no
+second attempt runs;
+`enable_totp` itself raises, so no revoke runs; the `auth.session_rotated` audit write raises,
+after the rotation and before `enable_totp`; a cancellation lands during the session-cap run that
+follows the rotation, also before `enable_totp`; or the `auth.mfa_enrolled` audit write raises,
+after `enable_totp` turned TOTP on. In each case but the last, TOTP is still off, so the live
+session is stamped MFA-verified on a factor that is not enabled. While it lives, it counts as a
+full session under `[auth].max_sessions_per_user`. Its token is not handed back in any case.
+The compare is
 on the stored ciphertext, so at least a store-key rotation that re-encrypts the column inside the
 window refuses too. That refusal reads as `secret_replaced` although no second enrolment started.
 `write_lost` means the row still held the verified secret with TOTP off, so the enable lost to
