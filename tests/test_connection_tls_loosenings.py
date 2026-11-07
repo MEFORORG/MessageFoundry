@@ -546,6 +546,46 @@ async def test_posture_route_resolves_an_env_dialect_from_the_runner(engine: Eng
     assert "OB_ENV_SS" not in static_names
 
 
+async def test_posture_route_reads_an_env_url_query_credential_from_the_runner(
+    engine: Engine,
+) -> None:
+    """Vault BACKLOG #3766 items 14 and 15: the ``url_query_credential`` entry reads an ``env()``
+    URL against the runner's values, as the build resolves it, and its literal default where the
+    values hold no key. A benign value over a credentialed default is the control."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        EnvRef,
+        Registry,
+        build_outbound_connection,
+    )
+
+    reg = Registry()
+    for name, default in (
+        ("OB_Q_VALUE", "https://p.example.invalid/x?fmt=json"),
+        ("OB_Q_DEFAULT", "https://p.example.invalid/x?key=SYNTH-DEFAULT"),
+        ("OB_Q_OVERRIDDEN", "https://p.example.invalid/x?sig=SYNTH-OVERRIDDEN"),
+    ):
+        url = EnvRef(f"q_{name.lower()}", default=default)
+        reg.add_outbound(
+            build_outbound_connection(
+                name, ConnectionSpec(type=ConnectorType.REST, settings={"url": url})
+            )
+        )
+    runner = engine.add_registry(reg)
+    runner.set_env_values(
+        {
+            "q_ob_q_value": "https://p.example.invalid/x?api_key=SYNTH-VALUE",
+            "q_ob_q_overridden": "https://p.example.invalid/x?fmt=json",
+        }
+    )
+    switches = {e["switch"]: e["risk"] for e in _loosenings(await _posture(engine))}
+    entry = switches["url_query_credential"]
+    assert "OB_Q_VALUE" in entry and "OB_Q_DEFAULT" in entry
+    assert "OB_Q_OVERRIDDEN" not in entry
+    assert "SYNTH" not in entry
+
+
 async def test_start_row_resolves_an_env_dialect_as_the_route_does(engine: Engine) -> None:
     """The start's ``config_loaded`` row records the list ``GET /security/posture`` reports. It read
     its graph with no ``env()`` values, so a dialect that resolves to sqlserver was recorded as

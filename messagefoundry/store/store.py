@@ -407,8 +407,18 @@ async def _writer_guard(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIt
 
 
 @asynccontextmanager
-async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIterator[None]:
+async def _writer_txn(
+    db: aiosqlite.Connection, lock: asyncio.Lock, *, immediate: bool = False
+) -> AsyncIterator[None]:
     """Run the block inside ONE writer transaction, holding ``lock``, unwinding on **BaseException**.
+
+    ``immediate`` opens it with ``BEGIN IMMEDIATE``, which takes SQLite's write lock at the
+    ``BEGIN``, waiting out another process's writer under ``busy_timeout``, so nothing another
+    process commits can land between the block's first read and its write. The deferred default
+    takes it at the first write, and a writer in another process that committed after the block's
+    read then fails that write with ``SQLITE_BUSY_SNAPSHOT`` rather than wait (BACKLOG #3078 F5).
+    The ``asyncio`` lock already serializes this process, so only a block that must decide on a
+    read across processes needs it: the first-administrator grant.
 
     **Every writer that opens an EXPLICIT transaction goes through here** — ``execute("BEGIN")``
     appears nowhere else on ``self._db``, and ``tests/test_writer_txn_is_the_only_begin.py`` keeps it
@@ -436,7 +446,10 @@ async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIter
     ``rollback()`` itself first or it leaves the transaction open for the next writer."""
     async with lock:
         try:
-            await db.execute("BEGIN")
+            if immediate:
+                await db.execute("BEGIN IMMEDIATE")
+            else:
+                await db.execute("BEGIN")
             yield
         except BaseException as exc:
             await _unwind_and_raise(db, exc, role="writer")
@@ -1897,17 +1910,17 @@ class AdminGrant(StrEnum):
     #: written. ``provision_first_administrator`` counts only one that signs in with a local
     #: password (vault BACKLOG #2711 step 1).
     ADMIN_EXISTS = "admin_exists"
-    #: The account no longer holds the credentials the caller wrote, holds a role already, or is
-    #: disabled or gone, so nothing was written.
+    #: The account no longer holds the credentials the caller wrote, holds a role or a passkey
+    #: already, or is disabled or gone, so nothing was written.
     ACCOUNT_CHANGED = "account_changed"
 
 
 #: How many times the SQLite store runs the first-administrator grant's transaction when SQLite
-#: answers busy (BACKLOG #3078). ``provision-admin`` is a process of its own, and the writer's
-#: deferred ``BEGIN`` means a writer in another process that committed after this one's read makes
-#: the write fail with ``SQLITE_BUSY_SNAPSHOT`` rather than wait. The re-run re-reads, so the
-#: committed write decides. Bounded, and a busy that outlasts it is raised, never read as a refusal:
-#: an unrelated engine write can be what was busy.
+#: answers busy (BACKLOG #3078). ``provision-admin`` is a process of its own. Its ``BEGIN IMMEDIATE``
+#: (F5) waits out another process's writer for ``busy_timeout`` before answering busy, so a re-run
+#: follows a writer that held the lock past that wait, such as a long engine transaction. The re-run
+#: re-reads, so the committed write decides. Bounded, and a busy that outlasts it is raised, never
+#: read as a refusal: an unrelated engine write can be what was busy.
 _ADMIN_GRANT_BUSY_ATTEMPTS: Final = 5
 _ADMIN_GRANT_BUSY_BACKOFF_SECONDS: Final = 0.05
 
@@ -2126,6 +2139,13 @@ class UserRecord:
     # one, and a session resolves only while its own ``user_epoch`` equals it. Both copies are
     # sealed: the session's in the session seal, this one in the account's own seal.
     session_epoch: int = 0
+    # THE DIRECTORY ACCOUNT'S ENROLMENT CODE (ADR 0207). The ``hash_token`` digest of the one code
+    # outstanding, when it expires, and the issuing Administrator's account id (``None`` for
+    # one the host command issued). All three are NULL with no code outstanding, and every write that
+    # clears the digest clears the other two (``enrolment_code_cleared``). Never the code itself.
+    enrolment_code_digest: str | None = None
+    enrolment_code_expires_at: float | None = None
+    enrolment_code_issuer: str | None = None
     # THE STORE'S GLOBAL SESSION EPOCH as this read found it (BACKLOG #5091), which a session's own
     # ``global_epoch`` must equal too. Not a column of this row and not in its seal: every user reader
     # selects it beside the row (``USER_READ_SQL``). ``GLOBAL_SESSION_EPOCH_SQL`` says why.
@@ -2199,6 +2219,11 @@ class UserRecord:
             # Hard subscript (BACKLOG #2592): a missing key would decode as epoch 0, which every
             # session minted before a revoke also carries, so it is the OPEN direction.
             session_epoch=int(d["session_epoch"]),
+            # ``.get()``s (ADR 0207): a missing key decodes as "no code outstanding", which refuses
+            # every code shown -- the closed direction.
+            enrolment_code_digest=d.get("enrolment_code_digest"),
+            enrolment_code_expires_at=_opt_float(d.get("enrolment_code_expires_at")),
+            enrolment_code_issuer=d.get("enrolment_code_issuer"),
             # Hard subscript for the same reason: every user reader is ``USER_READ_SQL``, and a
             # mapping without the global epoch fails here rather than decode one nobody read.
             global_session_epoch=global_epoch_or_refuse(d["global_session_epoch"]),
@@ -2447,6 +2472,16 @@ USER_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType(
     }
 )
 
+#: The ``users`` columns a user seal covers only while they hold a value (ADR 0207 Amendment A). A
+#: field encoded as ``None`` would still change the sealed bytes, so adding these as plain fields
+#: would break the seal of every account sealed before they existed, and rotate-key's re-seal pass
+#: refuses a record that fails. Left out while NULL, an account that never held a code keeps the
+#: seal it was sealed under; a value planted outside the store still fails the seal, as
+#: :func:`passkey_digest` treats ``discoverable``.
+USER_SEAL_WHEN_SET: Final[frozenset[str]] = frozenset(
+    {"enrolment_code_digest", "enrolment_code_expires_at", "enrolment_code_issuer"}
+)
+
 #: The ``webauthn_credentials`` columns the passkey digest leaves out, each with its reason.
 PASSKEY_DIGEST_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -2500,6 +2535,11 @@ class UserRow:
     session_epoch: int
     #: A digest of the account's passkeys (:func:`passkey_digest`), ``""`` with none.
     cred_digest: str
+    #: The enrolment code's digest, expiry and issuer (ADR 0207), each ``None`` with no code. Each
+    #: enters the seal only while it holds a value (:data:`USER_SEAL_WHEN_SET`).
+    enrolment_code_digest: str | None
+    enrolment_code_expires_at: float | None
+    enrolment_code_issuer: str | None
     #: The seal (``mfseal:v1:...``) over everything else. ``""`` on a keyless store.
     authz_seal: str
 
@@ -2542,6 +2582,9 @@ class UserRow:
             password_generated=bool(d["password_generated"]),
             session_epoch=int(d["session_epoch"]),
             cred_digest=str(d["cred_digest"] or ""),
+            enrolment_code_digest=_opt_str(d["enrolment_code_digest"]),
+            enrolment_code_expires_at=_opt_float(d["enrolment_code_expires_at"]),
+            enrolment_code_issuer=_opt_str(d["enrolment_code_issuer"]),
             authz_seal=str(d["authz_seal"] or ""),
         )
 
@@ -2609,11 +2652,13 @@ class UserAuthzRecord:
 
     def seal_fields(self) -> tuple[tuple[str, object], ...]:
         """The ``(name, value)`` pairs a user seal covers: every :class:`UserRow` field not in
-        :data:`USER_SEAL_EXCLUDED`, then the role rows, counted."""
+        :data:`USER_SEAL_EXCLUDED`, and none of :data:`USER_SEAL_WHEN_SET` while it is ``None``,
+        then the role rows, counted."""
         out: list[tuple[str, object]] = [
             (f.name, getattr(self.row, f.name))
             for f in _dc_fields(self.row)
             if f.name not in USER_SEAL_EXCLUDED
+            and not (f.name in USER_SEAL_WHEN_SET and getattr(self.row, f.name) is None)
         ]
         out.append(("roles", len(self.roles)))
         for grant in self.roles:
@@ -2777,8 +2822,9 @@ _USER_INSERT: Final = (
     " totp_enabled, totp_enrolled_at, totp_recovery_codes, last_totp_step, oidc_issuer,"
     " oidc_subject, directory_object_id, password_claimed_at, channel_scope_source, lock_cycles,"
     " second_step_failed_attempts, second_step_locked_until, second_step_lock_cycles,"
-    " password_generated, session_epoch, cred_digest, authz_seal)"
-    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    " password_generated, session_epoch, cred_digest, enrolment_code_digest,"
+    " enrolment_code_expires_at, enrolment_code_issuer, authz_seal)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 _USER_RESEAL: Final = (
     "UPDATE users SET username=?, auth_provider=?, display_name=?, email=?, notify_email=?,"
@@ -2788,7 +2834,8 @@ _USER_RESEAL: Final = (
     " last_totp_step=?, oidc_issuer=?, oidc_subject=?, directory_object_id=?,"
     " password_claimed_at=?, channel_scope_source=?, lock_cycles=?,"
     " second_step_failed_attempts=?, second_step_locked_until=?, second_step_lock_cycles=?,"
-    " password_generated=?, session_epoch=?, cred_digest=?, authz_seal=?"
+    " password_generated=?, session_epoch=?, cred_digest=?, enrolment_code_digest=?,"
+    " enrolment_code_expires_at=?, enrolment_code_issuer=?, authz_seal=?"
     " WHERE id=? AND authz_seal=?"
 )
 _USER_ROLES_CLEAR: Final = "DELETE FROM user_roles WHERE user_id=?"
@@ -2904,6 +2951,9 @@ def new_user_record(
         password_generated=bool(password_generated),
         session_epoch=0,
         cred_digest="",
+        enrolment_code_digest=None,
+        enrolment_code_expires_at=None,
+        enrolment_code_issuer=None,
         authz_seal="",
     )
     return UserAuthzRecord(row=row)
@@ -3614,6 +3664,161 @@ def totp_enable(
     return apply
 
 
+# --- ADR 0207: the directory account's single-use enrolment code ----------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class EnrolmentCodeOutcome:
+    """What one conditional enrolment-code write found in the record it replaced (ADR 0207).
+
+    :attr:`replaced` is whether an unexpired code was outstanding, which an issue reports.
+    :attr:`issuer_id` is the issuer of the code a spend cleared (Amendment A, A5), captured from
+    the record ``_write_user`` read under the account's lock, never from a separate read, so a
+    re-issue between a read and the write cannot make it name the wrong Administrator."""
+
+    replaced: bool = False
+    issuer_id: str | None = None
+
+
+def enrolment_code_outstanding(row: UserRow, now: float) -> bool:
+    """Whether ``row`` holds a code that has not expired at ``now``."""
+    return (
+        row.enrolment_code_digest is not None
+        and row.enrolment_code_expires_at is not None
+        and now < row.enrolment_code_expires_at
+    )
+
+
+def enrolment_code_cleared(r: UserAuthzRecord) -> UserAuthzRecord:
+    """``r`` with no code: the digest, the expiry and the issuer go together, so no issuer outlives
+    the code it named."""
+    return r.changed(
+        enrolment_code_digest=None, enrolment_code_expires_at=None, enrolment_code_issuer=None
+    )
+
+
+def _takes_a_first_code(row: UserRow) -> bool:
+    """Whether a code may be issued for, or spent on, ``row``: an enabled directory account holding
+    no engine factor. ``cred_digest`` is written in the same transaction as every passkey write,
+    under the account's lock, so it is the in-row answer to "holds a passkey"."""
+    return (
+        row.auth_provider == "ad"
+        and not row.disabled
+        and not row.totp_enabled
+        and row.cred_digest == ""
+    )
+
+
+def _code_matches(row: UserRow, code_digest: str, now: float) -> bool:
+    return (
+        enrolment_code_outstanding(row, now)
+        and row.enrolment_code_digest is not None
+        and hmac.compare_digest(row.enrolment_code_digest, code_digest)
+    )
+
+
+class EnrolmentCodeChange:
+    """A :data:`UserChange` for one enrolment-code write that keeps the record it was applied to,
+    as :class:`EpochBump` does, so :meth:`outcome` reports what that write replaced."""
+
+    def __init__(self, apply: UserChange, now: float) -> None:
+        self._apply = apply
+        self._now = float(now)
+        self._before: UserRow | None = None
+
+    def __call__(self, record: UserAuthzRecord) -> UserAuthzRecord | None:
+        self._before = record.row
+        return self._apply(record)
+
+    def outcome(self, updated: UserAuthzRecord | None) -> EnrolmentCodeOutcome | None:
+        """``None`` when the write wrote nothing: no row, a condition that did not hold, or a
+        compare lost to a concurrent write."""
+        before = self._before
+        if updated is None or before is None:
+            return None
+        return EnrolmentCodeOutcome(
+            replaced=enrolment_code_outstanding(before, self._now),
+            issuer_id=before.enrolment_code_issuer,
+        )
+
+
+def enrolment_code_issue(
+    *, code_digest: str, expires_at: float, issuer_id: str | None, now: float
+) -> EnrolmentCodeChange:
+    """What ``issue_enrolment_code`` writes (ADR 0207 sections 4 and 6): the digest, expiry and
+    issuer, replacing any outstanding code, only where the account is an enabled directory account
+    holding no engine factor. The conditions are judged on the record the write replaces."""
+    if not code_digest:
+        raise ValueError("an enrolment code digest is required")
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if not _takes_a_first_code(r.row):
+            return None
+        return r.changed(
+            enrolment_code_digest=code_digest,
+            enrolment_code_expires_at=float(expires_at),
+            enrolment_code_issuer=issuer_id,
+            updated_at=float(now),
+        )
+
+    return EnrolmentCodeChange(apply, now)
+
+
+def enrolment_code_revoke(now: float) -> UserChange:
+    """What ``revoke_enrolment_code`` writes: no code, only where one is held (expired or not), so a
+    revoke of nothing writes nothing and reports so."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if r.row.enrolment_code_digest is None:
+            return None
+        return enrolment_code_cleared(r).changed(updated_at=float(now))
+
+    return apply
+
+
+def enrolment_code_spend(*, code_digest: str, now: float) -> EnrolmentCodeChange:
+    """The passkey finish's spend (ADR 0207 Amendment A, A3 step 10): clear the code only where its
+    digest still matches and has not expired, the account is enabled, TOTP is still off and the
+    account holds no passkey. Only a write that changed a row spends, so two racing ceremonies
+    cannot both spend one code."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if not _takes_a_first_code(r.row) or not _code_matches(r.row, code_digest, now):
+            return None
+        return enrolment_code_cleared(r).changed(updated_at=float(now))
+
+    return EnrolmentCodeChange(apply, now)
+
+
+def totp_enable_spending_code(
+    recovery_code_hashes: Sequence[str],
+    now: float,
+    *,
+    expected_secret_cell: str | None,
+    code_digest: str,
+) -> EnrolmentCodeChange:
+    """The TOTP confirm's enable with the code's spend folded into it (ADR 0207 Amendment A, A3):
+    one write that turns TOTP on and clears the code, only where :func:`totp_enable`'s conditions
+    hold and the account is an enabled directory account with no passkey whose code still matches
+    and has not expired. A confirm whose enable matches no row therefore spends nothing."""
+    enable = totp_enable(recovery_code_hashes, now, expected_secret_cell=expected_secret_cell)
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if not _takes_a_first_code(r.row) or not _code_matches(r.row, code_digest, now):
+            return None
+        enabled = enable(r)
+        return None if enabled is None else enrolment_code_cleared(enabled)
+
+    return EnrolmentCodeChange(apply, now)
+
+
+def user_disabled_change(r: UserAuthzRecord, *, disabled: bool, now: float) -> UserAuthzRecord:
+    """What ``set_user_disabled`` writes. A disable clears an outstanding enrolment code in the same
+    write (ADR 0207 section 3), so re-enabling the account inside the code's life revives nothing."""
+    out = r.changed(disabled=bool(disabled), updated_at=float(now))
+    return enrolment_code_cleared(out) if disabled else out
+
+
 def first_admin_grant(
     admin_role_id: str,
     *,
@@ -3858,6 +4063,28 @@ def without_role(role_id: str) -> UserChange:
         if role_id not in r.role_ids:
             return None
         return replace(r, roles=tuple(g for g in r.roles if g.role_id != role_id))
+
+    return apply
+
+
+def roles_if_held(
+    role_ids: Sequence[str],
+    *,
+    expected_role_ids: Iterable[str],
+    assigned_by: str | None,
+    now: float,
+) -> UserChange:
+    """``set_user_roles_if_held``'s compare-and-set (vault BACKLOG #3085): the account's roles
+    replaced with ``role_ids``, only while the record still holds exactly ``expected_role_ids``,
+    compared as sets. Each backend runs it on the record its write read under the row's lock, so
+    a write decided from an older read of the roles writes nothing once another writer has moved
+    them."""
+    expected = frozenset(expected_role_ids)
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if frozenset(r.role_ids) != expected:
+            return None
+        return r.with_roles(role_ids, assigned_by=assigned_by, now=now)
 
     return apply
 
@@ -7186,8 +7413,11 @@ async def _secure_file_async(path: Path) -> None:
 # The data directory already names the right set. install-service.ps1 removes its inheritance and
 # grants SYSTEM, BUILTIN\Administrators and the run-as account. So where the store's directory is
 # HARDENED like that, every open writes the SAME explicit, protected DACL on the trio: SYSTEM and
-# Administrators full control, and the one per-service account Modify. It does not depend on who
-# opens, so the second opener finds it already exact and needs no WRITE_DAC; it is protected, so a
+# Administrators full control, and the one run-as account Modify. That account is a per-service
+# virtual account, or one named user account the host resolves (a local user, or a gMSA only if it
+# resolves to a user account, which is unmeasured; the -ServiceAccount install; BACKLOG #3760,
+# #2234, owner ruling 2026-11-05). It does not depend on who opens, so the second opener finds it
+# already exact and needs no WRITE_DAC; it is protected, so a
 # later edit to the directory does not reach the store. Anywhere else -- a developer checkout, a temp
 # directory, a directory admitting anyone else, one reached through a link, or one this code cannot
 # read -- the owner-only rewrite applies exactly as before. Every test below is an ALLOW-list.
@@ -7198,20 +7428,33 @@ _SDDL_SID_ALIASES: Mapping[str, str] = MappingProxyType({"SY": "S-1-5-18", "BA":
 _STORE_DIR_TRUSTED_SIDS = ("S-1-5-18", "S-1-5-32-544")
 #: One per-service virtual account, NT SERVICE\<name>: S-1-5-80 plus exactly five sub-authorities.
 #: NT SERVICE\ALL SERVICES is S-1-5-80-0 and does NOT match, because it admits every service.
-_SERVICE_SID = re.compile(r"S-1-5-80-\d+-\d+-\d+-\d+-\d+")
+_SERVICE_SID = re.compile(r"S-1-5-80-\d+-\d+-\d+-\d+-\d+", re.ASCII)
+#: A machine- or domain-relative account SID: S-1-5-21, the three sub-authorities naming the machine
+#: or the domain, then the RID. A local user, a domain user and a gMSA all have this shape; so do
+#: their groups, which is why the shape alone admits nothing (see :func:`_account_type_refusal`).
+#: ASCII digits only, here and in :data:`_SERVICE_SID`: ``\d`` alone also matches other scripts'
+#: digits, which ``int`` accepts.
+_ACCOUNT_SID = re.compile(r"S-1-5-21-\d+-\d+-\d+-(\d+)", re.ASCII)
+#: The lowest RID Windows hands an account or group it creates. Below it sit the built-in ones: at
+#: least Administrator (500), Guest (501), krbtgt (502), DefaultAccount (503) and the well-known
+#: domain groups from 512, Domain Users (513) among them.
+_FIRST_ASSIGNED_RID = 1000
+#: SidTypeUser, the SID_NAME_USE LookupAccountSidW reports for a user account. A group reports
+#: SidTypeGroup (2) or SidTypeAlias (4), a well-known SID SidTypeWellKnownGroup (5).
+_SID_TYPE_USER = 1
 _SDDL_DENY_TYPES = frozenset({"D", "OD", "XD"})
 _SDDL_ACE = re.compile(r"\(([^()]*)\)")
 _SDDL_OWNER = re.compile(r"O:(S-[0-9-]+|[A-Z]{2})")
 #: The SDDL right for each principal of the trio: full control (FA) for SYSTEM and Administrators,
-#: and Modify (0x1301bf, what install-service.ps1 grants the run-as account) for the service.
+#: and Modify (0x1301bf, what install-service.ps1 grants the run-as account) for that account.
 _TRIO_RIGHTS: Mapping[str, str] = MappingProxyType({"S-1-5-18": "FA", "S-1-5-32-544": "FA"})
-_SERVICE_RIGHTS = "0x1301bf"
+_RUN_AS_RIGHTS = "0x1301bf"
 
 
 def _trio_right(sid: str) -> str:
     """The one SDDL right the trio carries for ``sid``, upper-cased as the parser keeps rights. The
     writer and both checks use this, so they cannot drift apart."""
-    return _TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS).upper()
+    return _TRIO_RIGHTS.get(sid, _RUN_AS_RIGHTS).upper()
 
 
 @dataclass(frozen=True)
@@ -7263,7 +7506,29 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
 
 
 def _hardening_refusal(directory: _SddlDacl) -> str | None:
-    """Why ``directory`` is NOT hardened, or ``None`` when it is (see :func:`_hardened_trio_grants`).
+    """Why ``directory`` is NOT hardened, or ``None`` when it is.
+
+    Hardened means the directory is exactly what install-service.ps1 writes (Set-SecureDataDirAcl,
+    then Set-DataDirOwner): inheritance blocked; every ACE an allow with the installer's own
+    inheritance (``OICI``) and rights -- full control (``FA``) for SYSTEM and Administrators, both
+    present, and Modify (``0x1301bf``) for at most ONE run-as account -- and nothing else; no deny
+    ACE, because the trio's DACL does not carry denies over; and an owner of SYSTEM or
+    Administrators, or of the run-as account when it is a per-service virtual account, because an
+    owner keeps WRITE_DAC over the directory. The run-as account is a per-service virtual account,
+    or one user account this host resolves with a RID of 1000 or more (:func:`_account_shape_refusal`,
+    :func:`_account_type_refusal`). A user never qualifies as the OWNER: any standard user can own a
+    directory she made and grant herself the installer's shape, while install-service.ps1 makes
+    Administrators the owner (Set-DataDirOwner, which only warns when it cannot, and the directory is
+    then refused), and no standard user can own a directory as a virtual account.
+
+    NOT pure: for a user run-as it calls ``LookupAccountSidW``, which may block on a domain
+    controller and logs nothing itself. Call it once per decision (:func:`_hardening_verdict`), and
+    never on an event loop.
+
+    The RIGHTS and FLAGS are part of the test, not only the principals, because the trio is always
+    written with FA/Modify: a directory granting Administrators read, or a service container-only,
+    or a different service read, would otherwise produce a store WIDER than its directory. Any shape
+    but the installer's falls back to the owner-only rewrite.
 
     The first failing condition, in a fixed order, as one operator-readable sentence. The checks read
     the whole DACL, so a directory that fails two ways is refused whichever entry comes first."""
@@ -7272,55 +7537,95 @@ def _hardening_refusal(directory: _SddlDacl) -> str | None:
     if not directory.aces:  # defence in depth: the both-built-ins check below also refuses this
         return "its DACL is empty"
     named: set[str] = set()
-    services: set[str] = set()
+    run_as: set[str] = set()
     for ace_type, flags, rights, sid in directory.aces:
         trusted = sid in _STORE_DIR_TRUSTED_SIDS
-        service = not trusted and bool(_SERVICE_SID.fullmatch(sid))
         if ace_type != "A":
             return f"it carries a {ace_type} entry for {sid}, which the trio would not carry over"
-        if not (trusted or service):
-            return f"it grants {sid}, which is not SYSTEM, Administrators or one service account"
+        if not trusted and not _SERVICE_SID.fullmatch(sid):
+            refusal = _account_shape_refusal(sid)
+            if refusal is not None:
+                return refusal
         if _sddl_flag_set(flags) != {"OI", "CI"} or rights != _trio_right(sid):
             return (
                 f"it grants {sid} ({flags};{rights}), not the installer's shape "
                 f"(OICI;{_trio_right(sid)})"
             )
-        (named if trusted else services).add(sid)
+        (named if trusted else run_as).add(sid)
     # Both built-in principals are required, as the installer always writes them: without
     # Administrators among the grants, a file it owns could never be made exact, and would be
     # rewritten -- and warned about -- on every start.
     if named != set(_STORE_DIR_TRUSTED_SIDS):
         return "it does not grant both SYSTEM and Administrators"
-    if len(services) > 1:
-        return "it grants more than one service account"
+    # At most ONE run-as principal, of either kind: two service accounts, two users, or a service
+    # account beside a user are all refused. The installer grants one, or none for LocalSystem.
+    if len(run_as) > 1:
+        return f"it grants more than one service or user account ({', '.join(sorted(run_as))})"
+    services = {sid for sid in run_as if _SERVICE_SID.fullmatch(sid)}
     if directory.owner is None or (
         directory.owner not in _STORE_DIR_TRUSTED_SIDS and directory.owner not in services
     ):
         return f"it is owned by {directory.owner}, which keeps WRITE_DAC over it"
+    # Last, because it is the one check that can leave the host: a gMSA's SID resolves through a
+    # domain controller. Every cheaper refusal has had its chance first.
+    user = next(iter(run_as - services), None)  # at most one, by the check above
+    return None if user is None else _account_type_refusal(user)
+
+
+def _account_shape_refusal(sid: str) -> str | None:
+    """Why ``sid`` cannot be the trio's one named run-as user account by its SHAPE alone, or ``None``
+    when it may be one, pending :func:`_account_type_refusal`.
+
+    The owner ruling of 2026-11-05 (BACKLOG #3760, #2234) admits one principal beyond SYSTEM,
+    Administrators and a per-service virtual account, and only a user account with a RID of 1000 or
+    more: the account ``install-service.ps1 -ServiceAccount`` grants, such as a local user, or a
+    gMSA only if it resolves to a user account, which is unmeasured. The SID must be machine- or
+    domain-relative (``S-1-5-21-...``), whose last sub-authority is the RID of an account or group
+    that machine or domain holds; the regex admits no other family, so a BUILTIN alias
+    (``S-1-5-32-...``), whose last sub-authority is also a RID, is refused by shape. Any alias the
+    SDDL writer emits (``NS``, ``LA``, ``DU``) is not of this shape either, so it is refused too. A RID
+    under 1000 is a built-in account or group, refused without a lookup: at least the built-in Administrator (500), Guest (501) and Domain Users (513)."""
+    match = _ACCOUNT_SID.fullmatch(sid)
+    if match is None:
+        return (
+            f"it grants {sid}, which is not SYSTEM, Administrators, one service account or one "
+            "user account"
+        )
+    if int(match.group(1)) < _FIRST_ASSIGNED_RID:
+        return (
+            f"it grants {sid}, a built-in account or group (a RID below {_FIRST_ASSIGNED_RID}), "
+            "not one user account"
+        )
     return None
 
 
-def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...] | None:
-    """The principals the trio is granted when ``directory`` is HARDENED, else ``None``.
+def _account_type_refusal(sid: str) -> str | None:
+    """Why ``sid``, already of the account shape, is not a USER account on this host, or ``None``
+    when ``LookupAccountSidW`` resolves it to SidTypeUser. Refused when the lookup fails, and when it
+    returns any other type: a group or alias with an assigned RID has the same shape as a user, and
+    granting one Modify must not widen the store to every member."""
+    kind, status = _lookup_sid_type(sid)
+    if kind is None:
+        return (
+            f"it grants {sid}, which this host could not resolve to an account (Win32 status "
+            f"{status})"
+        )
+    if kind != _SID_TYPE_USER:
+        return f"it grants {sid}, which resolves to SID type {kind}, not a user account"
+    return None
 
-    Hardened means the directory is exactly what install-service.ps1 writes (Set-SecureDataDirAcl,
-    then Set-DataDirOwner): inheritance blocked; every ACE an allow with the installer's own
-    inheritance (``OICI``) and rights -- full control (``FA``) for SYSTEM and Administrators, both
-    present, and Modify (``0x1301bf``) for at most ONE per-service account -- and nothing else; no
-    deny ACE, because the trio's DACL does not carry denies over; and an owner of SYSTEM,
-    Administrators or that service account, because an owner keeps WRITE_DAC over the directory.
 
-    The RIGHTS and FLAGS are part of the test, not only the principals, because the trio is always
-    written with FA/Modify: a directory granting Administrators read, or a service container-only,
-    or a different service read, would otherwise produce a store WIDER than its directory. Any shape
-    but the installer's falls back to the owner-only rewrite. The answer names only principals the
-    directory allows, never who happens to be opening."""
-    if _hardening_refusal(directory) is not None:
-        return None
-    services = sorted(
-        sid for _t, _f, _r, sid in directory.aces if sid not in _STORE_DIR_TRUSTED_SIDS
-    )
-    return (*_STORE_DIR_TRUSTED_SIDS, *dict.fromkeys(services))
+def _hardening_verdict(directory: _SddlDacl) -> tuple[tuple[str, ...] | None, str | None]:
+    """``(grants, None)`` when ``directory`` is HARDENED, else ``(None, refusal)``: one check, so the
+    account lookup :func:`_hardening_refusal` may make runs once, and the grants are never built for
+    a directory that was not checked. The grants are SYSTEM, Administrators, then the run-as account
+    if the directory names one: only principals the directory allows, never who happens to be
+    opening."""
+    refusal = _hardening_refusal(directory)
+    if refusal is not None:
+        return None, refusal
+    run_as = (sid for _t, _f, _r, sid in directory.aces if sid not in _STORE_DIR_TRUSTED_SIDS)
+    return (*_STORE_DIR_TRUSTED_SIDS, *dict.fromkeys(run_as)), None
 
 
 def _sddl_flag_set(flags: str) -> set[str]:
@@ -7409,6 +7714,71 @@ def _read_dacl_sddl(path: Path, *, owner: bool = False) -> str | None:
         kernel32.LocalFree(descriptor)
 
 
+def _lookup_sid_type(sid: str) -> tuple[int | None, int]:
+    """``(SID_NAME_USE, 0)`` for what ``LookupAccountSidW`` reports for ``sid`` on this host, or
+    ``(None, Win32 status)`` when the lookup fails, and ``(None, 0)`` off Windows. A seam for tests,
+    so the decision runs anywhere.
+
+    A domain account's SID resolves through a domain controller, or through the LSA's lookup cache
+    when none answers. On every failure the directory is refused as not hardened, and each store
+    file takes the fallback restricted by :func:`_secure_file` (see ADR 0163,
+    *Note (2026-11-05)*; decision d20261106T140017335-d24848). Why ERROR_NONE_MAPPED (1332) does
+    not prove the SID names no account, and what that fallback leaves on each file, are stated
+    once, in ADR 0163, *Note (2026-11-05)*, *Left open*. Nothing is logged here: the status goes
+    into the refusal, which the caller logs once, beside the directory it refused."""
+    if sys.platform != "win32":
+        return None, 0
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    convert = advapi32.ConvertStringSidToSidW
+    convert.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    convert.restype = wintypes.BOOL
+    lookup = advapi32.LookupAccountSidW
+    lookup.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.c_void_p,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    lookup.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    psid = ctypes.c_void_p()
+    if not convert(sid, ctypes.byref(psid)):
+        return None, ctypes.get_last_error()
+    try:
+        name_len, domain_len = wintypes.DWORD(256), wintypes.DWORD(256)
+        status = 0
+        # A name longer than the first buffers fails with ERROR_INSUFFICIENT_BUFFER (122) and sets
+        # both lengths to what is needed, so one retry at those lengths is enough.
+        for _attempt in range(2):
+            name = ctypes.create_unicode_buffer(name_len.value)
+            domain = ctypes.create_unicode_buffer(domain_len.value)
+            use = ctypes.c_int()
+            if lookup(
+                None,
+                psid,
+                name,
+                ctypes.byref(name_len),
+                domain,
+                ctypes.byref(domain_len),
+                ctypes.byref(use),
+            ):
+                return use.value, 0
+            status = ctypes.get_last_error()
+            if status != 122:
+                break
+        return None, status
+    finally:
+        kernel32.LocalFree(psid)
+
+
 def _is_windows() -> bool:
     """A seam the tests patch, instead of patching the process-wide ``os.name``."""
     return os.name == "nt"
@@ -7438,9 +7808,9 @@ def _reaches_through_a_link(path: Path) -> bool:
 
 
 def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
-    """The trio grants for a store in ``directory`` (see :func:`_hardened_trio_grants`), or ``None``
-    for the owner-only rewrite: off Windows, through a link, or when the DACL cannot be read or
-    parsed."""
+    """The trio grants for a store in ``directory`` (see :func:`_hardening_verdict`), or ``None``
+    for the owner-only rewrite: off Windows, through a link, when the DACL cannot be read or parsed,
+    or when the directory is refused as not hardened, a failed account lookup included."""
     if not _is_windows() or _reaches_through_a_link(directory):
         return None
     sddl = _read_dacl_sddl(directory, owner=True)
@@ -7449,7 +7819,7 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
     parsed = _parse_sddl_dacl(sddl)
     if parsed is None:
         return None
-    reason = _hardening_refusal(parsed)
+    grants, reason = _hardening_verdict(parsed)
     if reason is not None:
         # A locked-down directory (inheritance off) that still fails the test is the case an operator
         # needs to hear about: the fallback brings back the Wave 0 lockout, whose only other symptom
@@ -7460,15 +7830,14 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
         if parsed.protected and not any(sid == "OW" for _t, _f, _r, sid in parsed.aces):
             log.warning(
                 "%s is locked down but %s, so the store there is restricted owner-only; the service "
-                "account and an operator's provision-admin cannot then both open it (ADR 0163 note "
-                "of 2026-09-24)",
+                "account and an operator's provision-admin cannot then both open it (ADR 0163 notes "
+                "of 2026-09-24 and 2026-11-05)",
                 directory,
                 reason,
             )
         else:
             log.debug("%s is not a hardened store directory: %s", directory, reason)
-        return None
-    return _hardened_trio_grants(parsed)
+    return grants
 
 
 def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = None) -> bool:
@@ -7488,7 +7857,7 @@ def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = N
     from ctypes import wintypes
 
     # Written in the canonical SDDL spelling (lower-case ``0x`` hex); only COMPARISONS upper-case.
-    aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS)};;;{sid})" for sid in grants)
+    aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _RUN_AS_RIGHTS)};;;{sid})" for sid in grants)
     sddl = (f"O:{owner}" if owner else "") + f"D:P{aces}"
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -9178,6 +9547,9 @@ CREATE TABLE IF NOT EXISTS users (
     password_generated   INTEGER NOT NULL DEFAULT 0,  -- ADR 0197 Amendment A: 1 while the credential in force is engine-generated; wrong passwords arm no sign-in lock then. NO COMMA in this comment
     session_epoch        INTEGER NOT NULL DEFAULT 0,  -- BACKLOG #2592: raised by every whole-account session revoke; a session minted under an older epoch resolves to nothing. NO COMMA in this comment
     cred_digest          TEXT NOT NULL DEFAULT '',  -- BACKLOG #2592: digest of the account's passkeys; the user seal covers it. NO COMMA in this comment
+    enrolment_code_digest TEXT,                -- ADR 0207: hash_token digest of the outstanding enrolment code; NULL = none. NO COMMA in this comment
+    enrolment_code_expires_at REAL,            -- ADR 0207: when that code expires; NULL with no code. NO COMMA in this comment
+    enrolment_code_issuer TEXT,                -- ADR 0207 Amendment A5: the issuing Administrator's account id; NULL for a host-issued code. NO COMMA in this comment
     authz_seal           TEXT NOT NULL DEFAULT ''  -- BACKLOG #2592: integrity seal over the account's row and role rows. NO COMMA in this comment
 );
 
@@ -11127,6 +11499,12 @@ class MessageStore:
             # `report_unsealed_users` names the count at open.
             ("cred_digest", "TEXT NOT NULL DEFAULT ''"),
             ("authz_seal", "TEXT NOT NULL DEFAULT ''"),
+            # ADR 0207: the enrolment code's digest, expiry and issuer. NULL on an existing row is
+            # "no code outstanding", and a NULL column stays out of the seal
+            # (USER_SEAL_WHEN_SET), so the add re-seals nobody.
+            ("enrolment_code_digest", "TEXT"),
+            ("enrolment_code_expires_at", "REAL"),
+            ("enrolment_code_issuer", "TEXT"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -17511,7 +17889,7 @@ class MessageStore:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._write_user(
-                user_id, lambda r: r.changed(disabled=bool(disabled), updated_at=float(now))
+                user_id, lambda r: user_disabled_change(r, disabled=disabled, now=now)
             )
             await self._commit()
 
@@ -17601,6 +17979,64 @@ class MessageStore:
             written = await self._write_user(user_id, change)
             await self._commit()
         return written is not None
+
+    # --- ADR 0207: the directory account's enrolment code (Store protocol states the contract) ---
+
+    async def _write_code(
+        self, user_id: str, change: EnrolmentCodeChange
+    ) -> EnrolmentCodeOutcome | None:
+        async with _writer_guard(self._db, self._lock):
+            written = await self._write_user(user_id, change)
+            await self._commit()
+        return change.outcome(written)
+
+    async def issue_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        code_digest: str,
+        expires_at: float,
+        issuer_id: str | None,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = enrolment_code_issue(
+            code_digest=code_digest, expires_at=expires_at, issuer_id=issuer_id, now=now
+        )
+        return await self._write_code(user_id, change)
+
+    async def revoke_enrolment_code(self, user_id: str, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        async with _writer_guard(self._db, self._lock):
+            written = await self._write_user(user_id, enrolment_code_revoke(now))
+            await self._commit()
+        return written is not None
+
+    async def spend_enrolment_code(
+        self, user_id: str, *, code_digest: str, now: float | None = None
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        return await self._write_code(
+            user_id, enrolment_code_spend(code_digest=code_digest, now=now)
+        )
+
+    async def enable_totp_spending_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        code_digest: str,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = totp_enable_spending_code(
+            recovery_code_hashes,
+            now,
+            expected_secret_cell=expected_secret_cell,
+            code_digest=code_digest,
+        )
+        return await self._write_code(user_id, change)
 
     async def replace_totp_enrolment(
         self,
@@ -17953,7 +18389,7 @@ class MessageStore:
                     return False
             if change is AdminRemoval.DISABLE:
                 await self._write_user(
-                    user_id, lambda r: r.changed(disabled=True, updated_at=float(now))
+                    user_id, lambda r: user_disabled_change(r, disabled=True, now=now)
                 )
             elif change is AdminRemoval.DELETE:
                 await self._delete_user_rows(user_id)
@@ -17979,8 +18415,13 @@ class MessageStore:
     ) -> AdminGrant:
         """The first-administrator guard and its grant in one transaction (BACKLOG #3078); see
         ``AuthStore``. The writer lock serializes it in this process. Another process is serialized
-        by SQLite's single writer: a write that lost to one committed after this read fails busy,
-        and the transaction runs again so the re-read decides (:data:`_ADMIN_GRANT_BUSY_ATTEMPTS`)."""
+        by ``BEGIN IMMEDIATE`` (BACKLOG #3078 F5): the transaction takes SQLite's write lock before
+        its read, waiting out another writer under ``busy_timeout``, so no other process commits
+        between the read and the write. A busy that outlasts that wait is run again so the re-read
+        decides (:data:`_ADMIN_GRANT_BUSY_ATTEMPTS`). Before, the deferred ``BEGIN`` let an engine
+        write in another process land after the read, and then this write failed busy at once, so a
+        busy ``serve`` could exhaust the re-runs. The account write that follows the guard read
+        also checks that no passkey is on the row (F2), as the server backends do."""
         now = time.time() if now is None else now
         change = first_admin_grant(
             admin_role_id,
@@ -17991,7 +18432,7 @@ class MessageStore:
         )
         for attempt in range(1, _ADMIN_GRANT_BUSY_ATTEMPTS + 1):
             try:
-                async with _writer_txn(self._db, self._lock):
+                async with _writer_txn(self._db, self._lock, immediate=True):
                     cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
                     holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
                     _, others = await admin_guard_counts(
@@ -18005,6 +18446,13 @@ class MessageStore:
                         await self._db.rollback()
                         return AdminGrant.ADMIN_EXISTS
                     if await self._write_user(user_id, change) is None:
+                        await self._db.rollback()
+                        return AdminGrant.ACCOUNT_CHANGED
+                    # BACKLOG #3078 F2: a passkey on the row is an earlier holder's, enrolled in the
+                    # repair window, since this command enrols none. Read after the write, on this
+                    # transaction's connection, so it sees every passkey committed before it.
+                    passkey = await self._db.execute(_WEBAUTHN_ANY_FOR_USER, (user_id,))
+                    if await passkey.fetchone() is not None:
                         await self._db.rollback()
                         return AdminGrant.ACCOUNT_CHANGED
                     await self._commit()
@@ -18341,6 +18789,26 @@ class MessageStore:
                 user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
             )
             await self._commit()
+
+    async def set_user_roles_if_held(
+        self,
+        user_id: str,
+        role_ids: Sequence[str],
+        *,
+        expected_role_ids: Iterable[str],
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """The compare-and-set role write (vault BACKLOG #3085); see ``AuthStore``. Under the one
+        writer lock, so no other write to the row lands between the compare and the write."""
+        now = time.time() if now is None else now
+        change = roles_if_held(
+            role_ids, expected_role_ids=expected_role_ids, assigned_by=assigned_by, now=now
+        )
+        async with _writer_txn(self._db, self._lock):
+            written = await self._write_user(user_id, change)
+            await self._commit()
+        return written is not None
 
     async def set_user_channel_scope(
         self,

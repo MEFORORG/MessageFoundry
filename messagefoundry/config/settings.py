@@ -443,9 +443,8 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
     and the anonymous FTPS ``tls_verify=false`` context, **and — since #329 —** the SFTP
     unknown-host-key acceptance for a login with no ``password``
-    (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
-    cleartext-``http`` hops. The credential hops it no longer reaches are named once, in
-    docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*. Pass the construction-time
+    (:mod:`messagefoundry.transports.remotefile`). The credential hops it no longer reaches are
+    named once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*. Pass the construction-time
     :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
     :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
     out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
@@ -3627,9 +3626,10 @@ class AuthSettings(_Section):
     # How many CONSECUTIVE passes must fail to find a principal before its sessions are revoked. A
     # single ambiguous result never revokes: "the search returned nothing" cannot tell deleted from
     # moved out of the search base, and a set disabled bit or an unreadable userAccountControl strikes
-    # the same way, so requiring two agreeing probes costs at most one extra interval of exposure and
-    # buys immunity to a single flaky search. Strike state is process-local (the rate-limiter
-    # precedent), so a restart resets it — biased toward NOT revoking.
+    # the same way, so requiring two agreeing probes costs at most one extra interval of exposure
+    # within one process's life, and buys immunity to a single flaky search. Strike state is
+    # process-local (the rate-limiter precedent); what a restart loses is stated once, in
+    # docs/SECURITY.md, "What a restart loses" (vault BACKLOG #3689).
     ad_session_recheck_strikes: int = 2
     # Per-pass bind budget. A pass probes at most this many distinct users; the remainder are picked up
     # by the following passes (least-recently-probed first), so a very large estate degrades to a longer
@@ -5558,8 +5558,10 @@ _ALERT_EVENT_TYPES = frozenset(
         # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
         "audit_write_failed",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
-        # a pass left accounts unrevoked (the breaker tripped, or probes were referred, BACKLOG
-        # #2538), and one principal's sessions were revoked.
+        # a pass left accounts unrevoked, and one principal's sessions were revoked. The first is
+        # raised for at least a breaker trip, a referral (BACKLOG #2538), a configuration refusal
+        # (#3010), a probe fault (#3100), a paging refusal (vault #3696), a lasting outage (#3709)
+        # and an account the directory keeps failing for (#3100), each under its own source.
         "ad_reconcile_aborted",
         "ad_session_revoked",
         # ADR 0195: the reconciler held accounts whose userAccountControl it could not read.
@@ -9622,7 +9624,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"{_auth_default('ad_reconcile_outage_passes')}: it comes after {floor} at the "
                     "configured interval. Until it does, a directory account disabled or deleted "
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
-                    "per pass to show for it",
+                    "per pass to show for it. The same count bounds one account the directory "
+                    "keeps failing for while it answers others, so that page waits longer too",
                 )
             )
         strikes = auth.ad_session_recheck_strikes
@@ -10233,7 +10236,8 @@ def security_loosenings(
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
     ``tls_allow_expired`` (#129 / ADR 0094), ``hostname_unchecked_hops`` declares
     ``tls_check_hostname=false`` (ASVS 12.3.2), ``query_credential_hops`` is an outbound or
-    ``FhirLookup`` whose literal ``url`` carries a credential-like query parameter (ASVS 14.2.1),
+    ``FhirLookup`` whose ``url`` carries a credential-like query parameter (ASVS 14.2.1), read as
+    ``config.wiring.query_credential_hops`` says,
     ``unverified_db_hops`` is a
     generic-ODBC ``DATABASE``
     connection whose ``odbc_params`` set no usable TLS mode its driver family reads, or set one to

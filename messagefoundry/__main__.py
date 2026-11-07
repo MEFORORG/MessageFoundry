@@ -721,6 +721,33 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
 
+    # ADR 0207 section 6: a site whose every enabled Administrator is a directory account with no
+    # engine factor has nobody who can issue an enrolment code. This is the host's exit, on
+    # admin-unlock's gate, for any directory account.
+    issue_enrolment_code = sub.add_parser(
+        "issue-enrolment-code",
+        help="issue a directory account's one-time enrolment code from the host (offline)",
+        description="Issue the single-use enrolment code a directory account needs to bind its "
+        "first engine factor, for a site where no Administrator can issue one from the console. "
+        "Runs against the store directly, on the same host gate as admin-unlock. On SQLite it "
+        "refuses while another connection holds the store, and when it cannot tell; on a server "
+        "store it cannot tell, so run it with the engine stopped. It prints the code once; hand it "
+        "over after confirming who is asking, never through the account's own mail or chat. It "
+        "refuses a local account, a disabled account and an account that holds a factor.",
+    )
+    issue_enrolment_code.add_argument(
+        "--username", required=True, help="the directory account the code is for"
+    )
+    issue_enrolment_code.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    issue_enrolment_code.add_argument(
+        "--db", default=None, help="store path (overrides [store].path)"
+    )
+    issue_enrolment_code.add_argument("--json", action="store_true", help="emit JSON")
+
     # BACKLOG #2614. DELETE /sessions ends sessions in bulk through the API; this is the same act
     # from the host, for when the API itself is what is not trusted. Same host gate as admin-unlock.
     admin_revoke_sessions = sub.add_parser(
@@ -2593,7 +2620,8 @@ def _remote_debug_refused(
     """True, with the reason printed, when :func:`messagefoundry.remotedebug.remote_debug_refusal`
     refuses ``posture`` and nothing lifts it (vault BACKLOG #2700). ``what`` is what is refused.
     Where the acceptance lifts it, the :func:`_remote_debug_audit` line is logged instead. The
-    caller logs it again once its log handlers exist, as BACKLOG #1989 does for its audit lines."""
+    caller logs it again once its log handlers exist, as BACKLOG #1989 does for its audit lines.
+    A refusal with the engine's hook missing also logs the ``remote_debug_unguarded`` entry."""
     audit = _remote_debug_audit(settings, posture, enforcing=enforcing, what=what)
     if audit is not None:
         logging.getLogger(__name__).warning("%s", audit)
@@ -2601,6 +2629,13 @@ def _remote_debug_refused(
     refused = remote_debug_refusal(posture) if enforcing else None
     if refused is None:
         return False
+    # Vault BACKLOG #3795: the residual line follows this gate, so without this a refused start
+    # would not say that the engine's hook did not answer. The relaunch the refusal names turns
+    # the interface off, and would leave what stopped the hook unreported.
+    if not posture.guard_installed and (unguarded := remote_debug_loosening(posture)) is not None:
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *unguarded
+        )
     print(f"error: refusing to {what}: {refused}.", file=sys.stderr)
     return True
 
@@ -5187,17 +5222,6 @@ def _supervise(args: argparse.Namespace) -> int:
     # forwarder (BACKLOG #2356).
     configure_logging("INFO")
 
-    # The supervisor has no API and builds no loosening list, so its own reading is reported here.
-    # Each shard reports its own through `serve`.
-    security_lines: list[tuple[str, str]] = []
-    remote_debug_reading = remote_debug_posture()
-    remote_debug = remote_debug_loosening(remote_debug_reading)
-    if remote_debug is not None:
-        security_lines.append(remote_debug)
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
-        )
-
     # ADR 0050 AC-9: anchor the discovery --config and the --db base under the project root HERE, before
     # discover_shard_specs runs load_config() — so `supervise --project-root R --config <relative>` from a
     # non-root CWD discovers shards under R, and each shard's <stem>_<shard>.db composes under R in the
@@ -5263,8 +5287,8 @@ def _supervise(args: argparse.Namespace) -> int:
 
     # Vault BACKLOG #2701: the start-up code check each engine shard's `serve` makes, for the same
     # reason as the gates around it, and because the supervisor's own interpreter ran that code
-    # too. The supervisor builds no loosening list, so its own reading is logged here, like the
-    # remote-debugging one above. Each engine shard reports its own through `serve`. The reading
+    # too. The supervisor builds no loosening list, so its own reading is logged below, once the
+    # start-file gate has passed. Each engine shard reports its own through `serve`. The reading
     # also searches the import path the engine shards inherit, so a module only they would run
     # refuses here.
     from messagefoundry.config.ai_policy import SecurityEnforcement
@@ -5282,10 +5306,23 @@ def _supervise(args: argparse.Namespace) -> int:
         return 2
     # Vault BACKLOG #2700: the supervisor's OWN process. Its engine shards start with the
     # interface off (messagefoundry/childenv.py), so none of them would refuse on it.
+    remote_debug_reading = remote_debug_posture()
     if _remote_debug_refused(
         settings, remote_debug_reading, enforcing=enforcing, what="start the fleet"
     ):
         return 2
+    # The supervisor has no API and builds no loosening list, so its own reading is reported here,
+    # and only after the refusal above (vault BACKLOG #3795 item 8): a fleet refused on the
+    # reading does not first log it as a residual. One exception: where the engine's hook did not
+    # answer, _remote_debug_refused logs `remote_debug_unguarded` before its refusal, on the log
+    # stream (stdout here), while the refusal goes to stderr.
+    security_lines: list[tuple[str, str]] = []
+    remote_debug = remote_debug_loosening(remote_debug_reading)
+    if remote_debug is not None:
+        security_lines.append(remote_debug)
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
+        )
     if settings.security.allow_remote_debugging:
         accepted = REMOTE_DEBUG_ACCEPTANCE_LOOSENING
         security_lines.append(accepted)
@@ -5422,13 +5459,8 @@ def _supervise(args: argparse.Namespace) -> int:
     if forwarder_installed:
         # The readings above were logged before a forwarder existed. Log them once more so the
         # off-box copy has them. With no forwarder installed this writes nothing.
-        for security_line in security_lines:
-            logging.getLogger(__name__).warning(
-                "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
-                "forwarder.)",
-                *security_line,
-            )
-        # Vault BACKLOG #2700: the AUDIT line the remote-debugging gate logged above, if any.
+        # Vault BACKLOG #2700: the AUDIT line the remote-debugging gate logged above, if any. First,
+        # because the gate logged it ahead of every line in security_lines (vault BACKLOG #3795).
         if (
             fleet_audit := _remote_debug_audit(
                 settings, remote_debug_reading, enforcing=enforcing, what="start the fleet"
@@ -5436,6 +5468,12 @@ def _supervise(args: argparse.Namespace) -> int:
         ) is not None:
             logging.getLogger(__name__).warning(
                 "%s (Logged again for the off-box forwarder.)", fleet_audit
+            )
+        for security_line in security_lines:
+            logging.getLogger(__name__).warning(
+                "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
+                "forwarder.)",
+                *security_line,
             )
 
     try:
@@ -6691,10 +6729,11 @@ def _host_gated_store_settings(
 ) -> ServiceSettings | int:
     """The host gate's settings for a command that acts on an EXISTING store, or an exit code.
 
-    Shared by ``admin-unlock``, ``admin-set-notify-email``, ``admin-reset-totp`` and
-    ``admin-revoke-sessions`` (BACKLOG #2614) so the gate is stated once (ADR 0171 and its
-    Amendment B, ADR 0183 Amendment A Wave 1c). ``provision-admin`` does not use it: it
-    legitimately creates the store, so it cannot carry the M-31 guard below.
+    Shared by ``admin-unlock``, ``admin-set-notify-email``, ``admin-reset-totp``,
+    ``admin-revoke-sessions`` (BACKLOG #2614) and ``issue-enrolment-code`` (ADR 0207) so the gate
+    is stated once (ADR 0171 and its Amendment B, ADR 0183 Amendment A Wave 1c).
+    ``provision-admin`` does not use it: it legitimately creates the store, so it cannot carry the
+    M-31 guard below.
     ``store attest-transit-bound`` and ``withdraw-transit-bound`` use it too (BACKLOG #2337). Each
     passes ``false_finding``, the result a fresh empty store would wrongly report for it.
 
@@ -6862,6 +6901,170 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         print(
             f"OK: cleared lockout for {args.username!r} ({states}; {cycles}, {kept}); "
             "the password is UNCHANGED"
+        )
+    return 0
+
+
+#: The 16-byte header every SQLite database file starts with.
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _starts_as_sqlite(path: str) -> bool:
+    """Whether ``path`` is empty or begins with the SQLite header. An empty file is the probe's
+    ``not_a_store`` case, so it is let through to that refusal; an unreadable one is the probe's
+    ``unchecked`` case."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(len(_SQLITE_HEADER))
+    except OSError:
+        return True
+    return head == b"" or head == _SQLITE_HEADER
+
+
+def _enrolment_code_host_refusal(settings: ServiceSettings) -> str | None:
+    """Why ``issue-enrolment-code`` refuses the store before it opens it, or ``None`` (ADR 0207
+    Amendment A, A4). On SQLite: another connection holds it, it is not a SQLite database, it holds
+    no store, or the probe cannot tell; a command that issues a credential fails closed when it
+    cannot tell, which is stricter than ``rotate-key``. A server store has no probe, so it proceeds
+    and the caller prints a note; the audit append there is serialized by the chain's own lock."""
+    from messagefoundry.config.settings import StoreBackend
+
+    if settings.store.backend != StoreBackend.SQLITE:
+        return None
+    where = _shown_path(settings.store.path)
+    probe = _sqlite_store_held_elsewhere(settings.store.path)
+    if probe.held:
+        return f"another connection holds the store at {where}; stop the engine and re-run"
+    if not _starts_as_sqlite(settings.store.path):
+        # The probe answers all-clear on a file SQLite cannot read as a database at all and leaves
+        # it to the store open, which rotate-key relies on. Here it is refused first (A4).
+        return f"{where} is not a SQLite database; check --db / [store].path"
+    if probe.not_a_store:
+        return (
+            f"{where} holds no MessageFoundry store; refusing to create one and issue a code into "
+            "it (check --db / [store].path)"
+        )
+    if probe.unchecked is not None:
+        return (
+            f"could not check whether an engine holds the store at {where}: {probe.unchecked}. "
+            "Stop the engine, make the store readable and writable by this account in WAL mode, "
+            "and re-run"
+        )
+    return None
+
+
+def _issue_enrolment_code(args: argparse.Namespace) -> int:
+    """Issue a directory account's single-use enrolment code from the host (ADR 0207 section 6).
+
+    THE GATE IS ``admin-unlock``'s HOST GATE (ADR 0171): whoever holds the service config, the store
+    and its key already holds the database. It issues for any directory account, not only an
+    Administrator, since host access already grants everything. It refuses a local account, a
+    disabled one and one that holds an engine factor, and its write is the same conditional sealed
+    write the route makes, so a disable or a factor that lands meanwhile leaves no code. It writes
+    the route's ``auth.enrolment_code_issued`` row, with ``via`` ``host``, the actor naming the OS
+    user, and no issuer, so a spend of it notifies nobody. Never logs the code; prints it once."""
+    import getpass
+
+    from messagefoundry.auth.notifications import deadline_utc
+    from messagefoundry.auth.service import (
+        ENROLMENT_CODE_ISSUE_REFUSALS,
+        enrolment_code_issue_refusal,
+        enrolment_code_issued_detail,
+        holds_engine_factor,
+        write_enrolment_code,
+    )
+    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal
+    from messagefoundry.last_resort import run_guarded
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+    )
+    from messagefoundry.store.row_seal import RowSealError
+
+    settings = _host_gated_store_settings(args)
+    if isinstance(settings, int):
+        return settings
+    refusal = _enrolment_code_host_refusal(settings)
+    if refusal is not None:
+        _emit_error(refusal, as_json=args.json)
+        return 2
+    if settings.store.backend != StoreBackend.SQLITE:
+        print(
+            f"note: a {settings.store.backend.value} store cannot be checked for a serving engine; "
+            "run this with the engine stopped",
+            file=sys.stderr,
+        )
+    posture = _command_hop_posture(settings)
+
+    async def run() -> tuple[str, dict[str, Any]]:
+        _warn_on_an_unrevoked_store_hop(settings)
+        store = await _open_store_or_refuse(
+            open_store(
+                settings.store,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
+        )
+        try:
+            user = await store.get_user_by_username(args.username)
+            if user is None:
+                return ("no-such-user", {})
+            reason = enrolment_code_issue_refusal(
+                user, holds_factor=await holds_engine_factor(store, user)
+            )
+            if reason is not None:
+                return (reason, {})
+            _refuse_an_unauditable_write(store)  # before the issue's write, not after it
+            issued = await write_enrolment_code(store, user, issuer_id=None)
+            if issued is None:
+                return ("changed", {})
+            await store.record_audit(
+                "auth.enrolment_code_issued",
+                actor=f"cli:{getpass.getuser()}",
+                detail=enrolment_code_issued_detail(user, issued, via="host"),
+            )
+            return (
+                "issued",
+                {"code": issued.code, "expires_at": issued.expires_at, "replaced": issued.replaced},
+            )
+        finally:
+            await store.close()
+
+    try:
+        outcome, report = run_guarded(run())
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _UnauditableWrite,
+        _StoreOpenRefused,
+    ) as exc:
+        _emit_error(str(exc), as_json=args.json)
+        return 2
+    except RowSealError:
+        return _emit_error(
+            _seal_refusal(args.username, "enrolment code issue") + ". Nothing was written",
+            as_json=args.json,
+        )
+    except sqlite3.DatabaseError as exc:
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    if outcome == "no-such-user":
+        return _emit_error(f"no account named {args.username!r}", as_json=args.json)
+    if outcome != "issued":
+        return _emit_error(
+            f"no enrolment code issued for {args.username!r}: "
+            f"{ENROLMENT_CODE_ISSUE_REFUSALS[outcome]}",
+            as_json=args.json,
+        )
+    if args.json:
+        print(json.dumps({"ok": True, "username": args.username, **report}))
+    else:
+        replaced = " It replaces the code issued before it." if report["replaced"] else ""
+        print(
+            f"Enrolment code for {args.username!r}, shown once: {report['code']}\n"
+            f"It expires at {deadline_utc(report['expires_at']) or 'its 24-hour limit'}."
+            f"{replaced} Hand it over "
+            "after confirming who is asking, never through the account's own mail or chat."
         )
     return 0
 
@@ -7760,8 +7963,9 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
 
     Under ``vault_transit`` a local key counts whichever provider is pinned, as it did before #2077:
     the store's cipher never resolves ``key_provider`` there, so an ignored local key cannot make the
-    store open plaintext. The DR backup and ``rotate-key`` paths DO resolve it, and refuse an ignored
-    key there through ``store.base._checked_active_key``."""
+    store open plaintext. The DR backup path DOES resolve it, and refuses an ignored key there
+    through ``store.base._checked_active_key``. ``rotate-key`` refuses this mode before it resolves
+    a key (BACKLOG #2109)."""
     from messagefoundry.store.keyprovider import provider_reads_a_configured_key
 
     store = settings.store
@@ -10729,6 +10933,10 @@ def _uploads_root_refusal(uploads_dir: str) -> str | None:
         )
 
 
+#: The docs/SECURITY.md section ``rotate-key``'s vault_transit refusal cites, by its bold title.
+_TRANSIT_AUDIT_RETIRE_SECTION = "Retiring an old version of the audit key breaks the chain"
+
+
 def _rotate_key(args: argparse.Namespace) -> int:
     """Re-encrypt every cipher-covered value under the active key (WP-5 key rotation, ASVS 11.2.2).
 
@@ -10736,7 +10944,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
     the prior key(s) in ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` so existing rows can be decrypted, then
     rotate. After it finishes the retired key can be removed. The store pass re-seals the
     secret-rotation fingerprint cells too, so no engine start needs the retired key to read them
-    (BACKLOG #3472, ADR 0213).
+    (BACKLOG #3472, ADR 0213). Under ``[store].cipher_provider = "vault_transit"`` it refuses right
+    after the settings load, before it resolves or unwraps a key, dials Vault or opens the store,
+    since no run there can finish (BACKLOG #2109).
 
     **Offline is checked on SQLite, once, before the store opens (BACKLOG #1915).** The command refuses
     a store another connection holds, which is how a serving engine holds it; see
@@ -10796,6 +11006,30 @@ def _rotate_key(args: argparse.Namespace) -> int:
     settings, detail = _load_service_settings(args.service_config, cli=cli)
     if settings is None:
         print(f"error: {detail}", file=sys.stderr)
+        return 2
+    if settings.store.cipher_provider == "vault_transit":
+        # BACKLOG #2109. The re-encrypt pass refuses the Transit cipher (BACKLOG #1165), so no run
+        # here can finish. Refuse before the key, the Vault hop and the writable open, which a run
+        # with a local key reached first, and before the "needs an active key" refusal below,
+        # which sends a run without one to set a key the Transit cipher never reads.
+        print(
+            'error: rotate-key does not run under [store].cipher_provider = "vault_transit". It '
+            "re-encrypts only under the in-process aesgcm cipher, and no command moves values "
+            "between that cipher and Transit, in either direction, or between two Transit keys "
+            "(BACKLOG #2109). To rotate the Transit data key, rotate it in Vault: that makes a "
+            "new version of the key named by MEFOR_STORE_TRANSIT_KEY, new values are sealed under "
+            "it, and values under an older version still read. Nothing re-seals those older "
+            "values, so rotating is safe and retiring a version that still seals a value or MACs "
+            "an audit row is not. At least these retire one. Raising the data key's "
+            "min_decryption_version above a version stops the values sealed under it from "
+            "decrypting. Raising the audit key's min_encryption_version above a version breaks "
+            "the audit chain at every row MACed under it; the audit key is the data key unless "
+            "MEFOR_STORE_TRANSIT_AUDIT_KEY names another. Trimming a version off either key does "
+            "the same to what it sealed or MACed, and cannot be undone. docs/SECURITY.md, under "
+            f"'{_TRANSIT_AUDIT_RETIRE_SECTION}', describes the audit chain break and what it "
+            "does to the attestation. Nothing was changed.",
+            file=sys.stderr,
+        )
         return 2
 
     posture = _command_hop_posture(settings)
@@ -10891,8 +11125,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
         )
         from messagefoundry.store.store import SecretRotationMetaStore
 
-        # BACKLOG #2109: in vault_transit mode the Transit key-type check runs inside this open, not
-        # at resolve_active_key above, so its refusal needs the same clean exit 2.
+        # A key the open cannot resolve, or a store hop the posture refuses, exits 2 as one at
+        # resolve_active_key above does. vault_transit mode never gets here (BACKLOG #2109).
         _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         store = await _open_store_or_refuse(open_store(settings.store, posture=posture))
         try:
@@ -12968,6 +13202,7 @@ _DISPATCH = {
     "cert": _cert,
     "protect-key": _protect_key,
     "admin-unlock": _admin_unlock,
+    "issue-enrolment-code": _issue_enrolment_code,
     "provision-admin": _provision_admin,
     "store": _store,
     "check-privileges": _check_privileges,

@@ -59,6 +59,8 @@ from pathlib import Path
 from messagefoundry.config.key_file_access import _UNREACHABLE_WINERRORS
 from messagefoundry.config.snapshot import is_missing_directory
 from messagefoundry.controlchars import scrub_log_argument
+from messagefoundry.file_lock import lock_exclusive as _try_lock
+from messagefoundry.file_lock import unlock as _unlock
 
 __all__ = [
     "CANDIDATE_DIR_SUFFIX",
@@ -441,45 +443,10 @@ def _acquire(
         time.sleep(_LOCK_POLL_S)
 
 
-def _try_lock(fd: int) -> bool:
-    """One non-blocking attempt at an exclusive lock. ``False`` when another handle holds it.
-
-    ``flock`` on POSIX, not ``lockf``: a ``lockf`` lock belongs to the process, so two threads of one
-    process would not exclude each other. ``msvcrt.locking`` on Windows is per handle already."""
-    if sys.platform == "win32":
-        import msvcrt
-
-        os.lseek(fd, 0, os.SEEK_SET)
-        try:
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        except OSError as exc:
-            # A held range refuses with EACCES or EDEADLOCK, the CRT's two contention codes (the same
-            # reading as `pipeline/dr_backup.py` and `api/tls.py`). Anything else is a real fault.
-            if exc.errno not in (errno.EACCES, errno.EDEADLOCK):
-                raise
-            return False
-        return True
-    import fcntl
-
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return False
-    return True
-
-
 def _release(fd: int) -> None:
     """Drop the lock on ``fd``. A failure is harmless: closing the handle drops it anyway."""
     with contextlib.suppress(OSError):
-        if sys.platform == "win32":
-            import msvcrt
-
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        _unlock(fd)
 
 
 def _fsync_dir(directory: Path) -> None:

@@ -2869,10 +2869,14 @@ def test_the_twelfth_sweep_probes_mfa_and_the_first_factor_order(
             f"AuthService.{enrol} is gone; the README and the early-adopter guide say TOTP and "
             "passkeys are built."
         )
+    # `require` delegates its checks to `_admit`, which every derived gate shares (BACKLOG #1197).
+    assert _called(ast.parse(textwrap.dedent(inspect.getsource(api_security.require))), "_admit"), (
+        "api.security.require no longer runs _admit, where the factor access gate lives."
+    )
     assert _called(
-        ast.parse(textwrap.dedent(inspect.getsource(api_security.require))), "mfa_satisfied"
+        ast.parse(textwrap.dedent(inspect.getsource(api_security._admit))), "mfa_satisfied"
     ), (
-        "api.security.require no longer asks mfa_satisfied; the docs say the factor is an access gate."
+        "api.security._admit no longer asks mfa_satisfied; the docs say the factor is an access gate."
     )
 
     # 2. Wave 2 (ADR 0197 Amendment A): the first factor of an account the requirement covers is
@@ -4929,7 +4933,8 @@ def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
     """BACKLOG #2239. The step-up section said "the passkey leg does not ask the directory", which
     was true until ``finish_webauthn_assertion`` gained the same directory check ``verify_mfa`` has
     (#2023). This pins the call, then refuses the old sentence and asks for the new citation. The
-    behaviour (refused before the challenge is taken, nothing charged) is pinned in
+    behaviour (asked only after the assertion verifies, before the sign count moves, nothing
+    charged) is pinned in
     ``tests/test_passkey_directory_recheck.py``, not by this AST read."""
     assertion = _service_func("finish_webauthn_assertion")
     helper = _service_func("_directory_vouches_for_factor")
@@ -4967,7 +4972,8 @@ def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
     for token in (
         "`auth.webauthn_failed`",
         "`reason=directory_unconfirmed`",
-        "challenge in flight",
+        "only once the assertion has verified",
+        "ceremony back in flight",
     ):
         assert token in paragraph, f"the passkey leg's directory paragraph must name {token}"
 

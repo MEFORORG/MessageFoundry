@@ -558,6 +558,52 @@ def test_a_url_query_credential_over_verify_off_is_refused(
     _assert_credential_refusal(exc)
 
 
+@pytest.mark.parametrize("name", ["code", "CODE", "code1"])
+@pytest.mark.parametrize("cell", _CELLS)
+def test_a_url_code_parameter_over_verify_off_is_refused(
+    cell: str, name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3533 item 7: ``?code=`` carries an Azure Functions function key, and the
+    query heuristic leaves it out, so this refusal counts it itself."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    url = f"{_HTTPS[cell][2]}?{name}={_SECRET}"
+    with active_hop_posture(_STAGING), pytest.raises(ValueError, match=_CREDENTIAL_REFUSAL) as exc:
+        _build_raw(cell, {"verify_tls": False, "url": url})
+    assert f"url query parameter {name}" in str(exc.value)
+    _assert_credential_refusal(exc)
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+@pytest.mark.parametrize("declared", ["attested", "accepted"])
+def test_a_url_code_parameter_over_declared_cleartext_is_refused(
+    cell: str, declared: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The off-box cleartext rule reads the same list (vault BACKLOG #3533 item 7)."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    ctype, factory, url = _CLEARTEXT[cell]
+    with (
+        active_hop_posture(_PROD),
+        pytest.raises(
+            InsecureHopRefused, match="HTTP cleartext credentials: .*with no escape"
+        ) as exc,
+    ):
+        _build((ctype, factory, f"{url}?code={_SECRET}"), **{declared: True})
+    assert "url query parameter code" in str(exc.value)
+    assert _SECRET not in str(exc.value)
+
+
+def test_a_code_parameter_is_counted_by_the_refusal_alone() -> None:
+    """The heuristic other readers use (the WARNING, ``check`` and the loosening report) still
+    leaves ``code`` out, so an ordinary ``?code=404`` there is not called a credential."""
+    from messagefoundry.secretscrub import credential_query_params
+
+    url = "https://api.example.com/x?code=404&fmt=json"
+    assert credential_query_params(url) == []
+    assert credential_query_params(url, refusal=True) == ["code"]
+    # The name is matched whole, so a longer name holding the word is not counted.
+    assert credential_query_params("https://a.example/x?zipcode=1", refusal=True) == []
+
+
 def test_a_proxy_credential_or_a_cleartext_url_is_not_this_refusals_case() -> None:
     """The proxy credential goes to the proxy inside the CONNECT, never across this hop, so the
     credential list does not name it. An http url has no TLS to verify (refuse_cleartext_credentials

@@ -68,7 +68,7 @@ from messagefoundry.childenv import hook_environment
 from messagefoundry.config.settings import DrSettings, StoreBackend
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pipeline.dr_backup import VerifyResult, run_restore_verify
+from messagefoundry.pipeline.dr_backup import VerifyResult, join_before_checks, run_restore_verify
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import Store
@@ -942,17 +942,27 @@ class DrCoordinator:
         if verify.status == "KEY_MISMATCH":
             await self._record_aborted(
                 "key",
-                "the DR site does not hold the DEK the cold-seed archive is encrypted under "
-                f"(KEY_MISMATCH: {verify.reason or 'key fingerprint differs'}) — env/external KeyProvider "
-                "required at the DR site (DPAPI is machine-bound); refusing to activate (ADR 0048 AC-9)",
+                # Added before any staging check the reason ends in, so nothing follows a check.
+                join_before_checks(
+                    "the DR site does not hold the DEK the cold-seed archive is encrypted under "
+                    f"(KEY_MISMATCH: {verify.reason or 'key fingerprint differs'}",
+                    "",
+                    ") — env/external KeyProvider required at the DR site (DPAPI is "
+                    "machine-bound); refusing to activate (ADR 0048 AC-9)",
+                ),
                 actor,
                 now,
             )
         if not verify.ok:
             await self._record_aborted(
                 "seed",
-                f"cold-seed restore-verify {verify.status}: {verify.reason or 'archive did not verify'} "
-                "— refusing to activate against an unverified store (ADR 0048 fail-closed, AC-9)",
+                join_before_checks(
+                    f"cold-seed restore-verify {verify.status}: "
+                    f"{verify.reason or 'archive did not verify'}",
+                    " ",
+                    "— refusing to activate against an unverified store (ADR 0048 fail-closed, "
+                    "AC-9)",
+                ),
                 actor,
                 now,
             )

@@ -694,9 +694,9 @@ def test_an_early_security_reading_is_logged_again_only_once_a_forwarder_is_inst
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The supervisor reports its remote-debugging reading before it has read any settings, so
-    before a forwarder can exist. With one installed the line is logged a second time, so the
-    off-box copy has it. With none it is logged once, as before."""
+    """The supervisor reports its remote-debugging reading once its own remote-debugging gate has
+    passed, before a forwarder can exist. With one installed the line is logged a second time, so
+    the off-box copy has it. With none it is logged once, as before."""
     monkeypatch.setattr(
         "messagefoundry.__main__.remote_debug_loosening", lambda posture: ("probe_key", "a probe")
     )
