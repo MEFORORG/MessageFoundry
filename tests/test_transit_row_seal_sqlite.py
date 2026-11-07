@@ -178,8 +178,12 @@ async def test_an_hmac_only_outage_after_a_good_check_writes_nothing(
     assert row == (seal, 0)
 
 
-async def test_a_session_under_a_retired_key_ends_quietly_on_a_write(tmp_path: Path) -> None:
-    """Owner ruling 2026-11-07: the write path ends it, with no RowSealError and no extra call."""
+async def test_a_session_under_a_retired_key_is_declined_on_a_write_as_on_main(
+    tmp_path: Path,
+) -> None:
+    """The helper names it RowSealKeyRetiredError (owner ruling 2026-11-07), found in one check;
+    the SQLite writer still declines it as RowSealError and writes nothing, as every backend does,
+    so the reader's quiet end stays the only end until the callers name the new type."""
     path = tmp_path / "retired.db"
     store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
     try:
@@ -190,18 +194,26 @@ async def test_a_session_under_a_retired_key_ends_quietly_on_a_write(tmp_path: P
         assert await store.create_session(
             token_hash=token, user_id="u-1", expires_at=time.time() + 3600
         )
-        # The audit key changes; the old one is listed as retired.
+        seal = _seal_of(path, "SELECT seal FROM sessions WHERE token_hash=?", (token,))
         new = FakeBackend()
         store._row_sealer = TransitRowSealer(new, retired_key_names=[RETIRED])  # type: ignore[assignment]
-        await store.mark_session_reauthed(token)
-        assert new.verify_calls == 1
+        with pytest.raises(RowSealError):
+            await store.mark_session_reauthed(token)
+        assert new.verify_calls == 1  # one check, no second Transit call
         conn = sqlite3.connect(path)
         try:
-            revoked, seal = conn.execute(
+            revoked, kept = conn.execute(
                 "SELECT revoked_at, seal FROM sessions WHERE token_hash=?", (token,)
             ).fetchone()
         finally:
             conn.close()
-        assert revoked is not None and seal == ""
+        assert revoked is None and kept == seal
+        # Control: a session under the active key is stamped and stays live.
+        live = "ab" * 32
+        assert await store.create_session(
+            token_hash=live, user_id="u-1", expires_at=time.time() + 3600
+        )
+        await store.mark_session_reauthed(live)
+        assert _seal_of(path, "SELECT seal FROM sessions WHERE token_hash=?", (live,)) != ""
     finally:
         await store.close()

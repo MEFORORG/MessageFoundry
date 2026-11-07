@@ -18481,8 +18481,8 @@ class MessageStore:
 
         Reads the unrevoked row, verifies its seal, applies ``change``, seals the result and writes
         every sealed column with a compare on the seal it read. Returns the new row, or ``None`` when
-        there is no unrevoked row, the compare lost to a concurrent write, or the row was sealed
-        under a retired key, which it ends (revokes) quietly instead. Raises
+        there is no unrevoked row or the compare lost to a concurrent write. A row sealed under a
+        retired key raises ``RowSealError``, as on ``main``. Raises
         :class:`RowSealError` (Forged) or, under a Transit sealer, its sibling
         :class:`RowSealUnverifiableError` or :class:`TransitSealUnavailableError` (Outage), and
         writes nothing, when the row it read does not verify or cannot be checked: re-sealing
@@ -18500,13 +18500,13 @@ class MessageStore:
         except RowSealKeyRetiredError:
             retired = True
         if retired:
-            # Owner ruling 2026-11-07: a session sealed under a retired key ends quietly, with no
-            # report and no further Transit call, as revoke_session ends one.
-            await self._db.execute(
-                "UPDATE sessions SET revoked_at=?, seal='' WHERE token_hash=? AND revoked_at IS NULL",
-                (time.time(), token_hash),
-            )
-            return None
+            # Raised as main raises it, on every backend alike. The helper names a retired-key
+            # session as its own type (owner ruling 2026-11-07), but ending it HERE would hide the
+            # end from every caller: revoke_user_sessions would miscount its kept session and the
+            # stamp legs would record a success for a session just ended. So the write declines it
+            # as before, and the reader's quiet end (AuthService, key_changed) stays the one end,
+            # until each caller of this writer names the new type (the catch census).
+            raise RowSealError(SESSION_KIND)
         updated = await seal_session_async(self._row_sealer, change(current))
         cur = await self._db.execute(_SESSION_RESEAL, session_reseal_params(updated, current))
         return updated if cur.rowcount == 1 else None
