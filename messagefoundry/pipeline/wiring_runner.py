@@ -12568,13 +12568,17 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
     def settle(queued: asyncio.Future[None]) -> None:
         # A work item the executor cancelled or failed before run() began leaves ``built`` pending;
         # settle it so the caller is not left waiting.
+        # Raised as the WiringError every build failure is (_normalised_build_failure), so a route
+        # that records a refused build records this one too (Lander hold 6703229134, item 2).
         if built.done():
             return
         if queued.cancelled():
             # A failure, not a cancellation: the caller was not cancelled, and must not read as if.
-            built.set_exception(RuntimeError("the executor cancelled the connector build"))
+            built.set_exception(WiringError("connector build failed: the executor cancelled it"))
         elif (exc := queued.exception()) is not None:
-            built.set_exception(exc)
+            failure = WiringError(f"connector build failed: {exc}")
+            failure.__cause__ = exc
+            built.set_exception(failure)
 
     loop.run_in_executor(None, run).add_done_callback(settle)
     try:
@@ -12596,7 +12600,8 @@ def _close_abandoned_build(
     """Close the connector ``work`` built for a caller that was cancelled while it ran
     (:func:`_build_off_loop`). A build that was cancelled or failed built nothing to close. Runs on
     the build's thread once it finishes, or at once if it already had, so the close is handed to
-    ``loop``; a loop that has closed is logged, never passed over silently."""
+    ``loop``. A loop that is not running, closed or stopped and not yet closed, would never run the
+    close, so that is logged rather than passed over silently (Lander hold 6703229134, item 1)."""
     if work.cancelled() or work.exception() is not None:
         return
     built = work.result()
@@ -12606,13 +12611,16 @@ def _close_abandoned_build(
         close = built.stop
     else:
         return
-    try:
-        loop.call_soon_threadsafe(_start_abandoned_close, close)
-    except RuntimeError:
-        log.warning(
-            "a %s built for a cancelled caller could not be closed: its loop closed",
-            type(built).__name__,
-        )
+    if loop.is_running():
+        try:
+            loop.call_soon_threadsafe(_start_abandoned_close, close)
+            return
+        except RuntimeError:
+            pass  # it closed after the check
+    log.warning(
+        "a %s built for a cancelled caller could not be closed: its loop is not running",
+        type(built).__name__,
+    )
 
 
 def _start_abandoned_close(close: Callable[[], Awaitable[None]]) -> None:

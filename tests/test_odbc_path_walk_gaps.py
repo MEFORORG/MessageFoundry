@@ -1325,6 +1325,80 @@ def test_hold_d_a_build_that_outlives_its_loop_logs_that_it_was_not_closed(
     assert any("could not be closed" in r.getMessage() for r in caplog.records)
 
 
+def test_hold_d_a_build_whose_loop_stopped_unclosed_logs_that_it_was_not_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A build whose caller was cancelled and whose loop has stopped, but is not yet closed, when
+    its thread finishes: a close queued there would never run. That is logged, never dropped
+    silently. Red (Lander hold 6703229134, item 1): the close was queued on the stopped loop, and
+    nothing was logged."""
+    from messagefoundry.pipeline import wiring_runner
+
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def slow_build() -> object:
+        entered.set()
+        release.wait(5)
+        try:
+            return object.__new__(database.DatabaseDestination)
+        finally:
+            finished.set()
+
+    caplog.set_level(logging.WARNING, logger=wiring_runner.log.name)
+    loop = asyncio.new_event_loop()
+    try:
+        task = loop.create_task(wiring_runner._build_off_loop(None, slow_build))
+        loop.run_until_complete(asyncio.to_thread(entered.wait, 5))
+        task.cancel()
+        loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+        release.set()  # the loop is stopped and not closed while the build finishes
+        assert finished.wait(5)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not any(
+            "could not be closed" in r.getMessage() for r in caplog.records
+        ):
+            time.sleep(0.01)
+        assert any("could not be closed" in r.getMessage() for r in caplog.records)
+    finally:
+        release.set()
+        loop.close()
+
+
+@pytest.mark.parametrize("fault", ["cancelled", "broken"])
+def test_hold_an_executor_fault_reaches_the_caller_as_a_wiring_error(fault: str) -> None:
+    """A work item the executor cancels or fails before the build runs reaches the caller as the
+    WiringError every build failure is, with the executor's fault as its cause, so a route that
+    records a refused build records this one too. Red (Lander hold 6703229134, item 2): a bare
+    RuntimeError or BrokenThreadPool escaped."""
+    from concurrent.futures import Future, ThreadPoolExecutor
+    from concurrent.futures.thread import BrokenThreadPool
+
+    from messagefoundry.config.wiring import WiringError
+    from messagefoundry.pipeline import wiring_runner
+
+    class _FaultyExecutor(ThreadPoolExecutor):
+        def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Future[Any]:
+            work: Future[Any] = Future()
+            if fault == "cancelled":
+                work.cancel()
+            else:
+                work.set_exception(BrokenThreadPool("synthetic broken pool"))
+            return work
+
+    async def main() -> BaseException | None:
+        asyncio.get_running_loop().set_default_executor(_FaultyExecutor(max_workers=1))
+        try:
+            await asyncio.wait_for(wiring_runner._build_off_loop(None, object), timeout=5)
+        except Exception as exc:  # noqa: BLE001 - the test reads what reached the caller
+            return exc
+        return None
+
+    raised = asyncio.run(main())
+    assert isinstance(raised, WiringError), raised
+    if fault == "broken":
+        assert isinstance(raised.__cause__, BrokenThreadPool)
+
+
 def test_hold_e_an_abandoned_build_that_has_not_started_never_runs() -> None:
     """A caller cancelled while its build still waits in the executor's queue cancels the build,
     so nothing walks a folder or reads a key file for a caller that is gone. Red (Lander hold
