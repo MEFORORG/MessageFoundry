@@ -1682,30 +1682,35 @@ def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
     NOTHING IS PASSED THROUGH (the eighth hold). Every refusal here is a new exception, raised
     outside the handler ``from None``, with a fixed text chosen by the builder's error's class as
     read with ``type``: a hop refusal as an ``InsecureHopRefused``, a ``StoreTlsRefused`` kept as
-    one, and a host fault as :class:`_TlsHostFault`. Nothing is read from the error and no chain is
+    one with the settings text, and a host fault as :class:`_TlsHostFault`. Nothing is read from the error and no chain is
     kept, so the builder's own text, the ``ssl`` or ``cryptography`` library's included, is not
     printed from here."""
     try:
-        return _verifying_context(settings)
-    except ValueError as exc:
-        kind = type(exc)
-        judged = not issubclass(kind, (InsecureHopRefused, OSError))
-        reading = _codec_chain_reading(exc) if judged else None
-    # Built outside the handler, so nothing raised here has the builder's error as its context;
-    # chosen by the class alone, read with ``type``, so nothing is read from the error.
-    refusal: ValueError
-    if issubclass(kind, StoreTlsRefused):
-        refusal = StoreTlsRefused(_TLS_HOP_REFUSED)
-    elif issubclass(kind, InsecureHopRefused):
-        refusal = InsecureHopRefused(_TLS_HOP_REFUSED)
-    elif issubclass(kind, OSError):
-        refusal = _TlsHostFault(_TLS_HOST_FAULT)
-    elif reading is None:
-        refusal = StoreTlsRefused(_TLS_REFUSED)
-    else:
-        refusal = StoreTlsRefused(f"{_TLS_UNBUILT}: an error {reading}, not quoted")
-    _flush_unjudged()
-    raise refusal from None
+        try:
+            return _verifying_context(settings)
+        except ValueError as exc:
+            kind = type(exc)
+            judged = not issubclass(kind, (InsecureHopRefused, OSError))
+            reading = _codec_chain_reading(exc) if judged else None
+        # Built outside the handler, so nothing raised here has the builder's error as its
+        # context; chosen by the class alone, read with ``type``, so nothing is read from the error.
+        # A ``StoreTlsRefused`` is a refusal of the settings, not of the posture.
+        refusal: ValueError
+        if issubclass(kind, StoreTlsRefused):
+            refusal = StoreTlsRefused(_TLS_REFUSED)
+        elif issubclass(kind, InsecureHopRefused):
+            refusal = InsecureHopRefused(_TLS_HOP_REFUSED)
+        elif issubclass(kind, OSError):
+            refusal = _TlsHostFault(_TLS_HOST_FAULT)
+        elif reading is None:
+            refusal = StoreTlsRefused(_TLS_REFUSED)
+        else:
+            refusal = StoreTlsRefused(f"{_TLS_UNBUILT}: an error {reading}, not quoted")
+        raise refusal from None
+    finally:
+        # In ``finally``, so a line held for a judgement that an interrupt escaped is still written
+        # here, not by a later, unrelated refusal on this thread.
+        _flush_unjudged()
 
 
 class _TlsHostFault(OSError, ValueError):

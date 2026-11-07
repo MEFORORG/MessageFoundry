@@ -394,7 +394,9 @@ def test_an_unset_address_refuses_and_vault_addr_is_never_judged_or_dialled(
     assert type(c.value) is own
     # The store's key resolution and cipher build replace the provider's text with a fixed one
     # (the eighth hold on engine PR 2818); the secrets provider keeps its own.
-    if section == "store":
+    if entry is _transit:
+        assert str(c.value) == store_base._TRANSIT_BUILD_TEXTS[4]
+    elif section == "store":
         assert str(c.value) == store_base._KEY_SEAM_TEXTS[4]
     else:
         assert f"MEFOR_{section.upper()}_VAULT_ADDR is not set" in str(c.value)

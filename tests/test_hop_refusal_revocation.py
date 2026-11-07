@@ -657,6 +657,12 @@ def test_the_default_path_refuses_a_crl_bundle_that_adds_a_trust_anchor(crl_bund
     # The open's refusal text is fixed (engine PR 2818's seventh hold) and, since the eighth hold,
     # raised from None: the builder's text is not kept as its cause.
     assert exc.value.__cause__ is None and exc.value.__suppress_context__
+    # The control: the builder itself, unwrapped, refuses for the trust-anchor reason, so the open's
+    # fixed refusal above is this check's and not some other failure's.
+    from messagefoundry.store.postgres import _verifying_context
+
+    with pytest.raises(ValueError, match="not already in this hop's trust store"):
+        _verifying_context(_pg(ssl_crl_file=crl_bundle))
 
 
 def test_the_store_crl_is_refused_on_a_hop_that_verifies_nothing(bare_crl: str) -> None:

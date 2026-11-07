@@ -32,15 +32,20 @@
   refusal with a fixed text the site chooses, raised from `None`, and nothing is passed through.**
   The new refusal's class follows the error's: an `InsecureHopRefused`, a `DpapiError` or a
   `DpapiUnavailable` is replaced by one of its own class, any other `ValueError` by a
-  `StoreCipherConfigError`, and any other `Exception` by a `KeyProviderError`. Its text names the
-  settings for that case, such as `[store].cipher_provider`, `[store].key_provider` or
-  `[store].encryption_key_file`, and reads nothing from the error: an exact
+  `StoreCipherConfigError`, and any other `Exception` by a `KeyProviderError`; at the cipher build
+  a hop refusal is a `StoreCipherConfigError` too, as every `ValueError` there. Its text names the
+  settings for that case, such as `[store].cipher_provider`, `[store].key_provider`,
+  `[store].encryption_key_file` or, under `vault_transit`, the Transit cipher's own settings, and
+  reads nothing from the error: an exact
   `StoreCipherConfigError` or `KeyProviderError` is replaced too, since its arguments could have
   been reassigned, and so is a subclass, since its own `__str__` could print a byte. A refusal the
-  key resolution raised keeps the text it recorded when it was built, and one whose error or cause
+  key resolution raised keeps the text it recorded when it was built, the key check's refusals
+  built from the settings alone among them, and one whose error or cause
   is exactly the Vault hop's marked refusal gets a fixed text naming the store's Vault levers,
   `[store].vault_revocation_attested` among them. The refusal keeps no cause and no context, so a
-  traceback of it does not print the error's own text. Before, a `ValueError` from the build was
+  traceback of it does not print the error's own text, and the site drops the error, so no frame
+  local of the refusal's traceback holds it. The replaced error's class is logged as a WARNING by
+  its name alone. Before, a `ValueError` from the build was
   refused with its own text, and an error of any other class passed through as it was.
   (`BACKLOG #4882`)
 - **The PostgreSQL store's TLS context refusal at the open, `StoreTlsRefused`, carries a fixed text

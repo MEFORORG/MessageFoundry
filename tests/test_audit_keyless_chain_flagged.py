@@ -575,9 +575,7 @@ async def test_open_store_refuses_a_key_the_provider_does_not_read(
     """The seam no command skips. A fresh store under the opt-out and an existing keyed store both
     opened under the identity cipher before this item; both now refuse before the backend opens."""
     fresh = shell / "fresh.db"
-    # The cipher build replaces the key check's text with a fixed one (the eighth hold on engine
-    # PR 2818), so "reads only" is not shown through the open.
-    with pytest.raises(KeyProviderError, match="its text not shown"):
+    with pytest.raises(KeyProviderError, match="reads only"):
         await open_store(
             _unread(provider, source, path=str(fresh)), create=True, keyless_chain_refusal=None
         )
@@ -589,7 +587,7 @@ async def test_open_store_refuses_a_key_the_provider_does_not_read(
     )
     await store.record_audit("seed", actor="test")
     await store.close()
-    with pytest.raises(KeyProviderError, match="its text not shown"):
+    with pytest.raises(KeyProviderError, match="reads only"):
         await open_store(_unread(provider, source, path=str(keyed)), keyless_chain_refusal=None)
 
 

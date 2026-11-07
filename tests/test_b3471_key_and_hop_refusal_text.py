@@ -128,6 +128,13 @@ def _decode_error() -> UnicodeDecodeError:
     raise AssertionError("the synthetic key bytes decoded as ASCII")
 
 
+@pytest.fixture(autouse=True)
+def _no_held_log_line() -> None:
+    """A test that calls the judgement directly leaves its log line held for the next site on the
+    thread; start every test with none, so a count of log calls is this test's own."""
+    store_base._UNLOGGED.lines = []
+
+
 def _with_provider(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
     """Every store key resolution raises ``error``."""
     monkeypatch.setattr(
@@ -1690,7 +1697,10 @@ def test_reassigned_arguments_are_not_passed_through(
     _with_provider(monkeypatch, error)
     escaped = _escaping(lambda: getattr(store_base, entry)(StoreSettings()))
     assert escaped is not error
-    assert isinstance(escaped, kind if kind is not StoreCipherConfigError else ValueError)
+    # The cipher build raises a hop refusal as a StoreCipherConfigError, as every ValueError there.
+    built_as_value = kind is InsecureHopRefused and entry == "build_store_cipher"
+    expected = ValueError if kind is StoreCipherConfigError or built_as_value else kind
+    assert isinstance(escaped, expected), type(escaped)
     _assert_no_key_byte(_whole(escaped))
     assert escaped.__cause__ is None and escaped.__suppress_context__
 
@@ -1784,3 +1794,23 @@ def test_a_failing_log_handler_prints_no_judged_error(
     printed = capsys.readouterr().err
     assert "synthetic: the handler failed" in printed  # the control: the handler did fail
     _assert_no_key_byte(printed)
+
+
+@pytest.mark.parametrize(
+    "entry", ["build_store_cipher", "resolve_active_key", "resolve_decrypt_keys"]
+)
+@pytest.mark.parametrize("codec", [True, False], ids=["codec", "plain"])
+def test_the_refusal_traceback_holds_no_frame_local_of_the_error(
+    entry: str, codec: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 1 of the eighth hold's review: the site kept the caught error as a frame local after
+    its handler, so a renderer that prints locals printed it, byte included, from the refusal's
+    own traceback."""
+    error: Exception = _decode_error() if codec else ValueError(f"synthetic: {_decode_error()}")
+    _with_provider(monkeypatch, error)
+    escaped = _escaping(lambda: getattr(store_base, entry)(StoreSettings()))
+    rendered = "".join(
+        traceback.TracebackException.from_exception(escaped, capture_locals=True).format()
+    )
+    assert "refusal =" in rendered  # the control: the site's own frame locals were rendered
+    _assert_no_key_byte(rendered)

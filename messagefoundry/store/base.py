@@ -3374,17 +3374,20 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
     building the cipher, such as ``rotate-key``. The key check after a provider answers is not
     judged here."""
     try:
-        key = resolve_key_provider(settings, posture=posture).active_key()
-    except Exception as exc:
-        caught, refusal = exc, _codec_safe_refusal(exc)
-    else:
-        return _checked_active_key(key, settings)
-    # Outside the handler, so nothing raised here, at the recursion limit included, has the
-    # caught error as its context.
-    if refusal is None:
-        refusal = _fresh_refusal(caught, _KEY_SEAM_TEXTS)
-    _flush_unjudged()
-    raise refusal from None
+        try:
+            key = resolve_key_provider(settings, posture=posture).active_key()
+        except Exception as exc:
+            caught, refusal = exc, _codec_safe_refusal(exc)
+        else:
+            return _checked_active_key(key, settings)
+        # Outside the handler, so nothing raised here, at the recursion limit included, has the
+        # caught error as its context; and the caught error is dropped, so the refusal's traceback
+        # holds no frame local that reaches it.
+        refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
+        del caught
+        raise refusal from None
+    finally:
+        _flush_unjudged()
 
 
 def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
@@ -3400,13 +3403,17 @@ def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
 
     if key:
         return key
+    # Each text is built from the settings alone, so it is recorded (:func:`_recorded`) and a site
+    # that replaces the refusal keeps it.
     if settings.key_provider in _EXTERNAL_PROVIDERS:
-        raise KeyProviderError(
+        text = (
             f"[store].key_provider={settings.key_provider!r} resolved no key; refusing to use "
             "the identity (plaintext) cipher in its place."
         )
+        raise _recorded(KeyProviderError(text), text)
     if (unread := unread_key_refusal(settings)) is not None:
-        raise KeyProviderError(f"resolved no key, refusing to continue: {unread}")
+        text = f"resolved no key, refusing to continue: {unread}"
+        raise _recorded(KeyProviderError(text), text)
     return key
 
 
@@ -3430,20 +3437,21 @@ def resolve_decrypt_keys(
     anything the fallback refusal itself raises propagate in place of the refusal or the error,
     with no cause and no context."""
     try:
-        provider = resolve_key_provider(settings, posture=posture)
-        active = _checked_active_key(provider.active_key(), settings)
-        # Copied here, so a provider whose sequence reads as it is iterated is refused here too.
-        retired_keys = list(provider.retired_keys())
-    except Exception as exc:
-        caught, refusal = exc, _codec_safe_refusal(exc)
-    else:
-        return _keyring(active, retired_keys)
-    # Outside the handler, so nothing raised here, at the recursion limit included, has the
-    # caught error as its context.
-    if refusal is None:
-        refusal = _fresh_refusal(caught, _KEY_SEAM_TEXTS)
-    _flush_unjudged()
-    raise refusal from None
+        try:
+            provider = resolve_key_provider(settings, posture=posture)
+            active = _checked_active_key(provider.active_key(), settings)
+            # Copied here, so a provider whose sequence reads as it is iterated is refused here too.
+            retired_keys = list(provider.retired_keys())
+        except Exception as exc:
+            caught, refusal = exc, _codec_safe_refusal(exc)
+        else:
+            return _keyring(active, retired_keys)
+        # As at :func:`resolve_active_key`.
+        refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
+        del caught
+        raise refusal from None
+    finally:
+        _flush_unjudged()
 
 
 def _keyring(active: str | None, retired_keys: Sequence[str]) -> list[str]:
@@ -3471,8 +3479,8 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     rotation posture as the message store, without reaching into a live ``Store`` instance's private
     cipher. No key configured → the identity cipher (plaintext), exactly like the store.
 
-    A ``ValueError`` from the build is raised as :class:`StoreCipherConfigError`, which subclasses
-    it: at least a key that is not base64 of 32 bytes, an unknown ``cipher_provider`` and a Transit
+    A ``ValueError`` from the build, a hop refusal included, is raised as a new
+    :class:`StoreCipherConfigError`, which subclasses it: at least a key that is not base64 of 32 bytes, an unknown ``cipher_provider`` and a Transit
     client setting it refuses. Each comes from the settings or the key provider before the store
     reads a row, so a caller can treat that class as "could not start" where a bare ``ValueError``
     from the open could mean anything (vault BACKLOG #3054, item 8).
@@ -3492,18 +3500,32 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     another class with a fixed text chosen by its class. A refusal the engine built itself keeps
     the text the engine recorded for it, never read from the instance. Nothing is passed through,
     and nothing is read from the error (the seventh and eighth holds on engine PR 2818)."""
+    texts = _TRANSIT_BUILD_TEXTS if settings.cipher_provider == "vault_transit" else _BUILD_TEXTS
     try:
-        return _build_store_cipher(settings, posture)
-    except Exception as exc:
-        caught, refusal = exc, _codec_safe_refusal(exc)
-    if refusal is None:
-        refusal = _fresh_refusal(caught, _BUILD_TEXTS)
-    # Outside the handler, so nothing raised here, at the recursion limit included, has the
-    # caught error as its context.
-    if refusal is None:
-        refusal = _fresh_refusal(caught, _KEY_SEAM_TEXTS)
-    _flush_unjudged()
-    raise refusal from None
+        try:
+            return _build_store_cipher(settings, posture)
+        except Exception as exc:
+            caught, refusal = exc, _codec_safe_refusal(exc)
+        # As at :func:`resolve_active_key`. A hop refusal is a ``StoreCipherConfigError`` here, as
+        # every ``ValueError`` from the build is, so each command's key arm still reports it.
+        refusal = _in_place_of(caught, refusal, texts, StoreCipherConfigError)
+        del caught
+        raise refusal from None
+    finally:
+        _flush_unjudged()
+
+
+def _in_place_of(
+    caught: Exception, refusal: Exception | None, texts: _SiteTexts, hop_as: type[Exception]
+) -> Exception:
+    """``refusal``, as :func:`_codec_safe_refusal` gave it, or, where it gave none, a new one from
+    :func:`_fresh_refusal`; called outside the handler. The replaced error's class is logged by
+    name alone (:func:`_log_unjudged`), so a replaced error is not swallowed silently."""
+    if refusal is not None:
+        return refusal
+    if _recorded_text(caught) is None:  # one the engine built is not news
+        _log_unjudged("an error was replaced with a fixed text", type(caught))
+    return _fresh_refusal(caught, texts, hop_as)
 
 
 #: The fixed texts :func:`_fresh_refusal` chooses from, by the replaced error's class: a hop
@@ -3511,7 +3533,9 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
 _SiteTexts = tuple[str, str, str, str, str]
 
 
-def _fresh_refusal(exc: Exception, texts: _SiteTexts) -> Exception:
+def _fresh_refusal(
+    exc: Exception, texts: _SiteTexts, hop_as: type[Exception] = InsecureHopRefused
+) -> Exception:
     """A new refusal in ``exc``'s place, for a site where :func:`_codec_safe_refusal` gave none,
     of the class its callers expect, chosen by ``exc``'s class as read with ``type``: an
     ``InsecureHopRefused``, a ``DpapiError``, a ``DpapiUnavailable``, a
@@ -3531,7 +3555,7 @@ def _fresh_refusal(exc: Exception, texts: _SiteTexts) -> Exception:
         hop = value = other = _VAULT_HOP_TEXT
     made: type[Exception]
     if issubclass(kind, InsecureHopRefused):
-        made, text = InsecureHopRefused, hop
+        made, text = hop_as, hop
     elif issubclass(kind, DpapiError):
         made, text = DpapiError, dpapi
     elif issubclass(kind, DpapiUnavailable):
@@ -3613,7 +3637,8 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
             return _refusal_for(exc)
         except Exception as judging:  # noqa: BLE001 -- fail closed: the judgement ran exc's own code
             swallowed = type(judging)
-        # Logged once the handler is left, so nothing the log call raises is chained to ``judging``.
+        # Held, and written once the site has left its handler, so nothing the log call raises is
+        # chained to ``judging`` or to the judged error.
         refusal = _refused(type(exc), _UNJUDGED)
         _log_unjudged("an error could not be judged for a codec error", swallowed)
         return refusal
@@ -3624,9 +3649,9 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
         raise
 
 
-#: The pass-through's text for every other ``ValueError`` from the build. It names the settings
-#: and the failure modes the build checks, and reads nothing from the error (the seventh hold on
-#: engine PR 2818); the error stays on the chain as the cause.
+#: The text for every other ``ValueError`` from the build. It names the settings and the failure
+#: modes the build checks, and reads nothing from the error (the seventh hold on engine PR 2818);
+#: the refusal is raised from ``None``, so the error is not on its chain (the eighth hold).
 _UNTEXTED = (
     "the store cipher could not be built from the settings: check [store].cipher_provider "
     "('aesgcm' or 'vault_transit'), the Vault Transit settings when it is vault_transit, and every "
@@ -3671,6 +3696,15 @@ _KEY_SEAM_TEXTS: _SiteTexts = (
 #: :func:`_fresh_refusal`'s texts at ``build_store_cipher``: the key seam's, with
 #: :data:`_UNTEXTED` for a ``ValueError``.
 _BUILD_TEXTS: _SiteTexts = (*_KEY_SEAM_TEXTS[:3], _UNTEXTED, _KEY_SEAM_TEXTS[4])
+
+#: The cipher build's texts under ``cipher_provider = 'vault_transit'``, chosen by that setting: an
+#: error of the Transit cipher's own build names its settings, not ``[store].key_provider``.
+_TRANSIT_BUILD_TEXTS: _SiteTexts = (
+    *_BUILD_TEXTS[:4],
+    f"{_KEY_SOURCE}: the Vault Transit cipher could not be built, its text not shown; check "
+    "[store].cipher_provider = 'vault_transit', MEFOR_STORE_VAULT_ADDR, MEFOR_STORE_VAULT_TOKEN, "
+    "MEFOR_STORE_TRANSIT_KEY and the Transit key's type, and that the [vault] extra is installed",
+)
 
 #: The log line when the log call for a fail-closed judgement itself failed. It has no argument.
 _LOG_FAILED = "store: a codec judgement failed closed, and its log line could not be written"

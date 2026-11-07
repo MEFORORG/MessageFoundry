@@ -442,6 +442,9 @@ def test_postgres_pinned_ca_context_asserts(every_suite_looks_weak: None, tmp_pa
     with pytest.raises(ValueError, match="suites must narrow to the approved list") as caught:
         postgres._build_ssl(settings)
     assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    # The control: the unwrapped builder fails on this arm's own assertion.
+    with pytest.raises(ValueError, match=r"Postgres store \(pinned CA\)"):
+        postgres._verifying_context(settings)
 
 
 def test_postgres_trust_server_certificate_context_asserts(
@@ -468,6 +471,9 @@ def test_postgres_default_arm_context_asserts(every_suite_looks_weak: None) -> N
     with pytest.raises(ValueError, match="suites must narrow to the approved list") as caught:
         postgres._build_ssl(_pg_settings())
     assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    # The control: the unwrapped builder fails on this arm's own assertion.
+    with pytest.raises(ValueError, match=r"Postgres store \(system trust\)"):
+        postgres._verifying_context(_pg_settings())
 
 
 # --- the AD LDAPS bind: auth/ldap.py --------------------------------------------------------------
