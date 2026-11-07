@@ -1132,16 +1132,29 @@ class _HostFault(OSError, ValueError):
     """A real OSError that is also a ValueError, as a CRL staging copy that failed is."""
 
 
+def _host_fault_from_a_codec_error() -> _HostFault:
+    """A host fault whose text quotes a codec error that is also its cause."""
+    try:
+        decode_error = _decode_error()
+        raise _HostFault(f"synthetic: staging copy failed: {decode_error}") from decode_error
+    except _HostFault as exc:
+        return exc
+
+
 @pytest.mark.parametrize(
     "make",
-    [lambda: _HostFault("synthetic: staging copy failed"), lambda: _host_echoing()],
-    ids=["oserror-and-valueerror", "insecure-hop-refused"],
+    [
+        lambda: _HostFault("synthetic: staging copy failed"),
+        _host_echoing,
+        _host_fault_from_a_codec_error,
+    ],
+    ids=["oserror-and-valueerror", "insecure-hop-refused", "host-fault-with-a-codec-error"],
 )
 def test_the_postgres_tls_wrap_passes_a_real_host_fault_or_hop_refusal_through(
     make: Callable[[], ValueError], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The control for the class test above: an error whose real type is one of the two leaves
-    as itself, untyped, as the docstring says."""
+    as itself, untyped, as the docstring says, a codec error on its chain included."""
     from messagefoundry.store import postgres
 
     error = make()
