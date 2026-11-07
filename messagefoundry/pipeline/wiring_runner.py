@@ -12556,9 +12556,10 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
     runs in the default executor, in a copy of the caller's context.
 
     An executor fault, a build it cancelled, failed as a broken pool or refused because it was shut
-    down, raises :class:`WiringError` with the fault as its cause, as a refused build does, so every
-    caller records it as one rather than letting a bare ``RuntimeError`` escape (Lander hold
-    6703229134, item 2). The build never ran, so nothing was built to close."""
+    down, raises :class:`WiringError` with the fault as its cause, as a refused build does, so no
+    caller meets a bare ``RuntimeError`` (Lander hold 6703229134, item 2). A build the pool queued
+    before it failed to start a thread is cancelled, or, if a worker already took it, closed when
+    it finishes as an abandoned build is."""
 
     def stamped() -> T:
         with active_hop_posture(posture):
@@ -12599,8 +12600,10 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
         queued = loop.run_in_executor(None, run)
     except RuntimeError as exc:  # the executor was shut down, or its pool is broken
         # A pool can queue the work item and then fail to start a thread for it, so a later
-        # dequeue must find the build cancelled and build nothing for a caller told it failed.
-        built.cancel()
+        # dequeue must find the build cancelled and build nothing for a caller told it failed. A
+        # worker that already took it builds, and what it builds is closed as an abandoned build.
+        if not built.cancel():
+            built.add_done_callback(functools.partial(_close_abandoned_build, loop))
         raise _executor_fault(exc) from exc
     queued.add_done_callback(settle)
     try:

@@ -468,3 +468,31 @@ async def test_a_build_the_pool_queued_before_it_failed_to_start_a_thread_never_
     assert len(queued_items) == 1
     queued_items[0]()  # the late dequeue
     assert not ran.is_set()
+
+
+async def test_a_build_a_worker_took_before_the_pool_failed_to_start_a_thread_is_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other order: a busy worker takes the queued build before the pool's thread start
+    raises. The caller is still told the build failed, so what the worker built is handed to the
+    abandoned-build close rather than left open."""
+    loop = asyncio.get_running_loop()
+    handed: list[object] = []
+
+    def record(_loop: object, work: Any) -> None:
+        handed.append(work.result())
+
+    monkeypatch.setattr(wiring_runner, "_close_abandoned_build", record)
+
+    def run_then_raise(_executor: Any, fn: Callable[[], object], *_args: Any) -> Any:
+        worker = threading.Thread(target=fn)
+        worker.start()
+        worker.join()
+        raise RuntimeError("can't start new thread")
+
+    built = object()
+    monkeypatch.setattr(loop, "run_in_executor", run_then_raise)
+    with pytest.raises(WiringError):
+        await wiring_runner._build_off_loop(None, lambda: built)
+    monkeypatch.undo()
+    assert handed == [built]
