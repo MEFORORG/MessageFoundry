@@ -23,7 +23,13 @@ import uuid
 from typing import Any
 
 import pytest
-from _ui_clients import SAME_ORIGIN, PresentDirectory, held_totp_code, ui_client
+from _ui_clients import (
+    SAME_ORIGIN,
+    PresentDirectory,
+    enrolment_code_for,
+    held_totp_code,
+    ui_client,
+)
 
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.ldap import AdPrincipal
@@ -78,7 +84,10 @@ async def _staged_body(service: AuthService, identity: Identity, token: str) -> 
     await service.store.mark_session_reauthed(hash_token(token))
     key = SoftAuthenticator(rp_id="t", origin="http://t")
     response = json.loads(key.create_response(base64url_to_bytes(options["challenge"])))
-    return {"label": "key", "response": response}
+    # ADR 0207: a directory account's first factor binds only with an issued code; None once it
+    # holds one, where the factor refusal answers first.
+    code = await enrolment_code_for(service, identity.user_id)
+    return {"label": "key", "response": response, "enrolment_code": code}
 
 
 async def _enrol_totp_elsewhere(service: AuthService) -> None:
@@ -86,7 +95,10 @@ async def _enrol_totp_elsewhere(service: AuthService) -> None:
     identity, token = await _sign_in(service)
     enrollment = await service.begin_mfa_enrollment(identity)
     with held_totp_code(enrollment.secret) as code:
-        assert (await service.confirm_mfa_enrollment(identity, code, token=token)).ok
+        issued = await enrolment_code_for(service, identity.user_id)  # ADR 0207
+        assert (
+            await service.confirm_mfa_enrollment(identity, code, token=token, enrolment_code=issued)
+        ).ok
 
 
 def _spy_ceremony_budget(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> list[str]:

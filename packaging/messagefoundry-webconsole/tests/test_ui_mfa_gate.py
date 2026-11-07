@@ -18,7 +18,12 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from _ui_clients import SAME_ORIGIN, create_local_user_chosen, held_totp_code
+from _ui_clients import (
+    SAME_ORIGIN,
+    create_local_user_chosen,
+    enrolment_code_for,
+    held_totp_code,
+)
 
 from messagefoundry.api import create_app
 from messagefoundry.api.auth_routes import _DIRECTORY_DEMOTED_DETAIL, _DIRECTORY_UNCONFIRMED_DETAIL
@@ -1173,7 +1178,10 @@ async def _directory_session(
         assert setup.identity is not None and setup.token is not None
         enrollment = await service.begin_mfa_enrollment(setup.identity)
         confirmed = await service.confirm_mfa_enrollment(
-            setup.identity, totp.totp(enrollment.secret), token=setup.token
+            setup.identity,
+            totp.totp(enrollment.secret),
+            token=setup.token,
+            enrolment_code=await enrolment_code_for(service, setup.identity.user_id),  # ADR 0207
         )
         assert confirmed.ok
     out = await service._complete_ad_login(principal, None, mfa_verified=False)

@@ -42,6 +42,7 @@ from messagefoundry.transports.x12 import (
     _names_sent_interchange,
     _sent_isa13,
 )
+from tests._log_absence import assert_capture_sees
 
 
 def _isa(*, control: str = "000000001") -> str:
@@ -223,6 +224,7 @@ def test_a_ta1_accept_logs_no_warning(caplog: pytest.LogCaptureFixture) -> None:
     # The control for the test above: a plain TA1*A is not a warning.
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.x12"):
         _dest(capture_response=True)._check_ta1(_ta1(" a "), payload=EDI)
+    assert_capture_sees(caplog, "messagefoundry.transports.x12")
     assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
 
 

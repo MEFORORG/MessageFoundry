@@ -86,7 +86,9 @@ class Fx:
         return self.primary / ".claude" / "worktrees" / name
 
     def env(self, *, claudecode: bool = False) -> dict[str, str]:
-        env = dict(os.environ)
+        # Without the git config carriers the step refuses on, so an inherited one (git exports
+        # GIT_CONFIG_PARAMETERS to a hook run under `git -c`) cannot fail every positive control.
+        env = {k: v for k, v in os.environ.items() if not re.match(r"GIT_CONFIG(_|$)", k, re.I)}
         env["USERPROFILE"] = str(self.home)
         env["MEFOR_COORD_ROOT"] = str(self.coord)
         if claudecode:
@@ -1031,3 +1033,267 @@ def test_a_junction_above_the_tree_inside_its_claude_segment_refuses(fx: Fx) -> 
     assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
     assert "a folder above it" in rows["clean"]["Reason"], rows["clean"]
     assert (real / "clean" / "seed.txt").is_file()
+
+
+# --- Engine PR 2803's open findings 11, 12, 15 and 21. Each test below was red on a1a686e0a1. ---
+
+#: git config carried in the environment, by variable name: each one reaches every `git -C <tree>`
+#: gate, so a core.fsmonitor hook, say, could make a dirty tree read clean. Values point nowhere real.
+_CONFIG_ENV: dict[str, dict[str, str | None]] = {
+    "GIT_CONFIG_COUNT": {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_0": "false",
+    },
+    "GIT_CONFIG_KEY_0": {"GIT_CONFIG_KEY_0": "core.fsmonitor"},
+    "GIT_CONFIG_PARAMETERS": {"GIT_CONFIG_PARAMETERS": "'core.fsmonitor'='false'"},
+    "GIT_CONFIG_GLOBAL": {"GIT_CONFIG_GLOBAL": "stray-global.gitconfig"},
+    "GIT_CONFIG_SYSTEM": {"GIT_CONFIG_SYSTEM": "stray-system.gitconfig"},
+    "GIT_CONFIG_NOSYSTEM": {"GIT_CONFIG_NOSYSTEM": "1"},
+    "GIT_CONFIG": {"GIT_CONFIG": "stray.gitconfig"},
+}
+
+
+@pytest.mark.parametrize("var", sorted(_CONFIG_ENV))
+def test_git_config_in_the_environment_refuses_every_tree(fx: Fx, var: str) -> None:
+    """Red on a1a686e0a1: only the four redirect names refused, so git config injected through the
+    environment reached every git gate and the removal ran. GIT_CONFIG_GLOBAL is refused on purpose:
+    it swaps the global config for a file nothing in the step has read."""
+    rows = remove(fx, [fx.tree("clean")], apply=True, env_extra=_CONFIG_ENV[var])
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    pattern = rf"\b{var}\b[^.]* is set, so git config from the environment"
+    assert re.search(pattern, rows["clean"]["Reason"]), rows["clean"]
+    assert fx.tree("clean").is_dir()
+    assert fx.is_registered(fx.tree("clean"))
+
+
+def test_the_runner_still_prunes_under_git_config_and_logs_the_refusal(
+    fx: Fx, tmp_path: Path
+) -> None:
+    """The refusal is the step's alone: unlike a redirect, it does not stop the core prune before it,
+    which is logged as run, and the step logs each tree REFUSED with the reason."""
+    log_dir = tmp_path / "logs-config"
+    proc = run_runner(
+        fx,
+        log_dir,
+        "-RemoveFinishedClaudeWorktrees",
+        env_extra={"GIT_CONFIG_PARAMETERS": "'core.fsmonitor'='false'"},
+    )
+    (log,) = log_dir.glob("prune-*.log")
+    text = log.read_text(encoding="utf-8")
+    assert "REFUSED before the prune" not in text, text
+    assert "--- finished .claude/worktrees: mode=DRYRUN ---" in text, text
+    for name in FINISHED:
+        assert _outcome(text, "REFUSED", fx.tree(name)), text
+    assert "GIT_CONFIG_PARAMETERS is set" in text, text
+    assert re.search(r"mode=DRYRUN listed=\d+ removed=0 wouldRemove=0 ", text), text
+    assert proc.returncode in (0, 2), proc.stdout + proc.stderr
+
+
+#: The tree's own .git file swapped for a junction to the tree's admin dir. git reads that as the same
+#: worktree, so every gate passes through it; a junction elsewhere would read another repository.
+_LINK_DOT_GIT = (
+    "$g = Join-Path $env:T_TREE '.git'; "
+    "$admin = (Get-Content -LiteralPath $g -Raw).Trim() -replace '^gitdir:\\s*', ''; "
+    "Move-Item -LiteralPath $g -Destination $env:T_AWAY; "
+    "$null = New-Item -ItemType Junction -Path $g -Target $admin"
+)
+#: Both idle readings held idle: the junction's own mtime is new and cannot be aged from here, as in
+#: the root-junction test above, and git's first reads through the new .git read as fresh metadata.
+#: Without this the tree is refused as recently active, and the .git gate is never the one that speaks.
+_HOLD_IDLE = (
+    "function global:Get-WorkingTreeActivity { (Get-Date).AddDays(-30) }; "
+    "function global:Get-WorktreeActivity { (Get-Date).AddDays(-30) }"
+)
+
+
+@pytest.mark.parametrize("when", ["first-pass", "late-pass"])
+def test_a_tree_whose_dot_git_is_a_link_refuses(fx: Fx, when: str) -> None:
+    """Red on a1a686e0a1: the root check read the root and the folders above it, never the tree's own
+    .git entry, which every `git -C <tree>` gate reads through."""
+    tree = fx.tree("clean")
+    env_extra: dict[str, str | None] = {
+        "T_TREE": str(tree),
+        "T_AWAY": str(fx.root / "clean.gitfile"),
+    }
+    if when == "first-pass":
+        prelude = _HOLD_IDLE + "; " + _LINK_DOT_GIT
+        rows = remove(fx, [tree], apply=False, prelude=prelude, env_extra=env_extra)
+        expected = "its .git entry is not a plain file"
+    else:
+        prelude = _HOLD_IDLE + "; " + _LATE_WRITE.format(write=_LINK_DOT_GIT)
+        rows = remove(fx, [tree], apply=True, prelude=prelude, env_extra=env_extra)
+        expected = "re-checked just before the removal: its .git entry is not a plain file"
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert expected in rows["clean"]["Reason"], rows["clean"]
+    assert (tree / "seed.txt").is_file()
+    assert fx.is_registered(tree)
+
+
+#: Runs {write} once, right AFTER the second fence read: the late pass's, the last gate before the
+#: removal, so only a check after the fence can see it.
+_AFTER_LATE_FENCE = (
+    "$global:fence = ${{function:Get-WorktreeOccupancy}}; "
+    "function global:Get-WorktreeOccupancy {{ param($Repo) $r = & $global:fence -Repo $Repo; "
+    "$global:fenceReads++; if ($global:fenceReads -eq 2) {{ {write} }}; $r }}"
+)
+
+
+def test_a_root_swapped_after_the_late_fence_refuses(fx: Fx) -> None:
+    """Red on a1a686e0a1: the late pass's last root check ran before the slow walk and the fence, so a
+    root swapped for a junction during those reads was removed through."""
+    tree = fx.tree("clean")
+    away = fx.root / "clean-away"
+    swap = (
+        "Move-Item -LiteralPath $env:T_TREE -Destination $env:T_AWAY; "
+        "$null = New-Item -ItemType Junction -Path $env:T_TREE -Target $env:T_AWAY"
+    )
+    rows = remove(
+        fx,
+        [tree],
+        apply=True,
+        prelude=_AFTER_LATE_FENCE.format(write=swap),
+        env_extra={"T_TREE": str(tree), "T_AWAY": str(away)},
+    )
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert (
+        "re-checked just before the removal: its root is a junction or link"
+        in rows["clean"]["Reason"]
+    ), rows["clean"]
+    assert (away / "seed.txt").is_file()
+    assert fx.is_registered(tree)
+
+
+def test_a_root_moved_away_after_the_late_fence_refuses(fx: Fx) -> None:
+    """Red on c91761f75d: the last root check passed a root that was not there, and no gate followed
+    it, so git deregistered the moved tree and deleted its admin dir, its reflog and refs with it."""
+    tree = fx.tree("clean")
+    away = fx.root / "clean-moved"
+    rows = remove(
+        fx,
+        [tree],
+        apply=True,
+        prelude=_AFTER_LATE_FENCE.format(
+            write="Move-Item -LiteralPath $env:T_TREE -Destination $env:T_AWAY"
+        ),
+        env_extra={"T_TREE": str(tree), "T_AWAY": str(away)},
+    )
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert (
+        "re-checked just before the removal: its root is no longer there" in rows["clean"]["Reason"]
+    ), rows["clean"]
+    assert fx.is_registered(tree)
+    assert (away / "seed.txt").is_file()
+
+
+#: The real removal, then the directory put back and its parent folder renamed away, nothing in its
+#: place: the leftover now sits under the moved folder.
+_PARENT_GONE = _GIT_SHIM.format(
+    body="& git.exe @args; $c = $LASTEXITCODE; "
+    "$null = New-Item -ItemType Directory -Path $args[4]; "
+    "Move-Item -LiteralPath (Split-Path -Parent $args[4]) -Destination $env:T_MOVED; "
+    "$global:LASTEXITCODE = $c"
+)
+
+
+def test_an_end_state_whose_parent_is_gone_is_never_removed(fx: Fx) -> None:
+    """Red on c91761f75d: the end state walked up past a parent that was gone, read the tree as gone
+    because .claude listed without `worktrees`, and the leftover under the moved folder went
+    unreported. The end state still needs the tree's own parent to be there."""
+    tree = fx.tree("clean")
+    moved = fx.root / "worktrees-moved"
+    rows = remove(fx, [tree], apply=True, prelude=_PARENT_GONE, env_extra={"T_MOVED": str(moved)})
+    assert rows["clean"]["Outcome"] == "ORPHANED", rows["clean"]
+    assert (moved / "clean").is_dir()
+
+
+#: The real removal, then .claude/worktrees swapped for a junction: to a folder that is then deleted
+#: (a dead link), or to an empty one. Either way the tree reads not-found under a parent that is there.
+_PARENT_SWAP = _GIT_SHIM.format(
+    body="& git.exe @args; $c = $LASTEXITCODE; "
+    "$wt = Split-Path -Parent $args[4]; "
+    "Move-Item -LiteralPath $wt -Destination $env:T_MOVED; "
+    "$null = New-Item -ItemType Directory -Path $env:T_TARGET; "
+    "$null = New-Item -ItemType Junction -Path $wt -Target $env:T_TARGET; "
+    "if ($env:T_DEAD) { Remove-Item -LiteralPath $env:T_TARGET }; "
+    "$global:LASTEXITCODE = $c"
+)
+
+
+@pytest.mark.parametrize("parent", ["dead-junction", "junction-to-empty"])
+def test_an_end_state_under_a_linked_parent_is_never_removed(fx: Fx, parent: str) -> None:
+    """Red on a1a686e0a1: the end state was a not-found under a parent Get-Item could find, and the
+    parent was never listed, so a tree not-found under a dead junction read REMOVED. The end state now
+    takes the walk-and-list rule prune-merged.ps1's orphan ledger takes, and the folder it lists must
+    be a plain directory, as the root check already required of that folder."""
+    tree = fx.tree("clean")
+    rows = remove(
+        fx,
+        [tree],
+        apply=True,
+        prelude=_PARENT_SWAP,
+        env_extra={
+            "T_MOVED": str(fx.root / "worktrees-moved"),
+            "T_TARGET": str(fx.root / "link-target"),
+            "T_DEAD": "1" if parent == "dead-junction" else None,
+        },
+    )
+    assert rows["clean"]["Outcome"] == "ORPHANED", rows["clean"]
+    assert "not confirmed gone" in rows["clean"]["Reason"], rows["clean"]
+    assert not fx.is_registered(tree)
+
+
+def _ignore_like_the_engine(fx: Fx, tree: Path) -> None:
+    """Commit, on the tree's branch, the engine's own ignore shape for the two local files: `/.claude/*`
+    rather than the fixture's `/.claude/`, so git lists `.claude/seat.local.txt` by name, and
+    scan-tokens.local.txt by its path."""
+    ignore = tree / ".gitignore"
+    text = ignore.read_text(encoding="utf-8").replace("/.claude/\n", "/.claude/*\n")
+    ignore.write_text(text + "scripts/security/scan-tokens.local.txt\n", encoding="utf-8")
+    _git(tree, "add", "--", ".gitignore")
+    _git(tree, "commit", "-qm", "ignore like the engine")
+
+
+@pytest.mark.parametrize(
+    ("case", "outcome"),
+    [
+        ("seat-file", "WOULD-REMOVE"),
+        ("scan-tokens", "REFUSED"),
+        ("seat-folder", "REFUSED"),
+        ("seat-link", "REFUSED"),
+    ],
+)
+def test_only_a_plain_seat_local_file_is_tolerated(fx: Fx, case: str, outcome: str) -> None:
+    """The owner's ruling of 2026-11-06, "seat.local.txt only (Recommended)": a tree whose only
+    blocking ignored entry is `.claude/seat.local.txt`, a plain file, no longer refuses on that
+    account. Red on a1a686e0a1 for "seat-file". scan-tokens.local.txt, and a seat.local.txt that is a
+    folder or a link, still refuse; those three are the controls."""
+    tree = fx.tree("clean")
+    _ignore_like_the_engine(fx, tree)
+    seat = tree / ".claude" / "seat.local.txt"
+    seat.parent.mkdir()
+    if case == "seat-file":
+        seat.write_text("builder\n", encoding="utf-8")
+    elif case == "scan-tokens":
+        tokens = tree / "scripts" / "security" / "scan-tokens.local.txt"
+        tokens.parent.mkdir(parents=True)
+        tokens.write_text("token\n", encoding="utf-8")
+    elif case == "seat-folder":
+        seat.mkdir()
+        (seat / "x.txt").write_text("x\n", encoding="utf-8")
+    else:
+        target = fx.root / "seat-target"
+        target.mkdir()
+        _junction(seat, target)
+    _age(fx.primary, tree, 200)
+    rows = remove(fx, [tree], apply=False)
+    assert rows["clean"]["Outcome"] == outcome, rows["clean"]
+    if outcome == "REFUSED":
+        assert "ignored entr(ies) that are not a regenerable cache" in rows["clean"]["Reason"]
+
+
+def test_a_removed_tree_under_a_plain_parent_still_reads_removed(fx: Fx) -> None:
+    """The control for the test above: the same removal, the parent left alone, reads REMOVED."""
+    rows = remove(fx, [fx.tree("clean")], apply=True, prelude=_AFTER_REMOVAL)
+    assert rows["clean"]["Outcome"] == "REMOVED", rows["clean"]
+    assert not fx.tree("clean").exists()

@@ -117,6 +117,13 @@ LOGIN_NEW_IP = "login_new_ip"
 # creating administrator chooses that address, so this is not a control against that administrator:
 # the operator-side signal for a new Administrator is the ``administrator_granted`` alert.
 ACCOUNT_CREATED = "account_created"
+# ADR 0207 section 4 -- an Administrator issued an enrolment code for this directory account. A
+# courtesy, not a control: it names no code, and the address may be a mailbox the same directory
+# password opens.
+ENROLMENT_CODE_ISSUED = "enrolment_code_issued"
+# ADR 0207 Amendment A, A5 -- an enrolment code this Administrator issued was spent. Sent to the
+# ISSUER, not the account that spent it; ``detail["holder"]`` names that account. Names no code.
+ENROLMENT_CODE_SPENT = "enrolment_code_spent"
 
 # First success after this many prior failed attempts is flagged as suspicious (6.3.5). Kept modest and
 # fixed (not an operator knob) so a single fat-fingered password does not generate a notice.
@@ -177,6 +184,8 @@ NOTICE_KIND_LOG_LABELS: Mapping[str, str] = MappingProxyType(
         NEW_ADDRESS_REVERIFY: "new_address_reverify_required",
         LOGIN_NEW_IP: "login_new_ip",
         ACCOUNT_CREATED: "account_created",
+        ENROLMENT_CODE_ISSUED: "enrolment_code_issued",
+        ENROLMENT_CODE_SPENT: "enrolment_code_spent",
     }
 )
 

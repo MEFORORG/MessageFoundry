@@ -348,7 +348,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/auth/service.py": frozenset(
         {"hashlib", "messagefoundry.config.tls_policy", "messagefoundry.store.crypto", "secrets"}
     ),
-    "messagefoundry/auth/tokens.py": frozenset({"hashlib", "secrets"}),
+    # ADR 0207: hmac.compare_digest checks a directory account's enrolment code digest.
+    "messagefoundry/auth/tokens.py": frozenset({"hashlib", "hmac", "secrets"}),
     "messagefoundry/auth/totp.py": frozenset({"hashlib", "hmac", "secrets"}),
     # WP #285 (ASVS 6.7.1): SHA-256 fingerprint of an operator-supplied auth-path trust anchor
     # (oidc/ad/api-client CA PEM) — the optional pin compared at construction + reload, and the
@@ -1071,9 +1072,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # BACKLOG #1719: cipher-audit decrypts the live store's sealed cells through the store
             # cipher, by cipher_cells' walk. It never encrypts.
             "cipher:via messagefoundry.store.cipher_cells",
+            # ADR 0207: issue-enrolment-code mints a directory account's enrolment code and stores
+            # only its digest, through the service's shared write_enrolment_code.
+            "csprng:via messagefoundry.auth.service",
             "csprng:via messagefoundry.auth.totp",
             "csprng:via messagefoundry.store.crypto",
             "hash:via messagefoundry.api.tls",
+            # ADR 0207: issue-enrolment-code's code digest, through write_enrolment_code.
+            "hash:via messagefoundry.auth.service",
             # BACKLOG #3778: admin-reset-totp pins the account's opened TOTP seed across the prompt
             # by its SHA-256 digest (auth.tokens.hash_token), compared in constant time.
             "hash:via messagefoundry.auth.tokens",
@@ -1103,7 +1109,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # through asyncio.to_thread, a reference this scanner does not follow as a call.
     # BACKLOG #1167 (ASVS 11.2.4): the config-provenance drift compare, via fingerprint_matches.
     # Vault BACKLOG #2371: the SHA-256 of a dialling CA file, via make_lane_anchor_check. It
-    # fingerprints the file to tell a repeated refusal from a changed one. A digest, not a key.
+    # fingerprints the file to tell a repeated check from a changed one. A digest, not a key.
     # Vault BACKLOG #2615: app.py also runs store.crypto's audit_body_digests (HKDF-SHA256 off the
     # audit-chain key, then HMAC-SHA256 of each body, for the edit-resend and upload-inject audit
     # rows). It runs through asyncio.to_thread, a reference this scanner does not follow as a call,
@@ -1214,6 +1220,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # The OIDC `state` compare moved into FlowCache.pop_if_state_matches (BACKLOG #3198), so
             # it is listed under messagefoundry/auth/oidc/flow.py and no longer here.
             "compare:via messagefoundry.auth.oidc_http",  # BACKLOG #1167: the anchor pin compare
+            # ADR 0207: a binding step checks a directory account's enrolment code
+            # (tokens.enrolment_code_matches).
+            "compare:via messagefoundry.auth.tokens",
             "compare:via messagefoundry.auth.totp",
             "csprng:secrets.token_urlsafe",
             "csprng:via messagefoundry.auth.oidc.flow",
@@ -1240,7 +1249,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/auth/tokens.py": frozenset(
-        {"csprng:secrets.token_urlsafe", "hash:hashlib.sha256"}
+        {
+            # ADR 0207: a directory account's enrolment code is 160 bits from secrets.token_bytes,
+            # stored only as its SHA-256 digest and checked with a constant-time compare.
+            "compare:hmac.compare_digest",
+            "csprng:secrets.token_bytes",
+            "csprng:secrets.token_urlsafe",
+            "hash:hashlib.sha256",
+        }
     ),
     "messagefoundry/auth/totp.py": frozenset(
         {
@@ -2030,8 +2046,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # with, to prove the policy leaves one to issue; the value is discarded. Wave 2 (BACKLOG #3373):
     # the census hashes an account's passkey set (``passkey_digest``, SHA-256) to compare it with the
     # digest the account's seal covers, so a passkey row flipped outside the store is not counted.
+    # BACKLOG #1167 (ASVS 11.2.4): that digest compare is constant_time_equal now.
     "messagefoundry/verify/checks.py": frozenset(
         {
+            "compare:via messagefoundry.auth.service",
             "csprng:via messagefoundry.auth.service",
             "hash:via messagefoundry.auth.service",
             "mac:via messagefoundry.auth.service",

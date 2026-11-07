@@ -254,6 +254,7 @@ from messagefoundry.store.store import (
     DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
+    EnrolmentCodeOutcome,
     EpochBump,
     EpochRaise,
     FailOutcome,
@@ -317,6 +318,9 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    enrolment_code_issue,
+    enrolment_code_revoke,
+    enrolment_code_spend,
     escalation_passkeys,
     escalation_verdict,
     existing_roles_only,
@@ -380,12 +384,14 @@ from messagefoundry.store.store import (
     should_record_event,
     tee_audits,
     totp_enable,
+    totp_enable_spending_code,
     totp_removal,
     totp_replace,
     totp_stage,
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
+    user_disabled_change,
     user_insert_params,
     user_reseal_params,
     user_seal_ok,
@@ -993,16 +999,15 @@ _SCHEMA: list[str] = [
         -- BACKLOG #2592: the digest of the account's passkeys, and the integrity seal over the
         -- account's row and role rows. Both written only by the store's user write helper.
         cred_digest          TEXT NOT NULL DEFAULT '',
+        -- ADR 0207: the outstanding enrolment code's hash_token digest, its expiry, and the issuing
+        -- Administrator's account id (NULL for a host-issued code). All NULL with no code.
+        enrolment_code_digest TEXT,
+        enrolment_code_expires_at DOUBLE PRECISION,
+        enrolment_code_issuer TEXT,
         authz_seal           TEXT NOT NULL DEFAULT ''
     )""",
-    # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
-    # its read and its write are separate awaits, so two concurrent FIRST logins for one subject can
-    # both observe "no holder" and both bind. Same shape as ux_webauthn_label (ADR 0068 4).
-    # PARTIAL so unfederated rows coexist; Postgres treats NULLs as distinct, so the WHERE states
-    # intent here and is REQUIRED on SQL Server, where NULLs compare equal.
-    """CREATE UNIQUE INDEX IF NOT EXISTS ux_users_federated_subject
-        ON users(oidc_issuer, oidc_subject)
-        WHERE oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL""",
+    # ux_users_federated_subject (BACKLOG #1256) is built in _migrate_lease_columns, after the ADD
+    # of the two columns it keys on; _FEDERATED_SUBJECT_INDEX_DDL says why.
     """CREATE TABLE IF NOT EXISTS roles (
         id           TEXT PRIMARY KEY,
         display_name TEXT NOT NULL,
@@ -1259,6 +1264,12 @@ _SCHEMA.append(_gated_add_column("sessions", "global_epoch", "INTEGER NOT NULL D
 # nothing seals it here.
 _SCHEMA.append(_gated_add_column("users", "cred_digest", "TEXT NOT NULL DEFAULT ''"))
 _SCHEMA.append(_gated_add_column("users", "authz_seal", "TEXT NOT NULL DEFAULT ''"))
+# ADR 0207: the enrolment code's digest, expiry and issuer, for a users table created before them.
+# NULL on an existing row is "no code outstanding", and a NULL column stays out of the user seal
+# (store.py's USER_SEAL_WHEN_SET), so the add re-seals nobody. In _SCHEMA, so no _MIGRATION_REV bump.
+_SCHEMA.append(_gated_add_column("users", "enrolment_code_digest", "TEXT"))
+_SCHEMA.append(_gated_add_column("users", "enrolment_code_expires_at", "DOUBLE PRECISION"))
+_SCHEMA.append(_gated_add_column("users", "enrolment_code_issuer", "TEXT"))
 # BACKLOG #2592: a role's integrity seal. An existing custom role gets an empty seal and grants nothing
 # until an administrator saves it again; store.py's report_unsealed_role_records says why.
 _SCHEMA.append(_gated_add_column("roles", "seal", "TEXT NOT NULL DEFAULT ''"))
@@ -1303,7 +1314,9 @@ _SCHEMA.append(
 # 8 (BACKLOG #1720): the same function's catalog reads are scoped to current_schema(), and the open
 # now checks the live schema before it writes the marker. _SCHEMA is unchanged, so this bump is the
 # only thing that sends a store marked by an earlier build through both once.
-_MIGRATION_REV = 8
+# 9 (BACKLOG #1720): the same function builds ux_users_federated_subject, moved out of _SCHEMA. The
+# _SCHEMA edit moves the hash too; the bump is what the contract above ties the body to.
+_MIGRATION_REV = 9
 
 # BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's plan
 # is pinned by a test; this backend's plan has not been measured. Built in _migrate_lease_columns with
@@ -1330,6 +1343,19 @@ _FIFO_OUT_SEQ_INDEX_DDL = (
 # name dropped here is not expected (BACKLOG #5062).
 _FIFO_IN_DROP_DDL = "DROP INDEX IF EXISTS ix_queue_fifo_in"
 _FIFO_OUT_DROP_DDL = "DROP INDEX IF EXISTS ix_queue_fifo_out"
+# BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself -- its
+# read and its write are separate awaits, so two concurrent FIRST logins for one subject can both
+# observe "no holder" and both bind. Same shape as ux_webauthn_label (ADR 0068 4). PARTIAL so
+# unfederated rows coexist; Postgres treats NULLs as distinct, so the WHERE states intent here and is
+# REQUIRED on SQL Server, where NULLs compare equal. Built after the migration ADDs its two columns
+# (BACKLOG #1720): in _SCHEMA it ran first, and on a users table that predates them, a 0.3.2 one, the
+# build failed with the driver's undefined-column error before the live-schema check could name the
+# store's real differences. SQLite builds it in its _migrate for the same reason.
+_FEDERATED_SUBJECT_INDEX_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_federated_subject"
+    " ON users(oidc_issuer, oidc_subject)"
+    " WHERE oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL"
+)
 #: What the live-schema check expects: the batch, then every index the migration builds or drops, in
 #: the order it runs them. The migration's columns are in the batch's CREATE TABLE statements
 #: already, so it adds none here; a test holds each ADD's type and nullability to that CREATE TABLE.
@@ -1341,6 +1367,7 @@ _MIGRATION_INDEX_DDL: Final = (
     _FIFO_IN_DROP_DDL,
     _FIFO_OUT_DROP_DDL,
     _RECEIVED_INDEX_DDL,
+    _FEDERATED_SUBJECT_INDEX_DDL,
 )
 
 # The live shape, read on the schema transaction's own connection after the batch (BACKLOG #1720).
@@ -1519,9 +1546,10 @@ _PG_USER_INSERT: Final = (
     " totp_enabled, totp_enrolled_at, totp_recovery_codes, last_totp_step, oidc_issuer,"
     " oidc_subject, directory_object_id, password_claimed_at, channel_scope_source, lock_cycles,"
     " second_step_failed_attempts, second_step_locked_until, second_step_lock_cycles,"
-    " password_generated, session_epoch, cred_digest, authz_seal)"
+    " password_generated, session_epoch, cred_digest, enrolment_code_digest,"
+    " enrolment_code_expires_at, enrolment_code_issuer, authz_seal)"
     " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,"
-    "$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)"
+    "$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)"
 )
 _PG_USER_RESEAL: Final = (
     "UPDATE users SET username=$1, auth_provider=$2, display_name=$3, email=$4, notify_email=$5,"
@@ -1532,7 +1560,8 @@ _PG_USER_RESEAL: Final = (
     " directory_object_id=$23, password_claimed_at=$24, channel_scope_source=$25,"
     " lock_cycles=$26, second_step_failed_attempts=$27, second_step_locked_until=$28,"
     " second_step_lock_cycles=$29, password_generated=$30, session_epoch=$31, cred_digest=$32,"
-    " authz_seal=$33 WHERE id=$34 AND authz_seal=$35"
+    " enrolment_code_digest=$33, enrolment_code_expires_at=$34, enrolment_code_issuer=$35,"
+    " authz_seal=$36 WHERE id=$37 AND authz_seal=$38"
 )
 _PG_USER_ROLE_INSERT: Final = (
     "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by) VALUES ($1,$2,$3,$4)"
@@ -2482,9 +2511,10 @@ class PostgresStore:
         open. Gating on ``information_schema`` keeps re-opens of an already-migrated DB lock-free
         (this runs under the schema advisory lock alongside the CREATEs). Also creates the lease
         index here — AFTER the columns are guaranteed present — since on a Step-1 table the index
-        would reference a not-yet-added column if it lived in the _SCHEMA loop. Also runs the index
-        builds that need asyncpg's client timeout lifted (the FIFO covering indexes and
-        ix_messages_received), which the _SCHEMA loop cannot give per statement.
+        would reference a not-yet-added column if it lived in the _SCHEMA loop, and for the same
+        reason builds ux_users_federated_subject after the users ADD loop (BACKLOG #1720). Also
+        runs the index builds that need asyncpg's client timeout lifted (the FIFO covering indexes
+        and ix_messages_received), which the _SCHEMA loop cannot give per statement.
 
         Every catalog read here is scoped to ``current_schema()``, the schema the unqualified DDL
         resolves into (BACKLOG #1720). Unscoped, a second store in another schema of the same database
@@ -2575,6 +2605,7 @@ class PostgresStore:
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
+        await conn.execute(_FEDERATED_SUBJECT_INDEX_DDL)
         # Claimed-ness (BACKLOG #1245): whether the holder has ever set their own credential. It was
         # added for the first-run account's auto-retirement, and ADR 0183 Amendment A retired that
         # account and its one reader. The column stays, because its writers stay and the fact it
@@ -9824,6 +9855,54 @@ class PostgresStore:
         change = totp_enable(recovery_code_hashes, now, expected_secret_cell=expected_secret_cell)
         return await self._write_user_txn(user_id, change) is not None
 
+    # --- ADR 0207: the directory account's enrolment code (Store protocol states the contract) ---
+    # One conditional sealed write each, through ``_write_user`` in a transaction of its own, with
+    # the account row locked; store.py's change builders hold every condition.
+
+    async def issue_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        code_digest: str,
+        expires_at: float,
+        issuer_id: str | None,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = enrolment_code_issue(
+            code_digest=code_digest, expires_at=expires_at, issuer_id=issuer_id, now=now
+        )
+        return change.outcome(await self._write_user_txn(user_id, change))
+
+    async def revoke_enrolment_code(self, user_id: str, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        return await self._write_user_txn(user_id, enrolment_code_revoke(now)) is not None
+
+    async def spend_enrolment_code(
+        self, user_id: str, *, code_digest: str, now: float | None = None
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = enrolment_code_spend(code_digest=code_digest, now=now)
+        return change.outcome(await self._write_user_txn(user_id, change))
+
+    async def enable_totp_spending_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        code_digest: str,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = totp_enable_spending_code(
+            recovery_code_hashes,
+            now,
+            expected_secret_cell=expected_secret_cell,
+            code_digest=code_digest,
+        )
+        return change.outcome(await self._write_user_txn(user_id, change))
+
     async def replace_totp_enrolment(
         self,
         user_id: str,
@@ -9919,7 +9998,7 @@ class PostgresStore:
     ) -> None:
         now = time.time() if now is None else now
         await self._write_user_txn(
-            user_id, lambda r: r.changed(disabled=bool(disabled), updated_at=float(now))
+            user_id, lambda r: user_disabled_change(r, disabled=disabled, now=now)
         )
 
     async def update_user_profile(
@@ -10192,7 +10271,7 @@ class PostgresStore:
                     return False  # nothing written; the commit releases the lock
             if change is AdminRemoval.DISABLE:
                 await self._write_user(
-                    conn, user_id, lambda r: r.changed(disabled=True, updated_at=float(now))
+                    conn, user_id, lambda r: user_disabled_change(r, disabled=True, now=now)
                 )
             elif change is AdminRemoval.DELETE:
                 await self._delete_user_rows(conn, user_id)

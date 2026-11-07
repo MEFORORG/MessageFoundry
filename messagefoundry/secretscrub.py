@@ -1441,6 +1441,14 @@ _QUERY_NOT_CREDENTIAL_TAILS = (
     "idempotencykey",
 )
 
+#: Names the HTTP family's no-escape credential refusals count beside the heuristic, as the whole
+#: name after :func:`_base_name`, ignoring case (``refusal=True``). ``code`` carries an Azure
+#: Functions function key, and an OAuth authorization code. The heuristic leaves it out, because it
+#: also names an ordinary parameter such as a status ``?code=404``, and what reads the heuristic
+#: warns and reports. A refusal of a hop that already relaxed verification, or that crosses plain
+#: ``http`` off this machine, takes that over-refusal (vault BACKLOG #3533 item 7).
+_QUERY_REFUSAL_NAMES = frozenset({"code"})
+
 
 def _camel_tail(name: str, word: str) -> bool:
     """Whether ``name`` ends in ``word`` as a camelCase segment, as ``accessToken`` ends in token.
@@ -1498,7 +1506,7 @@ def _display_name(name: str) -> str:
     return name if _PLAIN_NAME.fullmatch(name) else repr(name)
 
 
-def credential_query_params(url: str) -> list[str]:
+def credential_query_params(url: str, *, refusal: bool = False) -> list[str]:
     """The query-parameter NAMES in ``url`` that look like a credential, sorted and unique.
 
     For the ASVS 14.2.1 check on an endpoint URL: a credential in a query string rides the request
@@ -1516,9 +1524,11 @@ def credential_query_params(url: str) -> list[str]:
     ``verify_tls = false`` and off-box cleartext credential rules refuse on a match, with no escape,
     and accept that a name that only looks like one refuses too (vault BACKLOG #3230, #3533).
 
+    ``refusal=True`` also names :data:`_QUERY_REFUSAL_NAMES`, for those refusals alone.
+
     Not :class:`logging_setup.CredentialQueryScrubFilter`'s list. That one scrubs VALUES out of log
-    text and carries ``code`` and ``state`` for the OIDC callback; neither is a credential name on a
-    partner endpoint, and naming them here would flag ordinary query strings."""
+    text and carries ``code`` and ``state`` for the OIDC callback; naming them here would flag
+    ordinary query strings."""
     # Imported here, not at module scope: this leaf is imported by every log handler at startup on
     # ``re`` alone, and only configuration checks call this.
     import urllib.parse  # noqa: PLC0415
@@ -1528,7 +1538,14 @@ def credential_query_params(url: str) -> list[str]:
         pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
     except ValueError:
         return []
-    return sorted({_display_name(name) for name, _ in pairs if _is_credential_param(name)})
+    return sorted(
+        {
+            _display_name(name)
+            for name, _ in pairs
+            if _is_credential_param(name)
+            or (refusal and _base_name(name).casefold() in _QUERY_REFUSAL_NAMES)
+        }
+    )
 
 
 #: The characters that start a ``name=value`` segment for :func:`has_credential_like_segment`: a
