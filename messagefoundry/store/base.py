@@ -4278,21 +4278,14 @@ def _server_store_class(backend: StoreBackend) -> type[SqlServerStore] | type[Po
 #: create that left any of these without ``schema_meta`` does. Each is a declared table on both
 #: server backends, which a test pins.
 STORE_MARKER_TABLES: tuple[str, ...] = (
-    "audit_log",
     "authority_set_seal",
     "cipher_meta",
-    "delivered_keys",
     "global_session_epoch",
     "keyed_surface",
-    "keyring",
-    "message_events",
-    "resend_log",
     "schema_meta",
     "secret_rotation_meta",
-    "shared_body",
     "store_salt",
     "transit_bound_attestation",
-    "webauthn_credentials",
 )
 
 

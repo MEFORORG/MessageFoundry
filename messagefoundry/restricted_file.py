@@ -884,9 +884,12 @@ def can_add_a_file(directory: Path) -> bool | None:
     a yes that such a privilege can give. Any other failure is ``None``. Elsewhere ``os.access``
     asks the kernel for write and search, with the effective ids where the platform supports that.
 
-    What it does not see, at least: the mandatory integrity label, which is not read; a thread
-    impersonating another account, since the process token is the one checked; and, on the
-    fallback open, the privilege's yes above."""
+    What it does not see, at least: a thread impersonating another account, since the process
+    token is the one checked; on a network share, the share's own permissions and the server's
+    view of the token's groups; a central access policy; and, on the fallback open, the
+    privilege's yes above. Windows adds the rights to read attributes and to wait on the handle
+    to every open, so a directory that grants add-file and the right to read its list without
+    them answers no."""
     if sys.platform != "win32":
         try:
             effective = os.access in os.supports_effective_ids
@@ -969,7 +972,7 @@ def can_add_a_file(directory: Path) -> bool | None:
         )
         return opened
 
-    handle = open_directory(0x00020000)  # READ_CONTROL
+    handle = open_directory(_READ_CONTROL)
     if handle is None or handle == invalid:
         if ctypes.get_last_error() != 5:  # 5: ERROR_ACCESS_DENIED
             return None
@@ -981,11 +984,12 @@ def can_add_a_file(directory: Path) -> bool | None:
         return True
     descriptor = ctypes.c_void_p()
     try:
-        # OWNER, GROUP and DACL: AccessCheck needs the first two present in the descriptor.
+        # OWNER, GROUP and DACL, which AccessCheck needs, and the integrity label, so a label
+        # above this token's level answers no, as the create would.
         status = advapi32.GetSecurityInfo(
             handle,
             1,  # SE_FILE_OBJECT
-            0x1 | 0x2 | 0x4,
+            0x1 | 0x2 | 0x4 | 0x10,
             None,
             None,
             None,

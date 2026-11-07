@@ -8817,13 +8817,13 @@ def _provision_admin(args: argparse.Namespace) -> int:
         return await server_store_found() != "held"
 
     async def no_store_anywhere() -> Literal["none"]:
-        """``none`` once the server database's catalog shows no store schema in the schemas the
-        open resolves (PR 2804 fourteenth hold). An open's "no store" is only what its login may
-        see there, so a store it cannot see reads the same. Raises :class:`HostCustodyRefused`
-        for a store schema there that the login cannot reach, and for a catalog it cannot show:
-        neither is minted over. What the catalog read cannot see, at least, is in
+        """``none`` once the server database's catalog shows none of the store's marker tables in
+        the schemas the open resolves (PR 2804 fourteenth and fifteenth holds). An open's "no
+        store" is only what its login may see there, so a store it cannot see reads the same.
+        Raises :class:`HostCustodyRefused` for marker tables there, a store the login cannot
+        reach or one partly created, and for a catalog it cannot show, a search_path it cannot
+        read included: neither is minted over. What the catalog read cannot see, at least, is in
         :func:`~messagefoundry.store.base.server_store_schema_found_anywhere`."""
-        from messagefoundry.config.settings import StoreBackend
         from messagefoundry.store import base as store_base
         from messagefoundry.store.base import store_connect_errors, store_driver_errors
         from messagefoundry.store.custody_host import HostCustodyRefused
@@ -8844,14 +8844,16 @@ def _provision_admin(args: argparse.Namespace) -> int:
             if settings.store.backend is StoreBackend.POSTGRES:
                 why = (
                     "the search_path names no schema, or a schema name this check does not read, "
-                    "so no key was minted. Set [store].db_schema, or the role's search_path when "
-                    "it is not set, to a plain lower-case schema name, then run the command again"
+                    "or the catalog returned no answer, so no key was minted. Set "
+                    "[store].db_schema, or the role's search_path when it is not set, to a plain "
+                    "lower-case schema name, then run the command again"
                 )
             else:
                 why = (
                     "the view definition permission on the login's default schema and on dbo is "
-                    "not shown as held, so no key was minted. Grant this login that permission on "
-                    "both, or run with a login that holds it, then run the command again"
+                    "not shown as held, or the catalog returned no answer, so no key was minted. "
+                    "Grant this login that permission on both, or run with a login that holds "
+                    "it, then run the command again"
                 )
             raise HostCustodyRefused(
                 "this login reads no store in the database, but cannot show that none is there: "

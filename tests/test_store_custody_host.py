@@ -1262,7 +1262,8 @@ async def _never_started_pin_text(directory: Path) -> str:
     return str(refused.value)
 
 
-#: Phrases the guard takes out first: one reports what failed, and one changes only a setting.
+#: Phrases the guard takes out of every text first: one reports what failed, and one forbids a
+#: change (the kept-key warning's "Keep both, and do not delete either").
 _NOT_CHANGING_WHAT_EXISTS = ("could not be removed", "do not delete either")
 
 #: foreign_custody_refusal's own remedy, which changes settings only. Allowed for that text alone.
@@ -2115,7 +2116,7 @@ def test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none(
     # is not. Neither advises changing what exists.
     if anywhere is None:
         other = "view definition" if backend is StoreBackend.POSTGRES else "search_path"
-        assert other not in err, err
+        assert other not in err.lower(), err
     else:
         assert "cannot reach, so" not in err and "partly created" in err, err
     assert not _advises_changing(err), err
@@ -2236,10 +2237,11 @@ def test_the_store_marker_tables_are_declared_and_not_generic() -> None:
     from messagefoundry.store.postgres import _declared_schema as postgres_schema
     from messagefoundry.store.sqlserver import _declared_schema as sqlserver_schema
 
-    assert "schema_meta" in STORE_MARKER_TABLES and "audit_log" in STORE_MARKER_TABLES
+    assert "schema_meta" in STORE_MARKER_TABLES and "cipher_meta" in STORE_MARKER_TABLES
     for declared in (postgres_schema().columns, sqlserver_schema().columns):
         assert set(STORE_MARKER_TABLES) <= set(declared), set(STORE_MARKER_TABLES) - set(declared)
     generic = {"users", "sessions", "roles", "messages", "queue", "state", "nodes", "reference"}
+    generic |= {"audit_log", "keyring", "webauthn_credentials", "message_events", "resend_log"}
     assert not generic & set(STORE_MARKER_TABLES)
 
 
