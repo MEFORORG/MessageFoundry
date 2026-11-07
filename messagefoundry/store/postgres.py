@@ -2209,8 +2209,8 @@ class PostgresStore:
     async def schema_meta_anywhere(
         cls, settings: StoreSettings, *, posture: HopPosture | None = None
     ) -> bool | None:
-        """Whether a schema this connection's search_path names holds a table under any name
-        :func:`_declared_schema` declares (PR 2804 fourteenth to sixteenth holds), or ``None`` when
+        """Whether a schema this connection's search_path names holds a relation or type under
+        a table or index name :func:`_declared_schema` declares (PR 2804 fourteenth to sixteenth holds), or ``None`` when
         that cannot be shown. The path is ``db_schema`` when it is set, else the role's own path, read
         by :func:`_search_path_schemas`; an element it cannot read as one schema name, or a path
         that names none, is ``None``. Names are bound as ``text[]`` and cast to ``name[]`` in SQL,
@@ -2229,7 +2229,9 @@ class PostgresStore:
             if setting is None:
                 return None
             schemas = _search_path_schemas(str(setting["path"]), str(setting["who"]))
-            tables = sorted(_declared_schema().columns)
+            # An index shares the relation namespace, so its name collides as a table's does.
+            declared = _declared_schema()
+            tables = sorted({*declared.columns, *declared.named_indexes})
             if not schemas or not tables:
                 return None
             # Any relation or type under a store table's name, a view, sequence or enum

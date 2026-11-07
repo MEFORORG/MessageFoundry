@@ -2240,8 +2240,10 @@ def test_the_postgres_catalog_check_asks_for_store_tables_as_well(
     tables = list(conn.calls[1][1][1])  # type: ignore[call-overload]
     # PR 2804 sixteenth hold, item 2: every table name the store builds, whoever built the table,
     # and any relation or type under one, not tables alone.
-    assert tables == sorted(postgres_schema().columns), tables
+    declared = postgres_schema()
+    assert tables == sorted({*declared.columns, *declared.named_indexes}), tables
     assert {"schema_meta", "cipher_meta", "users", "messages"} <= set(tables), tables
+    assert {"ix_queue_ready", "ix_audit_ts"} <= set(tables), tables  # index names collide too
     query = conn.calls[1][0]
     assert "relkind" not in query and "pg_catalog.pg_type" in query, query
 
@@ -2256,9 +2258,10 @@ def test_an_empty_store_table_name_set_reads_as_cannot_show(
     from messagefoundry.store.postgres import PostgresStore
     from messagefoundry.store.sqlserver import SqlServerStore
 
-    empty = types.SimpleNamespace(columns={})
+    empty = types.SimpleNamespace(columns={}, named_indexes={})
     monkeypatch.setattr(postgres, "_declared_schema", lambda: empty)
     monkeypatch.setattr(sqlserver, "_declared_schema", lambda: empty)
+    monkeypatch.setattr(sqlserver, "_SCHEMA", [])
     _postgres_catalog(monkeypatch, [{"path": "public", "who": "mefor"}, {"found": False}])
     settings = StoreSettings().model_copy(update={"backend": StoreBackend.POSTGRES})
     assert asyncio.run(PostgresStore.schema_meta_anywhere(settings)) is None
@@ -2433,8 +2436,10 @@ def test_the_sqlserver_catalog_check_asks_for_store_tables_as_well(
     assert isinstance(names, tuple) and query.count("?") == len(names), (query, args)
     from messagefoundry.store.sqlserver import _declared_schema as sqlserver_schema
 
-    assert names == tuple(sorted(sqlserver_schema().columns)), (query, args)
+    assert set(sqlserver_schema().columns) <= set(names), (query, args)
     assert {"schema_meta", "cipher_meta", "users"} <= set(names), names
+    # A named constraint is a schema-wide object, so its name collides too.
+    assert {"pk_state", "fk_queue_message", "DF_nodes_is_leader"} <= set(names), names
     assert "type = N'U'" not in query, query  # any object under the name, not tables alone
 
 

@@ -37,6 +37,7 @@ import json
 import logging
 import math
 import queue
+import re
 import time
 from collections.abc import (
     AsyncIterator,
@@ -2829,6 +2830,10 @@ def _schema_hash() -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+#: A constraint the batch names, as ``CONSTRAINT pk_state`` (PR 2804 sixteenth hold).
+_NAMED_CONSTRAINT = re.compile(r"\bCONSTRAINT\s+\[?(\w+)", re.IGNORECASE)
+
+
 def _declared_schema() -> ServerSchemaShape:
     """What the live-schema check expects: every object the batch declares (BACKLOG #1720), with
     each column's type, nullability, numbering and declared collation (BACKLOG #5085)."""
@@ -5199,7 +5204,8 @@ class SqlServerStore:
         cls, settings: StoreSettings, *, posture: HopPosture | None = None
     ) -> bool | None:
         """Whether the schemas ``OBJECT_ID`` resolves through, the login's default schema and
-        ``dbo``, hold a table under any name :func:`_declared_schema` declares (PR 2804
+        ``dbo``, hold an object under a table name :func:`_declared_schema` declares or a
+        constraint name the batch gives (PR 2804
         fourteenth to sixteenth holds), or ``None`` when this login cannot show that. A missing
         row is ``None``. ``sys.objects`` lists only what the login may see, so its answer counts
         only where ``HAS_PERMS_BY_NAME`` shows ``VIEW DEFINITION`` held on both schemas; a NULL,
@@ -5207,7 +5213,9 @@ class SqlServerStore:
         ``DENY`` of ``VIEW DEFINITION`` on such a table itself can still hide one. Reads
         only."""
         found: bool | None = None
-        tables = tuple(sorted(_declared_schema().columns))
+        # A named constraint is a schema-wide object, so its name collides as a table's does.
+        constraints = {name for each in _SCHEMA for name in _NAMED_CONSTRAINT.findall(each)}
+        tables = tuple(sorted({*_declared_schema().columns, *constraints}))
         if not tables:
             return None
         async with (

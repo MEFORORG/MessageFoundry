@@ -4274,12 +4274,13 @@ def _server_store_class(backend: StoreBackend) -> type[SqlServerStore] | type[Po
 async def server_store_schema_found_anywhere(
     settings: StoreSettings, *, posture: HopPosture | None = None
 ) -> bool | None:
-    """Whether a schema the open resolves holds a table under any name the store builds,
-    whoever built it, read from the catalog rather than through the login's own name resolution,
-    or ``None`` when the login cannot show that (PR 2804 fourteenth to sixteenth holds). A table
-    under a store table's name breaks the create, so a mint beside one is refused too. Postgres: the
-    search_path's schemas, in ``pg_class``, which every role reads whatever its schema
-    privileges. SQL Server: the login's default schema and ``dbo``, in ``sys.objects``, counted
+    """Whether a schema the open resolves holds an object under a name the store's create
+    gives a schema-wide object, whoever built it, read from the catalog rather than through the
+    login's own name resolution, or ``None`` when the login cannot show that (PR 2804 fourteenth
+    to sixteenth holds). Such an object breaks the create, so a mint beside one is refused too.
+    The names are at least the tables, with the indexes on Postgres and the named constraints on
+    SQL Server. Postgres: the search_path's schemas, in ``pg_class`` and ``pg_type``, which every
+    role reads whatever its schema privileges. SQL Server: the login's default schema and ``dbo``, in ``sys.objects``, counted
     only where the login holds ``VIEW DEFINITION`` on both. A schema outside those, such as
     another install's ``db_schema``, is not asked. What it cannot see, at least: on SQL Server a
     table-level ``DENY`` of ``VIEW DEFINITION`` on such a table itself. A read-only check on a
