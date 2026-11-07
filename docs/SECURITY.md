@@ -3602,13 +3602,13 @@ TOTP is still off (BACKLOG #2224, #3025): the enable is a compare-and-set on the
 `totp_secret` cell the code was checked against. If a reset clears the secret during the confirm,
 another confirm turns TOTP on first, or a second enrolment start re-stages a different secret inside
 the same window, the confirm turns nothing on and returns no recovery codes. The refused confirm
-asks the store to end the session it just rotated, and answers as a lost session: `401` on `POST
-/me/mfa/confirm`, and the sign-in page in the web console. It is audited `auth.mfa_enroll_refused`.
+asks the store to end the session it just rotated, and answers as a lost session: `401` on
+`POST /me/mfa/confirm`, and the sign-in page in the web console. It is audited `auth.mfa_enroll_refused`.
 The `reason` values it records include `account_gone`, `already_enabled`, `secret_cleared`,
 `secret_replaced` and `write_lost`. Each is read from the row after the refusal, so a `reason`
 points an operator at the likely cause rather than proving it. The row's `session_ended` is false
 when no revoke of the rotated session landed, as far as the confirm saw: a cancellation that lands
-after the store committed the revoke still reads false. When the revoke is refused, the
+after the store committed the revoke still reads false. The
 `auth.mfa_enroll_refused` row is written whatever the revoke raised, unless its own write fails,
 which is logged at ERROR (vault BACKLOG #3113). `AuthService.confirm_mfa_enrollment` tries a refused
 revoke once more (BACKLOG #3025). It retries a raise in `audit_write_errors()`
