@@ -516,9 +516,9 @@ async def test_a_build_a_worker_took_before_the_pool_failed_to_start_a_thread_is
 
 
 def test_an_executor_fault_anywhere_in_a_reload_chain_is_read_as_one() -> None:
-    """The rollback's on-loop switch reads the reload's whole failure: a WiringBuildFault or a
-    raw broken pool, raised from or during it, and a chain it cannot read, count; another
-    failure does not."""
+    """The rollback's on-loop switch reads the reload's whole failure: a WiringBuildFault, a raw
+    broken pool or a bare submit-time executor refusal, raised from or during it, and a chain it
+    cannot read, count; another failure does not."""
     from concurrent.futures.thread import BrokenThreadPool
 
     from messagefoundry.config.wiring import WiringBuildFault

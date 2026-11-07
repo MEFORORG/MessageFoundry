@@ -3047,6 +3047,7 @@ async def test_a_reload_executor_fault_leaves_the_previous_inbounds_running(
         "cannot schedule new futures after interpreter shutdown",
         "Executor shutdown has been called",
         "can't start new thread",
+        "can't create new thread at interpreter shutdown",
     ],
 )
 async def test_a_bare_executor_refusal_in_a_reload_leaves_the_previous_inbounds_running(
@@ -3088,3 +3089,4 @@ async def test_a_bare_executor_refusal_in_a_reload_leaves_the_previous_inbounds_
             assert r.status_code == 500, r.text
             assert rr.inbound_running("IB_T_ADT")
             assert rr.inbound_failed("IB_T_ADT") is None
+            assert cast(Any, rr)._rollback_builds_on_loop is False

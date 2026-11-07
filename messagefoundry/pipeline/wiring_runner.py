@@ -12665,7 +12665,7 @@ def _is_executor_refusal(exc: BaseException) -> bool:
 
 def _executor_faulted(exc: BaseException) -> bool:
     """Whether ``exc``, or an exception it wraps, is an executor fault (:func:`_is_executor_refusal`):
-    the executor kept a connector build or another worker-thread hop from running. A chain that
+    the executor refused a connector build or another worker-thread hop. A chain that
     cannot be read is taken as one, so a reload's rollback still restarts its inbounds rather than
     stopping on the walk."""
     try:

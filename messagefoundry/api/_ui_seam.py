@@ -829,7 +829,7 @@ from typing import Any
 #:
 #: Engine PR 2815 (BACKLOG #5197): ``DrStatus`` gained ``failures``, the steps a degraded DR
 #: activation left unfinished, which the console's status page renders. The digest moved from
-#: ``348fe2ce7f78d903``. Merged with main's ``bfae7aa7c6c809e6`` and re-derived with ``--write`` over
+#: ``348fe2ce7f78d903`` (to ``4b8f0c19e6301e96`` on its own branch). Merged with main's ``bfae7aa7c6c809e6`` and re-derived with ``--write`` over
 #: both, to ``2a4589213e5e782c``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
