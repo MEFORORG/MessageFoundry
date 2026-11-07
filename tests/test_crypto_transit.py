@@ -272,7 +272,7 @@ def test_unknown_cipher_provider_fails_closed() -> None:
         build_store_cipher(StoreSettings(cipher_provider="nope"))
     # The refusal's text is fixed and names the setting (engine PR 2818's seventh hold); the
     # build's own text is its cause.
-    assert "[store].cipher_provider must name a known cipher provider" in str(caught.value)
+    assert "check [store].cipher_provider" in str(caught.value)
     assert "not a known cipher provider" in str(caught.value.__cause__)
 
 

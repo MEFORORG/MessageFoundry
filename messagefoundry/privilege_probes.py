@@ -185,8 +185,8 @@ def _why(exc: BaseException) -> str:
     #
     # A hop refusal keeps its text only when it is exactly the Vault hop's marked one, built from
     # fixed text (BACKLOG #3471), as `vault_failure_text` reads it. Any other `InsecureHopRefused`
-    # falls through to its type name: the base type promises no fixed text. `_ad_why` keeps the
-    # LDAPS guard's for the AD probe.
+    # falls through to its type name: the base type promises no fixed text. `_ad_why` gives the
+    # LDAPS guard's a fixed text for the AD probe, read from nothing in it.
     fail_closed = (KeyProviderError, SecretProviderError, LdapError)
     if isinstance(exc, fail_closed) or is_vault_hop_refusal(exc):
         return strip_control_chars(str(exc))

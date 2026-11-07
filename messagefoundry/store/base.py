@@ -3554,15 +3554,17 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
 #: and the failure modes the build checks, and reads nothing from the error (the seventh hold on
 #: engine PR 2818); the error stays on the chain as the cause.
 _UNTEXTED = (
-    "the store cipher could not be built from the settings: [store].cipher_provider must name a "
-    "known cipher provider, and the store key from MEFOR_STORE_ENCRYPTION_KEY or its key file "
-    "must be valid base64 of 32 bytes; the error's own text is not shown"
+    "the store cipher could not be built from the settings: check [store].cipher_provider, the "
+    "Vault Transit settings when it is vault_transit, and every store key, active or retired, from "
+    "MEFOR_STORE_ENCRYPTION_KEY, its key file, MEFOR_STORE_ENCRYPTION_KEYS_RETIRED or "
+    "[store].key_provider, each of which must be valid base64 of 32 bytes; the error's own text "
+    "is not shown"
 )
 
-#: What each refusal :func:`_refusal_for` gives opens with: the settings the key comes from.
+#: What each refusal :func:`_refusal_for` gives opens with: the settings it may come from.
 _KEY_SOURCE = (
-    "the store key could not be resolved from [store].key_provider, MEFOR_STORE_ENCRYPTION_KEY "
-    "or its key file"
+    "the store key or cipher could not be resolved from the settings ([store].key_provider, "
+    "[store].cipher_provider and the keys or Vault settings they read)"
 )
 
 #: The fallback refusal's text. Like every refusal text here it reads nothing from the error.
@@ -3571,7 +3573,7 @@ _UNJUDGED = (
 )
 
 #: The log line when the log call for a fail-closed judgement itself failed. It has no argument.
-_LOG_FAILED = "store key: a codec judgement failed closed, and its log line could not be written"
+_LOG_FAILED = "store: a codec judgement failed closed, and its log line could not be written"
 
 #: ``type``'s own ``__name__`` descriptor, so naming a class runs no metaclass code.
 _NAME_OF_A_TYPE: Any = vars(type)["__name__"]
@@ -3582,14 +3584,18 @@ def _log_unjudged(what: str, swallowed: type[BaseException]) -> None:
     by its name alone: never its text, nor the judged error's, either of which may quote the byte.
     A name that is not an ASCII identifier is not printed, as one a class built from data could
     carry it. Called once the handler is left. If that log call fails, :data:`_LOG_FAILED` is
-    logged as an ERROR instead, with no argument, so the failure is not silent and the refusal it
-    reports is not replaced."""
+    logged as an ERROR instead, with no argument, so the failure is not silent. If that fails too,
+    the logger itself is broken and nothing is left to report with; it is not raised, so the
+    refusal is not replaced, and the refusal is then the only record."""
     name = _NAME_OF_A_TYPE.__get__(swallowed)
     shown = name if type(name) is str and name.isascii() and name.isidentifier() else "unnamed"
     try:
         log.warning("%s (%s); refused with a fixed text", what, shown)
     except Exception:  # noqa: BLE001 -- the log call is what failed; say so with fixed text
-        log.error(_LOG_FAILED)
+        try:
+            log.error(_LOG_FAILED)
+        except Exception:  # noqa: BLE001 -- the logger is broken; see the docstring
+            return
 
 
 #: ``BaseException``'s own link descriptors, which ``BaseException.__cause__`` and its siblings
@@ -3656,8 +3662,9 @@ def _codec_error_on(exc: BaseException) -> tuple[BaseException | None, bool]:
 def _codec_chain_reading(exc: BaseException) -> str | None:
     """For the PostgreSQL store's TLS context wrap, what to say of ``exc`` in place of its text:
     ``"from a codec error"`` where a codec error is on its chain as :func:`_codec_error_on` reads
-    it, ``"whose chain cannot be read whole"`` where that read did not finish, else ``None``, and
-    the text may be kept (BACKLOG #3471, #4882). A ``BaseException`` from the walk, such as a
+    it, ``"whose chain cannot be read whole"`` where that read did not finish, else ``None``
+    (BACKLOG #3471, #4882). Whatever it answers, the wrap reads nothing else from ``exc`` (the
+    seventh hold on engine PR 2818). A ``BaseException`` from the walk, such as a
     ``KeyboardInterrupt``, propagates with no cause and no context, its links cleared through
     ``BaseException``'s descriptors as :func:`_codec_safe_refusal` says."""
     try:

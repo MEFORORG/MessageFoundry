@@ -1616,7 +1616,6 @@ def test_a_failed_log_call_is_logged_with_fixed_text(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Item 5 of the seventh hold: a log call that failed vanished; a fixed ERROR line says so."""
-    real_warning = store_base.log.warning
 
     def _warning_fails(*args: object, **kwargs: object) -> None:
         raise RuntimeError("synthetic: the logger failed")
@@ -1627,4 +1626,20 @@ def test_a_failed_log_call_is_logged_with_fixed_text(
         escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
     assert type(escaped) is StoreCipherConfigError, type(escaped)
     assert store_base._LOG_FAILED in [r.getMessage() for r in caplog.records], caplog.records
-    assert real_warning is not _warning_fails
+
+
+def test_a_broken_logger_does_not_replace_the_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 1 of the seventh hold's review: with both log calls failing, as under a filter that
+    raises, the fallback ERROR call raised in place of the typed refusal."""
+
+    def _logging_is_broken(record: object) -> bool:
+        raise RuntimeError("synthetic: logging is broken")
+
+    store_base.log.addFilter(_logging_is_broken)
+    try:
+        _with_provider(monkeypatch, _UnreadableReason(f"synthetic: {_decode_error()}"))
+        escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
+    finally:
+        store_base.log.removeFilter(_logging_is_broken)
+    assert type(escaped) is StoreCipherConfigError, type(escaped)
+    assert escaped.__cause__ is None and escaped.__context__ is None
