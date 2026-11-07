@@ -69,6 +69,9 @@ from messagefoundry.auth.ldap import (
     LdapReferralError,
     LdapUnansweredError,
     LdapUndecodableError,
+    _reading_connection,
+    _type_name,
+    interpreter_error,
     kerberos_principal,
     normalise_object_guid,
 )
@@ -2427,9 +2430,18 @@ async def _ask_directory[**P, T](call: Callable[P, T], /, *args: P.args, **kwarg
     audit row. The reconciler's own probe does not use this: ``_probe_principal`` reads such a fault
     as a probe fault, which alerts.
 
-    **The defect stays visible.** The type is logged at WARNING on every call, and the traceback at
-    DEBUG; the text never reaches the log line, the ``LdapError`` or an audit row, because it can
+    **The defect stays visible.** The type is logged on every call, at WARNING or ERROR as below,
+    and the traceback at DEBUG; the text never reaches the log line, the ``LdapError`` or an audit row, because it can
     quote a directory value. ``CancelledError`` is not an ``Exception``, so it propagates.
+
+    **An engine defect is told apart, at ERROR (BACKLOG #3017 L6).** Catching an engine
+    programming error here is deliberate: these legs grant, so they fail closed rather than answer
+    a 500 with no audit row. But read as a plain outage it would hide among them. Only a fault
+    ldap3 raised while reading what the directory sent, and a network error saying the directory
+    was not reached, stay at WARNING. Any other is logged at
+    ERROR, naming the frame's module, line and function, and still no text (:func:`_engine_frame`).
+    That includes a runtime fault such as the thread pool refusing work at shutdown, which is not
+    the directory's either.
     """
     try:
         return await asyncio.to_thread(call, *args, **kwargs)
@@ -2437,14 +2449,82 @@ async def _ask_directory[**P, T](call: Callable[P, T], /, *args: P.args, **kwarg
         raise
     except Exception as exc:
         kind = type(exc).__name__
-        _log.warning(
-            "directory call %s raised %s; read as the directory not answering, so the request "
-            "is refused",
-            getattr(call, "__name__", "?"),
-            kind,
-        )
+        name = getattr(call, "__name__", "?")
+        where = _engine_frame(exc)
+        if where is None:
+            _log.warning(
+                "directory call %s raised %s; read as the directory not answering, so the request "
+                "is refused",
+                name,
+                kind,
+            )
+        else:
+            _log.error(
+                "directory call %s raised %s at %s, not in ldap3's read of the directory's answer, "
+                "so it is read as an engine defect, or a directory value engine code could not "
+                "handle; the request is refused",
+                name,
+                kind,
+                where,
+            )
         _log.debug("directory call raised", exc_info=exc)
         raise LdapError(f"directory call failed: unexpected {kind}") from exc
+
+
+def _engine_frame(exc: Exception) -> str | None:
+    """``module:line in function`` of the frame ``exc`` was raised in, or ``None`` when ldap3
+    raised it while reading what the directory sent, or it is a network error that says the
+    directory was not reached (``_unreached_directory``, the reconciler's reading).
+
+    The origin rule is ``ldap.py``'s own (``_reading_connection``), which tells the directory's
+    fault from one ldap3 raises while building a request from the engine's arguments. Any other
+    origin counts as the engine's: its own code, a library call it made with a bad argument, or no
+    traceback at all, so a defect never hides by losing its frame. Code-defined names and a line
+    number only, never a value (:func:`_ask_directory`)."""
+    if _reading_connection(exc) is not None:
+        return None
+    # The reconciler's own reading: a network error says the directory was not reached.
+    if _unreached_directory(exc):
+        return None
+    tb = exc.__traceback__
+    if tb is None:
+        return "an unknown frame"
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    # tb_lineno, not f_lineno: a finally that ran in the frame moves f_lineno off the raise.
+    module = str(tb.tb_frame.f_globals.get("__name__", ""))
+    return f"{module}:{tb.tb_lineno} in {tb.tb_frame.f_code.co_name}"
+
+
+def _directory_error_detail(exc: LdapError) -> dict[str, str | int]:
+    """What an ``auth.login_error`` row records of a directory error: a closed reason, type names
+    and, for an unanswered operation, its integer result code with ldap3's fixed name for it;
+    never the error's text (BACKLOG #3196, #3727).
+
+    The text can carry what an outside party chose: a referral's hosts, a value read after a
+    Kerberos step accepted the caller's token, or a message from a fault ``_ask_directory``
+    mapped. The reason is ``directory_error``, which names the class and claims no cause: the
+    error may be an outage or a configuration fault. Beside it, at least: ``error``, the error's
+    type; for an unanswered operation, ``code`` and ``code_name``, the result code and ldap3's
+    name for it from its fixed table, and ``operation``, the engine's own name for what was
+    refused; ``cause``, the chained error's type, such as the
+    ``TypeError`` behind an unexpected fault; and ``interpreter_error``, the interpreter error an
+    ldap3 socket error merges in (``interpreter_error`` in ``ldap.py``). Whatever else the text
+    said is not on the row; where the raising code logs a diagnostic, the log keeps it."""
+    detail: dict[str, str | int] = {"reason": "directory_error", "error": type(exc).__name__}
+    if isinstance(exc, LdapUnansweredError):
+        if exc.code is not None:
+            detail["code"] = exc.code
+        detail["code_name"] = exc.code_name
+        if exc.operation:
+            detail["operation"] = exc.operation
+    cause = exc.__cause__
+    if cause is not None:
+        detail["cause"] = _type_name(cause)
+        underlying = interpreter_error(cause)
+        if underlying is not None and underlying != type(cause).__name__:
+            detail["interpreter_error"] = underlying
+    return detail
 
 
 #: How much of a typed username :func:`_credential_lock_key` reads (BACKLOG #1943). Four times the
@@ -5987,10 +6067,14 @@ class AuthService:
         except LdapError as exc:
             # Reached from settings, from the directory, or from a principal read after the step
             # accepted the token. kerberos_principal turns every failure of the step into the arm above.
+            # A closed reason and type names only (BACKLOG #3196): the text can carry what the
+            # caller or the directory chose.
             await self._audit(
                 "auth.login_error",
                 actor="<kerberos>",
-                detail=_json({"provider": "ad", "mech": "kerberos", "error": str(exc)}),
+                detail=_json(
+                    {"provider": "ad", "mech": "kerberos", **_directory_error_detail(exc)}
+                ),
                 client=client,
             )
             return LoginOutcome(ok=False, error="directory unavailable")
@@ -6542,10 +6626,18 @@ class AuthService:
                 self._ldap.resolve_principal, bound.username, object_id=object_id
             )
         except LdapError as exc:
+            # A closed reason and type names only, as the Kerberos arm (BACKLOG #3727, #3196).
             await self._audit(
                 "auth.login_error",
                 actor="<oidc>",
-                detail=_json({**floor_marker, "provider": "ad", "mech": "oidc", "error": str(exc)}),
+                detail=_json(
+                    {
+                        **floor_marker,
+                        "provider": "ad",
+                        "mech": "oidc",
+                        **_directory_error_detail(exc),
+                    }
+                ),
                 client=client,
             )
             return LoginOutcome(

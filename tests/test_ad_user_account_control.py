@@ -242,6 +242,8 @@ def _install_directory(monkeypatch: pytest.MonkeyPatch, directory: _Directory) -
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             self.entries: list[_Entry] = []
             self.result: dict[str, Any] | None = None  # no referral
+            # Read by doubles layered over this one, to tell the service account's bind apart.
+            self._bind_dn: str | None = kwargs.get("user")
 
         def __enter__(self) -> FakeConnection:
             return self
