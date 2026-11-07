@@ -649,7 +649,8 @@ def mint_target(
     (``service_account`` of ``None``), for the account. ``FileExistsError`` when a host blob or a
     handoff is already there: a second mint over a store's key is never made. A handoff is Windows
     only; a POSIX host mints as the service user itself. Last, :class:`HostCustodyRefused` for a
-    custody directory the write would refuse (PR 2804 eleventh hold)."""
+    custody directory that is missing or on a file system the write refuses (PR 2804 eleventh
+    hold); whether this account may create a file there is still answered only by the write."""
     host, handoff = check_host_custody_settings(settings, environ=environ)
     for path in (host, handoff):
         if os.path.lexists(path):

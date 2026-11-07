@@ -8781,13 +8781,19 @@ def _provision_admin(args: argparse.Namespace) -> int:
             store_slot.current = None
             await store.close()
 
+    # What the pre-check's probe found, so the probe after a failed create discards a key only
+    # where both found no store schema: a probe's "none" is only what its login can see.
+    precheck_found: Literal["none", "empty", "held"] | None = None
+
     async def server_store_absent() -> bool:
         """Under the host key provider with no blob here: whether the server database holds no
         store yet (vault BACKLOG #3411): no store at all, or an empty audit chain over a store
         that holds no data either, is absent; a chain with a genesis record, or data under an empty
         chain, is a store this mint must not take. Connection and hop refusals surface here, before
         the prompts, as the ordinary pre-check's do."""
-        return await server_store_found() != "held"
+        nonlocal precheck_found
+        precheck_found = await server_store_found()
+        return precheck_found != "held"
 
     async def server_store_found() -> Literal["none", "empty", "held"]:
         """What the server database holds, read as :func:`server_store_absent` reads it: ``none``,
@@ -8843,7 +8849,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         :func:`server_store_found` (PR 2804 eleventh hold). ``None`` where it is not asked: SQLite,
         whose absence ``_discard_minted_custody`` reads itself, a pin refused before the open's
         first write, which already settles it, and an interrupt, which is not answered with more
-        I/O. ``None`` too whenever the probe cannot answer, so the key is kept."""
+        I/O. ``None`` too whenever the probe cannot answer, so the key is kept, and for ``none``
+        where the pre-check found a store schema: the schema may only be hidden from this login."""
         from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
 
         if (
@@ -8853,7 +8860,14 @@ def _provision_admin(args: argparse.Namespace) -> int:
         ):
             return None
         try:
-            return await server_store_found()
+            found = await server_store_found()
+            if found == "none" and precheck_found != "none":
+                logging.getLogger(__name__).warning(
+                    "the store schema the pre-check found is not visible after the failed create,"
+                    " so the store key minted for it is kept"
+                )
+                return None
+            return found
         except HostCustodyRefused as unread:
             # The engine's own text, which names the grant or the server fault, never a cell.
             logging.getLogger(__name__).warning("%s; the store key minted for it is kept", unread)

@@ -1963,6 +1963,7 @@ def test_a_custody_directory_the_write_refuses_is_refused_before_the_recovery_ke
         ("keyed leftovers", False),
         ("holds data", False),
         ("unreadable", False),
+        ("schema hidden", False),
     ],
 )
 def test_a_failed_server_create_discards_the_minted_key_only_over_a_store_that_holds_nothing(
@@ -1982,7 +1983,9 @@ def test_a_failed_server_create_discards_the_minted_key_only_over_a_store_that_h
     # leftovers" held no data, but the genesis record may have been in flight, so the key is kept
     # and the warning says how to tell and how to remove it. The negative controls keep it: "holds
     # data" is a store with a row in a data table, "unreadable" a census that cannot be shown
-    # complete.
+    # complete, and "schema hidden" a database whose schema the pre-check saw and the probe after
+    # the failure cannot: a probe's "no store" is only what its login can see, so it does not
+    # discard a key over a store the pre-check found.
     import asyncio
 
     from messagefoundry import __main__ as cli
@@ -2002,7 +2005,7 @@ def test_a_failed_server_create_discards_the_minted_key_only_over_a_store_that_h
     held = tmp_path / "held.db"
     if shape == "keyed leftovers":
         asyncio.run(_failed_mint_leftovers(held, tmp_path))
-    elif shape in ("holds data", "unreadable"):
+    elif shape in ("holds data", "unreadable", "schema hidden"):
 
         async def _seed() -> None:
             store = await _keyless_store(held)
@@ -2045,7 +2048,10 @@ def test_a_failed_server_create_discards_the_minted_key_only_over_a_store_that_h
                 raise StoreChainNeverStarted("refusing to open the store: never started (stand-in)")
             raise _no_store()
         # The server probe, under its throwaway blob: no store before the create, then the shape.
-        if not created or shape == "no store":
+        # "schema hidden" is found before the create and not after it.
+        if (not created and shape != "schema hidden") or (
+            created and shape in ("no store", "schema hidden")
+        ):
             raise _no_store()
         with monkeypatch.context() as probing:
             # The stand-in's own open must not meet the minted file, which is no part of it.
@@ -2083,8 +2089,9 @@ def test_a_failed_server_create_discards_the_minted_key_only_over_a_store_that_h
     # Each shape keeps or removes the key for its own reason: the census answered, or it was asked
     # and could not be shown complete, whose remedy the log keeps. Nothing else failed to read.
     assert censused == (["incomplete"] if shape == "unreadable" else []), censused
-    assert len(unread) == (1 if shape == "unreadable" else 0), unread
-    assert all("view definition permission" in message for message in unread), unread
+    assert len(unread) == (1 if shape in ("unreadable", "schema hidden") else 0), unread
+    reason = "view definition permission" if shape == "unreadable" else "not visible after"
+    assert all(reason in message for message in unread), unread
     if not discarded:
         # The key may hold data, so it is kept, unchanged, and named.
         assert host_file.read_bytes() == b"minted (stand-in)"
