@@ -689,17 +689,19 @@ _UNSCANNABLE_RE_PATTERNS = {
     # _PS_QUOTES), so those three cannot drift between the text and the split. The splicing is
     # the only reason the scanner cannot read it. Its literal form, the pattern it compiles to,
     # passes the nested-quantifier detector, and the literal-form test below checks that on every
-    # run. So a sub-pattern edit that nests an unbounded greedy quantifier reds the build. The
-    # detector does not model overlapping alternation, so it does not catch every catastrophic
-    # edit: a quoted run made greedy again over branches that overlap passes it.
+    # run. The detector fires only when two nested levels are both greedy and unbounded, so one
+    # repetition made greedy again would still pass it. That test therefore also requires every
+    # unbounded repetition in the pattern to be possessive. The detector does not model
+    # overlapping alternation, so neither check catches every catastrophic edit.
     #
-    # It passes because its three unbounded repetitions are possessive: the quoted run, the
-    # ' + ' parts and the ' ; ' checks. Possessive does not change what it matches, because
-    # giving an iteration back never yields a match. A quoted run given back ends at the first
-    # quote of a doubled pair, and the quote after it is not ' ; ', ' + ', ')' or the end. A
-    # ' + ' or ' ; ' iteration given back leaves a space where ')' or the end must follow. The
-    # branches of each choice differ at their first character. That rests on those conditions,
-    # so the differential test below compares the possessive and greedy forms on seeded texts.
+    # Its three kinds of unbounded repetition are possessive: the quoted run, the ' + ' parts and
+    # the ' ; ' checks. Possessive does not change what it matches, because giving an iteration
+    # back never yields a match. A quoted run given back ends at a character the ASCII closing
+    # quote cannot match, or at the first quote of a doubled '' pair, whose second quote is not
+    # ' ; ', ' + ', ')' or the end. A ' + ' or ' ; ' iteration given back leaves a space where ')'
+    # or the end must follow. The branches of each choice differ at their first character. That
+    # rests on those conditions, so the differential test below compares the possessive and
+    # greedy forms on seeded texts, with a planted variant to show it can see a difference.
     # The caller uses the unanchored ``.search``, which starts again only where the literal lead
     # occurs.
     #
@@ -752,73 +754,100 @@ def test_the_scanners_blind_spots_are_the_recorded_ones() -> None:
     assert actual == _UNSCANNABLE_RE_PATTERNS
 
 
+def _greedy_twin(pattern: str) -> str:
+    """``pattern`` with every possessive group repetition ``)*+`` made greedy ``)*``."""
+    greedy = pattern.replace(")*+", ")*")
+    assert greedy != pattern
+    return greedy
+
+
 def test_the_dr_staging_check_matcher_passes_the_detector_in_literal_form() -> None:
     # The pin above exempts _CHECKS_AT_END from the scan only because it is spliced. The pattern
     # it compiles to, written out as a literal, must pass the same detector, so a sub-pattern edit
-    # that brings back a nested unbounded quantifier reds here rather than hiding behind the pin.
+    # that nests two greedy unbounded quantifiers reds here rather than hiding behind the pin.
     from messagefoundry.pipeline import dr_backup
 
     pattern = dr_backup._CHECKS_AT_END.pattern
     source = f"import re\nre.compile({pattern!r})\n"
     assert _regex_literals(source) == [pattern]
     assert find_nested_quantifiers(source) == []
-    greedy = pattern.replace(")*+", ")*")
-    assert greedy != pattern
+    # The detector passes a pattern with only one greedy level, so it alone would not notice one
+    # repetition made greedy again. Every unbounded repetition here is a possessive `)*+`.
+    assert "*" not in pattern.replace(")*+", "")
+    assert "+" not in pattern.replace(")*+", "").replace("\\+", "")
+    greedy = _greedy_twin(pattern)
     assert find_nested_quantifiers(f"import re\nre.compile({greedy!r})\n") == [greedy]
 
 
 def test_the_dr_staging_check_matcher_matches_what_its_greedy_form_did() -> None:
     # Possessive repetitions commit to their first parse, so they match what the greedy form did
     # only while giving an iteration back never yields a match. The pin above argues that holds.
-    # This compares the two forms on seeded texts: real-shaped checks, the same with one mutation,
-    # and random runs of the pieces a check is built from.
+    # This compares the two forms on seeded texts: checks on paths `_ps_path` spells, the same
+    # with one piece swapped, and random runs of the pieces a check is built from.
     import random
 
     from messagefoundry.pipeline import dr_backup
 
     possessive = dr_backup._CHECKS_AT_END
-    greedy = re.compile(possessive.pattern.replace(")*+", ")*"))
-    assert greedy.pattern != possessive.pattern
+    greedy = re.compile(_greedy_twin(possessive.pattern))
     lead, check = dr_backup._CHECKS_LEAD, dr_backup._TEST_PATH
-    parts = ["'a'", "'b''c'", "'\u2018\u2018x'", "''", "[char]0x2028"]
+    name_pieces = [
+        *"a +;()'",
+        *dr_backup._PS_QUOTES,
+        "\u2028",
+        "\u00a0",
+        "\udc80",
+        "\n",
+    ]
     atoms = [
-        *parts,
-        "'",
-        "\u2019",
-        "\u201b\u201b",
-        "a",
-        " ",
+        lead,
+        check + " ",
         " ; ",
         " + ",
         "(",
         ")",
+        "'",
+        "''",
+        "\u2019",
+        "\u201b\u201b",
+        "a",
+        " ",
+        "[char]0x2028",
         "[char]0xdc80",
-        lead,
-        check + " ",
         "('' + ",
     ]
     rng = random.Random(2420)
-    texts: list[str] = []
+    real: list[str] = []
+    swapped: list[str] = []
+    noise: list[str] = []
     for _ in range(4000):
-        checks = []
-        for _ in range(rng.randint(1, 3)):
-            if rng.random() < 0.5:
-                checks.append(f"{check} {rng.choice(parts[:4])}")
-            else:
-                joined = " + ".join(rng.choice(parts) for _ in range(rng.randint(1, 4)))
-                checks.append(f"{check} ({joined})")
-        text = "head" + lead + " ; ".join(checks)
-        texts.append(text)
+        paths = (
+            dr_backup._ps_path("".join(rng.choice(name_pieces) for _ in range(rng.randint(0, 6))))
+            for _ in range(rng.randint(1, 3))
+        )
+        text = "head" + lead + " ; ".join(f"{check} {path}" for path in paths)
+        real.append(text)
         i = rng.randrange(len(text))
-        texts.append(text[:i] + rng.choice(atoms) + text[i + 1 :])
-        texts.append("".join(rng.choice(atoms) for _ in range(rng.randint(1, 16))))
+        swapped.append(text[:i] + rng.choice(atoms) + text[i + 1 :])
+        noise.append("".join(rng.choice(atoms) for _ in range(rng.randint(1, 16))))
 
     def found(pattern: re.Pattern[str], text: str) -> tuple[tuple[int, int], str] | None:
         match = pattern.search(text)
         return None if match is None else (match.span(), match.group(1))
 
-    assert sum(1 for t in texts if found(possessive, t)) > 4000
-    assert [t for t in texts if found(possessive, t) != found(greedy, t)] == []
+    for texts in (real, swapped, noise):
+        assert [t for t in texts if found(possessive, t) != found(greedy, t)] == []
+    assert all(found(possessive, t) for t in real)
+    for texts in (swapped, noise):
+        assert 0 < sum(1 for t in texts if found(possessive, t)) < len(texts)
+    # The control: a variant whose possessive and greedy forms do differ, an optional quote before
+    # the end, must show a difference on these same texts, or they could not see one at all.
+    assert possessive.pattern.endswith("\\Z")
+    planted = possessive.pattern[:-2] + "'?\\Z"
+    planted_possessive, planted_greedy = re.compile(planted), re.compile(_greedy_twin(planted))
+    assert any(
+        found(planted_possessive, t) != found(planted_greedy, t) for t in [*real, *swapped, *noise]
+    )
 
 
 def test_the_blind_spot_pin_records_expressions_not_just_counts() -> None:
