@@ -8,6 +8,8 @@
   answered as a demotion: sign out and sign in again, which writes the scope the groups grant now.
   An account whose groups grant Administrator is not asked. When the AD group-to-channel map fails
   its seal, an account holding a scope is refused as `directory_scope_map_unsealed` instead and is
-  told to try again later or ask an administrator, as for a failing role map; a new sign-in
-  does not clear it. See
+  told to try again later or ask an administrator, as for a failing role map. A new sign-in
+  reads the same failing map: it keeps a scope an administrator set, so that refusal stands, and
+  withdraws a directory-set scope to NULL, which grants no channel, so the step-up then passes
+  with no channels. See
   [SECURITY.md](../docs/SECURITY.md). (`vault BACKLOG #3081`)

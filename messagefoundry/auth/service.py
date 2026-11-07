@@ -992,8 +992,9 @@ DIRECTORY_SCOPE_NARROWED = "directory_scope_narrowed"
 #: account holding a channel scope when the AD group-to-channel map fails its seal, so no scope can
 #: be judged (vault BACKLOG #3081 item 4). Not :data:`DIRECTORY_SCOPE_NARROWED`, for the reason
 #: :data:`DIRECTORY_ROLE_MAP_UNSEALED` is not a demotion: the fix is an administrator re-saving the
-#: map. A new sign-in reads the same failing map, which withdraws a directory-set scope and
-#: keeps one an administrator set, and neither clears this refusal.
+#: map. A new sign-in reads the same failing map. It keeps a scope an administrator set, so this
+#: refusal stands, and withdraws a directory-set scope to NULL, which grants no channel, so the
+#: step-up then passes with no channels.
 DIRECTORY_SCOPE_MAP_UNSEALED = "directory_scope_map_unsealed"
 
 
@@ -14625,9 +14626,10 @@ class AuthService:
         grant now. When the AD group-to-channel map fails its seal, no scope can be judged, so an
         account with a scope that grants something is refused with
         :data:`DIRECTORY_SCOPE_MAP_UNSEALED`, whether or not it would narrow, as the role map's
-        failure is refused. A new sign-in reads the same failing map, which withdraws a
-        directory-set scope and keeps one an administrator set, and neither clears the
-        refusal, so it is not told to sign in again. The role map is still read here, for
+        failure is refused. A new sign-in reads the same failing map. It keeps a scope an
+        administrator set, so that refusal stands, and withdraws a directory-set scope to NULL,
+        which grants no channel, so the step-up then passes with no channels. Neither restores
+        the scope, so it is not told to sign in again. The role map is still read here, for
         the Administrator question, when the account holds no role but a scope that grants
         something."""
         groups = frozenset(groups)  # read more than once below

@@ -3409,13 +3409,14 @@ grant Administrator is not asked, decided from the roles the groups grant, as si
 reconciliation pass decide it, and neither is a stored scope that grants nothing. Its fix is a
 demotion's: a new sign-in writes the scope the groups grant now. When the AD group-to-role map
 fails its seal, no role can be judged, so each of these legs refuses an account that holds a role
-with `directory_role_map_unsealed` instead, whether or not a role was lost, and an account with no
-role passes. That is not a demotion: nothing changed in the directory, a new sign-in reads the same
+with `directory_role_map_unsealed` instead, whether or not a role was lost. An account with no
+role passes that role test, and can still be refused on its channel scope below. That is not a demotion: nothing changed in the directory, a new sign-in reads the same
 map, and the fix is an administrator saving the map again. So it is never told to sign out. The
 AD group-to-channel map is handled the same way: when it fails its seal, an account whose scope
 grants something is refused with `directory_scope_map_unsealed`, whether or not its scope would
-narrow, and is never told to sign out: a new sign-in reads the same map, which withdraws a
-directory-set scope and keeps one an administrator set, and neither clears the refusal. Every one of these legs calls one shared comparison rather than writing it out.
+narrow, and is never told to sign out. A new sign-in reads the same failing map. It keeps a scope
+an administrator set, so that refusal stands. It withdraws a directory-set scope to NULL, which
+grants no channel, so the step-up then passes, with no channels. Every one of these legs calls one shared comparison rather than writing it out.
 
 **The caller is told which fix clears the refusal, and not its cause (BACKLOG #3082).** The precise
 cause stays on the audit row. A demotion is told to sign out and sign in again. A new sign-in clears
