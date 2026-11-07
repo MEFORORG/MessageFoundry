@@ -189,11 +189,12 @@ _FAIL_CLOSED = (SecretProviderError, KeyProviderError)
 
 
 def _assert_refused(caught: pytest.ExceptionInfo[Exception], entry: EntryPoint) -> None:
-    """The provider raised its own fail-closed type, caused by the marked refusal, with the
-    refusal's fixed text kept whole. The text names this hop's settings pair and no other lever,
-    and no part of the address or the proxy. At the store's key resolution and cipher build the
-    refusal is a new one with the store's fixed Vault hop text and no chain (the eighth hold on
-    engine PR 2818), chosen because its cause is exactly the marked refusal."""
+    """The provider raised its own fail-closed type. For the secrets hop it is caused by the marked
+    refusal, with the refusal's fixed text kept whole, which names this hop's settings pair and no
+    other lever. At the store's key resolution and cipher build the refusal is a new one with the
+    store's fixed Vault hop text and no chain (the eighth hold on engine PR 2818), chosen because
+    its cause is exactly the marked refusal; that text names the store's Vault settings. Neither
+    names any part of the address or the proxy."""
     from messagefoundry.store import base as store_base
     from messagefoundry.transports import strict_requests
 
@@ -205,7 +206,7 @@ def _assert_refused(caught: pytest.ExceptionInfo[Exception], entry: EntryPoint) 
     assert type(caught.value) is own
     text = str(caught.value)
     if section == "store":
-        assert caught.value.__cause__ is None and caught.value.__suppress_context__
+        assert caught.value.__cause__ is None and caught.value.__context__ is None
         assert text == store_base._VAULT_HOP_TEXT
     else:
         assert type(caught.value.__cause__) is strict_requests.VaultHopRefused

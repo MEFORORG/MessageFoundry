@@ -114,6 +114,14 @@ _UPLOAD_MISS = (
     "(base64 body, json.dumps metadata)"
 )
 
+#: The four store refusal sites of engine PR 2818's eighth hold: each raises outside its own
+#: handler, so the error it caught is on neither chain link; ``from None`` there suppresses at most
+#: an exception a caller is handling, and the refusal's fixed text is read from no error.
+_RAISED_AFTER_HANDLER = (
+    _SAFE + "raised after its own handler exited, so the caught error is on neither chain link; "
+    "from None suppresses at most a caller's handled exception, and the text is fixed"
+)
+
 #: One entry per (site key, count). Read the module docstring before adding one.
 _ALLOWED: tuple[_Allowed, ...] = (
     # ---- SAFE: the suppressed exception carries nothing the raised one does not already say.
@@ -217,28 +225,22 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "the lookup error quotes the pipe or frame refusal, which names a frame and never "
         "its content (decode_frame keeps only safe_exc text)",
     ),
-    # The store key seam, cipher build and PostgreSQL TLS open (engine PR 2818, eighth hold): each
-    # builds its refusal after the handler has exited, so neither chain holds the caught error
-    # whether or not ``from None`` is written; the refusal's text is fixed and read from no error.
+    # The store key seam, cipher build and PostgreSQL TLS open (engine PR 2818, eighth hold).
     _Allowed(
         "messagefoundry/store/base.py::build_store_cipher::<no handler>::refusal",
-        _SAFE + "raised after the handler exited, so nothing was suppressed: __context__ is empty "
-        "and the refusal's fixed text is read from no error",
+        _RAISED_AFTER_HANDLER,
     ),
     _Allowed(
         "messagefoundry/store/base.py::resolve_active_key::<no handler>::refusal",
-        _SAFE + "raised after the handler exited, so nothing was suppressed: __context__ is empty "
-        "and the refusal's fixed text is read from no error",
+        _RAISED_AFTER_HANDLER,
     ),
     _Allowed(
         "messagefoundry/store/base.py::resolve_decrypt_keys::<no handler>::refusal",
-        _SAFE + "raised after the handler exited, so nothing was suppressed: __context__ is empty "
-        "and the refusal's fixed text is read from no error",
+        _RAISED_AFTER_HANDLER,
     ),
     _Allowed(
         "messagefoundry/store/postgres.py::_verifying_context_at_open::<no handler>::refusal",
-        _SAFE + "raised after the handler exited, so nothing was suppressed: __context__ is empty "
-        "and the refusal's fixed text is read from no error",
+        _RAISED_AFTER_HANDLER,
     ),
     _Allowed(
         "messagefoundry/store/store.py::parse_audit_anchor::ValueError::AuditAnchorError",
