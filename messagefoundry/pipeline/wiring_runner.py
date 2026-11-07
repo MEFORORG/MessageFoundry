@@ -23,7 +23,6 @@ Reuses the store, the connector registry, and the ACK builder.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import contextvars
 import errno
 import functools
@@ -12541,37 +12540,20 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
 
     The thread is not stopped by a cancellation of the awaiting task. What it then builds is
     closed rather than dropped (:func:`_close_abandoned_build`), as a connector built in place and
-    then cancelled is. The build is held by a thread future and not by a task, so the loop's
-    shutdown cancel, which reaches every task, cannot cancel it and drop what it builds (engine PR
-    2815, Lander hold 6698688363 item 5). Like :func:`asyncio.to_thread`, the thread runs in the
-    default executor, in a copy of the caller's context."""
-    loop = asyncio.get_running_loop()
-    context = contextvars.copy_context()
-    built: concurrent.futures.Future[T] = concurrent.futures.Future()
+    then cancelled is. The build is held by the executor's own future and not by a task, so the
+    loop's shutdown cancel, which reaches every task, cannot cancel it and drop what it builds
+    (engine PR 2815, Lander hold 6698688363 item 5). As in :func:`asyncio.to_thread`, the thread
+    runs in the default executor, in a copy of the caller's context."""
 
     def stamped() -> T:
         with active_hop_posture(posture):
             return build()
 
-    def run() -> None:
-        if not built.set_running_or_notify_cancel():
-            return
-        try:
-            result = context.run(stamped)
-        except BaseException as exc:  # noqa: BLE001 - handed to the awaiting caller, not swallowed
-            built.set_exception(exc)
-        else:
-            built.set_result(result)
-
-    await_built = asyncio.wrap_future(built, loop=loop)
-    loop.run_in_executor(None, run)
+    work = asyncio.get_running_loop().run_in_executor(None, contextvars.copy_context().run, stamped)
     try:
-        return await asyncio.shield(await_built)
+        return await asyncio.shield(work)
     except asyncio.CancelledError:
-        built.add_done_callback(functools.partial(_close_abandoned_build, loop))
-        # No caller is left to read the wrapper. Cancelling it also cancels a build whose thread
-        # has not started, and leaves one that has to finish and be closed.
-        await_built.cancel()
+        work.add_done_callback(_close_abandoned_build)
         raise
 
 
@@ -12580,28 +12562,21 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
 _ABANDONED_BUILD_CLOSES: set[asyncio.Task[None]] = set()
 
 
-def _close_abandoned_build(
-    loop: asyncio.AbstractEventLoop, work: concurrent.futures.Future[Any]
-) -> None:
+def _close_abandoned_build(work: asyncio.Future[Any]) -> None:
     """Close the connector ``work`` built for a caller that was cancelled while it ran
-    (:func:`_build_off_loop`). A build that failed built nothing to close. Runs on the build's
-    thread once it finishes, or at once if it already had, so the close is handed to ``loop``."""
+    (:func:`_build_off_loop`). A build that failed built nothing to close."""
     if work.cancelled() or work.exception() is not None:
         return
     built = work.result()
-    if not isinstance(built, (DestinationConnector, SourceConnector)):
+    if isinstance(built, DestinationConnector):
+        closing: Awaitable[None] = built.aclose()
+    elif isinstance(built, SourceConnector):
+        closing = built.stop()
+    else:
         return
-    try:
-        loop.call_soon_threadsafe(_start_abandoned_close, built)
-    except RuntimeError:
-        # The loop closed before the build finished, so nothing can await the close.
-        log.warning("a connector built for a cancelled caller could not be closed: its loop closed")
-
-
-def _start_abandoned_close(built: DestinationConnector | SourceConnector) -> None:
-    """Start closing ``built`` on the loop, holding the task until it finishes."""
-    closing = built.aclose() if isinstance(built, DestinationConnector) else built.stop()
-    task = asyncio.get_running_loop().create_task(_close_quietly(closing))
+    # Started eagerly, so a close that does not suspend finishes in this callback. At the loop's
+    # shutdown this callback can run in the loop's last pass, which never reaches a later step.
+    task = asyncio.Task(_close_quietly(closing), loop=asyncio.get_running_loop(), eager_start=True)
     _ABANDONED_BUILD_CLOSES.add(task)
     task.add_done_callback(_ABANDONED_BUILD_CLOSES.discard)
 
