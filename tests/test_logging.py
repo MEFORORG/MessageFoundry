@@ -14,7 +14,6 @@ import logging
 import logging.handlers
 import os
 import queue
-import random
 import re
 import sys
 import threading
@@ -48,7 +47,7 @@ from messagefoundry.logging_setup import (
 from messagefoundry.redaction import clamp_untrusted, redact, safe_traceback
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER
 from messagefoundry.support import redact as support_redact
-from tests._cpu_clock import CPU_SAMPLE_FLOOR_SECONDS, cpu_seconds
+from tests._cpu_clock import CPU_SAMPLE_FLOOR_SECONDS, cpu_seconds, interleaved_thread_cpu
 from tests._phi_gate_provisions import make_syslog_ca_and_crl
 
 #: Synthetic HL7 (never real PHI) embedded in a log record so a redaction assertion has something to
@@ -537,31 +536,31 @@ def test_control_the_same_record_is_expensive_unbounded() -> None:
 #: copy and the scan is CPU-bound regex work, so how many renders the unbounded scan costs depends
 #: on the runner's memory against its core (readings in the test).
 #:
-#: So there are two lines, both measured beside the subject, and the filter must clear both:
+#: So the line is a ceiling measured beside the subject: **at most this many REFERENCE renders.**
+#: The reference is the stdlib's ``Formatter.formatException``, which the filter does not call, so
+#: it does not move with the filter's own render. The filter runs one render plus a clamped scan of
+#: about a millisecond, and reads about one reference. A filter that renders twice reads about two,
+#: and so does one that scans the whole render, since the test asserts that scan costs more than a
+#: render. A ``safe_traceback`` that grows a pass of its own reds here only if that pass costs at
+#: least half a render: a cheap linear pass over the whole text, a ``str.count`` say, does not.
 #:
-#: - **The ceiling: at most this many REFERENCE renders.** The reference is the stdlib's
-#:   ``Formatter.formatException``, which the filter does not call, so a filter that renders twice,
-#:   or a ``safe_traceback`` that grows an unbounded pass of its own, costs two or more references
-#:   whatever the runner, and reds here. The filter runs one render plus a clamped scan of about a
-#:   millisecond, so it reads about one reference.
-#: - **The scan line: one reference render plus this share of the unbounded scan**, ``redact`` over
-#:   the whole render. With the bound the filter adds about nothing to the render; without it, it
-#:   adds the whole scan. Wherever the unbounded scan costs more than the render, which the test
-#:   asserts, the ceiling is the tighter of the two, and this line is what still holds a runner on
-#:   which the render had grown to dwarf the scan.
+#: **No separate scan line.** This arm once also held the filter under one render plus half the
+#: unbounded scan. With the scan asserted to cost more than a render, that line sits above this
+#: ceiling, so it could never fail where the ceiling passed, and it is gone. The scan itself is held
+#: to its own budget below, apart from the render.
 _TRACEBACK_RENDER_CEILING = 1.5
-_TRACEBACK_SCAN_SHARE = 0.5
 
 
 type _ExcInfo = tuple[type[BaseException], BaseException, TracebackType | None]
 
 
 #: The traceback's message length: half the frame cap, 8 Mi characters, 128 times the scan
-#: window. The render and both scans are linear in it, so the ratios the test reads are the ones it
-#: would read at the cap, and each call costs half as much, which beside load is most of the test's
-#: run time (BACKLOG #3456: the test ran into a 60 s timeout on a loaded box). Not a quarter: the
-#: filter's fixed cost, the clamped scan and the record, is a larger share of a smaller render, and
-#: at a quarter the shipped filter read up to 1.48 renders idle, too near the ceiling.
+#: window. The render and the unbounded scan are linear in it, so each call costs half what it
+#: would at the cap, which beside load is most of the test's run time (BACKLOG #3456: the test ran
+#: into a 60 s timeout on a loaded box). The filter's fixed cost, the clamped scan and the record, is
+#: not linear in it, so the filter reads a larger share of a smaller render: up to 1.32 renders idle
+#: at this length (the readings in the test), against 1.08 at the full cap, and 1.48 at a quarter,
+#: which is too near the ceiling. So not a quarter.
 _TRACEBACK_MESSAGE_CHARS = _HOSTILE_CHARS // 2
 
 
@@ -586,66 +585,26 @@ def _filter_a_fresh_record(exc_info: _ExcInfo) -> None:
     RedactionFilter().filter(_record_of(exc_info))
 
 
-#: One arm's sample in :func:`_interleaved_thread_cpu`: at least this much CPU time, and at least
+#: One arm's sample in ``interleaved_thread_cpu``: at least this much CPU time, and at least
 #: ``_TRACEBACK_MIN_CALLS`` calls of an arm whose one call costs less. Three times the shared floor,
-#: because the ceiling's margin is narrower than the scan line's: a doubled render must read over
-#: 1.5 renders and the shipped filter under it. The call count is for the loaded case, where a
+#: because the ceiling's margin is narrow: a doubled render must read over 1.5 renders and the
+#: shipped filter under it. The call count is for the loaded case, where a
 #: render costs hundreds of milliseconds and the floor alone would take one or two calls, so one
-#: load-skewed call set the arm. Measured 2026-11-06 at the full frame cap, the filter-over-render
-#: ratio alone, twenty runs idle and twenty beside 64 copying processes per setting: at twice the
-#: floor and four calls, the shipped filter read up to 1.19 idle and the doubled render down to
-#: 1.52; at this setting, up to 1.08 and down to 1.74, over both conditions.
+#: load-skewed call set the arm. Measured 2026-11-06 at the FULL frame cap, before the message was
+#: halved, the filter-over-render ratio alone, twenty runs idle and twenty beside 64 copying
+#: processes per setting: at twice the floor and four calls, the shipped filter read up to 1.19
+#: idle and the doubled render down to 1.52; at this setting, up to 1.08 and down to 1.74, over both
+#: conditions. At the half cap the test runs at, its own readings give the margin it has.
 _TRACEBACK_SAMPLE_SECONDS = 3 * CPU_SAMPLE_FLOOR_SECONDS
 _TRACEBACK_MIN_CALLS = 6
-
-
-def _interleaved_thread_cpu(
-    arms: dict[str, Callable[[], object]], *, once: frozenset[str] = frozenset()
-) -> dict[str, float]:
-    """CPU seconds per call of each arm on the CALLING thread, with the arms' calls interleaved.
-
-    Each pass calls every arm still pending once, in an order drawn from an unseeded generator (the
-    rule ``tests/_growth.py`` gives, BACKLOG #3721), and charges each call the thread clock's move
-    across it. An arm is pending until it has spent ``_TRACEBACK_SAMPLE_SECONDS``, and, while its
-    calls average less than that, until it has had ``_TRACEBACK_MIN_CALLS`` calls. An arm named in
-    ``once`` is called once, in the first pass, for an arm whose one call is many ticks long, as the
-    unbounded scan's is: about 0.2 s idle, more beside load.
-    **Interleaved call by call rather than one block per arm**, so a stretch of load that lifts the
-    memory-bound render lifts both render-shaped arms alike instead of landing on one arm's block:
-    in blocks, beside 64 copying processes, the filter read 0.73 to 1.31 renders.
-
-    The thread clock, the one ``tests/test_redaction.py::_thread_cpu_sample`` reads, because every
-    arm runs synchronously on this thread and a thread an earlier test left running would otherwise
-    be billed to whichever arm it overlapped. On Windows it moves in 15.625 ms ticks; a call's
-    charge is off by up to one, in either direction, and those errors average across an arm's
-    calls."""
-    spent = dict.fromkeys(arms, 0.0)
-    calls = dict.fromkeys(arms, 0)
-
-    def pending(name: str) -> bool:
-        if name in once:
-            return calls[name] == 0
-        if spent[name] < _TRACEBACK_SAMPLE_SECONDS:
-            return True
-        return calls[name] < _TRACEBACK_MIN_CALLS and spent[name] / calls[name] < (
-            _TRACEBACK_SAMPLE_SECONDS
-        )
-
-    order = random.Random()
-    while due := [name for name in arms if pending(name)]:
-        for name in order.sample(due, k=len(due)):
-            start = time.thread_time()
-            arms[name]()
-            spent[name] += time.thread_time() - start
-            calls[name] += 1
-    return {name: spent[name] / calls[name] for name in arms}
 
 
 def test_the_filter_bounds_a_peer_sized_traceback() -> None:
     """The realistic vector, and the one the row calls the worst of the three surfaces: a Handler
     raises carrying the received body and an outer ``log.exception`` renders the whole thing.
 
-    One interleaved sample per arm (:func:`_interleaved_thread_cpu`), not best-of rounds of blocks,
+    One interleaved sample per arm (``tests._cpu_clock.interleaved_thread_cpu``), not best-of
+    rounds of blocks,
     over half the frame cap (``_TRACEBACK_MESSAGE_CHARS``).
 
     Readings, 2026-11-06, one Windows box with 32 logical CPUs shared with other sessions, Python
@@ -658,27 +617,31 @@ def test_the_filter_bounds_a_peer_sized_traceback() -> None:
       render 1.59 to 2.29, each red in 20 of 20. The unbounded scan 8.9 to 16.9 renders.
     - beside 64 processes copying 48 MiB buffers, ten runs: the filter 0.89 to 1.03; the doubled
       render 1.65 to 2.05 and the unbounded render 1.76 to 1.94, each red in 10 of 10. The
-      unbounded scan 2.2 to 3.3 renders, which is why the scan line is not a fixed number of
-      renders.
+      unbounded scan 2.2 to 3.3 renders, so how many renders it costs is the runner's, not a
+      constant.
+    - the unbounded scan (``redact_untrusted`` swapped for ``redact`` in
+      ``messagefoundry.logging_setup``): red in 10 of 10 idle and 10 of 10 loaded.
     - the shape before the ceiling, the filter under one render plus half the unbounded scan in
-      three shuffled best-of rounds, at the full cap: green in 89 of 90 runs with one plant or the
-      other, idle and loaded, since half the unbounded scan is more than one render on both.
+      three shuffled best-of rounds, at the full cap: green in 89 of 90 runs with the doubled or
+      the unbounded render, idle and loaded, since half the unbounded scan is more than one render
+      on both.
     - the shape before that, one wall-clock filter call against 0.20 s at the full cap: 0.040 to
       0.051 s idle, and 0.316 to 1.800 s beside 96 such processes, over the line in 6 of 6."""
     exc_info = _raised_traceback()
     rendered = safe_traceback(exc_info)
-    cost = _interleaved_thread_cpu(
+    cost = interleaved_thread_cpu(
         {
             "render": partial(logging.Formatter().formatException, exc_info),
             "filter": partial(_filter_a_fresh_record, exc_info),
             "unbounded scan": partial(redact, rendered),
         },
+        floor=_TRACEBACK_SAMPLE_SECONDS,
+        min_calls=_TRACEBACK_MIN_CALLS,
         once=frozenset({"unbounded scan"}),
     )
     render, filtered, unbounded_scan = cost["render"], cost["filter"], cost["unbounded scan"]
-    # Non-vacuity: the scan line's tolerance is a share of the unbounded scan, so a scan grown cheap
-    # beside the render would shrink it into the render's own noise; and an unbounded filter, one
-    # render plus this scan, must breach the ceiling too.
+    # Non-vacuity: an unbounded filter, one render plus this scan, must breach the ceiling, which
+    # takes a scan of more than half a render; a whole render keeps a margin over that.
     assert unbounded_scan > render, (
         f"the unbounded scan cost {unbounded_scan:.4f} CPU s, under the {render:.4f} s render -- "
         f"this fixture no longer separates a bounded filter from an unbounded one"
@@ -687,13 +650,7 @@ def test_the_filter_bounds_a_peer_sized_traceback() -> None:
     assert filtered < ceiling, (
         f"the filter cost {filtered:.4f} CPU s on a peer-sized traceback, over the ceiling of "
         f"{ceiling:.4f}: {_TRACEBACK_RENDER_CEILING} of the {render:.4f} s reference render -- "
-        f"a second render, or an unbounded one"
-    )
-    line = render + _TRACEBACK_SCAN_SHARE * unbounded_scan
-    assert filtered < line, (
-        f"the filter cost {filtered:.4f} CPU s on a peer-sized traceback, against a line of "
-        f"{line:.4f}: the {render:.4f} s render plus {_TRACEBACK_SCAN_SHARE} of the "
-        f"{unbounded_scan:.4f} s unbounded scan"
+        f"a second render, or an unbounded scan"
     )
 
     rec = _record_of(exc_info)

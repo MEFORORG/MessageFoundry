@@ -293,7 +293,7 @@ class _SlowReadyPool(_ReadyPool):
 
 
 #: How long the cleanup may wait for a cancelled borrow to unwind, in wall seconds. A bound on a
-#: hang, not a timing: ``acquire_pooled`` cancels its inner borrow and returns, leaving the salvage
+#: hang, not a timing: ``acquire_pooled`` cancels its inner borrow and re-raises, leaving the salvage
 #: to a callback, so the unwind takes a few turns. A regression that awaited the salvage instead
 #: would wait out ``_SlowReadyPool``'s hour, and this turns that into a failure.
 _UNWIND_SECONDS = 10.0
@@ -301,11 +301,11 @@ _UNWIND_SECONDS = 10.0
 
 async def _finished_within_turns(work: Coroutine[Any, Any, Any]) -> asyncio.Task[Any] | None:
     """``work`` as a task, if it finished within ``_HEALTHY_BORROW_TURNS`` loop turns; otherwise
-    ``None``, with the task cancelled and waited for, for at most ``_UNWIND_SECONDS``.
-    ``asyncio.wait`` rather than an await, so a cancellation aimed at the test itself still
-    propagates; the ``finally`` cancels the task on that path too. A pool's own inner acquire is
-    cancelled by ``acquire_pooled`` but not awaited here, so it finishes on a later turn of this
-    loop."""
+    ``None``, with the task cancelled and waited for, for at most ``_UNWIND_SECONDS``, and a failure
+    if it is still unwinding then. ``asyncio.wait`` rather than an await, so a cancellation aimed at
+    the test itself still propagates; that path cancels the task too, and re-raises what it caught
+    rather than a failure of its own. A pool's own inner acquire is cancelled by ``acquire_pooled``
+    but not awaited here, so it finishes on a later turn of this loop."""
     task = asyncio.create_task(work)
     try:
         for _ in range(_HEALTHY_BORROW_TURNS):
@@ -314,15 +314,17 @@ async def _finished_within_turns(work: Coroutine[Any, Any, Any]) -> asyncio.Task
             await asyncio.sleep(0)
         if task.done():
             return task
-    finally:
-        if not task.done():
-            task.cancel()
-            await asyncio.wait({task}, timeout=_UNWIND_SECONDS)
-            if not task.done():
-                pytest.fail(
-                    f"a cancelled borrow was still unwinding after {_UNWIND_SECONDS}s -- the "
-                    "cancel path now waits on the late borrow instead of handing it to the salvage"
-                )
+    except BaseException:
+        task.cancel()
+        await asyncio.wait({task}, timeout=_UNWIND_SECONDS)
+        raise
+    task.cancel()
+    await asyncio.wait({task}, timeout=_UNWIND_SECONDS)
+    if not task.done():
+        pytest.fail(
+            f"a cancelled borrow was still unwinding after {_UNWIND_SECONDS}s -- the "
+            "cancel path now waits on the late borrow instead of handing it to the salvage"
+        )
     return None
 
 
@@ -672,7 +674,9 @@ async def test_sqlserver_post_commit_borrow_keeps_the_cancellation_quarantine() 
             raise asyncio.CancelledError
 
     task = await _store_call_within_turns(cancelled_mid_body())
-    assert task.cancelled(), "the body's CancelledError did not propagate out of the borrow"
+    if not task.cancelled():
+        task.result()  # an ordinary failure in the body surfaces as itself
+        pytest.fail("the body's CancelledError did not propagate out of the borrow")
     assert order == ["quarantine []"], "the cancelled connection was released before quarantine"
     assert pool.released == [pool.conn]
 

@@ -3,10 +3,14 @@
 """A CPU-time stopwatch for the cost arms whose margin a loaded runner can eat (BACKLOG #2958).
 
 Shared here rather than imported as a private name from one test module. ``tests/test_redaction.py``
-built it; ``tests/test_logging.py``'s log read-back arm (BACKLOG #1547) uses it too."""
+built it; ``tests/test_logging.py``'s log read-back arm (BACKLOG #1547) uses it too.
+:func:`interleaved_thread_cpu` is the thread-clock sampler ``tests/test_logging.py``'s traceback
+arm reads (BACKLOG #3456); ``tests/test_redaction.py``'s ``_thread_cpu_sample`` is its block-shaped
+sibling, still private to that module."""
 
 from __future__ import annotations
 
+import random
 import time
 from collections.abc import Callable
 
@@ -44,3 +48,46 @@ def cpu_seconds(work: Callable[[], object], reps: int = 3) -> float:
                 break
         best = min(best, spent / calls)
     return best
+
+
+def interleaved_thread_cpu(
+    arms: dict[str, Callable[[], object]],
+    *,
+    floor: float = CPU_SAMPLE_FLOOR_SECONDS,
+    min_calls: int = 1,
+    once: frozenset[str] = frozenset(),
+) -> dict[str, float]:
+    """CPU seconds per call of each arm on the CALLING thread, with the arms' calls interleaved.
+
+    Each pass calls every arm still pending once, in an order drawn from an unseeded generator (the
+    rule ``tests/_growth.py`` gives, BACKLOG #3721), and charges each call the thread clock's move
+    across it. An arm is pending until it has spent ``floor``, and, while its calls average less
+    than that, until it has had ``min_calls`` calls. An arm named in ``once`` is called once, in the
+    first pass, for an arm whose one call is many ticks long.
+
+    **Interleaved call by call rather than one block per arm**, so a stretch of load lifts every
+    arm alike instead of landing on one arm's block (BACKLOG #3456: in blocks, beside 64 copying
+    processes, a filter read 0.73 to 1.31 times a render it costs about one of).
+
+    The thread clock rather than :func:`cpu_seconds`'s process clock, because a thread an earlier
+    test left running would otherwise be billed to whichever arm it overlapped; so every arm must
+    run synchronously on the calling thread. On Windows it moves in 15.625 ms ticks; a call's charge
+    is off by up to one, in either direction, and those errors average across an arm's calls."""
+    spent = dict.fromkeys(arms, 0.0)
+    calls = dict.fromkeys(arms, 0)
+
+    def pending(name: str) -> bool:
+        if name in once:
+            return calls[name] == 0
+        if spent[name] < floor:
+            return True
+        return calls[name] < min_calls and spent[name] / calls[name] < floor
+
+    order = random.Random()
+    while due := [name for name in arms if pending(name)]:
+        for name in order.sample(due, k=len(due)):
+            start = time.thread_time()
+            arms[name]()
+            spent[name] += time.thread_time() - start
+            calls[name] += 1
+    return {name: spent[name] / calls[name] for name in arms}
