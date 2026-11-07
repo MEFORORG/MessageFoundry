@@ -7146,9 +7146,7 @@ def _discard_minted_custody(
         # A new store location only where the pin refused: a store another key made is there.
         step = keep_the_key_step(
             store,
-            new_store=isinstance(
-                failure, (StoreIdPinRefusedBeforeWrite, StoreCreateBatchFailedBeforeKeyUse)
-            ),
+            new_store=isinstance(failure, StoreIdPinRefusedBeforeWrite),
             service_account=service_account,
         )
         print(
@@ -9318,8 +9316,17 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except Exception as exc:
         # The server backends' integrity refusals, which share no class with sqlite3's. Matched by
         # MRO name as the service matches them; anything else propagates as it did before.
-        if not _is_integrity_refusal(exc) or batch_failed:
+        if not _is_integrity_refusal(exc):
             raise
+        if batch_failed:
+            # The create batch's integrity error (PR 2804 hold 17): no account write started, and
+            # the driver's text can quote a colliding row's value, so the class alone is named.
+            return _emit_error(
+                f"the store could not be created: its create batch failed "
+                f"({type(exc).__name__}) before any account was written, so no Administrator was "
+                "provisioned",
+                as_json=args.json,
+            )
         return refused_write(exc)
 
     # True only once issued codes actually reached the console; ``recovery_codes_shown`` says so to

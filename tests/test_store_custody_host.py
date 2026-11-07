@@ -2757,7 +2757,7 @@ def test_a_lock_timeout_inside_the_batch_is_translated_and_typed_on_a_minting_op
         assert failure.__cause__ is failure.failure
         failure = failure.failure
     assert isinstance(failure, SchemaDdlLockTimeout), failure
-    assert failure.__cause__ is driver and failure.__traceback__ is not None
+    assert failure.__cause__ is driver and driver.__traceback__ is not None
 
 
 def test_the_typed_batch_failure_survives_a_copy() -> None:
@@ -2834,12 +2834,13 @@ def test_a_create_that_fails_in_its_batch_removes_the_key_and_one_after_it_keeps
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
     if where == "batch integrity":
-        # Reaches the last-resort floor as the driver's error, as an unmapped batch error did
-        # before, never as a refused write that says the Administrator may be partly written.
+        # Named by class alone, since the driver's text can quote a colliding row's value, and
+        # never as a refused write that says the Administrator may be partly written.
         code = main([*argv, "--no-totp"])
         err = " ".join(capsys.readouterr().err.split())
         assert code != 0, err
         assert not host_file.exists(), err
+        assert "UniqueViolationError" in err and "duplicate key" not in err, err
         assert "may be missing or incomplete" not in err, err
         return
     code = main([*argv, "--no-totp"])

@@ -5426,8 +5426,9 @@ class StoreChainNeverStarted(StoreIdPinRefusedBeforeWrite):
 
 class StoreCreateBatchFailedBeforeKeyUse(Exception):
     """A minting open's create batch failed before its commit (PR 2804 hold 17). The batch is one
-    transaction on each server backend, and the store key is first used after it commits, in
-    ``bind_store_salt``, so nothing was sealed under the key: a minting command may remove the key
+    transaction on each server backend, and nothing is sealed under the store key before it commits:
+    the first seal follows ``bind_store_salt``, after the batch and the pin check, which only reads.
+    So nothing was sealed under the key, and a minting command may remove the key
     it minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the batch's own error,
     also the cause. Raised only on a minting open (:func:`minting_open`), so no other caller sees a
     new class; a failure at or after the commit is never this."""
@@ -5454,13 +5455,13 @@ def minting_open() -> bool:
 
 def create_batch_failure(raised: Exception, translated: Exception | None = None) -> Exception:
     """What a server backend raises for ``raised``, caught inside its create batch before the
-    commit: ``translated`` (a lock timeout the backend names) when given, chained to ``raised`` and
-    carrying its traceback, else ``raised``; wrapped as :class:`StoreCreateBatchFailedBeforeKeyUse`
-    on a minting open (PR 2804 hold 17). Shared, so both backends answer the same way."""
+    commit: ``translated`` (a lock timeout the backend names) when given, chained to ``raised``,
+    else ``raised``; wrapped as :class:`StoreCreateBatchFailedBeforeKeyUse` on a minting open (PR
+    2804 hold 17). Shared, so both backends answer the same way."""
     failure = raised
     if translated is not None:
         translated.__cause__ = raised
-        failure = translated.with_traceback(raised.__traceback__)
+        failure = translated
     if not minting_open():
         return failure
     wrapped = StoreCreateBatchFailedBeforeKeyUse(failure)
