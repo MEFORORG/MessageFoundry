@@ -472,7 +472,7 @@ async def test_a_build_the_pool_queued_before_it_failed_to_start_a_thread_never_
 
 @pytest.mark.parametrize("outcome", ["built", "refused"])
 async def test_a_build_a_worker_took_before_the_pool_failed_to_start_a_thread_is_its_own_answer(
-    monkeypatch: pytest.MonkeyPatch, outcome: str
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, outcome: str
 ) -> None:
     """The other order: a busy worker takes the queued build before the pool's thread start
     raises. The build's own outcome is the answer: a good build is returned, and a refusal is
@@ -511,3 +511,5 @@ async def test_a_build_a_worker_took_before_the_pool_failed_to_start_a_thread_is
         assert str(raised.value) == "the build's own refusal"
     monkeypatch.undo()
     assert handed == []
+    # The executor's own fault is not lost: it is logged.
+    assert any("can't start new thread" in r.getMessage() for r in caplog.records)

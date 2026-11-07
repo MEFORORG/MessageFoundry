@@ -3036,3 +3036,5 @@ async def test_a_reload_executor_fault_leaves_the_previous_inbounds_running(
             assert r.status_code == 500, r.text
             assert rr.inbound_running("IB_T_ADT")
             assert rr.inbound_failed("IB_T_ADT") is None
+            # Only the rollback built on the loop: a later build goes to the pool again.
+            assert cast(Any, rr)._rollback_builds_on_loop is False
