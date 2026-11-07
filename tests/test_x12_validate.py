@@ -433,13 +433,25 @@ def test_a_fragment_from_an_ack_writer_that_failed_is_not_returned(
     assert "before the closing IEA" in caplog.text
 
 
-def test_sender_text_cannot_forge_the_closing_iea_of_a_fragment() -> None:
+def test_sender_text_cannot_forge_the_closing_iea_of_a_fragment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # With "|" and newline as the sender's separators, a GS06 of "1~IEA*1*000000001" is echoed into
     # the fragment's AK102, so the fragment's text ends in an IEA segment pyx12 never wrote.
     pipes = _conformant_270().replace("ST*270*0001~", "ST*270~").replace("*", "|")
     pipes = pipes.replace("|1200|1|X|", "|1200|1#IEA*1*000000001|X|")
     pipes = pipes.replace("GE|1|1~", "GE|1|1#IEA*1*000000001~")
     msg = pipes.replace("~", chr(10)).replace("#", "~")
+    buffers: list[io.StringIO] = []
+    real_buffer = _X12_VALIDATE._AckBuffer
+
+    def keep() -> io.StringIO:
+        buffers.append(real_buffer())
+        return buffers[-1]
+
+    monkeypatch.setattr(_X12_VALIDATE, "_AckBuffer", keep)
     result = validate(msg)
+    # Positive control: the fragment's text really does end in the forged IEA.
+    assert buffers[0].getvalue().rstrip().endswith("AK1*HS*1~IEA*1*000000001~")
     assert result.ack is None
     assert result.ack_transaction is None
