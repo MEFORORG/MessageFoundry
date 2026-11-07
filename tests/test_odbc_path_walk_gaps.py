@@ -1319,10 +1319,10 @@ def test_hold_d_a_build_that_outlives_its_loop_logs_that_it_was_not_closed(
     assert finished.wait(5)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and not any(
-        "could not be closed" in r.getMessage() for r in caplog.records
+        "may not be closed" in r.getMessage() for r in caplog.records
     ):
         time.sleep(0.01)
-    assert any("could not be closed" in r.getMessage() for r in caplog.records)
+    assert any("may not be closed" in r.getMessage() for r in caplog.records)
 
 
 def test_hold_d_a_build_whose_loop_stopped_unclosed_logs_that_it_was_not_closed(
@@ -1355,48 +1355,39 @@ def test_hold_d_a_build_whose_loop_stopped_unclosed_logs_that_it_was_not_closed(
         assert finished.wait(5)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not any(
-            "could not be closed" in r.getMessage() for r in caplog.records
+            "may not be closed" in r.getMessage() for r in caplog.records
         ):
             time.sleep(0.01)
-        assert any("could not be closed" in r.getMessage() for r in caplog.records)
+        assert any("may not be closed" in r.getMessage() for r in caplog.records)
     finally:
         release.set()
         loop.close()
 
 
-@pytest.mark.parametrize("fault", ["cancelled", "broken"])
-def test_hold_an_executor_fault_reaches_the_caller_as_a_wiring_error(fault: str) -> None:
-    """A work item the executor cancels or fails before the build runs reaches the caller as the
-    WiringError every build failure is, with the executor's fault as its cause, so a route that
-    records a refused build records this one too. Red (Lander hold 6703229134, item 2): a bare
-    RuntimeError or BrokenThreadPool escaped."""
-    from concurrent.futures import Future, ThreadPoolExecutor
-    from concurrent.futures.thread import BrokenThreadPool
-
+@pytest.mark.parametrize("fault", ["cancelled", "shut-down"])
+async def test_hold_an_executor_fault_reaches_the_connection_test_as_a_wiring_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore, fault: str
+) -> None:
+    """A connection test whose build the executor cancels, or refuses because it was shut down,
+    reaches the caller as the WiringError a refused build is, with the executor's fault as its
+    cause, so the route records it as one. Red (Lander hold 6703229134, item 2): a bare
+    RuntimeError escaped, which the route answers with a 500 and no audit row."""
     from messagefoundry.config.wiring import WiringError
-    from messagefoundry.pipeline import wiring_runner
 
-    class _FaultyExecutor(ThreadPoolExecutor):
-        def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Future[Any]:
-            work: Future[Any] = Future()
-            if fault == "cancelled":
-                work.cancel()
-            else:
-                work.set_exception(BrokenThreadPool("synthetic broken pool"))
-            return work
+    runner = _db_runner(db_store, _db_graph(_capath(tmp_path, "0a1b2c3d.0")))
+    loop = asyncio.get_running_loop()
 
-    async def main() -> BaseException | None:
-        asyncio.get_running_loop().set_default_executor(_FaultyExecutor(max_workers=1))
-        try:
-            await asyncio.wait_for(wiring_runner._build_off_loop(None, object), timeout=5)
-        except Exception as exc:  # noqa: BLE001 - the test reads what reached the caller
-            return exc
-        return None
+    def faulty(_executor: object, _fn: object, *_args: object) -> asyncio.Future[None]:
+        if fault == "shut-down":
+            raise RuntimeError("Executor shutdown has been called")
+        queued: asyncio.Future[None] = loop.create_future()
+        queued.cancel()
+        return queued
 
-    raised = asyncio.run(main())
-    assert isinstance(raised, WiringError), raised
-    if fault == "broken":
-        assert isinstance(raised.__cause__, BrokenThreadPool)
+    monkeypatch.setattr(loop, "run_in_executor", faulty)
+    with pytest.raises(WiringError) as raised:
+        await asyncio.wait_for(runner.build_test_connector_off_loop(_OUT), timeout=5)
+    assert isinstance(raised.value.__cause__, RuntimeError)
 
 
 def test_hold_e_an_abandoned_build_that_has_not_started_never_runs() -> None:

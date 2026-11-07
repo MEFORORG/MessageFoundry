@@ -3760,9 +3760,16 @@ class RegistryRunner:
         """:meth:`build_test_connector` for a caller on the event loop: the configuration is
         resolved here, on the loop, and only the build runs in a worker thread
         (:func:`_build_off_loop`), since a build can list folders and read files (engine PR 2815,
-        hold F2). Raises as that method does."""
+        hold F2). Raises as that method does: an executor fault, which the build's own normaliser
+        never sees, is a :class:`WiringError` too, so the route records it as a refused build
+        (Lander hold 6703229134, item 2)."""
         direction, build = self._test_connector_build(name)
-        return direction, await _build_off_loop(self._hop_posture, build)
+        try:
+            return direction, await _build_off_loop(self._hop_posture, build)
+        except WiringError:
+            raise
+        except Exception as exc:
+            raise WiringError(f"connector build failed: {exc}") from exc
 
     def _test_connector_build(
         self, name: str
@@ -12542,7 +12549,8 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
     The thread is not stopped by a cancellation of the awaiting task. A build still queued for a
     thread is cancelled, so it never runs; one already running finishes, and what it built is
     closed rather than dropped (:func:`_close_abandoned_build`), as a connector built in place and
-    then cancelled is (Lander hold 6702318430, items D and E). The build is held by a thread
+    then cancelled is, or logged when its loop is not running (Lander hold 6702318430, items D
+    and E). The build is held by a thread
     future and not by a task, so the loop's shutdown cancel, which reaches every task, cannot drop
     what it builds (Lander hold 6698688363, item 5). As in :func:`asyncio.to_thread`, the thread
     runs in the default executor, in a copy of the caller's context."""
@@ -12568,17 +12576,13 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
     def settle(queued: asyncio.Future[None]) -> None:
         # A work item the executor cancelled or failed before run() began leaves ``built`` pending;
         # settle it so the caller is not left waiting.
-        # Raised as the WiringError every build failure is (_normalised_build_failure), so a route
-        # that records a refused build records this one too (Lander hold 6703229134, item 2).
         if built.done():
             return
         if queued.cancelled():
             # A failure, not a cancellation: the caller was not cancelled, and must not read as if.
-            built.set_exception(WiringError("connector build failed: the executor cancelled it"))
+            built.set_exception(RuntimeError("the executor cancelled the connector build"))
         elif (exc := queued.exception()) is not None:
-            failure = WiringError(f"connector build failed: {exc}")
-            failure.__cause__ = exc
-            built.set_exception(failure)
+            built.set_exception(exc)
 
     loop.run_in_executor(None, run).add_done_callback(settle)
     try:
@@ -12600,8 +12604,9 @@ def _close_abandoned_build(
     """Close the connector ``work`` built for a caller that was cancelled while it ran
     (:func:`_build_off_loop`). A build that was cancelled or failed built nothing to close. Runs on
     the build's thread once it finishes, or at once if it already had, so the close is handed to
-    ``loop``. A loop that is not running, closed or stopped and not yet closed, would never run the
-    close, so that is logged rather than passed over silently (Lander hold 6703229134, item 1)."""
+    ``loop``. A loop that is not running, closed or stopped and not yet closed, may never run the
+    close, so that is logged rather than passed over silently, and the close is still queued on a
+    loop that is not closed, in case it runs again (Lander hold 6703229134, item 1)."""
     if work.cancelled() or work.exception() is not None:
         return
     built = work.result()
@@ -12611,16 +12616,16 @@ def _close_abandoned_build(
         close = built.stop
     else:
         return
-    if loop.is_running():
-        try:
-            loop.call_soon_threadsafe(_start_abandoned_close, close)
-            return
-        except RuntimeError:
-            pass  # it closed after the check
-    log.warning(
-        "a %s built for a cancelled caller could not be closed: its loop is not running",
-        type(built).__name__,
-    )
+    running = loop.is_running()
+    try:
+        loop.call_soon_threadsafe(_start_abandoned_close, close)
+    except RuntimeError:
+        running = False  # the loop has closed
+    if not running:
+        log.warning(
+            "a %s built for a cancelled caller may not be closed: its loop is not running",
+            type(built).__name__,
+        )
 
 
 def _start_abandoned_close(close: Callable[[], Awaitable[None]]) -> None:
