@@ -15956,8 +15956,9 @@ class AuthService:
         SQL Server's collation compares the (user_id, label) index (BACKLOG #2733, pass F).
 
         Read through :meth:`_verified_passkeys`, so only a checked set is judged. A set that fails
-        its seal or holds a row that does not parse refuses the registration, as the read before
-        the enrolment-code spend does, rather than reading as no label held."""
+        its seal, or holds a row the store reports as :class:`PasskeyRowMalformed`, refuses the
+        registration, as the read before the enrolment-code spend does, rather than reading as no
+        label held. A cell the driver cannot fetch at all is not caught there, and still raises."""
         held = await self._verified_passkeys(user)
         if held is None:
             raise ValueError("no such user")
@@ -16166,7 +16167,7 @@ class AuthService:
         # both. Asked here, behind every guard above, so a session that has not passed them learns
         # nothing about the account's labels; the cost is a used ceremony. A check before the
         # insert, so two enrolments racing case variants can still both land on SQLite and
-        # Postgres, whose indexes keep case.
+        # Postgres, whose indexes keep case. A passkey set that fails its check refuses here too.
         if await self._passkey_label_held(user, label):
             raise ValueError("label already in use")
         spent: EnrolmentCodeOutcome | None = None
@@ -16254,7 +16255,8 @@ class AuthService:
             # Pass F findings 3 and 5: the label clash is told apart the same way, by a passkey of
             # this account now holding the label. Anything else, such as a competing row deleted
             # before these re-reads, or another integrity refusal, is not called a label clash.
-            # Judged against the re-read account, whose seal already covers a racing insert.
+            # Judged against the re-read account, which saves _verified_passkeys its own re-read
+            # (one more read, and one more window) when a racing insert has re-sealed the set.
             if await self._passkey_label_held(reread, label):
                 raise ValueError("label already in use") from exc
             raise ValueError(_PASSKEY_NOT_STORED) from exc
