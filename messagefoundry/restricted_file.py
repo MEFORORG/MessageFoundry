@@ -43,6 +43,7 @@ type-checks on the Linux CI leg (mirrors :mod:`messagefoundry.secrets_dpapi`).
 from __future__ import annotations
 
 import errno
+import functools
 import os
 import stat
 import sys
@@ -72,14 +73,18 @@ __all__ = [
     "WINERROR_SHARING_VIOLATION",
     "RestrictedFileError",
     "broad_access_problem",
+    "can_add_a_file",
     "custody_account_problem",
     "custody_engine_problem",
+    "custody_non_local_account_problem",
     "delete_through_handle",
     "handoff_grantee_problem",
+    "key_directory_volume_problem",
     "key_file_handle_problem",
     "linux_file_system_problem",
     "linux_file_system_refusal",
     "linux_file_system_type",
+    "local_account_domain_sid",
     "posix_access_acl",
     "replace_generated",
     "ride_out_a_held_file",
@@ -282,6 +287,65 @@ def custody_engine_problem(engine_sid: str | None) -> str | None:
     one refusal both the custody writers and :func:`key_file_handle_problem` give."""
     problem = custody_account_problem(engine_sid)
     return None if problem is None else f"the engine's own account is refused: {problem}"
+
+
+#: The head every account of a Windows account domain shares.
+_ACCOUNT_DOMAIN_HEAD = "S-1-5-21-"
+
+
+def custody_non_local_account_problem(sid: str, local_domain_sid: str | None) -> str | None:
+    """Why the account ``sid`` is not one local to this host, or ``None`` when it is: a virtual
+    service account (S-1-5-80-...), or an account of this host's own account domain
+    ``local_domain_sid`` (a local user).
+
+    Everything else reads as not local, at least a domain user, a group managed service account
+    and a computer account. The key custody design refuses those under ``enforce`` and names them as
+    a loosening outside it until its slice S8; whether a gMSA tier is offered at all is the owner's
+    open question 8, which this does not decide. ``local_domain_sid`` of ``None`` (it could not be
+    read) reads every account-domain SID as not local, so an unreadable host fails closed. SYSTEM
+    and the shared service accounts are :func:`custody_account_problem`'s, refused before this is
+    asked. Kept free of ctypes so the decision is testable on every platform."""
+    from messagefoundry.store.store import _SERVICE_SID
+
+    upper = sid.upper()
+    if _SERVICE_SID.fullmatch(upper):  # one service's own SID, never NT SERVICE\ALL SERVICES
+        return None
+    if local_domain_sid is not None and upper.startswith(_ACCOUNT_DOMAIN_HEAD):
+        domain, _, rid = upper.rpartition("-")
+        if rid.isdigit() and domain == local_domain_sid.upper():
+            return None
+    return (
+        f"{describe_sid(sid)} is not an account of this host: it is not a virtual service account "
+        "(S-1-5-80-...) and not a local user, so it may be a domain user, a group managed service "
+        "account or a computer account, whose key every holder of that domain identity can open"
+    )
+
+
+@functools.cache
+def local_account_domain_sid() -> str | None:
+    """The SID of this host's own account domain, the head every local user's SID shares, or
+    ``None`` when it cannot be read. Windows only: ``None`` elsewhere. Read once per process: the
+    host's account domain does not change under a running engine."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetComputerNameW.argtypes = [wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetComputerNameW.restype = wintypes.BOOL
+    size = wintypes.DWORD(64)
+    name = ctypes.create_unicode_buffer(size.value)
+    if not kernel32.GetComputerNameW(name, ctypes.byref(size)):
+        return None
+    found = _lookup_account_name(name.value)
+    if found is None:
+        return None
+    sid, use = found
+    # SidTypeDomain: the host's account domain itself. A domain controller answers its own computer
+    # account instead, and has no local accounts: its account domain is the domain's, so None, and
+    # every account reads as not local there.
+    return sid if use == 3 else None
 
 
 # --- the read check, before a key file is used ----------------------------------------------------
@@ -803,6 +867,229 @@ def _read_handle_volume(handle: int) -> _HandleVolume:
     )
 
 
+def can_add_a_file(directory: Path) -> bool | None:
+    """Whether this process may create a FILE in ``directory``, as a key file's write must, or
+    ``None`` when that cannot be told (PR 2804 thirteenth hold).
+
+    Windows: the directory is opened, following a junction or link to its target as the key
+    file's create does, and the owner, group and access list are read from that handle and handed
+    to the system's own access check, with an impersonation copy of this process's token, asking
+    for the add-file right alone. The access list decides: no privilege is applied, so a token
+    with the restore privilege enabled, which opens the directory with backup semantics whatever
+    the list says, still answers no where the list denies add-file, as the key file's own create
+    does (PR 2804 fifteenth hold). A right to add a folder does not answer yes, as it does for
+    :func:`messagefoundry.startupcode._can_add_files`, which asks about planting start-up code.
+    Where the list cannot be read, because it does not grant this account the right to read it,
+    the directory is opened asking for add-file instead: access denied is no and an open is yes,
+    a yes that such a privilege can give. Any other failure is ``None``. Elsewhere ``os.access``
+    asks the kernel for write and search, with the effective ids where the platform supports that.
+
+    What it does not see, at least: a thread impersonating another account, since the process
+    token is the one checked; on a network share, the share's own permissions and the server's
+    view of the token's groups; a central access policy; and, on the fallback open, the
+    privilege's yes above. Windows adds the rights to read attributes and to wait on the handle
+    to every open, so a directory that grants add-file and the right to read its list without
+    them answers no."""
+    if sys.platform != "win32":
+        try:
+            effective = os.access in os.supports_effective_ids
+            return os.access(directory, os.W_OK | os.X_OK, effective_ids=effective)
+        except OSError:
+            return None
+    import ctypes
+    from ctypes import wintypes
+
+    class _GenericMapping(ctypes.Structure):
+        _fields_ = (
+            ("read", wintypes.DWORD),
+            ("write", wintypes.DWORD),
+            ("execute", wintypes.DWORD),
+            ("all", wintypes.DWORD),
+        )
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    except OSError:  # pragma: no cover - both are always present on win32
+        return None
+    pvoid_p = ctypes.POINTER(ctypes.c_void_p)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    advapi32.GetSecurityInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+    ]
+    advapi32.GetSecurityInfo.restype = wintypes.DWORD
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.DuplicateToken.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.AccessCheck.argtypes = [
+        ctypes.c_void_p,
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(_GenericMapping),
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    invalid = wintypes.HANDLE(-1).value
+
+    def open_directory(access: int) -> int | None:
+        opened: int | None = kernel32.CreateFileW(
+            str(directory),
+            access,
+            0x07,  # share read, write and delete
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS: a directory opens only with it
+            None,
+        )
+        return opened
+
+    handle = open_directory(_READ_CONTROL)
+    if handle is None or handle == invalid:
+        if ctypes.get_last_error() != 5:  # 5: ERROR_ACCESS_DENIED
+            return None
+        # The list is not readable to this account: ask the system for add-file directly.
+        probe = open_directory(0x0002)  # FILE_ADD_FILE, and nothing else
+        if probe is None or probe == invalid:
+            return False if ctypes.get_last_error() == 5 else None
+        kernel32.CloseHandle(probe)
+        return True
+    descriptor = ctypes.c_void_p()
+    try:
+        # OWNER, GROUP and DACL, which AccessCheck needs, and the integrity label, so a label
+        # above this token's level answers no, as the create would.
+        status = advapi32.GetSecurityInfo(
+            handle,
+            1,  # SE_FILE_OBJECT
+            0x1 | 0x2 | 0x4 | 0x10,
+            None,
+            None,
+            None,
+            None,
+            ctypes.byref(descriptor),
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+    if status != 0 or not descriptor.value:
+        return None
+    try:
+        process_token = wintypes.HANDLE()
+        # TOKEN_QUERY | TOKEN_DUPLICATE
+        if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(), 0x0008 | 0x0002, ctypes.byref(process_token)
+        ):
+            return None
+        try:
+            checked = wintypes.HANDLE()
+            # SecurityImpersonation: AccessCheck takes an impersonation token, never a primary.
+            if not advapi32.DuplicateToken(process_token, 2, ctypes.byref(checked)):
+                return None
+            try:
+                # The file generic rights, so any generic entry maps as a file's would.
+                mapping = _GenericMapping(0x120089, 0x120116, 0x1200A0, 0x1F01FF)
+                privileges = ctypes.create_string_buffer(256)
+                privileges_size = wintypes.DWORD(256)
+                granted = wintypes.DWORD(0)
+                allowed = wintypes.BOOL(False)
+                if not advapi32.AccessCheck(
+                    descriptor,
+                    checked,
+                    0x0002,  # FILE_ADD_FILE, and nothing else
+                    ctypes.byref(mapping),
+                    privileges,
+                    ctypes.byref(privileges_size),
+                    ctypes.byref(granted),
+                    ctypes.byref(allowed),
+                ):
+                    return None
+                return bool(allowed.value) and bool(granted.value & 0x0002)
+            finally:
+                kernel32.CloseHandle(checked)
+        finally:
+            kernel32.CloseHandle(process_token)
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def key_directory_volume_problem(directory: Path) -> str | None:
+    """Why a key file written into ``directory`` with ``local_volume_only`` would be refused for
+    its volume, or ``None`` when it would not. The same rule :func:`write_restricted_file` applies
+    to the new file (:func:`_volume_problem` on Windows, :func:`linux_file_system_refusal` over
+    :data:`LINUX_HOST_FILE_SYSTEMS` on Linux, and a refusal on any other platform), read through a
+    handle on the directory, so a mint can refuse before it shows a recovery key (PR 2804 eleventh
+    hold). The file the write makes is still judged by its own handle: this is the early answer,
+    not the check of record. ``OSError`` when the directory cannot be opened, which says nothing
+    about its volume (PR 2804 twelfth hold)."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.CreateFileW(
+            str(directory),
+            0x80,  # FILE_READ_ATTRIBUTES
+            0x07,  # share read, write and delete
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS: a directory opens only with it
+            None,
+        )
+        if handle is None or handle == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return _volume_problem(_read_handle_volume(handle))
+        finally:
+            kernel32.CloseHandle(handle)
+    if sys.platform != "linux":
+        return "the host key provider mints a store key on Linux and Windows only"
+    # O_PATH: fstatfs reads through it (Linux 3.12 and later), and it needs no read permission on
+    # the directory, which the write, needing only write and search, does not need either.
+    fd = os.open(directory, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        return linux_file_system_refusal(fd, LINUX_HOST_FILE_SYSTEMS, "key custody host file")
+    finally:
+        os.close(fd)
+
+
 def key_file_handle_problem(handle: int, *, engine_read_only: bool) -> str | None:
     """Windows: why the key file open as ``handle`` is not owned and listed exactly as one, or
     ``None`` when it is.
@@ -846,7 +1133,8 @@ def key_file_handle_problem(handle: int, *, engine_read_only: bool) -> str | Non
 #: (ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER).
 _FILE_DISPOSITION_INFO = 4
 _FILE_DISPOSITION_INFO_EX = 21
-_DISPOSITION_DELETE_POSIX = 0x1 | 0x2
+_DISPOSITION_DELETE = 0x1
+_DISPOSITION_DELETE_POSIX = _DISPOSITION_DELETE | 0x2
 #: FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: a read-only attribute that a copy or a restore
 #: left on the file does not stop the delete, which the deleting account could not clear.
 _DISPOSITION_IGNORE_READONLY = 0x10
@@ -860,8 +1148,9 @@ def delete_through_handle(handle: int) -> None:
     ``SetFileInformationByHandle``, POSIX semantics first (``FileDispositionInfoEx``, ignoring a
     read-only attribute, then without that flag on a build that predates it), so the name goes
     when THIS handle closes, even while another handle holds the file open. Where the volume has
-    no such delete, the classic ``FileDispositionInfo``, which removes the name only when the last
-    handle to the file closes and refuses a read-only file. Either way the name is still there
+    no such delete, ``FileDispositionInfoEx`` without POSIX semantics, ignoring a read-only
+    attribute, and failing that the classic ``FileDispositionInfo``; both remove the name only when
+    the last handle to the file closes, and the classic one refuses a read-only file. Either way the name is still there
     until the handle closes. The handle must hold DELETE. Raises ``OSError`` when Windows refuses,
     and :class:`RestrictedFileError` off Windows."""
     if sys.platform != "win32":
@@ -880,6 +1169,9 @@ def delete_through_handle(handle: int) -> None:
     for value in (
         _DISPOSITION_DELETE_POSIX | _DISPOSITION_IGNORE_READONLY,
         _DISPOSITION_DELETE_POSIX,
+        # A volume with no POSIX-semantics delete may still take the Ex class without it, and then
+        # a read-only attribute does not stop the delete, which the classic class below refuses.
+        _DISPOSITION_DELETE | _DISPOSITION_IGNORE_READONLY,
     ):
         flags = ctypes.c_uint32(value)  # FILE_DISPOSITION_INFO_EX.Flags
         if kernel32.SetFileInformationByHandle(
@@ -1372,8 +1664,69 @@ def _resolve_sid(principal: str) -> str:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
     advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    refusal = RestrictedFileError(f"the account {principal!r} could not be resolved")
+    literal = principal.removeprefix("*")
+    if literal.upper().startswith("S-1-"):
+        sid_pointer = ctypes.c_void_p()
+        if not advapi32.ConvertStringSidToSidW(literal, ctypes.byref(sid_pointer)):
+            raise refusal
+        try:
+            rendered = _render_sid(sid_pointer)
+        finally:
+            kernel32.LocalFree(sid_pointer)
+    else:
+        found = _lookup_account_name(principal)
+        if found is None:
+            raise refusal
+        rendered, use = found
+        # SID_NAME_USE: 1 is a user account and 5 a well-known account, which is how SYSTEM and a
+        # service's virtual account resolve. A group, an alias or a bare domain name is not ONE
+        # account, and a bare domain SID is one no token carries, so the grant would reach nobody.
+        if use not in (1, 5):
+            raise RestrictedFileError(
+                f"{principal!r} names a group or a domain, not one account, so a key file cannot "
+                "be granted to it. Name the one account the engine runs as"
+            )
+    if rendered is None:
+        raise refusal
+    return rendered
+
+
+def _render_sid(sid_pointer: object) -> str | None:
+    """``ConvertSidToStringSidW`` of the binary SID at ``sid_pointer``, or ``None`` when it fails.
+    Windows only."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
     advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    text = wintypes.LPWSTR()
+    if not advapi32.ConvertSidToStringSidW(sid_pointer, ctypes.byref(text)):
+        return None
+    try:
+        return text.value
+    finally:
+        kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+
+def _lookup_account_name(name: str) -> tuple[str, int] | None:
+    """``(SID, SID_NAME_USE)`` that ``LookupAccountNameW`` answers for ``name`` on this machine, or
+    ``None`` when it maps the name to nothing or the SID could not be rendered. Windows only."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     advapi32.LookupAccountNameW.argtypes = [
         wintypes.LPCWSTR,  # lpSystemName (NULL = this machine)
         wintypes.LPCWSTR,  # lpAccountName
@@ -1384,65 +1737,26 @@ def _resolve_sid(principal: str) -> str:
         ctypes.POINTER(ctypes.c_int),  # peUse
     ]
     advapi32.LookupAccountNameW.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-
-    def render(sid_pointer: ctypes.c_void_p | ctypes.Array[ctypes.c_char]) -> str | None:
-        text = wintypes.LPWSTR()
-        if not advapi32.ConvertSidToStringSidW(sid_pointer, ctypes.byref(text)):
-            return None
-        try:
-            return text.value
-        finally:
-            kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
-
-    refusal = RestrictedFileError(f"the account {principal!r} could not be resolved")
-    literal = principal.removeprefix("*")
-    if literal.upper().startswith("S-1-"):
-        sid_pointer = ctypes.c_void_p()
-        if not advapi32.ConvertStringSidToSidW(literal, ctypes.byref(sid_pointer)):
-            raise refusal
-        try:
-            rendered = render(sid_pointer)
-        finally:
-            kernel32.LocalFree(sid_pointer)
-    else:
-        sid_size = wintypes.DWORD(0)
-        domain_size = wintypes.DWORD(0)
-        use = ctypes.c_int(0)
-        # Sizing probe: fails by design and fills the two lengths.
-        advapi32.LookupAccountNameW(
-            None,
-            principal,
-            None,
-            ctypes.byref(sid_size),
-            None,
-            ctypes.byref(domain_size),
-            ctypes.byref(use),
-        )
-        if sid_size.value == 0:
-            raise refusal
-        sid_buffer = ctypes.create_string_buffer(sid_size.value)
-        domain = ctypes.create_unicode_buffer(max(domain_size.value, 1))
-        if not advapi32.LookupAccountNameW(
-            None,
-            principal,
-            sid_buffer,
-            ctypes.byref(sid_size),
-            domain,
-            ctypes.byref(domain_size),
-            ctypes.byref(use),
-        ):
-            raise refusal
-        # SID_NAME_USE: 1 is a user account and 5 a well-known account, which is how SYSTEM and a
-        # service's virtual account resolve. A group, an alias or a bare domain name is not ONE
-        # account, and a bare domain SID is one no token carries, so the grant would reach nobody.
-        if use.value not in (1, 5):
-            raise RestrictedFileError(
-                f"{principal!r} names a group or a domain, not one account, so a key file cannot "
-                "be granted to it. Name the one account the engine runs as"
-            )
-        rendered = render(sid_buffer)
-    if rendered is None:
-        raise refusal
-    return rendered
+    size = wintypes.DWORD(0)
+    domain_size = wintypes.DWORD(0)
+    use = ctypes.c_int(0)
+    # Sizing probe: fails by design and fills the two lengths.
+    advapi32.LookupAccountNameW(
+        None, name, None, ctypes.byref(size), None, ctypes.byref(domain_size), ctypes.byref(use)
+    )
+    if size.value == 0:
+        return None
+    sid_buffer = ctypes.create_string_buffer(size.value)
+    domain = ctypes.create_unicode_buffer(max(domain_size.value, 1))
+    if not advapi32.LookupAccountNameW(
+        None,
+        name,
+        sid_buffer,
+        ctypes.byref(size),
+        domain,
+        ctypes.byref(domain_size),
+        ctypes.byref(use),
+    ):
+        return None
+    rendered = _render_sid(sid_buffer)
+    return None if rendered is None else (rendered, int(use.value))

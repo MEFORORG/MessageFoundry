@@ -786,6 +786,8 @@ class StoreSettings(_Section):
     # configured key for the keyless at-rest gate, before it resolves (BACKLOG #1998). This
     # names a *provider*, not key material, so it is NOT a secret — it must never be added to
     # `_FILE_SECRET_KEYS`. Unknown/unresolvable values fail closed at `open_store` (store/keyprovider.py).
+    # `host` reads the key custody host blob the engine mints with the store, and pins the store id
+    # at every open (vault BACKLOG #3411, store/custody_host.py); it refuses any other key beside it.
     key_provider: str = "auto"
     # Store CIPHER provider (ADR 0138, ASVS 13.3.3): selects the at-rest cipher ITSELF — distinct from
     # `key_provider` above, which only *sources* DEK bytes for the in-process AES-GCM cipher. `aesgcm` (the
@@ -10149,6 +10151,12 @@ def security_loosenings(
     so 0 unbounds every such credential. :func:`_auth_limit_loosenings` names it at 0 or less and
     above its default. This paragraph once recorded it as unreported.
 
+    **Two entries are read from the PROCESS (vault BACKLOG #3411):** ``recovery_key_unproved`` and
+    ``key_custody_non_local_account``, from what this process's latest open of a key custody host
+    blob found (:func:`messagefoundry.custody_posture.observed_key_custody`), and only under
+    ``[store].key_provider = 'host'``. A process that opened none, ``messagefoundry security show``
+    among them, names neither. ``store_id_not_pinned`` is read from ``store``.
+
     **One entry is read from the process environment and from no argument:**
     ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` (vault BACKLOG #2599), named while
     :func:`insecure_config_source_escape_permitted` says the loader honours it. It reports the
@@ -10986,6 +10994,18 @@ def security_loosenings(
     # secret in the service's registry-held NSSM list, and a list that could not be read.
     if service_env is not None:
         out.extend(service_env_loosenings(service_env))
+    # --- the store key's custody (vault BACKLOG #3411, key custody slice S3). `store_id_not_pinned`
+    # is read from the settings; the other two from what this process's own open of a host blob
+    # found, read from the process as the docstring says, with their wording beside that record.
+    from messagefoundry.custody_posture import key_custody_loosenings, observed_key_custody
+
+    out.extend(
+        key_custody_loosenings(
+            key_provider=store.key_provider,
+            cipher_provider=store.cipher_provider,
+            observed=observed_key_custody(),
+        )
+    )
     # --- [store].schema_management = auto on a server backend (#305, ASVS 13.2.2). External is the
     # server-DB default; auto hands the schema DDL back to the runtime principal, which then needs
     # standing DDL rights. SQLite resolves to auto by construction and is never reported.
