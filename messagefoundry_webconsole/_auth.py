@@ -1327,7 +1327,8 @@ def claim_continuation(
     if entry is None and token:
         # A federated start may still hold this issue for a flow that never came back (an
         # abandoned IdP prompt, a refused or mismatched return that consumed nothing): a new
-        # re-auth takes it from there, so the retry such a page offers still continues.
+        # re-auth takes it from there, so the retry such a page offers still continues, but only
+        # while the issue has not lapsed (ADR 0065, Change of 2026-11-05).
         entry = _take_flow_claim(hash_token(token), next_path)
     if entry is None or token is None:
         return ContinuationClaim(continues=False)
@@ -1337,7 +1338,7 @@ def claim_continuation(
 #: The claims a federated step-up start leg holds for its staged flow, by flow id (vault BACKLOG
 #: #3241, added items 7 and 9). The callback carries no session cookie, so the claim waits here
 #: until the flow resolves: a refusal puts the entry back, so the retry the refusal page offers
-#: continues while the entry has not lapsed, and a success drops it. Bounded like the issued table; an entry for a flow that
+#: continues only while the entry has not lapsed, and a success drops it. Bounded like the issued table; an entry for a flow that
 #: never returns lapses with the continuation's TTL, which costs only that continuation.
 _FLOW_CLAIMS: OrderedDict[str, ContinuationClaim] = OrderedDict()
 #: The same claims by session hash and then ``next``, to their flow id: at most one per pair, since a
