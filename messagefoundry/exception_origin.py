@@ -33,9 +33,9 @@ the loader also reads the real class (``wiring._is_engine_text``). No frame rule
 the value, still passes.
 
 :func:`engine_worded_text` is that rule applied to text: it reads ``args`` through
-``BaseException``'s own descriptor, and only for an instance of a class whose constructor and
-``__str__`` are those of the base the caller names, so a caller can take an engine refusal's text
-without running any of the error's code."""
+``BaseException``'s own descriptor, and only for an instance whose constructor and ``__str__``
+are those of the base the caller names, so a caller can take an engine refusal's text without
+running any of the error's code."""
 
 from __future__ import annotations
 
@@ -150,27 +150,31 @@ _TEXT_HOOKS: Final = ("__init__", "__new__", "__str__")
 
 
 def engine_worded_text(exc: BaseException, kind: type[BaseException]) -> str | None:
-    """``exc``'s one ``str`` argument when ``exc`` is a ``kind`` and :func:`worded_by_the_engine`,
-    and no class of its own below ``kind`` defines ``__init__``, ``__new__`` or ``__str__``, else
-    ``None``, read with none of ``exc``'s own code run (the sixth hold on engine PR 2818).
+    """``exc``'s one ``str`` argument when ``exc`` is a ``kind`` that :func:`worded_by_the_engine`,
+    and its ``__init__``, ``__new__`` and ``__str__`` each resolve to ``kind`` or a class above it,
+    else ``None``, read with none of ``exc``'s own code run (the sixth hold on engine PR 2818). This
+    is the one statement of the rule; the store's and the AD probe's refusals link here.
 
-    ``kind`` must be a class whose constructor and ``__str__`` are ``BaseException``'s, such as
-    ``ValueError``: then the arguments are what an engine ``raise`` statement passed, and they are
-    what ``str(exc)`` prints. A subclass's own ``__init__`` writes its arguments and its own
-    ``__str__`` prints what it likes, so either could quote a byte the arguments do not show, and
-    such a one is never read. The class is read with ``type`` and its MRO and dicts through
-    ``type``'s own descriptors. Like :func:`worded_by_the_engine`, this proves who wrote the text,
-    not what it holds: an engine ``raise`` can interpolate another error's text. A caller that gets
-    ``None`` says something fixed instead."""
-    below: list[type] = []
-    for base in _TYPE_MRO.__get__(type(exc)):
-        if base is kind:
-            break
-        below.append(base)
-    else:
-        return None  # not a kind
-    if any(name in _TYPE_DICT.__get__(base) for base in below for name in _TEXT_HOOKS):
+    ``kind`` must be a class whose ``__init__`` and ``__str__`` are ``BaseException``'s, such as
+    ``ValueError`` or ``InsecureHopRefused``: then the arguments are what the engine ``raise``
+    passed, and what ``str(exc)`` prints. A constructor or ``__str__`` of any other class, a mixin
+    after ``kind`` in the MRO included, could write or print a byte the arguments do not show, so
+    such an error is never read. The class is read with ``type`` and its MRO and dicts through
+    ``type``'s own descriptors.
+
+    It proves less than that the engine wrote the text. Like :func:`worded_by_the_engine`, it does
+    not see what the text holds, since an engine ``raise`` can interpolate another error's text. Nor
+    does it see arguments reassigned after the raise by code that caught the error and raised it
+    again with a bare ``raise``, which adds no frame, or rewritten by a metaclass ``__call__``. A
+    caller that gets ``None`` says something fixed instead."""
+    mro = _TYPE_MRO.__get__(type(exc))
+    if not any(base is kind for base in mro):
         return None
+    allowed = _TYPE_MRO.__get__(kind)
+    for name in _TEXT_HOOKS:
+        owner = next((base for base in mro if name in _TYPE_DICT.__get__(base)), None)
+        if not any(owner is base for base in allowed):
+            return None
     if not worded_by_the_engine(exc):
         return None
     args = _ARGS_OF.__get__(exc)

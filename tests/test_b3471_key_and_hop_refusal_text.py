@@ -1353,7 +1353,8 @@ def test_the_ad_probe_reads_no_argument_of_the_guard_refusal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Finding 5 of the sixth hold, at the AD probe: a guard refusal's one ``str`` argument was
-    returned whole, so one that quoted a byte printed it."""
+    returned whole, so one that quoted a byte printed it. Here the test's own frame raises it, so
+    no engine ``raise`` worded it and it is not read."""
     from messagefoundry.privilege_probes import _ad_why
 
     refusal = InsecureHopRefused(f"synthetic hop refused: {_decode_error()}")
@@ -1508,6 +1509,15 @@ class _Plain(ValueError):
     pass
 
 
+class _RewritingMixin(Exception):
+    def __init__(self, text: str) -> None:
+        super().__init__(f"synthetic: rewritten {text}")
+
+
+class _MixinAfterTheBase(ValueError, _RewritingMixin):
+    """The mixin comes after ``ValueError`` in the MRO, so its ``__init__`` writes the arguments."""
+
+
 @pytest.mark.parametrize(
     ("error", "kept"),
     [
@@ -1515,10 +1525,19 @@ class _Plain(ValueError):
         (_Plain(_SETTING_TEXT), True),
         (_OwnStr(_SETTING_TEXT), False),
         (_OwnInit(_SETTING_TEXT), False),
+        (_MixinAfterTheBase(_SETTING_TEXT), False),
         (KeyError(_SETTING_TEXT), False),
         (ValueError(_SETTING_TEXT, "second"), False),
     ],
-    ids=["exact", "plain-subclass", "own-str", "own-init", "not-a-kind", "two-arguments"],
+    ids=[
+        "exact",
+        "plain-subclass",
+        "own-str",
+        "own-init",
+        "mixin-after-the-base",
+        "not-a-kind",
+        "two-arguments",
+    ],
 )
 def test_engine_worded_text_keeps_only_what_a_raise_passed(
     error: BaseException, kept: bool, monkeypatch: pytest.MonkeyPatch

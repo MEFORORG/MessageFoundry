@@ -24,7 +24,6 @@ the callers caring.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -3474,12 +3473,9 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     of any class with a codec error on it is raised as :func:`_codec_safe_refusal` gives it, with
     no byte and no chain, and so is one whose chain cannot be read whole or whose judgement raised
     an ``Exception``. Every other
-    ``ValueError`` keeps its chain. Its text is kept only when an engine ``raise`` statement
-    raised it and no class of its own defines a constructor or ``__str__``, read from its one
-    ``str`` argument
-    (:func:`~messagefoundry.exception_origin.engine_worded_text`); any other gets a fixed text,
-    since a subclass's ``__str__`` or constructor can put a byte in what it prints (the sixth hold
-    on engine PR 2818). Every other error, such as a
+    ``ValueError`` keeps its chain, and its text only as
+    :func:`~messagefoundry.exception_origin.engine_worded_text` reads it; any other gets a fixed
+    text (the sixth hold on engine PR 2818). Every other error, such as a
     ``KeyProviderError`` or ``DpapiError``, passes through untouched."""
     try:
         return _build_store_cipher(settings, posture)
@@ -3581,8 +3577,10 @@ def _log_unjudged(what: str, swallowed: type[BaseException]) -> None:
     it cannot replace the refusal it reports: there is nothing left to log it with."""
     name = _NAME_OF_A_TYPE.__get__(swallowed)
     shown = name if type(name) is str and name.isascii() and name.isidentifier() else "unnamed"
-    with contextlib.suppress(Exception):  # the logger is what failed; see the docstring
+    try:
         log.warning("%s (%s); refused with a fixed text", what, shown)
+    except Exception:  # noqa: BLE001 -- the logger is what failed; see the docstring
+        return
 
 
 #: ``BaseException``'s own link descriptors, which ``BaseException.__cause__`` and its siblings
