@@ -164,11 +164,10 @@ _RUN_ON_LABEL = (
 # stays linear, are stated once, on the same fragments in ``messagefoundry/secretscrub.py``. THIS
 # COPY RUNS BEFORE THE PHI PASS, and the tail is written back masked, so a PHI reader that keys on
 # letters in the braces no longer sees them; the tail refuses the readers found doing so, an XML tag
-# and a word ending in a segment-shaped triple (``MSH`` and a segment ID glued behind digits among
-# them), and a differential that runs the PHI pass after this layer is the measurement for this
-# copy, not the write-time one. ``_MFB64`` runs before this layer and
-# writes ``[REDACTED]`` into the braces, which ends in a segment-shaped triple, so a tail holding it is
-# refused here and prints as before, where ``secretscrub`` masks it. The tail is a copy of
+# and any capital letter (a segment ID, an ``MSH`` header and a name glued behind digits among them),
+# and a differential that runs the PHI pass after this layer is the measurement for this copy, not
+# the write-time one. ``_MFB64`` runs before this layer and writes ``[REDACTED]`` into the braces, so
+# a tail holding it is refused, here and in ``secretscrub``, and prints as before. The tail is a copy of
 # ``secretscrub``'s, its label refusal spelled with this copy's ``_RUN_ON_LABEL``; a test holds the two
 # equal on that substitution.
 _BRACED_HEAD = r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b[:=]"
@@ -178,8 +177,7 @@ _SPACED_BRACED_TAIL = (
     + r"|(?!"
     + _RUN_ON_LABEL
     + r"|(?i:bearer|basic|digest)\s"
-    + r"|[A-Za-z0-9]*?(?-i:[A-Z][A-Z0-9]{2})(?![A-Za-z0-9])"
-    + r")(?-i:[A-Za-z0-9])++)*+"
+    + r")(?-i:[a-z0-9])++)*+"
 )
 _BRACED_LABEL = _BRACED_HEAD + _SPACED_BRACED_HEAD + _SPACED_BRACED_TAIL + r"\}(?!\})"
 _BRACED_RUN_ON = (

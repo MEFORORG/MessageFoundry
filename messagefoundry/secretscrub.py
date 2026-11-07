@@ -129,7 +129,12 @@ holds a "{" now walks rather than taking the fast path: a token value then a bra
 the change is for, costs 7.5 against 6.1 us, and a ``MEFOR_STORE_DSN`` holding one 7.8 against 5.0.
 Three 6 KB runs built to make every check walk are level within 6 percent: braced runs, unclosed
 ``PWD={`` labels, and closed spaced ones, the last 1.21 against 1.15 ms. Those figures were measured
-before the braced tail began checking for a label; the growth tests in ``tests/test_log_redaction_secret_domain.py`` still bound both.
+before the braced tail began checking for a label; the growth tests in
+``tests/test_log_redaction_secret_domain.py`` bound the unclosed-label run alone. A review measured
+two shapes they do not cover, on 2026-11-07: a 6 KB ``session={a:1}{a:1}...`` value, which now walks
+because the fast path refuses any "{", 0.83 against 0.045 ms, and a 6 KB braced tail of short words,
+which the tail mask walks word by word, 4.9 against 0.9 ms. Both grew linearly, under the ceiling
+above.
 """
 
 from __future__ import annotations
@@ -564,13 +569,15 @@ _RUN_ON_LABEL = (
 # closer stays. So ``MEFOR_X=a;PWD={pp ww}`` becomes ``MEFOR_X=<redacted> xx}``, the old
 # ``MEFOR_X=<redacted> ww}`` with its letters masked, and the label is hidden with the value, as it was
 # before. That mask keeps each word's length and the class of each character, so the tail's word
-# lengths, digit positions and punctuation still print, and it keeps whole what a later pass reads:
-# a placeholder an earlier pass wrote, a word holding one of the member mask's keep words before a
-# ":" or "=", as ``Passw0rd=`` in ``PWD={p1 Passw0rd=v}``, and a scheme word such as ``Bearer``
-# before a space. So every later CREDENTIAL pass reads text of the shape the old class left. A PHI
-# pass does not: the mask changes the letters it reads, an XML tag name, a segment ID or the ``MSH``
-# that declares a line's delimiters, and in the support bundle the PHI pass runs after this one. The
-# braces' conditions below refuse those shapes instead.
+# lengths, digit positions and punctuation still print, and it keeps whole what a later pass reads
+# that can reach it: the PHI pass's ``[redacted]`` (``<redacted>`` and ``[REDACTED]`` are refused
+# below, by the "<" and the capital letter) and a word holding one of the member mask's keep words
+# before a ":" or "=", as ``passw0rd=`` in ``PWD={p1 passw0rd=v}``. So a later CREDENTIAL pass that
+# runs before any PHI pass reads text of the shape the old class left. One that runs after a PHI
+# pass need not, as the bundle's second credential layer does, because the PHI pass may rewrite the
+# masked tail otherwise than the raw one. A PHI pass reads letters too: an XML tag name, a segment
+# ID, the ``MSH`` that declares a line's delimiters and a capitalised name, and in the support
+# bundle it runs after this pass. The braces' conditions below refuse those shapes instead.
 #
 # A FIRST FORM MASKED EVERY LETTER AND DIGIT TO "x" and printed values the old class hid: in
 # ``token=a;PWD={pp Bearer abcdefgh}ijkl`` the later bearer pass no longer saw ``Bearer`` and
@@ -605,20 +612,22 @@ _RUN_ON_LABEL = (
 #   which the old text hid and the run-on printed. A "%" is refused because a label may start right
 #   after a percent escape, as in ``%3Bpassword=``, where the check in front of each run does not look;
 #   a character outside ASCII, so a label spelled with a fold character cannot slip past it.
-# * No "<", and no run that ENDS in a segment-shaped triple (a capital letter, then two capitals or
-#   digits), after the first white space. That covers a run that is one, as ``PID``, one glued
-#   behind digits or letters, as ``6789PID``, and one ending in ``MSH``, ``BHS`` or ``FHS``. The
-#   bundle's PHI pass runs after this pass and reads an XML element from its tag name, a segment
-#   from its ID, and the delimiters a line declares from its ``MSH``, and each of those can redact
-#   text past the closer. The mask rewrites those letters, so the PHI pass no longer saw them:
+# * No "<" and no capital letter after the first white space. The bundle's PHI pass runs after this
+#   pass and reads an XML element from its tag name, a segment from its ID, the delimiters a line
+#   declares from its ``MSH``, and a name from its capitals, and each of those can redact text past
+#   the closer. The mask rewrites those letters, so the PHI pass no longer saw them:
 #   ``token=a;PWD={pp <name>}vq2</name> rest`` and, after an ``MSH#`` header,
-#   ``MEFOR_X=a;PWD={pp NK1#}vq2 vq3`` printed "vq2". A segment ID glued behind digits is not one
-#   the PHI pass reads in the original text, but after it redacts the digits in front, as an SSN, a
-#   second PHI pass does: the store's :func:`~messagefoundry.redaction.safe_text` over a detail the
-#   bundle's redactor wrote, where ``token=a;PWD={pp 123-45-6789PID| ..}vq`` printed "vq" while the
-#   run-on refused only a run STARTING with the triple. Reviews found these with a random
-#   differential that put the PHI pass where the bundle runs it; they are the readers found, not a
-#   census of what a PHI pass reads.
+#   ``MEFOR_X=a;PWD={pp NK1#}vq2 vq3`` printed "vq2". A segment ID or a name glued behind digits is
+#   not one the PHI pass reads in the original text, but once it redacts the digits in front, as an
+#   SSN or a date, a second PHI round does: the store's :func:`~messagefoundry.redaction.safe_text`
+#   over a detail the bundle's redactor wrote, or the bundle's own second round on a line holding a
+#   structured PHI field. There ``token=a;PWD={pp 123-45-6789PID| ..}vq`` printed "vq", and
+#   ``MEFOR_X=a;PWD={pp a|123-45-6789Jane Doe}vq02|vq03`` printed "vq02|vq03", while the tail refused
+#   only some capitals. With no capital in the tail the mask keeps each character's class, a lower
+#   case letter to "x" and a digit to "0", so a PHI reader keyed on classes reads the same shape; one
+#   keyed on a lower case word is not ruled out. Reviews found these with a random differential that
+#   put the PHI pass where the bundle and the store run it; they are the readers found, not a census
+#   of what a PHI pass reads. The cost is coverage: a tail holding a capital prints as it did before.
 # * The first white space a space or a tab, and no line break of any kind after it: none of VT, FF,
 #   U+001C to U+001E, U+0085, U+2028 or U+2029, which the log and bundle readers split a record at.
 # * No "{", which keeps the scan linear. A walk from one label's "{" ends at the next "{" at the
@@ -658,8 +667,7 @@ _SPACED_BRACED_TAIL = (
     + r"|(?!"
     + _RUN_ON_LABEL
     + r"|(?i:bearer|basic|digest)\s"
-    + r"|[A-Za-z0-9]*?(?-i:[A-Z][A-Z0-9]{2})(?![A-Za-z0-9])"
-    + r")(?-i:[A-Za-z0-9])++)*+"
+    + r")(?-i:[a-z0-9])++)*+"
 )
 _BRACED_LABEL = _BRACED_HEAD + _SPACED_BRACED_HEAD + _SPACED_BRACED_TAIL + r"\}(?!\})"
 _BRACED_RUN_ON = (
@@ -921,11 +929,12 @@ _MEFOR_SECRET = re.compile(
 #   " w}"; its punctuation, white space and closer still print as before, and so does what the mask
 #   keeps whole. A label or braced value that :data:`_BRACED_RUN_ON`'s conditions refuse still
 #   prints all or part of the braced value, as before, and so does a key-material or token label
-#   with one, as in ``token=a;session={p w}``; the conditions, stated once on that fragment, are the
-#   list. On the installed log chain a ``token=`` line still prints the tail, because the query
+#   with one, as in ``token=a;session={p w}``; the conditions are stated once, on that fragment. On
+#   the installed log chain a ``token=`` line still prints the tail, because the query
 #   filter runs first and takes the head of the braced value before this pass sees it.
 # Each of the residuals above, from the unclosed quote on, printed the same text before BACKLOG
-# #1685's remainder; none is new.
+# #1685's remainder; none is new. The BACKLOG #2966 bullet is the exception: it records a shape that
+# change closed, and its residuals are the shapes the conditions refuse, which print as before it.
 _CREDENTIAL_KV = re.compile(
     r"(?i)"
     + _LABEL_START

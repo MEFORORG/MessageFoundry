@@ -2403,8 +2403,8 @@ def test_the_swallow_tests_fail_without_the_stop(monkeypatch: pytest.MonkeyPatch
 # ``messagefoundry/secretscrub.py``.
 
 #: The braced value's two words. Synthetic, and each holds "-" and "_", so the bundle's long-base64
-#: sweep cannot be what hides it.
-_BRACED_WORDS = ("bv-Br_A-71", "bv-Br_B-72")
+#: sweep cannot be what hides it. Lower case, because a tail holding a capital letter is refused.
+_BRACED_WORDS = ("bv-br_a-71", "bv-br_b-72")
 
 #: The five shapes the row was measured on: a ``MEFOR_`` value, a ``MEFOR_`` DSN, and the token,
 #: session and api_key labels, each then ``;PWD=`` with a braced value holding a space.
@@ -2532,6 +2532,8 @@ def test_a_placeholder_and_a_line_break_in_a_braced_value_survive() -> None:
     for brk in ("\v", "\f", "\x1c", "\x85", "\u2028", "\u2029"):
         assert scrub_credentials(f"token=a;PWD={{pp{brk}ww}}") == f"token=<redacted>{brk}ww}}"
     assert scrub_credentials("token=a;PWD={p [redacted] vq9}") == "token=<redacted> [redacted] xx0}"
+    # A capital letter after the first white space refuses the braced label: the line reads as before.
+    assert scrub_credentials("token=a;PWD={p w Summer2024}") == "token=<redacted> w Summer2024}"
 
 
 def test_the_bundle_copy_of_the_braced_tail_is_the_write_time_one() -> None:
@@ -2660,10 +2662,38 @@ def test_the_spaced_head_lines_print_when_the_head_takes_a_space_or_tab(
         assert any(value in out for out in outs), f"{line!r} printed no value -- got {outs!r}"
 
 
-#: The tail's refusal of a run that ENDS in a segment-shaped triple, as both copies spell it. A
-#: segment ID glued behind digits or letters, as in ``6789PID|``, is one such run, and so are ``MSH``,
-#: ``BHS`` and ``FHS``, which an earlier form refused on their own.
-_SEGMENT_ENDING_RUN = r"|[A-Za-z0-9]*?(?-i:[A-Z][A-Z0-9]{2})(?![A-Za-z0-9])"
+#: The tail's run class, as both copies spell it: lower case letters and digits, so a capital letter
+#: ends the tail and the braced label is refused. That is what refuses a segment ID, an ``MSH`` and
+#: a name, glued behind digits or not.
+_TAIL_RUN = "(?-i:[a-z0-9])++"
+#: The run class and segment checks the earlier forms had, for the positive controls.
+_EARLIER_TAIL_RUN = "(?-i:[A-Za-z0-9])++"
+_EARLIER_SEGMENT_CHECKS = (
+    r"|(?-i:[A-Z][A-Z0-9]{2})(?![A-Za-z0-9])|[A-Za-z0-9]*?(?-i:MSH|BHS|FHS)(?![A-Za-z0-9])"
+)
+
+
+def _restore_an_earlier_tail(
+    monkeypatch: pytest.MonkeyPatch, *, segment_checks: bool, take_lt: bool = False
+) -> None:
+    """Both copies' stopped patterns with the tail taking capital letters again, with the earlier
+    segment checks or without them, and taking a "<" too where ``take_lt``."""
+    for module in (scrub_mod, redact_mod):
+        tail = module._SPACED_BRACED_TAIL
+        assert tail.endswith(")" + _TAIL_RUN + ")*+"), f"{module.__name__}: the tail run moved"
+        head, _ = tail.rsplit(")" + _TAIL_RUN, 1)
+        checks = _EARLIER_SEGMENT_CHECKS if segment_checks else ""
+        bare = head + checks + ")" + _EARLIER_TAIL_RUN + ")*+"
+        if take_lt:
+            assert "%;,&<" in bare, f"{module.__name__}._SPACED_BRACED_TAIL lost its '<'"
+            bare = bare.replace("%;,&<", "%;,&")
+        for name in _STOPPED_PATTERNS:
+            pattern: re.Pattern[str] = getattr(module, name)
+            assert tail in pattern.pattern, f"{module.__name__}.{name} has no braced tail"
+            monkeypatch.setattr(
+                module, name, re.compile(pattern.pattern.replace(tail, bare), pattern.flags)
+            )
+
 
 #: Braces whose tail holds what the bundle's PHI pass reads by its letters: an XML tag, an HL7
 #: segment ID before a delimiter an ``MSH`` header declared, and the header itself. The masked tail
@@ -2687,23 +2717,9 @@ def test_a_braced_tail_holding_what_the_phi_pass_reads_is_left_to_it(line: str, 
 def test_the_phi_reader_lines_print_when_the_tail_takes_them(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """THE POSITIVE CONTROL. With the tail taking a "<", a segment-shaped word and an ``MSH`` again,
-    each line prints its value in the bundle."""
-    cuts = (
-        ("%;,&<", "%;,&"),
-        (_SEGMENT_ENDING_RUN, ""),
-    )
-    for module in (scrub_mod, redact_mod):
-        tail = module._SPACED_BRACED_TAIL
-        bare = tail
-        for old, new in cuts:
-            assert old in bare, f"{module.__name__}._SPACED_BRACED_TAIL lost {old}"
-            bare = bare.replace(old, new)
-        for name in _STOPPED_PATTERNS:
-            pattern: re.Pattern[str] = getattr(module, name)
-            monkeypatch.setattr(
-                module, name, re.compile(pattern.pattern.replace(tail, bare), pattern.flags)
-            )
+    """THE POSITIVE CONTROL. With the tail taking a "<" and capital letters again, each line prints
+    its value in the bundle."""
+    _restore_an_earlier_tail(monkeypatch, segment_checks=False, take_lt=True)
     for line, value in _BRACED_PHI_READER_LINES:
         out = redact_log_line(line)
         assert value in out, f"{line!r} hid -- got {ascii(out)}"
@@ -2715,46 +2731,42 @@ def _store_detail(line: str) -> str:
     return safe_text(redact_log_line(line), limit=100_000)
 
 
-#: A segment ID glued behind digits inside the braces' tail, after a value the PHI pass reads. The
-#: masked tail rewrote ``PID`` to ``xxx``, so once the SSN in front was redacted the second PHI pass on
-#: the store path no longer saw a segment and the text past the closer printed, which the patterns
-#: before BACKLOG #2966 hid there. A review found the shape; each line ends a run with a
-#: segment-shaped triple, which the tail now refuses, so it reads as before.
+#: A segment ID or a name glued behind digits inside the braces' tail, after a value the PHI pass
+#: reads. The masked tail rewrote ``PID`` to ``xxx`` and ``Jane`` to ``xxxx``, so once the SSN or
+#: date in front was redacted a second PHI round on the store path no longer saw a segment or a name,
+#: and the text past the closer printed, which the patterns before BACKLOG #2966 hid there. Reviews
+#: found the shapes; each tail holds a capital letter, which the tail now refuses, so it reads as
+#: before.
 _GLUED_SEGMENT_LINES: tuple[tuple[str, str], ...] = (
     ("token=a;PWD={pp 123-45-6789PID| ..}vq rest", "rest"),
     ("MEFOR_X=a;PWD={pp q 123-45-6789PID|vq1}vq3 rest", "vq3"),
     ("token=a;PWD={pp 123-45-6789NK1| ..} vq3", "vq3"),
+    ("MEFOR_X=a;PWD={pp a|123-45-6789Jane Doe}vq02|vq03", "vq02"),
+    ("token=a;PWD={pp a|19800505T12Jane Doe}vq02|vq03", "vq02"),
+    ("MEFOR_X=a;PWD={pp a|Jane Doe123-45-6789}vq02|vq03", "vq02"),
 )
 
 
-@pytest.mark.parametrize(("line", "value"), _GLUED_SEGMENT_LINES, ids=range(3))
+@pytest.mark.parametrize(("line", "value"), _GLUED_SEGMENT_LINES, ids=range(6))
 def test_a_segment_id_glued_behind_digits_in_a_braced_tail_is_left_to_the_phi_pass(
     line: str, value: str
 ) -> None:
-    """The store path hides the value past the closer, as it did before the run-on."""
+    """The store path hides the value past the closer, as it did before the run-on, and so does the
+    bundle on the line with a structured PHI field after it, which makes the PHI pass run twice."""
     out = _store_detail(line)
     assert value not in out, f"store: {value} printed -- got {ascii(out)}"
+    if "Jane" in line:
+        out = redact_log_line(line + " PatientName=x")
+        assert value not in out, f"bundle: {value} printed -- got {ascii(out)}"
 
 
 def test_the_glued_segment_lines_print_when_the_tail_reads_only_a_run_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """THE POSITIVE CONTROL. With the tail refusing a segment-shaped triple only at the START of a
-    run, and a run ending in ``MSH``, ``BHS`` or ``FHS``, as the previous form did, each line prints
-    its value on the store path."""
-    previous = (
-        r"|(?-i:[A-Z][A-Z0-9]{2})(?![A-Za-z0-9])"
-        r"|[A-Za-z0-9]*?(?-i:MSH|BHS|FHS)(?![A-Za-z0-9])"
-    )
-    for module in (scrub_mod, redact_mod):
-        tail = module._SPACED_BRACED_TAIL
-        assert _SEGMENT_ENDING_RUN in tail, f"{module.__name__}._SPACED_BRACED_TAIL lost it"
-        bare = tail.replace(_SEGMENT_ENDING_RUN, previous)
-        for name in _STOPPED_PATTERNS:
-            pattern: re.Pattern[str] = getattr(module, name)
-            monkeypatch.setattr(
-                module, name, re.compile(pattern.pattern.replace(tail, bare), pattern.flags)
-            )
+    """THE POSITIVE CONTROL. With the tail taking capital letters again and refusing a
+    segment-shaped triple only at the START of a run, and a run ending in ``MSH``, ``BHS`` or ``FHS``,
+    as the earlier forms did, each line prints its value on the store path."""
+    _restore_an_earlier_tail(monkeypatch, segment_checks=True)
     for line, value in _GLUED_SEGMENT_LINES:
         out = _store_detail(line)
         assert value in out, f"{line!r} hid -- got {ascii(out)}"
