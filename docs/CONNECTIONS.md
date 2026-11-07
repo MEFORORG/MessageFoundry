@@ -2290,11 +2290,13 @@ Two limits follow from this:
   clears. A network fault the system reports as a denial or as a missing name is still left.
 
   On Windows, the host check first walks the path, reading each name in it, before the file
-  itself is judged. The walk refuses at least a name the system could not read, as on a denial
-  or a device, sharing or network fault, and then says the file could not be read. It also
-  refuses at least a link loop, a path through a file and a share Windows could not reach, as not
-  a plain local path. A missing name, other than such a share, ends the walk and is left to
-  libpq.
+  itself is judged. The walk refuses at least a folder in the path the system could not read or
+  resolve, as on a denial or a device, sharing or network fault, and then says the file could not
+  be read. It also refuses at least a chain of links it will not follow further, a path through a
+  file and a share Windows could not reach, as not a plain local path. A denial or fault on the
+  file's own name can pass the walk, since Windows answers it from the folder's listing; the
+  read then refuses it as a file that could not be read. A missing name, other than such a share,
+  ends the walk and is left to libpq.
 
   The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
   application-data folder. Elsewhere it is under `~/.postgresql`. The engine finds this home as

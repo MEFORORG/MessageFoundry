@@ -949,9 +949,10 @@ def _windows_path_verdict(
             return "the type of this volume could not be read"
         return None
 
-    stopped_unread: list[str] = []
+    stopped_unread = False
 
     def probing(part: str) -> tuple[str, str | None]:
+        nonlocal stopped_unread
         try:
             kind, target = probe(part)
         except (FileNotFoundError, NotADirectoryError) as exc:
@@ -963,7 +964,7 @@ def _windows_path_verdict(
             # a failure the system reported counts as unread, not _win_probe's own refusal of a
             # reparse point it does not follow, which carries no errno.
             if exc.errno is not None:
-                stopped_unread.append(part)
+                stopped_unread = True
             raise
         if target is not None:
             text = target.strip()
@@ -1255,7 +1256,9 @@ _LIBPQ_STAT_LEFT_ERRNOS = frozenset(
 #: ``ERROR_NETWORK_UNREACHABLE``, all EINVAL but 53 and 67, and the ``PermissionError`` faults
 #: 21 ``ERROR_NOT_READY``, 23 ``ERROR_CRC``, 31 ``ERROR_GEN_FAILURE``, 32
 #: ``ERROR_SHARING_VIOLATION``, 33 ``ERROR_LOCK_VIOLATION`` and 65 ``ERROR_NETWORK_ACCESS_DENIED``,
-#: on a directory too.
+#: on a directory too. This set judges the file's own ``stat``. Before it, the
+#: :func:`names_another_host` walk has refused at least a code other than a missing name met on a
+#: folder in the path, 5, 123 and 1921 among them, so on a folder those are refused, not left.
 _LIBPQ_STAT_LEFT_WINERRORS = frozenset({2, 3, 5, 15, _WINDOWS_INVALID_NAME, 161, 206, 267, 1921})
 
 
@@ -1416,14 +1419,15 @@ def _refuse_encrypted_libpq_root_cert(
 
     A path that names another host (:func:`names_another_host`) is refused unread, with
     ``PGSSLROOTCERT`` as the way out. On Windows that check's walk reads each name of the path
-    before the file is judged. It refuses at least a name the system could not read, saying the
-    file could not be read, and a link loop or a path through a file, as not a plain local path.
-    A ``stat`` failure that says no file is
-    there, or that libpq could not ``stat`` it either, is left to libpq
-    (:func:`_libpq_cannot_stat_either`): at least a missing name other than a share Windows could
-    not reach, and off Windows a permission denial. Every other ``stat`` failure is judged as a
-    failed read is, with no second look for a directory, so it is refused unless it says no file
-    is there, since libpq stats again at every connect and may load the file once the fault clears.
+    before the file is judged. It refuses at least a folder the system could not read or resolve,
+    saying the file could not be read, and a chain of links it will not follow further or a path
+    through a file, as not a plain local path (``docs/CONNECTIONS.md``, Generic ODBC). A ``stat``
+    failure that says no file is there, or that libpq could not ``stat`` it either, is left to
+    libpq (:func:`_libpq_cannot_stat_either`): at least a missing name other than a share Windows
+    could not reach, and off Windows a permission denial. Every other ``stat`` failure is judged
+    as a failed read is, with no second look for a directory, so it is refused unless it says no
+    file is there, since libpq stats again at every connect and may load the file once the fault
+    clears.
     Past the ``stat``, the path takes :func:`_read_driver_file`'s read,
     as an ``sslca`` does: a directory is left to libpq, and a file that cannot be opened or read,
     or one past :data:`_MAX_DRIVER_CA_FILE_BYTES`, is refused, as libpq would fail the connect on
@@ -1462,7 +1466,8 @@ def _refuse_encrypted_libpq_root_cert(
             # path leads off the host, so "not a plain local path" would misname the fault.
             raise ValueError(
                 f"{setting}: the {what} could not be read to check {_CA_CHECKED_FOR}: {cause}; "
-                "make it readable, or set PGSSLROOTCERT to a readable local path"
+                "check the path and the folders above it, or set PGSSLROOTCERT to a readable "
+                "local path"
             )
         raise ValueError(
             f"{setting}: the {what} is not a plain local path on this host, so it was not read "
@@ -1558,12 +1563,11 @@ def _read_driver_file(
     driver could not ``stat`` it either (:func:`_libpq_cannot_stat_either`), is left to the driver
     too: at least a missing name other than a share Windows could not reach, and off Windows a
     permission denial. On Windows the caller's :func:`names_another_host` walk has already refused
-    at least a name in the path the system could not read, a link loop and a path through a
-    file. Every other
-    ``stat`` failure is judged as a failed read is, with no second look for a directory, so it is
-    refused unless it says no file is there, since the driver stats again at each connect and may
-    then load the file.
-    That costs a second ``stat`` of a path that passes, which :func:`read_if_regular` makes again.
+    at least a folder in the path the system could not read, as
+    :func:`_refuse_encrypted_libpq_root_cert` says. Every other ``stat`` failure is judged as a
+    failed read is, with no second look for a directory, so it is refused unless it says no file is
+    there, since the driver stats again at each connect and may then load the file. That costs a
+    second ``stat`` of a path that passes, which :func:`read_if_regular` makes again.
 
     The file is read by :func:`~messagefoundry.auth.trust_anchors.read_if_regular`, which says
     how a device or pipe is judged without being read, or waited on."""

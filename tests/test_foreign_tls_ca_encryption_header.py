@@ -365,25 +365,27 @@ def test_a_pgsslrootcert_on_another_host_is_refused_unread(
 def test_a_local_root_certificate_the_walk_cannot_read_is_refused_as_unread(
     _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch, source: str, winerror: int
 ) -> None:
-    """On Windows, ``names_another_host``'s walk ``lstat``s each name of the path and refuses on
-    any failure but a missing name, before the file's own ``stat`` is judged. So a denial, a
-    network fault reported as a denial and a link that cannot be resolved are refused there, end
-    to end. The path is local, so the refusal says the file could not be read, not that it names
-    another host, whose remedy cannot help. Red before the walk's unread names were told apart."""
+    """On Windows, ``names_another_host``'s walk ``lstat``s each name of the path before the file's
+    own ``stat`` is judged, and refuses on any failure but a missing name. So a denial, a network
+    fault reported as a denial and a link that cannot be resolved, met on the folder that holds
+    the file, are refused there, end to end. The walk stopped before anything showed the path
+    leads off the host, so the refusal says the file could not be read, not that it names another
+    host. Red before the walk's unread names were told apart."""
     root = _write(_no_libpq_root, _certificate(), "root.crt")
     if source == "PGSSLROOTCERT":
         monkeypatch.setenv("PGSSLROOTCERT", root)
+    folder = _no_libpq_root.name.lower()
     real_lstat = os.lstat
 
     def unreadable(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
-        if os.path.basename(str(path)).lower() == "root.crt":
+        if os.path.basename(str(path)).lower() == folder:
             raise OSError(None, f"Windows error {winerror}", None, winerror)
         return real_lstat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "lstat", unreadable)
-    with pytest.raises(ValueError, match="root certificate file could not be read to check it"):
-        _build_psql()
-    with pytest.raises(ValueError) as refused:
+    with pytest.raises(
+        ValueError, match="root certificate file could not be read to check it"
+    ) as refused:
         _build_psql()
     text = str(refused.value)
     assert "a name in the path could not be read" in text
