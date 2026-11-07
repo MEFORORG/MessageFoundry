@@ -12643,11 +12643,17 @@ async def _build_off_loop[T](
 
 
 def _executor_faulted(exc: BaseException) -> bool:
-    """Whether ``exc``, or an exception it wraps, is a :class:`WiringBuildFault`: the executor
-    kept a connector build from running. A chain too long to read is taken as one."""
+    """Whether ``exc``, or an exception it wraps, is an executor fault: a
+    :class:`WiringBuildFault`, the executor keeping a connector build from running, or a broken
+    pool another worker-thread hop met. A chain that cannot be read is taken as one, so a reload's
+    rollback still restarts its inbounds rather than stopping on the walk."""
+    faults = (WiringBuildFault, concurrent.futures.BrokenExecutor)
     try:
-        return any(isinstance(e, WiringBuildFault) for e in exception_chain(exc))
+        return any(isinstance(e, faults) for e in exception_chain(exc))
     except ExceptionChainTooLong:
+        return True
+    except Exception:  # noqa: BLE001 - a third-party chain's attribute read; logged, never raised
+        log.warning("could not read a failed reload's exception chain", exc_info=True)
         return True
 
 

@@ -513,3 +513,27 @@ async def test_a_build_a_worker_took_before_the_pool_failed_to_start_a_thread_is
     assert handed == []
     # The executor's own fault is not lost: it is logged.
     assert any("can't start new thread" in r.getMessage() for r in caplog.records)
+
+
+def test_an_executor_fault_anywhere_in_a_reload_chain_is_read_as_one() -> None:
+    """The rollback's on-loop switch reads the reload's whole failure: a WiringBuildFault or a
+    raw broken pool, raised from or during it, and a chain it cannot read, count; another
+    failure does not."""
+    from concurrent.futures.thread import BrokenThreadPool
+
+    from messagefoundry.config.wiring import WiringBuildFault
+
+    class Unreadable(Exception):
+        @property
+        def reason(self) -> object:
+            raise KeyError("reason")
+
+    def raised_from(outer: Exception, inner: BaseException) -> Exception:
+        outer.__cause__ = inner
+        return outer
+
+    faulted = wiring_runner._executor_faulted
+    assert faulted(WiringBuildFault("x"))
+    assert faulted(raised_from(RuntimeError("outer"), BrokenThreadPool("pool")))
+    assert faulted(Unreadable("odd"))
+    assert not faulted(raised_from(PortConflictError("busy"), OSError("bind")))
