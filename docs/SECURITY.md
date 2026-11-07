@@ -854,8 +854,9 @@ the exchange, and a failed exchange is refused with its own reason rather than `
 
 **Why a sign-in callback is floored only sometimes.** An IdP that still holds a live single sign-on
 session answers the engine's redirect with no human step at all. A floor there would refuse that
-sign-in on every retry. So the sign-in is floored only when the verified `auth_time` is at or after
-the flow's start, which means the person signed in at the IdP inside this flow. An IdP clock that
+sign-in on every retry. So the sign-in is floored only when the verified `auth_time`, which is whole
+seconds, is at or after the flow's start rounded down to the whole second, which means the person
+signed in at the IdP inside this flow or in the second it started. An IdP clock that
 runs ahead can make an older sign-on look fresh. The refusal then clears once the skew has passed,
 and it never lets a flow through early. An IdP clock that runs behind can do the reverse, and then
 that sign-in is not floored. A sign-on made before the flow starts is the case the list under
