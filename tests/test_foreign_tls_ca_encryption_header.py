@@ -340,6 +340,18 @@ def test_libpqs_root_certificate_controls_still_build(
     assert "SSLmode=verify-full;" in _build_psql()
 
 
+#: The refusal of a path the host check does not clear, worded as ``_refuse_remote_path`` words
+#: it, naming both causes, and its remedy, which names who may write the copy's folder.
+_NOT_CLEARED = (
+    "root certificate file must be a plain local path on this host: not a share, a network "
+    "drive, a link to one, or a path it cannot read"
+)
+_NOT_CLEARED_REMEDY = (
+    "point PGSSLROOTCERT at a readable copy in a local folder only administrators and the "
+    "service account can write"
+)
+
+
 @pytest.mark.usefixtures("_no_libpq_root")
 def test_a_pgsslrootcert_on_another_host_is_refused_unread(
     monkeypatch: pytest.MonkeyPatch,
@@ -349,7 +361,7 @@ def test_a_pgsslrootcert_on_another_host_is_refused_unread(
     monkeypatch.setenv("PGSSLROOTCERT", "//db.synthetic.test/share/root.crt")
     with pytest.raises(ValueError, match=_NOT_CLEARED) as refused:
         _build_psql()
-    assert "point PGSSLROOTCERT at a readable copy in another folder" in str(refused.value)
+    assert _NOT_CLEARED_REMEDY in str(refused.value)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the path walk runs on Windows only")
@@ -391,14 +403,6 @@ def test_a_local_root_certificate_the_walk_cannot_read_is_refused_as_unread(
     assert "a name in the path could not be read" in text
     assert "set PGSSLROOTCERT to a readable local path" in text
     assert "must be a plain local path" not in text
-
-
-#: The refusal of a path the host check does not clear, worded as ``_refuse_remote_path`` words
-#: it, naming both causes.
-_NOT_CLEARED = (
-    "root certificate file must be a plain local path on this host: not a share, a network "
-    "drive, a link to one, or a path it cannot read"
-)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the path walk runs on Windows only")
@@ -451,7 +455,7 @@ def test_a_root_certificate_the_walk_stops_in_without_a_read_failure_is_not_clea
     with pytest.raises(ValueError, match=_NOT_CLEARED) as refused:
         _build_psql()
     text = str(refused.value)
-    assert "point PGSSLROOTCERT at a readable copy in another folder on this host" in text
+    assert _NOT_CLEARED_REMEDY in text
     assert "could not be read to check" not in text  # not the unread refusal
     assert "set PGSSLROOTCERT to a local path" not in text
 

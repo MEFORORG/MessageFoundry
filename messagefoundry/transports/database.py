@@ -1472,13 +1472,14 @@ def _refuse_encrypted_libpq_root_cert(
                 "local path"
             )
         # Worded as _refuse_remote_path words it: the walk may have stopped on a local path it
-        # could not finish, so the remedy cannot be only to name a local path. The remedy comes
-        # before the scope clause, since a bounded rendering keeps the front.
+        # could not finish, so the remedy cannot be only to name a local path. The copy it names
+        # is a trust anchor no ACL check covers, so the remedy says who may write its folder.
         raise ValueError(
             f"{setting}: the {what} must be a plain local path on this host: not a share, a "
             "network drive, a link to one, or a path it cannot read; check the path and the "
-            "folders above it, or point PGSSLROOTCERT at a readable copy in another folder on "
-            f"this host. It was not read to check {_CA_CHECKED_FOR}"
+            "folders above it, or point PGSSLROOTCERT at a readable copy in a local folder only "
+            f"administrators and the service account can write. It was not read to check "
+            f"{_CA_CHECKED_FOR}"
         )
     data = _read_driver_file(path, setting, what, _CA_CHECKED_FOR, leave_unstatable=True)
     if data is not None:
