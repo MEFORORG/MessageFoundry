@@ -865,6 +865,57 @@ def _read_handle_volume(handle: int) -> _HandleVolume:
     )
 
 
+def key_directory_volume_problem(directory: Path) -> str | None:
+    """Why a key file written into ``directory`` with ``local_volume_only`` would be refused for
+    its volume, or ``None`` when it would not. The same rule :func:`write_restricted_file` applies
+    to the new file (:func:`_volume_problem` on Windows, :func:`linux_file_system_refusal` over
+    :data:`LINUX_HOST_FILE_SYSTEMS` on Linux, and a refusal on any other platform), read through a
+    handle on the directory, so a mint can refuse before it shows a recovery key (PR 2804 eleventh
+    hold). The file the write makes is still judged by its own handle: this is the early answer,
+    not the check of record. A directory that cannot be opened is refused, naming why."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.CreateFileW(
+            str(directory),
+            0x80,  # FILE_READ_ATTRIBUTES
+            0x07,  # share read, write and delete
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS: a directory opens only with it
+            None,
+        )
+        if handle is None or handle == wintypes.HANDLE(-1).value:
+            return f"it could not be opened (Win32 error {ctypes.get_last_error()})"
+        try:
+            return _volume_problem(_read_handle_volume(handle))
+        finally:
+            kernel32.CloseHandle(handle)
+    if sys.platform != "linux":
+        return "a file system is checked before a key file is written on Linux and Windows only"
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as exc:
+        return f"it could not be opened ({exc.strerror or type(exc).__name__})"
+    try:
+        return linux_file_system_refusal(fd, LINUX_HOST_FILE_SYSTEMS, "key custody host file")
+    finally:
+        os.close(fd)
+
+
 def key_file_handle_problem(handle: int, *, engine_read_only: bool) -> str | None:
     """Windows: why the key file open as ``handle`` is not owned and listed exactly as one, or
     ``None`` when it is.

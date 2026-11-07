@@ -1870,3 +1870,56 @@ def test_a_cleanup_that_cannot_remove_the_host_file_keeps_the_original_reason(
         load_host_custody(_settings(tmp_path), enforcing=True, environ={})
     text = str(excinfo.value)
     assert "the read-back stand-in refusal" in text and "could not be removed" in text
+
+
+@host_file_platforms
+@pytest.mark.parametrize("shape", ["missing directory", "refused file system"])
+def test_a_custody_directory_the_write_refuses_is_refused_before_the_recovery_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    shape: str,
+) -> None:
+    # PR 2804 eleventh hold, A: the write refuses a missing directory and a volume that fails
+    # write_restricted_file's local-volume rule, but only after the ceremony. mint_target now asks
+    # first, through that rule's own check, so no recovery key is shown for a key that cannot land.
+    from messagefoundry import __main__ as cli
+    from messagefoundry import restricted_file
+    from messagefoundry.__main__ import main
+
+    shown: list[str] = []
+
+    def _ceremony(*_args: object, **_kwargs: object) -> None:
+        shown.append("recovery key shown")
+        raise AssertionError("the ceremony was reached")
+
+    monkeypatch.setattr(custody_host, "mint_host_custody", _ceremony)
+    # The prompts before the ceremony answer, so a run that does not refuse reaches it.
+    monkeypatch.setattr(cli, "_read_new_password", lambda _prompt: "correct horse battery")
+    if shape == "missing directory":
+        store_path = tmp_path / "missing" / "store.db"
+    else:
+        store_path = tmp_path / "store.db"
+        if sys.platform == "win32":
+            fat = restricted_file._HandleVolume(
+                file_system="FAT32", device_type=restricted_file._FILE_DEVICE_DISK
+            )
+            monkeypatch.setattr(restricted_file, "_read_handle_volume", lambda _handle: fat)
+        else:
+            monkeypatch.setattr(restricted_file, "linux_file_system_type", lambda _fd: 0x01021994)
+    monkeypatch.chdir(tmp_path)
+    # MFA off, so --no-totp reaches the ceremony without a TOTP enrolment to answer.
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[store]\nkey_provider = "host"\n[security]\nrequire_mfa = false\n'
+    )
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    argv.append("--no-totp")
+    code = main([*argv, "--db", str(store_path)])
+    assert shown == [], shown  # the recovery-key ceremony was never reached
+    refused = " ".join(capsys.readouterr().err.split())
+    assert code == 2, refused
+    assert "no recovery key was shown" in refused, refused
+    expected = "does not exist" if shape == "missing directory" else "cannot hold a store key"
+    assert expected in refused, refused
+    assert not (store_path.parent / custody_host.HOST_FILE_NAME).exists()

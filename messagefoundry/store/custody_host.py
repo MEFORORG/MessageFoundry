@@ -658,6 +658,23 @@ def mint_target(
                 "it in place. "
                 f"{keep_the_key_step(settings, new_store=False, service_account=service_account)}"
             )
+    # Before any recovery key is shown: the write refuses a missing directory and a volume that
+    # fails write_restricted_file's local-volume rule only after the ceremony (PR 2804 eleventh hold).
+    from messagefoundry.restricted_file import key_directory_volume_problem
+
+    directory = host.parent
+    if not directory.is_dir():
+        raise HostCustodyRefused(
+            f"the custody directory {directory} does not exist, so no store key was minted and no "
+            "recovery key was shown. Create it, restricted as a secrets directory must be, and run "
+            "the command again"
+        )
+    volume = key_directory_volume_problem(directory)
+    if volume is not None:
+        raise HostCustodyRefused(
+            f"the custody directory {directory} cannot hold a store key: {volume}. No store key "
+            "was minted and no recovery key was shown"
+        )
     if service_account is None:
         # What the write refuses for this account, asked now: the shared and non-local accounts
         # (and on Linux root and nobody).
