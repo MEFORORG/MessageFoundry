@@ -5922,17 +5922,67 @@ a lapse row is written, and put that lapse row on it; on `/ui/logout`, which nam
 
 **A refused sign-out audit write is logged, not raised (BACKLOG #3884),** so `/ui/logout` still
 clears the cookie. That row is then missing, with an ERROR log line; the line names the session
-when the sign-out ended one. A failed owner lookup on `/ui/logout`, which names no caller, writes
+when the sign-out ended one. A fault in the revoke itself still raises: that request answers 500,
+the cookie stays set and a live session stays live. A failed owner lookup on `/ui/logout`, which names no caller, writes
 the row with no actor, so it does not reach that user's security-events feed. On a session that
 passed its clock checks it also leaves the temporary credential unchecked, as above.
 
-**Open gap: `/ui/logout` audit rows for sign-outs that end no session are unbounded.** A request
-to `/ui/logout` whose session cookie ends no session can still write an `auth.logout` row, with
-`outcome` `nothing_to_revoke`. Nothing in the engine bounds how many such rows a caller who can
-reach the route can append, and nothing prunes `audit_log` (see
-[retention](CONFIGURATION.md#retention)). A bound in the engine is a follow-up, not yet filed.
-Until it exists, treat `/ui/logout` as an unbounded audit-write surface to any caller that can
-reach the console, on the engine's own host or beyond it.
+**`/ui/logout` audit rows for sign-outs that end no session are bounded (BACKLOG #4735).** A
+request to `/ui/logout` whose session cookie ends no session writes an `auth.logout` row with
+`outcome` `nothing_to_revoke`, and the route needs no credential, so the engine bounds those rows.
+Each source begins at most 3 such row writes in any 60 seconds, and all sources together at most
+120 begun. A source is the caller's address, folded as the sign-in limiter folds it, and every
+caller with no address shares one source. So ten distinct sources flooding the route write 30 rows a
+minute and leave the other 90 rows to everyone else, 30 more sources' worth. Forty sources at their
+share fill the 120 ceiling, and then no source writes its own row until earlier rows age out of the
+window.
+
+A sign-out past either limit is not written as its own row but counted. The count is written in an
+`auth.logout` row with no actor and no client, `outcome` `unrecorded` and `"count": N`, the
+sign-outs left unwritten since the last such row, and at most one such row is begun in any 60
+seconds. The slot is spent when the write starts, so count-row writes that stall can land together.
+A WARNING log line gives the same N once the row is written. Its own outcome keeps a reader
+that counts `nothing_to_revoke` rows from reading it as one sign-out. Only a sign-out that names no
+caller and ends nothing writes the count: the first one past a limit writes it at once, unless a
+count row was attempted in the 60 seconds before, since a count-row write that is refused or
+cancelled spends that window's one slot too. A sign-out through `POST /auth/logout` never writes
+it. The row's time is when its write began, not when the misses it counts arrived. When only the
+audit writes are refused, the ERROR line each refused row write logs is bounded the same way. When
+the whole store refuses, that bound does not apply: the revoke's own store write raises before any
+row is attempted, so each request that passes the route's origin check (`assert_same_origin`) and
+carries a non-empty session cookie answers 500, the cookie stays set and a live session stays
+live, and nothing bounds the errors those requests log.
+
+**What the count can miss.** A count stays in memory until a later sign-out that names no caller
+and ends nothing arrives after the 60 seconds, so the misses at the end of a flood are written only
+then, and a restart of either kind, graceful or not, loses a count not yet written. A count-row
+write that is refused or cancelled puts its count back for the next count row, but it has spent
+that window's one count row.
+
+At least these limits stay as well. Callers the engine sees under one folded address are one
+source: at least every caller behind one NAT or egress address, every caller behind a proxy whose
+forwarded address the engine does not trust, every loopback caller (so every caller of an engine
+on its default loopback bind), every caller with no address, and every caller whose forwarded
+address reads `unknown`, which shares the no-address source. Three misses from any of them then cost the rest their own rows for the window, and only
+the count records the others. The source is the whole address, so an IPv6 host that holds a /64 can
+be 40 sources by itself and fill the ceiling. The bound and the count are in-process, so each engine
+shard keeps its own. Nothing prunes `audit_log` (see [retention](CONFIGURATION.md#retention)), so the
+rows still grow, by at most 121 rows begun a minute for each engine process. Each bound is charged
+when a row's write starts, not when it lands, so the rows of writes that stall can land together,
+more than 121 in one minute.
+
+**The bound is on the audit row, not on the request.** Every request to `/ui/logout` that passes
+the route's origin check (`assert_same_origin`) and carries a non-empty session cookie still runs
+the sign-out's revoke, a store write transaction, whether or not it ends a session: on
+SQLite its `UPDATE` takes the store's write lock even when it matches no row, and that competes with
+message ingress commits. Nothing in the engine bounds those requests, so treat `/ui/logout` as an
+unbounded store-write surface to any caller that can reach the console, on the engine's own host or
+beyond it. The bound never refuses a sign-out, though one that writes a count row waits for that
+write too; a sign-out whose revoke raises answers 500, the cookie stays set and a live session
+stays live (above). The bound never stops the row of a sign-out that ended a session, or of one that names its
+caller, as `POST /auth/logout` does, though a refused audit write still loses such a row with an
+ERROR line (above). Concurrent `POST /auth/logout` calls on one token each write a row, all but one
+`nothing_to_revoke`, and that is kept on purpose, because each is an authenticated request.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was
@@ -6427,7 +6477,7 @@ for a token, so it is not a sign-in leg.
 
 ### The documented protection set (ASVS 6.1.1)
 
-Eleven controls defend the authentication surface against automated attack. Each is named with its
+Twelve controls defend the authentication surface against automated attack. Each is named with its
 threshold, the switch that disables it, and — the part that matters for "not disabled or bypassable" —
 **what is left when it is off**.
 
@@ -6444,6 +6494,7 @@ threshold, the switch that disables it, and — the part that matters for "not d
 | 9 | **JWKS min-refetch floor** (`JwksCache.get_key`) | unauthenticated `kid`-driven refetch amplification against the IdP on the OIDC callback leg — the sibling of control 7 on the *other* federated leg | one upstream fetch per **300 s**, globally (`[auth].oidc_jwks_min_refetch_seconds`), plus a `_MAX_JWKS_BYTES` **512 KiB** response-body cap and a 3600 s key TTL. Within the floor an unknown `kid` raises `JwksError` and that login fails (a still-cached key is served even past the soft TTL rather than fail while throttled) | `oidc_jwks_min_refetch_seconds = 0` — no validator floor, so this **is** a genuine opt-out, and it restores the amplification | limiter 2 and control 7 (the same legs charge `allow_login_attempt` and stage a bounded flow first) |
 | 10 | **Repeated-credential audit budget** (`allow_repeated_credential_audit`) | an unauthenticated caller growing `audit_log` by sending a repeated `Authorization` header or session cookie, which is refused before any credential is read (BACKLOG #2454) | > 10 `auth.repeated_credential` rows per client IP **or** > 60 across all clients, per 60 s. Its own budget: it never draws on, or exhausts, limiter 2. A flood from many addresses can spend the global 60, and other refusals in that window then get the line and no row | *the same* `[auth].login_rate_limit_enabled` | the refusal is unchanged: every repeat is still a `400` and a WARNING line. Only the row loses its bound, so with the switch off every refusal writes one |
 | 11 | **Step-up return audit budget** (`allow_step_up_return_audit`) | many accounts' live IdP step-up flows, or a page that sends many operators' browsers to `GET /ui/oidc/callback`, growing `audit_log` through the step-up return's refusals that consume nothing and so repeat while the flow lives: a `state` mismatch, on the completion or the abandon leg, and a non-navigation fetch (BACKLOG #3965) | > 10 such rows per **source** per 60 s, where the source is the staged **user**, or, for a flow that names no user, the callback's client **address**. Behind that, a **backstop** of 60 rows across all sources per 60 s: past it each **account** still writes one row a window, and a source with no account writes none. The first row it stops in a window, per audit action, pages `audit_write_failed` keyed `step_up_return:audit_budget:<action>`, with an ERROR line; a row the per-account floor writes pages nothing. Its own budget: it never draws on, or exhausts, limiter 2 or limiter 3, and it gates the **row only**. An over-budget refusal answers exactly as before (a `state` mismatch the step-up page with **403**, a non-navigation fetch a **303** to `/ui/login?e=oidc_failed`), consumes nothing, and writes a WARNING line instead of the row. So one source spending its budget costs no other source a row; a flood across many sources that spends the backstop still leaves each account one row that window, and pages once it stops one; and none of it refuses anyone's step-up return | *the same* `[auth].login_rate_limit_enabled`, among others: `login_rate_limit_global = 0` removes its backstop and with it the page, `login_rate_limit_per_ip = 0` its per-source figure, and a `login_rate_limit_window_seconds` of `0` or less the whole budget while the switch reads on. A **lower** `login_rate_limit_global` also writes fewer of these rows, and a negative one only each account's one row a window, paging once a window per action it stops. The startup loosening report names those values for the sign-in and ceremony limits only; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced) says they loosen this budget too | nothing: the same switch removes limiter 3, whose per-user return key otherwise holds each user's step-up returns, these rows among them, to 10 a window with no ceiling across users. The refusals are unchanged, and with the switch off every one writes its row |
+| 12 | **Sign-out miss-row budget** (`_admit_logout_miss_row`) | an unauthenticated caller growing `audit_log` through `POST /ui/logout` with a cookie that ends no session, each request writing an `auth.logout` row with `outcome` `nothing_to_revoke` (BACKLOG #4735) | For each engine process, per 60 s: > 3 such row writes begun per source **or** > 120 begun across all sources, where the source is the client address and every caller with no address shares one; a miss past either is counted, and at most one `auth.logout` row with `outcome` `unrecorded` is begun to write the count, with a WARNING line once it is written. [Session inventory](#session-inventory--targeted-revocation-wp-10) states its limits | none: it is always on, and `[auth].login_rate_limit_enabled` does not turn it off | nothing to turn off. It gates the row only, so a sign-out is never refused, and each miss still runs one store write transaction that this budget does not bound |
 
 **Control 1 bounds the lock; it bounds the campaign only where the owner has a way past it
 (ADR 0197).** Each lock releases itself, and the next run to the threshold sets the next one. What
@@ -6767,7 +6818,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /ui/account/mfa/verify` | per-actor ceremony budget | |
 | `POST /ui/account/webauthn/verify` | per-actor ceremony budget | the passkey registration finish (BACKLOG #3014); its 429 is a `JSONResponse` carrying `Retry-After: 30` (BACKLOG #3690 item 5), charged after the gate's admin-write floor, and not charged for a session the factor-binding rule refuses, which logs a WARNING instead (BACKLOG #3690 item 6) |
 | `POST /ui/account/password` | *(inherits)* | delegates to the JSON handler, which charges once; the 429 is re-raised intact — deliberately not double-charged |
-| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 paced three routes that were listed here. They are `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email`, now on `require_paced`. **Two earlier routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` and `GET /ui/mfa` belong here because the admin-write floor is non-GET only, and so does `GET /ui/oidc/start` while its interstitial is shown. So do `POST /ui/logout` and `POST /ui/csp-report`, which carry no `require_ui` gate (the sign-out's unbounded `nothing_to_revoke` audit rows are an open gap under [Session inventory](#session-inventory--targeted-revocation-wp-10)), and the passkey-first refusal branch of `POST /ui/reauth` (control 8). The console's WebAuthn **staging** POSTs do **not** — see control 8. The list is at least these |
+| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 paced three routes that were listed here. They are `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email`, now on `require_paced`. **Two earlier routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` and `GET /ui/mfa` belong here because the admin-write floor is non-GET only, and so does `GET /ui/oidc/start` while its interstitial is shown. So do `POST /ui/logout` and `POST /ui/csp-report`, which carry no `require_ui` gate (the sign-out's `nothing_to_revoke` audit rows are bounded, not the request, as [Session inventory](#session-inventory--targeted-revocation-wp-10) states), and the passkey-first refusal branch of `POST /ui/reauth` (control 8). The console's WebAuthn **staging** POSTs do **not** — see control 8. The list is at least these |
 
 The console calls the ceremony gate directly. It used to resolve it through a `getattr` shim that
 fell back to the **sign-in** budget on an engine without the method. The console pins one engine
@@ -6779,7 +6830,7 @@ Every enforced limit, with both dimensions stated even where one is hard-coded o
 **and** globally" is the requirement's own wording. **Enforcement scope is stated per row, because it
 is not uniform.** The four sliding-window limiters (sign-in, credential ceremony, PHI read, admin
 write) and the two pending-flow caches are **in-process, per API process** — N engine shards multiply
-*those* budgets by N. So are the two audit-row budgets of the 6.1.1 set (controls 10 and 11),
+*those* budgets by N. So are at least the three audit-row budgets of the 6.1.1 set (controls 10 to 12),
 which this table does not list. The account lockout and the concurrent-session cap are
 **store-backed** (`increment_login_failure` / `enforce_session_cap` against the one unified store), so they are **shared** by every API process and are **not** multiplied by N. For
 the lockout, shared is not by itself enough and the second half is what makes the first half true: the
@@ -6882,7 +6933,7 @@ IP is a backlog follow-up).
 ## Audit
 
 Every authentication and authorization event is written to the durable `audit_log` with the acting
-user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.directory_login_locked` / `auth.logout` /
+user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.directory_login_locked` / `auth.logout` (an unauthenticated sign-out that ends nothing, past its bound, is counted in a row rather than written as its own; see [Session inventory](#session-inventory--targeted-revocation-wp-10)) /
 `auth.login_new_ip` / `auth.login_address_unevaluated` (the first-seen sign-in address, BACKLOG #288;
 on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
 `auth.permission_denied` / `auth.channel_denied` / `auth.gate_refused` / `auth.self_target_refused` / `auth.session_revoke_missed`, the 6.3.5 events `auth.account_locked` /
