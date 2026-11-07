@@ -6168,9 +6168,9 @@ class AuthService:
         # BACKLOG #2301 (ASVS 2.4.2): the minimum-elapsed floor, only when the person signed in at
         # the IdP during THIS flow, which the verified auth_time says. An IdP holding a live single
         # sign-on session answers with no human step, so there is nothing to floor, and flooring it
-        # would refuse that sign-in on every retry. auth_time is whole seconds, so it is compared
-        # with the flow's start rounded down: a sign-in in the same second as the start is the fast
-        # case this floor exists for. An IdP clock that runs ahead can make an older sign-on look
+        # would refuse that sign-in on every retry. auth_time is compared with the flow's start
+        # rounded down, so a sign-in in the same second as the start counts as the fast case this
+        # floor exists for. An IdP clock that runs ahead can make an older sign-on look
         # fresh; the refusal then clears once the skew has passed, and it never lets a flow through.
         signed_in_during_flow = principal_claims.auth_time >= math.floor(flow.issued_at)
         # BACKLOG #2388: an IdP that re-authenticates with no human step (an amr the operator named
