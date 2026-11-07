@@ -28,6 +28,18 @@ async def test_webauthn_store_contract_sqlite(tmp_path: Path) -> None:
         await store.close()
 
 
+async def test_a_session_for_a_missing_account_is_refused_sqlite(tmp_path: Path) -> None:
+    store = await MessageStore.open(tmp_path / "orphan.db")
+    try:
+        from tests._webauthn_store_contract import (
+            assert_a_session_for_a_missing_account_is_refused,
+        )
+
+        await assert_a_session_for_a_missing_account_is_refused(store)
+    finally:
+        await store.close()
+
+
 async def test_webauthn_rehash_contract_sqlite(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "rehash.db")
     try:

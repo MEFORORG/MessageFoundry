@@ -4497,8 +4497,10 @@ Facts that are easy to get wrong, stated plainly first:
   **Two session writes wait longer, on purpose (BACKLOG #2283 on Postgres, #3023 on SQL
   Server).** `rotate_session` and `revoke_user_sessions` mostly run after their caller's own change
   has committed: a password reset, a disable, a role change, a completed second factor. Nothing
-  retries them, so a pool shortage at the ordinary limit would fail them after that change. Callers
-  with no earlier write, such as "sign out everywhere else", wait the same way.
+  retries a rotation, and the auth service runs a revoke again only within a short budget (vault
+  BACKLOG #3023), which one SQL Server pool wait uses up, so a pool shortage at the ordinary limit
+  would fail them after that change. Callers with no
+  earlier write, such as "sign out everywhere else", wait the same way.
 
   - On **SQL Server** they wait up to **2 times `acquire_timeout`**, 60 s at the default, and then
     raise `StoreAcquireTimeout` like any other borrow. The wait is still bounded. The limit comes
@@ -4514,8 +4516,10 @@ Facts that are easy to get wrong, stated plainly first:
 
   On both, `[store].command_timeout` still bounds the statement unless it is set to 0, and a lost
   connection still fails it. An HTTP request's own deadline still cancels the wait, and a cancelled
-  wait writes nothing and records nothing. A revoke that fails leaves the account's other sessions
-  unrevoked, and the change's own audit row and notice are lost with it. A rotation that fails,
+  wait writes nothing and records nothing. A revoke the store refuses after a committed change is
+  run again within a bounded budget, and one the service gives up on is recorded, as
+  [SECURITY.md](SECURITY.md) states; it leaves the account's other sessions unrevoked, and the
+  change's own audit row and notice are lost with it. A rotation that fails,
   including one that reached the SQL Server limit, is answered as a lost session: the old session
   is revoked, best effort, an `auth.session_rotation_failed` row with reason `store_error` records
   in `revokes_landed` whether every revoke landed, and the caller signs in again. The same callers

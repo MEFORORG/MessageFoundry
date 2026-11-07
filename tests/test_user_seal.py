@@ -362,7 +362,7 @@ _USER_READERS = frozenset(
 )
 #: The service functions allowed to call a raw user reader, and why each needs it.
 _LOADERS: dict[str, frozenset[str]] = {
-    "_load_user": frozenset({"get_user"}),
+    "_lookup_user": frozenset({"get_user"}),
     "_lookup_by_username": frozenset({"get_user_by_username"}),
     "_lookup_by_directory_object_id": frozenset({"get_user_by_directory_object_id"}),
     "_load_user_by_federated_subject": frozenset({"get_user_by_federated_subject"}),
