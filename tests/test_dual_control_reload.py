@@ -2936,3 +2936,50 @@ def test_the_undrained_row_wait_fits_inside_the_engine_stop_reserve() -> None:
     from messagefoundry.api import app as app_module
 
     assert app_module._ROW_CANCEL_WAIT_SECONDS <= app_module._ENGINE_STOP_RESERVE_SECONDS / 3
+
+
+@pytest.mark.parametrize("cause", ["executor-fault", "invalid-config"])
+async def test_an_executor_fault_in_a_reload_build_is_a_fault_row_not_an_invalid_config(
+    engine: Engine, tmp_path: Path, cause: str
+) -> None:
+    """A reload whose outbound rebuild the executor fails, by a broken pool, answers the reload's
+    generic 500 and writes a reload_fault row, as any fault inside the reload does: nothing is
+    wrong with the config. Red (Lander hold 6703767989): _build_off_loop raised a plain
+    WiringError, which the route answered 422 invalid configuration with reason invalid_config.
+    The control is a config that really is wrong, which still answers 422 invalid_config."""
+    from concurrent.futures.thread import BrokenThreadPool
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    loop = asyncio.get_running_loop()
+    real = loop.run_in_executor
+
+    def faulty(executor: Any, fn: Any, *args: Any) -> asyncio.Future[Any]:
+        if "_build_off_loop" not in getattr(fn, "__qualname__", ""):
+            return real(executor, fn, *args)
+        queued: asyncio.Future[Any] = loop.create_future()
+        queued.set_exception(BrokenThreadPool("a thread initializer failed"))
+        return queued
+
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "op")
+        first = await c.post("/config/reload", json={}, headers=headers)
+        assert first.status_code == 200, first.text
+        cfg = tmp_path / "cfg"
+        if cause == "executor-fault":
+            # The outbound moves, so the reload rebuilds it through _build_off_loop.
+            _write_valid_config(cfg, tmp_path / "in", tmp_path / "out2")
+        else:
+            text = (cfg / "cfg.py").read_text(encoding="utf-8")
+            (cfg / "cfg.py").write_text(text.replace("router='r'", "router='nope'"), "utf-8")
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(loop, "run_in_executor", faulty)
+            r = await c.post("/config/reload", json={}, headers=headers)
+    rows = await _failed_reload_rows(engine)
+    if cause == "executor-fault":
+        assert r.status_code == 500, r.text
+        assert r.json() == {"detail": _FAULT_DETAIL}
+        assert [(d["reason"], d["error"]) for d in rows] == [("reload_fault", "WiringBuildFault")]
+    else:
+        assert r.status_code == 422, r.text
+        assert [d["reason"] for d in rows] == ["invalid_config"]

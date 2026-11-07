@@ -186,6 +186,7 @@ __all__ = [
     "Registry",
     "WiringError",
     "ConfigDirUnlistable",
+    "WiringBuildFault",
     "PortConflictError",
     "StateKeyError",
     "API_LISTENER_LABEL",
@@ -246,6 +247,14 @@ class ConfigDirUnlistable(WiringError):
     ``unreadable``, as it audits the engine's own check of the target, not as a config to fix
     (vault BACKLOG #5248). Still a ``WiringError``, so every caller that refuses a bad config
     refuses this one the same way."""
+
+
+class WiringBuildFault(WiringError):
+    """A connector build the executor kept from running: it cancelled the build, failed it as a
+    broken pool, or refused it because it was shut down. Nothing is wrong with the config. Its own
+    type, so a reload audits it as ``reload_fault``, a fault inside the reload, not as a config to
+    fix (Lander hold 6703767989). Still a ``WiringError``, so an operator start or restart that
+    meets it answers and audits it as a refused start (Lander hold 6703229134, item 2)."""
 
 
 class PortConflictError(WiringError):

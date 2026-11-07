@@ -410,6 +410,7 @@ from messagefoundry.config.wiring import (
     EnvRef,
     InboundConnection,
     Registry,
+    WiringBuildFault,
     WiringError,
     accepted_cleartext_hops,
     attested_secure_hops,
@@ -2776,7 +2777,9 @@ async def _audit_refused_reload(
         )
         action, detail["reason"] = "config_reload_failed", "store_unavailable"
         status, answer = 503, _ANCHOR_STORE_DETAIL
-    elif isinstance(exc, WiringError):
+    elif isinstance(exc, WiringError) and not isinstance(exc, WiringBuildFault):
+        # A WiringBuildFault is the executor's, not the config's (Lander hold 6703767989), so it
+        # falls to the fault arm below, as it did when it reached here as a bare RuntimeError.
         anchor_refused = _refused_by_trust_anchor(exc)
         warn(
             "config reload %s: %s",

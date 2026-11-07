@@ -107,6 +107,7 @@ from messagefoundry.config.wiring import (
     OutboundConnection,
     PortConflictError,
     Registry,
+    WiringBuildFault,
     WiringError,
     _refuse_attested_and_accepted,
     apply_hop_attestation,
@@ -12556,7 +12557,7 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
     runs in the default executor, in a copy of the caller's context.
 
     An executor fault, a build it cancelled, failed as a broken pool or refused because it was shut
-    down, raises :class:`WiringError` with the fault as its cause, as a refused build does, so no
+    down, raises :class:`WiringBuildFault`, a :class:`WiringError`, with the fault as its cause, so no
     caller meets a bare ``RuntimeError`` (Lander hold 6703229134, item 2). A build the pool queued
     before it failed to start a thread is cancelled, or, if a worker already took it, closed when
     it finishes as an abandoned build is."""
@@ -12614,10 +12615,10 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
         raise
 
 
-def _executor_fault(exc: Exception) -> WiringError:
-    """The :class:`WiringError` for an executor ``exc`` that kept a build from running
+def _executor_fault(exc: Exception) -> WiringBuildFault:
+    """The :class:`WiringBuildFault` for an executor ``exc`` that kept a build from running
     (:func:`_build_off_loop`), with ``exc`` as its cause, as ``raise ... from exc`` sets it."""
-    fault = WiringError(f"connector build failed: {exc}")
+    fault = WiringBuildFault(f"connector build failed: {exc}")
     fault.__cause__ = exc
     fault.__suppress_context__ = True
     return fault
