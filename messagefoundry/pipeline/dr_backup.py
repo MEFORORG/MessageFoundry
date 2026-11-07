@@ -1741,8 +1741,13 @@ def _verify_archive_blocking(
     Steps (ADR 0049): (1) key-fingerprint precheck — a mismatch is a clean ``KEY_MISMATCH`` BEFORE any
     decrypt; (2) decrypt the archive; (3) extract + open ``store.db`` read-only, run
     ``PRAGMA integrity_check``; (4) compare per-table row counts to the manifest. ``full`` additionally
-    re-opens the snapshot through the real ``open_store`` path (cipher + migrations) and decrypts +
-    authenticates every cipher-covered cell in it — heavier. That leg returns its own
+    decrypts + authenticates the cipher-covered cells the snapshot holds as archived, then re-opens it
+    through the real ``open_store`` path (cipher + migrations) — heavier. The walk runs before the open,
+    so it reads the archive's own schema and reads a cell only where that schema holds the cell's
+    table and every column its tag binds. A cell that only a later migration adds or renames is not
+    read, by the walk or after the open: at least ``queue.payload`` on a schema without ``body_ref``,
+    ``search_presets.criteria`` on one without ``owner_user_id``, and a value the outbox fold moves into
+    ``queue``. That leg returns its own
     ``KEY_MISMATCH`` when the settings resolve no key for a snapshot that holds sealed cells or is
     recorded as keyed (see :func:`_full_open_check`), so an archive that is fine and a key
     configuration that is not are not both reported as ``FAIL``.
