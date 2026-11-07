@@ -337,8 +337,8 @@ have not, the document says nothing about that CVE and your scanner's finding st
   **npm-audit**. The generator itself, and the jscpd clone report in `quality-advisory.yml`, install
   from a separate committed lock, `ci/npm-tools/package-lock.json` (vault BACKLOG #2793). **No
   blocking audit lane reads that lock**; Dependabot watches it. Read 2026-11-06, with the `overrides`
-  in `ci/npm-tools/package.json` that hold `glob` and `minimatch` on their patched lines, `npm audit`
-  on it reports 0 vulnerabilities. That is a dated reading, not a standing property.
+  in `ci/npm-tools/package.json` (why: its description), `npm audit` on it reports 0
+  vulnerabilities. That is a dated reading, not a standing property.
 - **Container image** — `trivy image --format cyclonedx` over the built image (OS + Python layers).
   Continuously vuln-scanned by **Trivy** (with our VEX applied).
 
