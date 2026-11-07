@@ -689,17 +689,19 @@ _UNSCANNABLE_RE_PATTERNS = {
     # _PS_QUOTES), so those three cannot drift between the text and the split. The splicing is
     # the only reason the scanner cannot read it. Its literal form, the pattern it compiles to,
     # passes the nested-quantifier detector, and the literal-form test below checks that on every
-    # run, so an edit to a spliced sub-pattern cannot slip past this pin.
+    # run. So a sub-pattern edit that nests an unbounded greedy quantifier reds the build. The
+    # detector does not model overlapping alternation, so it does not catch every catastrophic
+    # edit: a quoted run made greedy again over branches that overlap passes it.
     #
     # It passes because its three unbounded repetitions are possessive: the quoted run, the
     # ' + ' parts and the ' ; ' checks. Possessive does not change what it matches, because
     # giving an iteration back never yields a match. A quoted run given back ends at the first
     # quote of a doubled pair, and the quote after it is not ' ; ', ' + ', ')' or the end. A
-    # ' + ' or ' ; ' iteration given back leaves a space where ')' or the end must follow. The two
-    # branches at each choice open on different characters. Measured 2026-11-07 against the
-    # greedy form: identical spans and groups on the 36 texts the DR tests split and on 300,000
-    # adversarial texts. The caller uses the unanchored ``.search``, which starts again only
-    # where the literal lead occurs.
+    # ' + ' or ' ; ' iteration given back leaves a space where ')' or the end must follow. The
+    # branches of each choice differ at their first character. That rests on those conditions,
+    # so the differential test below compares the possessive and greedy forms on seeded texts.
+    # The caller uses the unanchored ``.search``, which starts again only where the literal lead
+    # occurs.
     #
     # At least these spellings are NOT coupled: the [char] spelling, the parentheses and ' + ' of
     # _ps_path, the quote around a literal, the space after the check, and the ' ; '
@@ -763,6 +765,60 @@ def test_the_dr_staging_check_matcher_passes_the_detector_in_literal_form() -> N
     greedy = pattern.replace(")*+", ")*")
     assert greedy != pattern
     assert find_nested_quantifiers(f"import re\nre.compile({greedy!r})\n") == [greedy]
+
+
+def test_the_dr_staging_check_matcher_matches_what_its_greedy_form_did() -> None:
+    # Possessive repetitions commit to their first parse, so they match what the greedy form did
+    # only while giving an iteration back never yields a match. The pin above argues that holds.
+    # This compares the two forms on seeded texts: real-shaped checks, the same with one mutation,
+    # and random runs of the pieces a check is built from.
+    import random
+
+    from messagefoundry.pipeline import dr_backup
+
+    possessive = dr_backup._CHECKS_AT_END
+    greedy = re.compile(possessive.pattern.replace(")*+", ")*"))
+    assert greedy.pattern != possessive.pattern
+    lead, check = dr_backup._CHECKS_LEAD, dr_backup._TEST_PATH
+    parts = ["'a'", "'b''c'", "'\u2018\u2018x'", "''", "[char]0x2028"]
+    atoms = [
+        *parts,
+        "'",
+        "\u2019",
+        "\u201b\u201b",
+        "a",
+        " ",
+        " ; ",
+        " + ",
+        "(",
+        ")",
+        "[char]0xdc80",
+        lead,
+        check + " ",
+        "('' + ",
+    ]
+    rng = random.Random(2420)
+    texts: list[str] = []
+    for _ in range(4000):
+        checks = []
+        for _ in range(rng.randint(1, 3)):
+            if rng.random() < 0.5:
+                checks.append(f"{check} {rng.choice(parts[:4])}")
+            else:
+                joined = " + ".join(rng.choice(parts) for _ in range(rng.randint(1, 4)))
+                checks.append(f"{check} ({joined})")
+        text = "head" + lead + " ; ".join(checks)
+        texts.append(text)
+        i = rng.randrange(len(text))
+        texts.append(text[:i] + rng.choice(atoms) + text[i + 1 :])
+        texts.append("".join(rng.choice(atoms) for _ in range(rng.randint(1, 16))))
+
+    def found(pattern: re.Pattern[str], text: str) -> tuple[tuple[int, int], str] | None:
+        match = pattern.search(text)
+        return None if match is None else (match.span(), match.group(1))
+
+    assert sum(1 for t in texts if found(possessive, t)) > 4000
+    assert [t for t in texts if found(possessive, t) != found(greedy, t)] == []
 
 
 def test_the_blind_spot_pin_records_expressions_not_just_counts() -> None:
