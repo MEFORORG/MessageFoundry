@@ -864,20 +864,16 @@ def test_the_oidc_client_certificate_rides_beside_the_store_pin(tmp_path: Path) 
 
 
 def test_a_certificate_the_signer_never_loads_adds_no_row(tmp_path: Path) -> None:
-    # The same existing file adds no row where nothing sends it: OIDC off with a leftover value,
-    # which settings load accepts, and OIDC on with the secret method. The first test above is the
-    # positive control: the same file under private_key_jwt does add a row.
+    # An existing file adds no row where nothing sends it: OIDC off, with the private_key_jwt
+    # method and the certificate left behind, which settings load accepts. Only oidc_enabled
+    # differs from the first test above, which is the positive control.
     cert = tmp_path / "oidc-client.pem"
     _write_cert(cert, not_after=_REF + datetime.timedelta(days=10))
-    off = ServiceSettings(auth=AuthSettings(oidc_client_certificate=str(cert)))
-    assert certs_from_settings(off) == []
-    secret = _oidc(
-        None,
-        oidc_token_endpoint_auth_method="client_secret_post",
-        oidc_client_private_key=None,
-        oidc_client_secret="synthetic-secret",
+    off = AuthSettings(
+        oidc_token_endpoint_auth_method="private_key_jwt", oidc_client_certificate=str(cert)
     )
-    assert certs_from_settings(secret) == []
+    assert off.oidc_private_key_jwt
+    assert certs_from_settings(ServiceSettings(auth=off)) == []
 
 
 @pytest.mark.parametrize(

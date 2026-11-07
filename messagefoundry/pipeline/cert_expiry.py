@@ -86,8 +86,9 @@ _SECONDS_PER_DAY = 86_400
 
 @dataclass(frozen=True)
 class MonitoredCert:
-    """A certificate file the engine serves with: ``label`` identifies it in the alert (``"api"`` or a
-    connection name); ``path`` is the PEM file to read (public cert only — never its key)."""
+    """A certificate file the engine serves or presents with: ``label`` identifies it in the alert
+    (``"api"``, a connection name, or a setting's dotted name from :func:`certs_from_settings`);
+    ``path`` is the PEM file to read (public cert only — never its key)."""
 
     label: str
     path: str
@@ -240,10 +241,12 @@ def certs_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
       assertion carries (BACKLOG #296). The signer checks its validity window only at start.
       Listed only where the signer loads it (OIDC on, ``private_key_jwt``), so a leftover value
       raises no alert for a credential nothing sends. Inline PEM names no file, so only a path is
-      listed (``-----BEGIN`` is the signer's own test for inline PEM), and only a value naming an
-      existing file: a mis-set value, such as a bare base64 body, is never echoed into the log or
-      the inventory as a "path", the rule the signer keeps for this value (BACKLOG #1664). The
-      signer reads the file once, so the row watches the file, not the copy the signer holds."""
+      listed (``-----BEGIN`` is the signer's own test for inline PEM). Unlike the signer, which
+      probes nothing and names the setting instead of the value (BACKLOG #1664), this list probes:
+      it keeps only a value naming an existing file, so a mis-set value such as a bare base64 body
+      is never echoed into the log or the inventory as a "path". The cost is that a mistyped path
+      adds no row here; the signer still refuses it at start, by setting name. The signer reads the
+      file once, so the row watches the file, not the copy the signer holds."""
     certs: list[MonitoredCert] = []
     store, pin = settings.store, settings.store.ssl_root_cert
     # Only where the store sends it: an escaped weakened posture sends no pin.
@@ -251,6 +254,8 @@ def certs_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
     if store.backend is StoreBackend.SQLSERVER and sends_pin and isinstance(pin, str) and pin:
         certs.append(MonitoredCert("store.ssl_root_cert", pin))
     auth, oidc_cert = settings.auth, settings.auth.oidc_client_certificate
+    # oidc_private_key_jwt is belt and braces: with OIDC on, settings load already refuses a
+    # certificate beside the secret method, so only oidc_enabled filters a loadable config today.
     if (
         auth.oidc_enabled
         and auth.oidc_private_key_jwt
