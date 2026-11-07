@@ -580,8 +580,9 @@ korus `roles/STEWARD.md` and `roles/COMMON.md` define them."*
 `watch.py`, still prints the weekly ladder at SessionStart and UserPromptSubmit; a cloud session and
 an unwired root see no ladder, and that does not mean none is in force. By the owner's ruling of
 2026-10-31 the weekly window carries the stop, so the ladder's HOLD NEW WORK state still means start
-no new work. The Lander is exempt from the ladder's three states, as ADR 0211 records from korus
-`STEWARD.md` 3e. The 90 percent gate on a new Workflow still binds.
+no new work. The Lander is exempt from the ladder's three states, as korus `roles/COMMON.md`, *The
+three usage states*, says; ADR 0211 records it from what is now korus `roles/retired/STEWARD.md`
+3e. The 90 percent gate on a new Workflow still binds.
 `scripts/hooks/usage-headroom-inject.ps1` still reads a `status.json` it calls the Steward's, as a
 labelled fallback. Read on 2026-11-05, that file sits beside `watch.py`, which writes it, and no
 scheduled task named for the Steward was found. A retired seat can leave a mechanism running, and

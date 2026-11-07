@@ -1561,6 +1561,53 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
             "CLAUDE.md no longer says the usage controls bind where watch.py prints nothing",
         )
 
+    #: The hook or its settings file named as what HOLDS the levels or triggers, within one clause
+    #: (a clause ends at a period or semicolon followed by a space, so `~/.claude/` does not end it).
+    #: Korus COMMON.md, *The three usage states*, is that source, and wins where the hook disagrees.
+    _HOOK_AS_SOURCE = re.compile(
+        r"(?:watch\.py|thresholds\.json)(?:(?![.;]\s).)*?\bholds?\b"
+        r"(?:(?![.;]\s).)*?\b(?:levels?|triggers?)\b",
+        re.I,
+    )
+    _MANAGER_ROW = re.compile(r"^\|\s*\*\*Manager\*\*\s*\|.*$", re.M)
+
+    def _manager_texts(self) -> dict[str, str]:
+        row = self._MANAGER_ROW.search(read(AGREEMENT))
+        self.assertIsNotNone(row, "CLAUDE.md has no Manager row to check")
+        assert row is not None
+        card = " ".join(read(CARD_DIR / "manager.card.md").split())
+        return {"CLAUDE.md Manager row": row.group(0), "manager.card.md": card}
+
+    def test_the_manager_reads_the_states_from_common_not_from_the_hook(self):
+        """A Manager reads its own row and card first, so both must name COMMON as the source."""
+        for where, text in self._manager_texts().items():
+            with self.subTest(where=where):
+                hit = self._HOOK_AS_SOURCE.search(text)
+                self.assertIsNone(
+                    hit,
+                    f"{where} names the hook as holding the levels or triggers: "
+                    f"{hit.group(0) if hit else ''!r}",
+                )
+                self.assertIn("roles/COMMON.md", text, f"{where} never names korus COMMON.md")
+                self.assertIn(
+                    "The three usage states", text, f"{where} never names The three usage states"
+                )
+
+    def test_the_hook_as_source_scan_fires_on_the_wording_it_forbids(self):
+        """Positive control: the Manager row's text before this check, and the new wording."""
+        old = (
+            "`watch.py` and the `thresholds.json` beside it, in `~/.claude/mefor-usage/`, "
+            "hold the levels and triggers, and korus `roles/COMMON.md` states the gate."
+        )
+        self.assertIsNotNone(self._HOOK_AS_SOURCE.search(old))
+        self.assertIsNotNone(self._HOOK_AS_SOURCE.search("thresholds.json holds the triggers"))
+        new = (
+            "korus `roles/COMMON.md`, *The three usage states*, holds the states, levels and "
+            "triggers. The user-scope usage watch hook `watch.py` is a copy that prints them only "
+            "on a config root that wires it; where nothing prints them, they bind all the same."
+        )
+        self.assertIsNone(self._HOOK_AS_SOURCE.search(new))
+
 
 if __name__ == "__main__":
     unittest.main()
