@@ -649,8 +649,8 @@ def mint_target(
     (``service_account`` of ``None``), for the account. ``FileExistsError`` when a host blob or a
     handoff is already there: a second mint over a store's key is never made. A handoff is Windows
     only; a POSIX host mints as the service user itself. Last, :class:`HostCustodyRefused` for a
-    custody directory that is missing or on a file system the write refuses (PR 2804 eleventh
-    hold); whether this account may create a file there is still answered only by the write."""
+    custody directory that is missing, that this account cannot add a file to, or that is on a
+    file system the write refuses (PR 2804 eleventh and twelfth holds)."""
     host, handoff = check_host_custody_settings(settings, environ=environ)
     for path in (host, handoff):
         if os.path.lexists(path):
@@ -684,28 +684,83 @@ def mint_target(
         except _custody_errors() as exc:
             raise _refused("no store key was minted", exc) from exc
         target = handoff
-    _refuse_an_unusable_directory(target.parent)
+    environ = os.environ if environ is None else environ
+    _refuse_an_unusable_directory(
+        target.parent,
+        service_account=service_account,
+        named=bool(environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()),
+    )
     return target
 
 
-def _refuse_an_unusable_directory(directory: Path) -> None:
+def _refuse_an_unusable_directory(
+    directory: Path, *, service_account: str | None, named: bool
+) -> None:
     """Refuse, before any recovery key is shown, a custody directory the key file's write would
-    refuse only after the ceremony: one that is not a directory, and one whose volume fails
+    refuse only after the ceremony: one that is missing or not a directory, one this account
+    cannot add a file to (PR 2804 twelfth hold, item 4), and one whose volume fails
     :func:`~messagefoundry.restricted_file.write_restricted_file`'s local-volume rule, asked through
-    that rule's own check (PR 2804 eleventh hold)."""
+    that rule's own check (PR 2804 eleventh hold). ``named`` is whether ``MEFOR_SECRETS_DIRECTORY``
+    names the directory, rather than a SQLite store's own data directory, so each refusal names
+    the setting that moves it."""
+    from messagefoundry import startupcode
     from messagefoundry.restricted_file import key_directory_volume_problem
 
-    if not directory.is_dir():
+    none_shown = "so no store key was minted and no recovery key was shown"
+    if sys.platform not in ("linux", "win32"):
         raise HostCustodyRefused(
-            f"the custody directory {directory} is missing, or is not a directory this account can "
-            "read, so no store key was minted and no recovery key was shown. Create it, restricted "
-            "as a secrets directory must be, and run the command again"
+            f"the host key provider mints a store key on Linux and Windows only, {none_shown}"
         )
-    volume = key_directory_volume_problem(directory)
+    writers = "this account" + (
+        "" if service_account is None else f' and the service account "{service_account}"'
+    )
+    secrets_directory = "restricted as a secrets directory must be and writable by " + writers
+
+    def move_on(to: str) -> str:
+        # The variable is named as a literal: this text reaches stderr (keep_the_key_step says
+        # why).
+        variable = (
+            "set MEFOR_SECRETS_DIRECTORY, here and in the service's own environment, to " + to
+        )
+        if named:
+            return variable
+        return (
+            f"point --db at a SQLite path in {to}, since the store key sits beside the store "
+            f"file, or {variable}"
+        )
+
+    if not directory.is_dir():
+        if os.path.lexists(directory):
+            raise HostCustodyRefused(
+                f"the custody directory {directory} is not a directory this account can read, "
+                f"{none_shown}. To go on, {move_on('a directory ' + secrets_directory)}, and run "
+                "the command again"
+            )
+        raise HostCustodyRefused(
+            f"the custody directory {directory} is missing, {none_shown}. Create it, "
+            f"{secrets_directory}, and run the command again"
+        )
+    if startupcode._can_add_files(directory) is False:
+        raise HostCustodyRefused(
+            f"this account cannot add a file to the custody directory {directory}, {none_shown}. "
+            f"Let this account add files there, or {move_on('a directory ' + secrets_directory)}, "
+            "and run the command again"
+        )
+    try:
+        volume = key_directory_volume_problem(directory)
+    except OSError as exc:
+        raise HostCustodyRefused(
+            f"the file system of the custody directory {directory} could not be checked, since "
+            f"this account could not open the directory ({exc.strerror or type(exc).__name__}), "
+            f"{none_shown}. Let this account open it, or "
+            f"{move_on('a directory ' + secrets_directory)}, and run the command again"
+        ) from exc
     if volume is not None:
         raise HostCustodyRefused(
             f"the custody directory {directory} cannot hold a store key: {volume}. No store key "
-            "was minted and no recovery key was shown"
+            "was minted and no recovery key was shown. To go on, "
+            f"{move_on('a directory on a local file system, ' + secrets_directory)}, and run the "
+            "command again"
         )
 
 

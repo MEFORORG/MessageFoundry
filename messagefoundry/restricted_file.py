@@ -873,7 +873,8 @@ def key_directory_volume_problem(directory: Path) -> str | None:
     :data:`LINUX_HOST_FILE_SYSTEMS` on Linux, and a refusal on any other platform), read through a
     handle on the directory, so a mint can refuse before it shows a recovery key (PR 2804 eleventh
     hold). The file the write makes is still judged by its own handle: this is the early answer,
-    not the check of record. A directory that cannot be opened is refused, naming why."""
+    not the check of record. ``OSError`` when the directory cannot be opened, which says nothing
+    about its volume (PR 2804 twelfth hold)."""
     if sys.platform == "win32":
         import ctypes
         from ctypes import wintypes
@@ -900,19 +901,16 @@ def key_directory_volume_problem(directory: Path) -> str | None:
             None,
         )
         if handle is None or handle == wintypes.HANDLE(-1).value:
-            return f"it could not be opened (Win32 error {ctypes.get_last_error()})"
+            raise ctypes.WinError(ctypes.get_last_error())
         try:
             return _volume_problem(_read_handle_volume(handle))
         finally:
             kernel32.CloseHandle(handle)
     if sys.platform != "linux":
-        return "a file system is checked before a key file is written on Linux and Windows only"
-    try:
-        # O_PATH: fstatfs reads through it (Linux 3.12 and later), and it needs no read permission
-        # on the directory, which the write, needing only write and search, does not need either.
-        fd = os.open(directory, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
-    except OSError as exc:
-        return f"it could not be opened ({exc.strerror or type(exc).__name__})"
+        return "the host key provider mints a store key on Linux and Windows only"
+    # O_PATH: fstatfs reads through it (Linux 3.12 and later), and it needs no read permission on
+    # the directory, which the write, needing only write and search, does not need either.
+    fd = os.open(directory, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         return linux_file_system_refusal(fd, LINUX_HOST_FILE_SYSTEMS, "key custody host file")
     finally:
