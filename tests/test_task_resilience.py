@@ -964,16 +964,19 @@ async def test_a_dead_per_lane_worker_is_respawned_and_its_lane_delivers(
             monkeypatch.setattr(runner, spawn, lambda *a, **k: None)
         armed = _kill_per_lane_worker(runner, store, stage, monkeypatch)
 
-        await _until(first.done, timeout=5.0)
+        # asyncio.wait, not a poll of first.done: the supervisor is the dead task's done-callback,
+        # registered at spawn, so it runs before wait's own and the test resumes only after it. A
+        # poll can resume on the pass that finished the task, before the supervisor ran. Off-loop
+        # builds in start() let the delivery worker claim and park on its idle wait before start()
+        # returns, so the injected fault no longer lands on its first claim, and the poll lost
+        # that race (engine PR 2815, Lander hold 6705921002).
+        await asyncio.wait({first}, timeout=5.0)
+        assert first.done()
         assert armed == {"claim_faults": 1, "sleep_raises": 1}
         exc = first.exception()
         assert isinstance(exc, RuntimeError) and "injected death" in str(exc), exc
-        # The supervisor names the worker it respawned; the three kinds share the suffix only. The
-        # supervisor is the dead task's done-callback, which the loop runs on a LATER pass than the
-        # one that finished the task, and _until can return on that same pass, so wait for its line
-        # rather than read it at once (engine PR 2815, Lander hold 6705921002).
-        respawned = f"{kind} worker '{key}' exited unexpectedly; respawning"
-        await _until(lambda: respawned in caplog.text, timeout=5.0)
+        # The supervisor names the worker it respawned; the three kinds share the suffix only.
+        assert f"{kind} worker '{key}' exited unexpectedly; respawning" in caplog.text
 
         control_id = f"M1614{kind[:3]}"
         if not respawn:
