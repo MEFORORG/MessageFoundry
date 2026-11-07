@@ -10531,13 +10531,12 @@ def create_app(
         threshold, and the activation mode (always ``manual`` this slice). Read-only — gated by
         ``monitoring:read`` (carries no PHI)."""
         dr = engine.dr_settings
-        coord = engine.dr_coordinator
         return DrStatus(
             enabled=dr.enabled,
             active=engine.dr_active,
             threshold=dr.priority_threshold.value,
             activation_mode=dr.activation_mode.value,
-            failures=list(coord.activation_failures) if coord is not None else [],
+            failures=list(engine.dr_activation_failures),
         )
 
     @app.get("/service/status", response_model=ServiceStatusInfo)

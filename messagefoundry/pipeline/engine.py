@@ -1071,6 +1071,16 @@ class Engine:
         return self._dr_active
 
     @property
+    def dr_activation_failures(self) -> tuple[str, ...]:
+        """The steps the DR activation that made this box active left unfinished, such as
+        ``outbound_close``, for ``GET /dr/status`` (engine PR 2815). Empty while the run-profile is
+        off, and when no coordinator has been built; reading it never builds one."""
+        coord = self._dr_coordinator
+        if coord is None or not self._dr_active:
+            return ()
+        return coord.activation_failures
+
+    @property
     def dr_settings(self) -> DrSettings:
         """The resolved ``[dr]`` settings (#61, ADR 0048) — read by the DR coordinator + the API."""
         return self._dr_settings

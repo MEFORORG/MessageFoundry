@@ -1350,6 +1350,7 @@ def test_hold_e_an_abandoned_build_that_has_not_started_never_runs() -> None:
         await asyncio.sleep(0.05)  # the build is queued behind the busy worker
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled()  # the control: the build was queued, and its caller cancelled
         await asyncio.sleep(0.05)
         free.set()
         await blocker

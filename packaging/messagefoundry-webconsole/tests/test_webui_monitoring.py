@@ -422,11 +422,12 @@ async def test_a_degraded_dr_activation_is_shown_to_the_operator(
         activation_failures = ("outbound_close",)
 
         async def activate(self, **_kwargs: object) -> DrResult:
+            monkeypatch.setattr(engine, "_dr_active", True)
             return DrResult(
                 action="activate", active=True, threshold="critical", failures=("outbound_close",)
             )
 
-    monkeypatch.setattr(Engine, "dr_coordinator", property(lambda _self: _Coordinator()))
+    monkeypatch.setattr(engine, "_dr_coordinator", _Coordinator())
     service = await _service(engine)
     async with _boss_client(engine, service) as c:
         r = await c.post("/ui/dr/activate", headers={"Sec-Fetch-Site": "same-origin"})

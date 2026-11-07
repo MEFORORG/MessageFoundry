@@ -491,6 +491,7 @@ class DrCoordinator:
         try:
             self._active = True
             self._last_release = None  # an earlier fail-back's outcome no longer describes this box
+            self._activation_failures = ()  # nor do an earlier activation's unfinished steps
             step_failures = await self._activate_profile()
         except Exception as exc:
             self._active = False

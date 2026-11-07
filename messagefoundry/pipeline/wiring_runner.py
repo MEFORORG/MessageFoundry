@@ -12571,7 +12571,8 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
         if built.done():
             return
         if queued.cancelled():
-            built.cancel()
+            # A failure, not a cancellation: the caller was not cancelled, and must not read as if.
+            built.set_exception(RuntimeError("the executor cancelled the connector build"))
         elif (exc := queued.exception()) is not None:
             built.set_exception(exc)
 
@@ -12608,7 +12609,10 @@ def _close_abandoned_build(
     try:
         loop.call_soon_threadsafe(_start_abandoned_close, close)
     except RuntimeError:
-        log.warning("a connector built for a cancelled caller could not be closed: its loop closed")
+        log.warning(
+            "a %s built for a cancelled caller could not be closed: its loop closed",
+            type(built).__name__,
+        )
 
 
 def _start_abandoned_close(close: Callable[[], Awaitable[None]]) -> None:

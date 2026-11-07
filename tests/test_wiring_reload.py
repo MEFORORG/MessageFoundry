@@ -644,7 +644,16 @@ async def test_a_reload_a_stop_overtakes_does_not_restart_reference_sync(
         await release.wait()
         return result
 
+    reconciled_after_stop: list[bool] = []
+    real_reconcile = Engine._reconcile_reference_sync
+
+    async def recording_reconcile(self: Engine, *, startup: bool) -> None:
+        if stopping:
+            reconciled_after_stop.append(startup)
+        await real_reconcile(self, startup=startup)
+
     monkeypatch.setattr(ReferenceSyncRunner, "start", recording_start)
+    monkeypatch.setattr(Engine, "_reconcile_reference_sync", recording_reconcile)
     monkeypatch.setattr(runner, "reload", held_reload)
     load = asyncio.create_task(eng.reload(good))
     stopped = False
@@ -654,6 +663,7 @@ async def test_a_reload_a_stop_overtakes_does_not_restart_reference_sync(
         await eng.stop()
         release.set()
         await asyncio.gather(load, return_exceptions=True)
+        assert reconciled_after_stop == [False]  # the control: the reload reached the reconcile
         assert starts_after_stop == []
     finally:
         release.set()
