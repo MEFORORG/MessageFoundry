@@ -59,6 +59,7 @@ class FakeBackend:
         self.probe_reply: str | None = None
         self.forbid: set[str] = set()
         self.other_failure = False
+        self.hmac_refused = False
         self.hold_mac: str | None = None
         self.entered = threading.Event()
         self.release = threading.Event()
@@ -89,6 +90,8 @@ class FakeBackend:
             raise CipherError("synthetic outage")
         if self.other_failure:
             raise RuntimeError("synthetic library failure")
+        if self.hmac_refused:
+            raise TransitSealRefused(403)
         return self._mac(self.active, self.latest[self.active], digest)
 
     def verify_seal_hmac(self, key_name: str, digest: bytes, mac: str) -> bool:
@@ -115,6 +118,8 @@ class FakeBackend:
         self.thread_names.add(threading.current_thread().name)
         if self.probe_down:
             raise CipherError("synthetic probe outage")
+        if self.hmac_refused:
+            raise TransitSealRefused(403)
         if self.other_failure:
             raise RuntimeError("synthetic library failure")
         if self.probe_reply is not None:
@@ -483,6 +488,19 @@ async def test_require_seal_for_write_names_each_cause() -> None:
     old_session = await _sealer(old_backend).seal_async(SESSION_KIND, FIELDS)
     with pytest.raises(RowSealError):
         await require_seal_for_write(with_retired, SESSION_KIND, FIELDS, old_session, subject="s")
+    # A stored value the encoder cannot read fails its seal on both sealers.
+    unreadable: list[tuple[str, object]] = [("token_hash", object())]
+    with pytest.raises(RowSealError):
+        await require_seal_for_write(sealer, USER_KIND, unreadable, stored, subject=subject)
+    with pytest.raises(RowSealError):
+        await require_seal_for_write(RowSealer(b"k" * 32), USER_KIND, unreadable, "", subject="u")
+    # A refused hmac is an Outage, never a raw refusal.
+    backend.hmac_refused = True
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.seal_async(USER_KIND, FIELDS)
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.probe_async()
+    backend.hmac_refused = False
     # The local sealer serves the same call.
     local = RowSealer(b"k" * 32)
     await require_seal_for_write(
@@ -543,7 +561,13 @@ async def test_each_outage_cause_is_logged(caplog: pytest.LogCaptureFixture) -> 
         await sealer.verify_held_async(USER_KIND, FIELDS, stored)
     lines = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert len(lines) == 2  # one per cause: the repeat inside the window is throttled
-    assert "synthetic outage" in lines[0] and "HTTP 403" in lines[1]
+    # The whole line is fixed text and the backend's own CipherError text: no row value.
+    tail = ": an outage, not a seal failure"
+    head = "a row seal could not be made or checked through Vault transit"
+    assert lines == [
+        f"{head} (synthetic outage){tail}",
+        f"{head} (Transit refused a seal check (HTTP 403)){tail}",
+    ]
 
 
 async def test_transit_receives_a_fixed_length_digest_and_runs_off_the_event_loop() -> None:

@@ -401,9 +401,11 @@ class TransitSealBackend(Protocol):
         ...
 
     def seal_hmac(self, digest: bytes) -> object:
-        """Transit's ``hmac`` of ``digest`` under the active key's latest version. Each of the
-        three calls raises :class:`~messagefoundry.store.crypto.CipherError` for every Vault
-        failure, which the sealer reads as an Outage; any other exception is a defect."""
+        """Transit's ``hmac`` of ``digest`` under the active key's latest version. The three
+        calls raise :class:`~messagefoundry.store.crypto.CipherError` for a Vault failure, and
+        :class:`~messagefoundry.store.crypto.TransitSealRefused` for an HTTP 400 or 403. On this
+        call and the probe the sealer reads either as an Outage; on ``verify`` a refusal is
+        classified (*The four answers*). Any other exception is a defect."""
         ...
 
     def verify_seal_hmac(self, key_name: str, digest: bytes, mac: str) -> object:
@@ -446,9 +448,14 @@ _UNVERIFIABLE: Final = "unverifiable"
 #: calls ahead of it take, each bounded by the Vault client's own timeout; a thread whose caller
 #: was cancelled finishes its call, and interpreter exit waits for it.
 TRANSIT_SEAL_WORKERS: Final = 8
-_TRANSIT_POOL: Final = ThreadPoolExecutor(
-    max_workers=TRANSIT_SEAL_WORKERS, thread_name_prefix="mefor-transit-seal"
-)
+
+
+@functools.cache
+def _transit_pool() -> ThreadPoolExecutor:
+    # Built on first use, so a process that never seals through Transit builds no pool.
+    return ThreadPoolExecutor(
+        max_workers=TRANSIT_SEAL_WORKERS, thread_name_prefix="mefor-transit-seal"
+    )
 
 
 async def _in_transit_pool[**P, T](call: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
@@ -457,7 +464,7 @@ async def _in_transit_pool[**P, T](call: Callable[P, T], *args: P.args, **kwargs
     context = contextvars.copy_context()
     loop = asyncio.get_running_loop()
     bound = functools.partial(context.run, call, *args, **kwargs)
-    return await loop.run_in_executor(_TRANSIT_POOL, bound)
+    return await loop.run_in_executor(_transit_pool(), bound)
 
 
 def transit_seal_key_id(mount: str, key_name: str) -> str:
@@ -526,8 +533,8 @@ class TransitRowSealer:
 
     **The caches.** A Holds, Forged or Unverifiable answer is reused for
     :data:`TRANSIT_SEAL_CACHE_TTL_SECONDS`, keyed by a digest of the seal input's SHA-256, the key
-    id and the stored Transit string, never by a row id. Both are emptied whenever a refused check's
-    probe names a different latest version than the last one did, and a check that began before
+    id and the stored Transit string, never by a row id. Both are emptied whenever a probe (a refused
+    check's, or :meth:`probe_async`) names a different latest version than the last one did, and a check that began before
     that keeps its answer for its own caller only. An Outage is never cached."""
 
     __slots__ = (
@@ -614,6 +621,8 @@ class TransitRowSealer:
             mac = await _in_transit_pool(self._backend.seal_hmac, digest)
         except CipherError as exc:  # the backend's form of every Vault failure: an Outage
             failure = exc
+        except TransitSealRefused as refused:  # a refused hmac is a Vault failure too
+            failure = CipherError(f"Transit refused a seal hmac (HTTP {refused.status})")
         if failure is not None or not isinstance(mac, str) or transit_mac_version(mac) is None:
             raise self._outage(
                 failure or CipherError("Transit returned a MAC of an unexpected shape")
@@ -737,6 +746,8 @@ class TransitRowSealer:
             answered = await _in_transit_pool(self._backend.seal_probe)
         except CipherError as exc:  # a probe that fails makes the refusal an Outage
             failure = exc
+        except TransitSealRefused as refused:  # a refused hmac is a Vault failure too
+            failure = CipherError(f"Transit refused a seal hmac (HTTP {refused.status})")
         version = transit_mac_version(answered) if isinstance(answered, str) else None
         if failure is not None or version is None:
             failure = failure or CipherError("Transit's key probe returned an unexpected shape")
@@ -794,6 +805,8 @@ async def require_seal_for_write(
         holds = await check(kind, fields, stored)
     except TransitSealUnverifiableError as exc:
         verdict = exc
+    except TypeError:  # a stored value the encoder cannot read fails its seal, as on main
+        holds = False
     # Raised outside the handler, so neither chains the Transit verdict.
     if verdict is not None:
         raise RowSealUnverifiableError(
