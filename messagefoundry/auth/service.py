@@ -15956,8 +15956,8 @@ class AuthService:
         SQL Server's collation compares the (user_id, label) index (BACKLOG #2733, pass F).
 
         Read through :meth:`_verified_passkeys`, so only a checked set is judged. A set that fails
-        its seal or holds a row that does not parse refuses the registration, as every other
-        passkey read does, rather than reading as no label held."""
+        its seal or holds a row that does not parse refuses the registration, as the read before
+        the enrolment-code spend does, rather than reading as no label held."""
         held = await self._verified_passkeys(user)
         if held is None:
             raise ValueError("no such user")
@@ -16243,7 +16243,8 @@ class AuthService:
             # BACKLOG #1807: the same classes carry the user_id foreign-key refusal, raised when the
             # account is deleted mid-enrolment. Told apart by re-reading the account, never by the
             # driver's message: that text can echo the operator-chosen label.
-            if await self._load_user(user.id) is None:
+            reread = await self._load_user(user.id)
+            if reread is None:
                 raise ValueError("no such user") from exc
             # BACKLOG #2733: the credential-id primary key fires too, when the same authenticator
             # enrols concurrently (on this account or another). Told apart the same way: a row now
@@ -16253,7 +16254,8 @@ class AuthService:
             # Pass F findings 3 and 5: the label clash is told apart the same way, by a passkey of
             # this account now holding the label. Anything else, such as a competing row deleted
             # before these re-reads, or another integrity refusal, is not called a label clash.
-            if await self._passkey_label_held(user, label):
+            # Judged against the re-read account, whose seal already covers a racing insert.
+            if await self._passkey_label_held(reread, label):
                 raise ValueError("label already in use") from exc
             raise ValueError(_PASSKEY_NOT_STORED) from exc
         if not bound:

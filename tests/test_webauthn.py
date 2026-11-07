@@ -880,8 +880,10 @@ async def test_a_passkey_row_that_does_not_parse_refuses_the_label_check(
             )
         )
         original = store.get_webauthn_credential
+        inserts: list[WebAuthnCredential] = []
 
         async def spoil_first(credential_id_hash: str) -> WebAuthnCredential | None:
+            monkeypatch.setattr(store, "get_webauthn_credential", original)
             await store._db.execute(
                 "UPDATE webauthn_credentials SET transports=? WHERE user_id=?",
                 ('["not json', identity.user_id),
@@ -889,7 +891,12 @@ async def test_a_passkey_row_that_does_not_parse_refuses_the_label_check(
             await store._db.commit()
             return await original(credential_id_hash)
 
+        async def record_insert(cred: WebAuthnCredential, **kwargs: Any) -> bool:
+            inserts.append(cred)
+            return True
+
         monkeypatch.setattr(store, "get_webauthn_credential", spoil_first)
+        monkeypatch.setattr(store, "add_webauthn_credential", record_insert)
         with pytest.raises(ValueError, match="no such user"):
             await service.finish_webauthn_registration(
                 identity,
@@ -901,6 +908,8 @@ async def test_a_passkey_row_that_does_not_parse_refuses_the_label_check(
                 rp_id=RP,
                 origin=ORIGIN,
             )
+        # Refused at the label check: the insert was never reached.
+        assert inserts == []
         async with store._db.execute(
             "SELECT COUNT(*) FROM webauthn_credentials WHERE user_id=?", (identity.user_id,)
         ) as cur:
