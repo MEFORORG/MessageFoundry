@@ -531,6 +531,7 @@ class DrCoordinator:
         if step_failures:
             # Step labels only, as the config_reload row records them. The detail text, which
             # names a lane and an error, stays in the server log (the row is forwarded off the box).
+            detail["degraded"] = True
             detail["failed_steps"] = sorted(step_failures)
         self._unrecorded_activation = (detail, actor, now)
         # Provenance is read only once the profile is applied and the row is owed, so a cancellation

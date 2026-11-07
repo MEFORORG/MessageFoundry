@@ -1275,8 +1275,9 @@ def test_hold_5_a_build_the_loop_shutdown_cancels_is_closed(
         )
         # Return while the thread is still building, so asyncio.run's shutdown cancels the tasks
         # and then waits for the default executor's threads.
-        while not watch.threads:
-            await asyncio.sleep(0.01)
+        async with asyncio.timeout(5):
+            while not watch.threads:
+                await asyncio.sleep(0.01)
 
     asyncio.run(main())
     assert callers[0].cancelled()

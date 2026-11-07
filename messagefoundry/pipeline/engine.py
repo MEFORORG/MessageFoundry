@@ -1150,11 +1150,11 @@ class Engine:
         hands to :meth:`add_registry` meets neither check at load. That is a fact about embedding,
         and an activation is not where it changes.
 
-        Returns each follow-on step that did not complete, as ``{step: detail}``, the coordinator
-        puts on its result and the ``dr.activate`` row. Today that is ``outbound_close``, as
-        :meth:`reload_detail` reports it: a connector the reload replaced and could not close. The
-        profile is live then, so it is reported rather than raised (engine PR 2815, Lander hold
-        6698688363 item 3)."""
+        Returns each follow-on step that did not complete, as ``{step: detail}``. The coordinator
+        puts the step labels on its result and the ``dr.activate`` row; the detail is in the server
+        log. Today the one step is ``outbound_close``, as :meth:`reload_detail` reports it: a
+        connector the reload replaced and could not close. The profile is live then, so it is
+        reported rather than raised (engine PR 2815, Lander hold 6698688363 item 3)."""
         was_active = self._dr_active
         rr = self._registry_runner
         # What an operator had bound before this call, which a failed activation does not unbind.
@@ -1508,6 +1508,8 @@ class Engine:
     async def _first_load(self, registry: Registry, env_values: dict[str, Any]) -> RegistryRunner:
         """Install and start the runner for ``registry`` on an engine with none, for
         :meth:`reload_detail`, which holds ``_first_load_lock`` across this call."""
+        if self._stopping:
+            raise RuntimeError("the engine is stopping, so the first load started no runner")
         # Bad connector -> WiringError (422), before any start. The check awaits a worker thread,
         # so it runs on a runner that is not installed yet: installed first, a concurrent reload
         # could take it, unstarted, as the live runner in that window. Nothing yields between

@@ -586,8 +586,10 @@ async def test_engine_first_load_does_not_start_a_runner_after_a_stop(
     )
     await eng.start()
     load = asyncio.create_task(eng.reload(good))
+    stopped = False
     try:
         await asyncio.wait_for(in_check.wait(), timeout=5)
+        stopped = True
         await eng.stop()
         release.set()
         with pytest.raises(RuntimeError, match="stopping"):
@@ -601,6 +603,8 @@ async def test_engine_first_load_does_not_start_a_runner_after_a_stop(
         await asyncio.gather(load, return_exceptions=True)
         for orphan in started:
             await orphan.stop()
+        if not stopped:
+            await eng.stop()
 
 
 def _write_env_config(cfg: Path, inbox: Path) -> None:

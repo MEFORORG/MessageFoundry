@@ -12578,8 +12578,9 @@ def _close_abandoned_build(work: asyncio.Future[Any]) -> None:
     # shutdown this callback can run in one of the loop's last passes, and a close that suspends
     # may then be cut off when the loop closes; a connector whose close needs no await is closed.
     task = asyncio.Task(_close_quietly(closing), loop=asyncio.get_running_loop(), eager_start=True)
-    _ABANDONED_BUILD_CLOSES.add(task)
-    task.add_done_callback(_ABANDONED_BUILD_CLOSES.discard)
+    if not task.done():
+        _ABANDONED_BUILD_CLOSES.add(task)
+        task.add_done_callback(_ABANDONED_BUILD_CLOSES.discard)
 
 
 async def _close_quietly(closing: Awaitable[None]) -> None:
