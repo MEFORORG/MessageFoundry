@@ -3410,13 +3410,16 @@ reconciliation pass decide it, and neither is a stored scope that grants nothing
 demotion's: a new sign-in writes the scope the groups grant now. When the AD group-to-role map
 fails its seal, no role can be judged, so each of these legs refuses an account that holds a role
 with `directory_role_map_unsealed` instead, whether or not a role was lost. An account with no
-role passes that role test, and can still be refused on its channel scope below. That is not a demotion: nothing changed in the directory, a new sign-in reads the same
-map, and the fix is an administrator saving the map again. So it is never told to sign out. The
-AD group-to-channel map is handled the same way: when it fails its seal, an account whose scope
-grants something is refused with `directory_scope_map_unsealed`, whether or not its scope would
-narrow, and is never told to sign out. A new sign-in reads the same failing map. It keeps a scope
-an administrator set, so that refusal stands. It withdraws a directory-set scope to NULL, which
-grants no channel, so the step-up then passes, with no channels. Every one of these legs calls one shared comparison rather than writing it out.
+role passes that role test, and can still be refused on its channel scope, as
+`directory_scope_narrowed` above or `directory_scope_map_unsealed` below. A
+`directory_role_map_unsealed` refusal is not a demotion: nothing changed in the directory, a new
+sign-in reads the same map, and the fix is an administrator saving the map again. So it is never
+told to sign out. The AD group-to-channel map is handled the same way: when it fails its seal, an
+account whose scope grants something is refused with `directory_scope_map_unsealed`, whether or not
+its scope would narrow, and is never told to sign out. A new sign-in reads the same failing map. It
+keeps a scope an administrator set, so that refusal stands. It withdraws a directory-set scope to
+NULL, which grants no channel, so the step-up then passes, with no channels. Every one of these legs
+calls one shared comparison rather than writing it out.
 
 **The caller is told which fix clears the refusal, and not its cause (BACKLOG #3082).** The precise
 cause stays on the audit row. A demotion is told to sign out and sign in again. A new sign-in clears
@@ -5320,10 +5323,11 @@ row both report. Two that both read the old roles do not, because the role write
 compare-and-set on the roles it read (vault BACKLOG #3085): only the first counts the change, and
 the second, ending no session, is quiet. A write that finds the roles moved to another set since
 the apply read them writes nothing. A sign-in that wrote between the pass's plan and its apply is
-still overwritten, as is a newer write of the same set the apply read. The second still reports when it ends a session the first
-had not yet ended; `AuthService._apply_reconcile_revocation` names that residual. If the first
-reconciler's pass ended before it alerted, the second's quiet revocation means that account pages
-nobody. A quiet revocation whose own row is refused alerts instead, with no notice.
+still overwritten, as is a newer write of the same set the apply read. The second still reports when
+it ends a session the first had not yet ended; `AuthService._apply_reconcile_revocation` names that
+residual. If the first reconciler's pass ended before it alerted, the second's quiet revocation
+means that account pages nobody. A quiet revocation whose own row is refused alerts instead, with no
+notice.
 
 A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
 them. A refused audit write does not end the pass (BACKLOG #3018). That holds for the store errors

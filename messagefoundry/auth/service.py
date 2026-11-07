@@ -9955,16 +9955,16 @@ class AuthService:
         row showing another pass already revoked it (owner ruling B258-R7). That method states the
         rule.
 
-        A role change counts only when THIS call's write made it: the write is a compare-and-set
-        on the roles this call read (vault BACKLOG #3085), so of two reconcilers that both read the
-        old roles only the first counts it, and the second, ending no session, is quiet. A write
-        whose roles another writer moved to a different set after this call's read writes
-        nothing. **Not closed, at least:** a sign-in that wrote between the pass's plan and this
-        call's read, since the plan's roles are not carried to compare on; and a newer write of
-        the same set this call read, since the compare is on the set, not the record. **Residual, at least:** the second
+        A role change counts only when THIS call's write made it: the write is a compare-and-set on
+        the roles this call read (vault BACKLOG #3085), so of two reconcilers that both read the old
+        roles only the first counts it, and the second, ending no session, is quiet. A write whose
+        roles another writer moved to a different set after this call's read writes nothing. **Not
+        closed, at least:** a sign-in that wrote between the pass's plan and this call's read, since
+        the plan's roles are not carried to compare on; and a newer write of the same set this call
+        read, since the compare is on the set, not the record. **Residual, at least:** the second
         can still end a session the first had not yet ended, when its whole apply runs between the
-        first's role write and the first's own session revocation. Both then report, the first
-        for the roles and the second for the session."""
+        first's role write and the first's own session revocation. Both then report, the first for
+        the roles and the second for the session."""
         user = await self._load_user(revocation.user_id)
         if revocation.reason == reconcile.SCOPE_CHANGED and (
             user is None or user.channel_scope != revocation.scope_from
@@ -10021,7 +10021,8 @@ class AuthService:
                 )
                 # Vault BACKLOG #3141. The gain side, from the same sealed read and at the same
                 # point, so a later step's failure cannot lose the page. The next sign-in finds the
-                # role already written and gains nothing, so this pass is the only chance to raise it.
+                # role already written and gains nothing, so this pass is the only chance to raise
+                # it.
                 self._report_directory_admin_grant(
                     user, before=user.role_ids, after=revocation.role_ids
                 )
