@@ -118,7 +118,7 @@ _UPLOAD_MISS = (
 _ALLOWED: tuple[_Allowed, ...] = (
     # ---- SAFE: the suppressed exception carries nothing the raised one does not already say.
     _Allowed(
-        "messagefoundry/anon/rules.py::_coerce_kind::ValueError::RuleError",
+        "messagefoundry_toolkit/anon/rules.py::_coerce_kind::ValueError::RuleError",
         _SAFE + "enum miss quoting the rule's own kind name, which the new message also quotes",
     ),
     _Allowed(

@@ -39,11 +39,11 @@ from collections.abc import (
 )
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import cache, partial
 from types import MappingProxyType
-from typing import Any, Final, Literal, NamedTuple, TypeVar
+from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeVar
 from uuid import uuid4
 
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
@@ -78,6 +78,8 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
+    ENROLMENT_CODE_ISSUED,
+    ENROLMENT_CODE_SPENT,
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
     FIRST_ADMINISTRATOR_TAKEOVER,
@@ -127,7 +129,10 @@ from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import (
     CREDENTIAL_ID_HASH_SCHEME,
     credential_id_hash_scheme,
+    enrolment_code_digest,
+    enrolment_code_matches,
     hash_token,
+    mint_enrolment_code,
     mint_token,
 )
 from messagefoundry.auth.tokens import (
@@ -177,6 +182,7 @@ from messagefoundry.store.store import (
     AdminRemoval,
     AuditAppend,
     ChannelScopeSource,
+    EnrolmentCodeOutcome,
     FederatedUnbind,
     KeyedAuditEvidenceStore,
     LockoutCounter,
@@ -862,6 +868,12 @@ STEP_UP_ACTION_ADMIN_RESET_PASSWORD = "admin_reset_password"  # nosec B105 — s
 # attribute that affects authentication (ASVS 7.5.1). Bound to its own action and single-use, and
 # MFA-gated, for the same reason `admin_reset_password` is.
 STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY = "admin_federated_identity"
+# ADR 0207 section 4. Issuing or revoking a directory account's enrolment code decides who may bind
+# that account's first factor, an attribute that affects authentication (ASVS 7.5.1). Each is bound
+# to its own action and single-use, as the password and MFA resets are, so a grant minted for one
+# cannot be spent on the other.
+STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_ISSUE = "admin_enrolment_code_issue"
+STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_REVOKE = "admin_enrolment_code_revoke"
 # Vault BACKLOG #2625. The routes that inject a message, send a stored body to another partner,
 # export bodies in bulk, cancel queued deliveries or swap the live graph. Each takes a proof bound to
 # its own action, so one live session inside the step-up window is not enough to do any of them.
@@ -1798,6 +1810,132 @@ class FactorEnrolmentRequired(ValueError):
         super().__init__(ENROL_AUTHENTICATOR_FIRST)
 
 
+#: ADR 0207 section 3: an enrolment code lives 24 hours from issue, fixed rather than a setting. That
+#: is the ADR's recommended answer to its open lifetime item, and Amendment A6 records the trade: a
+#: shorter life would expire codes handed over late in a day, and each re-issue is one more handover.
+ENROLMENT_CODE_LIFETIME_SECONDS: Final = 24 * 60 * 60
+
+#: The ONE client-facing reply for every refused enrolment code (ADR 0207 section 3): missing,
+#: malformed, never issued, wrong, expired or already spent. So a caller learns nothing about whether
+#: a code is outstanding. It sends the holder to an Administrator through the site's identity check,
+#: never through mail or chat the same directory password opens (section 4).
+ENROLMENT_CODE_REFUSED = (
+    "this directory account needs a one-time enrolment code from an Administrator to add its "
+    "first two-factor authenticator, and no valid code was given. Ask an Administrator in person "
+    "or through your organization's identity check, not by mail or chat"
+)
+
+
+class EnrolmentCodeRefused(ValueError):
+    """A binding step refused the enrolment code it was shown, or found none (ADR 0207). A
+    ``ValueError`` so every route that renders a flow refusal renders this one, and always with
+    :data:`ENROLMENT_CODE_REFUSED`, whatever the reason the audit row records."""
+
+    def __init__(self) -> None:
+        super().__init__(ENROLMENT_CODE_REFUSED)
+
+
+class EnrolmentCodeIssueRefused(ValueError):
+    """An Administrator's, or the host command's, issue of an enrolment code was refused (ADR 0207
+    section 4). ``reason`` is a closed-set code; the message is operator-facing and names no code."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+#: Each issue refusal, by reason, with its operator-facing message (ADR 0207 sections 4 and 6).
+ENROLMENT_CODE_ISSUE_REFUSALS: Final = {
+    "local_account": (
+        "an enrolment code is only for a directory account; a local account is given a generated "
+        "password instead"
+    ),
+    "factor_present": "the account already holds a second factor; reset its MFA first",
+    "disabled": "the account is disabled; enable it before issuing an enrolment code",
+    "changed": "the account changed while the code was being issued, so none was issued",
+}
+
+
+@dataclass(frozen=True)
+class IssuedEnrolmentCode:
+    """An enrolment code, shown ONCE (ADR 0207 section 4); the engine keeps only its digest.
+    ``replaced`` says an unexpired code was outstanding and no longer works."""
+
+    code: str = field(repr=False)  # the live code: never in a repr, a log or a traceback
+    expires_at: float
+    replaced: bool = False
+
+
+@dataclass(frozen=True)
+class MfaReset:
+    """What :meth:`AuthService.admin_reset_mfa` issued, each returned once: the generated credential
+    a local account gets (ADR 0197 Amendment A, AC-A4), or the enrolment code an enabled directory
+    account gets (ADR 0207 section 5). At most one is set."""
+
+    credential: IssuedCredential | None = None
+    enrolment_code: IssuedEnrolmentCode | None = None
+
+
+# The issue's shared steps (ADR 0207 sections 4 and 6), module-level so the host command, which
+# builds no AuthService, issues and audits exactly as the route does.
+
+
+async def holds_engine_factor(store: Any, user: UserRecord) -> bool:
+    """Whether ``user`` holds TOTP or at least one passkey: TOTP, then the sealed passkey digest,
+    then the store's passkey rows, the round trip only when neither already answers. Each term can
+    only add a factor (BACKLOG #2592). ``AuthService._second_factor_enrolled`` and the host command
+    both ask this, so they cannot disagree on what counts."""
+    if user.totp_enabled or (user.row is not None and user.row.cred_digest != ""):
+        return True
+    return bool(await store.has_webauthn_credentials(user.id))
+
+
+def enrolment_code_issue_refusal(user: UserRecord, *, holds_factor: bool) -> str | None:
+    """Why a code may not be issued for ``user``, as a key of :data:`ENROLMENT_CODE_ISSUE_REFUSALS`,
+    or ``None``. The store's conditional write judges the same rule again on the record it
+    replaces; this names the reason."""
+    if user.auth_provider != AuthProvider.AD.value:
+        return "local_account"
+    if user.disabled:
+        return "disabled"
+    if holds_factor:
+        return "factor_present"
+    return None
+
+
+async def write_enrolment_code(
+    store: Any, user: UserRecord, *, issuer_id: str | None
+) -> IssuedEnrolmentCode | None:
+    """Mint a code and write its digest, 24 hours of life and ``issuer_id`` in one conditional
+    sealed write. ``None`` when the write changed no row; nothing is shown then."""
+    code = mint_enrolment_code()
+    code_digest = enrolment_code_digest(code)
+    if code_digest is None:  # pragma: no cover - a minted code always normalises
+        raise RuntimeError("an enrolment code failed its own shape check")
+    now = time.time()
+    expires_at = now + ENROLMENT_CODE_LIFETIME_SECONDS
+    outcome = await store.issue_enrolment_code(
+        user.id, code_digest=code_digest, expires_at=expires_at, issuer_id=issuer_id, now=now
+    )
+    if outcome is None:
+        return None
+    return IssuedEnrolmentCode(code=code, expires_at=expires_at, replaced=outcome.replaced)
+
+
+def enrolment_code_issued_detail(user: UserRecord, issued: IssuedEnrolmentCode, *, via: str) -> str:
+    """The ``auth.enrolment_code_issued`` row's detail. Names neither the code nor its digest."""
+    return _json(
+        {
+            "user_id": user.id,
+            "username": user.username,
+            "expires_at": issued.expires_at,
+            "via": via,
+            "replaced": issued.replaced,
+            "bound": user.oidc_issuer is not None and user.oidc_subject is not None,
+        }
+    )
+
+
 class UsernameTaken(RuntimeError):
     """:meth:`AuthService.create_local_user` lost a concurrent create's race for its username
     (BACKLOG #1808). ``POST /users`` answers it 409, with its own pre-check's text.
@@ -2687,7 +2825,7 @@ async def lockable_account_census(
         # Two questions, two rules (BACKLOG #3937). Whether a reset would remove a passkey that
         # may still sign the holder in asks ``sign_in_counts``. Whether the account holds a way
         # past the GATES count asks the configured rp_id, as the gates do. One digest check.
-        trusted = not sealed or passkey_digest(creds) == digest
+        trusted = not sealed or constant_time_equal(passkey_digest(creds), digest)
         if trusted and any(sign_in_counts(c) for c in creds):
             if state == "unknown":
                 unknown_beside_a_passkey.append(user.username)
@@ -2845,6 +2983,9 @@ SelfTargetOp = Literal[
     "revoke_sessions",
     "set_roles",
     "channel_scope",
+    # ADR 0207 section 4: an Administrator never issues or revokes its own enrolment code.
+    "enrolment_code_issue",
+    "enrolment_code_revoke",
 ]
 
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
@@ -3967,7 +4108,7 @@ class AuthService:
                 except ValueError:  # CredentialHashSchemeError is one too
                     refused += 1
                     continue
-                if cred.credential_id_hash == new_hash:
+                if constant_time_equal(cred.credential_id_hash, new_hash):
                     continue
                 if scheme == CREDENTIAL_ID_HASH_SCHEME:
                     # Today's tag over a digest its own raw id does not give: not a row this
@@ -5433,7 +5574,8 @@ class AuthService:
         # name the account as enrolled to anyone who knows the username. The secret comes from the
         # checked record, so no driver runs here since BACKLOG #3510; the catch stays broad because
         # each backend's cipher raises its own classes, which ``auth/`` does not import, and every
-        # arm fails CLOSED (the code is wrong). ``consume_totp_step`` below is outside it.
+        # arm fails CLOSED (the code is wrong). ``consume_totp_step`` below is outside it, and is
+        # reached only once a code matched.
         try:
             secret = await self._totp_secret(user)
             step = (
@@ -5453,6 +5595,15 @@ class AuthService:
                 user.username,
             )
             step = None
+        # The store is asked only once the code matched a step (ASVS 11.2.4, BACKLOG #1167: kept on
+        # purpose). Asked on every combined sign-in, it would be a store call only an account with
+        # TOTP on makes, reachable with neither factor: its refusal would escape ``login`` as an
+        # unpadded 500, and a pool wait can outlast the pad, so either would name the account as
+        # enrolled to anyone who knows the username. It would also add a locked round trip on the
+        # account's row to every wrong code. So a wrong code makes the store calls a password-only
+        # sign-in makes. A refusal here still escapes unpadded, as before, but only on a code that
+        # matched a step, which already tells its sender the account is enrolled. The ``int``
+        # signature of ``consume_totp_step`` keeps this short-circuit the only form that type-checks.
         code_ok = step is not None and await self._store.consume_totp_step(user.id, step)
         return password_ok, code_ok
 
@@ -5769,10 +5920,11 @@ class AuthService:
         # assumes the maximum. False is that minimum -- one factor proven, none asserted -- so the
         # session is MFA-pending and the engine's own second factor decides the rest.
         #
-        # This is only safe CO-LANDED with directory-account engine-factor enrollment (the same item):
-        # a minimum-minted directory session reaches nothing outside api/security.py's six-entry
-        # MFA-exempt set, so without an enrollment ceremony that accepts a directory account it is a
-        # lockout rather than a control.
+        # Under require_mfa a minimum-minted directory session reaches nothing outside
+        # api/security.py's MFA-exempt set and the enrolment ceremonies. Since ADR 0207 those
+        # ceremonies bind the account's FIRST factor only with a single-use issued enrolment
+        # code, so a directory password alone binds nothing: the lockout this
+        # minimum would otherwise be is an onboarding step, and the pending-MFA page says so.
         return await self._complete_ad_login(
             principal,
             client,
@@ -10825,7 +10977,9 @@ class AuthService:
         failing its seal; on a keyless store it is logged, at most once per report interval."""
         try:
             creds = await self._store.list_webauthn_credentials(user.id)
-            if self._store.row_sealer() is None or passkey_digest(creds) == user.cred_digest:
+            if self._store.row_sealer() is None or constant_time_equal(
+                passkey_digest(creds), user.cred_digest
+            ):
                 return creds
             fresh = await self._load_user(user.id)
             if fresh is None:
@@ -10838,7 +10992,7 @@ class AuthService:
             elif self._seal_failures_reported.due(f"passkey-parse:{user.id}"):
                 _log.warning("a passkey row of user %s did not parse (%s)", user.id, exc)
             return None
-        if passkey_digest(creds) == fresh.cred_digest:
+        if constant_time_equal(passkey_digest(creds), fresh.cred_digest):
             return creds
         await self._user_seal_failed(user.id, part="passkeys")
         return None
@@ -13477,11 +13631,7 @@ class AuthService:
         store round-trip only runs when neither TOTP nor the sealed passkey digest already answers.
         Each term can only add a factor (BACKLOG #2592): a passkey row deleted outside the store
         does not make a sealed record that names one read as unenrolled."""
-        return (
-            user.totp_enabled
-            or user.has_passkeys
-            or await self._store.has_webauthn_credentials(user.id)
-        )
+        return await holds_engine_factor(self._store, user)
 
     def _mfa_required_for(
         self, user: UserRecord, roles: frozenset[Role], *, second_factor_enrolled: bool
@@ -13598,7 +13748,13 @@ class AuthService:
         )
 
     async def confirm_mfa_enrollment(
-        self, identity: Identity, code: str, *, token: str, client: str | None = None
+        self,
+        identity: Identity,
+        code: str,
+        *,
+        token: str,
+        client: str | None = None,
+        enrolment_code: str | None = None,
     ) -> Elevation:
         """Confirm a staged enrollment by proving a live TOTP code. On success: activate MFA, mint the
         single-use recovery codes (returned **once**, plaintext, for the user to save), mark the
@@ -13644,7 +13800,16 @@ class AuthService:
         session, as above. A session revoked before that ask returns ``session_lost``, audited
         ``auth.mfa_failed`` with ``reason=session_lost`` and ``phase=enroll`` (BACKLOG #3807).
         Read-then-act: a passkey bound after the ask, while the recovery codes are hashed, is not
-        caught."""
+        caught.
+
+        **An unstamped session on a directory account shows an enrolment code** (ADR 0207). After
+        the factor check and before the TOTP step is checked, ``enrolment_code`` is read against the
+        account row the lookup returned; a missing or refused one raises
+        :class:`EnrolmentCodeRefused`, spending no step. The spend is folded into the enable's own
+        conditional write (Amendment A, A3), which also needs the account to hold no passkey, so a
+        confirm whose enable matches no row spends nothing and answers ``session_lost``. A row that
+        already has TOTP on when it is re-read is asked for no code: its enable cannot match, and
+        the confirm answers ``session_lost`` as #2224 documents."""
         arrived_at = time.time()  # the floor's clock, read before any await
         # The TOTP clock at arrival: the directory lookup below can cross a step boundary, so the
         # code is judged as of now, as verify_mfa judges it (BACKLOG #1943, #3061).
@@ -13689,8 +13854,20 @@ class AuthService:
             if fresh is not None and (
                 fresh.has_passkeys or await self._store.has_webauthn_credentials(fresh.id)
             ):
-                await self.audit_mfa_denied(identity, "confirm_mfa_enrollment", client=client)
+                await self._audit_factor_refusal(
+                    identity, user, op="confirm_mfa_enrollment", ceremony="totp", client=client
+                )
                 raise ValueError(self._TOTP_FACTOR_PRESENT)
+        # ADR 0207, A3: the code is read here, after the lookup and the factor check, and before
+        # the TOTP step is consumed, so a refused code costs the holder no step. Not when the row
+        # the lookup returned already has TOTP on (another confirm enabled it meanwhile): that is
+        # no first factor, the enable below cannot match the row, and the confirm ends as #2224's
+        # lost session rather than as a code refusal for an account that holds a factor.
+        code_digest: str | None = None
+        if not user.totp_enabled and await self._enrolment_code_owed(token, user):
+            code_digest = await self._read_enrolment_code(
+                identity, user, enrolment_code, ceremony="totp", client=client
+            )
         # Verify the enrollment proof under the SAME configured clock-skew window as a login (BACKLOG
         # #187): default 0 = strict current-step only. Enrolling under the same window a login uses
         # avoids the trap of a skewed-clock authenticator that confirms enrollment yet then fails every
@@ -13738,9 +13915,21 @@ class AuthService:
         )
         if elevation.token is None:  # not ``ok``, spelled so mypy narrows the token below
             return elevation
-        if not await self._store.enable_totp(
-            identity.user_id, recovery_code_hashes=hashes, expected_secret_cell=verified_cell
-        ):
+        spent: EnrolmentCodeOutcome | None = None
+        if code_digest is None:
+            enabled = await self._store.enable_totp(
+                identity.user_id, recovery_code_hashes=hashes, expected_secret_cell=verified_cell
+            )
+        else:
+            # ADR 0207 Amendment A, A3: the spend folded into the enable's own conditional write.
+            spent = await self._store.enable_totp_spending_enrolment_code(
+                identity.user_id,
+                recovery_code_hashes=hashes,
+                expected_secret_cell=verified_cell,
+                code_digest=code_digest,
+            )
+            enabled = spent is not None
+        if not enabled:
             # BACKLOG #2224, #3025: the conditional enable matched no row, for example because an
             # administrator's reset cleared the staged secret inside the rotation window, a second
             # confirm enabled TOTP first, or a second begin staged a secret this confirm never
@@ -13790,6 +13979,21 @@ class AuthService:
                 )
             return Elevation(session_lost=True)
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
+        # TOTP is on and the session rotated, so a fault here must not lose the token and the
+        # recovery codes (BACKLOG #1902): both writes are soft, logged at ERROR, never raised.
+        # ``defects`` is empty because a raise would report a bound factor as a failure.
+        if spent is not None:
+            used = spent  # narrowed, for the lambda
+            await write_audit_soft(
+                lambda: self._record_code_spent(identity, used, "totp", client=client),
+                log=_log,
+                message="the enrolment code spent by %s could not record its rows",
+                args=lambda: (scrub_log_argument(identity.username),),
+                errors=(RowSealError, *audit_write_errors()),
+                defects=(),
+            )
+        else:
+            await self._clear_stale_enrolment_code(user)
         # ADR 0197 Amendment A: enrolment now comes BEFORE the first rotation, so whoever intercepts
         # an issued credential can enrol their own authenticator without rotating. The notice to a
         # must-change account says so, and says what to do.
@@ -13828,7 +14032,9 @@ class AuthService:
             reason = "already_enabled"
         elif after.totp_secret_cell is None:
             reason = "secret_cleared"
-        elif after.totp_secret_cell != verified_cell:
+        elif verified_cell is None or not constant_time_equal(
+            after.totp_secret_cell, verified_cell
+        ):
             reason = "secret_replaced"
         else:
             # The row still holds the verified cell with TOTP off, so the write lost to some other
@@ -14735,7 +14941,9 @@ class AuthService:
         )
         return user is not None and user.totp_enabled
 
-    async def admin_reset_mfa(self, user_id: str, *, actor: str) -> IssuedCredential | None:
+    async def admin_reset_mfa(
+        self, user_id: str, *, actor: str, actor_id: str | None = None
+    ) -> MfaReset:
         """Admin: clear a user's MFA — TOTP **and** every WebAuthn passkey (lost authenticator + no
         recovery path; ADR 0068 extends this to credentials) — and revoke their sessions so they
         re-enroll. The always-available recovery for a locked-out passkey user. Raises
@@ -14756,7 +14964,12 @@ class AuthService:
         password and gets ``None``.
 
         It also clears the account's known sign-in addresses, local or directory (vault BACKLOG
-        #2946; see :meth:`_clear_login_addresses`)."""
+        #2946; see :meth:`_clear_login_addresses`).
+
+        **ON AN ENABLED DIRECTORY ACCOUNT IT ISSUES AN ENROLMENT CODE, RETURNED ONCE** (ADR 0207
+        section 5), since the account needs one to enrol again. ``actor_id`` is the issuing
+        Administrator's account id, whom the spent notice reaches (Amendment A, A5). A disabled
+        account gets none, and neither does one whose issue the store refused."""
         user = await self._load_user(user_id)
         if user is None:
             raise ValueError("no such user")
@@ -14810,6 +15023,32 @@ class AuthService:
                 }
             ),
         )
+        code: IssuedEnrolmentCode | None = None
+        if user.auth_provider == AuthProvider.AD.value and not user.disabled:
+            issue_refused: tuple[type[Exception], ...] = (RowSealError, *audit_write_errors())
+            try:
+                code = await self.issue_enrolment_code(
+                    user_id, actor=actor, issuer_id=actor_id, via="reset"
+                )
+            except EnrolmentCodeIssueRefused as exc:
+                # The factors are already gone, so the reset stands; the Administrator issues a code
+                # separately once the account allows one. Logged, never raised over the reset.
+                _log.warning(
+                    "the MFA reset of %s issued no enrolment code: %s",
+                    scrub_log_argument(user.username),
+                    exc.reason,
+                )
+            except AUDIT_WRITE_DEFECTS:
+                raise  # a bug, not a refusal
+            except issue_refused:
+                # The account went, its record fails its seal, or the store or the audit chain
+                # refused the issue, after the reset's writes. The reset still stands and its
+                # notices still go; no code is shown, and the Administrator issues one separately.
+                _log.warning(
+                    "the MFA reset of %s issued no enrolment code: the account could not be read",
+                    scrub_log_argument(user.username),
+                    exc_info=True,
+                )
         await self._notify_security(
             MFA_DISABLED, username=user.username, email=user.notify_email, detail={"reset": True}
         )
@@ -14826,7 +15065,217 @@ class AuthService:
                     else {"expires_at": issued.expires_at}
                 ),
             )
+        return MfaReset(credential=issued, enrolment_code=code)
+
+    # --- ADR 0207: a directory account's single-use enrolment code -----------------------------
+
+    async def issue_enrolment_code(
+        self, user_id: str, *, actor: str, issuer_id: str | None, via: str
+    ) -> IssuedEnrolmentCode:
+        """Issue an enrolment code for a directory account's first engine factor, returned ONCE
+        (ADR 0207 sections 4 and 5). ``actor`` is the issuing Administrator's username and
+        ``issuer_id`` that Administrator's account id; ``via`` is ``api`` or ``ui`` from the issue
+        routes, or ``reset`` from :meth:`admin_reset_mfa`. The host command (section 6) does not
+        call this: it calls :func:`write_enrolment_code` with no issuer and writes its own
+        ``auth.enrolment_code_issued`` row, with ``via`` ``host``, and sends no notice.
+
+        Refuses, with :class:`EnrolmentCodeIssueRefused`, a local account, a disabled account and an
+        account that holds an engine factor; raises :class:`ValueError` ``no such user`` for an
+        unknown one. Self-targeting is the route's refusal, as the resets' is. The write is one
+        conditional sealed write, so a disable or a factor that lands after these checks leaves no
+        code and the issue is refused. Only the code's ``hash_token`` digest is stored. A new code
+        replaces an outstanding one. Never logs the code."""
+        user = await self._load_user(user_id)
+        if user is None:
+            raise ValueError("no such user")
+        reason = enrolment_code_issue_refusal(
+            user, holds_factor=await self._second_factor_enrolled(user)
+        )
+        if reason is not None:
+            raise EnrolmentCodeIssueRefused(reason, ENROLMENT_CODE_ISSUE_REFUSALS[reason])
+        issued = await write_enrolment_code(self._store, user, issuer_id=issuer_id)
+        if issued is None:
+            after = await self._load_user(user_id)
+            if after is None:
+                raise ValueError("no such user")
+            reason = enrolment_code_issue_refusal(
+                after, holds_factor=await self._second_factor_enrolled(after)
+            )
+            reason = reason or "changed"
+            raise EnrolmentCodeIssueRefused(reason, ENROLMENT_CODE_ISSUE_REFUSALS[reason])
+        await self._audit(
+            "auth.enrolment_code_issued",
+            actor=actor,
+            detail=enrolment_code_issued_detail(user, issued, via=via),
+        )
+        await self._notify_security(
+            ENROLMENT_CODE_ISSUED, username=user.username, email=user.notify_email
+        )
         return issued
+
+    async def revoke_enrolment_code(self, user_id: str, *, actor: str) -> bool:
+        """Clear an account's outstanding enrolment code, for a handover that went wrong (ADR 0207
+        section 4). Returns whether one was cleared, and audits only then. Raises
+        :class:`ValueError` ``no such user`` for an unknown account."""
+        user = await self._load_user(user_id)
+        if user is None:
+            raise ValueError("no such user")
+        # The stored id, not the caller's spelling: a store whose id compare ignores case (SQL
+        # Server) finds the row from another spelling, and the audit row must name the account.
+        if not await self._store.revoke_enrolment_code(user.id):
+            return False
+        await self._audit(
+            "auth.enrolment_code_revoked",
+            actor=actor,
+            detail=_json({"user_id": user.id, "username": user.username}),
+        )
+        return True
+
+    async def _clear_stale_enrolment_code(self, user: UserRecord) -> None:
+        """After a directory account bound a factor with no code (a session the identity provider
+        stamped), clear any code still outstanding on it, so a code that may have been intercepted
+        at handover cannot bind a first factor again once that factor is removed. Soft: the factor
+        is already bound, so a store fault here is logged, never raised over the enrolment."""
+        if user.auth_provider != AuthProvider.AD.value:
+            return
+        # ``defects`` is empty: a raise here would report a factor already bound as a failure.
+        await write_audit_soft(
+            lambda: self._store.revoke_enrolment_code(user.id),
+            log=_log,
+            message="an enrolment code on %s could not be cleared after a factor was bound without it",
+            args=lambda: (scrub_log_argument(user.username),),
+            errors=(RowSealError, *audit_write_errors()),
+            defects=(),
+        )
+
+    async def _enrolment_code_owed(self, token: str | None, user: UserRecord) -> bool:
+        """Whether a binding step on this session must be shown an enrolment code (ADR 0207 section
+        1): the account is a directory account and the session is not stamped MFA-verified. It
+        never reads the session's mechanism or ``kerberos_enabled``. A session that cannot be read
+        owes one, the closed direction; the binding steps' own guards answer a dead session lost
+        before this is asked."""
+        if user.auth_provider != AuthProvider.AD.value:
+            return False
+        session = None if not token else await self._load_session(hash_token(token))
+        return session is None or session.mfa_verified_at is None
+
+    async def enrolment_code_required(self, token: str | None, identity: Identity) -> bool:
+        """Whether this session would be asked for an enrolment code to bind the account's first
+        factor: a directory account holding no factor, on a session not stamped MFA-verified. For
+        the status reply and the console pages; the binding steps decide for themselves."""
+        if identity.auth_provider is not AuthProvider.AD:
+            return False  # no store read for the common case, a local account
+        user = await self._load_user(identity.user_id)
+        if user is None or await self._second_factor_enrolled(user):
+            return False
+        return await self._enrolment_code_owed(token, user)
+
+    async def _read_enrolment_code(
+        self,
+        identity: Identity,
+        user: UserRecord,
+        presented: str | None,
+        *,
+        ceremony: str,
+        client: str | None,
+    ) -> str:
+        """The digest of ``presented`` when it matches the code on ``user``'s row, has not expired
+        and the account is enabled; otherwise the refusal (:meth:`_refuse_enrolment_code`). ``user``
+        is the row the directory lookup returned (Amendment A, A3). Spends nothing."""
+        if presented is None or not presented.strip():
+            await self._refuse_enrolment_code(
+                identity, "not_presented", ceremony=ceremony, client=client
+            )
+        expires_at = user.enrolment_code_expires_at
+        digest = enrolment_code_matches(user.enrolment_code_digest, presented)
+        if (
+            digest is not None
+            and expires_at is not None
+            and not user.disabled
+            and time.time() < expires_at
+        ):
+            return digest
+        await self._refuse_enrolment_code(
+            identity, "code_refused", ceremony=ceremony, client=client
+        )
+
+    async def _refuse_enrolment_code(
+        self, identity: Identity, reason: str, *, ceremony: str, client: str | None
+    ) -> NoReturn:
+        """Write the ``auth.enrolment_code_refused`` row and raise the one reply. ``reason`` is
+        ``not_presented`` or ``code_refused``; the second covers a malformed, never-issued, wrong,
+        expired or spent code alike, so the account's own feed does not tell them apart either."""
+        await self._audit(
+            "auth.enrolment_code_refused",
+            actor=identity.username,
+            detail=_json({"reason": reason, "ceremony": ceremony}),
+            client=client,
+        )
+        raise EnrolmentCodeRefused()
+
+    async def _audit_factor_refusal(
+        self, identity: Identity, user: UserRecord, *, op: str, ceremony: str, client: str | None
+    ) -> None:
+        """The rows a binding step's factor refusal writes: ``auth.mfa_denied`` for ``op``, and
+        beside it, for a directory account only, ``auth.enrolment_code_refused`` with
+        ``factor_present`` (ADR 0207 Amendment A, A2). One helper, so no refusal site writes one
+        without the other. Every caller is on a session the factor-binding rule refused, which is an
+        unstamped one."""
+        await self.audit_mfa_denied(identity, op, client=client)
+        if user.auth_provider != AuthProvider.AD.value:
+            return
+        await self._audit(
+            "auth.enrolment_code_refused",
+            actor=identity.username,
+            detail=_json({"reason": "factor_present", "ceremony": ceremony}),
+            client=client,
+        )
+
+    async def _record_code_spent(
+        self,
+        identity: Identity,
+        spent: EnrolmentCodeOutcome,
+        ceremony: str,
+        *,
+        client: str | None,
+    ) -> None:
+        """The rows a spent code writes (ADR 0207 section 7, Amendment A, A5):
+        ``auth.enrolment_code_used`` under the account that enrolled, naming no issuer; and, when an
+        Administrator issued it and that account still exists, ``auth.enrolment_code_spent_notice``
+        under the issuer's name as the row's RECIPIENT, with the client address, plus a notice to
+        the issuer's address. The only audit row whose actor did not act (docs/SECURITY.md)."""
+        await self._audit(
+            "auth.enrolment_code_used",
+            actor=identity.username,
+            detail=_json({"ceremony": ceremony}),
+            client=client,
+        )
+        if spent.issuer_id is None:
+            return
+        issuer = await self._load_user(spent.issuer_id)
+        if issuer is None:
+            return
+        await self._audit(
+            "auth.enrolment_code_spent_notice",
+            actor=issuer.username,
+            detail=_json(
+                {
+                    "actor_role": "recipient",
+                    "user_id": identity.user_id,
+                    "username": identity.username,
+                    "ceremony": ceremony,
+                    "client": client,
+                }
+            ),
+            client=client,
+        )
+        await self._notify_security(
+            ENROLMENT_CODE_SPENT,
+            username=issuer.username,
+            email=issuer.notify_email,
+            client=client,
+            detail={"holder": identity.username},
+        )
 
     async def mfa_status(self, identity: Identity) -> MfaStatus:
         """The caller's current MFA posture for ``GET /me/mfa``."""
@@ -14949,6 +15398,7 @@ class AuthService:
         rp_id: str,
         origin: str,
         factor_refused: bool = False,
+        enrolment_code: str | None = None,
     ) -> Elevation:
         """Verify an attestation response and persist the passkey. Returns a not-``ok``
         :class:`Elevation` when the response fails verification (audited — parity with a wrong TOTP
@@ -14990,7 +15440,14 @@ class AuthService:
         its factor between the two reads (a delete on another session, an administrator's reset)
         would let a request nothing charged finish. Proving the factor on this session instead
         re-keys it, so that interleaving is answered lost. A revoked session is still answered lost
-        first, whatever the caller read."""
+        first, whatever the caller read.
+
+        **An unstamped session on a directory account shows an enrolment code** (ADR 0207,
+        Amendment A, A3). It is read after the directory lookup and the second factor check and
+        before the challenge is popped, so a refused code costs neither the code nor the ceremony.
+        After the verify, the duplicate check and a label check, it is spent by one conditional
+        write before the credential is written; a spend that changes no row ends the ceremony and
+        writes no credential."""
         arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._load_user(identity.user_id)
         if user is None:
@@ -15024,7 +15481,13 @@ class AuthService:
             token, STEP_UP_ACTION_WEBAUTHN_ENROLL
         ):
             self._webauthn_challenges.pop((hash_token(token), "register"))
-            await self.audit_mfa_denied(identity, "finish_webauthn_registration", client=client)
+            await self._audit_factor_refusal(
+                identity,
+                user,
+                op="finish_webauthn_registration",
+                ceremony="webauthn",
+                client=client,
+            )
             raise ValueError(self._FACTOR_PRESENT)
         if await self._enrolment_too_early(
             token, user, arrived_at, event="auth.webauthn_failed", client=client
@@ -15062,8 +15525,21 @@ class AuthService:
             return Elevation(session_lost=True)
         if await self._factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
             self._webauthn_challenges.pop((hash_token(token), "register"))
-            await self.audit_mfa_denied(identity, "finish_webauthn_registration", client=client)
+            await self._audit_factor_refusal(
+                identity,
+                user,
+                op="finish_webauthn_registration",
+                ceremony="webauthn",
+                client=client,
+            )
             raise ValueError(self._FACTOR_PRESENT)
+        # ADR 0207, A3 step 7: the code read, before the pop, so a refused code leaves the
+        # ceremony staged and costs no code.
+        code_digest: str | None = None
+        if await self._enrolment_code_owed(token, user):
+            code_digest = await self._read_enrolment_code(
+                identity, user, enrolment_code, ceremony="webauthn", client=client
+            )
         pending = self._webauthn_challenges.pop((hash_token(token), "register"))
         if pending is None or pending.user_id != user.id:
             raise ValueError(self._CEREMONY_EXPIRED)
@@ -15104,6 +15580,48 @@ class AuthService:
         credential_id_hash = _credential_id_hash(result.credential_id)
         if await self._store.get_webauthn_credential(credential_id_hash) is not None:
             raise ValueError("this passkey is already enrolled")
+        spent: EnrolmentCodeOutcome | None = None
+        if code_digest is not None:
+            # ADR 0207, A3 step 9: a label the account already holds is refused before the spend,
+            # so that refusal costs no code. The insert's integrity error stays the backstop for a
+            # label written concurrently, which does cost it.
+            held = await self._verified_passkeys(user)
+            if held is None:
+                # The passkey set fails its seal or does not parse, so the credential write below
+                # would refuse anyway: refuse before the spend, as begin_webauthn_registration does,
+                # so the code is not burned on a write that cannot land.
+                raise ValueError("no such user")
+            if any(c.label == label for c in held):
+                raise ValueError("label already in use")
+            # A3 step 10: the spend, one conditional write, before the credential is written.
+            spent = await self._store.spend_enrolment_code(user.id, code_digest=code_digest)
+            if spent is None:
+                fresh = await self._load_user(user.id)
+                if fresh is not None and await self._second_factor_enrolled(fresh):
+                    await self._audit_factor_refusal(
+                        identity,
+                        user,
+                        op="finish_webauthn_registration",
+                        ceremony="webauthn",
+                        client=client,
+                    )
+                    raise ValueError(self._FACTOR_PRESENT)
+                await self._refuse_enrolment_code(
+                    identity, "code_refused", ceremony="webauthn", client=client
+                )
+            # Recorded at the spend, not after the credential write: a write that then fails (a
+            # label written concurrently, a session revoked meanwhile) has still cost the code, and
+            # the used row and the issuer's notice say where it went. Soft, as on the TOTP leg: the
+            # code is already spent, so a fault in these rows must not also cost the binding.
+            used = spent  # narrowed, for the lambda
+            await write_audit_soft(
+                lambda: self._record_code_spent(identity, used, "webauthn", client=client),
+                log=_log,
+                message="the enrolment code spent by %s could not record its rows",
+                args=lambda: (scrub_log_argument(identity.username),),
+                errors=(RowSealError, *audit_write_errors()),
+                defects=(),
+            )
         now = time.time()
         cred = WebAuthnCredential(
             credential_id_hash=credential_id_hash,
@@ -15158,8 +15676,16 @@ class AuthService:
                 return Elevation(session_lost=True)
             if await self._load_user(user.id) is None:
                 raise ValueError("no such user")
-            await self.audit_mfa_denied(identity, "finish_webauthn_registration", client=client)
+            await self._audit_factor_refusal(
+                identity,
+                user,
+                op="finish_webauthn_registration",
+                ceremony="webauthn",
+                client=client,
+            )
             raise ValueError(self._FACTOR_PRESENT)
+        if spent is None:
+            await self._clear_stale_enrolment_code(user)
         # Parity with confirm_mfa_enrollment: the enrolling session is now MFA-verified (it just
         # proved possession of the freshly-bound authenticator). Stamped against the OLD hash, then
         # rotated — the reverse order writes nothing and still reports success.
@@ -15346,7 +15872,12 @@ class AuthService:
         # passkey row the store did not write fails the whole set, so none of them signs in.
         held = await self._verified_passkeys(user)
         wanted = _credential_id_hash(raw_id)
-        cred = next((c for c in held or () if c.credential_id_hash == wanted), None)
+        # ASVS 11.2.4 (BACKLOG #1167): every candidate compared, each in constant time, as
+        # _passkey_assertion_ok does; no early exit at the matching slot.
+        cred: WebAuthnCredential | None = None
+        for candidate in held or ():
+            if constant_time_equal(candidate.credential_id_hash, wanted) and cred is None:
+                cred = candidate
         if cred is None or cred.user_id != user.id or cred.rp_id != rp_id:
             # Unknown credential, another user's, or minted under a different origin — same
             # refusal either way (no oracle distinguishing the three).
@@ -15474,8 +16005,8 @@ class AuthService:
         sign-count miss writes its clone row before this is asked. The account is asked
         only when the set does not hold ``cred``, since a set read of a deleted account fails its
         seal on a keyed store and is empty on a keyless one. This re-check compares every
-        credential, each in constant time (ASVS 11.2.4, as the delete path does); the lookup that
-        first picked ``cred`` does not."""
+        credential, each in constant time (ASVS 11.2.4, as the delete path does), as the lookup
+        that first picked ``cred`` does."""
         held = await self._verified_passkeys(user)
         if held is not None:
             # A list, not a generator: any() over a generator would stop at the first match.
@@ -17137,6 +17668,30 @@ class AuthService:
             "auth.permission_granted",
             actor=identity.username,
             detail=_json({"permission": permission.value, "path": path}),
+            client=client,
+        )
+
+    async def audit_gate_refused(
+        self,
+        identity: Identity,
+        permission: Permission,
+        path: str,
+        *,
+        reason: str,
+        client: str | None,
+    ) -> None:
+        """Audit a request refused by a check its gate makes AFTER the permission check passed
+        (BACKLOG #1197, ASVS 16.3.2), such as a stale step-up (``reason`` ``step_up``) or the
+        per-actor pacing (``throttled``).
+
+        The caller holds ``permission``, so this is not :meth:`audit_permission_denied`: that row
+        says the permission was missing, and the denial-burst detector counts it.
+        ``_recorded_decision`` in ``api/security.py`` decides when this row is written. ``client``
+        is required, as for :meth:`audit_self_target_refused`."""
+        await self._audit(
+            "auth.gate_refused",
+            actor=identity.username,
+            detail=_json({"permission": permission.value, "path": path, "reason": reason}),
             client=client,
         )
 

@@ -9,7 +9,7 @@ A de-id rule has two halves and the project identity dictates which is which:
   the same sanctioned config category as ``connections.toml`` (ADR 0007). A deployment customising
   *which* PHI fields to scrub edits data, not code.
 * **HOW** a surrogate is produced is **code** — the pure functions in
-  :mod:`messagefoundry.anon.surrogates`, keyed by :class:`SurrogateKind`.
+  :mod:`messagefoundry_toolkit.anon.surrogates`, keyed by :class:`SurrogateKind`.
 
 The data layer is deliberately incapable of expressing a *transform*: a rule may only map a
 whole-**field** path to an existing :class:`SurrogateKind` (or ``keep``/``drop``). There is no

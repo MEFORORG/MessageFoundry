@@ -38,6 +38,7 @@ from tests._root_logging import root_logging_restored
 
 if TYPE_CHECKING:
     from messagefoundry.config.wiring import _WinConfigSourceProbes, _WinPathSecurity
+    from messagefoundry.remotedebug import RemoteDebugPosture
 
 # A helper module holding the content-free asserts several connector tests share. pytest rewrites
 # asserts only in test modules unless told, and an unrewritten assert vanishes under `python -O`.
@@ -575,6 +576,13 @@ def _no_qt_object_left_in_a_reference_cycle(request: pytest.FixtureRequest) -> I
         )
 
 
+def _remote_debug_off() -> RemoteDebugPosture:
+    """The remote-debugging reading of the hardened launch: the interface off."""
+    from messagefoundry.remotedebug import RemoteDebugPosture
+
+    return RemoteDebugPosture(interpreter_enabled=False, guard_installed=False)
+
+
 @pytest.fixture
 def remote_debugging_off(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin the PROCESS readings ``GET /security/posture`` takes to the hardened launch (vault
@@ -586,13 +594,9 @@ def remote_debugging_off(monkeypatch: pytest.MonkeyPatch) -> None:
     a test whose subject is the SETTINGS posture and which asserts the exact list.
     ``tests/test_remote_debug_guard.py`` and ``tests/test_startup_code_inventory.py`` cover the
     other readings."""
-    from messagefoundry.remotedebug import RemoteDebugPosture
     from messagefoundry.startupcode import InterpreterLaunch, StartupPosture
 
-    monkeypatch.setattr(
-        "messagefoundry.api.app.remote_debug_posture",
-        lambda: RemoteDebugPosture(interpreter_enabled=False, guard_installed=False),
-    )
+    monkeypatch.setattr("messagefoundry.api.app.remote_debug_posture", _remote_debug_off)
     hardened = StartupPosture(
         launch=InterpreterLaunch(
             isolated=True, safe_path=True, ignore_environment=True, no_user_site=True
@@ -607,32 +611,26 @@ def remote_debugging_off(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _remote_debug_start_gate_stood_down() -> Iterator[Callable[..., bool]]:
-    """Stand down the start-up refusal for remote debugging (vault BACKLOG #2700) in the
-    in-process ``serve`` and ``supervise`` runs, and yield the real gate.
+def _remote_debug_posture_pinned_off() -> Iterator[None]:
+    """Pin the remote-debugging PROCESS reading the in-process ``serve`` and ``supervise`` runs
+    take to the interface off (vault BACKLOG #2700, #3795).
 
-    That gate reads the PROCESS, and a plain ``pytest`` run has the interpreter's remote
-    debugging on, so under the shipped ``enforce`` every in-process start would stop there,
-    whatever gate the test is about. Autouse for that reason, like the config-source
-    read above: it is a fact about the test runner, not about any scenario. A test whose subject
-    is the gate takes :func:`remote_debug_start_gate`. A subprocess start is not covered."""
+    A plain ``pytest`` run has the interpreter's remote debugging on, so under the shipped
+    ``enforce`` every in-process start would stop at that gate, whatever gate the test is about.
+    Autouse for that reason, like the config-source read above: it is a fact about the test
+    runner, not about any scenario. The reading is pinned, not the gate, so the real gate still
+    runs in every in-process start, and a gate that refuses or raises with the interface off fails
+    them. The reading itself does not run there; ``tests/test_remote_debug_guard.py`` covers it.
+    A test whose subject is the gate pins its own reading. Only this one name is pinned. At least
+    these other readings are not: a subprocess start's, the
+    API's own (``messagefoundry.api.app``, which :func:`remote_debugging_off` pins where a test
+    asks) and the engine's refusal watch (``messagefoundry.pipeline.remote_debug_watch``)."""
     from messagefoundry import __main__ as cli
 
-    real = cli._remote_debug_refused
     with pytest.MonkeyPatch.context() as patch:
-        # setattr raises on a missing name, so a renamed gate fails here rather than going unstubbed.
-        patch.setattr(cli, "_remote_debug_refused", lambda *args, **kwargs: False)
-        yield real
-
-
-@pytest.fixture
-def remote_debug_start_gate(
-    monkeypatch: pytest.MonkeyPatch, _remote_debug_start_gate_stood_down: Callable[..., bool]
-) -> None:
-    """Put the real remote-debugging start gate back for one test (vault BACKLOG #2700)."""
-    monkeypatch.setattr(
-        "messagefoundry.__main__._remote_debug_refused", _remote_debug_start_gate_stood_down
-    )
+        # setattr raises on a missing name, so a renamed reading fails here rather than going unpinned.
+        patch.setattr(cli, "remote_debug_posture", _remote_debug_off)
+        yield
 
 
 @pytest.fixture
@@ -652,6 +650,20 @@ def _syslog_ca_and_crl_bundle(tmp_path_factory: pytest.TempPathFactory) -> str:
     from tests._phi_gate_provisions import make_syslog_ca_and_crl
 
     return make_syslog_ca_and_crl(tmp_path_factory.mktemp("syslog-ca"))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _the_provisioned_collector_never_reaches_dns() -> Iterator[None]:
+    """Answer the provisioned collector's lookup in this process, so no test asks DNS for it
+    (BACKLOG #2279 item 3). A test that patches ``socket.getaddrinfo`` itself replaces this for its
+    own duration, and monkeypatch's undo puts this back."""
+    import socket
+
+    from tests._phi_gate_provisions import ProvisionedCollectorResolver
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(socket, "getaddrinfo", ProvisionedCollectorResolver(socket.getaddrinfo))
+        yield
 
 
 @pytest.fixture

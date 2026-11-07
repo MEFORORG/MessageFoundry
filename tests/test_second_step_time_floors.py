@@ -34,6 +34,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
+from tests._enrolment_code import enrolment_code_for
 from tests._fake_directory import DirectoryOf
 from tests._totp_clock import pin_totp_clock
 from tests.test_auth_oidc_service import (
@@ -509,6 +510,8 @@ async def test_a_directory_sessions_first_passkey_inside_the_floor_is_refused(
         assert not await service.mfa_satisfied(out.token), "the session must owe its factor"
         identity = await service.identity_for_user_id(session.user_id)
         assert identity is not None
+        # ADR 0207: this directory account's first factor binds only with an issued code.
+        code = await enrolment_code_for(service, identity.user_id)
         auth = SoftAuthenticator(rp_id=rp, origin=origin)
         options = json.loads(
             await service.begin_webauthn_registration(
@@ -522,7 +525,13 @@ async def test_a_directory_sessions_first_passkey_inside_the_floor_is_refused(
         now = [session.created_at + MFA_FLOOR - 0.001]
         _fake_service_wall_clock(monkeypatch, now)
         early = await service.finish_webauthn_registration(
-            identity, response, label="key", token=out.token, rp_id=rp, origin=origin
+            identity,
+            response,
+            label="key",
+            token=out.token,
+            rp_id=rp,
+            origin=origin,
+            enrolment_code=code,
         )
 
         assert early == Elevation()
@@ -534,7 +543,13 @@ async def test_a_directory_sessions_first_passkey_inside_the_floor_is_refused(
         # CONTROL: past the floor, the SAME response binds the passkey and satisfies the session.
         now[0] = session.created_at + MFA_FLOOR + 0.001
         served = await service.finish_webauthn_registration(
-            identity, response, label="key", token=out.token, rp_id=rp, origin=origin
+            identity,
+            response,
+            label="key",
+            token=out.token,
+            rp_id=rp,
+            origin=origin,
+            enrolment_code=code,
         )
         assert served.ok and served.token is not None
         assert await service.mfa_satisfied(served.token)

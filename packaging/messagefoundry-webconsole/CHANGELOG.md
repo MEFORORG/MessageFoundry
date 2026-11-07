@@ -22,6 +22,13 @@ this line.**
 
 ### Added
 
+- **Directory-account enrolment codes (ADR 0207, BACKLOG #2609).** A directory account's user page
+  offers "Issue enrolment code" and "Revoke enrolment code", each behind its own single-use step-up,
+  and the issue shows the code once with the handover rule. An MFA reset of an enabled directory
+  account shows the code it issued. The TOTP confirm form and the passkey page carry an enrolment
+  code field when the session owes one, the passkey page script sends it in its body, and the
+  account page tells a directory user with no factor to ask an Administrator through the site's
+  identity check, not by mail or chat.
 - **The sign-in page offers a combined passkey sign-in.** A "Sign in with password and passkey"
   button runs a usernameless passkey ceremony (`POST /ui/login/passkey`, which charges the sign-in
   window first and sets the challenge's handle as an HttpOnly cookie) and submits the assertion with

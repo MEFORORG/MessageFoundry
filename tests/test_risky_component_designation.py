@@ -1814,10 +1814,13 @@ def test_the_survey_checks_can_fail() -> None:
             search,
             found,
         )
-    # Source and data answers dated before the compiled one.
-    early = one({"surveyed": "2026-10-05", "forms_surveyed": "2026-10-04"})
+    # Source and data answers dated before the compiled one, both after the search ran.
+    run = dt.date.fromisoformat(survey["search"]["run"])
+    early = one(
+        {"surveyed": str(run + dt.timedelta(2)), "forms_surveyed": str(run + dt.timedelta(1))}
+    )
     assert early == [f"{name}: the source and data answers are dated before the first"], early
-    assert one({"surveyed": "2026-10-05", "forms_surveyed": "2026-10-05"}) == []
+    assert one({"surveyed": str(run), "forms_surveyed": str(run)}) == []
     # A malformed entry is reported, and neither the check nor the renderer raises on it.
     # The first is on a wheel whose compiled answer is "yes", so its entry is read and rendered.
     carrier = next(w for w in wheels if w["carries"] == "yes")
@@ -2055,7 +2058,7 @@ def test_the_survey_record_field_checks_can_fail() -> None:
         assert any(line.startswith(f"{name}: {problem}") for line in found), (problem, found)
     # A project's ``display``, and a second release line of the wheel's own project.
     yes = {"carries": "yes", "evidence": "a file list"}
-    shown = {"name": "a table", "version": "1.0", "display": "a table, the first edition"}
+    shown = {"name": "a table", "version": "1.0", "display": "a table 1.0, the first edition"}
     assert one({"data": {**yes, "projects": [shown]}}) == []
     for display in (3, " ", None):
         found = one({"data": {**yes, "projects": [{**shown, "display": display}]}})
@@ -2131,6 +2134,111 @@ def test_the_survey_record_field_checks_can_fail() -> None:
     assert edited != page, stated_line
     drift = _survey_page_drift(edited, survey)
     assert [line.partition(":")[0] for line in drift] == ["own line"], drift
+
+
+def test_the_survey_cell_line_and_search_day_checks_can_fail() -> None:
+    """RED when: a field the page prints in a table cell may hold a ``|`` or a line break, a hit
+    that names several files may record line numbers, a ``display`` may leave out the project's
+    name or version, or a source and data answer may be dated before the search's ``run``, or none
+    on that day.
+
+    THE POSITIVE CONTROL FOR ENGINE PR 2390 NOTES 1, 2, 3 AND 5 (vault BACKLOG #3030). Each case
+    changes one wheel, or the search, of the tracked record, which passes as tracked. A case may
+    set two fields that must agree, such as a hit and its adapted module.
+    """
+    page = _DOC.read_text(encoding="utf-8")
+    data, survey = _snapshot(), _survey()
+    labels = component_readings.designation_labels(page)
+    wheels = survey["wheels"]
+    assert component_readings.survey_problems(survey, data, labels) == []
+
+    def problems(wheel: dict[str, Any], change: dict[str, Any]) -> list[str]:
+        changed = [{**w, **change} if w is wheel else w for w in wheels]
+        return component_readings.survey_problems({**survey, "wheels": changed}, data, labels)
+
+    def red(wheel: dict[str, Any], change: dict[str, Any], problem: str) -> None:
+        found = problems(wheel, change)
+        assert any(line.startswith(f"{wheel['name']}: {problem}") for line in found), (
+            change,
+            found,
+        )
+
+    plain = next(
+        w
+        for w in wheels
+        if w["name"] not in labels
+        and all(_said(w, form) == "no" for form in _FORMS)
+        and any(f["file"].endswith(".whl") for f in w["files_read"])
+    )
+    # Notes 1 and 3: a project's name, version and display, each a cell, the display holding both.
+    yes = {"carries": "yes", "evidence": "a file list"}
+    shown = {"name": "a table", "version": "1.0", "display": "a table, version 1.0"}
+    assert problems(plain, {"data": {**yes, "projects": [shown]}}) == []
+    locked = {"name": "a table", "version": "as locked", "display": "a table, from the lock"}
+    assert problems(plain, {"data": {**yes, "projects": [locked]}}) == []
+    for project in (
+        {**shown, "name": "a | table", "display": "a | table, version 1.0"},
+        {**shown, "version": "1.0\n2.0", "display": "a table, version 1.0\n2.0"},
+        {**shown, "display": "a table, version 1.0 | 2.0"},
+        {**shown, "display": "a table, the first edition"},
+        {**shown, "display": "the first edition, version 1.0"},
+        {**shown, "display": "a table, version 11.0.2"},
+        {**shown, "display": "a table, version 1.0.3"},
+        {"name": "a | table", "version": "1.0"},
+        {"name": "a table", "version": "1.0 2.0"},
+    ):
+        red(plain, {"data": {**yes, "projects": [project]}}, "the data answer 'yes'")
+    # Note 1: an adapted module's file and project, a route's reason and a read route's fields.
+    word = survey["search"]["words"][0]
+    hit = {"files": ["a/module.py"], "words": [word], "kind": "adapted module", "says": "a note"}
+    module = {"file": "a/module.py", "project": "another project", "words": "copied from it"}
+    assert problems(plain, {"word_hits": [hit], "adapted_modules": [module]}) == []
+    red(
+        plain,
+        {"word_hits": [hit], "adapted_modules": [{**module, "project": "one | another"}]},
+        "an adapted module",
+    )
+    red(
+        plain,
+        {
+            "word_hits": [{**hit, "files": ["a/mod|ule.py"]}],
+            "adapted_modules": [{**module, "file": "a/mod|ule.py"}],
+        },
+        "an adapted module",
+    )
+    routed = next(w for w in wheels if w.get("route") == "highlight")
+    red(routed, {"route_reason": "it carries | a library"}, "not designated")
+    read = {"source": "a notice page", "date": "2026-10-05", "version": "1.0", "result": "none"}
+    assert problems(routed, {"route": "read", "read": read}) == []
+    for field in ("source", "version", "result"):
+        red(routed, {"route": "read", "read": {**read, field: "a\nb"}}, "a read route must")
+    # Note 2: line numbers belong to one file.
+    two = {**hit, "kind": "prose", "files": ["a/one.py", "a/two.py"]}
+    assert problems(plain, {"word_hits": [two]}) == []
+    red(plain, {"word_hits": [{**two, "lines": [3]}]}, "a word-search hit")
+    # Note 5: the source and data answers against the day the search ran.
+    stated = survey["search"]
+    run = dt.date.fromisoformat(stated["run"])
+    red(
+        plain,
+        {"forms_surveyed": str(run - dt.timedelta(days=1))},
+        "the source and data answers are dated before the search",
+    )
+    earlier = {**survey, "search": {**stated, "run": str(run - dt.timedelta(days=1))}}
+    found = component_readings.survey_problems(earlier, data, labels)
+    assert any(line.startswith("the survey's search ran on") for line in found), found
+    # A wheel nobody fetched was never searched, so its day cannot stand for the search's.
+    unfetched = [w for w in wheels if not component_readings._wheel_files(w)]
+    assert unfetched, f"no wheel in {_SURVEY.name} was left unfetched"
+    moved = str(run + dt.timedelta(days=30))
+    redated = [
+        {**w, "forms_surveyed": str(run)}
+        if w in unfetched
+        else {**w, "surveyed": moved, "forms_surveyed": moved}
+        for w in wheels
+    ]
+    found = component_readings.survey_problems({**survey, "wheels": redated}, data, labels)
+    assert any(line.startswith("the survey's search ran on") for line in found), found
 
 
 def test_the_survey_count_phrases_agree_at_a_count_of_one() -> None:

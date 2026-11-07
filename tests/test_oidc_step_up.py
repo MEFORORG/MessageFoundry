@@ -52,6 +52,7 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
 from tests._ast_sites import call_sites, find_funcs, parse_source
+from tests._enrolment_code import enrolment_code_for
 from tests.test_auth_oidc_service import (
     AUTH_CODE,
     DEFAULT_SUB,
@@ -1191,7 +1192,11 @@ async def _enrol_totp(
     pin_totp_clock(monkeypatch, _T0)
     enroll = await service.begin_mfa_enrollment(identity)
     confirmed = await service.confirm_mfa_enrollment(
-        identity, totp.totp(enroll.secret, now=_T0), token=token
+        identity,
+        totp.totp(enroll.secret, now=_T0),
+        token=token,
+        # ADR 0207: an unstamped federated session (the claim gate off) needs an issued code.
+        enrolment_code=await enrolment_code_for(service, identity.user_id),
     )
     assert confirmed.ok and confirmed.token is not None, confirmed
     pin_totp_clock(monkeypatch, _T1)
