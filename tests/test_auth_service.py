@@ -35,6 +35,7 @@ from messagefoundry.auth.service import AuthService, IssuedCredential, UsernameT
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, create_admin, create_local_user_chosen
+from tests._log_absence import assert_capture_sees
 
 GOOD_PASSWORD = "Sup3rSecret!!"
 NEW_PASSWORD = "An0ther-Str0ng-Pass!!"
@@ -773,6 +774,7 @@ async def test_a_deliberate_notices_off_setting_is_not_reported_as_a_drop(
                 disabled=None,
                 actor="admin",
             )
+        assert_capture_sees(caplog, _AUTH_LOGGER)
         assert [r for r in caplog.records if r.name == _AUTH_LOGGER] == []
     finally:
         await store.close()

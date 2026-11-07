@@ -58,6 +58,7 @@ from messagefoundry.pipeline.crl_reload import (
     reload_replaced_crls,
 )
 from messagefoundry.pki import crl_signature_finding, judge_crl_signatures
+from tests._log_absence import assert_capture_sees
 from tests.test_crl_bundle_anchors import _ku
 from tests.test_crl_held_copy_alert import _bundle_scan
 from tests.test_crl_reload import _ca_cert, _key_pem, _leaf
@@ -1303,6 +1304,7 @@ def test_a_failure_in_the_reload_s_check_is_raised_as_main_raised_it(
             with pytest.raises(RuntimeError, match="a defect in the check"):
                 crl_signature_finding(pem, ders)
             assert len(judged) == 2
+    assert_capture_sees(caplog, "messagefoundry.pki")
     assert [r for r in caplog.records if r.name == "messagefoundry.pki"] == []
 
 

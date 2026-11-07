@@ -2869,10 +2869,14 @@ def test_the_twelfth_sweep_probes_mfa_and_the_first_factor_order(
             f"AuthService.{enrol} is gone; the README and the early-adopter guide say TOTP and "
             "passkeys are built."
         )
+    # `require` delegates its checks to `_admit`, which every derived gate shares (BACKLOG #1197).
+    assert _called(ast.parse(textwrap.dedent(inspect.getsource(api_security.require))), "_admit"), (
+        "api.security.require no longer runs _admit, where the factor access gate lives."
+    )
     assert _called(
-        ast.parse(textwrap.dedent(inspect.getsource(api_security.require))), "mfa_satisfied"
+        ast.parse(textwrap.dedent(inspect.getsource(api_security._admit))), "mfa_satisfied"
     ), (
-        "api.security.require no longer asks mfa_satisfied; the docs say the factor is an access gate."
+        "api.security._admit no longer asks mfa_satisfied; the docs say the factor is an access gate."
     )
 
     # 2. Wave 2 (ADR 0197 Amendment A): the first factor of an account the requirement covers is

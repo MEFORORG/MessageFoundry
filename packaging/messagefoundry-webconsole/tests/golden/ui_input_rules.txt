@@ -87,6 +87,8 @@ POST /ui/uploaded-logs/file/{file_id}/resend	file_id	path	-	-
 POST /ui/uploaded-logs/file/{file_id}/resend	to	query	-	-
 POST /ui/users/{user_id}/channel-scope	user_id	path	-	-
 POST /ui/users/{user_id}/delete	user_id	path	-	-
+POST /ui/users/{user_id}/enrolment-code	user_id	path	-	-
+POST /ui/users/{user_id}/enrolment-code/revoke	user_id	path	-	-
 POST /ui/users/{user_id}/federated-identity/link	user_id	path	-	-
 POST /ui/users/{user_id}/federated-identity/unlink	user_id	path	-	-
 POST /ui/users/{user_id}/reset-mfa	user_id	path	-	-

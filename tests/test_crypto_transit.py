@@ -246,11 +246,13 @@ def test_unmarked_value_refused_unless_allowed(monkeypatch: pytest.MonkeyPatch) 
 
 def test_in_process_marker_fails_closed_in_transit_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     # An mfenc:v1/v2/v4 value is in-process AES-GCM; Transit holds no key that reads it — refuse, never
-    # mis-decrypt (a store switched to Transit must be rotated first).
+    # mis-decrypt. No command moves such a value into Transit, so the refusal must not name one
+    # (BACKLOG #2109); it used to say to rotate the store into Transit, which rotate-key refuses.
     _use_fake(monkeypatch)
     cipher = build_transit_cipher(StoreSettings())
-    with pytest.raises(CipherError, match="rotate"):
+    with pytest.raises(CipherError, match="no command moves it into Transit") as refused:
         cipher.decrypt("mfenc:v1:deadbeef:AAAA")
+    assert "rotate" not in str(refused.value)
 
 
 # --- selection seam -------------------------------------------------------------------------------

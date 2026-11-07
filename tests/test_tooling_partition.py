@@ -145,6 +145,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # (BACKLOG #1193). A Dockerfile edit sets `code=true` but NOT `tooling=true`, so listed as
         # tooling it would be deselected on the engine legs and unreached by the tooling path gate.
         "test_container_build_pins.py",
+        # Reads docker/Dockerfile's ENTRYPOINT and rglobs messagefoundry/**.py, and holds ci.yml's
+        # `docker` path arm to the named engine start-path modules (vault BACKLOG #3455). What
+        # breaks it includes at least a start-path module renamed or removed, an ENGINE diff, and an
+        # ENTRYPOINT edit, a docker/ diff. Neither of those trips the tooling path gate.
+        "test_ci_docker_gate.py",
         "test_cp1252_console_safety.py",
         # Arrived with #421 while this branch was in flight. Same shape as cp1252_console_safety and
         # licence_header_gate above: a repo-wide scanner over TRACKED TEXT, which includes
@@ -174,6 +179,13 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # which does not trip the tooling path gate, so as tooling it would face nothing there.
         "test_from_none_is_not_redaction.py",
         "test_licence_header_gate.py",
+        # NOT engine source, so this entry widens the list's stated rule, as
+        # test_conftest_name_collision_guard.py does and for the same reason. Its subject is
+        # tests/_log_absence.py, the positive control that at least the engine and console suites'
+        # log-absence checks call (vault BACKLOG #3766 item 9). A change to that helper arrives as
+        # a tests/ diff, which sets `code=true` but NOT `tooling=true`, so listed as tooling this
+        # would run on no leg for the change that breaks it.
+        "test_log_absence_helper.py",
         # Parses messagefoundry/api/app.py (the factories' allow_no_auth pass-through) and every
         # other source file outside tests/ off disk without importing them. What it guards is a
         # sign-in-off app appearing in shipped code, which can arrive as an ENGINE or harness diff
@@ -231,6 +243,15 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # via `-m 'not tooling'` AND out of every queue entry, where `ci-gate` reads a skipped need
         # as a pass -- the same defect ci.yml already records against `.gitignore` (BACKLOG #327).
         "test_security_txt_rfc9116.py",
+        # LEFT THE MANIFEST (vault BACKLOG #3652). NOT engine source, so this entry widens the
+        # list's stated rule, as test_conftest_name_collision_guard.py does. Its subject is the
+        # server-DB store suites (tests/test_postgres_store.py, tests/test_sqlserver_store.py and
+        # the others ci.yml's server-DB steps run): it AST-reads their messagefoundry imports and
+        # holds ci.yml's `serverdb` arm to admit each one. What breaks it includes an engine
+        # import added to one of those suites, a test diff that sets `code=true` but NOT
+        # `tooling=true`, and the merge_group arm pins `tooling=false`. Engine PR 2335 was that
+        # diff: it merged green, and the push run went red.
+        "test_serverdb_ci_coverage.py",
         # Engine-subject for the same reason as control_char_check and escape_sequence_check above,
         # and the reason is the one arm that does not use tmp_path: the screen's DEFAULT SCOPE is
         # messagefoundry/api/app.py and auth_routes.py, so test_the_live_api_scope_still_surfaces_the
@@ -306,6 +327,13 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # engine, which arrives as an ENGINE diff. Its one import of a test module is how it
         # shares that module's walk of the package.
         "test_vault_posture_census.py",
+        # Reads messagefoundry/**, messagefoundry_webconsole/** and messagefoundry_toolkit/** off
+        # disk through tests/_ast_sites.package_trees and pins the warn_query_credentials callers it
+        # can see there; its docstring lists at least the shapes it misses (vault BACKLOG #3766
+        # item 4). What breaks or blinds it is at least a caller added, moved or removed in one of
+        # those packages, or an edit to tests/_ast_sites.py; each arrives as an ENGINE, console,
+        # toolkit or tests/ diff, and the tooling path gate sees none of them.
+        "test_warn_query_credentials_callers.py",
     }
 )
 

@@ -3349,10 +3349,41 @@ jobs:
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
           fi
           # The container image smoke runs on PRs that touch the image, the per-profile locks, packaging,
-          # or this workflow (engine-wide regressions are already covered by the `test` job + push-to-main).
+          # this workflow, an engine module on the image's start path, or a rig file its steps run.
           # ci/locks/release-tools.lock is in because the image's builder stage installs from it
           # (BACKLOG #1193), so a bump to it can break the image build.
-          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|\.github/workflows/ci\.yml)'; then
+          #
+          # THE START-PATH ARM (vault BACKLOG #3455). The image's ENTRYPOINT is `python -m
+          # messagefoundry` (docker/Dockerfile), and this job is the only one that starts `serve` the
+          # way the container does: a non-root uid, root-owned anchors and config, a minted TLS pair,
+          # the enforcing PHI posture and an isolated interpreter. The `test` job runs the engine's
+          # unit tests, not that start. Push-to-main does not cover it either, because the push arm
+          # above writes docker=false. Of the engine, PR 2284 changed only __main__.py, api/app.py
+          # and auth/trust_anchors.py, so this job skipped on it, and the nightly run was the first
+          # to see the engine refuse the rig's syslog CA.
+          #
+          # The named modules, and what each is in for, at least: __init__ and __main__ (what `-m`
+          # runs, and the lazy exports the baked config imports); api/__init__ and api/app (the app
+          # factory and lifespan); api/tls and pki (the minted pair); auth/trust_anchors,
+          # auth/anchor_path and config/anchor (the anchor ownership rule); config/settings (the
+          # MEFOR_* values the rig sets); config/wiring (the config load and its root-ownership
+          # check); serviceenv, config/retention_classification, transports/egress and
+          # config/tls_policy (enforcing-start refusals the rig's settings are chosen to pass);
+          # logging_setup (the TLS log forwarder); startupcode and remotedebug (the interpreter
+          # posture); api/models and terminal_text (the posture fields the serve step reads back,
+          # and how the rig prints them); and auth/passwords (the rig Administrator's password
+          # check). The rest are rig files the steps run, and the helper make_syslog_ca_crl.py
+          # imports to mint the CA.
+          #
+          # NAMED MODULES, NOT `^messagefoundry/`, which would run this job on nearly every engine PR
+          # on the contended ubuntu pool. auth/service.py is left out although the rig provisions its
+          # Administrator through it, and a change there can red this job: it changes on many PRs for
+          # routes the smoke never takes. An engine start change outside this list is still first run
+          # by the nightly. A red here stops no merge either: the job is not a required context and
+          # not in ci-gate's needs (see the note above ci-gate). The merge_group and push arms are
+          # unchanged (#1830). tests/test_ci_docker_gate.py pins this alternation, and the measured
+          # run rate is in that file's docstring.
+          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|messagefoundry/(__init__|__main__|serviceenv|terminal_text|api/(__init__|app|models|tls)|auth/(trust_anchors|anchor_path|passwords)|pki|config/(anchor|retention_classification|settings|tls_policy|wiring)|transports/egress|logging_setup|startupcode|remotedebug)\.py$|harness/load/rigadmin\.py$|scripts/ci/make_syslog_ca_crl\.py$|tests/_phi_gate_provisions\.py$|\.github/workflows/ci\.yml)'; then
             echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"
@@ -4954,8 +4985,8 @@ jobs:
         # and run with exactly the privilege list the installer writes. One Server SKU each.
         # - localsystem (-AllowLocalSystem) is listed. Its first run is in the merge queue.
         # - localuser (-ServiceAccount, a local user created on the runner) is WIRED BUT NOT LISTED,
-        #   for the reason docs/SERVICE.md "Restrict the service token" gives (the store's
-        #   _hardening_refusal in messagefoundry/store/store.py). Add this row once that changes:
+        #   for the reason docs/SERVICE.md "Restrict the service token" gives (the installer's
+        #   read-back of the HOST\user spelling, BACKLOG #3938). Add this row once that changes:
         #     - { os: windows-2025, python-version: "3.14", account: localuser }
         # - A gMSA gets no leg. docs/SERVICE.md "Restrict the service token" says why.
         include:
@@ -5368,12 +5399,44 @@ jobs:
           # windows-2025, in the unit arm that runs the function against a temp directory: an
           # explicit one came through /inheritance:r /grant:r with icacls exiting 0 and reached the
           # logs directory beneath it.
-          $dirs = @("C:\ProgramData\MessageFoundry", "C:\ProgramData\MessageFoundry\logs")
+          #
+          # THE RUN-AS ACCOUNT MUST HOLD ITS GRANT ON BOTH (BACKLOG #1699). A lockdown that dropped
+          # -Account passes every check above, since it leaves SYSTEM and Administrators only, and
+          # the service could then not write its own store or logs. Set-SecureDataDirAcl writes
+          # "<account>:(OI)(CI)M"; icacls prints it (OI)(CI)(M) on the data directory, whose
+          # inheritance the lockdown cut, and (I)(OI)(CI)(M) on logs, which inherits it. Each
+          # directory must show its own form, and no Deny entry for the account may stand beside it.
+          # MATCHED AS THE NAME, A COLON AND THE RIGHTS TOGETHER, NEVER AS A BARE NAME: the path
+          # icacls echoes on its first line holds "MessageFoundry" too, so a substring test on the
+          # name passes with the entry gone.
+          # tests/test_service_install_manifest.py runs this script against stand-in icacls output.
+          # It reads icacls on purpose rather than lifting the installer's Get-WriteGrantProblem:
+          # a witness that shares the installer's code would pass the installer's own bug. The
+          # installer only warns on a missing grant, and the /health step below fails without
+          # naming the cause, so this step is where the cause is named.
+          #
+          # THE LOCALSYSTEM LEG HAS NO NAMED GRANT TO ASSERT. The installer writes none for
+          # LocalSystem ($ServiceAccount is empty on that leg), so that leg requires the entry
+          # LocalSystem writes through instead: SYSTEM's (OI)(CI)(F), which every leg gets.
+          # $grantee mirrors the Install step's for the other legs.
+          if ($env:SMOKE_ACCOUNT -eq "virtual") {
+            $grantee = "NT SERVICE\MessageFoundry"; $rights = "M"
+          } elseif ($env:SMOKE_ACCOUNT -eq "localuser") {
+            $grantee = "$env:COMPUTERNAME\$env:SMOKE_LOCAL_USER"; $rights = "M"
+          } elseif ($env:SMOKE_ACCOUNT -eq "localsystem") {
+            $grantee = "NT AUTHORITY\SYSTEM"; $rights = "F"
+          } else {
+            throw "unknown SMOKE_ACCOUNT '$env:SMOKE_ACCOUNT'"
+          }
+          # Each directory, with the inheritance flag its run-as entry must carry.
+          $dirs = [ordered]@{ "C:\ProgramData\MessageFoundry" = ""; "C:\ProgramData\MessageFoundry\logs" = "(I)" }
           $broad = @("S-1-1-0", "Everyone", "S-1-5-32-545", "BUILTIN\Users",
                      "S-1-5-11", "Authenticated Users", "S-1-5-32-546", "BUILTIN\Guests",
                      "S-1-3-4", "OWNER RIGHTS")
+          $entry = "(?m)(?:^|\s)" + [regex]::Escape("${grantee}:")
           $bad = @()
-          foreach ($d in $dirs) {
+          $missing = @()
+          foreach ($d in $dirs.Keys) {
             if (-not (Test-Path $d)) { throw "expected directory is missing: $d" }
             $acl = (& icacls $d | Out-String)
             "===== icacls $d ====="
@@ -5385,12 +5448,19 @@ jobs:
             foreach ($p in $broad) {
               if ($acl -match [regex]::Escape($p)) { $bad += "$d grants $p" }
             }
+            $want = $dirs[$d] + "(OI)(CI)($rights)"
+            if ($acl -notmatch ($entry + [regex]::Escape($want))) { $missing += "$d shows no '${grantee}:$want' entry" }
+            if ($acl -match ($entry + "(?:\(\w+\))*\(DENY\)")) { $missing += "$d carries a Deny entry for $grantee" }
           }
+          $bad | ForEach-Object { "BROAD ACCESS: $_" }
+          $missing | ForEach-Object { "NO RUN-AS GRANT: $_" }
           if ($bad.Count -gt 0) {
-            $bad | ForEach-Object { "BROAD ACCESS: $_" }
             throw "the data/log directory is reachable by a broad principal - the captured engine logs are a PHI sink (H-13, BACKLOG #1699)"
           }
-          "data-directory DACL OK: no broad principal on either directory"
+          if ($missing.Count -gt 0) {
+            throw "the data/log directory does not show the grant '$grantee' needs to write the store and logs (BACKLOG #1699); the icacls output above shows what it holds"
+          }
+          "data-directory DACL OK: no broad principal on either directory, and $grantee holds (OI)(CI)($rights) on the data directory and (I)(OI)(CI)($rights) on logs"
 
       - name: Start and verify /health
         run: |
@@ -6016,14 +6086,14 @@ jobs:
   # signed in, sends one synthetic ADT^A01 over the in-container MLLP listener, and asserts it FINALIZES
   # to PROCESSED (not merely RECEIVED — that distinguishes ACK-on-receipt from final disposition). Then
   # it verifies a graceful `docker stop`: tini forwards SIGTERM -> uvicorn lifespan -> engine.stop().
-  # Runs NIGHTLY + on dispatch; on PRs only when the image/locks/packaging/this workflow change
-  # (gated by `changes`), so docs/unrelated PRs don't pay the build. No longer per push-to-main —
+  # Runs NIGHTLY + on dispatch; on PRs only when `changes` sets docker=true (its comment lists the
+  # paths), so docs/unrelated PRs don't pay the build. No longer per push-to-main --
   # an image-touching merge was path-gated on its own PR minutes earlier (same rationale as the
   # server-DB legs; `changes` sets docker=false on push, the other half of this guard).
   docker-smoke:
     name: docker image smoke (slim, linux)
     needs: changes
-    # Nightly / on-demand, or a PR that touches the image/locks/packaging.
+    # Nightly / on-demand, or a PR that touches the image/locks/packaging or the engine start path.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     steps:
