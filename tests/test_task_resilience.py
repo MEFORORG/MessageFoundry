@@ -1157,6 +1157,7 @@ async def test_a_failed_start_claims_nothing(
     def fatal() -> None:
         raise RuntimeError("injected fatal start step")
 
+    real_activate = runner._activate_statement_batching
     monkeypatch.setattr(store, "claim_next_fifo", claim)
     monkeypatch.setattr(runner, "_activate_statement_batching", fatal)
     _yield_before_builds(monkeypatch)
@@ -1165,6 +1166,12 @@ async def test_a_failed_start_claims_nothing(
             await runner.start()
         assert claims == []
         assert not runner._running
+        # The control: the same rig, started for real, does see the worker's claims, each made
+        # once start() committed to running.
+        monkeypatch.setattr(runner, "_activate_statement_batching", real_activate)
+        await runner.start()
+        await _until(lambda: bool(claims), timeout=5.0)
+        assert all(claims), claims
     finally:
         await runner.stop()
         await store.close()

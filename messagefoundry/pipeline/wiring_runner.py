@@ -1951,8 +1951,8 @@ class RegistryRunner:
         self._stop = asyncio.Event()
         # Set once start() commits to running, cleared by a teardown. A per-lane worker spawned
         # before then waits on it before its first turn (:meth:`_after_start`), so a start that
-        # unwinds has claimed nothing and a worker cannot die unsupervised mid-start (Lander hold
-        # 6706244756).
+        # unwinds has had no per-lane claim and no per-lane worker can die unsupervised mid-start
+        # (Lander hold 6706244756). The pooled dispatchers are not gated by it.
         self._started = asyncio.Event()
         # Per-stage wake events so a producer wakes only its own downstream consumer class. A single
         # shared auto-clearing event would let an idle worker of one class swallow another class's
@@ -6990,7 +6990,9 @@ class RegistryRunner:
             finally:
                 started.cancel()
                 stopped.cancel()
-            if self._stop.is_set():
+            # Decided from the commit itself, not from which wait woke: run only if start()
+            # committed and no stop has come since.
+            if not self._started.is_set() or self._stop.is_set():
                 return
         await work()
 
