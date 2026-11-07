@@ -5677,9 +5677,9 @@ class RegistryRunner:
         **Called BEFORE the outbound lanes are built, and that placement is the fix rather than a
         detail.** Pooled replays ``_outbound_paused`` onto the fresh OUTBOUND dispatcher at
         :meth:`_start_pooled_dispatchers` step 2.5, and a per_lane delivery worker reads
-        ``_outbound_resume`` at its loop-top gate from the moment :meth:`_spawn_worker` starts it.
-        Pausing after the build loop — where the intake half runs — would leave a window in both modes
-        for exactly the delivery this refuses.
+        ``_outbound_resume`` at its loop-top gate on its first turn, which :meth:`_after_start` holds
+        until start() commits. Pausing after the build loop — where the intake half runs — would leave
+        a window in pooled mode for exactly the delivery this refuses.
 
         Shares :meth:`_pause_delivery_lanes` with the mid-run halt, which owns how a lane goes down
         and what that leaves behind. Recovery is unchanged: :meth:`start_outbound` /
