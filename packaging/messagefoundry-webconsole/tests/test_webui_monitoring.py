@@ -409,6 +409,34 @@ async def test_dr_routes_pass_a_fresh_step_up_through_to_the_handler(
         assert "not a DR standby" in r.text
 
 
+async def test_a_degraded_dr_activation_is_shown_to_the_operator(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An activation whose reload left a step unfinished is answered with the usual redirect, so
+    a refresh never re-POSTs the promotion, and the status page it lands on names the step. Red
+    (Lander hold 6702318430, item B): the action dropped the result, and nothing on the status
+    page said the activation was degraded."""
+    from messagefoundry.pipeline.dr import DrResult
+
+    class _Coordinator:
+        activation_failures = ("outbound_close",)
+
+        async def activate(self, **_kwargs: object) -> DrResult:
+            monkeypatch.setattr(engine, "_dr_active", True)
+            return DrResult(
+                action="activate", active=True, threshold="critical", failures=("outbound_close",)
+            )
+
+    monkeypatch.setattr(engine, "_dr_coordinator", _Coordinator())
+    service = await _service(engine)
+    async with _boss_client(engine, service) as c:
+        r = await c.post("/ui/dr/activate", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 303 and r.headers["location"] == "/ui/status"
+        page = await c.get("/ui/status")
+        assert page.status_code == 200
+        assert "Unfinished steps" in page.text and "outbound_close" in page.text
+
+
 def test_alerts_builder_renders_write_controls() -> None:
     from messagefoundry.api.models import (
         AlertInstanceInfo,

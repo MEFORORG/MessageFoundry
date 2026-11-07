@@ -964,7 +964,14 @@ async def test_a_dead_per_lane_worker_is_respawned_and_its_lane_delivers(
             monkeypatch.setattr(runner, spawn, lambda *a, **k: None)
         armed = _kill_per_lane_worker(runner, store, stage, monkeypatch)
 
-        await _until(first.done, timeout=5.0)
+        # asyncio.wait, not a poll of first.done: the supervisor is the dead task's done-callback,
+        # registered at spawn, so it runs before wait's own and the test resumes only after it. A
+        # poll can resume on the pass that finished the task, before the supervisor ran. Off-loop
+        # builds in start() let the delivery worker claim and park on its idle wait before start()
+        # returns, so the injected fault no longer lands on its first claim, and the poll lost
+        # that race (engine PR 2815, Lander hold 6705921002).
+        await asyncio.wait({first}, timeout=5.0)
+        assert first.done()
         assert armed == {"claim_faults": 1, "sleep_raises": 1}
         exc = first.exception()
         assert isinstance(exc, RuntimeError) and "injected death" in str(exc), exc

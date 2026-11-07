@@ -2,28 +2,53 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Gaps in the generic ODBC remote-path walk that engine PR 2671 added (vault BACKLOG #5197).
 
-Each test names the row's item it pins, and each was red on the code before the fix. The walk
-takes its file system as injected callables (``probe``, ``drive_type``, ``drive_target``, ``cwd``)
-and reads paths with ``ntpath``, so every test here runs on any platform. Every fix moves a verdict
-toward ``None`` (could not clear) or ``True`` (leads off the host), never toward ``False``.
+Each test names the row's item it pins. Each was red on the code before its fix, except the ones
+whose docstring calls them a control. The walk takes its file system as injected callables
+(``probe``, ``drive_type``, ``drive_target``, ``cwd``) and reads paths with ``ntpath``, so the
+tests run on any platform, apart from the real-reader halves of findings 4, 5 and 9. Every fix
+moves a verdict toward ``None`` (could not clear) or ``True`` (leads off the host), with one
+exception: turn 2's PR 2738 finding 1 moves a subst drive onto a bare drive (``\\??\\C:``), which
+the walk refused for a cause that was not there, to ``False``, where the walk now reads the path
+it stands for.
 
 Synthetic paths and host names only.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import copy
 import logging
+import os
 import pickle
-from collections.abc import Callable, Mapping
+import re
+import sys
+import threading
+import time
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from messagefoundry.api.app import _run_connection_test
 from messagefoundry.auth import anchor_path
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import DIRECTORY, FILE, LINK, windows_chain
+from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.wiring import (
+    ConnectionSpec,
+    Database,
+    DatabasePoll,
+    File,
+    Registry,
+    build_inbound_connection,
+    build_outbound_connection,
+)
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.store import MessageStore
 from messagefoundry.transports import database
 
 _FIXED = 3  # GetDriveTypeW: a fixed disk
@@ -388,3 +413,1070 @@ def test_review_an_empty_sslca_is_left_to_the_build() -> None:
         "odbc_params": {"SSLMODE": "VERIFY_IDENTITY", "SSLCA": ""},
     }
     assert ta.database_ca_anchor_spec("OB_DB_GEN", settings) is None
+
+
+# === turn 2 of #5197 =============================================================================
+
+_OUT = "OB_DB_GEN"
+_IN = "IB_DB_GEN"
+_GENERIC: dict[str, Any] = {
+    "dialect": "generic",
+    "odbc_driver": "MySQL ODBC 9.1 Unicode Driver",
+    "server": "db.synthetic.test",
+}
+
+
+def _generic(**params: object) -> dict[str, Any]:
+    return {**_GENERIC, "odbc_params": {"SSLMODE": "VERIFY_IDENTITY", **params}}
+
+
+# --- PR 2738 finding 1: a subst drive onto a bare drive ------------------------------------------
+
+
+def test_finding_1_a_subst_drive_onto_a_bare_drive_is_walked(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``DefineDosDevice`` can stand a letter for a bare drive (``\\??\\C:``), so ``S:\\ca.pem`` is
+    ``C:\\ca.pem``. Red: the walk judged the target ``C:`` alone as drive-relative, refused it and
+    warned a cause that was not there."""
+    caplog.set_level(logging.WARNING, logger=database.logger.name)
+    assert _walk(r"S:\ca.pem", substs={"S:": "\\??\\C:"}) is False
+    assert caplog.records == []
+    links = {r"C:\ca.pem": _SHARE + r"\ca.pem"}
+    assert _walk(r"S:\ca.pem", links, substs={"S:": "\\??\\C:"}) is True
+    _chain, cause = windows_chain(
+        r"S:\ca.pem",
+        _no_cwd,
+        _probe(),
+        drive_target=lambda d: "\\??\\C:" if d.upper() == "S:" else None,
+    )
+    assert cause is None
+
+
+def test_finding_1_a_drive_relative_subst_target_is_still_a_cause() -> None:
+    """The control: a target with a drive and no separator before the rest stays a cause."""
+    assert _walk(r"S:\ca.pem", substs={"S:": "\\??\\C:certs"}) is None
+
+
+# --- PR 2738 findings 4, 5 and 9: one QueryDosDeviceW reader -------------------------------------
+
+
+def test_finding_5_both_walks_read_a_subst_drive_through_one_reader() -> None:
+    """Red: database kept its own ``QueryDosDeviceW`` reader, with its own error text."""
+    assert vars(database)["query_drive_target"] is anchor_path.query_drive_target
+    if sys.platform == "win32":
+        assert anchor_path.windows_host_readers().drive_target is anchor_path.query_drive_target
+
+
+def test_finding_4_a_drive_read_cause_keeps_its_code_and_says_it_once() -> None:
+    """The reader's error names the Win32 code in ``strerror``. Red on Windows, with the real
+    reader: database's error was one argument, so the cause read "could not be read: the drive S:
+    could not be read (winerror 6)", and the path-free kind read only "OSError"."""
+
+    def unread(_drive: str) -> str | None:
+        if sys.platform == "win32":
+            return anchor_path.query_drive_target("C:\\")  # error 6, as finding 9 measures
+        raise OSError(None, "Win32 error 6 (The handle is invalid.)")
+
+    _chain, cause = windows_chain(r"S:\ca.pem", _no_cwd, _probe(), drive_target=unread)
+    assert cause is not None
+    assert cause.count("could not be read") == 1
+    assert re.search(r"Win32 error [0-9]+ ", cause.kind) and "S:" not in cause.kind
+
+
+def test_finding_9_the_drive_reader_raises_for_a_failed_query() -> None:
+    """On Windows the real reader raises for a failed query other than "no such device", and
+    answers ``None`` for a real volume. ``C:\\`` is not a device name, and ``QueryDosDeviceW``
+    answers it with error 6 (measured on Windows 11, 2026-11-05). Red: the reader did not exist
+    outside ``windows_host_readers``, so nothing pinned its raise."""
+    if sys.platform != "win32":
+        with pytest.raises(OSError):
+            anchor_path.query_drive_target("C:")
+        return
+    with pytest.raises(OSError, match=r"Win32 error [0-9]+ ") as refused:
+        anchor_path.query_drive_target("C:\\")
+    assert refused.value.strerror is not None and refused.value.strerror.startswith("Win32 error ")
+    assert anchor_path.query_drive_target(os.environ.get("SYSTEMDRIVE", "C:")) is None
+
+
+# --- PR 2738 finding 2: sslkey and sslpassword read by the text sent -----------------------------
+
+
+def test_finding_2_an_sslkey_of_zero_counts_as_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The build sends ``SSLKEY=0``, so the key comes from the file ``0``, which its own check
+    reads, and ``sslcert`` is not read for a key. Red: truthiness read ``0`` as unset."""
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: False)
+    read: list[str] = []
+
+    def reading(path: str, _limit: int) -> bytes:
+        read.append(path)
+        return b"-----BEGIN CERTIFICATE-----\n"
+
+    monkeypatch.setattr(database, "read_if_regular", reading)
+    database._refuse_weak_driver_cert({"sslkey": 0, "sslcert": "client.pem"})
+    assert read == []
+    database._refuse_weak_driver_cert({"sslcert": "client.pem"})  # the control: no sslkey
+    assert read == ["client.pem"]
+
+
+def test_finding_2_an_sslpassword_of_zero_counts_as_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The build sends ``sslpassword=0``, a passphrase the driver unlocks with, so the wrap check
+    is told one was given. Red: truthiness told it none was."""
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: False)
+    monkeypatch.setattr(database, "read_if_regular", lambda _p, _n: b"synthetic key")
+    given: list[bool] = []
+
+    def recording(_data: bytes, **kwargs: Any) -> None:
+        given.append(kwargs["passphrase_given"])
+
+    monkeypatch.setattr(database, "refuse_weak_key_wrap", recording)
+    database._refuse_weak_driver_key({"sslkey": "client.key", "sslpassword": 0})
+    database._refuse_weak_driver_key({"sslkey": "client.key"})  # the control: none given
+    assert given == [True, False]
+
+
+# --- PR 2738 finding 6: one literal check for the build and the lane check ------------------------
+
+
+@pytest.mark.parametrize("value", [True, "C:\\certs\\ca.pem ", "C:\\certs;\\ca.pem"])
+def test_finding_6_the_lane_check_refuses_a_value_with_the_builds_own_text(
+    monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
+    """The lane check and the build refuse a boolean or a bad literal through one function, so the
+    two refusals cannot drift apart. Red: the lane check copied the boolean check with its own
+    wording."""
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: False)
+    settings = _generic(SSLCA=value)
+    with pytest.raises(ValueError) as built:
+        database._build_odbc_dsn(settings, connection=_OUT)
+    with pytest.raises(ValueError) as checked:
+        ta.database_ca_anchor_spec(_OUT, settings)
+    assert str(checked.value) == str(built.value)
+
+
+# --- closing step 4, ask item 18: the lane check judges every driver file keyword ----------------
+
+
+@pytest.mark.parametrize("keyword", ["SSLCAPATH", "SSLCERT", "SSLKEY"])
+@pytest.mark.parametrize("verdict", [True, None])
+def test_item_18_the_lane_check_refuses_a_driver_path_that_turned_remote(
+    monkeypatch: pytest.MonkeyPatch, keyword: str, verdict: bool | None
+) -> None:
+    """A path the build cleared that later leads off the host, or that the walk can no longer
+    clear, is refused at the lane check, as ``sslca`` is. The refusal names the keyword, never the
+    path. Red: the lane check judged ``sslca`` only, so these got no refusal."""
+    settings = _generic(**{keyword: r"C:\phi-name\client.pem"})
+    assert ta.lane_anchor_spec("outbound", _OUT, settings) is None  # cleared at the build
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: verdict)
+    for direction, name in (("outbound", _OUT), ("inbound", _IN)):
+        with pytest.raises(ValueError, match=f"odbc_params {keyword.lower()} must be a") as refused:
+            ta.lane_anchor_spec(direction, name, settings)
+        assert "phi-name" not in str(refused.value)
+
+
+@pytest.mark.parametrize("keyword", ["SSLCAPATH", "SSLCERT", "SSLKEY"])
+def test_item_18_a_poller_naming_only_another_driver_path_is_lane_checked(keyword: str) -> None:
+    """A ``DatabasePoll`` with no ``sslca`` still goes to the lane check when it names another
+    driver file, and a refused one names that keyword. Red: the gate counted ``sslca`` only."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.pipeline import wiring_runner
+
+    settings = _generic(**{keyword: r"C:\certs\client.pem"})
+    assert ta.inbound_lane_reads_ca(ConnectorType.DATABASE, settings)
+    assert wiring_runner._refused_setting_keys(settings) == f"odbc_params {keyword.lower()}"
+    both = _generic(SSLCA=r"C:\certs\ca.pem", **{keyword: r"C:\certs\client.pem"})
+    assert wiring_runner._refused_setting_keys(both) == f"odbc_params sslca or {keyword.lower()}"
+    # The controls: no driver file, and a blank one, count for nothing.
+    assert not ta.inbound_lane_reads_ca(ConnectorType.DATABASE, _generic())
+    assert not ta.inbound_lane_reads_ca(ConnectorType.DATABASE, _generic(**{keyword: ""}))
+
+
+async def test_item_18_the_real_lane_check_refuses_it_as_a_setting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from messagefoundry.store import MessageStore
+
+    store = await MessageStore.open(tmp_path / "audit.db")
+    try:
+        check = ta.make_lane_anchor_check(store, enforcing=True)
+        monkeypatch.setattr(database, "_path_verdict", lambda _p: True)
+        with pytest.raises(ta.AnchorSettingRefused, match="odbc_params sslkey must be a"):
+            await check("outbound", _OUT, _generic(SSLKEY=r"C:\certs\client.key"))
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("value", [True, " client.key", ""])
+def test_item_18_a_value_the_build_refuses_is_not_walked_by_the_lane_check(
+    monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
+    """A boolean or padded value is refused before any walk, and an empty one is left to the
+    build's refusal, as for ``sslca``."""
+
+    def never(_path: str) -> bool | None:
+        raise AssertionError("a value the build refuses must not be walked")
+
+    monkeypatch.setattr(database, "_path_verdict", never)
+    settings = _generic(SSLKEY=value)
+    if value == "":
+        assert ta.lane_anchor_spec("outbound", _OUT, settings) is None
+        return
+    with pytest.raises(ValueError, match="sslkey"):
+        ta.lane_anchor_spec("outbound", _OUT, settings)
+
+
+# --- closing step 4: the entries of an SSLCAPATH folder ------------------------------------------
+
+
+def _capath(tmp_path: Path, *names: str) -> Path:
+    folder = tmp_path / "phi-capath"
+    folder.mkdir()
+    for name in names:
+        (folder / name).write_bytes(b"synthetic")
+    return folder
+
+
+def _entry_verdicts(
+    monkeypatch: pytest.MonkeyPatch, verdicts: Mapping[str, bool | None]
+) -> list[str]:
+    """Stand the probe and ``_path_verdict`` in: an entry named in ``verdicts`` is a link, which
+    takes the full walk and gets its verdict there; any other entry is a plain file, and any other
+    path walks ``False``. The walk beyond the spelling runs as on Windows. Returns the paths the
+    full walk judged."""
+    judged: list[str] = []
+
+    def verdict(path: str) -> bool | None:
+        judged.append(path)
+        return verdicts.get(os.path.basename(path), False)
+
+    def probe(path: str) -> tuple[str, str | None]:
+        if os.path.basename(path) in verdicts:
+            return LINK, r"C:\elsewhere"
+        return FILE, None
+
+    monkeypatch.setattr(database, "_WALKS_BEYOND_SPELLING", True)
+    monkeypatch.setattr(database, "_path_verdict", verdict)
+    monkeypatch.setattr(database, "_win_probe", probe)
+    return judged
+
+
+@pytest.mark.parametrize("verdict", [True, None])
+def test_closing_step_4_an_sslcapath_entry_that_leaves_the_host_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, verdict: bool | None
+) -> None:
+    """A driver opens ``<hash>.0`` in the folder by name, so a link there onto a share leads its CA
+    lookup off the host. The build and the lane check refuse it, naming the keyword and never the
+    path. Red: no entry was judged."""
+    folder = _capath(tmp_path, "0a1b2c3d.0", "readme.txt")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": verdict})
+    settings = _generic(SSLCAPATH=str(folder))
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list") as built:
+        database._build_odbc_dsn(settings, connection=_OUT)
+    with pytest.raises(ValueError, match="sslcapath must name a folder it can list") as checked:
+        ta.lane_anchor_spec("outbound", _OUT, settings)
+    for refused in (built, checked):
+        assert "phi-capath" not in str(refused.value)
+
+
+def test_closing_step_4_a_local_sslcapath_folder_passes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The control: none leaves the host, so the build and the lane check pass. A plain entry is
+    judged by its probe alone, and a link takes the full walk, which clears it here."""
+    folder = _capath(tmp_path, "0a1b2c3d.0", "0a1b2c3d.1")
+    judged = _entry_verdicts(monkeypatch, {"0a1b2c3d.1": False})
+    settings = _generic(SSLCAPATH=str(folder))
+    database._build_odbc_dsn(settings, connection=_OUT)
+    assert ta.lane_anchor_spec("outbound", _OUT, settings) is None
+    walked = sorted(os.path.basename(p) for p in judged if p != str(folder))
+    assert walked == ["0a1b2c3d.1", "0a1b2c3d.1"]  # once by the build, once by the lane check
+
+
+@pytest.mark.parametrize("name", ["a.0:stream", "a.0 ", "a.0."])
+def test_closing_step_4_an_entry_the_walk_ends_on_takes_the_full_walk(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """A name the walk ends on is never cleared by its probe alone. The probe would read it as a
+    plain file; the full walk answers a cause. Synthetic names, so no folder is listed."""
+    walked: list[str] = []
+    monkeypatch.setattr(database, "_win_probe", lambda _p: (FILE, None))
+
+    def verdict(path: str) -> bool | None:
+        walked.append(path)
+        return None
+
+    monkeypatch.setattr(database, "_path_verdict", verdict)
+    assert database._capath_entry_clear(rf"C:\capath\{name}", name) is False
+    assert walked == [rf"C:\capath\{name}"]
+
+
+def test_closing_step_4_an_entry_the_probe_cannot_read_takes_the_full_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unreadable(_path: str) -> tuple[str, str | None]:
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(database, "_win_probe", unreadable)
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: None)
+    assert database._capath_entry_clear(r"C:\capath\a.0", "a.0") is False
+
+
+def test_closing_step_4_a_folder_on_an_unreached_share_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Windows raises a share it could not reach (53, 67) as not found. Read as a missing folder,
+    the value was cleared with no entry judged. Red: it was left to the driver."""
+    folder = _capath(tmp_path, "a.0")
+    _entry_verdicts(monkeypatch, {})
+    real = os.scandir
+
+    def unreached(path: str) -> Any:
+        if os.fspath(path) == str(folder):
+            exc = FileNotFoundError(2, "not reached")
+            exc.winerror = 53  # type: ignore[attr-defined]
+            raise exc
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", unreached)
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
+        database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
+
+
+def test_closing_step_4_the_refusal_fits_a_stored_failure() -> None:
+    """A stored failure keeps about the first 200 characters, so the rule must end inside them for
+    a connection name of ordinary length. Red: the entry rule ran past 200 and was cut."""
+    prefix = "connection 'OB_ACME_LAB_DB'; DATABASE odbc_params value for 'sslcapath' "
+    assert len(prefix + database.CAPATH_ENTRY_RULE) <= 200
+    assert len(prefix + database.REMOTE_PATH_RULE) <= 200
+
+
+def test_item_18_a_dialect_that_is_not_text_answers_no_value_on_the_lane_check() -> None:
+    """A dialect that is not text answers no value, as before item 18, so the build refuses the
+    dialect itself. Red: the lane check refused the keyword as None, before the build ran."""
+    settings = {**_generic(SSLKEY=r"C:\certs\client.key"), "dialect": None}
+    assert ta.lane_anchor_spec("outbound", _OUT, settings) is None
+
+
+def test_closing_step_4_a_folder_past_the_entry_cap_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A folder the check would take too long to judge is refused rather than judged in part."""
+    folder = _capath(tmp_path, "a.0", "b.0", "c.0")
+    _entry_verdicts(monkeypatch, {})
+    monkeypatch.setattr(database, "_MAX_CAPATH_ENTRIES", 2)
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
+        database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
+
+
+def test_closing_step_4_a_folder_that_cannot_be_listed_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    folder = _capath(tmp_path, "a.0")
+    _entry_verdicts(monkeypatch, {})
+
+    real = os.scandir
+
+    def denied(path: str) -> Any:
+        if os.fspath(path) == str(folder):
+            raise PermissionError(13, "denied", str(folder))
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", denied)
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
+        database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warned and all("phi-capath" not in m for m in warned)
+
+
+@pytest.mark.parametrize("raised", [FileNotFoundError, NotADirectoryError, PermissionError])
+def test_closing_step_4_a_listing_that_fails_partway_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    raised: type[OSError],
+) -> None:
+    """A folder that opens and then fails while it is listed was judged in part. Read as a missing
+    folder, the value was cleared with the remaining entries unjudged. Red: a not-found or
+    not-a-folder raised partway left it to the driver. The PermissionError case is a control: it
+    was refused before the fix too."""
+    folder = _capath(tmp_path, "a.0", "b.0")
+    _entry_verdicts(monkeypatch, {})
+    real = os.scandir
+
+    class Partway:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __enter__(self) -> Partway:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            self._inner.close()
+
+        def __iter__(self) -> Iterator[Any]:
+            yield next(self._inner)
+            raise raised(2, "gone partway", str(folder))
+
+    def partway(path: str) -> Any:
+        if os.fspath(path) == str(folder):
+            return Partway(real(path))
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", partway)
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
+        database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("an sslcapath folder could not be listed: gone partway" in m for m in warned)
+    assert all("phi-capath" not in m for m in warned)
+
+
+def test_closing_step_4_a_missing_folder_or_a_file_is_left_to_the_driver(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Left to the driver, as a missing file is, and said at DEBUG with the keyword and the
+    reason, never the path. Red: nothing was logged."""
+    _entry_verdicts(monkeypatch, {})
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    single = tmp_path / "phi-ca.pem"
+    single.write_bytes(b"synthetic")
+    for value in (tmp_path / "phi-absent", single):
+        caplog.clear()
+        database._build_odbc_dsn(_generic(SSLCAPATH=str(value)), connection=_OUT)
+        left = [r for r in caplog.records if "left to the driver" in r.getMessage()]
+        assert left and all(r.levelno == logging.DEBUG for r in left)
+        for message in (r.getMessage() for r in left):
+            assert "sslcapath" in message
+            assert "phi-" not in message and str(tmp_path) not in message
+
+
+def test_closing_step_4_the_entries_are_not_listed_where_only_the_spelling_is_checked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On POSIX the check reads nothing beyond the spelling (docs/CONNECTIONS.md), so the folder is
+    not listed there."""
+    folder = _capath(tmp_path, "a.0")
+
+    real = os.scandir
+
+    def never(path: str) -> Any:
+        if os.fspath(path) == str(folder):
+            raise AssertionError("the folder must not be listed")
+        return real(path)
+
+    monkeypatch.setattr(database, "_WALKS_BEYOND_SPELLING", False)
+    monkeypatch.setattr(os, "scandir", never)
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: False)
+    database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
+
+
+@pytest.mark.parametrize("walks", [True, False])
+def test_closing_step_4_a_refused_folder_never_reads_as_clear(
+    monkeypatch: pytest.MonkeyPatch, walks: bool
+) -> None:
+    """Given verdicts that refuse the folder itself, the entry judgement answers "refuse" too, on
+    its own, rather than finding no spelling to list and answering clear. Red: it answered clear."""
+    monkeypatch.setattr(database, "_WALKS_BEYOND_SPELLING", walks)
+    folder = r"S:\certs"
+    assert database._capath_entries_leave_host(folder, {folder: True}) is True
+    assert database._capath_entries_leave_host(folder, {folder: None}) is True
+
+
+# === engine PR 2815 hold ========================================================================
+
+# --- F1: a walk that finds another host says which check found it ------------------------------
+
+
+def _unreached(path: str) -> OSError:
+    exc = FileNotFoundError(2, "not reached", path)
+    exc.winerror = 53  # type: ignore[attr-defined]
+    return exc
+
+
+@pytest.mark.parametrize(
+    ("walk", "kind"),
+    [
+        (
+            lambda: _walk(r"C:\phi-name\a.0", {r"C:\phi-name\a.0": _SHARE + r"\ca.pem"}),
+            "a link on the path leads to a share",
+        ),
+        (
+            lambda: _walk(r"S:\phi-name\a.0", substs={"S:": "\\??\\UNC\\files.test\\share"}),
+            "network share",
+        ),
+        (
+            lambda: database._windows_path_verdict(
+                r"Z:\phi-name\a.0",
+                probe=_probe(),
+                drive_type=lambda _root: database._DRIVE_REMOTE,
+                drive_target=lambda _drive: None,
+                cwd=r"C:\work",
+            ),
+            "network drive",
+        ),
+        (
+            lambda: _walk(r"C:\phi-name\a.0", failing={r"C:\phi-name": _unreached(r"C:\phi-name")}),
+            "could not reach",
+        ),
+    ],
+)
+def test_hold_f1_a_walk_that_finds_another_host_warns_the_check(
+    caplog: pytest.LogCaptureFixture, walk: Callable[[], bool | None], kind: str
+) -> None:
+    """``CAPATH_ENTRY_RULE`` sends the operator to the server log for the check that failed, so
+    every arm that refuses logs one: the check's kind at WARNING, the path at DEBUG only. Red: the
+    arms that found another host returned ``True`` and logged nothing."""
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    assert walk() is True
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(kind in m for m in warned), warned
+    assert all("phi-name" not in m for m in warned)
+    debugged = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+    assert any("phi-name" in m for m in debugged)
+
+
+def test_hold_f1_an_sslcapath_entry_linked_onto_a_share_is_refused_with_a_logged_check(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The case the hold names: an entry of the folder that links onto a share. Red: refused with
+    no line in the log, where the refusal says the log names the check."""
+    entry = r"C:\capath\phi-entry.0"
+    monkeypatch.setattr(database, "_win_probe", lambda _p: (LINK, _SHARE + r"\ca.pem"))
+    monkeypatch.setattr(
+        database, "_path_verdict", lambda p: _walk(p, {entry: _SHARE + r"\ca.pem"}, cwd=_no_cwd)
+    )
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    assert database._capath_entry_clear(entry, "phi-entry.0") is False
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("a link on the path leads to a share" in m for m in warned), warned
+    assert all("phi-entry" not in m for m in warned)
+
+
+# --- F2: a serving engine never lists an sslcapath folder on the event loop ---------------------
+
+
+def _db_spec(folder: Path, statement: str = "INSERT INTO t (a) VALUES (:a)") -> ConnectionSpec:
+    return Database(
+        server="db.synthetic.test",
+        statement=statement,
+        dialect="generic",
+        odbc_driver="MySQL ODBC 9.1 Unicode Driver",
+        odbc_params={"SSLMODE": "VERIFY_IDENTITY", "SSLCAPATH": str(folder)},
+    )
+
+
+def _db_graph(folder: Path, statement: str = "INSERT INTO t (a) VALUES (:a)") -> Registry:
+    """One generic DATABASE outbound whose ``sslcapath`` names ``folder``."""
+    reg = Registry()
+    reg.add_outbound(build_outbound_connection(_OUT, _db_spec(folder, statement)))
+    return reg
+
+
+@pytest.fixture
+async def db_store(tmp_path: Path) -> AsyncIterator[MessageStore]:
+    s = await MessageStore.open(tmp_path / "hold-f2.db")
+    yield s
+    await s.close()
+
+
+def _db_runner(store: MessageStore, reg: Registry) -> RegistryRunner:
+    return RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
+
+
+async def _no_probe(_self: object) -> None:
+    """Stands in for a coroutine method the test does not exercise."""
+    return None
+
+
+class _LoopWatch:
+    """Each listing of an sslcapath folder, recorded with the thread it ran on and whether a
+    coroutine on the event loop ran while it took ``seconds``. A listing on the loop thread holds
+    the loop, so the coroutine cannot run during it."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, seconds: float = 0.0) -> None:
+        self.threads: list[int] = []
+        self.loop_ran: list[bool] = []
+        self._seconds = seconds
+        self._ticks = 0
+        real = database._capath_folder_clear
+
+        def listing(folder: str) -> bool:
+            self.threads.append(threading.get_ident())
+            before = self._ticks
+            time.sleep(self._seconds)  # a slow listing, as of a large folder or a slow volume
+            self.loop_ran.append(self._ticks > before)
+            return real(folder)
+
+        monkeypatch.setattr(database, "_capath_folder_clear", listing)
+
+    @contextlib.asynccontextmanager
+    async def ticking(self) -> AsyncIterator[None]:
+        """Run a coroutine that counts on the loop while the body runs."""
+        stop = asyncio.Event()
+
+        async def tick() -> None:
+            while not stop.is_set():
+                self._ticks += 1
+                await asyncio.sleep(0.005)
+
+        task = asyncio.create_task(tick())
+        try:
+            yield
+        finally:
+            stop.set()
+            await task
+
+
+async def test_hold_f2_a_reload_lists_the_folder_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore
+) -> None:
+    """A reload's build check and its rebuild of the changed lane each list the folder, and
+    neither holds the event loop while it does. Red: both listed on the loop thread, and the
+    concurrent coroutine did not run during either listing."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+    runner = _db_runner(db_store, _db_graph(folder))
+    await runner.start()
+    try:
+        watch = _LoopWatch(monkeypatch, seconds=0.2)
+        async with watch.ticking():
+            await runner.reload(_db_graph(folder, "INSERT INTO t (b) VALUES (:b)"))
+        assert len(watch.threads) == 2, watch.threads  # the build check, then the rebuild
+        assert threading.get_ident() not in watch.threads
+        assert all(watch.loop_ran), watch.loop_ran
+    finally:
+        await runner.stop()
+
+
+async def test_hold_f2_a_connection_test_lists_the_folder_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore
+) -> None:
+    """The connection test builds a fresh connector, and its listing does not hold the event loop.
+    Red: the test built it on the loop thread."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+
+    monkeypatch.setattr(database.DatabaseDestination, "test_connection", _no_probe)
+    runner = _db_runner(db_store, _db_graph(folder))
+    watch = _LoopWatch(monkeypatch, seconds=0.2)
+    async with watch.ticking():
+        result = await _run_connection_test(runner, _OUT, "outbound")
+    assert result.success, result.detail
+    assert len(watch.threads) == 1 and threading.get_ident() not in watch.threads
+    assert all(watch.loop_ran), watch.loop_ran
+
+
+async def test_hold_f2_no_lane_start_skips_the_entry_walk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore
+) -> None:
+    """The walk runs in the build itself, so no path can build a connector that skips it, even one
+    that never awaits ``validate_startup``. A refused entry still fails the lane before it serves,
+    with the build's own refusal. Red: a lane start left the walk to ``validate_startup``, so with
+    that not awaited the entry was never judged and the lane served."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
+
+    monkeypatch.setattr(database.DatabaseDestination, "validate_startup", _no_probe)
+    watch = _LoopWatch(monkeypatch)
+    runner = _db_runner(db_store, _db_graph(folder))
+    await runner.start()
+    try:
+        assert watch.threads and threading.get_ident() not in watch.threads
+        assert _OUT not in cast(Any, runner)._destinations
+        failure = cast(Any, runner)._failed.get(("outbound", _OUT))
+        assert failure is not None
+        assert "'sslcapath' must name a folder it can list" in str(failure)
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("direction", ["outbound", "inbound"])
+async def test_hold_f2_a_build_on_a_running_loop_still_refuses_at_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, direction: str
+) -> None:
+    """The control: constructing a connector directly judges the entries and refuses in the
+    constructor, whatever thread or loop it runs on, as ``messagefoundry check`` and the dry run
+    rely on."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list") as refused:
+        _db_connector(direction, folder)
+    assert "phi-capath" not in str(refused.value)
+
+
+def _db_connector(direction: str, folder: Path) -> Any:
+    settings = _generic(SSLCAPATH=str(folder))
+    if direction == "outbound":
+        return database.DatabaseDestination(
+            Destination(
+                name=_OUT,
+                type=ConnectorType.DATABASE,
+                settings={**settings, "statement": "INSERT INTO t (a) VALUES (:a)"},
+            )
+        )
+    return database.DatabaseSource(
+        Source(
+            name=_IN,
+            type=ConnectorType.DATABASE,
+            settings={**settings, "poll_statement": "SELECT a FROM t"},
+        )
+    )
+
+
+async def test_hold_f2_no_runner_build_runs_on_the_event_loop_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore
+) -> None:
+    """Each of these builds runs on a worker thread: a lane start of an inbound and an outbound,
+    a reload's build check, inbound rebind and outbound rebuild, the dry run's build check, and the
+    connection test. The next test covers an operator start. Red: each built on the loop thread."""
+    from messagefoundry.pipeline import wiring_runner
+
+    built: list[tuple[str, int]] = []
+    for name in ("build_source", "build_destination"):
+        real = getattr(wiring_runner, name)
+
+        def recording(*args: Any, _real: Any = real, _name: str = name, **kwargs: Any) -> Any:
+            built.append((_name, threading.get_ident()))
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(wiring_runner, name, recording)
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+    monkeypatch.setattr(database.DatabaseDestination, "test_connection", _no_probe)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    reg = _db_graph(folder)
+    reg.add_inbound(build_inbound_connection(_IN, File(directory=str(inbox)), router="r"))
+    reg.add_router("r", lambda _m: [])
+    runner = _db_runner(db_store, reg)
+    await runner.start()
+    try:
+        changed = _db_graph(folder, "INSERT INTO t (b) VALUES (:b)")
+        changed.add_inbound(build_inbound_connection(_IN, File(directory=str(inbox)), router="r"))
+        changed.add_router("r", lambda _m: [])
+        await runner.reload(changed)
+        await runner.build_check_off_loop(changed)
+        await _run_connection_test(runner, _OUT, "outbound")
+    finally:
+        await runner.stop()
+    kinds = {kind for kind, _thread in built}
+    assert kinds == {"build_source", "build_destination"}, built
+    assert len(built) == 9, built  # start 2, reload 4 (check 2, rebind, rebuild), dry run 2, test 1
+    assert threading.get_ident() not in {thread for _kind, thread in built}
+
+
+async def test_hold_f2_an_operator_start_of_an_unbuilt_lane_builds_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore
+) -> None:
+    """An outbound the boot gates left unbuilt is built when an operator starts it, and that
+    build lists the folder off the event loop too."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+    reg = Registry()
+    reg.add_outbound(build_outbound_connection(_OUT, _db_spec(folder), auto_start=False))
+    runner = _db_runner(db_store, reg)
+    await runner.start()
+    try:
+        assert _OUT not in cast(Any, runner)._destinations
+        watch = _LoopWatch(monkeypatch)
+        await runner.start_outbound(_OUT)
+        assert _OUT in cast(Any, runner)._destinations
+        assert len(watch.threads) == 1 and threading.get_ident() not in watch.threads
+    finally:
+        await runner.stop()
+
+
+async def test_hold_f2_a_refused_entry_fails_a_database_inbound_at_its_lane_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore
+) -> None:
+    """The inbound arm of the lane start: a DATABASE poll whose sslcapath entry leads off the
+    host fails its lane with the build's refusal, built off the event loop, and never polls."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
+    watch = _LoopWatch(monkeypatch)
+    reg = Registry()
+    spec = DatabasePoll(
+        server="db.synthetic.test",
+        poll_statement="SELECT a FROM t",
+        dialect="generic",
+        odbc_driver="MySQL ODBC 9.1 Unicode Driver",
+        odbc_params={"SSLMODE": "VERIFY_IDENTITY", "SSLCAPATH": str(folder)},
+    )
+    reg.add_inbound(build_inbound_connection(_IN, spec, router="r"))
+    reg.add_router("r", lambda _m: [])
+    runner = _db_runner(db_store, reg)
+    await runner.start()
+    try:
+        assert watch.threads and threading.get_ident() not in watch.threads
+        assert _IN not in cast(Any, runner)._sources
+        failure = cast(Any, runner)._failed.get(("inbound", _IN))
+        assert failure is not None
+        assert "'sslcapath' must name a folder it can list" in str(failure)
+    finally:
+        await runner.stop()
+
+
+async def test_hold_f2_a_build_its_caller_abandons_is_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cancellation of the task awaiting a build does not stop the worker thread. What the
+    thread builds is closed rather than dropped, as a connector built in place and then cancelled
+    is (``_ensure_destination_built``)."""
+    from messagefoundry.pipeline import wiring_runner
+
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+    watch = _LoopWatch(monkeypatch, seconds=0.3)
+    closed = asyncio.Event()
+
+    async def close(_self: object) -> None:
+        closed.set()
+
+    monkeypatch.setattr(database.DatabaseDestination, "aclose", close)
+    task = asyncio.create_task(
+        wiring_runner._build_off_loop(None, lambda: _db_connector("outbound", folder))
+    )
+    # Cancel only once the build thread is running: a build still queued is cancelled and never
+    # built, so a fixed sleep would race the executor on a loaded runner.
+    async with asyncio.timeout(5):
+        while not watch.threads:
+            await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not closed.is_set()
+    await asyncio.wait_for(closed.wait(), timeout=5)
+
+
+def test_hold_5_a_build_the_loop_shutdown_cancels_is_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The loop's shutdown cancel reaches every task: the caller awaiting a build and, before this
+    fix, the task that held the build itself. What the thread then builds is closed once it
+    finishes. Red (engine PR 2815, Lander hold 6698688363 item 5): the build's own task read as
+    cancelled, so the close returned early and the connector was never closed."""
+    from messagefoundry.pipeline import wiring_runner
+
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+    watch = _LoopWatch(monkeypatch, seconds=0.3)
+    closed: list[object] = []
+
+    async def close(self: object) -> None:
+        closed.append(self)
+
+    monkeypatch.setattr(database.DatabaseDestination, "aclose", close)
+    callers: list[asyncio.Task[Any]] = []
+
+    async def main() -> None:
+        callers.append(
+            asyncio.create_task(
+                wiring_runner._build_off_loop(None, lambda: _db_connector("outbound", folder))
+            )
+        )
+        # Return while the thread is still building, so asyncio.run's shutdown cancels the tasks
+        # and then waits for the default executor's threads.
+        async with asyncio.timeout(5):
+            while not watch.threads:
+                await asyncio.sleep(0.01)
+
+    asyncio.run(main())
+    assert callers[0].cancelled()
+    assert len(closed) == 1 and isinstance(closed[0], database.DatabaseDestination)
+
+
+def test_hold_d_a_build_that_outlives_its_loop_logs_that_it_was_not_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A build whose caller was cancelled and whose loop closed before its thread finished cannot
+    be closed. That is logged, never dropped silently. Red (Lander hold 6702318430, item D): the
+    finished build met asyncio's silent return for a closed loop, and nothing named the leak."""
+    from messagefoundry.pipeline import wiring_runner
+
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def slow_build() -> object:
+        entered.set()
+        release.wait(5)
+        try:
+            return object.__new__(database.DatabaseDestination)
+        finally:
+            finished.set()
+
+    caplog.set_level(logging.WARNING, logger=wiring_runner.log.name)
+    loop = asyncio.new_event_loop()
+    try:
+        task = loop.create_task(wiring_runner._build_off_loop(None, slow_build))
+        loop.run_until_complete(asyncio.to_thread(entered.wait, 5))
+        task.cancel()
+        loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+    finally:
+        loop.close()  # shuts the executor down without waiting for the build
+    release.set()
+    assert finished.wait(5)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not any(
+        "may not be closed" in r.getMessage() for r in caplog.records
+    ):
+        time.sleep(0.01)
+    assert any("may not be closed" in r.getMessage() for r in caplog.records)
+
+
+def test_hold_d_a_build_whose_loop_stopped_unclosed_logs_that_it_was_not_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A build whose caller was cancelled and whose loop has stopped, but is not yet closed, when
+    its thread finishes: a close queued there would never run. That is logged, never dropped
+    silently. Red (Lander hold 6703229134, item 1): the close was queued on the stopped loop, and
+    nothing was logged."""
+    from messagefoundry.pipeline import wiring_runner
+
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def slow_build() -> object:
+        entered.set()
+        release.wait(5)
+        try:
+            return object.__new__(database.DatabaseDestination)
+        finally:
+            finished.set()
+
+    caplog.set_level(logging.WARNING, logger=wiring_runner.log.name)
+    loop = asyncio.new_event_loop()
+    try:
+        task = loop.create_task(wiring_runner._build_off_loop(None, slow_build))
+        loop.run_until_complete(asyncio.to_thread(entered.wait, 5))
+        task.cancel()
+        loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+        release.set()  # the loop is stopped and not closed while the build finishes
+        assert finished.wait(5)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not any(
+            "may not be closed" in r.getMessage() for r in caplog.records
+        ):
+            time.sleep(0.01)
+        assert any("may not be closed" in r.getMessage() for r in caplog.records)
+    finally:
+        release.set()
+        loop.close()
+
+
+@pytest.mark.parametrize("fault", ["cancelled", "shut-down"])
+async def test_hold_an_executor_fault_reaches_the_connection_test_as_a_wiring_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore, fault: str
+) -> None:
+    """A connection test whose build the executor cancels, or refuses because it was shut down,
+    reaches the caller as the WiringError a refused build is, with the executor's fault as its
+    cause, so the route records it as one. Red (Lander hold 6703229134, item 2): a bare
+    RuntimeError escaped, which the route answers with a 500 and no audit row."""
+    from messagefoundry.config.wiring import WiringError
+
+    runner = _db_runner(db_store, _db_graph(_capath(tmp_path, "0a1b2c3d.0")))
+    loop = asyncio.get_running_loop()
+
+    def faulty(_executor: object, _fn: object, *_args: object) -> asyncio.Future[None]:
+        if fault == "shut-down":
+            raise RuntimeError("Executor shutdown has been called")
+        queued: asyncio.Future[None] = loop.create_future()
+        queued.cancel()
+        return queued
+
+    monkeypatch.setattr(loop, "run_in_executor", faulty)
+    with pytest.raises(WiringError) as raised:
+        await asyncio.wait_for(runner.build_test_connector_off_loop(_OUT), timeout=5)
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+def test_hold_e_an_abandoned_build_that_has_not_started_never_runs() -> None:
+    """A caller cancelled while its build still waits in the executor's queue cancels the build,
+    so nothing walks a folder or reads a key file for a caller that is gone. Red (Lander hold
+    6702318430, item E): the queued build ran to completion and was then closed."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from messagefoundry.pipeline import wiring_runner
+
+    ran: list[bool] = []
+    busy, free = threading.Event(), threading.Event()
+
+    def occupy() -> None:
+        busy.set()
+        free.wait(5)
+
+    def build() -> object:
+        ran.append(True)
+        return object()
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        blocker = loop.run_in_executor(None, occupy)
+        while not busy.is_set():
+            await asyncio.sleep(0.01)
+        task = asyncio.create_task(wiring_runner._build_off_loop(None, build))
+        await asyncio.sleep(0.05)  # the build is queued behind the busy worker
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled()  # the control: the build was queued, and its caller cancelled
+        await asyncio.sleep(0.05)
+        free.set()
+        await blocker
+
+    asyncio.run(main())  # waits for the executor's queue before it returns
+    assert ran == []
+
+
+@pytest.mark.parametrize("worker_alive", [True, False], ids=["in-place", "worker-dead"])
+async def test_hold_f2_a_replaced_connector_whose_close_raises_leaves_the_reload_consistent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore, worker_alive: bool
+) -> None:
+    """A reload rebuild swaps the new connector in, then closes the one it replaced. A close that
+    raises leaves the swap standing, as the reload's other outbound reconciles do: the new graph
+    and the new connector are live, the old connector is in no mapping, and the reload returns the
+    lane whose close failed. Red (engine PR 2815): the close raised into the reload's rollback,
+    which put the old graph back while the mapping kept the connector built from the new one.
+    Both rebuild sites: a live lane rebuilt in place, and a per-lane lane whose worker is dead."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+    runner = RegistryRunner(
+        _db_graph(folder),
+        db_store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+        claim_mode="pooled" if worker_alive else "per_lane",
+    )
+    await runner.start()
+    stale: database.DatabaseDestination | None = None
+    real_close = database.DatabaseDestination.aclose
+    try:
+        state = cast(Any, runner)
+        stale = state._destinations[_OUT]
+        if not worker_alive:
+            worker = state._workers[_OUT]
+            worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker
+
+        async def close(self: database.DatabaseDestination) -> None:
+            if self is stale:
+                raise OSError("synthetic close failure")
+            await real_close(self)
+
+        monkeypatch.setattr(database.DatabaseDestination, "aclose", close)
+        changed = _db_graph(folder, "INSERT INTO t (b) VALUES (:b)")
+        failures = await runner.reload(changed)
+        live = state._destinations[_OUT]
+        assert runner.registry is changed
+        assert live is not stale and isinstance(live, database.DatabaseDestination)
+        assert stale not in state._destinations.values()
+        assert [name for name, _detail in failures] == [_OUT]
+        assert "synthetic close failure" in failures[0][1]
+        assert state._failed.get(("outbound", _OUT)) is None
+        if not worker_alive:
+            assert not state._workers[_OUT].done()  # the rebuild respawned the lane's worker
+    finally:
+        await runner.stop()
+        if stale is not None:
+            await real_close(stale)

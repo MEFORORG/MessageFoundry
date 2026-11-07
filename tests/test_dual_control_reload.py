@@ -1554,15 +1554,15 @@ async def test_a_dry_run_checks_the_new_env_values_without_applying_them(
     runner = engine.registry_runner
     assert runner is not None
     checked: list[object] = []
-    real_check = runner.build_check
+    real_check = runner.build_check_off_loop
 
-    def _recording_check(registry: Any, *env_values: Any) -> None:
+    async def _recording_check(registry: Any, *env_values: Any) -> None:
         # Passes on only what it was given, so a call without the values fails the assert below
         # rather than the spy (the round-2 review).
         checked.append(env_values[0] if env_values else None)
-        real_check(registry, *env_values)
+        await real_check(registry, *env_values)
 
-    monkeypatch.setattr(runner, "build_check", _recording_check)
+    monkeypatch.setattr(runner, "build_check_off_loop", _recording_check)
     values["HOST"] = "second.example.invalid"
     await engine.reload_detail(dry_run=True)
     assert checked == [{"HOST": "second.example.invalid"}]
@@ -2936,3 +2936,157 @@ def test_the_undrained_row_wait_fits_inside_the_engine_stop_reserve() -> None:
     from messagefoundry.api import app as app_module
 
     assert app_module._ROW_CANCEL_WAIT_SECONDS <= app_module._ENGINE_STOP_RESERVE_SECONDS / 3
+
+
+@pytest.mark.parametrize("cause", ["executor-fault", "invalid-config"])
+async def test_an_executor_fault_in_a_reload_build_is_a_fault_row_not_an_invalid_config(
+    engine: Engine, tmp_path: Path, cause: str
+) -> None:
+    """A reload whose connector build the executor fails, by a broken pool, answers the reload's
+    generic 500 and writes a reload_fault row naming the executor's fault, as any fault inside the
+    reload does: nothing is wrong with the config. The build that meets it is the restart of the
+    running inbound, which every reload makes through _build_off_loop before it rebuilds an
+    outbound. Red (Lander hold 6703767989): _build_off_loop raised a plain
+    WiringError, which the route answered 422 invalid configuration with reason invalid_config.
+    The control is a config that really is wrong, which still answers 422 invalid_config."""
+    from concurrent.futures.thread import BrokenThreadPool
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    loop = asyncio.get_running_loop()
+    real = loop.run_in_executor
+
+    def faulty(executor: Any, fn: Any, *args: Any) -> asyncio.Future[Any]:
+        if "_build_off_loop" not in getattr(fn, "__qualname__", ""):
+            return real(executor, fn, *args)
+        queued: asyncio.Future[Any] = loop.create_future()
+        queued.set_exception(BrokenThreadPool("a thread initializer failed"))
+        return queued
+
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "op")
+        first = await c.post("/config/reload", json={}, headers=headers)
+        assert first.status_code == 200, first.text
+        cfg = tmp_path / "cfg"
+        if cause == "invalid-config":
+            text = (cfg / "cfg.py").read_text(encoding="utf-8")
+            (cfg / "cfg.py").write_text(text.replace("router='r'", "router='nope'"), "utf-8")
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(loop, "run_in_executor", faulty)
+            r = await c.post("/config/reload", json={}, headers=headers)
+    rows = await _failed_reload_rows(engine)
+    if cause == "executor-fault":
+        assert r.status_code == 500, r.text
+        assert r.json() == {"detail": _FAULT_DETAIL}
+        assert [(d["reason"], d["error"]) for d in rows] == [("reload_fault", "BrokenThreadPool")]
+    else:
+        assert r.status_code == 422, r.text
+        assert [d["reason"] for d in rows] == ["invalid_config"]
+
+
+async def test_a_convergence_reload_records_an_executor_fault_as_a_reload_error(
+    engine: Engine,
+) -> None:
+    """A convergence reload records an executor fault with reason reload_error and the executor
+    fault's type, as it did before the fault was a WiringBuildFault, not as a refused reload."""
+    from concurrent.futures.thread import BrokenThreadPool
+
+    from messagefoundry.api.app import _audit_failed_convergence
+    from messagefoundry.config.wiring import WiringBuildFault
+
+    fault = WiringBuildFault("connector build failed: a thread initializer failed")
+    fault.__cause__ = BrokenThreadPool("a thread initializer failed")
+    await _audit_failed_convergence(engine, fault, 7, set())
+    rows = await _failed_reload_rows(engine)
+    assert [(d["reason"], d["error"], d["config_version"]) for d in rows] == [
+        ("reload_error", "BrokenThreadPool", 7)
+    ]
+
+
+async def test_a_reload_executor_fault_leaves_the_previous_inbounds_running(
+    engine: Engine,
+) -> None:
+    """The pool stays broken for the whole reload, its rollback included. The rollback restarts
+    the previous graph's inbounds without the faulted pool, so intake is as it was before the
+    reload. Red (Lander hold 6704342060, item 1): the rollback built through the same pool, so
+    IB_T_ADT failed to start and intake was left down."""
+    from concurrent.futures.thread import BrokenThreadPool
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    loop = asyncio.get_running_loop()
+    real = loop.run_in_executor
+
+    def faulty(executor: Any, fn: Any, *args: Any) -> asyncio.Future[Any]:
+        if "_build_off_loop" not in getattr(fn, "__qualname__", ""):
+            return real(executor, fn, *args)
+        queued: asyncio.Future[Any] = loop.create_future()
+        queued.set_exception(BrokenThreadPool("a thread initializer failed"))
+        return queued
+
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "op")
+        first = await c.post("/config/reload", json={}, headers=headers)
+        assert first.status_code == 200, first.text
+        rr = engine.registry_runner
+        assert rr is not None and rr.inbound_running("IB_T_ADT")
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(loop, "run_in_executor", faulty)
+            r = await c.post("/config/reload", json={}, headers=headers)
+            assert r.status_code == 500, r.text
+            assert rr.inbound_running("IB_T_ADT")
+            assert rr.inbound_failed("IB_T_ADT") is None
+            # Only the rollback built on the loop: a later build goes to the pool again.
+            assert cast(Any, rr)._rollback_builds_on_loop is False
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "cannot schedule new futures after shutdown",
+        "cannot schedule new futures after interpreter shutdown",
+        "Executor shutdown has been called",
+        "can't start new thread",
+        "can't create new thread at interpreter shutdown",
+    ],
+)
+async def test_a_bare_executor_refusal_in_a_reload_leaves_the_previous_inbounds_running(
+    engine: Engine, refusal: str
+) -> None:
+    """A hop other than the connector build meets the executor's refusal at submit, a bare
+    RuntimeError, and the pool stays refusing for the rollback. The rollback still restarts the
+    previous inbounds without the pool. Red (Lander hold 6704973771, item 1): only a
+    WiringBuildFault or a broken pool switched the rollback, so its builds met the refusing pool
+    and IB_T_ADT was left down."""
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    loop = asyncio.get_running_loop()
+    real = loop.run_in_executor
+    refusing = False
+
+    def faulty(executor: Any, fn: Any, *args: Any) -> asyncio.Future[Any]:
+        if refusing and "_build_off_loop" in getattr(fn, "__qualname__", ""):
+            raise RuntimeError(refusal)
+        return real(executor, fn, *args)
+
+    async def refused_hop(self: RegistryRunner, *_args: Any) -> Any:
+        nonlocal refusing
+        refusing = True
+        raise RuntimeError(refusal)
+
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "op")
+        first = await c.post("/config/reload", json={}, headers=headers)
+        assert first.status_code == 200, first.text
+        rr = engine.registry_runner
+        assert rr is not None and rr.inbound_running("IB_T_ADT")
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(loop, "run_in_executor", faulty)
+            patch.setattr(RegistryRunner, "_reconcile_outbounds", refused_hop)
+            r = await c.post("/config/reload", json={}, headers=headers)
+            assert r.status_code == 500, r.text
+            assert rr.inbound_running("IB_T_ADT")
+            assert rr.inbound_failed("IB_T_ADT") is None
+            assert cast(Any, rr)._rollback_builds_on_loop is False

@@ -411,6 +411,7 @@ from messagefoundry.config.wiring import (
     EnvRef,
     InboundConnection,
     Registry,
+    WiringBuildFault,
     WiringError,
     accepted_cleartext_hops,
     attested_secure_hops,
@@ -1867,7 +1868,7 @@ def _build_approval_gate(
                 # NULL client, so this line names the release too. Type name only, never the text:
                 # for a 404 or 422 refusal, or a reload_fault, _audit_refused_reload logs the
                 # redacted text itself.
-                _log.warning("released config reload refused: %s", type(exc).__name__)
+                _log.warning("released config reload refused: %s", _fault_type_name(exc))
                 _status, answer = await _audit_refused_reload(
                     engine, exc, actor=actor, requested=config_dir, dry_run=False
                 )
@@ -2579,6 +2580,9 @@ async def _record_reload_audit(
 #: around the reload alone, never ``BaseException``, so a cancellation, ``KeyboardInterrupt`` and
 #: ``SystemExit`` propagate. At least a DR activation's reload is not among them; a convergence
 #: reload records a fault outside this tuple with reason ``reload_error`` (vault BACKLOG #3109), and a row whose own write fails is logged, not written.
+#: A :class:`~messagefoundry.config.wiring.WiringBuildFault` is a ``WiringError`` but no refusal:
+#: the executor kept a connector build from running, so it is recorded as the fault it is
+#: (:func:`_is_reload_refusal`, Lander hold 6703767989).
 _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     ConfigReloadDenied,
     ConfigDigestMismatch,
@@ -2777,7 +2781,9 @@ async def _audit_refused_reload(
         )
         action, detail["reason"] = "config_reload_failed", "store_unavailable"
         status, answer = 503, _ANCHOR_STORE_DETAIL
-    elif isinstance(exc, WiringError):
+    elif isinstance(exc, WiringError) and not isinstance(exc, WiringBuildFault):
+        # A WiringBuildFault is the executor's, not the config's (Lander hold 6703767989), so it
+        # falls to the fault arm below, as it did when it reached here as the executor's fault.
         anchor_refused = _refused_by_trust_anchor(exc)
         warn(
             "config reload %s: %s",
@@ -2799,7 +2805,7 @@ async def _audit_refused_reload(
             exc_info=exc,
         )
         action, detail["reason"] = "config_reload_failed", "reload_fault"
-        detail["error"] = type(exc).__name__
+        detail["error"] = _fault_type_name(exc)
         status, answer = 500, "the reload failed inside the engine; see the engine log"
     row = json.dumps(detail)
     # The exc above and this row carry the caller's requested directory, so their arguments are
@@ -2834,6 +2840,22 @@ def _failure_row_key(action: str, detail: Mapping[str, object]) -> str:
     return f"{action}:{detail.get('reason')}:{detail.get('error')}"
 
 
+def _is_reload_refusal(exc: Exception) -> bool:
+    """Whether ``exc`` is one of :data:`_RELOAD_REFUSALS`, a
+    :class:`~messagefoundry.config.wiring.WiringBuildFault` excepted: that is a fault inside the
+    reload, recorded as one (Lander hold 6703767989)."""
+    return isinstance(exc, _RELOAD_REFUSALS) and not isinstance(exc, WiringBuildFault)
+
+
+def _fault_type_name(exc: Exception) -> str:
+    """The type name a fault row records: for a
+    :class:`~messagefoundry.config.wiring.WiringBuildFault`, its executor fault's, as the row named
+    it before the fault was wrapped, so a broken pool and a shut-down executor stay apart."""
+    if isinstance(exc, WiringBuildFault) and exc.__cause__ is not None:
+        return type(exc.__cause__).__name__
+    return type(exc).__name__
+
+
 async def _audit_failed_convergence(
     engine: Engine, exc: Exception, version: int, reported: set[str]
 ) -> None:
@@ -2843,9 +2865,10 @@ async def _audit_failed_convergence(
     The row is the one an operator's refused reload writes, as :data:`_CONVERGENCE_ACTOR` with
     ``initiator`` and the shared ``config_version`` the node could not converge on. ``requested``
     is ``null``: a convergence reload loads the node's startup directory. A refusal goes through
-    :func:`_audit_refused_reload`, whose status and answer nobody reads here. A fault that is none
-    of :data:`_RELOAD_REFUSALS` has no reason there, so it is recorded with reason
-    ``reload_error`` and its type name, never its text, which the convergence runner logs. Nothing
+    :func:`_audit_refused_reload`, whose status and answer nobody reads here. A fault that is no
+    refusal (:func:`_is_reload_refusal`), a ``WiringBuildFault`` included, has no reason there, so
+    it is recorded with reason ``reload_error`` and its type name (:func:`_fault_type_name`), never
+    its text, which the convergence runner logs. Nothing
     was swapped either way: the reload raises only before its swap commits, and the node keeps its
     running graph and retries.
 
@@ -2854,7 +2877,7 @@ async def _audit_failed_convergence(
     refused is tried again on the next failure. It never raises: the write goes through
     :func:`write_audit_soft` with ``defects=()``."""
     extra = {"initiator": _CONVERGENCE_INITIATOR, "config_version": version}
-    if isinstance(exc, _RELOAD_REFUSALS):
+    if _is_reload_refusal(exc):
         await _audit_refused_reload(
             engine,
             exc,
@@ -2871,7 +2894,7 @@ async def _audit_failed_convergence(
         "dry_run": False,
         **extra,
         "reason": "reload_error",
-        "error": type(exc).__name__,
+        "error": _fault_type_name(exc),
     }
     key = _failure_row_key(action, detail)
     if key in reported:
@@ -4189,7 +4212,9 @@ async def _run_connection_test(rr: RegistryRunner, name: str, direction: str) ->
         # vault BACKLOG #2371: the dialling CA first, as a lane build checks it.
         await rr.check_test_anchor(name)
         checked = True
-        _direction, connector = rr.build_test_connector(name)
+        # The build runs off the event loop: it can list folders and read files, such as a
+        # DATABASE connector's sslcapath entries (engine PR 2815, hold F2).
+        _direction, connector = await rr.build_test_connector_off_loop(name)
     except WiringError as exc:
         # This catch is EXHAUSTIVE only because build_test_connector normalizes every build failure to
         # WiringError; it did not always, and the escape cost more than a 500. The credential route's
@@ -10535,6 +10560,7 @@ def create_app(
             active=engine.dr_active,
             threshold=dr.priority_threshold.value,
             activation_mode=dr.activation_mode.value,
+            failures=list(engine.dr_activation_failures),
         )
 
     @app.get("/service/status", response_model=ServiceStatusInfo)
@@ -10575,7 +10601,9 @@ def create_app(
         not touched first (vault BACKLOG #2581).
         ``{"dba_attests_restored": true}`` is the operator's per-activation attestation that
         the DBA restored the server-DB ``mefor`` database (REQUIRED on postgres/sqlserver, ignored on
-        SQLite — BACKLOG #102). Aborts return a 4xx/5xx with the failing phase; the box stays passive."""
+        SQLite — BACKLOG #102). Aborts return a 4xx/5xx with the failing phase; the box stays passive.
+        A 200 with ``degraded`` true is not a clean activation: the box is active, and ``failures``
+        names each follow-on step that did not complete, such as ``outbound_close``."""
         coord = engine.dr_coordinator
         if coord is None:
             raise HTTPException(503, "this deployment is not a DR standby ([dr].enabled is false)")
@@ -10613,6 +10641,8 @@ def create_app(
             verify_status=result.verify_status,
             seed_segment=result.seed_segment,
             vip_hook_ran=result.vip_hook_ran,
+            degraded=bool(result.failures),
+            failures=list(result.failures),
         )
 
     @app.post("/dr/release", response_model=DrActionResult)
