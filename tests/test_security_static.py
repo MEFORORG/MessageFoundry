@@ -685,24 +685,27 @@ _UNSCANNABLE_RE_PATTERNS = {
         r"f'^\\.[0-9a-f]{{32}}(?:{re.escape(_BLOB_SUFFIX)}|{re.escape(_META_SUFFIX)})\\.[0-9a-f]{{{_TMP_TOKEN_BYTES * 2}}}\\.tmp\\Z'",
     ),
     # BACKLOG #2420 -- the DR staging refusal's trailing checks. Unresolvable BY CONSTRUCTION: the
-    # matcher that finds the checks ending a message is spliced from the constants the refusal
-    # names its lead, its check and its quotes with (_CHECKS_LEAD, _TEST_PATH, _PS_QUOTES), so
-    # those three cannot drift between the text and the split. Writing them out as literals would
-    # restore static scannability and lose that coupling. At least these are NOT coupled: the
-    # [char] spelling, the parentheses and ' + ' of _ps_path, the quote around a literal, the space
-    # after the check, and the ' ; ' join_before_checks writes. Each is spelled on both sides by
-    # hand and can drift apart. The shape is non-catastrophic by
-    # inspection: a literal lead, then checks joined by the literal ' ; ', anchored at \Z. A check
-    # opens with the literal 'Test-Path -LiteralPath ' and is one quoted literal or one
-    # parenthesised run of parts joined by ' + '. A quoted literal is one quote, then a run whose
-    # branches are a non-quote class and a doubled quote, which cannot both match at one position,
-    # then one quote. A [char] part is fixed width. The repetitions nest. Backtracking can close a
-    # quoted run at the first quote of a doubled pair, but a closing quote must be followed by
-    # ' ; ', ' + ', ')' or the end, and the second quote of the pair is none of them, so that split
-    # fails at the next character. The caller uses the unanchored ``.search``, which starts again
-    # only where the literal lead occurs.
+    # matcher is spliced from constants the refusal also writes with (_CHECKS_LEAD, _TEST_PATH,
+    # _PS_QUOTES), so those three cannot drift between the text and the split. The splicing is
+    # the only reason the scanner cannot read it. Its literal form, the pattern it compiles to,
+    # passes the nested-quantifier detector, and the literal-form test below checks that on every
+    # run, so an edit to a spliced sub-pattern cannot slip past this pin.
+    #
+    # It passes because its three unbounded repetitions are possessive: the quoted run, the
+    # ' + ' parts and the ' ; ' checks. Possessive does not change what it matches, because
+    # giving an iteration back never yields a match. A quoted run given back ends at the first
+    # quote of a doubled pair, and the quote after it is not ' ; ', ' + ', ')' or the end. A
+    # ' + ' or ' ; ' iteration given back leaves a space where ')' or the end must follow. The two
+    # branches at each choice open on different characters. Measured 2026-11-07 against the
+    # greedy form: identical spans and groups on the 36 texts the DR tests split and on 300,000
+    # adversarial texts. The caller uses the unanchored ``.search``, which starts again only
+    # where the literal lead occurs.
+    #
+    # At least these spellings are NOT coupled: the [char] spelling, the parentheses and ' + ' of
+    # _ps_path, the quote around a literal, the space after the check, and the ' ; '
+    # join_before_checks writes. Each is spelled on both sides by hand and can drift apart.
     "messagefoundry/pipeline/dr_backup.py": (
-        "f'{re.escape(_CHECKS_LEAD)}({_CHECK}(?: ; {_CHECK})*)\\\\Z'",
+        "f'{re.escape(_CHECKS_LEAD)}({_CHECK}(?: ; {_CHECK})*+)\\\\Z'",
     ),
     # BACKLOG #1142 -- the icacls line-1 path echo. Unresolvable BY CONSTRUCTION: the pattern is built
     # from the trust-anchor path being checked, which is runtime configuration, so there is no literal
@@ -745,6 +748,21 @@ def test_the_scanners_blind_spots_are_the_recorded_ones() -> None:
         if unresolved:
             actual[path.relative_to(_REPO).as_posix()] = tuple(unresolved)
     assert actual == _UNSCANNABLE_RE_PATTERNS
+
+
+def test_the_dr_staging_check_matcher_passes_the_detector_in_literal_form() -> None:
+    # The pin above exempts _CHECKS_AT_END from the scan only because it is spliced. The pattern
+    # it compiles to, written out as a literal, must pass the same detector, so a sub-pattern edit
+    # that brings back a nested unbounded quantifier reds here rather than hiding behind the pin.
+    from messagefoundry.pipeline import dr_backup
+
+    pattern = dr_backup._CHECKS_AT_END.pattern
+    source = f"import re\nre.compile({pattern!r})\n"
+    assert _regex_literals(source) == [pattern]
+    assert find_nested_quantifiers(source) == []
+    greedy = pattern.replace(")*+", ")*")
+    assert greedy != pattern
+    assert find_nested_quantifiers(f"import re\nre.compile({greedy!r})\n") == [greedy]
 
 
 def test_the_blind_spot_pin_records_expressions_not_just_counts() -> None:

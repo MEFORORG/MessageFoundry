@@ -2525,14 +2525,17 @@ _TEST_PATH = "Test-Path -LiteralPath"
 _CHECKS_LEAD = "; to check, in PowerShell: "
 #: Each character PowerShell reads as a single quote, which :func:`_ps_literal` doubles.
 _PS_QUOTES = "'\u2018\u2019\u201a\u201b"
-_PS_LITERAL = f"'(?:[^{_PS_QUOTES}]|" + "|".join(re.escape(q * 2) for q in _PS_QUOTES) + ")*'"
+_PS_LITERAL = f"'(?:[^{_PS_QUOTES}]|" + "|".join(re.escape(q * 2) for q in _PS_QUOTES) + ")*+'"
 _PS_PART = rf"(?:{_PS_LITERAL}|\[char\]0x[0-9A-F]{{4}})"
 #: One check as :func:`_rewritten_staging_refusal` writes it, on a :func:`_ps_path` path.
-_CHECK = rf"{re.escape(_TEST_PATH)} (?:{_PS_LITERAL}|\({_PS_PART}(?: \+ {_PS_PART})*\))"
+_CHECK = rf"{re.escape(_TEST_PATH)} (?:{_PS_LITERAL}|\({_PS_PART}(?: \+ {_PS_PART})*+\))"
 #: The checks that end a message, from the first lead after which nothing else follows. The search
 #: takes the leftmost such lead, so one inside a path is not taken for it. A Windows name cannot
-#: hold the lead, whose colon NTFS refuses, but the split does not rest on that.
-_CHECKS_AT_END = re.compile(rf"{re.escape(_CHECKS_LEAD)}({_CHECK}(?: ; {_CHECK})*)\Z")
+#: hold the lead, whose colon NTFS refuses, but the split does not rest on that. Every unbounded
+#: repetition here is possessive, so the pattern's literal form passes the ReDoS gate's
+#: nested-quantifier detector; giving an iteration back never yields a match, so it matches
+#: what the greedy form did (tests/test_security_static.py says why).
+_CHECKS_AT_END = re.compile(rf"{re.escape(_CHECKS_LEAD)}({_CHECK}(?: ; {_CHECK})*+)\Z")
 
 
 def _split_checks(text: str) -> tuple[str, str]:
