@@ -706,11 +706,13 @@ _UNSCANNABLE_RE_PATTERNS = {
     # closing quote cannot match, or at the first quote of a doubled '' pair, whose second quote
     # is not ' ; ', ' + ', ')' or the end. A ' + ' or ' ; ' iteration given back leaves a space
     # where ')' or the end must follow. The branches of each choice differ at their first
-    # character. That was measured once, on 2026-11-07 UTC, against the greedy form of the pattern
-    # at commit 1ecac0d9fd, and no test repeats it. Span and group did not differ on 300,000
-    # seeded texts, or on the 12 texts either form matched among the 36 the DR tests split. The
-    # caller uses the unanchored ``.search``, which starts again only where the literal lead
-    # occurs.
+    # character. No test checks that now. On 2026-11-07 UTC, against the greedy form of the
+    # pattern at commit 1ecac0d9fd, span and group did not differ on 300,000 seeded random texts
+    # from a script not kept in the tree. Nor did they differ on the 12 texts either form matched
+    # among the 36 calls to ``_split_checks`` that 17 DR test files made on Windows. A seeded
+    # differential test, since removed, also compared the two forms from c6daab9250 to
+    # 3de33f4f7b. The caller uses the unanchored ``.search``, which starts again only where the
+    # literal lead occurs.
     #
     # At least these spellings are NOT coupled: the [char] spelling, the parentheses and ' + ' of
     # _ps_path, the quote around a literal, the space after the check, and the ' ; '
@@ -834,6 +836,7 @@ def test_the_dr_staging_check_matcher_passes_the_detector_in_literal_form() -> N
     assert _backtracking_repeats(pattern, flags) == []
     # The detector's control: the pattern with its ``)*+`` repetitions made greedy is flagged.
     greedy = pattern.replace(")*+", ")*")
+    assert greedy != pattern
     assert find_nested_quantifiers(f"import re\nre.compile({greedy!r})\n") == [greedy]
 
 
