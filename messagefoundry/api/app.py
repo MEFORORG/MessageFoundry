@@ -10614,6 +10614,8 @@ def create_app(
             verify_status=result.verify_status,
             seed_segment=result.seed_segment,
             vip_hook_ran=result.vip_hook_ran,
+            degraded=bool(result.failures),
+            failures=list(result.failures),
         )
 
     @app.post("/dr/release", response_model=DrActionResult)

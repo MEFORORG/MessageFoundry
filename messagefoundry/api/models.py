@@ -1433,6 +1433,11 @@ class DrActionResult(BaseModel):
     #: stay held on outbounds the engine parks. A release that did not drain says so here.
     drained: bool | None = None
     held_on_parked_outbounds: int | None = None
+    #: Activate only (engine PR 2815): the profile is live and a follow-on step did not complete,
+    #: so ``failures`` names each, with the step labels ``ReloadResult.failures`` uses, such as
+    #: ``outbound_close``. A 200 with ``degraded`` True is not a clean activation.
+    degraded: bool = False
+    failures: list[str] = []
 
 
 class DrActivateRequest(RequestModel):

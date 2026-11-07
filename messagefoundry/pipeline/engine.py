@@ -365,6 +365,15 @@ class ReloadStepFailure:
     detail: str
 
 
+def _outbound_close_failure(close_failures: Sequence[tuple[str, str]]) -> ReloadStepFailure:
+    """The ``outbound_close`` step for the connectors a reload replaced and could not close, as
+    ``(outbound name, reason)`` pairs from :meth:`RegistryRunner.reload` (engine PR 2815)."""
+    return ReloadStepFailure(
+        "outbound_close",
+        "; ".join(f"outbound {name!r}: {detail}" for name, detail in close_failures),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ReloadOutcome:
     """What a :meth:`Engine.reload_detail` call actually did, so the report matches the engine.
@@ -1118,7 +1127,7 @@ class Engine:
                 self._dr_run_threshold(), standby=self._dr_standby_threshold()
             )
 
-    async def _dr_activate_profile(self) -> None:
+    async def _dr_activate_profile(self) -> dict[str, str]:
         """Engine callback the DR coordinator runs to BEGIN serving under the DR run-profile (#61, ADR
         0048 step 4): latch the run-profile ON, hand the runner the threshold, and re-apply the
         running graph so the runner binds only connections at/above ``[dr].priority_threshold`` (the
@@ -1139,7 +1148,13 @@ class Engine:
         over the whole graph and before the shard filter. On an engine-shard process ``rr.registry`` is the
         filtered graph, so a guard here would judge less than that load did. A graph an embedder
         hands to :meth:`add_registry` meets neither check at load. That is a fact about embedding,
-        and an activation is not where it changes."""
+        and an activation is not where it changes.
+
+        Returns each follow-on step that did not complete, as ``{step: detail}``, the coordinator
+        puts on its result and the ``dr.activate`` row. Today that is ``outbound_close``, as
+        :meth:`reload_detail` reports it: a connector the reload replaced and could not close. The
+        profile is live then, so it is reported rather than raised (engine PR 2815, Lander hold
+        6698688363 item 3)."""
         was_active = self._dr_active
         rr = self._registry_runner
         # What an operator had bound before this call, which a failed activation does not unbind.
@@ -1159,12 +1174,13 @@ class Engine:
         # connection. rr.reload() re-applies whichever graph is current once it holds the reload
         # lock, so an operator reload that lands first is re-evaluated rather than reverted. A local
         # DR decision is never a cluster-wide config bump.
+        close_failures: tuple[tuple[str, str], ...] = ()
         try:
             if rr is not None:
                 await self._dr_preflight(rr.registry)
             self._set_dr_active(True)
             if rr is not None:
-                await rr.reload()
+                close_failures = await rr.reload()
         except BaseException:
             # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile,
             # so the latch and the runner's threshold go back too. Left set, the next operator
@@ -1198,6 +1214,10 @@ class Engine:
                         "failed too; POST /config/reload closes them"
                     )
             raise
+        if not close_failures:
+            return {}
+        failure = _outbound_close_failure(close_failures)
+        return {failure.step: failure.detail}
 
     async def _dr_preflight(self, registry: Registry) -> None:
         """The settings and registry preflights a DR activation runs before its reload, bounded by
@@ -3513,12 +3533,7 @@ class Engine:
         # A connector the swap replaced and could not close: the new one is live, so it is a step
         # an operator may still have to finish, not a failed reload (engine PR 2815).
         if close_failures:
-            failures.append(
-                ReloadStepFailure(
-                    "outbound_close",
-                    "; ".join(f"outbound {name!r}: {detail}" for name, detail in close_failures),
-                )
-            )
+            failures.append(_outbound_close_failure(close_failures))
         # Reference sets (ADR 0006): re-arm + materialize after the swap, so a reference set added by
         # this reload syncs immediately (resolves on the next message, not only after the refresh
         # interval) and a 0->N change actually starts the loop. Idempotent when nothing changed.

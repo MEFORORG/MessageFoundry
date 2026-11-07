@@ -176,6 +176,9 @@ class DrResult:
     #: (vault BACKLOG #3067). ``None`` when the engine callback reported neither.
     drained: bool | None = None
     held_on_parked_outbounds: int | None = None
+    #: Activate only: each follow-on step of the profile's reload that did not complete, such as
+    #: ``outbound_close`` (engine PR 2815). The profile is live; an operator has a step to finish.
+    failures: tuple[str, ...] = ()
 
 
 @dataclass
@@ -223,7 +226,7 @@ class DrCoordinator:
         settings: DrSettings,
         *,
         store_settings: object,
-        activate_profile: Callable[[], Awaitable[None]],
+        activate_profile: Callable[[], Awaitable[Mapping[str, str] | None]],
         deactivate_profile: Callable[[], Awaitable[Mapping[str, object] | None]],
         config_fingerprint_provider: Callable[[], Awaitable[str | None]] | None = None,
         alert_sink: AlertSink | None = None,
@@ -472,10 +475,13 @@ class DrCoordinator:
         # #2751).
         progress.step = "profile"
         anchor_abort: str | None = None
+        # The steps the profile's reload could not finish, such as closing a connector it replaced.
+        # The profile is live then, so they go on the row and the result rather than abort it.
+        step_failures: Mapping[str, str] | None = None
         try:
             self._active = True
             self._last_release = None  # an earlier fail-back's outcome no longer describes this box
-            await self._activate_profile()
+            step_failures = await self._activate_profile()
         except Exception as exc:
             self._active = False
             refusal = trust_anchor_cause(exc)
@@ -522,6 +528,8 @@ class DrCoordinator:
             "seed_segment": progress.seed_segment,
             "vip_hook_ran": progress.hook_ran,
         }
+        if step_failures:
+            detail["failures"] = dict(step_failures)
         self._unrecorded_activation = (detail, actor, now)
         # Provenance is read only once the profile is applied and the row is owed, so a cancellation
         # while it is read still leaves the box recorded as active (vault BACKLOG #3067). Its fields
@@ -544,6 +552,7 @@ class DrCoordinator:
             verify_status=verify.status,
             seed_segment=progress.seed_segment,
             vip_hook_ran=progress.hook_ran,
+            failures=tuple(step_failures or ()),
         )
 
     # --- release (fail-back) -------------------------------------------------
