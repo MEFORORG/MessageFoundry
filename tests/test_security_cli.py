@@ -161,6 +161,36 @@ def test_a_session_limit_only_the_environment_loosens_is_named_as_the_environmen
         assert entry["risk"].startswith(f"set by {variable} in this command's environment")
 
 
+def test_a_variable_looser_than_a_loose_file_is_named_beside_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file sets the limit looser and the variable looser still: both values are named, the
+    file's unlabelled and the variable's labelled, so the looser one this shell loads is not hidden
+    behind the file's (vault BACKLOG #2600)."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nmax_session_hours = 24\n", encoding="utf-8")
+    monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", "48")
+    authored, from_env = _entries(_show(toml, capsys), "max_session_hours")
+    assert "MEFOR_SECURITY" not in authored["risk"]
+    assert from_env["risk"].startswith(f"set by {_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS")
+
+
+def test_two_reads_that_disagree_with_no_variable_are_not_blamed_on_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no variable set, a loaded limit that differs from the [security] read, as a concurrent
+    edit between the two reads leaves it, is still named but not labelled as a variable that does
+    not exist (vault BACKLOG #2600)."""
+    from messagefoundry.config import security_edit
+
+    monkeypatch.delenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", raising=False)
+    monkeypatch.setattr(security_edit, "read_security", lambda service_config: {})
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nmax_session_hours = 48\n", encoding="utf-8")
+    (entry,) = _entries(_show(toml, capsys), "max_session_hours")
+    assert entry["risk"].startswith("read differently by the whole-file load")
+
+
 @pytest.mark.parametrize("error", ["security_edit", "os"])
 def test_set_preview_does_not_refuse_an_edit_whose_candidate_read_raises(
     tmp_path: Path,

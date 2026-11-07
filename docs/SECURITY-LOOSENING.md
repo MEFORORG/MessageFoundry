@@ -512,11 +512,12 @@ false premise.
   (vault BACKLOG #2600), so the serve-time warning, `messagefoundry security show` and
   `GET /security/posture` list it. A value of `0` or less ends every session at once, which is
   stricter, and is not named. `messagefoundry security show` and the `security set` preview read
-  both limits from the file's `[security]`, the authored values `show` prints. A
-  `MEFOR_SECURITY_*` variable in the operator's shell that sets a limit looser than the file does
-  is still named, after the authored entries, with a risk that names the variable and says the
-  file does not set it; at least the two session limits are reported this way, and only when the
-  whole-file load succeeds. The variable also feeds that load, so one the load refuses makes the
+  both limits from the file's `[security]`, the authored values `show` prints. When a
+  `MEFOR_SECURITY_*` variable in the operator's shell sets a limit to a value that is a loosening,
+  that value is named too, after the authored entries, beside any entry for the file's own value,
+  with a risk that starts by naming the variable. That happens only when the whole-file load runs
+  and succeeds: a report that is partial, or a file that does not exist yet, runs no successful
+  load and does not name it. The variable also feeds that load, so one the load refuses makes the
   report partial, or refuses the edit. The IDE security editor marks a value above the default it
   is shown.
 

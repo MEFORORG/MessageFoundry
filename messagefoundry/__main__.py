@@ -12016,6 +12016,7 @@ def _security(args: argparse.Namespace) -> int:
         SecuritySettings,
         ServiceSettings,
         _auth_default,
+        _auth_limit_loosenings,
         security_loosenings,
     )
 
@@ -12045,11 +12046,9 @@ def _security(args: argparse.Namespace) -> int:
         variable leaves it, not ``sec``'s default: the two are separate literals, which
         tests/test_security_cli.py pins equal for the session limits.
 
-        A loosening that only the environment layer delivers is still named, after the authored
-        ones and labelled as coming from that variable (vault BACKLOG #2600): at least a session
-        limit set looser by a MEFOR_SECURITY_* variable in this shell while the file leaves it
-        alone. It is found by comparing the loaded [auth] copies with the authored ones, so only a
-        load that succeeded can surface one; a partial report cannot, and says it is partial."""
+        A session limit the environment layer loosens is still named, after the authored entries
+        and labelled with its variable (vault BACKLOG #2600); docs/SECURITY-LOOSENING.md, the
+        idle-limit entry, says when."""
         full: ServiceSettings | None = saved
         partial_reason: str | None = None
         # An ABSENT file is not a degraded read -- the shipped defaults ARE the effective posture
@@ -12112,27 +12111,36 @@ def _security(args: argparse.Namespace) -> int:
             )
 
         loosenings = [{"switch": s, "risk": r} for s, r in registry(auth)]
-        # A switch whose loaded [auth] copy differs from the authored one was set by the
-        # environment, the only layer the load adds over the file here. Name what that value
-        # loosens, so a variable in this shell is disclosed rather than silently dropped.
-        from_env = {
+        # The registry reads only the two session limits off their [auth] copies, so those are the
+        # switches a loaded value can loosen behind the authored one. Where the load read a limit
+        # differently, name what the loaded value loosens too, beside any authored entry, so a
+        # variable in this shell is disclosed rather than silently dropped. The label names the
+        # variable only when it is set; otherwise the two reads disagreed, as a concurrent edit
+        # between them leaves them.
+        differs = {
             switch
             for switch, section, field in _SECURITY_PASSTHROUGH
-            if section == "auth" and loaded and getattr(full.auth, field) != getattr(auth, field)
+            if section == "auth"
+            and switch in ("sign_out_after_idle_minutes", "max_session_hours")
+            and loaded
+            and getattr(full.auth, field) != getattr(auth, field)
         }
-        if from_env:
-            named = {entry["switch"] for entry in loosenings}
-            loosenings.extend(
-                {
-                    "switch": s,
-                    "risk": (
-                        f"set by MEFOR_SECURITY_{s.upper()} in this command's environment, not by "
-                        f"the file, so `values` does not show it and the service may not carry it: {r}"
-                    ),
-                }
-                for s, r in registry(full.auth)
-                if s in from_env and s not in named
-            )
+        if differs:
+            import os
+
+            environ = {name.upper() for name in os.environ}
+            for s, r in _auth_limit_loosenings(full.auth):
+                if s not in differs:
+                    continue
+                variable = f"MEFOR_SECURITY_{s.upper()}"
+                source = (
+                    f"set by {variable} in this command's environment, which overrides the file "
+                    "and may not be the service's"
+                    if variable in environ
+                    else "read differently by the whole-file load than by the [security] read "
+                    "this report shows, as a concurrent edit between the two leaves it"
+                )
+                loosenings.append({"switch": s, "risk": f"{source}: {r}"})
         # Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
         # degraded or settings-only report for a complete one. `partial` means the sections outside
         # [security] could not be read at all (the file did not load), so they report shipped defaults; the scope string is the standing limitation above. It names
@@ -12171,10 +12179,10 @@ def _security(args: argparse.Namespace) -> int:
                 "The [security] switches are the AUTHORED values, so a MEFOR_SECURITY_* "
                 "variable the service carries is NOT reflected here, and neither is a "
                 "`serve --host` bind override on a running engine — see `messagefoundry check` or "
-                "GET /security/posture. A MEFOR_SECURITY_* variable in THIS command's environment "
-                "that loosens a switch read off its [auth] copy, at least either session limit, is "
-                "named after the authored entries and labelled with the variable, when the "
-                "whole-file load succeeds. The other sections are read as the whole-file load "
+                "GET /security/posture. A session limit that a MEFOR_SECURITY_* variable in THIS "
+                "command's environment loosens is named after the authored entries, labelled with "
+                "the variable, but only when a whole-file load runs and succeeds: an absent file "
+                "runs none, so it is not named there. The other sections are read as the whole-file load "
                 "resolves them, so a MEFOR_<SECTION>_<KEY> variable in THIS command's environment "
                 "counts there, which may not be the service's. One entry is not read from the "
                 "file at all: "
@@ -12220,7 +12228,7 @@ def _security(args: argparse.Namespace) -> int:
             saved_sec.append(
                 SecuritySettings.model_validate(security_edit.read_security(candidate))
             )
-        except (ValidationError, security_edit.SecurityEditError, OSError):
+        except (ValueError, OSError):  # ValidationError and SecurityEditError are ValueErrors
             saved_sec.append(None)
 
     try:
