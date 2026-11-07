@@ -50,6 +50,7 @@ from messagefoundry.store.store import (  # noqa: E402
     UserRecord,
 )
 from tests._admin_account import ADMIN_USERNAME, login_admin  # noqa: E402
+from tests._enrolment_code import enrolment_code_for  # noqa: E402
 from tests._fake_directory import FakeDirectory as _Directory  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
@@ -108,6 +109,8 @@ async def _register_passkey(
         token=token,
         rp_id=_RP,
         origin=_ORIGIN,
+        # ADR 0207: a directory account's first factor binds only with an issued code.
+        enrolment_code=await enrolment_code_for(service, identity.user_id),  # type: ignore[attr-defined]
     )
     assert enrolled.ok
 

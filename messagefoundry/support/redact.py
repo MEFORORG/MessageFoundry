@@ -7,8 +7,9 @@ bodies at INFO+ (PHI.md §1), a log line can still carry a stray HL7 fragment, a
 ``MEFOR_*`` secret value, or an embedded base64/``mfb64:`` blob — none of which belong in a file an
 operator emails to support. This module scrubs those **patterns** out of each line.
 
-It is deliberately a small regex pass, **not** the full HL7-shaped :mod:`messagefoundry.anon` engine:
-the goal is "don't leak a secret or a body into the support zip", not deterministic de-identification.
+It is deliberately a small regex pass, **not** the full HL7-shaped ``anon`` package in the
+``messagefoundry-toolkit`` distribution: the goal is "don't leak a secret or a body into the
+support zip", not deterministic de-identification.
 Stdlib ``re`` only — no dependency, no engine state — so it stays usable from the offline CLI.
 
 The PHI pass is **delegated to the shared engine redactor** (:func:`messagefoundry.redaction.redact`, also

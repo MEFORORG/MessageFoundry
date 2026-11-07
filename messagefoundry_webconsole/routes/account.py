@@ -30,6 +30,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_WEBAUTHN_DELETE,
     STEP_UP_ACTION_WEBAUTHN_ENROLL,
     AuthService,
+    EnrolmentCodeRefused,
     NotifyEmailAlreadySet,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -149,6 +150,9 @@ register_ui_action(
 _SESSION_OFFER_TTL_SECONDS = 300.0
 #: The most sessions the table holds; the oldest mark is dropped first.
 _SESSION_OFFER_SESSIONS_MAX = 4096
+#: The longest enrolment code the console passes on, as the JSON plane's MfaConfirmRequest caps
+#: it (ADR 0207). A real code is far shorter.
+_ENROLMENT_CODE_MAX = 64
 
 
 class _SessionOffers:
@@ -254,7 +258,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         status_code: int = 200,
         session_offer: int | None = None,
     ) -> HTMLResponse:
-        mfa = await admin.my_mfa(service=service, identity=identity)
+        mfa = await admin.my_mfa(service=service, identity=identity, token=session_token(request))
         # L5a passkey rows (plain mappings — the pages module never touches the store); the
         # "usable" flag compares each credential's mint-time rp_id to the CURRENT RP identity
         # (an origin migration renders old credentials visibly unusable, ADR 0068 §7).
@@ -505,15 +509,22 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 service, identity, request, error=str(exc.detail), status_code=400
             )
         # The staged secret renders ONCE (with the confirm form); it is inert until confirmed.
-        return HTMLResponse(pages.mfa_enroll_page(enroll.secret, enroll.otpauth_uri))
+        # ADR 0207: with the enrolment-code field when this session's first factor owes one.
+        owed = await service.enrolment_code_required(session_token(request), identity)
+        return HTMLResponse(
+            pages.mfa_enroll_page(enroll.secret, enroll.otpauth_uri, enrolment_code=owed)
+        )
 
     @app.get("/ui/account/mfa/confirm", response_class=HTMLResponse)
     async def ui_mfa_confirm_form(
-        _identity: Identity = Depends(require_ui_reauth_only()),
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_ui_reauth_only()),
     ) -> HTMLResponse:
         # The unlock re-entry point: the secret is already staged server-side (and in the user's
         # authenticator), so this form only collects the code — the secret is never re-shown.
-        return HTMLResponse(pages.mfa_confirm_page())
+        owed = await service.enrolment_code_required(session_token(request), identity)
+        return HTMLResponse(pages.mfa_confirm_page(enrolment_code=owed))
 
     @app.post("/ui/account/mfa/verify")
     async def ui_mfa_verify(
@@ -540,7 +551,19 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         code = form.get("code", "").strip()
         try:
             elevation = await service.confirm_mfa_enrollment(
-                identity, code, token=token, client=client
+                identity,
+                code,
+                token=token,
+                client=client,
+                # Bounded as the JSON plane bounds it (MfaConfirmRequest, max_length=64): no
+                # code is that long, so the cut only stops an outsized value being normalised.
+                enrolment_code=form.get("enrolment_code", "")[:_ENROLMENT_CODE_MAX] or None,
+            )
+        except EnrolmentCodeRefused as exc:
+            # ADR 0207: the one reply, on the form it came from, so the holder can retry; the
+            # refusal spent no TOTP step and left the staged secret in place.
+            return HTMLResponse(
+                pages.mfa_confirm_page(error=str(exc), enrolment_code=True), status_code=400
             )
         except ValueError as exc:
             # At least: unknown account, no enrollment staged, or a factor bound meanwhile
@@ -563,7 +586,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # vouch for a directory account (BACKLOG #3061), or a second-step lock, said in
             # /ui/reauth's words (BACKLOG #3810 finding 4).
             error = _refusal_error(elevation, "Invalid code.")
-            return HTMLResponse(pages.mfa_confirm_page(error=error), status_code=400)
+            # ADR 0207: keep the enrolment-code field when the session still owes one, so a wrong
+            # TOTP code does not cost the holder a second round trip for the field.
+            owed = await service.enrolment_code_required(token, identity)
+            return HTMLResponse(
+                pages.mfa_confirm_page(error=error, enrolment_code=owed), status_code=400
+            )
         # Activated: the recovery codes render ONCE — never re-fetchable. The confirm re-keyed the
         # session (ASVS 7.2.4), so this response must carry the new cookie or the operator is signed
         # out on the very page showing codes they have not written down yet.
@@ -740,7 +768,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 service, identity, request, error=str(exc), status_code=503
             )
         # The creation options render ONCE in a data-* hook (CSP: no inline script).
-        return HTMLResponse(pages.webauthn_enroll_page(options))
+        return HTMLResponse(
+            pages.webauthn_enroll_page(
+                options, enrolment_code=await service.enrolment_code_required(token, identity)
+            )
+        )
 
     @app.post("/ui/account/webauthn/verify")
     async def ui_webauthn_verify(
@@ -761,7 +793,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             body = await request.json()
             response_json = json.dumps(body["response"])
             label = str(body.get("label", ""))
-        except (ValueError, KeyError, TypeError):
+            # ADR 0207: the enrolment code a directory account's first factor needs, or None.
+            raw_code = body.get("enrolment_code")
+            enrolment_code = (
+                raw_code[:_ENROLMENT_CODE_MAX] if isinstance(raw_code, str) and raw_code else None
+            )
+        except (ValueError, KeyError, TypeError, AttributeError):
             return JSONResponse({"ok": False, "error": "malformed request"}, status_code=400)
         # BACKLOG #3014: ui_mfa_verify's per-actor budget, charged only on a request that reaches
         # the ceremony, and after the gate's admin-write charge (that order is BACKLOG #2652's, left
@@ -799,6 +836,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 rp_id=rp[0],
                 origin=rp[1],
                 factor_refused=factor_refused,
+                enrolment_code=enrolment_code,
             )
         except ValueError as exc:
             # Service-authored, safe messages only (expired ceremony / duplicate label or

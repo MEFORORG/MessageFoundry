@@ -231,11 +231,11 @@ import shlex
 import ssl
 import stat
 import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed tool, no shell)
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
 
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth.anchor_path import (
@@ -1428,10 +1428,20 @@ def _enforce_verdict(
     warn(f"{unknown}\n{fix}\n{_WARNED}")
 
 
+def _is_clean(verdict: AnchorVerdict) -> bool:
+    """Whether ``verdict``'s ACL and path are both plainly fine. A verdict that passes logs a
+    warning from :func:`_enforce_verdict`, and gets a violation row from :func:`_audit_verdict`,
+    exactly when this is False: an ``acl_insecure``, ``acl_indeterminate``, ``path_insecure`` or
+    ``path_indeterminate`` row today. The lane check remembers only a clean pass (vault BACKLOG
+    #3188), so a change to which pass gets a row must change this too, or the lane check's
+    repeats would skip that row."""
+    return verdict.acl_ok is True and verdict.path_ok is True
+
+
 def _warned_state(verdict: AnchorVerdict) -> tuple[object, ...] | None:
     """What a warning :func:`_enforce_verdict` logged was about, or ``None`` when it logged none
     (every verdict it passes with a warning has an ACL or path that is not plainly fine)."""
-    if verdict.acl_ok is True and verdict.path_ok is True:
+    if _is_clean(verdict):
         return None
     path_findings = tuple((f.path, f.reason) for f in _findings(verdict, insecure=True))
     return (verdict.fingerprint, verdict.acl_ok, verdict.path_ok, verdict.pin_ok, path_findings)
@@ -2379,7 +2389,13 @@ async def _audit_verdict(
         raise faults[0]
 
 
-async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> str:
+async def _preflight_one(
+    store: Store,
+    spec: AnchorSpec,
+    *,
+    enforcing: bool,
+    verdict: AnchorVerdict | OSError | None = None,
+) -> str:
     """Preflight one anchor: audit the observation (baseline / changed) FIRST so a change is durably
     recorded even when the anchor then fails its pin/ACL, record any violation, then enforce (which may
     raise). Returns the fingerprint of the bytes it read and passed.
@@ -2413,20 +2429,30 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
 
     Every refusal it raises carries a :attr:`TrustAnchorError.setting`: the pin's setting for a
     pin that did not parse (:func:`evaluate_anchor`), ``spec.setting`` for any other (vault
-    BACKLOG #3498)."""
+    BACKLOG #3498).
+
+    ``verdict`` is a read of ``spec`` the caller already made with :func:`evaluate_anchor`: what
+    it returned, or the ``OSError`` it raised. It is judged in place of a second read, so what the
+    caller remembers and what this judged come from one read of the bytes, the ACL and the path
+    (vault BACKLOG #3188)."""
     try:
-        return await _preflight_checks(store, spec, enforcing=enforcing)
+        return await _preflight_checks(store, spec, enforcing=enforcing, verdict=verdict)
     except TrustAnchorError as refusal:
         if refusal.setting is None:
             refusal.setting = spec.setting
         raise
 
 
-async def _preflight_checks(store: Store, spec: AnchorSpec, *, enforcing: bool) -> str:
+async def _preflight_checks(
+    store: Store, spec: AnchorSpec, *, enforcing: bool, verdict: AnchorVerdict | OSError | None
+) -> str:
     """The body of :func:`_preflight_one`, whose docstring says what it checks."""
     shape_error: TrustAnchorError | None = None
     try:
-        verdict = await asyncio.to_thread(evaluate_anchor, spec)
+        if verdict is None:
+            verdict = await asyncio.to_thread(evaluate_anchor, spec)
+        elif isinstance(verdict, OSError):
+            raise verdict  # the caller's read failed: refused below, as this read's would be
         if verdict.pin_ok is not False:
             # A cafile= consumer takes only the private-key check (BACKLOG #3745), and a driver's
             # CA the encryption-header check (module item 12): the rest of the shape check would
@@ -2691,18 +2717,91 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
     **A repeat of the last refusal writes no rows.** A scheduled poller retries its bind at every
     window tick, and each audited refusal would add rows. Enough of them would push a quiet
     anchor's baseline out of :func:`_last_fingerprint`'s look-back, and its next swap would read as
-    a first observation. So a refusal whose file, pin and verdict match the last one for that label
-    is raised again from memory. Any change in them is checked and audited in full."""
-    refused: dict[str, tuple[tuple[object, ...], str]] = {}
+    a first observation. So a refusal whose spec and verdict match the last one for that lane is
+    raised again from memory. Any change in them is checked and audited in full.
 
-    def state(spec: AnchorSpec) -> tuple[object, ...]:
+    **A repeat of the last clean pass is not judged again** (vault BACKLOG #3188). A clean pass
+    is one :func:`_is_clean` accepts: its ACL reads as owner-only and no other account can
+    replace the file through its path, so it wrote no violation row. Only such a pass is
+    remembered, and only once its rows were all written. A repeat skips the content check
+    (:func:`_refuse_by_path_content`, the private-key and encryption-header refusal a lane CA
+    takes in place of the PEM shape check) and the audit pass. It skips them only when the spec
+    and the whole verdict match, and the audited baseline still names these bytes. The verdict
+    compared holds the fingerprint of the bytes, the result of the ACL read rather than the ACL
+    itself (``acl_ok``: True for owner-only, False for writable by a non-owner, None for
+    unjudged, and always True in a remembered pass), the pin result and each path finding. It
+    still reads that baseline, so a store that refuses the read raises as above, and a baseline
+    another writer moved is judged and audited again. A changed file, ACL result or setting is
+    judged and audited again.
+
+    **A pass that wrote a violation row is never remembered.** Under ``warn`` a CA whose ACL or
+    path is exposed or unjudged passes and writes its violation row (:func:`_is_clean` names
+    them). Every check judges it again and writes that row again, as each check did before this
+    pass memo, so this detective control records no less than it did. That keeps the cost the
+    refusal memo above avoids: a poller retrying such a lane at every window tick adds those rows
+    at every tick, as it did before this pass memo.
+
+    **Each check reads the CA once.** What is remembered and what was judged come from that one
+    read (:func:`_preflight_one`'s ``verdict``), so a file swapped during a check cannot pair one
+    file's state with another's verdict.
+
+    A reload that commits tells the check which lanes its graph declares, through
+    :meth:`_LaneAnchorCheck.retain_lanes`, so a removed or renamed lane's memory goes."""
+
+    def read(spec: AnchorSpec) -> AnchorVerdict | OSError:
+        # Defined here, not as a method, so the crypto inventory sees this function reach the
+        # pin compare in evaluate_anchor, and its callers with it.
         try:
-            v = evaluate_anchor(spec)
+            return evaluate_anchor(spec)
         except OSError as exc:
-            return (spec.path, spec.pin, "unreadable", exc.errno)
-        return (spec.path, spec.pin, v.fingerprint, v.acl_ok, v.pin_ok, v.path_ok)
+            return exc
 
-    async def check(direction: str, name: str, settings: Mapping[str, Any]) -> None:
+    return _LaneAnchorCheck(store, enforcing=enforcing, read=read)
+
+
+async def _baseline_names(store: Store, spec: AnchorSpec, verdict: AnchorVerdict) -> bool:
+    """Whether the newest audited fingerprint for ``spec`` is ``verdict``'s, in
+    :data:`ANCHOR_DIGEST`, with no newer row skipped: the case where :func:`_audit_verdict` writes
+    no ``observed`` or ``changed`` row. Raises :class:`AnchorStoreUnavailable` as that read does."""
+    baseline = await _last_fingerprint(store, spec.label)
+    return (
+        baseline.found == Fingerprint(ANCHOR_DIGEST, verdict.fingerprint) and not baseline.skipped
+    )
+
+
+@runtime_checkable
+class RetainsLanes(Protocol):
+    """A lane check that remembers a lane's last refusal or clean pass, and so must be told which
+    lanes still exist (vault BACKLOG #3188). The runner calls it once a reload commits."""
+
+    def retain_lanes(self, lanes: Collection[tuple[str, str]]) -> None: ...
+
+
+class _LaneAnchorCheck:
+    """The check :func:`make_lane_anchor_check` returns, whose docstring says what it does."""
+
+    def __init__(
+        self,
+        store: Store,
+        *,
+        enforcing: bool,
+        read: Callable[[AnchorSpec], AnchorVerdict | OSError],
+    ) -> None:
+        self._store = store
+        self._enforcing = enforcing
+        self._read = read
+        # (direction, name) -> (the spec and what its one read found, the refusal's text, or None
+        # for a clean pass whose rows were all written). A pass that wrote a violation row has no
+        # entry.
+        self._last: dict[tuple[str, str], tuple[tuple[object, ...], str | None]] = {}
+
+    def retain_lanes(self, lanes: Collection[tuple[str, str]]) -> None:
+        """Forget every lane not in ``lanes``, each ``(direction, name)``."""
+        for lane in [k for k in self._last if k not in lanes]:
+            del self._last[lane]
+
+    async def __call__(self, direction: str, name: str, settings: Mapping[str, Any]) -> None:
+        lane = (direction, name)
         # A DATABASE lane's spec stats its sslca path (database_ca_anchor_spec), so it is built
         # off the loop; any other lane's spec reads only the settings.
         try:
@@ -2714,24 +2813,53 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
             # The spec refused the setting before any anchor was evaluated, and the class says so.
             raise AnchorSettingRefused(str(exc)) from exc
         if spec is None:
-            refused.pop(f"{direction}:{name}", None)
+            self._last.pop(lane, None)
             return
         try:
-            now = await asyncio.to_thread(state, spec)
+            read = await asyncio.to_thread(self._read, spec)
         except (ValueError, TrustAnchorError) as exc:
             # A path the OS will not take, such as one holding a NUL, or an env() pin that
             # resolved but does not parse, the one TrustAnchorError evaluate_anchor raises. Each
             # is a setting refused before any audit row was written (vault BACKLOG #3498).
             raise AnchorSettingRefused(str(exc)) from exc
-        prior = refused.pop(spec.label, None)
+        # The memory keeps no CA bytes: a verdict's equality leaves them out anyway.
+        now: tuple[object, ...] = (
+            (spec, "unreadable", read.errno)
+            if isinstance(read, OSError)
+            else (spec, replace(read, data=b""))
+        )
+        prior = self._last.get(lane)
         if prior is not None and prior[0] == now:
-            refused[spec.label] = prior
-            raise TrustAnchorError(prior[1], setting=spec.setting)
+            if prior[1] is not None:
+                raise TrustAnchorError(prior[1], setting=spec.setting)
+            # A remembered pass, which is clean (_is_clean). The hit skips the content check and
+            # the audit pass, which writes no row while the baseline names these bytes. The
+            # baseline is read as a judged pass reads it, and a store fault there raises, as it
+            # would from _preflight_one. _enforce_verdict raises and warns on no clean verdict, so
+            # here it only keeps the hit applying what a judged pass applies. An unreadable file
+            # is never a pass, so read is a verdict here.
+            if isinstance(read, AnchorVerdict):
+                try:
+                    unchanged = await _baseline_names(self._store, spec, read)
+                except AnchorStoreUnavailable:
+                    _enforce_verdict(spec, read, enforcing=self._enforcing)
+                    raise
+                if unchanged:
+                    _enforce_verdict(spec, read, enforcing=self._enforcing)
+                    return
+        # Dropped only now, so a check that returns from memory never overwrites what a check
+        # that ran meanwhile stored.
+        self._last.pop(lane, None)
         try:
-            await _preflight_one(store, spec, enforcing=enforcing)
+            await _preflight_one(self._store, spec, enforcing=self._enforcing, verdict=read)
         except TrustAnchorError as exc:
             if not exc.unaudited:  # else re-check, so a recovered store gets the rows
-                refused[spec.label] = (now, str(exc))
+                self._last[lane] = (now, str(exc))
             raise
-
-    return check
+        # Reached only when every row was written: a store fault raised AnchorStoreUnavailable.
+        # Only a clean pass is remembered. A pass that wrote a violation row, which a lane CA
+        # passes with only under warn, is judged again at the next check and writes its row
+        # again, as each check did before this pass memo (make_lane_anchor_check's docstring).
+        # An unreadable file raised above, so read is a verdict here.
+        if isinstance(read, AnchorVerdict) and _is_clean(read):
+            self._last[lane] = (now, None)

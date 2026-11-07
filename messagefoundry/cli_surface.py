@@ -45,9 +45,9 @@ production set on the built wheel, installed without the toolkit (``.github/work
 
 WHAT THIS TABLE DOES NOT COVER. It governs the command surface, ASVS 15.2.3's clause (b). Clause (a),
 what the engine wheel includes, is the physical move of each module into the toolkit package, which
-ADR 0201 slices 6 and 7 finish for ``anon/``, ``generators/``, ``hl7schema.py`` and
-``hl7structures.py``. Until those land, do not cite this table as keeping that code off a production
-box.
+ADR 0201 slice 6 finished for ``anon/`` and slice 7 for ``generators/``, ``hl7schema.py`` and
+``hl7structures.py``. Even so, do not cite this table as keeping that code off a production box: it
+is clause (b) only, and ADR 0201 section 8 reads clause (a) on a released engine wheel.
 
 The module imports nothing from the engine and builds no parser, so a wheel build can read it cheaply.
 """
@@ -108,6 +108,8 @@ CLI_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "admin-set-notify-email": "production",
         "admin-reset-totp": "production",
         "admin-revoke-sessions": "production",
+        # ADR 0207 section 6: the host's way to a directory account's first enrolment code.
+        "issue-enrolment-code": "production",
         # Audit log.
         "audit-verify": "production",
         "audit-anchor": "production",

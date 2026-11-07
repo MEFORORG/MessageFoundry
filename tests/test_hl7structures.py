@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-import messagefoundry.generators.adt as adt
-from messagefoundry.hl7structures import (
+import messagefoundry_toolkit.generators.adt as adt
+from messagefoundry_toolkit.hl7structures import (
     SENTINEL,
     SUPPORTED_VERSION,
     TRIGGER_TO_STRUCTURE,

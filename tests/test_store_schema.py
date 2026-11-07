@@ -12,6 +12,7 @@ refuse, extra things are tolerated.
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from pathlib import Path
 
@@ -632,3 +633,51 @@ def test_backup_refuses_a_store_this_build_refuses_and_says_why(
     assert "is from an incompatible version" in text, text
     assert "dr_backup audit row" in text and "`audit-verify`" in text, text
     assert not (tmp_path / "dest").exists() or not any((tmp_path / "dest").iterdir())
+
+
+# --- BACKLOG #1720 step 3: the store v0.3.2 built, opened by this build ---------------------------
+
+
+def _rows(db: Path, sql: str) -> list[tuple[object, ...]]:
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        return conn.execute(sql).fetchall()
+
+
+def _objects(db: Path) -> dict[str, str]:
+    rows = _rows(db, "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL")
+    return {str(name): str(sql) for name, sql in rows}
+
+
+def _columns(db: Path, table: str) -> set[str]:
+    return {str(r[1]) for r in _rows(db, f"PRAGMA table_info({table})")}
+
+
+async def test_the_store_v032_built_is_refused_by_name_and_keeps_its_tables(tmp_path: Path) -> None:
+    """A v0.3.2 store does not migrate: its ``audit_log`` has no ``seq``, which no migration adds,
+    because the column is inside every row's MAC (BACKLOG #1198, vault BACKLOG #2594; ``_migrate``
+    says so). The open refuses, names that column and the remedy, and leaves the definition of every
+    v0.3.2 table and index as it was, rows included: the preset keeps its username owner in
+    ``owner``, so the BACKLOG #1909 rename rolled back with the refusal. What the script creates
+    does stay, because ``executescript`` commits before the migration's transaction opens: new
+    tables, and new indexes, some of them on v0.3.2 tables (``ix_audit_action`` on ``audit_log``,
+    for one). The compare below reads only the objects that were there before, so it does not
+    see those."""
+    from tests._store_v032_shape import build_sqlite_v032
+
+    db = tmp_path / "v032.db"
+    build_sqlite_v032(db)
+    before = _objects(db)
+    # Positive control: the file holds the 0.3.2 shape this test is about.
+    presets = _columns(db, "search_presets")
+    assert "seq" not in _columns(db, "audit_log")
+    assert "owner" in presets and "owner_user_id" not in presets
+
+    with pytest.raises(SchemaMismatchError) as caught:
+        await (await MessageStore.open(db)).close()
+    message = str(caught.value)
+    assert "is from an incompatible version; recreate it" in message, message
+    assert "table 'audit_log' is missing column 'seq'" in message, message
+
+    after = _objects(db)
+    assert {name: after.get(name) for name in before} == before
+    assert _rows(db, "SELECT id, owner FROM search_presets") == [("pa", "alice")]

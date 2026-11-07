@@ -2955,17 +2955,25 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     waiting for it at a bound (:func:`_close_pool_bounded`). Nothing in the engine bounds that time,
     because this connector sets no statement timeout (ADR 0159, amendment of 2026-10-30).
 
-    **What this does not cover, at least.** A cancellation during ``conn.cursor()`` reaches this
-    function with no cursor, so the connection goes back while that call may still be running. The
-    gate holds the next borrower's calls behind it, and the cursor it makes is left for the
-    collector. A cancellation that lands after a call was handed to the connection's executor but
-    before that call entered the gate finds no call running, so the close is not handed to it: the
-    two race for the gate, the close may run first, and the connection can go back while that call
-    is still to run. A connection with no gate (a test double) closes its cursor beside a running
-    call, as before. A cursor with no raw pyodbc cursor (a test double, or an aioodbc that renamed
-    ``_impl``, which :func:`~messagefoundry.odbc_call_gate.raw_cursor` logs once) is closed through
-    its own ``close()`` as a task, and a teardown cancel of that task keeps the connection out of
-    the pool (:func:`_return_when_settled`).
+    **The cancel paths the gate itself closes (BACKLOG #2394).** A cancellation during
+    ``conn.cursor()`` reaches this function with no cursor. On a gated connection the rollback
+    alone is handed to that call, so the connection goes back only once it has returned, and the
+    gate closes the cursor it made as it returns. A cancellation that lands after a call was handed
+    to the connection's executor but before that call entered the gate leaves a call that never
+    runs (:class:`~messagefoundry.odbc_call_gate.CallGate`), so no close races it. A connection
+    with no gate (one :func:`~messagefoundry.odbc_call_gate.install_call_gate` could not wrap,
+    which it logs at ERROR, or a test double) has nothing to hand a close to, so a cancellation
+    drops its handle and closes nothing: the pool gets it back closed, and pyodbc frees the cursor
+    and then the connection once nothing uses them, since its cursor holds the connection.
+
+    **What this does not cover, at least.** A cursor with no raw pyodbc cursor (a test double, or
+    an aioodbc that renamed ``_impl``, which :func:`~messagefoundry.odbc_call_gate.raw_cursor` logs
+    once) is closed through its own ``close()`` as a task, and a teardown cancel of that task keeps
+    the connection out of the pool (:func:`_return_when_settled`). An ungated connection's
+    unclosed handles are freed where their last reference drops, which can be the event loop, for
+    one through the cancelled call's own result: that free rolls back and disconnects there, the
+    trade for not freeing them under the call. Its session ends only then. A cancellation that lands after a ``cursor()`` call returned on its
+    thread, but before the loop delivered the result, leaves that cursor for the collector.
 
     **``discard`` closes the connection instead of returning it open (BACKLOG #5010).** A caller
     whose own rollback failed passes it, since the transaction may still be open on a live session
@@ -2974,18 +2982,27 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     handle, and the pool gets the connection back closed (:func:`_release`). Where the executor is
     shut down, no job runs, and the handle is left for pyodbc to close when it is collected."""
     cancelled = _unwinding_a_cancel()
+    gate = call_gate(conn)
+    hand_to_gate = cancelled and gate is not None
+    if cancelled and gate is None and getattr(conn, "_conn", None) is not None:
+        # No gate to hand a close to, so any close here would run beside a call that may still be
+        # running. Drop the handle and close nothing (BACKLOG #2394), with ``discard`` or without.
+        drop_handle(conn)
+        logger.debug("DATABASE: a cancelled borrow on an ungated connection discarded it unclosed")
+        await _release(pool, conn)
+        return
     dropped = drop_handle(conn) if discard else None  # first: no await may come before it
-    if cur is None and dropped is None:
+    if cur is None and dropped is None and not hand_to_gate:
         await _release(pool, conn)
         return
     raw_cur = None if cur is None else raw_cursor(cur)
-    gate = call_gate(conn)
     work: asyncio.Future[Any]
     if raw_cur is not None or cur is None:
         if dropped is not None:
             close = partial(_close_and_discard, raw_cur, dropped)
-        elif cancelled and gate is not None:
+        elif hand_to_gate:
             # Only inside a gate: on an ungated connection a rollback would run beside the statement.
+            # With no cursor the job is the rollback alone, handed to a cursor() call still running.
             close = partial(_close_after_a_cancel, conn, raw_cur)
         else:
             close = partial(_close_raw_cursor, raw_cur)
@@ -3005,14 +3022,18 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
         # The loop holds a task only weakly; keep this one alive until its done-callback has run.
         _DETACHED_SETTLES.add(work)
         work.add_done_callback(_DETACHED_SETTLES.discard)
+    if cur is not None:
+        what = "a cursor close"
+    else:
+        what = "a connection close" if dropped is not None else "a rollback after a cancel"
     if cancelled:
         # The close may be waiting for a cancelled statement; the cancellation must not.
-        _return_when_settled(pool, conn, work, "a cursor close")
+        _return_when_settled(pool, conn, work, what)
         return
     try:
         await asyncio.shield(work)
     except BaseException:
-        _return_when_settled(pool, conn, work, "a cursor close")
+        _return_when_settled(pool, conn, work, what)
         raise
     await _release(pool, conn)
 
@@ -3054,8 +3075,13 @@ def _close_after_a_cancel(conn: Any, raw_cur: Any) -> None:
     retry would write it again. It is dropped and closed here, still inside the gate,
     and the return that follows hands the pool a closed connection, which :func:`_release` wakes
     the pool for. The close need not end the server's session; :func:`_close_dropped` says what
-    that leaves."""
-    _close_raw_cursor(raw_cur)
+    that leaves.
+
+    ``raw_cur`` is ``None`` when the cancellation landed before the borrow had a cursor, during
+    ``conn.cursor()`` included: the job is then the rollback alone, and a cursor that call made is
+    closed by the gate as the call returns (BACKLOG #2394)."""
+    if raw_cur is not None:
+        _close_raw_cursor(raw_cur)
     raw = getattr(conn, "_conn", None)
     if raw is None:
         return

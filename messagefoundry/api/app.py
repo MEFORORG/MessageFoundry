@@ -1990,8 +1990,9 @@ def _posture_loosenings(
     ``graph`` is passed. The start passes the graph its snapshot took, so a reload that swaps the
     graph before its row is written cannot change what the row says the start loaded (vault BACKLOG
     #3076). ``graph_env_values`` are the ``env()`` values that graph resolves against, taken with it,
-    so a DATABASE hop's ``env()`` dialect reads as the route reads it off the runner; with none it
-    reads as unresolved. The settings-scoped entries are the same for either graph: a reload
+    so a DATABASE hop's ``env()`` dialect and an ``env()`` endpoint ``url`` read as the route reads
+    them off the runner. With none, the dialect reads as unresolved and the ``url`` as its literal
+    default. The settings-scoped entries are the same for either graph: a reload
     changes no settings."""
     store = getattr(state, "store_settings", None) or StoreSettings()
     cred_settings = getattr(state, "static_credential_settings", None)
@@ -2051,7 +2052,6 @@ def _posture_loosenings(
     cleartext_hops = hops(accepted_cleartext_hops)
     expired_hops = hops(expiry_relaxed_hops)
     hostname_hops = hops(hostname_unchecked_hops)
-    query_hops = hops(query_credential_hops)
     # A DATABASE dialect given as env() is resolved against the values the graph builds with, so a
     # hop is listed as generic only when it resolves to generic. One the values cannot resolve keeps
     # the reader's marker beside its name, because this entry keeps names only and its text states
@@ -2062,6 +2062,9 @@ def _posture_loosenings(
         if graph is not None
         else (runner.env_values if runner is not None else None)
     )
+    # An env() url is read against the same values, so the entry names the URL the build dials
+    # (vault BACKLOG #3766 items 14 and 15).
+    query_hops = hops(partial(query_credential_hops, env_values=db_env_values))
     db_hops = (
         []
         if registry is None
@@ -10334,8 +10337,10 @@ def create_app(
         code.
 
         **Which refusals get their own audit row.** Only the ones this body reaches. ``require_step_up``
-        already records the permission / step-up / MFA 403s as ``auth.permission_denied`` and the body
-        never runs on those, so a second denied row there would double-count. The ``409`` needs none
+        records at least the permission 403 as ``auth.permission_denied``, the MFA 403 as
+        ``auth.mfa_denied``, and the step-up 403 and the pacing 429 as ``auth.gate_refused``
+        (BACKLOG #1197). The body never runs on any gate refusal, so a second denied row there
+        would double-count, and the gate refusals that write no row stay the gate's to record. The ``409`` needs none
         either — the ``cluster_stepdown`` row written from the coordinator's return already reads
         ``was_leader: false, lease_released: false``, which IS the refusal. That leaves the
         not-clustered ``400``, the no-sibling ``412`` and the three ``503``s, which nothing else would
@@ -11921,16 +11926,15 @@ def create_managed_app(
         # #329: the derived instance hop posture, computed ONCE here for the OUT-OF-GATE cells this
         # lifespan builds — the alerts webhook sink (notifier_from_settings) and the AD bind
         # (AuthService → LdapAuthenticator). Neither is built inside an active_hop_posture scope, so
-        # current_hop_posture() is None there. The webhook sink's weakened-TLS escape would ship
-        # UNCLAMPED without an explicit posture, and the LDAPS revocation guard reads it (BACKLOG
-        # #2193), as the OIDC legs' guard does. CORRECTED 2026-10-28: this said the plain ldap://
-        # bind refusal reads it; that refusal holds at every posture since vault BACKLOG #3533. The
-        # LDAPS ad_tls_verify=false escape it once clamped is gone (vault BACKLOG #3230). None only
-        # for an embedding that passes no [ai] (serve always passes it). There the webhook escape
-        # fails closed (vault BACKLOG #2354), and so do the [alerts] SMTP login and webhook
-        # revocation guards, which count no posture as enforcing (ADR 0173 section 12); the LDAPS
-        # bind's and the OIDC legs' guards are the unstamped no-op there. Reuses
-        # the same hop_posture_from_ai derivation the store hop and the runner use.
+        # current_hop_posture() is None there. The webhook and LDAPS revocation guards read it
+        # (BACKLOG #2193), as the OIDC legs' guard does. CORRECTED 2026-10-28: this said the plain
+        # ldap:// bind refusal reads it; that refusal holds at every posture since vault BACKLOG
+        # #3533. The LDAPS ad_tls_verify=false escape it once clamped is gone (vault BACKLOG #3230),
+        # and so is the webhook's cleartext-http escape (vault BACKLOG #3533 item 5). None only for
+        # an embedding that passes no [ai] (serve always passes it). There the [alerts] SMTP login
+        # and webhook revocation guards count no posture as enforcing (ADR 0173 section 12); the
+        # LDAPS bind's and the OIDC legs' guards are the unstamped no-op there. Reuses the same
+        # hop_posture_from_ai derivation the store hop and the runner use.
         _hop_posture = (
             hop_posture_from_ai(
                 ai_settings, enforcement=(security_settings or SecuritySettings()).enforcement
@@ -11991,7 +11995,6 @@ def create_managed_app(
                     # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP
                     # hop too, so an estate on a private CA needs no per-alert CA path.
                     trust_anchor_policy=tls_settings.policy() if tls_settings else None,
-                    # #329: clamp the webhook sink's cleartext-http escape to the derived posture.
                     posture=_hop_posture,
                 )
                 if notifier_alerts is not None

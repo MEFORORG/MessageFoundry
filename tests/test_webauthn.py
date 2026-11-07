@@ -18,6 +18,8 @@ from typing import Any
 
 import pytest
 
+from tests._log_absence import assert_capture_sees
+
 pytest.importorskip("webauthn")
 
 from webauthn.helpers import base64url_to_bytes, bytes_to_base64url  # noqa: E402
@@ -33,6 +35,7 @@ from messagefoundry.auth.service import AuthService, Elevation  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore, WebAuthnCredential  # noqa: E402
 from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin  # noqa: E402
+from tests._enrolment_code import enrolment_code_for  # noqa: E402
 from tests._fake_directory import DirectoryOf  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
@@ -415,6 +418,7 @@ async def test_a_stored_key_registration_would_refuse_fails_sign_in_audited(
         ):
             refused = await _finish_assertion(service, token, signer)
         assert refused == Elevation(), "the caller must see the same refusal as a bad signature"
+        assert_capture_sees(caplog, _WEBAUTHN_LOG)
         assert not [r for r in caplog.records if r.name == _WEBAUTHN_LOG]
         warned = _stored_key_warnings(caplog)
         assert len(warned) == 1 and "'test key'" in warned[0], warned
@@ -1166,6 +1170,7 @@ async def test_a_first_passkey_registration_finishes_the_first_sign_in_and_recor
             client="10.6.6.6",
             rp_id=RP,
             origin=ORIGIN,
+            enrolment_code=await enrolment_code_for(service, out.identity.user_id),  # ADR 0207
         )
         assert elevation.ok
 
