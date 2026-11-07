@@ -13614,8 +13614,8 @@ class AuthService:
         staged secret, a second confirm enabled first (BACKLOG #2224), or a second begin staged a
         secret this confirm never verified (BACKLOG #3025). That confirm asks the store to end the
         session it rotated, hands back no codes, and audits ``auth.mfa_enroll_refused``, whose
-        ``session_ended`` says whether the store took the revoke (vault BACKLOG #3113; THE RETRY
-        comment in the body, BACKLOG #3025).
+        ``session_ended`` says whether the store took the revoke, as far as the confirm saw (vault
+        BACKLOG #3113; THE RETRY comment in the body, BACKLOG #3025).
 
         This is one of the two legs that turn an MFA-pending session into an MFA-satisfied one for a
         FIRST enrolment, so it rotates for the same reason ``verify_mfa`` does: without it a pre-MFA
@@ -13762,20 +13762,17 @@ class AuthService:
             # row first, so no exception the revoke raises can skip it.
             #
             # THE RETRY (BACKLOG #3025). Left live, the rotated session stays stamped MFA-verified
-            # on a factor that is not enabled, so a revoke the store REFUSED, which the helper
-            # logged and answered False, is tried once more. A refusal here is what ``refused``
-            # catches, and that set also reads some defects as refusals, at least an engine
-            # ``RuntimeError`` or a ``ValueError``; those are retried too. A cancellation, or a
-            # defect the helper re-raises, from the first attempt propagates with no second
-            # one, so the retry is never awaited while an exception is propagating; a
+            # on a factor that is not enabled, so a revoke the helper logged and answered False
+            # is tried once more. Which raises that covers, and when the session can still stay
+            # live, is stated once, in docs/SECURITY.md under ``auth.mfa_enroll_refused``. A raise
+            # from the first attempt that the helper does not answer False propagates with no
+            # second one, so the retry is never awaited while an exception is propagating; a
             # cancellation can still land during the retry itself. The retry recovers only a
             # refusal that has cleared by then, such as a deadlock victim; at least a closed
             # connection refuses it too. ``session_ended`` records whether either attempt
-            # landed. The session may stay live until its own timers end it, at least when both
-            # attempts are refused, or when the first attempt is cancelled or raises a defect;
-            # no caller holds its token, which is never handed back. The row's own write is soft
-            # too, so a store fault there is logged at ERROR rather than replacing the answer, or
-            # a defect already propagating. Known limit: a cancellation can land after the store
+            # landed, as far as the confirm saw. The row's own write is soft too, so a store
+            # fault there is logged at ERROR rather than replacing the answer, or a defect
+            # already propagating. Known limit: a cancellation can land after the store
             # committed a revoke, and the row then says ``session_ended: false`` for a session
             # that did end.
             rotated = hash_token(elevation.token)

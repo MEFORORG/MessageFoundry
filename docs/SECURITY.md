@@ -3607,14 +3607,18 @@ confirm asks the store to end the session it just rotated, and answers as a lost
 `auth.mfa_enroll_refused`. The `reason` values it records include `account_gone`, `already_enabled`,
 `secret_cleared`, `secret_replaced` and `write_lost`. Each is read from the row after the refusal,
 so a `reason` points an operator at the likely cause rather than proving it. The row's
-`session_ended` is false when no revoke of the rotated session landed. A refused revoke is retried
-once (BACKLOG #3025). A cancellation is not retried, and neither is a defect, at least a
-`NotImplementedError` or a `RecursionError`. So the session can stay live, with its token never
-handed back, until its own timers end it, at least when both attempts are refused, or when the
-first attempt is cancelled or raises a defect; while it lives, it counts as a full session under
-`[auth].max_sessions_per_user`. The token is not handed back in any case,
-and the row is written whatever the revoke raised, unless its own write fails, which is logged at
-ERROR (vault BACKLOG #3113). The compare is
+`session_ended` is false when no revoke of the rotated session landed, as far as the confirm saw:
+a cancellation that lands after the store committed the revoke still reads false. A revoke the
+store refused is retried once (BACKLOG #3025). A refusal is whatever the auth service's
+store-refusal audit writes catch, so a defect that raises one of those classes is retried too, at
+least any `RuntimeError` or `ValueError`. A cancellation is not retried, and neither is a raise the
+confirm passes on as a defect, at least a `NotImplementedError`, a `RecursionError` or a
+`sqlite3.ProgrammingError`. So the rotated session can stay live until its own timers end it, at
+least when both attempts are refused, or when the first attempt is cancelled or raises a defect
+that is passed on; while it lives, it counts as a full session under
+`[auth].max_sessions_per_user`. Its token is not handed back in any case, and the row is written
+whatever the revoke raised, unless its own write fails, which is logged at ERROR (vault BACKLOG
+#3113). The compare is
 on the stored ciphertext, so at least a store-key rotation that re-encrypts the column inside the
 window refuses too. That refusal reads as `secret_replaced` although no second enrolment started.
 `write_lost` means the row still held the verified secret with TOTP off, so the enable lost to
