@@ -88,6 +88,9 @@ _STRUCTURAL_CONTROLS: dict[str, str] = {
     "argon2 concurrency cap": "argon2",
     "request-body cap": "max_upload_bytes",
     "pre-auth client-network gate": "allowed_client_networks",
+    # BACKLOG #4735: the sign-out miss-row budget. Its accessor is private, so the allow_ derivation
+    # below does not find it; this token pins its row instead.
+    "sign-out miss-row budget": "_admit_logout_miss_row",
 }
 
 #: The count word the 6.1.1 preamble uses, pinned against the live row count so the sentence and the
@@ -2036,6 +2039,21 @@ def test_protection_set_is_derived_from_the_shipped_anti_automation_seams() -> N
     )
 
 
+def test_the_sign_out_miss_row_budget_token_names_a_shipped_method() -> None:
+    """The control 12 token is pinned by hand, so a rename must fail here rather than leave the row
+    matching a method that no longer exists, or one that no longer reads the budget's limiter
+    (BACKLOG #4735). Its name is private, so the ``allow_`` derivation does not see it."""
+    token = _STRUCTURAL_CONTROLS["sign-out miss-row budget"]
+    tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
+    service = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AuthService")
+    method = next(
+        (n for n in service.body if isinstance(n, ast.FunctionDef) and n.name == token), None
+    )
+    assert method is not None, f"{token} is no longer a method of AuthService"
+    attrs = {s.attr for s in ast.walk(method) if isinstance(s, ast.Attribute)}
+    assert "_logout_miss_rows" in attrs, f"{token} no longer reads the _logout_miss_rows limiter"
+
+
 def test_protection_set_count_word_matches_the_table() -> None:
     """The prose count and the table cannot diverge."""
     rows = len(_protection_rows()) - 1
@@ -2326,7 +2344,9 @@ def test_reauth_surface_feeds_the_lockout_and_the_doc_says_so() -> None:
     assert "global ceiling does **not**" in block, (
         "the SEC-024 caveat must still state that the global sign-in ceiling does not cover them."
     )
-    assert "per engine process" in block, "the caveat must state the per-process limit of the cap."
+    assert "That count is per engine process" in block, (
+        "the SEC-024 caveat must state the per-process limit of the cap."
+    )
 
 
 def test_throttle_observability_split_is_documented() -> None:

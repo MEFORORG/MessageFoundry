@@ -1221,10 +1221,12 @@ class Elevation:
       budget, in which case the proof was wrong or never checked; or (any ceremony, BACKLOG #2298)
       the session was ended because its temporary password lapsed, with the proof checked or not,
       as that ``auth.temp_password_expired`` row records; or (``confirm_mfa_enrollment`` only,
-      BACKLOG #2224) the proof was good but turning TOTP on matched no row, so the confirm ended
-      the session it had just rotated, as its ``auth.mfa_enroll_refused`` row records. That row's
-      ``session_ended`` is false when the store refused the revoke (vault BACKLOG #3113): the
-      rotated session then still exists, but its token was never handed back. Or (the TOTP and
+      BACKLOG #2224) the proof was good but turning TOTP on matched no row, so the confirm asked
+      the store to end the session it had just rotated, as its ``auth.mfa_enroll_refused`` row
+      records. That row's ``session_ended`` says whether a revoke landed, as far as the confirm
+      saw; when it is false, the rotated session may still exist, but its token was never handed
+      back (vault BACKLOG #3113, #3025; THE RETRY comment in
+      :meth:`AuthService.confirm_mfa_enrollment`). Or (the TOTP and
       passkey legs, BACKLOG #3068) the session or its account went while the leg waited on the
       directory lookup, the account queue or the proof check, with the proof checked or not. Fails
       CLOSED: no token is handed back. Held apart from a wrong proof so a route answers 401 rather
@@ -2942,7 +2944,9 @@ CredentialIssueOp = Literal["create", "password_reset", "mfa_reset"]
 #: What :meth:`AuthService.logout` reports, and what its ``auth.logout`` row's ``outcome`` records.
 #: ``lapsed`` is a revoke of a row :meth:`AuthService._was_live_at_revoke` found not live, or of a
 #: live one whose owner's admin-issued temporary credential had passed its deadline
-#: (:meth:`AuthService._gate_refusal`'s ``"credential"``) (BACKLOG #3749).
+#: (:meth:`AuthService._gate_refusal`'s ``"credential"``) (BACKLOG #3749). An ``auth.logout`` row can
+#: also carry ``unrecorded``, which no sign-out returns: the row that counts the sign-outs the
+#: miss-row bound left unwritten (BACKLOG #4735, :meth:`AuthService._count_unrecorded_logout_misses`).
 LogoutOutcome = Literal["revoked", "lapsed", "nothing_to_revoke"]
 #: BACKLOG #3715, #3749: how far before the moment a sign-out's token was proven live, or before
 #: the call when nothing proved it, the sign-out follows the session lineage. ``/ui/logout``
@@ -2950,6 +2954,19 @@ LogoutOutcome = Literal["revoked", "lapsed", "nothing_to_revoke"]
 #: another tab that committed while the sign-out was in flight, and no longer. docs/SECURITY.md
 #: states it as a power of its own.
 _LOGOUT_LINEAGE_SECONDS: Final = 5.0
+#: BACKLOG #4735, #3749 item 6: the bound on the ``auth.logout`` rows that a sign-out naming no
+#: caller (``/ui/logout``) writes when it ends nothing. Each source, the caller's folded address,
+#: writes at most _LOGOUT_MISS_ROWS_PER_SOURCE such rows a window, and every caller with no address
+#: shares one source. All sources together write at most _LOGOUT_MISS_ROWS_ALL, so a flood from many
+#: addresses cannot grow audit_log without limit. That is 40 sources' worth, so ten addresses at
+#: their cap leave 30 more sources their rows. A miss past either is counted, and at most one row a
+#: window writes the count (AuthService._count_unrecorded_logout_misses). A sign-out that ended a
+#: session, or that names its caller, is never bounded. docs/SECURITY.md states the bound.
+_LOGOUT_MISS_ROWS_PER_SOURCE: Final = 3
+#: The all-sources ceiling of the bound above, 40 sources' worth.
+_LOGOUT_MISS_ROWS_ALL: Final = 40 * _LOGOUT_MISS_ROWS_PER_SOURCE
+#: The window both terms of the bound above, and its count row, are measured over.
+_LOGOUT_MISS_ROW_WINDOW_SECONDS: Final = 60.0
 _ISSUE_ROW_EARLY_SECONDS: Final = 5.0
 _ISSUE_ROW_LATE_SECONDS: Final = 60.0
 _ISSUE_ROW_PAGE: Final = 200
@@ -3532,6 +3549,22 @@ class AuthService:
         # so a page for one action never hides a loss of the other.
         self._step_up_return_audit_alert = step_up_return_audit_alert
         self._step_up_return_audit_paged_at: dict[str, float] = {}
+        # BACKLOG #4735: the bound on the auth.logout rows of sign-outs that name no caller and end
+        # nothing; _LOGOUT_MISS_ROWS_PER_SOURCE says why each term. Always on, unlike the sign-in
+        # limiter: it gates a row, never the sign-out, so it refuses nobody, and turning the
+        # sign-in limiter off behind a fronting proxy must not unbound audit_log. A refusal by
+        # either term charges neither, so a source past its share costs the aggregate nothing.
+        self._logout_miss_rows = SlidingWindowRateLimiter(
+            per_key=_LOGOUT_MISS_ROWS_PER_SOURCE,
+            glob=_LOGOUT_MISS_ROWS_ALL,
+            window_seconds=_LOGOUT_MISS_ROW_WINDOW_SECONDS,
+        )
+        # One count row a window; it has no per-key term, so the key it is charged under is unread.
+        self._logout_miss_count_rows = SlidingWindowRateLimiter(
+            per_key=0, glob=1, window_seconds=_LOGOUT_MISS_ROW_WINDOW_SECONDS
+        )
+        #: Misses the bound left unwritten since the last row that counted them.
+        self._logout_misses_unrecorded = 0
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
         # bounded host keys (_bounded_address_text(_host_key(...)), BACKLOG #3772) already flagged since the session's last re-verification (BACKLOG #2159). Every
         # re-anchor drops the entry (_restart_new_ip_dedupe). Bounded twice: _NEW_IP_DEDUP_MAX sessions,
@@ -11494,6 +11527,14 @@ class AuthService:
         characters of its id and, when a link was followed, of the hash presented. With no token
         there is nothing to look up, so this returns ``nothing_to_revoke`` and writes no row.
 
+        **A sign-out that names no caller and ends nothing writes its row within a bound (BACKLOG
+        #4735).** ``/ui/logout`` needs no credential, so any caller that reaches it could otherwise
+        append such rows without limit. :meth:`_admit_logout_miss_row` holds the bound, and
+        :meth:`_count_unrecorded_logout_misses` writes the count of the misses past it. The bound
+        never stops the row of a sign-out that ended a session, or that names its caller as
+        ``POST /auth/logout`` does: concurrent ``POST /auth/logout`` calls on one token each write one, all
+        but one ``nothing_to_revoke``, and that is kept on purpose.
+
         **A fault in the owner lookup or an audit write is logged, not raised (BACKLOG #3884 item
         1).** Once a session ended, a raise would report a sign-out that already happened as a
         failure, and ``/ui/logout`` answered 500 without clearing the cookie. A failed owner lookup
@@ -11521,7 +11562,12 @@ class AuthService:
         ended = await self._store.supersede_session(presented, now=before, lineage_since=since)
         if ended is None:
             # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
-            # ended, so the trail still records the sign-out request.
+            # ended, so the trail still records the sign-out request: within the bound when it
+            # names no caller, and in a count past it (BACKLOG #4735).
+            bounded = actor is None
+            if bounded and not self._admit_logout_miss_row(client):
+                await self._count_unrecorded_logout_misses(refused=True)
+                return "nothing_to_revoke"
             await write_audit_soft(
                 lambda: self._audit(
                     "auth.logout",
@@ -11535,6 +11581,10 @@ class AuthService:
                 # without clearing the cookie (BACKLOG #3884).
                 defects=(),
             )
+            if bounded:
+                # After its own row, whose slot is already charged, so a fault in this write
+                # cannot cost it that row.
+                await self._count_unrecorded_logout_misses(refused=False)
             return "nothing_to_revoke"
         after = time.time()
         session = ended.token_hash[:12]
@@ -11605,6 +11655,63 @@ class AuthService:
             defects=(),
         )
         return outcome
+
+    def _admit_logout_miss_row(self, client: str | None) -> bool:
+        """Whether a sign-out that names no caller and ended nothing may write its own
+        ``auth.logout`` row, charging the bound when it may (BACKLOG #4735).
+
+        The source is ``client`` folded as the sign-in limiter folds it and bounded in length, so
+        every caller with no address shares one source. :data:`_LOGOUT_MISS_ROWS_PER_SOURCE`
+        gives the numbers. The bound is in-process, so each engine shard keeps its own."""
+        return self._logout_miss_rows.allow(_bounded_address_text(_client_limiter_key(client)))
+
+    async def _count_unrecorded_logout_misses(self, *, refused: bool) -> None:
+        """Count a miss :meth:`_admit_logout_miss_row` ``refused``, and write the count once no
+        count row was attempted in the last window (BACKLOG #4735).
+
+        Called for every sign-out that names no caller and ended nothing, admitted or not (after
+        an admitted one's own row). Only such a sign-out writes the count, so a count left when a
+        flood stops waits for the next one after the window; a sign-out that names its caller does
+        not write it. The row's detail is ``{"outcome": "unrecorded", "count": N}``, N being the
+        misses left unwritten since the last count row; its own outcome keeps it from reading as
+        one ``nothing_to_revoke`` sign-out. It names no actor and no client, because it counts
+        misses from every source, and a WARNING line gives N once the row is written. A refused
+        or cancelled write puts N back for the next count row, though it has spent this window's
+        slot; a refused one also logs an ERROR line. The count is in-process, so a restart loses
+        it."""
+        if refused:
+            self._logout_misses_unrecorded += 1
+        count = self._logout_misses_unrecorded
+        if not count or not self._logout_miss_count_rows.allow("auth.logout"):
+            return
+        # Taken off before the await, so a second count row cannot start on these while this
+        # write stalls; misses counted during the await stay for the next row.
+        self._logout_misses_unrecorded -= count
+        written = False
+        try:
+            written = await write_audit_soft(
+                lambda: self._audit(
+                    "auth.logout", detail=_json({"outcome": "unrecorded", "count": count})
+                ),
+                log=_log,
+                message="%d sign-outs that ended nothing went past the audit bound, and the "
+                "auth.logout row that counts them failed",
+                args=(count,),
+                # A raise would answer a sign-out the caller is owed with a failure (#3884).
+                defects=(),
+            )
+        finally:
+            # One path for a refused write and a cancelled one: the count goes back.
+            if not written:
+                self._logout_misses_unrecorded += count
+        if not written:
+            return
+        # The one operator signal, as often as the count row: the trail is being thinned.
+        _log.warning(
+            "%d sign-outs that ended nothing went past the audit bound; one auth.logout row "
+            "counts them",
+            count,
+        )
 
     def _was_live_at_revoke(self, row: SessionRecord, before: float, after: float) -> bool:
         """Whether ``row``, ended by a revoke that ran between the clock reads ``before`` and
@@ -11736,9 +11843,8 @@ class AuthService:
         owner = await self._load_user(prior.user_id)
         # BACKLOG #3749: a session ``_gate_refusal`` finds a credential lapse on is not recorded as
         # the end of a live one; that method says which gate refusals are not acted on here.
-        # Judged at ``after``, as logout judges it. The owner is read through the row's user_id,
-        # which the revoke returns unchecked (BACKLOG #3716), so a tampered row could judge, and
-        # name, another account.
+        # Judged at ``after``, and the owner read through the row's user_id, as logout does both;
+        # logout's comment says what that unchecked read (BACKLOG #3716) allows.
         refusal = None if owner is None else self._gate_refusal(prior, owner, after)
         ended = {"session": prior.token_hash[:12]}
         if not constant_time_equal(prior.token_hash, prior_hash):  # ASVS 11.2.4, as elsewhere
@@ -13768,9 +13874,10 @@ class AuthService:
         still OFF (BACKLOG #1902), so a lost session never leaves MFA on with codes nobody saw. So
         does a good code whose activation matches no row, for example because a reset cleared the
         staged secret, a second confirm enabled first (BACKLOG #2224), or a second begin staged a
-        secret this confirm never verified (BACKLOG #3025). That confirm ends the session it rotated,
-        hands back no codes, and audits ``auth.mfa_enroll_refused``, whose ``session_ended`` says
-        whether the store took the revoke (vault BACKLOG #3113).
+        secret this confirm never verified (BACKLOG #3025). That confirm asks the store to end the
+        session it rotated, hands back no codes, and audits ``auth.mfa_enroll_refused``, whose
+        ``session_ended`` says whether the store took the revoke, as far as the confirm saw (vault
+        BACKLOG #3113; THE RETRY comment in the body, BACKLOG #3025).
 
         This is one of the two legs that turn an MFA-pending session into an MFA-satisfied one for a
         FIRST enrolment, so it rotates for the same reason ``verify_mfa`` does: without it a pre-MFA
@@ -13946,14 +14053,23 @@ class AuthService:
             # A store refusal of the revoke is logged, not raised, so the confirm still answers
             # ``session_lost`` (vault BACKLOG #3113). That covers aiosqlite's closed connection
             # too, which it raises as a bare ``ValueError`` before sqlite3 is reached. A defect
-            # the helper re-raises still propagates, and the ``finally`` writes the refusal row
-            # first, so no exception the revoke raises can skip it. ``session_ended`` records
-            # what the revoke did. The token is not handed back either way, so the caller still
-            # cannot use the session; a session the revoke left live expires on its own timers.
-            # The row's own write is soft too, so a store fault there is logged at ERROR rather
-            # than replacing the answer, or a defect already propagating. Known limit: a
-            # cancellation can land after the store committed the revoke, and the row then says
-            # ``session_ended: false`` for a session that did end.
+            # the helper re-raises still propagates, and the outer ``finally`` writes the refusal
+            # row first, so no exception the revoke raises can skip it.
+            #
+            # THE RETRY (BACKLOG #3025). Left live, the rotated session stays stamped MFA-verified
+            # on a factor that is not enabled, so a revoke the helper logged and answered False
+            # is tried once more. Which raises that covers, and when the session can still stay
+            # live, is stated once, in docs/SECURITY.md under ``auth.mfa_enroll_refused``. A raise
+            # from the first attempt that the helper does not answer False propagates with no
+            # second one, so the retry is never awaited while an exception is propagating; a
+            # cancellation can still land during the retry itself. The retry recovers only a
+            # refusal that has cleared by then, such as a deadlock victim; at least a closed
+            # connection refuses it too. ``session_ended`` records whether either attempt
+            # landed, as far as the confirm saw. The row's own write is soft too, so a store
+            # fault there is logged at ERROR rather than replacing the answer, or a defect
+            # already propagating. Known limit: a cancellation can land after the store
+            # committed a revoke, and the row then says ``session_ended: false`` for a session
+            # that did end.
             rotated = hash_token(elevation.token)
             refused = audit_write_errors()
             session_ended = False
@@ -13961,11 +14077,27 @@ class AuthService:
                 session_ended = await write_audit_soft(
                     lambda: self._store.revoke_session(rotated),
                     log=_log,
-                    message="a refused TOTP enrolment for %s could not end the session it rotated",
+                    message="a refused TOTP enrolment for %s had its revoke refused; retrying",
                     args=lambda: (scrub_log_argument(identity.username),),
                     errors=refused,
                     defects=AUDIT_WRITE_DEFECTS,
                 )
+                if not session_ended:
+                    session_ended = await write_audit_soft(
+                        lambda: self._store.revoke_session(rotated),
+                        log=_log,
+                        message=(
+                            "a refused TOTP enrolment for %s could not end the session it rotated"
+                        ),
+                        args=lambda: (scrub_log_argument(identity.username),),
+                        errors=refused,
+                        defects=AUDIT_WRITE_DEFECTS,
+                    )
+                    if session_ended:
+                        _log.warning(
+                            "a refused TOTP enrolment for %s ended the session it rotated on retry",
+                            scrub_log_argument(identity.username),
+                        )
             finally:
                 await write_audit_soft(
                     lambda: self._audit_enroll_refused(
