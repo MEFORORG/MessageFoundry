@@ -178,6 +178,11 @@ async def test_the_planted_check_of_every_kind_raises_unverifiable(
     await store.set_ad_group_role_map([("g", VIEWER)])
     await _approval(store, "a-1")
     sealer = store._row_sealer
+    _plant(path, "users", "authz_seal", "id", "u-1")
+    record = await store._read_user_record("u-1")
+    assert record is not None
+    with pytest.raises(TransitSealUnverifiableError):
+        await user_seal_ok_async(sealer, record)
     _plant(path, "sessions", "seal", "token_hash", hash_token(token))
     session = await store._read_session_row(hash_token(token))
     assert session is not None
@@ -439,7 +444,7 @@ async def test_kept_session_census_an_unverifiable_kept_session_escapes(
 async def test_session_stamp_census_an_unverifiable_session_escapes(
     transit: tuple[MessageStore, FakeBackend, Path],
 ) -> None:
-    """Census pin (1b-iv): ``_sealed_stamp`` and ``rotate_session`` in the service catch
+    """Census pin (1b-iv): ``_sealed_stamp`` and ``_rotate_session_hash`` in the service catch
     RowSealError only; the store's stamp and rotation raise the sibling type for an Unverifiable
     session, and write nothing. A Forged one stays RowSealError, as on main."""
     store, _, path = transit

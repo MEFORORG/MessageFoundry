@@ -4244,9 +4244,8 @@ async def ad_map_write_async(
     sealer: AnyRowSealer | None, current: AdMap, change: AdMapChange
 ) -> AdMap | None:
     """:func:`ad_map_write`, awaitable, for either sealer (ADR 0217 slice 1b). An edit over a
-    stored map that fails is refused through :func:`require_seal_for_write`, so a Forged map is
-    :class:`RowSealError` as on ``main``, an Unverifiable one its sibling, and an Outage
-    propagates; the empty map stays exempt, as :func:`ad_map_seal_ok_async` says."""
+    stored map that fails is refused through :func:`require_seal_for_write`, which says with
+    what; the empty map stays exempt, as :func:`ad_map_seal_ok_async` says."""
     if isinstance(change, AdMap):
         changed = replace(change, name=current.name)
     else:
@@ -4519,8 +4518,7 @@ async def approval_update_async(
     sealer: AnyRowSealer | None, current: ApprovalRow, new: ApprovalRow
 ) -> ApprovalRow:
     """:func:`approval_update`, awaitable, for either sealer (ADR 0217 slice 1b): ``current`` is
-    checked through :func:`require_seal_for_write`, so a Forged row is :class:`RowSealError` as on
-    ``main``, an Unverifiable one its sibling, and an Outage propagates."""
+    refused, when its seal fails, by :func:`require_seal_for_write`, which says with what."""
     await require_seal_for_write(
         sealer, APPROVAL_KIND, current.seal_fields(), current.seal, subject=""
     )
@@ -16576,9 +16574,8 @@ class MessageStore:
         With no ``current`` it inserts ``new``, sealed; with ``unless_open`` (the four
         :data:`_SQLITE_OPEN_REPEAT` values) only when no open request matches. With ``current``,
         the row it read, it is a compare-and-set: :func:`approval_update_async` refuses a
-        ``current`` that fails its seal, writing nothing (:class:`RowSealError` for a Forged row,
-        its sibling for an Unverifiable one, and an Outage propagates), and the UPDATE lands only
-        while the row is still in ``current``'s status and carries its seal."""
+        ``current`` that fails its seal, writing nothing, and the UPDATE lands only while the row
+        is still in ``current``'s status and carries its seal."""
         sealer = self._row_sealer
         if current is not None:
             cur = await self._db.execute(
@@ -16795,7 +16792,9 @@ class MessageStore:
         or, when it fails that seal, as a tombstone that holds (BACKLOG #3638). Raises
         :class:`RowSealError` when neither holds, before any statement runs. The tombstone check
         and its write run outside the ``except``, so neither a Transit answer nor a database
-        fault in them is chained to the seal miss."""
+        fault in them is chained to the seal miss. Under Transit an Unverifiable row or an Outage
+        raises its own type instead, which the pass's ``RowSealError`` catch does not take, so it
+        stops the pass with the earlier rows committed (census pin, slice 1b-iv)."""
         try:
             current = ApprovalRow.from_mapping(found)
             return await self._write_approval(current, current=current)
@@ -18607,8 +18606,7 @@ class MessageStore:
                     continue
                 row = RoleRow.from_mapping(found)
                 # The write path's own refusal (ADR 0217 (c) step 1), as the map half below meets
-                # it through _write_ad_map: Forged is counted refused, as on main, and an
-                # Unverifiable row raises its sibling type, the one every write path raises.
+                # it through _write_ad_map: a Forged row is counted refused, as on main.
                 try:
                     await require_seal_for_write(
                         sealer, ROLE_KIND, row.seal_fields(), row.seal, subject=""

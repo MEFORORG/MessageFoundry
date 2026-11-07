@@ -121,6 +121,9 @@ https://github.com/MEFORORG/MessageFoundry/pull/2565#issuecomment-6682609779. An
 anchor/adr0217-owner-ruled-20261106 (94b485c2e1) and branch anchor/adr0217-owner-confirmed-20261106
 (ae898dc817).
 
+Difference 6 was added to the list after that confirmation. The five it confirmed are differences
+1 to 5; difference 6 rests on the owner's ruling of 2026-11-07, recorded next.
+
 **Build rulings, 2026-11-07.** The owner answered three questions the slice 1 build raised, in the
 Manager's chat (`AskUserQuestion`), and the Manager relayed them to the build. No PR comment or
 anchor records them yet; this paragraph is the record in this file.
@@ -135,7 +138,8 @@ anchor records them yet; this paragraph is the record in this file.
   `rotate_session`, `revoke_other_sessions`, `revoke_every_session`) and the store's
   `_keep_or_end_session` end the session quietly with `key_changed=True`, built with the catch
   census on all three backends together. Until then the SQLite session writer turns the type back
-  into `RowSealError`, as `main` raises.
+  into `RowSealError`, as `main` raises. In that list, `rotate_session` names the rotation site in
+  `AuthService`, `_rotate_session_hash`, which calls the store's `rotate_session`.
 
 ## Context
 

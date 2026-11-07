@@ -128,8 +128,12 @@ async def test_the_contract_fails_when_a_seal_check_is_switched_off(
 
         replacement = _approval_refuses_nothing
     monkeypatch.setattr(target, name, replacement)
-    # A contract step built on pytest.raises fails with pytest.fail.Exception, not AssertionError.
-    with pytest.raises((AssertionError, pytest.fail.Exception)):
+    # With the update refusal off, the contract's pytest.raises step for it is what fails, and
+    # pytest.raises fails with pytest.fail.Exception. Every other parameter fails an assert.
+    expected: tuple[type[BaseException], ...] = (AssertionError,)
+    if name == "require_seal_for_write":
+        expected = (pytest.fail.Exception,)
+    with pytest.raises(expected):
         await assert_approval_seal_contract(store, _raw_for(path))
 
 

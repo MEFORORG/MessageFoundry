@@ -2995,8 +2995,11 @@ class AuthStore(Protocol):
 
     # --- sessions ------------------------------------------------------------
     def row_sealer(self) -> AnyRowSealer | None:
-        """The sealer this store writes authority-row integrity seals with, or ``None`` when its
-        cipher holds no in-process key, in which case no seal is written or checked (BACKLOG #2592).
+        """The sealer this store writes authority-row integrity seals with, or ``None`` when it
+        has none, in which case no seal is written or checked (BACKLOG #2592). A local
+        :class:`~messagefoundry.store.row_seal.RowSealer` needs an in-process key; a
+        :class:`~messagefoundry.store.row_seal.TransitRowSealer` (ADR 0217) needs none, and its
+        write helpers also raise the Unverifiable and Outage types beside ``RowSealError``.
 
         The store writes the seals: every session write that changes a sealed column goes through
         one helper per backend, which verifies the row it read before it re-seals it and raises

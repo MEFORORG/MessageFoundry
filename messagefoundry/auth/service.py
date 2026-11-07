@@ -265,9 +265,12 @@ def _session_write_errors() -> tuple[type[Exception], ...]:
     own errors, the acquire timeout, ``OSError`` for a connection lost at the socket, and pyodbc's
     ``Error`` root, which pyodbc raises for an unmapped SQLSTATE such as a deadlock victim. Narrower
     than :func:`~messagefoundry.store.base.audit_write_errors`, which also takes every
-    ``RuntimeError``, ``ValueError``, ``CipherError`` and ``sqlite3.InterfaceError``: a session
-    row's seal is a local HMAC, so no Transit call can refuse it, and an engine ``RuntimeError``
-    other than the acquire timeout still reads as a defect."""
+    ``RuntimeError``, ``ValueError``, ``CipherError`` and ``sqlite3.InterfaceError``: under the
+    local sealer a session row's seal is a local HMAC, so no Transit call can refuse it, and an
+    engine ``RuntimeError`` other than the acquire timeout still reads as a defect. Under the
+    Transit sealer (ADR 0217) that premise is FALSE: an Outage or an Unverifiable seal raises a
+    type this tuple does not take, so it escapes the BACKLOG #3023 fail-closed revoke. Which
+    handling it gets is the catch census of slice 1b-iv, behind the owner gate."""
     return store_open_errors()
 
 
