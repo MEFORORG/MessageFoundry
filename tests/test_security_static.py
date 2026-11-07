@@ -709,14 +709,18 @@ _UNSCANNABLE_RE_PATTERNS = {
     # character. No test checks that now. On 2026-11-07 UTC, against the greedy form of the
     # pattern at commit 1ecac0d9fd, span and group did not differ on 300,000 seeded random texts
     # from a script not kept in the tree. Nor did they differ on the 12 texts either form matched
-    # among the 36 calls to ``_split_checks`` that 4 DR test files made on Windows. A seeded
-    # differential test, since removed, also compared the two forms from c6daab9250 to
-    # 3de33f4f7b. The caller uses the unanchored ``.search``, which starts again only where the
-    # literal lead occurs.
+    # among the 36 calls to ``_split_checks`` that 4 DR test files made on Windows, with those
+    # files as they stood from 1ecac0d9fd to f35be88801. None of the 12 held a [char] part or a
+    # doubled Unicode quote; the b2420 tests that split such texts came later and were not part of
+    # that comparison. A seeded differential test, since removed, also compared the two forms from
+    # c6daab9250 to 3de33f4f7b. The caller uses the unanchored ``.search``, which starts again only
+    # where the literal lead occurs.
     #
     # At least these spellings are NOT coupled: the [char] spelling, the parentheses and ' + ' of
     # _ps_path, the quote around a literal, the space after the check, and the ' ; '
-    # join_before_checks writes. Each is spelled on both sides by hand and can drift apart.
+    # join_before_checks writes. Each is spelled on both sides by hand and can drift apart. The
+    # b2420 staging tests split checks on [char] paths and on doubled Unicode quotes, so a drift
+    # in those spellings fails there; the others have no such test.
     "messagefoundry/pipeline/dr_backup.py": (
         "f'{re.escape(_CHECKS_LEAD)}({_CHECK}(?: ; {_CHECK})*+)\\\\Z'",
     ),
