@@ -2532,9 +2532,8 @@ _CHECK = rf"{re.escape(_TEST_PATH)} (?:{_PS_LITERAL}|\({_PS_PART}(?: \+ {_PS_PAR
 #: The checks that end a message, from the first lead after which nothing else follows. The search
 #: takes the leftmost such lead, so one inside a path is not taken for it. A Windows name cannot
 #: hold the lead, whose colon NTFS refuses, but the split does not rest on that. Every unbounded
-#: repetition here is possessive. tests/test_security_static.py fails on a greedy or lazy one whose
-#: count is not fixed, read from the parsed pattern; its pin for this file says what else it
-#: checks and why possessive keeps the matches.
+#: repetition here is possessive. The ReDoS gate's pin for this file, in
+#: tests/test_security_static.py, says what checks that and why possessive keeps the matches.
 _CHECKS_AT_END = re.compile(rf"{re.escape(_CHECKS_LEAD)}({_CHECK}(?: ; {_CHECK})*+)\Z")
 
 

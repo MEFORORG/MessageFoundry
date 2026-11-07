@@ -697,9 +697,10 @@ _UNSCANNABLE_RE_PATTERNS = {
     # pattern. It fails on any greedy or lazy repetition whose count is not fixed, at least ``*``,
     # ``+``, ``?``, ``{n,}``, ``{,}`` and ``{n,m}`` with any bound, so ``{4}`` passes and an escaped
     # ``\+`` or ``\*``, a literal, is not read. It fails too on an opcode it does not know that
-    # holds a sub-pattern. It also requires every possessive repetition to be spelled ``)*+``, the
-    # one form the differential test below can turn greedy to compare. The detector does not model
-    # overlapping alternation, so neither check catches every catastrophic edit.
+    # holds a sub-pattern at any depth. It also requires the greedy twin the differential test
+    # below compares against to hold no possessive repetition, so every one is compared with its
+    # greedy form. It reads the pattern with the flags it was compiled with. The detector does
+    # not model overlapping alternation, so neither check catches every catastrophic edit.
     #
     # Its three kinds of unbounded repetition are possessive: the quoted run, the ' + ' parts and
     # the ' ; ' checks. Possessive does not change what it matches, because giving an iteration
@@ -761,13 +762,18 @@ def test_the_scanners_blind_spots_are_the_recorded_ones() -> None:
     assert actual == _UNSCANNABLE_RE_PATTERNS
 
 
-def _repeats(pattern: str) -> list[tuple[str, str]]:
+def _holds_subpattern(arg: Any) -> bool:
+    """Whether ``arg`` holds a parsed sub-pattern at any depth of nested tuples and lists."""
+    if isinstance(arg, sre_parser.SubPattern):
+        return True
+    return isinstance(arg, (tuple, list)) and any(_holds_subpattern(a) for a in arg)
+
+
+def _repeats(pattern: str, flags: int = 0) -> list[tuple[str, str]]:
     """Every repetition in ``pattern`` whose count is not fixed, read from its parsed form, as
-    ``(kind, description)``: kind ``possessive`` or ``backtracking`` (greedy or lazy). So ``*``,
-    ``+``, ``?`` and ``{n,m}`` all count, ``{4}`` does not, and an escaped ``\\+`` is a literal.
-    An atomic group whose whole body is one repetition is that repetition made possessive. An
-    opcode this does not know that holds a sub-pattern raises, so a change to the private parser
-    cannot make the walk see nothing."""
+    ``(kind, description)``: kind ``possessive`` or ``backtracking`` (greedy or lazy). The pin for
+    ``messagefoundry/pipeline/dr_backup.py`` above says what that covers. An atomic group whose
+    whole body is one repetition is that repetition made possessive."""
     found: list[tuple[str, str]] = []
     repeat_ops = (
         sre_constants.MAX_REPEAT,
@@ -801,16 +807,16 @@ def _repeats(pattern: str) -> list[tuple[str, str]]:
                 if arg[2] is not None:
                     walk(arg[2])
             else:
-                parts = arg if isinstance(arg, (tuple, list)) else (arg,)
-                assert not any(isinstance(a, sre_parser.SubPattern) for a in parts), op
+                # An opcode this does not know, holding a sub-pattern, would hide what is in it.
+                assert not _holds_subpattern(arg), op
 
-    walk(sre_parser.parse(pattern))
+    walk(sre_parser.parse(pattern, flags))
     return found
 
 
-def _greedy_unbounded_repeats(pattern: str) -> list[str]:
+def _backtracking_repeats(pattern: str, flags: int = 0) -> list[str]:
     """Every greedy or lazy repetition in ``pattern`` whose count is not fixed (:func:`_repeats`)."""
-    return [what for kind, what in _repeats(pattern) if kind == "backtracking"]
+    return [what for kind, what in _repeats(pattern, flags) if kind == "backtracking"]
 
 
 def _greedy_twin(pattern: str) -> str:
@@ -832,11 +838,13 @@ def test_the_dr_staging_check_matcher_passes_the_detector_in_literal_form() -> N
     assert find_nested_quantifiers(source) == []
     # The detector passes a pattern with only one greedy level, so it alone would not notice one
     # repetition made greedy again.
-    assert _greedy_unbounded_repeats(pattern) == []
-    # Every possessive repetition is a `)*+`, the spelling `_greedy_twin` turns greedy, so the
-    # differential test below compares each one with its greedy form.
-    assert len(_repeats(pattern)) == pattern.count(")*+")
+    flags = dr_backup._CHECKS_AT_END.flags
+    assert _backtracking_repeats(pattern, flags) == []
+    # `_greedy_twin` must turn every possessive repetition greedy, so the differential test below
+    # compares each one with its greedy form.
     greedy = _greedy_twin(pattern)
+    twin = _repeats(greedy, flags)
+    assert [kind for kind, _what in twin] == ["backtracking"] * len(_repeats(pattern, flags))
     assert find_nested_quantifiers(f"import re\nre.compile({greedy!r})\n") == [greedy]
 
 
@@ -854,20 +862,23 @@ def _one_edit(pattern: str, old: str, new: str) -> str:
         pytest.param(("\\Z", "\\\\+\\Z"), id="greedy-escaped-backslash-plus"),
         pytest.param((")*+", ")*"), id="greedy-star"),
         pytest.param((")*+", ")*?"), id="lazy-star"),
-        pytest.param((")*+)", "){0,4294967294})"), id="greedy-large-bound"),
+        pytest.param(
+            (")*+)", f"){{0,{int(sre_constants.MAXREPEAT) - 1}}})"), id="greedy-large-bound"
+        ),
         pytest.param(("[0-9A-F]{4}", "[0-9A-F]{4,8}"), id="greedy-small-bound"),
     ],
 )
 def test_the_dr_staging_check_matcher_walk_fails_on_one_greedy_repetition(
     edit: tuple[str, str],
 ) -> None:
-    # Red before the parsed walk: the string check it replaced passed the first three, since it
-    # looked only for `*` and `+` and stripped every `\+`, the quantifier after `\\` included.
+    # Red before the parsed walk: the string check it replaced passed every case here but the two
+    # star ones, since it looked only for `*` and `+` and stripped every `\+`, the quantifier
+    # after `\\` included.
     from messagefoundry.pipeline import dr_backup
 
     pattern = _one_edit(dr_backup._CHECKS_AT_END.pattern, *edit)
     re.compile(pattern)
-    assert len(_greedy_unbounded_repeats(pattern)) == 1
+    assert len(_backtracking_repeats(pattern)) == 1
 
 
 @pytest.mark.parametrize(
@@ -877,7 +888,7 @@ def test_the_dr_staging_check_matcher_walk_fails_on_one_greedy_repetition(
         pytest.param(("[0-9A-F]{4}", "[0-9A-F]{6}"), id="fixed-count"),
     ],
 )
-def test_the_dr_staging_check_matcher_walk_passes_what_is_not_greedy_and_unbounded(
+def test_the_dr_staging_check_matcher_walk_passes_what_cannot_backtrack(
     edit: tuple[str, str],
 ) -> None:
     # The control: the pattern with a literal or fixed-count edit passes.
@@ -885,26 +896,48 @@ def test_the_dr_staging_check_matcher_walk_passes_what_is_not_greedy_and_unbound
 
     pattern = _one_edit(dr_backup._CHECKS_AT_END.pattern, *edit)
     re.compile(pattern)
-    assert _greedy_unbounded_repeats(pattern) == []
+    assert _backtracking_repeats(pattern) == []
 
 
 @pytest.mark.parametrize(
-    ("edit", "possessive"),
+    "edit",
     [
-        pytest.param((")*+", ")++"), 9, id="possessive-plus"),
-        pytest.param(("[0-9A-F]{4}", "[0-9A-F]{4,}+"), 10, id="possessive-brace"),
+        pytest.param((")*+", ")++"), id="possessive-plus"),
+        pytest.param(("[0-9A-F]{4}", "[0-9A-F]{4,}+"), id="possessive-brace"),
+        pytest.param(("[0-9A-F]{4}", "[0-9A-F)*+]{4}x++"), id="possessive-beside-a-decoy"),
     ],
 )
-def test_the_dr_staging_check_matcher_walk_counts_a_possessive_the_twin_cannot_turn(
-    edit: tuple[str, str], possessive: int
+def test_the_dr_staging_check_matcher_walk_finds_a_possessive_the_twin_cannot_turn(
+    edit: tuple[str, str],
 ) -> None:
     # A possessive spelled other than `)*+` is no backtracking risk, but `_greedy_twin` leaves it
-    # possessive, so the differential test would compare it with itself. The count catches it.
+    # possessive, so the differential test would compare it with itself. The twin's parsed form
+    # shows it, where a count of `)*+` substrings can be matched by a decoy.
     from messagefoundry.pipeline import dr_backup
 
     pattern = _one_edit(dr_backup._CHECKS_AT_END.pattern, *edit)
-    assert _greedy_unbounded_repeats(pattern) == []
-    assert len(_repeats(pattern)) == possessive != pattern.count(")*+")
+    assert _backtracking_repeats(pattern) == []
+    assert "possessive" in [kind for kind, _what in _repeats(_greedy_twin(pattern))]
+
+
+@pytest.mark.parametrize(
+    ("opcode", "pattern"),
+    [
+        pytest.param("BRANCH", "x(?:a|b*)y", id="branch"),
+        pytest.param("SUBPATTERN", "(b*)", id="subpattern"),
+        pytest.param("ASSERT_NOT", "(?!b*)c", id="assert-not"),
+        pytest.param("ATOMIC_GROUP", "(?>a*b*)", id="atomic-group"),
+        pytest.param("GROUPREF_EXISTS", "(a)?(?(1)b*|c)", id="conditional"),
+    ],
+)
+def test_the_parsed_walk_fails_on_a_container_it_does_not_know(
+    opcode: str, pattern: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The control for the fail-closed branch: the walk is made not to know one container opcode,
+    # as a change to the private parser could do, and must raise rather than read it as clean.
+    monkeypatch.setattr(sre_constants, opcode, object())
+    with pytest.raises(AssertionError):
+        _repeats(pattern)
 
 
 @pytest.mark.parametrize(
@@ -922,7 +955,7 @@ def test_the_dr_staging_check_matcher_walk_counts_a_possessive_the_twin_cannot_t
 def test_the_parsed_walk_descends_every_container(pattern: str, backtracking: int) -> None:
     # The real matcher has no lookaround, conditional or atomic group, so these plant one each, to
     # show the walk reads inside them.
-    assert len(_greedy_unbounded_repeats(pattern)) == backtracking
+    assert len(_backtracking_repeats(pattern)) == backtracking
 
 
 def test_the_dr_staging_check_matcher_matches_what_its_greedy_form_did() -> None:
