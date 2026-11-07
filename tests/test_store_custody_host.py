@@ -1990,6 +1990,11 @@ def test_a_custody_directory_that_grants_folders_but_not_files_is_refused_before
         ["icacls", str(folders_only), "/deny", f"{user}:(WD)"], check=True, capture_output=True
     )
     try:
+        # The positive control: the folder right is still granted, so the case is folders only.
+        from messagefoundry import startupcode
+
+        assert startupcode._can_add_files(folders_only) is True
+        assert restricted_file.can_add_a_file(folders_only) is False
         monkeypatch.chdir(tmp_path)
         (tmp_path / "messagefoundry.toml").write_text(
             '[store]\nkey_provider = "host"\n[security]\nrequire_mfa = false\n'

@@ -7102,8 +7102,9 @@ def _discard_minted_custody(
     (:class:`~messagefoundry.store.store.StoreIdPinRefusedBeforeWrite`; a pin refusal raised later,
     once the salt bind may have run, does not count), or a SQLite store whose file was never made.
 
-    Otherwise the file is kept, and the warning names it, says the store may hold nothing under it,
-    and names the check to make before removing it by hand. Nothing else is moved or removed: a
+    Otherwise the file is kept, and the warning names it and says the store may hold nothing under
+    it; for a server store it also names the check to make before removing it by hand, while over
+    a SQLite store file that exists removing it gains nothing. Nothing else is moved or removed: a
     server database read through a login that may not see every schema cannot prove it holds
     nothing (PR 2804 thirteenth hold). Neither text carries the key."""
     from messagefoundry.config.settings import StoreBackend

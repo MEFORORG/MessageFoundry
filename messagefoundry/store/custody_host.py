@@ -41,6 +41,7 @@ which writes the console device, and an entry read back is dropped once it is pa
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import sys
 import time
@@ -744,7 +745,15 @@ def _refuse_an_unusable_directory(
             f"account cannot search, {none_shown}. Create it, {secrets_directory}, or let this "
             "account search the directories above it, and run the command again"
         )
-    if can_add_a_file(directory) is False:
+    can_add = can_add_a_file(directory)
+    if can_add is None:
+        # Not answered, so the write is left to answer it, and the log keeps that this was asked.
+        logging.getLogger(__name__).warning(
+            "whether this account can add a file to the custody directory %s could not be "
+            "checked before the recovery key is shown; the key file's write checks it",
+            directory,
+        )
+    if can_add is False:
         raise HostCustodyRefused(
             f"this account cannot add a file to the custody directory {directory}, {none_shown}. "
             f"Let this account add files there, or {move_on('a directory ' + secrets_directory)}, "
