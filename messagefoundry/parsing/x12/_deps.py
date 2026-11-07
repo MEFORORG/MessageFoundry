@@ -41,3 +41,17 @@ def load_x12_validator() -> tuple[Any, Any]:
     except ImportError as exc:  # pragma: no cover - exercised only without the [x12] extra
         raise _missing_extra("strict X12 validation") from exc
     return pyx12.x12n_document.x12n_document, pyx12.params.params
+
+
+def load_x12_code_resolver() -> Any:
+    """Return ``pyx12.error_codes.x12_code_for``, or a clear :class:`RuntimeError` if the ``[x12]``
+    extra is absent.
+
+    ``x12_code_for(err_cde, prefer_5010=...)`` resolves a pyx12 error name to the X12 code the
+    997 (``prefer_5010=False``, AK codes) or 999 (``True``, IK codes) carries, ``None`` where pyx12
+    maps the name to neither, and passes a raw X12 number through unchanged."""
+    try:
+        import pyx12.error_codes
+    except ImportError as exc:  # pragma: no cover - exercised only without the [x12] extra
+        raise _missing_extra("strict X12 validation") from exc
+    return pyx12.error_codes.x12_code_for

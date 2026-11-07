@@ -49,36 +49,8 @@ _ISA_270 = (
 _GS_270 = "GS*HS*SENDERAPP*RECVAPP*20060501*1200*1*X*004010X092A1~"
 
 
-def test_valid_conformant_interchange_validates_true() -> None:
-    # A conformant 270 must validate with valid=True and zero surfaced errors (the positive case the
-    # existing suite lacked). The negative-ack side is exercised by the conformance-error test above.
-    msg = (
-        _ISA_270 + _GS_270 + "ST*270*0001~"
-        "BHT*0022*13*10001234*20060501*1319~"
-        "HL*1**20*1~"
-        "NM1*PR*2*ABC COMPANY*****PI*842610001~"
-        "HL*2*1*21*1~"
-        "NM1*1P*1*JONES*MARCUS****SV*0202034~"
-        "HL*3*2*22*0~"
-        "TRN*1*93175-012547*9877281234~"
-        "NM1*IL*1*SMITH*ROBERT****MI*11122333301~"
-        "DMG*D8*19430519*M~"
-        "DTP*307*D8*20060101~"
-        "EQ*30~"
-        "SE*13*0001~"
-        "GE*1*1~"
-        "IEA*1*000000001~"
-    )
-    result = validate(msg)
-    assert isinstance(result, X12ValidationResult)
-    assert result.valid is True
-    assert result.errors == ()
-
-
-def _conformant_270(
-    *, dob: str = "19430519", ge: str = "GE*1*1~", iea: str = "IEA*1*000000001~"
-) -> str:
-    """The conformant 270 above, with one slot left open so a test can break exactly one thing."""
+def _conformant_270(*, dob: str = "19430519", iea: str = "IEA*1*000000001~") -> str:
+    """The conformant 004010 270 eligibility inquiry, with slots left open to break exactly one thing."""
     return (
         _ISA_270 + _GS_270 + "ST*270*0001~"
         "BHT*0022*13*10001234*20060501*1319~"
@@ -92,8 +64,17 @@ def _conformant_270(
         f"DMG*D8*{dob}*M~"
         "DTP*307*D8*20060101~"
         "EQ*30~"
-        "SE*13*0001~" + ge + iea
+        "SE*13*0001~GE*1*1~" + iea
     )
+
+
+def test_valid_conformant_interchange_validates_true() -> None:
+    # A conformant 270 must validate with valid=True and zero surfaced errors (the positive case the
+    # existing suite lacked). The negative-ack side is exercised by the conformance-error test above.
+    result = validate(_conformant_270())
+    assert isinstance(result, X12ValidationResult)
+    assert result.valid is True
+    assert result.errors == ()
 
 
 def test_element_error_code_is_the_x12_number() -> None:
@@ -324,3 +305,20 @@ def test_segment_error_is_frozen_dataclass() -> None:
     err = X12SegmentError(code="3", message="segment NM1: error 3", segment_id="NM1")
     with pytest.raises(Exception):  # noqa: B017
         err.code = "9"  # type: ignore[misc]
+
+
+def test_codes_follow_the_ack_version_and_fall_back_to_the_pyx12_name() -> None:
+    # pyx12's own x12_code field is 999-first whatever the version; a 004010 group is acked with a 997,
+    # so its not-used segment is AK304 "2", not the 999's IK304 "I4". A raw group-level X12 number
+    # passes through, and a name pyx12 maps to no X12 code (an HL count mismatch) stands in as itself.
+    def report(vriic: str) -> dict[str, object]:
+        seg = {"seg_id": "REF", "errors": [{"err_cde": "SEG_2_segment_not_used"}], "elements": []}
+        hl = {"seg_id": "HL", "errors": [{"err_cde": "SEG_8_hl_count_mismatch"}], "elements": []}
+        txn = {"errors": [], "segments": [seg, hl]}
+        group = {"vriic": vriic, "errors": [{"err_cde": "5"}], "transactions": [txn]}
+        return {"interchanges": [{"errors": [], "groups": [group]}]}
+
+    codes_4010 = [e.code for e in _X12_VALIDATE._flatten_errors(report("004010X092A1"))]
+    codes_5010 = [e.code for e in _X12_VALIDATE._flatten_errors(report("005010X222A1"))]
+    assert codes_4010 == ["5", "2", "SEG_8_hl_count_mismatch"]
+    assert codes_5010 == ["5", "I4", "SEG_8_hl_count_mismatch"]

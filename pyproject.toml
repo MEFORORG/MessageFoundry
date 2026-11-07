@@ -277,8 +277,9 @@ dicom = ["pynetdicom==3.0.4", "pydicom>=3.0.2,<3.1"]
 # by-product. Its SOLE runtime dependency is the upstream defusedxml package, used to parse pyx12's
 # bundled TRUSTED map XML — not attacker input. The engine itself no longer depends on that package: it
 # parses through its own vendored copy (messagefoundry/_vendor/defusedxml/), so this extra is now the
-# only thing that installs upstream defusedxml. >=4.0.1 because parsing/x12/validate.py reads the X12
-# error number from the JSON report's x12_code field, which 4.0.1 added (err_cde became a pyx12 name).
+# only thing that installs upstream defusedxml. >=4.0.1 because parsing/x12/validate.py resolves error
+# codes with pyx12.error_codes.x12_code_for, which 4.0.1 added when its JSON err_cde became a pyx12
+# error name at segment, element and interchange level.
 x12 = ["pyx12>=4.0.1"]
 # Optional XML/SOAP message accessor + schema validation + signature for parsing/xml/ (BACKLOG #31).
 # Lazy-imported, so installs that never touch XML skip it. lxml is the hardened XPath/serialize engine
