@@ -3123,8 +3123,10 @@ def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
     under today's credential-id hash scheme, the only key the sign-in looks a passkey up by (BACKLOG
     #3423). A row the start-up rehash has not moved (a bare digest), or one it refused (an unknown
     tag, a malformed value), can never sign in, so it is no way past however it is recorded. The one
-    statement of the per-passkey rule: the store's conditional writes, the census, the service's
-    gates, the sign-in path and the lock notice all ask it."""
+    statement of the per-passkey way-past rule: at least the store's conditional writes, the census,
+    the service's gates, the sign-in path and the lock notice ask it. The census's reset list asks
+    only its hash-scheme half for a directory account's second factor, which needs no discoverable
+    record (:func:`~messagefoundry.auth.tokens.credential_id_hash_is_current`)."""
     if not cred.discoverable:
         return False
     # Lazy: a leaf module of the auth package (stdlib only), imported where the rule is asked so

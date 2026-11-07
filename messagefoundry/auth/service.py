@@ -2532,9 +2532,10 @@ class LockableAccountCensus:
     TOTP could not be judged is named in ``unknown_beside_a_passkey`` instead. The record
     is what the client reported, or the requirement the registration sent when it reported nothing,
     so on a client that does not conform it can overstate, and ADR 0197 Amendment A (N-G) has the
-    census name these accounts for that reason. :attr:`reset_would_remove_a_passkey` names every
-    account in ``undecryptable_totp`` that keeps a working passkey an administrator's factor reset
-    would remove, whatever the requirement covers."""
+    census name these accounts for that reason. :attr:`reset_would_remove_a_passkey` names the
+    accounts in ``undecryptable_totp`` that keep a passkey the census counts as working, which an
+    administrator's factor reset would remove, whatever the requirement covers. It does not name
+    every such account: a local account's non-discoverable second-factor passkey is not counted."""
 
     no_way_past: tuple[str, ...] = ()
     undecryptable_totp: tuple[str, ...] = ()
@@ -2763,8 +2764,9 @@ async def lockable_account_census(
     Read-only, and it needs no :class:`AuthService`, so ``messagefoundry verify`` runs it without the
     trust-anchor preflights or a directory client. Disabled accounts are read too: one cannot sign in
     now, but it is lockable the moment it is re-enabled. A local row with no password hash is in no
-    list: nobody can sign into it, so there is nothing to lock and no passkey a reset would cost
-    (an interrupted ``provision-admin`` leaves one). Raises :class:`CensusNeedsTheStoreKey` when a
+    lockable list and not in the reset list: nobody can sign into it, so there is nothing to lock
+    and no passkey a reset would cost (an interrupted ``provision-admin`` leaves one). An enabled
+    TOTP on it that is not usable is still named in ``undecryptable_totp``. Raises :class:`CensusNeedsTheStoreKey` when a
     TOTP cell is still ciphertext, which means this shell lacks the store key. Usernames only; each
     secret is dropped at once. :meth:`AuthService.report_lockable_account_census` warns and audits;
     ``verify`` reports. Neither refuses to start, since refusing would hand an account-level fact a

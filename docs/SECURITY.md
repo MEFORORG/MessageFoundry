@@ -5775,8 +5775,10 @@ the sign-in lock. The route's courtesy check, `must_enrol_before_rotating`, asks
 current password: `_has_way_past` counts TOTP or a passkey recorded as discoverable under the
 configured `rp_id` (ADR 0197 Amendment A, wave 2; BACKLOG #3937). The rotation itself refuses an account with no
 TOTP on and no such passkey before it hashes, and otherwise leaves the TOTP to the store's
-conditional write, which judges the cell it writes against and refuses a KNOWN refusal there
-(BACKLOG #3948 finding 13). One whose passkeys are not discoverable must also enrol a factor that is
+conditional write, which judges the cell it writes against (BACKLOG #3948 finding 13). That write
+refuses a KNOWN refusal only where no passkey counts either, and the passkey rule it is handed
+asks the configured `rp_id` and the passkey's own record, not whether the `[webauthn]` extra is
+installed. One whose passkeys are not discoverable must also enrol a factor that is
 before it rotates, so after the passkey it goes to the enrolment page, and only then to the password
 page. Such an account exists only where its passkey came before the requirement covered it, or
 before wave 2: a store from before ADR 0197 Amendment A, a site that turned `require_mfa` on or
