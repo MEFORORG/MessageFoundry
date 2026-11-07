@@ -284,6 +284,9 @@ class DrCoordinator:
         # The last completed hand-back, so a retry that finds the box passive answers with that
         # release's outcome (its depth left) rather than with nothing known.
         self._last_release: DrResult | None = None
+        # The steps the activation that made the box active left unfinished, so a retry that finds
+        # it active still names them (Lander hold 6702318430, item A). Set once its profile applies.
+        self._activation_failures: tuple[str, ...] = ()
         # The activation running under the lock, read by its abort rows; None between them.
         self._attempt: _ActivationProgress | None = None
         # Serialize activate/release so a double-promotion can't race the cold-seed/VIP/profile steps.
@@ -347,6 +350,7 @@ class DrCoordinator:
                     action="activate",
                     active=True,
                     threshold=self._settings.priority_threshold.value,
+                    failures=self._activation_failures,
                 )
             # A hand-back still owed its row is recorded before a new promotion can follow it.
             if self._unrecorded_release is not None:
@@ -519,6 +523,7 @@ class DrCoordinator:
             # __context__, which the API route chains its own error from.
             await self._record_aborted("profile", anchor_abort, actor, now)
         progress.profile_applied = True
+        self._activation_failures = tuple(step_failures or ())
 
         # Owed from here: a write cut short is made good by the next activate or release call.
         detail: dict[str, object] = {
@@ -555,7 +560,7 @@ class DrCoordinator:
             verify_status=verify.status,
             seed_segment=progress.seed_segment,
             vip_hook_ran=progress.hook_ran,
-            failures=tuple(step_failures or ()),
+            failures=self._activation_failures,
         )
 
     # --- release (fail-back) -------------------------------------------------
