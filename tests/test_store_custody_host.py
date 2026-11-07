@@ -1528,8 +1528,10 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         cli._discard_minted_custody(kept, server, StoreIdPinRefusedBeforeWrite("before"))
     held = capsys.readouterr().err
     assert "could not be removed" in held, held
-    # PR 2804 sixth hold: this run minted that key and nothing was written under it.
-    assert "This run minted it and nothing was written under it" in held, held
+    # PR 2804 sixth hold: this run minted that key and the store holds no data under it. The
+    # eleventh hold: so the text says how to remove it, the one change it may advise.
+    assert "This run minted it and the store holds no data under it" in held, held
+    assert held.count(cli._REMOVE_THE_VOID_KEY) == 1, held
     assert "cannot tell whose key" not in held, held
     texts.append(held)
     assert all(text.count("WARNING:") == 1 for text in texts[-2:]), texts[-2:]
@@ -1543,7 +1545,7 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         (fallback, "set [store].key_provider = 'host'"),
         (fallback, "leaves it in place"),
         ("Keep that file and run the command again",),
-        (fallback, "This run minted it and nothing was written under it"),
+        (fallback, "This run minted it and the store holds no data under it"),
     ]
     # One marker tuple per text this test means to scan, so an empty or short scan fails here
     # rather than passing the absence check below on nothing.
@@ -1551,7 +1553,16 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
     offending = [
         text
         for text in texts
-        if _advises_changing(text, allowed=(_KEY_SETTINGS_OUT,) if text is foreign else ())
+        if _advises_changing(
+            text,
+            allowed=(
+                (_KEY_SETTINGS_OUT,)
+                if text is foreign
+                else (cli._REMOVE_THE_VOID_KEY,)
+                if text is held
+                else ()
+            ),
+        )
     ]
     assert not offending, offending
     assert len(markers) == len(texts)
@@ -1814,9 +1825,14 @@ def test_a_minted_key_that_cannot_be_removed_is_named_as_this_runs_own(
     monkeypatch.setattr(Path, "unlink", _held)
     cli._discard_minted_custody(kept, server, StoreIdPinRefusedBeforeWrite("before"))
     warning = capsys.readouterr().err
-    assert "This run minted it and nothing was written under it" in warning, warning
+    assert "This run minted it and the store holds no data under it" in warning, warning
     assert "the recovery key shown opens nothing" in warning, warning
-    assert "cannot tell whose key" not in warning and not _advises_changing(warning), warning
+    # PR 2804 eleventh hold: it says plainly how to remove the file, and advises no other change.
+    # The step is one the scan reads, so taking it out is what lets the rest pass.
+    assert warning.count(cli._REMOVE_THE_VOID_KEY) == 1, warning
+    assert _advises_changing(cli._REMOVE_THE_VOID_KEY) and _advises_changing(warning), warning
+    assert not _advises_changing(warning, allowed=(cli._REMOVE_THE_VOID_KEY,)), warning
+    assert "cannot tell whose key" not in warning, warning
     assert "Copy into it every secret file" in " ".join(warning.split()), warning
 
 
@@ -1923,3 +1939,150 @@ def test_a_custody_directory_the_write_refuses_is_refused_before_the_recovery_ke
     expected = "does not exist" if shape == "missing directory" else "cannot hold a store key"
     assert expected in refused, refused
     assert not (store_path.parent / custody_host.HOST_FILE_NAME).exists()
+
+
+@host_file_platforms
+@pytest.mark.parametrize(
+    ("shape", "discarded"),
+    [
+        ("no store", True),
+        ("keyed leftovers", True),
+        ("holds data", False),
+        ("unreadable", False),
+    ],
+)
+def test_a_failed_server_create_discards_the_minted_key_only_over_a_store_that_holds_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    shape: str,
+    discarded: bool,
+) -> None:
+    # PR 2804 eleventh hold, B: a server create that failed under a minted key kept the key file
+    # whatever the database held, so a plain re-run met it and stopped: at the mint's
+    # FileExistsError over a database with no store, or at StoreChainNeverStarted over the salt,
+    # counter and markers a keyed open commits before its genesis record. After the failure the
+    # pre-check's own probe now reads the database. "no store" and "keyed leftovers" hold no data
+    # under the key, so the file is removed and the re-run mints again. The negative controls keep
+    # it: "holds data" is a store with a row in a data table, "unreadable" a census that cannot be
+    # shown complete.
+    import asyncio
+
+    from messagefoundry import __main__ as cli
+    from messagefoundry.__main__ import main
+    from messagefoundry.store import base
+    from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.custody_host import MintedCustody
+    from messagefoundry.store.store import StoreChainNeverStarted
+
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    if sys.platform != "win32":
+        # provision-admin refuses a secrets directory others can read before it reaches the mint.
+        secrets.chmod(0o700)
+    monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
+    host_file = secrets / custody_host.HOST_FILE_NAME
+    held = tmp_path / "held.db"
+    if shape == "keyed leftovers":
+        asyncio.run(_failed_mint_leftovers(held, tmp_path))
+    elif shape in ("holds data", "unreadable"):
+
+        async def _seed() -> None:
+            store = await _keyless_store(held)
+            try:
+                if shape == "holds data":
+                    await store.record_connection_event(
+                        connection="IB_TEST_ADT",
+                        transport="mllp",
+                        direction="inbound",
+                        kind="established",
+                    )
+            finally:
+                await store.close()
+
+        asyncio.run(_seed())
+    real_open = base.open_store
+    created: list[bool] = []
+    mints: list[Path] = []
+
+    censused: list[str] = []
+
+    async def _incomplete() -> dict[str, bool]:
+        censused.append("incomplete")
+        raise base.TableCensusIncomplete(
+            "this login does not hold the view definition permission on schema 'app' (stand-in)"
+        )
+
+    def _no_store() -> base.StoreNotFoundError:
+        return base.StoreNotFoundError.server_schema(StoreBackend.POSTGRES, "mefor")
+
+    async def _open(settings: StoreSettings, **kwargs: object) -> Store:
+        if kwargs.get("create"):  # the create under the minted blob, which fails
+            created.append(True)
+            raise CipherError("the create failed (stand-in)")
+        if kwargs.get("custody") is None:  # an open that resolves the host blob itself
+            if not host_file.exists():
+                raise HostCustodyMissing("no host blob and no handoff here (stand-in)")
+            # A re-run over a kept key, answered as the real open answers it for each shape.
+            if shape == "keyed leftovers":
+                raise StoreChainNeverStarted("refusing to open the store: never started (stand-in)")
+            raise _no_store()
+        # The server probe, under its throwaway blob: no store before the create, then the shape.
+        if not created or shape == "no store":
+            raise _no_store()
+        with monkeypatch.context() as probing:
+            # The stand-in's own open must not meet the minted file, which is no part of it.
+            probing.delenv("MEFOR_SECRETS_DIRECTORY")
+            store = await real_open(
+                StoreSettings(path=str(held)), read_only=True, keyless_chain_refusal=None
+            )
+        if shape == "unreadable":
+            monkeypatch.setattr(store, "table_occupancy", _incomplete)
+        return store
+
+    def _ceremony(*_args: object, **_kwargs: object) -> MintedCustody:
+        host_file.write_bytes(b"minted (stand-in)")
+        mints.append(host_file)
+        return MintedCustody(HostBlob(MasterKey.mint(), StoreId.mint()), host_file, b"wrap")
+
+    monkeypatch.setattr(base, "open_store", _open)
+    monkeypatch.setattr(custody_host, "mint_host_custody", _ceremony)
+    monkeypatch.setattr(cli, "_read_new_password", lambda _prompt: "correct horse battery")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[store]\nbackend = "postgres"\nkey_provider = "host"\n'
+        'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
+        "[security]\nrequire_mfa = false\n"
+    )
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    argv.append("--no-totp")
+    code = main(argv)
+    err = " ".join(capsys.readouterr().err.split())
+    assert code == 2, err
+    assert created == [True] and mints == [host_file], err
+    assert host_file.exists() is not discarded, err
+    unread = [r.getMessage() for r in caplog.records if "could not be read" in r.getMessage()]
+    # Each negative control keeps the key for its own reason: the census answered "holds data",
+    # or the census was asked and could not be shown complete. Nothing else failed to read.
+    assert unread == (
+        [
+            "whether the store holds data under the minted key could not be read "
+            "(HostCustodyRefused), so the key is kept"
+        ]
+        if shape == "unreadable"
+        else []
+    ), unread
+    assert censused == (["incomplete"] if shape == "unreadable" else []), censused
+    if not discarded:
+        # The key may hold data, so it is kept, unchanged, and named.
+        assert host_file.read_bytes() == b"minted (stand-in)"
+        assert f"so that key is kept in {host_file}" in err, err
+        assert "was removed from" not in err, err
+        return
+    assert f"The store key minted for it was removed from {host_file}" in err, err
+    # The plain re-run reaches the mint again rather than stopping at a key file.
+    assert main(argv) == 2
+    rerun = " ".join(capsys.readouterr().err.split())
+    assert mints == [host_file, host_file], rerun
