@@ -56,14 +56,17 @@ def interleaved_thread_cpu(
     floor: float = CPU_SAMPLE_FLOOR_SECONDS,
     min_calls: int = 1,
     once: frozenset[str] = frozenset(),
+    max_passes: int = 100_000,
 ) -> dict[str, float]:
     """CPU seconds per call of each arm on the CALLING thread, with the arms' calls interleaved.
 
     Each pass calls every arm still pending once, in an order drawn from an unseeded generator (the
     rule ``tests/_growth.py`` gives, BACKLOG #3721), and charges each call the thread clock's move
-    across it. An arm is pending until it has spent ``floor``, and, while its calls average less
-    than that, until it has had ``min_calls`` calls. An arm named in ``once`` is called once, in the
-    first pass, for an arm whose one call is many ticks long.
+    across it. An arm is pending until it has spent ``floor`` and had ``min_calls`` calls, however
+    long one call is, so one load-skewed call cannot set an arm on its own. An arm named in ``once``
+    is called once, in the first pass, for an arm whose one call is many ticks long. Past
+    ``max_passes`` passes it raises rather than spin, for an arm that accrues no thread CPU, because
+    it blocks or hands its work to another thread.
 
     **Interleaved call by call rather than one block per arm**, so a stretch of load lifts every
     arm alike instead of landing on one arm's block (BACKLOG #3456: in blocks, beside 64 copying
@@ -73,18 +76,27 @@ def interleaved_thread_cpu(
     test left running would otherwise be billed to whichever arm it overlapped; so every arm must
     run synchronously on the calling thread. On Windows it moves in 15.625 ms ticks; a call's charge
     is off by up to one, in either direction, and those errors average across an arm's calls."""
+    if floor <= 0 or min_calls < 1 or max_passes < 1:
+        raise ValueError(
+            f"floor {floor}, min_calls {min_calls} and max_passes {max_passes} must all be positive"
+        )
     spent = dict.fromkeys(arms, 0.0)
     calls = dict.fromkeys(arms, 0)
 
     def pending(name: str) -> bool:
         if name in once:
             return calls[name] == 0
-        if spent[name] < floor:
-            return True
-        return calls[name] < min_calls and spent[name] / calls[name] < floor
+        return spent[name] < floor or calls[name] < min_calls
 
     order = random.Random()
+    passes = 0
     while due := [name for name in arms if pending(name)]:
+        passes += 1
+        if passes > max_passes:
+            raise RuntimeError(
+                f"{due} still under {floor} CPU s after {max_passes} passes: an arm that does its "
+                "work off the calling thread reads as free here"
+            )
         for name in order.sample(due, k=len(due)):
             start = time.thread_time()
             arms[name]()

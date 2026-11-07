@@ -541,8 +541,12 @@ def test_control_the_same_record_is_expensive_unbounded() -> None:
 #: it does not move with the filter's own render. The filter runs one render plus a clamped scan of
 #: about a millisecond, and reads about one reference. A filter that renders twice reads about two,
 #: and so does one that scans the whole render, since the test asserts that scan costs more than a
-#: render. A ``safe_traceback`` that grows a pass of its own reds here only if that pass costs at
-#: least half a render: a cheap linear pass over the whole text, a ``str.count`` say, does not.
+#: render. A ``safe_traceback`` that grows a pass of its own reds here only if that pass costs
+#: about half a render, less on a runner where the shipped filter already reads above one (up to
+#: 1.32 in the readings); a cheap linear pass over the whole text, a ``str.count`` say, may pass,
+#: or red only some of the time. And it is half a render ON THE RUNNER: a load that slows the
+#: memory-bound render more than CPU-bound work shrinks a CPU-bound pass in render units, and the
+#: readings in the test show one that reds idle passing beside such a load.
 #:
 #: **No separate scan line.** This arm once also held the filter under one render plus half the
 #: unbounded scan. With the scan asserted to cost more than a render, that line sits above this
@@ -586,7 +590,7 @@ def _filter_a_fresh_record(exc_info: _ExcInfo) -> None:
 
 
 #: One arm's sample in ``interleaved_thread_cpu``: at least this much CPU time, and at least
-#: ``_TRACEBACK_MIN_CALLS`` calls of an arm whose one call costs less. Three times the shared floor,
+#: ``_TRACEBACK_MIN_CALLS`` calls, however long one call is. Three times the shared floor,
 #: because the ceiling's margin is narrow: a doubled render must read over 1.5 renders and the
 #: shipped filter under it. The call count is for the loaded case, where a
 #: render costs hundreds of milliseconds and the floor alone would take one or two calls, so one
@@ -604,27 +608,28 @@ def test_the_filter_bounds_a_peer_sized_traceback() -> None:
     raises carrying the received body and an outer ``log.exception`` renders the whole thing.
 
     One interleaved sample per arm (``tests._cpu_clock.interleaved_thread_cpu``), not best-of
-    rounds of blocks,
-    over half the frame cap (``_TRACEBACK_MESSAGE_CHARS``).
+    rounds of blocks, over half the frame cap (``_TRACEBACK_MESSAGE_CHARS``).
 
     Readings, 2026-11-06, one Windows box with 32 logical CPUs shared with other sessions, Python
     3.14, as multiples of the reference render (``formatException``). The doubled render is
-    ``safe_traceback`` called twice inside the filter; the unbounded render is a ``safe_traceback``
-    that also renders the stdlib's traceback with ``capture_locals``, so the frame's 8 Mi character
-    local too.
+    ``safe_traceback`` called twice inside the filter. The extra pass is a ``safe_traceback`` that
+    also takes the exception's ``repr``, a second, CPU-bound rendering of the whole message. (An
+    earlier version of this docstring named a ``capture_locals`` render for it; this frame holds no
+    locals, so that plant was only a second render.)
 
-    - idle, twenty runs: the filter 0.97 to 1.32; the doubled render 1.69 to 2.37 and the unbounded
-      render 1.59 to 2.29, each red in 20 of 20. The unbounded scan 8.9 to 16.9 renders.
-    - beside 64 processes copying 48 MiB buffers, ten runs: the filter 0.89 to 1.03; the doubled
-      render 1.65 to 2.05 and the unbounded render 1.76 to 1.94, each red in 10 of 10. The
-      unbounded scan 2.2 to 3.3 renders, so how many renders it costs is the runner's, not a
-      constant.
+    - idle, twenty runs: the filter 0.79 to 1.24; the doubled render 1.76 to 2.40 and the extra
+      pass 1.60 to 2.03, each red in 20 of 20. The unbounded scan 6.8 to 15.1 renders.
+    - beside 64 processes copying 48 MiB buffers, ten runs: the filter 0.88 to 1.12; the doubled
+      render 1.82 to 2.00, red in 10 of 10; **the extra pass 1.13 to 1.46, green in 10 of 10**.
+      That load slows the memory-bound render more than CPU-bound work, so beside it the ceiling
+      catches a second render but not a CPU-bound pass of under a render's idle cost. The unbounded
+      scan 2.0 to 3.5 renders, so how many renders it costs is the runner's, not a constant.
     - the unbounded scan (``redact_untrusted`` swapped for ``redact`` in
       ``messagefoundry.logging_setup``): red in 10 of 10 idle and 10 of 10 loaded.
     - the shape before the ceiling, the filter under one render plus half the unbounded scan in
-      three shuffled best-of rounds, at the full cap: green in 89 of 90 runs with the doubled or
-      the unbounded render, idle and loaded, since half the unbounded scan is more than one render
-      on both.
+      three shuffled best-of rounds, at the full cap: green in 89 of 90 runs with the doubled
+      render or the second render a ``capture_locals`` plant gave, idle and loaded, since half the
+      unbounded scan is more than one render on both.
     - the shape before that, one wall-clock filter call against 0.20 s at the full cap: 0.040 to
       0.051 s idle, and 0.316 to 1.800 s beside 96 such processes, over the line in 6 of 6."""
     exc_info = _raised_traceback()

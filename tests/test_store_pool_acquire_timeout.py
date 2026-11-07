@@ -322,9 +322,12 @@ async def _finished_within_turns(work: Coroutine[Any, Any, Any]) -> asyncio.Task
     await asyncio.wait({task}, timeout=_UNWIND_SECONDS)
     if not task.done():
         pytest.fail(
-            f"a cancelled borrow was still unwinding after {_UNWIND_SECONDS}s -- the "
-            "cancel path now waits on the late borrow instead of handing it to the salvage"
+            f"a cancelled borrow was still unwinding after {_UNWIND_SECONDS}s -- its cancel path "
+            "waits on something, the late borrow's salvage or a release, instead of returning"
         )
+    if not task.cancelled() and task.exception() is not None:
+        # It ended another way during the unwind; surface that rather than the turn count.
+        task.result()
     return None
 
 
