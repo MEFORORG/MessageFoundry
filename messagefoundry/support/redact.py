@@ -52,6 +52,7 @@ import re
 from messagefoundry.redaction import redact as _redact_phi
 from messagefoundry.secretscrub import (
     _CONNECTION_STRING_MEMBER,
+    _braced_tail,
     _mask_member,
     scrub_credentials,
 )
@@ -148,13 +149,53 @@ _LABEL_HEAD = (
 _MEFOR_LABEL_HEAD = r"\b(?-i:MEFOR_[A-Z0-9_]++)\b['\"]?\s*+[:=]\s*+"
 _QUOTED_LABEL = _LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
-_NOT_AT_QUOTED_LABEL = r"(?!" + _QUOTED_LABEL + r"|" + _MEFOR_QUOTED_LABEL + r")"
+_RUN_ON_LABEL = (
+    r"(?:(?=(?i:[abceipst]))"
+    r"(?:(?i:pass(?:word|wd|phrase)?|pwd|secret|credential|encryption_key(?:s_retired)?|private_key"
+    r"|intake_api_key_next)\b[^\S\r\n]*+[:=][^\S\r\n]*+"
+    r"|(?i:bearer|authorization|token|session|api[_-]?key)\b[^\S\r\n]*+[:=][^\S\r\n]*+"
+    r"(?:(?i:bearer|basic|digest)[^\S\r\n]++)?)"
+    r"|\b(?-i:MEFOR_[A-Z0-9_]++)\b[^\S\r\n]*+[:=][^\S\r\n]*+)"
+)
+# The stop fires before a ``_CREDENTIAL_KV`` label whose braced value holds white space and no "{"
+# too, and the value then takes that label up to the braced value's closer (BACKLOG #2966), so
+# ``MEFOR_X=a;PWD={pp ww}`` no longer prints " ww}". Why the closer stays, why those conditions on
+# the braces and the label are what refuse each shape measured printing a value, and why the scan
+# stays linear, are stated once, on the same fragments in ``messagefoundry/secretscrub.py``. THIS
+# COPY RUNS BEFORE THE PHI PASS, and the tail is written back masked, so a PHI reader that keys on
+# letters in the braces no longer sees them; the tail refuses the readers found doing so, an XML tag
+# and a word ending in a segment-shaped triple (``MSH`` and a segment ID glued behind digits among
+# them), and a differential that runs the PHI pass after this layer is the measurement for this
+# copy, not the write-time one.
+_BRACED_HEAD = r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b[:=]"
+_SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s;,&]|\}\})*+"
+_SPACED_BRACED_TAIL = (
+    r"[ \t](?:[^{}'\"%;,&<\r\n\v\f\x1c-\x1eA-Za-z0-9\x80-\U0010ffff]|\}\}"
+    + r"|(?!"
+    + _RUN_ON_LABEL
+    + r"|(?i:bearer|basic|digest)\s"
+    + r"|[A-Za-z0-9]*?(?-i:[A-Z][A-Z0-9]{2})(?![A-Za-z0-9])"
+    + r")(?-i:[A-Za-z0-9])++)*+"
+)
+_BRACED_LABEL = _BRACED_HEAD + _SPACED_BRACED_HEAD + _SPACED_BRACED_TAIL + r"\}(?!\})"
+_BRACED_RUN_ON = (
+    _BRACED_HEAD
+    + _SPACED_BRACED_HEAD
+    + r"(?P<braced_tail>"
+    + _SPACED_BRACED_TAIL
+    + r")(?=\}(?!\}))"
+)
+_NOT_AT_QUOTED_LABEL = (
+    r"(?!" + _QUOTED_LABEL + r"|" + _BRACED_LABEL + r"|" + _MEFOR_QUOTED_LABEL + r")"
+)
 _HARD_SEPARATOR_BEHIND = r"(?<![A-Za-z0-9._\-])"
 _NOT_BEFORE_QUOTED_LABEL = (
     r"(?!(?:"
     + _HARD_SEPARATOR_BEHIND
     + r"\b(?:[A-Za-z0-9]++_){1,6})?"
     + _QUOTED_LABEL
+    + r"|"
+    + _BRACED_LABEL
     + r"|"
     + _MEFOR_QUOTED_LABEL
     + r")"
@@ -168,14 +209,6 @@ _NOT_BEFORE_QUOTED_LABEL = (
 # linear, are stated once, on the same fragment in ``messagefoundry/secretscrub.py``. Written as plain
 # concatenation, not built by a helper, so ``tests/test_security_static.py`` can resolve this copy and
 # scan it.
-_RUN_ON_LABEL = (
-    r"(?:(?=(?i:[abceipst]))"
-    r"(?:(?i:pass(?:word|wd|phrase)?|pwd|secret|credential|encryption_key(?:s_retired)?|private_key"
-    r"|intake_api_key_next)\b[^\S\r\n]*+[:=][^\S\r\n]*+"
-    r"|(?i:bearer|authorization|token|session|api[_-]?key)\b[^\S\r\n]*+[:=][^\S\r\n]*+"
-    r"(?:(?i:bearer|basic|digest)[^\S\r\n]++)?)"
-    r"|\b(?-i:MEFOR_[A-Z0-9_]++)\b[^\S\r\n]*+[:=][^\S\r\n]*+)"
-)
 _SQ_RUN_ON_WALK = r"(?:[^'\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"')[A-Za-z0-9]++)*+"
 _DQ_RUN_ON_WALK = r"(?:[^\"\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"\")[A-Za-z0-9]++)*+"
 _RUN_ON_INNER = (
@@ -213,24 +246,28 @@ _KV_TERMINATORS = r"\s'\";,&"  # _CREDENTIAL_KV
 _KEY_TERMINATORS = r"\s'\";&"  # _KEY_MATERIAL
 _SCHEME_TERMINATORS = r"\s'\",;"  # _AUTH_SCHEME
 _PLAIN_VALUE = (
-    rf"['\"]?(?:[^{_PLAIN_TERMINATORS}]++{_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_PLAIN_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_PLAIN_TERMINATORS}])*+)"
+    rf"['\"]?(?:[^{_PLAIN_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_PLAIN_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_PLAIN_TERMINATORS}])*+"
+    rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KV_VALUE = (
-    rf"['\"]?(?:[^{_KV_TERMINATORS}]++{_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KV_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KV_TERMINATORS}])*+)"
+    rf"['\"]?(?:[^{_KV_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KV_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KV_TERMINATORS}])*+"
+    rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KEY_VALUE = (
-    rf"['\"]?(?:[^{_KEY_TERMINATORS}]++{_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KEY_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KEY_TERMINATORS}])*+)"
+    rf"['\"]?(?:[^{_KEY_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KEY_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KEY_TERMINATORS}])*+"
+    rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_SCHEME_VALUE = (
-    rf"['\"]?(?:[^{_SCHEME_TERMINATORS}]++{_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_SCHEME_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_SCHEME_TERMINATORS}])*+)"
+    rf"['\"]?(?:[^{_SCHEME_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_SCHEME_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_SCHEME_TERMINATORS}])*+"
+    rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 
 # WHY THE CASE FOLD IS SCOPED TO THE ALTERNATION, HERE AND IN THE TWO PATTERNS BELOW. Stated once,
@@ -652,12 +689,12 @@ def redact_log_text(text: str) -> str:
 def _keep_label(m: re.Match[str]) -> str:
     """Replace a ``<label>=<value>`` match, keeping the label so a reviewer sees WHICH credential
     leaked, and never the value. Group 1 is the label in every pattern that uses this."""
-    return f"{m.group(1)}={REDACTION_PLACEHOLDER}"
+    return f"{m.group(1)}={REDACTION_PLACEHOLDER}{_braced_tail(m)}"
 
 
 def _keep_scheme(m: re.Match[str]) -> str:
     """Replace a bare ``Bearer <tok>`` match, keeping the scheme word and hiding the credential."""
-    return f"{m.group(1)} {REDACTION_PLACEHOLDER}"
+    return f"{m.group(1)} {REDACTION_PLACEHOLDER}{_braced_tail(m)}"
 
 
 def _keep_dsn_user(m: re.Match[str]) -> str:
