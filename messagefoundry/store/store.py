@@ -1539,13 +1539,19 @@ async def _held_seal_ok(
     sealer: AnyRowSealer | None, kind: str, fields: Iterable[tuple[str, object]], stored: str
 ) -> bool:
     """The record read check every ``*_seal_ok_async`` shares: True with no sealer, else whether
-    ``stored`` holds under a held key, a value the encoder cannot read failing like a wrong seal."""
+    ``stored`` holds under a held key, a value the encoder cannot read failing like a wrong seal.
+
+    The encoding is tried on its own first, so only the encoder's ``TypeError`` reads as a
+    failed seal; one raised past it, in the pool hand-off or the backend, is a defect and
+    propagates, as :func:`~messagefoundry.store.row_seal.require_seal_for_write` lets it."""
     if sealer is None:
         return True
+    parts = tuple(fields)
     try:
-        return await sealer.verify_held_async(kind, fields, stored)
+        seal_bytes(kind, parts)
     except TypeError:
         return False
+    return await sealer.verify_held_async(kind, parts, stored)
 
 
 def new_session_record(
@@ -4697,10 +4703,9 @@ async def held_approval_tombstone_async(
     if claim is None:
         return None
     fields, seal, approver, decided_at = claim
-    try:
-        held = await sealer.verify_held_async(APPROVAL_TOMBSTONE_KIND, fields, seal)
-    except TypeError:
-        return None
+    # The claim's fields are two strings, a status and a float, so the encoder cannot refuse them:
+    # no TypeError is caught here, and one from past the encoder propagates as a defect.
+    held = await sealer.verify_held_async(APPROVAL_TOMBSTONE_KIND, fields, seal)
     return (approver, decided_at) if held else None
 
 
@@ -16516,7 +16521,8 @@ class MessageStore:
         The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned.
 
         The row is sealed as it is inserted (BACKLOG #2592). A repeat joins only an open request
-        whose seal holds: :func:`first_sealed_approval` says why."""
+        whose seal holds: :func:`first_sealed_approval` says why; SQLite runs its awaitable
+        twin."""
         row = new_approval_row(
             approval_id=approval_id,
             operation=operation,
@@ -16569,9 +16575,10 @@ class MessageStore:
 
         With no ``current`` it inserts ``new``, sealed; with ``unless_open`` (the four
         :data:`_SQLITE_OPEN_REPEAT` values) only when no open request matches. With ``current``,
-        the row it read, it is a compare-and-set: :func:`approval_update` refuses a ``current``
-        that fails its seal, raising :class:`RowSealError` and writing nothing, and the UPDATE
-        lands only while the row is still in ``current``'s status and carries its seal."""
+        the row it read, it is a compare-and-set: :func:`approval_update_async` refuses a
+        ``current`` that fails its seal, writing nothing (:class:`RowSealError` for a Forged row,
+        its sibling for an Unverifiable one, and an Outage propagates), and the UPDATE lands only
+        while the row is still in ``current``'s status and carries its seal."""
         sealer = self._row_sealer
         if current is not None:
             cur = await self._db.execute(
@@ -16636,7 +16643,7 @@ class MessageStore:
         ``interrupted`` the same way, so two resolvers cannot both record an outcome.
 
         The move goes through :meth:`_write_approval` (BACKLOG #2592): a row whose seal fails
-        raises :class:`RowSealError` and nothing is written.
+        is refused as that method says, and nothing is written.
 
         ``audit`` and ``claim_owner``: the Store protocol states the contract (vault BACKLOG #2255,
         BACKLOG #1562)."""
@@ -16704,9 +16711,10 @@ class MessageStore:
         self, approval_id: str, *, approver: str, decided_at: float, seal_read: object
     ) -> bool:
         """The one writer of :data:`_SQLITE_APPROVAL_TOMBSTONE` (BACKLOG #3638). Call it inside an
-        open write, on a row :func:`approval_fails_seal` refused, with the seal it read. Writes the
-        tombstone of :func:`approval_tombstone`, never an approval seal, so the row's other columns
-        stay as unverified as they were, and lands only while the row still carries ``seal_read``."""
+        open write, on a row :func:`approval_fails_seal_async` refused, with the seal it read.
+        Writes the tombstone of :func:`approval_tombstone_async`, never an approval seal, so the
+        row's other columns stay as unverified as they were, and lands only while the row still
+        carries ``seal_read``."""
         cur = await self._db.execute(
             _SQLITE_APPROVAL_TOMBSTONE,
             (
@@ -16785,24 +16793,26 @@ class MessageStore:
     async def _reseal_approval(self, found: aiosqlite.Row) -> bool:
         """One row of :meth:`reseal_approval_records`, read in its write: re-sealed as a request,
         or, when it fails that seal, as a tombstone that holds (BACKLOG #3638). Raises
-        :class:`RowSealError` when neither holds, before any statement runs. The tombstone write
-        runs outside the ``except``, so a database fault in it is not chained to the seal miss."""
+        :class:`RowSealError` when neither holds, before any statement runs. The tombstone check
+        and its write run outside the ``except``, so neither a Transit answer nor a database
+        fault in them is chained to the seal miss."""
         try:
             current = ApprovalRow.from_mapping(found)
             return await self._write_approval(current, current=current)
-        except RowSealError:
-            tombstone = await held_approval_tombstone_async(self._row_sealer, found)
-            if tombstone is None:
-                raise
+        except RowSealError as exc:
+            refused = exc
+        tombstone = await held_approval_tombstone_async(self._row_sealer, found)
+        if tombstone is None:
+            raise refused
         return await self._reseal_tombstone(str(found["id"]), *tombstone, seal_read=found["seal"])
 
     async def _reseal_tombstone(
         self, approval_id: str, approver: str, decided_at: float, *, seal_read: object
     ) -> bool:
         """The one writer of :data:`_SQLITE_APPROVAL_TOMBSTONE_RESEAL` (BACKLOG #3638). Call it
-        inside an open write, on a row :func:`held_approval_tombstone` passed, with what it returned
-        and the seal it read. Writes :func:`approval_tombstone` under the active key, so the row
-        stays a tombstone and never gains an approval seal."""
+        inside an open write, on a row :func:`held_approval_tombstone_async` passed, with what it
+        returned and the seal it read. Writes :func:`approval_tombstone_async` under the active
+        key, so the row stays a tombstone and never gains an approval seal."""
         cur = await self._db.execute(
             _SQLITE_APPROVAL_TOMBSTONE_RESEAL,
             (
@@ -17322,7 +17332,10 @@ class MessageStore:
         sealer = self._row_sealer
         if sealer is None:
             return 0, 0
-        # A sealer exists only for a cipher that holds its keys in-process, which is AesGcmCipher.
+        # The local sealer exists only for a cipher that holds its keys in-process, AesGcmCipher.
+        # A store whose cipher is a TransitCipher must never reach here: rotate-key is refused
+        # under vault_transit (ADR 0217), and this cast would hide that TransitCipher has no
+        # active_marker_prefix.
         cipher = cast("AesGcmCipher", self._cipher)
         change = rotation_reseal(
             sealer,
@@ -18525,8 +18538,8 @@ class MessageStore:
     async def _write_ad_map(self, name: str, change: AdMapChange) -> bool:
         """The one writer of an AD directory map and its seal (BACKLOG #2592). Call it inside an
         open write transaction. Reads the map, applies ``change`` and writes the result, sealed;
-        :func:`ad_map_write` says when it refuses, raising :class:`RowSealError` and writing
-        nothing. Returns whether anything was written."""
+        :func:`ad_map_write_async` says when it refuses, and with what, writing nothing. Returns
+        whether anything was written."""
         # Each statement is named at its call, not looked up; the module constants say why.
         role = _is_role_map(name)
         cur = await self._db.execute("SELECT seal FROM authority_set_seal WHERE name=?", (name,))
@@ -18593,7 +18606,14 @@ class MessageStore:
                 if found is None:
                     continue
                 row = RoleRow.from_mapping(found)
-                if not await role_seal_ok_async(sealer, row):
+                # The write path's own refusal (ADR 0217 (c) step 1), as the map half below meets
+                # it through _write_ad_map: Forged is counted refused, as on main, and an
+                # Unverifiable row raises its sibling type, the one every write path raises.
+                try:
+                    await require_seal_for_write(
+                        sealer, ROLE_KIND, row.seal_fields(), row.seal, subject=""
+                    )
+                except RowSealError:
                     refused += 1
                     continue
                 await self._write_role(row)

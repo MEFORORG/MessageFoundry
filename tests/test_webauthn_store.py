@@ -15,7 +15,11 @@ import functools
 from pathlib import Path
 from typing import Any, cast
 
-from messagefoundry.store.store import MessageStore, session_owes_unproven_factor
+from messagefoundry.store.store import (
+    MessageStore,
+    session_owes_unproven_factor,
+    session_owes_unproven_factor_async,
+)
 
 
 async def test_webauthn_store_contract_sqlite(tmp_path: Path) -> None:
@@ -60,6 +64,12 @@ class _Sealer:
     def verify_held(self, kind: str, fields: object, seal: str) -> bool:
         return self.user_ok
 
+    async def verify_async(self, kind: str, fields: object, seal: str) -> bool:
+        return self.session_ok
+
+    async def verify_held_async(self, kind: str, fields: object, seal: str) -> bool:
+        return self.user_ok
+
 
 async def test_the_conditional_bind_predicate_fails_closed_on_seals_and_epochs(
     tmp_path: Path,
@@ -96,6 +106,13 @@ async def test_the_conditional_bind_predicate_fails_closed_on_seals_and_epochs(
         assert owes(sound, stale, record, []) is True
         # BACKLOG #5091: an every-account revoke raised the global epoch past the session's.
         assert owes(sound, session, record, [], global_epoch=current + 1) is True
+        # The awaitable twin SQLite runs (ADR 0217 slice 1b) must fail closed on the same rows.
+        owes_async = functools.partial(session_owes_unproven_factor_async, global_epoch=current)
+        assert await owes_async(sound, session, record, []) is False
+        assert await owes_async(bad_session, session, record, []) is True
+        assert await owes_async(bad_user, session, record, []) is True
+        assert await owes_async(sound, stale, record, []) is True
+        assert await owes_async(sound, session, record, [], global_epoch=current + 1) is True
     finally:
         await store.close()
 

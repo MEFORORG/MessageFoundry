@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 
 import pytest
@@ -130,40 +130,41 @@ async def _approval(store: MessageStore, approval_id: str, nonce: str = "n") -> 
 async def test_every_awaitable_read_check_answers_through_transit(
     transit: tuple[MessageStore, FakeBackend, Path],
 ) -> None:
-    """Holds, then the same row with its seal planted (Unverifiable, raised as itself), then an
-    Outage, for each record kind the readers check."""
-    store, backend, path = transit
+    """Holds, then an Outage raised as itself, for each record kind the readers check, each kind
+    on its own fresh sealer so no cached Holds answer stands in for Transit's."""
+    store, backend, _ = transit
     await _roles(store)
     await _user(store, "u-1", VIEWER)
     token = await _session(store, "u-1")
     await store.set_ad_group_role_map([("g", VIEWER)])
     await _approval(store, "a-1")
+    record = await store._read_user_record("u-1")
+    session = await store._read_session_row(hash_token(token))
+    role = await store.get_role(CUSTOM)
+    approval = await store.get_pending_approval("a-1")
+    ad_map = await store.get_ad_map(AD_ROLE_MAP)
+    assert record and session and role and approval and ad_map.pairs
 
-    async def checks() -> list[bool]:
-        record = await store._read_user_record("u-1")
-        session = await store._read_session_row(hash_token(token))
-        role = await store.get_role(CUSTOM)
-        approval = await store.get_pending_approval("a-1")
+    def kinds(sealer: TransitRowSealer) -> list[Callable[[], Awaitable[bool]]]:
         assert record and session and role and approval
         return [
-            await user_seal_ok_async(store._row_sealer, record),
-            await session_seal_ok_async(store._row_sealer, session),
-            await role_seal_ok_async(store._row_sealer, RoleRow.from_mapping(role)),
-            await ad_map_seal_ok_async(store._row_sealer, await store.get_ad_map(AD_ROLE_MAP)),
-            await approval_seal_ok_async(store._row_sealer, ApprovalRow.from_mapping(approval)),
+            lambda: user_seal_ok_async(sealer, record),
+            lambda: session_seal_ok_async(sealer, session),
+            lambda: role_seal_ok_async(sealer, RoleRow.from_mapping(role)),
+            lambda: ad_map_seal_ok_async(sealer, ad_map),
+            lambda: approval_seal_ok_async(sealer, ApprovalRow.from_mapping(approval)),
         ]
 
-    assert await checks() == [True] * 5
-    before = backend.verify_calls
-    store._row_sealer = TransitRowSealer(backend)  # a fresh sealer: no Holds answer is cached
-    backend.down = True
-    with pytest.raises(TransitSealUnavailableError):
-        await checks()
-    backend.down = False
-    _plant(path, "users", "authz_seal", "id", "u-1")
-    with pytest.raises(TransitSealUnverifiableError):
-        await checks()
-    assert backend.verify_calls > before  # each answer above came from Transit, not the cache
+    for index in range(5):
+        assert await kinds(TransitRowSealer(backend))[index]() is True
+        before = backend.verify_calls
+        backend.down = True
+        try:
+            with pytest.raises(TransitSealUnavailableError):
+                await kinds(TransitRowSealer(backend))[index]()
+        finally:
+            backend.down = False
+        assert backend.verify_calls == before + 1, index  # this kind's own Transit call
 
 
 async def test_the_planted_check_of_every_kind_raises_unverifiable(
@@ -489,3 +490,60 @@ async def test_the_service_readers_run_through_transit(
     _plant(path, "roles", "seal", "id", CUSTOM)
     with pytest.raises(TransitSealUnverifiableError):
         await service._load_role(CUSTOM)
+
+
+async def test_a_tombstone_under_a_retired_key_is_resealed_through_transit(tmp_path: Path) -> None:
+    """``rotate-key``'s approval pass moves a rejected row's tombstone seal to the active key
+    through the awaitable tombstone check and seal, never through a sync-only sealer method."""
+    path = tmp_path / "tombstone.db"
+    store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
+    try:
+        store._row_sealer = TransitRowSealer(FakeBackend(active=RETIRED))
+        await _approval(store, "a-1")
+        _sql(path, "UPDATE pending_approvals SET params=? WHERE id=?", ('{"n": "bent"}', "a-1"))
+        (seal_read,) = _sql(path, "SELECT seal FROM pending_approvals WHERE id=?", ("a-1",))[0]
+        assert await store.reject_seal_failed_approval(
+            "a-1", approver="ap", decided_at=3.0, seal_read=seal_read, audits=()
+        )
+        (old,) = _sql(path, "SELECT seal FROM pending_approvals WHERE id=?", ("a-1",))[0]
+        sealer = TransitRowSealer(FakeBackend(), retired_key_names=[RETIRED])
+        store._row_sealer = sealer
+        assert await store.reseal_approval_records() == (1, 0)
+        (new,) = _sql(path, "SELECT seal FROM pending_approvals WHERE id=?", ("a-1",))[0]
+        assert new != old and sealer.is_active(str(new))
+        assert await store.reseal_approval_records() == (0, 0)  # control: nothing left to move
+    finally:
+        await store.close()
+
+
+async def test_session_loader_census_a_refused_retired_key_lookup_escapes(
+    tmp_path: Path,
+) -> None:
+    """Census pin (slice 2): ``_session_row_holds`` asks whether a failed session was sealed under
+    a retired key before it ends the row. Under Transit that lookup is a Transit call, so a 403
+    on the retired key raises Unverifiable there, and the session is neither ended nor reported.
+    The local sealer's lookup cannot raise, so on main the row was always ended."""
+    path = tmp_path / "retired-session.db"
+    store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
+    try:
+        store._row_sealer = TransitRowSealer(FakeBackend(active=RETIRED))
+        await _user(store, "u-1")
+        token = await _session(store, "u-1")
+        backend = FakeBackend()
+        store._row_sealer = TransitRowSealer(backend, retired_key_names=[RETIRED])
+        backend.forbid = {RETIRED}
+        with pytest.raises(TransitSealUnverifiableError):
+            await AuthService(store, AuthSettings()).identity_for_token(token)
+        assert _sql(
+            path, "SELECT revoked_at FROM sessions WHERE token_hash=?", (hash_token(token),)
+        ) == [(None,)]
+        # Control: with the retired key answering, the row is ended quietly, as on main.
+        backend.forbid = set()
+        store._row_sealer = TransitRowSealer(backend, retired_key_names=[RETIRED])
+        assert await AuthService(store, AuthSettings()).identity_for_token(token) is None
+        (revoked_at,) = _sql(
+            path, "SELECT revoked_at FROM sessions WHERE token_hash=?", (hash_token(token),)
+        )[0]
+        assert revoked_at is not None
+    finally:
+        await store.close()

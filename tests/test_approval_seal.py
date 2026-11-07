@@ -32,7 +32,7 @@ from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import AlertSink
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.row_seal import RowSealer, RowSealError
+from messagefoundry.store.row_seal import APPROVAL_KIND, RowSealer, RowSealError
 from messagefoundry.store.store import (
     APPROVAL_SEAL_EXCLUDED,
     ApprovalRow,
@@ -116,7 +116,18 @@ async def test_the_contract_fails_when_a_seal_check_is_switched_off(
     import importlib
 
     store, path = keyed
-    monkeypatch.setattr(importlib.import_module(module), name, _holds)
+    target = importlib.import_module(module)
+    replacement: object = _holds
+    if name == "require_seal_for_write":
+        # Off for the approval kind alone, so only the approval update's refusal is switched off.
+        real = target.require_seal_for_write
+
+        async def _approval_refuses_nothing(sealer: object, kind: str, *a: Any, **k: Any) -> None:
+            if kind != APPROVAL_KIND:
+                await real(sealer, kind, *a, **k)
+
+        replacement = _approval_refuses_nothing
+    monkeypatch.setattr(target, name, replacement)
     # A contract step built on pytest.raises fails with pytest.fail.Exception, not AssertionError.
     with pytest.raises((AssertionError, pytest.fail.Exception)):
         await assert_approval_seal_contract(store, _raw_for(path))
