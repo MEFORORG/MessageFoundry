@@ -537,3 +537,9 @@ def test_an_executor_fault_anywhere_in_a_reload_chain_is_read_as_one() -> None:
     assert faulted(raised_from(RuntimeError("outer"), BrokenThreadPool("pool")))
     assert faulted(Unreadable("odd"))
     assert not faulted(raised_from(PortConflictError("busy"), OSError("bind")))
+    # A bare submit-time refusal another hop met (Lander hold 6704973771, item 1); an unrelated
+    # RuntimeError is not one.
+    assert faulted(
+        raised_from(ValueError("outer"), RuntimeError("Executor shutdown has been called"))
+    )
+    assert not faulted(RuntimeError("the reload failed for another reason"))

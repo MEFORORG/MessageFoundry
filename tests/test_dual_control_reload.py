@@ -3038,3 +3038,53 @@ async def test_a_reload_executor_fault_leaves_the_previous_inbounds_running(
             assert rr.inbound_failed("IB_T_ADT") is None
             # Only the rollback built on the loop: a later build goes to the pool again.
             assert cast(Any, rr)._rollback_builds_on_loop is False
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "cannot schedule new futures after shutdown",
+        "cannot schedule new futures after interpreter shutdown",
+        "Executor shutdown has been called",
+        "can't start new thread",
+    ],
+)
+async def test_a_bare_executor_refusal_in_a_reload_leaves_the_previous_inbounds_running(
+    engine: Engine, refusal: str
+) -> None:
+    """A hop other than the connector build meets the executor's refusal at submit, a bare
+    RuntimeError, and the pool stays refusing for the rollback. The rollback still restarts the
+    previous inbounds without the pool. Red (Lander hold 6704973771, item 1): only a
+    WiringBuildFault or a broken pool switched the rollback, so its builds met the refusing pool
+    and IB_T_ADT was left down."""
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    loop = asyncio.get_running_loop()
+    real = loop.run_in_executor
+    refusing = False
+
+    def faulty(executor: Any, fn: Any, *args: Any) -> asyncio.Future[Any]:
+        if refusing and "_build_off_loop" in getattr(fn, "__qualname__", ""):
+            raise RuntimeError(refusal)
+        return real(executor, fn, *args)
+
+    async def refused_hop(self: RegistryRunner, *_args: Any) -> Any:
+        nonlocal refusing
+        refusing = True
+        raise RuntimeError(refusal)
+
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "op")
+        first = await c.post("/config/reload", json={}, headers=headers)
+        assert first.status_code == 200, first.text
+        rr = engine.registry_runner
+        assert rr is not None and rr.inbound_running("IB_T_ADT")
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(loop, "run_in_executor", faulty)
+            patch.setattr(RegistryRunner, "_reconcile_outbounds", refused_hop)
+            r = await c.post("/config/reload", json={}, headers=headers)
+            assert r.status_code == 500, r.text
+            assert rr.inbound_running("IB_T_ADT")
+            assert rr.inbound_failed("IB_T_ADT") is None

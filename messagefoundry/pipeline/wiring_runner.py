@@ -12642,14 +12642,34 @@ async def _build_off_loop[T](
         raise
 
 
+#: The text of the bare ``RuntimeError`` a worker-thread hop meets when the default executor
+#: refuses work at submit: ``ThreadPoolExecutor.submit`` after a shutdown, asyncio's
+#: ``run_in_executor`` after ``shutdown_default_executor``, and a thread the pool could not start.
+#: ``_build_off_loop`` turns each of these into a :class:`WiringBuildFault` on the build path;
+#: another hop, such as ``asyncio.to_thread``, raises it bare (Lander hold 6704973771, item 1).
+_EXECUTOR_REFUSAL_TEXT: tuple[str, ...] = (
+    "cannot schedule new futures after",
+    "Executor shutdown has been called",
+    "can't start new thread",
+    "can't create new thread",
+)
+
+
+def _is_executor_refusal(exc: BaseException) -> bool:
+    """Whether ``exc`` is an executor fault: a :class:`WiringBuildFault`, a broken pool, or a bare
+    ``RuntimeError`` carrying one of :data:`_EXECUTOR_REFUSAL_TEXT`."""
+    if isinstance(exc, (WiringBuildFault, concurrent.futures.BrokenExecutor)):
+        return True
+    return isinstance(exc, RuntimeError) and str(exc).startswith(_EXECUTOR_REFUSAL_TEXT)
+
+
 def _executor_faulted(exc: BaseException) -> bool:
-    """Whether ``exc``, or an exception it wraps, is an executor fault: a
-    :class:`WiringBuildFault`, the executor keeping a connector build from running, or a broken
-    pool another worker-thread hop met. A chain that cannot be read is taken as one, so a reload's
-    rollback still restarts its inbounds rather than stopping on the walk."""
-    faults = (WiringBuildFault, concurrent.futures.BrokenExecutor)
+    """Whether ``exc``, or an exception it wraps, is an executor fault (:func:`_is_executor_refusal`):
+    the executor kept a connector build or another worker-thread hop from running. A chain that
+    cannot be read is taken as one, so a reload's rollback still restarts its inbounds rather than
+    stopping on the walk."""
     try:
-        return any(isinstance(e, faults) for e in exception_chain(exc))
+        return any(_is_executor_refusal(e) for e in exception_chain(exc))
     except ExceptionChainTooLong:
         return True
     except Exception:  # noqa: BLE001 - a third-party chain's attribute read; logged, never raised
