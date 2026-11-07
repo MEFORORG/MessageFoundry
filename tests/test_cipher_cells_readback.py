@@ -1600,3 +1600,96 @@ def test_table_narrows_a_server_audit_to_that_backends_inventory(
         tmp_path, monkeypatch, capsys, "postgres", "--table", "synth_none"
     )
     assert rc == 2 and "no cipher-covered table named synth_none" in payload["error"], out
+
+
+# --- round-1 review repairs: what reaches each exit (BACKLOG #1719) ---------
+
+
+def test_a_server_open_without_its_driver_could_not_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A server open that raises a plain RuntimeError, as a missing driver extra does, read nothing:
+    exit 2, could not start. It reached the dispatch floor's 1, which this command spends on FAIL."""
+
+    async def no_driver(settings: StoreSettings, **_kw: Any) -> object:
+        raise RuntimeError("synthetic: Postgres backend requires the 'postgres' extra")
+
+    monkeypatch.setattr(store_base, "open_store", no_driver)
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 2 and "error" in payload, out
+    assert "db.invalid/mefor" in payload["error"], payload
+
+
+def test_a_server_open_refused_keyless_is_a_key_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The open's own keyless refusal blames the key, exit 4, as the SQLite branch does."""
+    from messagefoundry.store.crypto import StoreKeylessError
+
+    async def keyless(settings: StoreSettings, **_kw: Any) -> object:
+        raise StoreKeylessError("synthetic: the store is keyed and no key resolved")
+
+    monkeypatch.setattr(store_base, "open_store", keyless)
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 4 and payload["status"] == "KEY_MISMATCH", out
+
+
+class _GrantDenied(OSError):
+    """A driver error carrying an access-rule SQLSTATE, as asyncpg's does."""
+
+    sqlstate = "42501"
+
+
+def test_a_grant_the_server_walk_lacks_could_not_start(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A permission denied part way says nothing about a row: exit 2, as ``audit-verify`` splits
+    it, never the 1 a damaged value earns. The handle is still closed."""
+    db, settings = _copy(_template, tmp_path)
+    opened = _serve_from(monkeypatch, db, build_store_cipher(settings))
+
+    async def denied(self: _SqliteSource, *args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+        raise _GrantDenied("synthetic: permission denied")
+
+    monkeypatch.setattr(_SqliteSource, "cipher_walk_chunk", denied)
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 2 and "error" in payload, out
+    assert "42501" in payload["error"], payload
+    assert opened[0][1].closed
+
+
+def test_a_cipher_build_failure_in_the_full_walk_is_a_fail_verdict(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk now runs before the open, outside the open's handler. A failure in its cipher build
+    is still the FAIL verdict the open gave it, not an exception out of the verify."""
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    db, settings = _copy(_template, tmp_path)
+
+    def build_fails(*_a: Any, **_kw: Any) -> tuple[str, str, int]:
+        raise KeyProviderError("synthetic: the key service did not answer")
+
+    monkeypatch.setattr(dr_backup, "_decrypt_check", build_fails)
+    status, reason, cells = dr_backup._full_open_check(db, settings)
+    assert (status, cells) == ("FAIL", 0) and "key service" in reason, reason
+
+
+def test_a_salt_reset_failure_keeps_the_walks_verdict(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk read the archive first, so its verdict leads a later failure to reset the salt."""
+    import messagefoundry.store.store as store_module
+
+    db, settings = _copy(_template, tmp_path)
+    walked = ("KEY_MISMATCH", "synthetic walk line", 0)
+    monkeypatch.setattr(dr_backup, "_decrypt_check", lambda *_a, **_kw: walked)
+
+    def reset_fails(_snap: Path) -> None:
+        raise sqlite3.OperationalError("synthetic: database is locked")
+
+    monkeypatch.setattr(store_module, "forget_store_salt", reset_fails)
+    assert dr_backup._full_open_check(db, settings) == walked

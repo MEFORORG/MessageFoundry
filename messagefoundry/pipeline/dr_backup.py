@@ -3683,7 +3683,12 @@ def _full_open_check(
     # the opt-out, or on a surface no keyed open recorded, that includes a value whose marker is
     # damaged, which would then open cleanly and PASS. Read first, the walk judges that value as
     # it was archived, and the verdict matches `cipher-audit`'s on the same store.
-    walked = _decrypt_check(snap, snap_settings, posture=posture)
+    try:
+        walked = _decrypt_check(snap, snap_settings, posture=posture)
+    except Exception as exc:
+        # Its cipher build is the open's own, so a failure there (a key provider, a refused Vault
+        # hop, a cipher config) is the FAIL the open's handler below gave it when the open ran first.
+        return "FAIL", safe_exc(exc), 0
     # ADR 0196 AC-8: the snapshot is a copy of the LIVE store and carries its salt. Opened as it is,
     # anything the open seals (the at-open sweep) would land under the live store's data sub-key and
     # be counted only in this throwaway copy's row. Dropping the salt makes the open mint a new one,
@@ -3696,7 +3701,8 @@ def _full_open_check(
     try:
         forget_store_salt(snap)
     except sqlite3.Error as exc:
-        return "FAIL", safe_exc(exc), 0
+        # The walk's verdict, read before this, still leads (the order below).
+        return walked if walked[0] != "PASS" else ("FAIL", safe_exc(exc), 0)
 
     async def _open() -> tuple[bool, str]:
         # Bind the store BEFORE the try. An open that raises — a keyless or wrong-key open, an

@@ -10917,15 +10917,15 @@ def _restore_verify(args: argparse.Namespace) -> int:
     # No #1670 clause here on purpose: this one never opens `settings.store`. Its only open_store
     # call is inside `_full_open_check`, which catches broadly around that open and reports FAIL
     # with a reason -- and the leak that made that hang is fixed in `MessageStore.open` itself.
-    # Its later cipher build is outside that handler; the key arm below says what reaches it.
+    # Its decrypt pass, which runs before that open, is caught the same way (BACKLOG #1719).
     try:
         result = run_guarded(
             run_restore_verify(args.archive, store_settings=settings.store, full=args.full)
         )
     except _key_unresolved() as exc:
         # The keyring is resolved before the archive is read, so this is "could not start", not a
-        # FAIL (BACKLOG #3471). A --full verify builds the cipher again for its open, outside that
-        # check's own handler, so a key error there lands here too, after the archive was read.
+        # FAIL (BACKLOG #3471). A --full verify builds the cipher again, for its decrypt pass and
+        # its open, and reports a key error there as that check's FAIL, after the archive was read.
         return _emit_key_unresolved(exc, as_json=args.json)
     payload = {
         "status": result.status,
@@ -10979,11 +10979,13 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         keyless_opt_out_refusal,
     )
     from messagefoundry.last_resort import run_guarded
+    from messagefoundry.redaction import safe_exc
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
         StoreNotFoundError,
         audit_chain_read_errors,
         build_store_cipher,
+        is_store_shape_error,
         open_store,
     )
     from messagefoundry.store.cipher_cells import (
@@ -11002,7 +11004,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         server_walk_tables,
         store_tables,
     )
-    from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.crypto import CipherError, StoreKeylessError
 
     as_json = bool(args.json)
     cli: dict[str, dict[str, object]] = {}
@@ -11072,6 +11074,18 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 )
             except walk_errors as exc:
                 raise _StoreUnreachable() from exc
+            except StoreKeylessError as exc:
+                # A keyless open of a keyed store refused by the open itself: the key, not the
+                # store, so KEY_MISMATCH as the SQLite branch and the full restore-verify say it.
+                return False, CipherAudit(key_mismatch=safe_exc(exc)), None
+            except (RuntimeError, NotImplementedError, ValueError) as exc:
+                # Nothing was read, so never the FAIL a dispatch floor's exit 1 would read as: at
+                # least a missing driver extra, or an engine refusal of this open. Could not start.
+                if isinstance(
+                    exc, (_StoreOpenRefused, KeylessAuditChainRefused, StoreNotFoundError)
+                ):
+                    raise
+                raise _StoreUnreachable() from exc
             try:
                 source = cast(CipherCellSource, handle)
                 server_cipher = handle.cipher()
@@ -11086,6 +11100,10 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                         source, server_cipher, cells=cells, chunk_rows=chunk_rows, columns=columns
                     )
                 except walk_errors as exc:
+                    if is_store_shape_error(exc):
+                        # A table, column or grant the read needs, as `audit-verify` splits it:
+                        # nothing about a row, so could not start rather than FAIL.
+                        raise _StoreUnreachable() from exc
                     # Part way: a lost connection, a timeout, a value the driver cannot read. The
                     # rendering is the error's class and SQLSTATE, never a row's content.
                     return server_cipher.encrypts, CipherAudit(), _store_error_text(exc)
