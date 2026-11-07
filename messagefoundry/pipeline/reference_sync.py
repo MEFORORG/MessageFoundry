@@ -135,6 +135,11 @@ def reference_connection_name(name: str) -> str:
     return f"reference:{name}"
 
 
+#: The settings that name the login a DATABASE source dials, and which the role probe is remembered
+#: by (BACKLOG #2617). ``password`` is left out on purpose: the key must hold no credential.
+_LOGIN_KEYS = ("server", "port", "database", "auth", "username")
+
+
 def reference_acquire_timeout(settings: Mapping[str, Any]) -> float:
     """Read a DATABASE reference source's ``acquire_timeout`` by the rule in
     :func:`~messagefoundry.transports.base.float_setting`, or refuse it (BACKLOG #3432).
@@ -242,6 +247,7 @@ async def _load_database_source(
     *,
     posture: HopPosture | None = None,
     name: str | None = None,
+    probed: set[tuple[str, ...]] | None = None,
 ) -> dict[str, Any]:
     """Materialize a SQL-backed reference source (ADR 0006 increment 2) into ``{key: value}``.
 
@@ -262,12 +268,22 @@ async def _load_database_source(
     ``db_lookup`` twin refuses the same hop. Today no posture fails closed, and the escape is
     honoured only on an instance at ``[security].enforcement = warn``. ``None`` keeps the ambient
     posture, so a caller already inside a scope is unchanged. ``name`` is the reference set, so a
-    refusal or an attestation line names it."""
+    refusal or an attestation line names it.
+
+    Once the pool is open, the login's fixed-role membership is probed before the statement runs
+    (BACKLOG #2617, ``transports.database.probe_login_roles``). It warns on a database-wide write
+    role and never refuses or raises. ``probed`` remembers which set and login have been probed, so
+    the runner probes each once rather than every pass; a set pointed at another login, server or
+    database, as on a reload, is probed again. ``None`` probes on every call. A pool that fails to
+    open is not probed, and a probe that did not run is not remembered, so the next pass probes
+    either again."""
     from messagefoundry.transports.database import (
+        LoginRoleVerdict,
         _close_and_release,
         _close_pool_bounded,
         _login_timeout,
         _make_pool,
+        probe_login_roles,
     )
 
     server = str(settings.get("server", ""))
@@ -287,10 +303,9 @@ async def _load_database_source(
     statement = reference_statement(settings, name=name)
     # Fail loud on weakened TLS or bad auth, before dialing; why the posture is stamped is in the
     # docstring. Unlike wiring_runner._build_lookup_executor, a None posture keeps the ambient one.
+    connection = None if name is None else reference_connection_name(name)
     with active_hop_posture(posture if posture is not None else current_hop_posture()):
-        dsn = database_source_dsn(
-            settings, connection=None if name is None else reference_connection_name(name)
-        )
+        dsn = database_source_dsn(settings, connection=connection)
     # BACKLOG #1052: bound the borrow. This pool is throwaway (closed in the finally below), but the
     # acquire was unbounded, so an unresponsive server could hold the reference-sync runner's pass
     # open indefinitely — and the runner is a single sequential loop over every declared set, so one
@@ -309,6 +324,17 @@ async def _load_database_source(
         login_timeout=_login_timeout(settings, "DATABASE reference source"),
     )
     try:
+        # What names the login, never the password, so the remembered key holds no credential.
+        probe_key = (str(name),) + tuple(str(settings.get(k, "")) for k in _LOGIN_KEYS)
+        if probed is None or probe_key not in probed:
+            reading = await probe_login_roles(
+                pool,
+                label=connection or "DATABASE reference source",
+                acquire_timeout=acquire_timeout,
+            )
+            # A probe that did not run judged nothing, so the next pass tries again.
+            if probed is not None and reading.verdict is not LoginRoleVerdict.NOT_RUN:
+                probed.add(probe_key)
         conn = await acquire_pooled(pool, timeout=acquire_timeout, backend="reference:database")
         cur: Any = None
         try:
@@ -379,6 +405,8 @@ class ReferenceSyncRunner:
         # e.g. a backend with no `reference` tables). A permanent incapability, not a transient source
         # failure: retrying is guaranteed-futile, so a set lands here once and is skipped thereafter.
         self._unsupported: set[str] = set()
+        # BACKLOG #2617: each DATABASE set's login is role-probed once per DSN, not every pass.
+        self._roles_probed: set[tuple[str, ...]] = set()
 
     @property
     def enabled(self) -> bool:
@@ -555,7 +583,11 @@ class ReferenceSyncRunner:
             )  # blocking file I/O off-loop
         elif kind == "database":
             rows = await _load_database_source(  # async aioodbc dial
-                settings, self._egress, posture=self._hop_posture, name=spec.name
+                settings,
+                self._egress,
+                posture=self._hop_posture,
+                name=spec.name,
+                probed=self._roles_probed,
             )
         else:
             raise ReferenceSyncError(
