@@ -2201,7 +2201,7 @@ def test_the_postgres_catalog_check_reads_only_search_path_names_it_can_parse(
         return
     assert found is False, conn.calls
     query, args = conn.calls[1]
-    assert query.count("::text[]::name[]") == 2, query
+    assert query.count("::text[]::name[]") == 4, query
     assert list(args[0]) == expected, args  # type: ignore[call-overload]
 
 
@@ -2238,8 +2238,34 @@ def test_the_postgres_catalog_check_asks_for_store_tables_as_well(
     from messagefoundry.store.postgres import _declared_schema as postgres_schema
 
     tables = list(conn.calls[1][1][1])  # type: ignore[call-overload]
-    # PR 2804 sixteenth hold, item 2: every table name the store builds, whoever built the table.
+    # PR 2804 sixteenth hold, item 2: every table name the store builds, whoever built the table,
+    # and any relation or type under one, not tables alone.
     assert tables == sorted(postgres_schema().columns), tables
+    assert {"schema_meta", "cipher_meta", "users", "messages"} <= set(tables), tables
+    query = conn.calls[1][0]
+    assert "relkind" not in query and "pg_catalog.pg_type" in query, query
+
+
+def test_an_empty_store_table_name_set_reads_as_cannot_show(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # PR 2804 sixteenth hold, review round 1: a check that asked about no name would read none.
+    import asyncio
+
+    from messagefoundry.store import postgres, sqlserver
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    empty = types.SimpleNamespace(columns={})
+    monkeypatch.setattr(postgres, "_declared_schema", lambda: empty)
+    monkeypatch.setattr(sqlserver, "_declared_schema", lambda: empty)
+    _postgres_catalog(monkeypatch, [{"path": "public", "who": "mefor"}, {"found": False}])
+    settings = StoreSettings().model_copy(update={"backend": StoreBackend.POSTGRES})
+    assert asyncio.run(PostgresStore.schema_meta_anywhere(settings)) is None
+    cur = _sqlserver_catalog(monkeypatch, [(1, 1), (0,)])
+    settings = StoreSettings().model_copy(update={"backend": StoreBackend.SQLSERVER})
+    assert asyncio.run(SqlServerStore.schema_meta_anywhere(settings)) is None
+    assert cur.calls == [], cur.calls
 
 
 class _PresentTablesConn(_CatalogConn):
@@ -2408,6 +2434,8 @@ def test_the_sqlserver_catalog_check_asks_for_store_tables_as_well(
     from messagefoundry.store.sqlserver import _declared_schema as sqlserver_schema
 
     assert names == tuple(sorted(sqlserver_schema().columns)), (query, args)
+    assert {"schema_meta", "cipher_meta", "users"} <= set(names), names
+    assert "type = N'U'" not in query, query  # any object under the name, not tables alone
 
 
 @host_file_platforms

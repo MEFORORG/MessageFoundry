@@ -5208,6 +5208,8 @@ class SqlServerStore:
         only."""
         found: bool | None = None
         tables = tuple(sorted(_declared_schema().columns))
+        if not tables:
+            return None
         async with (
             cls._one_connection_store(settings, posture=posture) as probe,
             probe._acquire() as conn,
@@ -5222,9 +5224,11 @@ class SqlServerStore:
                 row = await cur.fetchone()
                 if row is not None and row[0] == 1 and row[1] == 1:
                     marks = ", ".join("?" for _ in tables)
+                    # Any object under a store table's name, a view or synonym included:
+                    # each breaks the create as a table does (PR 2804 sixteenth hold).
                     await cur.execute(
                         "SELECT COUNT(*) FROM sys.objects"
-                        f" WHERE type = N'U' AND name IN ({marks})"
+                        f" WHERE name IN ({marks})"
                         " AND schema_id IN (SCHEMA_ID(), SCHEMA_ID(N'dbo'))",
                         tables,
                     )

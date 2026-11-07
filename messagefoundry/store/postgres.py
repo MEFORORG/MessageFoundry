@@ -1437,7 +1437,8 @@ def _search_path_schemas(path: str, role: str) -> list[str] | None:
     schemas: list[str] = []
     for element in path.split(","):
         # Postgres skips ASCII whitespace alone (PR 2804 sixteenth hold); any other space stays in
-        # the element, so it fails the name patterns and reads as "cannot show".
+        # the element, so it fails the name patterns and reads as "cannot show". A vertical tab,
+        # which PostgreSQL 16 and later also skip, reads as "cannot show" too: closed, not open.
         item = element.strip(" \t\n\r\f")
         if not item:
             continue
@@ -2228,15 +2229,22 @@ class PostgresStore:
             if setting is None:
                 return None
             schemas = _search_path_schemas(str(setting["path"]), str(setting["who"]))
-            if not schemas:
+            tables = sorted(_declared_schema().columns)
+            if not schemas or not tables:
                 return None
+            # Any relation or type under a store table's name, a view, sequence or enum
+            # included: each breaks the create as a table does (PR 2804 sixteenth hold).
             row = await conn.fetchrow(
                 "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c"
                 " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
-                " WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::text[]::name[])"
-                " AND c.relname = ANY($2::text[]::name[])) AS found",
+                " WHERE n.nspname = ANY($1::text[]::name[])"
+                " AND c.relname = ANY($2::text[]::name[]))"
+                " OR EXISTS (SELECT 1 FROM pg_catalog.pg_type t"
+                " JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace"
+                " WHERE n.nspname = ANY($1::text[]::name[])"
+                " AND t.typname = ANY($2::text[]::name[])) AS found",
                 schemas,
-                sorted(_declared_schema().columns),
+                tables,
             )
         if row is None or row["found"] is None:
             return None
