@@ -47,7 +47,9 @@
   own `__str__` could print a byte. A refusal the key resolution raised keeps the text it recorded
   when it was built, the key check's refusals built from the settings alone among them, and one
   whose error or cause is exactly the Vault hop's marked refusal gets a fixed text naming the
-  store's Vault levers, `[store].vault_revocation_attested` and its reason among them. The refusal
+  store's Vault settings. Only the revocation refusal's text offers
+  `[store].vault_revocation_attested` with its reason, and only if revocation for the hop is covered
+  outside the engine; an http:// address or a proxy's cleartext credentials get none. The refusal
   keeps no cause and no context, so a traceback of it does not print the error's own text, and the
   site drops the error, so no frame local of the refusal's traceback holds the error itself. The
   class of a replaced error the engine did not build, and of its cause, is logged as a WARNING by

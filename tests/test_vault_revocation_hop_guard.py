@@ -207,7 +207,7 @@ def _assert_refused(caught: pytest.ExceptionInfo[Exception], entry: EntryPoint) 
     text = str(caught.value)
     if section == "store":
         assert caught.value.__cause__ is None and caught.value.__context__ is None
-        assert text == store_base._VAULT_HOP_TEXT
+        assert text == store_base._VAULT_REVOCATION_TEXT
     else:
         assert type(caught.value.__cause__) is strict_requests.VaultHopRefused
         assert text == f"{connector}: {strict_requests._UNREVOKED_VAULT_HOP} {lever}"
@@ -1022,8 +1022,8 @@ def test_verify_judges_its_secrets_vault_hop_as_strictly_as_its_store_opens(
     assert secret.status is expected, secret.detail
     assert "[secrets].vault_revocation_attested = true" in (secret.evidence or secret.detail)
     assert opened.status is Status.FAIL, opened.detail
-    # The store's refusal is the fixed Vault hop text since the eighth hold on engine PR 2818.
-    assert store_base._VAULT_HOP_TEXT in opened.detail
+    # The store's refusal is the fixed Vault revocation text since the tenth hold on engine PR 2818.
+    assert store_base._VAULT_REVOCATION_TEXT in opened.detail
     assert dials == []
 
     # The control, on the same address: the hop's own pair, with its reason, is the way across.
@@ -1410,3 +1410,49 @@ def test_each_entry_point_hands_its_posture_to_the_proxy_leg(
     (proxy_line,) = _proxy_leg_lines(caplog)
     assert _HOPS[entry][1] in proxy_line
     assert len(_crossing_lines(caplog)) == 2
+
+
+# --- the tenth hold on engine PR 2818: the attestation is offered for revocation alone ---------
+
+
+_STORE_ENTRY_POINTS = pytest.mark.parametrize(
+    "entry", [_kek, _transit], ids=["store-key", "transit"]
+)
+
+
+@_STORE_ENTRY_POINTS
+def test_the_store_revocation_refusal_names_the_attestation_with_its_precondition(
+    entry: EntryPoint, monkeypatch: pytest.MonkeyPatch, dials: list[object]
+) -> None:
+    """The store's fixed text for the revocation refusal offers the attestation only on its real
+    precondition, as the sibling levers word it: revocation covered outside the engine."""
+    with pytest.raises(KeyProviderError) as caught:
+        entry(monkeypatch, _OFF_BOX)
+    text = str(caught.value)
+    assert "if revocation for this hop is covered outside the engine" in text, text
+    assert "[store].vault_revocation_attested = true" in text, text
+    assert "[store].vault_revocation_attested_reason" in text, text
+    assert dials == []
+
+
+@_STORE_ENTRY_POINTS
+@pytest.mark.parametrize("hop", ["cleartext-address", "cleartext-proxy-credentials"])
+def test_a_store_hop_refusal_that_is_not_revocation_offers_no_attestation(
+    entry: EntryPoint, hop: str, monkeypatch: pytest.MonkeyPatch, dials: list[object]
+) -> None:
+    """An http:// Vault address or a proxy that would get its credentials in cleartext is not
+    crossed by the attestation, so the store's text must not offer it there."""
+    if hop == "cleartext-address":
+        with pytest.raises(KeyProviderError) as caught:
+            entry(monkeypatch, f"http://{_HOST}:8200")
+    else:
+        monkeypatch.setenv("HTTPS_PROXY", f"http://user:synthetic@{_PROXY_HOST}:3128")
+        with pytest.raises(KeyProviderError) as caught:
+            entry(monkeypatch, _OFF_BOX, attested=True)
+    # The control: the cause is the Vault hop's marked refusal, so the store chose its hop text.
+    from messagefoundry.store import base as store_base
+
+    assert str(caught.value).startswith(store_base._KEY_SOURCE), str(caught.value)
+    assert "Vault hop was refused" in str(caught.value), str(caught.value)
+    assert "vault_revocation_attested" not in str(caught.value), str(caught.value)
+    assert dials == []

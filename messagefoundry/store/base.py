@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import threading
 import weakref
 from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mapping, Sequence
@@ -3628,15 +3629,23 @@ def _fresh_refusal(
     (:func:`_recorded_text`), the text recorded when it was built. Nothing is read from ``exc``:
     not its text, its arguments or its class name (the eighth hold on engine PR 2818).
 
-    One more text is chosen by exact type, :data:`_VAULT_HOP_TEXT`: where ``exc`` or its cause,
-    read through ``BaseException``'s own descriptor, is exactly the Vault hop's marked refusal
+    Two more texts are chosen by exact type: where ``exc`` or its cause, read through
+    ``BaseException``'s own descriptor, is exactly the Vault hop's marked refusal
     (:func:`~messagefoundry.config.tls_policy.is_vault_hop_refusal`), so a Vault hop the engine
-    refused still names its levers and stays apart from one that crossed and failed later."""
+    refused still names its levers and stays apart from one that crossed and failed later. A
+    revocation refusal (:func:`_is_vault_revocation_refusal`) gets :data:`_VAULT_REVOCATION_TEXT`,
+    which offers the attestation; any other marked refusal gets :data:`_VAULT_HOP_TEXT`, which does
+    not, since the attestation crosses no other check (the tenth hold on engine PR 2818)."""
     kind = type(exc)
     recorded = _recorded_text(exc)
     hop, dpapi, unavailable, value, other = texts
-    if is_vault_hop_refusal(exc) or is_vault_hop_refusal(_CAUSE.__get__(exc)):
-        hop = value = other = _VAULT_HOP_TEXT
+    for link in (exc, _CAUSE.__get__(exc)):
+        if is_vault_hop_refusal(link):
+            vault = (
+                _VAULT_REVOCATION_TEXT if _is_vault_revocation_refusal(link) else _VAULT_HOP_TEXT
+            )
+            hop = value = other = vault
+            break
     made: type[Exception]
     if issubclass(kind, InsecureHopRefused):
         made, text = hop_as, hop
@@ -3755,15 +3764,47 @@ _KEY_SOURCE = (
 #: The fallback refusal's text. Like every refusal text here it reads nothing from the error.
 _UNJUDGED = f"{_KEY_SOURCE}: an error that could not be judged, its class and text not shown"
 
-#: :func:`_fresh_refusal`'s text, at both sites, for the Vault hop's marked refusal. It names the
-#: store's own levers and reads nothing from the refusal.
+#: :func:`_fresh_refusal`'s text, at both sites, for a Vault hop marked refusal that is not a
+#: revocation refusal, such as an http:// address, a proxy's cleartext credentials or an unchecked
+#: client key. It offers no attestation, which crosses none of those, and reads nothing from the
+#: refusal.
 _VAULT_HOP_TEXT = (
     f"{_KEY_SOURCE}: the store's Vault hop was refused by the engine's own hop checks, its text "
-    "not shown; check that MEFOR_STORE_VAULT_ADDR is an https:// address, any proxy variable, the "
-    "Vault CA and client settings; and, only where the hop checks no certificate revocation, "
-    "[store].vault_revocation_attested = true with a [store].vault_revocation_attested_reason that "
-    "covers the Vault server's certificate and any https:// proxy's the hop goes through"
+    "not shown; check that MEFOR_STORE_VAULT_ADDR is an https:// address, any proxy variable, and "
+    "the Vault CA and client settings"
 )
+
+#: :func:`_fresh_refusal`'s text, at both sites, for the Vault hop's revocation refusal, of the
+#: Vault server's certificate or of an https:// proxy's. The attestation is offered only on the
+#: precondition the hop's own levers state (``strict_requests._STORE_REVOCATION_LEVER``).
+_VAULT_REVOCATION_TEXT = (
+    f"{_KEY_SOURCE}: the store's Vault hop was refused because it checks no certificate "
+    "revocation, its text not shown; if revocation for this hop is covered outside the engine, "
+    "set [store].vault_revocation_attested = true with a [store].vault_revocation_attested_reason "
+    "that covers the Vault server's certificate and any https:// proxy's the hop goes through"
+)
+
+#: ``BaseException``'s own ``args`` descriptor, read so no subclass code runs.
+_ARGS: Any = vars(BaseException)["args"]
+
+
+def _is_vault_revocation_refusal(refusal: BaseException) -> bool:
+    """Whether ``refusal``, already exactly the Vault hop's marked refusal, is its revocation
+    refusal: its one argument, an exact ``str``, holds one of ``strict_requests``' two fixed
+    revocation reasons, ``_UNREVOKED_VAULT_HOP`` or ``_UNREVOKED_PROXY_LEG``. Only the marked type
+    is ever matched, and only by an exact ``str`` containment, which runs none of the refusal's
+    code; nothing read is printed, since the match only chooses between two fixed texts. The module
+    is read from ``sys.modules``, as ``is_vault_hop_refusal`` reads it."""
+    module = sys.modules.get("messagefoundry.transports.strict_requests")
+    args = _ARGS.__get__(refusal)
+    if module is None or len(args) != 1 or type(args[0]) is not str:
+        return False
+    reasons = (
+        getattr(module, "_UNREVOKED_VAULT_HOP", None),
+        getattr(module, "_UNREVOKED_PROXY_LEG", None),
+    )
+    return any(type(reason) is str and reason in args[0] for reason in reasons)
+
 
 #: :func:`_fresh_refusal`'s texts at the key seam (``resolve_active_key``, ``resolve_decrypt_keys``).
 _KEY_SEAM_TEXTS: _SiteTexts = (
