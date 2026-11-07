@@ -1728,11 +1728,19 @@ class Engine:
         graph then loaded via reload still gets a runner. ``start()`` is idempotent (a no-op when the
         loop is already up). The pre-sync runs on a reload unconditionally (so a new set resolves on the
         next message); at startup it honors ``[reference].sync_on_startup``. A sync failure is isolated
-        per-set (last-good kept) and never blocks start/reload."""
+        per-set (last-good kept) and never blocks start/reload.
+
+        Nothing is synced or started once :meth:`stop` has begun: it stops the loop, so a reload a
+        stop overtakes must not start it again against a store being closed (engine PR 2815, Lander
+        hold 6702318430 item C). Read again after the sync, which awaits."""
+        if self._stopping:
+            return
         if self._reference_runner is None:
             self._reference_runner = self._make_reference_runner()
         if not startup or (self._reference_settings or ReferenceSettings()).sync_on_startup:
             await self._reference_runner.sync_all()
+        if self._stopping:
+            return
         self._reference_runner.start()
 
     # --- lifecycle -----------------------------------------------------------

@@ -607,6 +607,63 @@ async def test_engine_first_load_does_not_start_a_runner_after_a_stop(
             await eng.stop()
 
 
+async def test_a_reload_a_stop_overtakes_does_not_restart_reference_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop that lands while a reload's runner swap is finishing stops the reference sync loop.
+    The reload then goes on, and must not start that loop again on a stopped engine. Red (Lander
+    hold 6702318430, item C): _reconcile_reference_sync started ReferenceSyncRunner after the
+    stop had stopped it, against the closed store."""
+    from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
+
+    good = tmp_path / "good"
+    _write_valid_config(good, tmp_path / "in", tmp_path / "out")
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
+    await eng.start()
+    await eng.reload(good)  # the first load: the runner is installed and started
+    starts_after_stop: list[ReferenceSyncRunner] = []
+    stopping = False
+    real_start = ReferenceSyncRunner.start
+
+    def recording_start(self: ReferenceSyncRunner) -> None:
+        if stopping:
+            starts_after_stop.append(self)
+        real_start(self)
+
+    runner = eng.registry_runner
+    assert runner is not None
+    real_reload = runner.reload
+    swapped = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held_reload(*args: Any, **kwargs: Any) -> tuple[tuple[str, str], ...]:
+        result = await real_reload(*args, **kwargs)
+        swapped.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(ReferenceSyncRunner, "start", recording_start)
+    monkeypatch.setattr(runner, "reload", held_reload)
+    load = asyncio.create_task(eng.reload(good))
+    stopped = False
+    try:
+        await asyncio.wait_for(swapped.wait(), timeout=5)
+        stopping = stopped = True
+        await eng.stop()
+        release.set()
+        await asyncio.gather(load, return_exceptions=True)
+        assert starts_after_stop == []
+    finally:
+        release.set()
+        await asyncio.gather(load, return_exceptions=True)
+        for ref in starts_after_stop:
+            await ref.stop()
+        if not stopped:
+            await eng.stop()
+
+
 def _write_env_config(cfg: Path, inbox: Path) -> None:
     """A valid graph whose outbound peer is env()-driven (resolved per environment)."""
     cfg.mkdir(parents=True, exist_ok=True)
