@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import re
 import types
+from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
 
@@ -291,27 +292,65 @@ class _SlowReadyPool(_ReadyPool):
         return self.conn
 
 
-async def _borrow_within_turns(pool: Any) -> asyncio.Task[Any] | None:
-    """The borrow, if it finished within ``_HEALTHY_BORROW_TURNS`` loop turns at the shipped timeout;
-    otherwise ``None``, with the borrow cancelled and waited for. ``asyncio.wait`` rather than an
-    await, so a cancellation aimed at the test itself still propagates; the ``finally`` cancels the
-    borrow on that path too. The pool's own inner acquire is cancelled by ``acquire_pooled`` but not
-    awaited here, so it finishes on a later turn of this loop."""
-    borrow = asyncio.create_task(
-        acquire_pooled(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT, backend="sqlserver")
-    )
+#: How long the cleanup may wait for a cancelled borrow to unwind, in wall seconds. A bound on a
+#: hang, not a timing: ``acquire_pooled`` cancels its inner borrow and returns, leaving the salvage
+#: to a callback, so the unwind takes a few turns. A regression that awaited the salvage instead
+#: would wait out ``_SlowReadyPool``'s hour, and this turns that into a failure.
+_UNWIND_SECONDS = 10.0
+
+
+async def _finished_within_turns(work: Coroutine[Any, Any, Any]) -> asyncio.Task[Any] | None:
+    """``work`` as a task, if it finished within ``_HEALTHY_BORROW_TURNS`` loop turns; otherwise
+    ``None``, with the task cancelled and waited for, for at most ``_UNWIND_SECONDS``.
+    ``asyncio.wait`` rather than an await, so a cancellation aimed at the test itself still
+    propagates; the ``finally`` cancels the task on that path too. A pool's own inner acquire is
+    cancelled by ``acquire_pooled`` but not awaited here, so it finishes on a later turn of this
+    loop."""
+    task = asyncio.create_task(work)
     try:
         for _ in range(_HEALTHY_BORROW_TURNS):
-            if borrow.done():
-                return borrow
+            if task.done():
+                return task
             await asyncio.sleep(0)
-        if borrow.done():
-            return borrow
+        if task.done():
+            return task
     finally:
-        if not borrow.done():
-            borrow.cancel()
-            await asyncio.wait({borrow})
+        if not task.done():
+            task.cancel()
+            await asyncio.wait({task}, timeout=_UNWIND_SECONDS)
+            if not task.done():
+                pytest.fail(
+                    f"a cancelled borrow was still unwinding after {_UNWIND_SECONDS}s -- the "
+                    "cancel path now waits on the late borrow instead of handing it to the salvage"
+                )
     return None
+
+
+async def _borrow_within_turns(pool: Any) -> asyncio.Task[Any] | None:
+    """The borrow, if it finished within ``_HEALTHY_BORROW_TURNS`` loop turns at the shipped timeout,
+    as :func:`_finished_within_turns` gives it."""
+    return await _finished_within_turns(
+        acquire_pooled(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT, backend="sqlserver")
+    )
+
+
+async def _store_call_within_turns(work: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+    """A store call over a ready pool, which must finish within ``_HEALTHY_BORROW_TURNS`` turns.
+
+    **For the tests that read what a healthy borrow leaves behind, not how fast it is (BACKLOG
+    #3456).** They built their store at ``FAST``, so a runner that held the loop off the core for
+    0.05 s let the timer win over a ready pool, the same race :func:`test_a_healthy_borrow_is_unaffected`
+    describes. Built at ``DEFAULT_STORE_ACQUIRE_TIMEOUT`` instead, the timer cannot come due, and the
+    turn budget keeps a regression to a waiting borrow a quick failure rather than a 30 s hang.
+    Measured 2026-11-06 on Windows, Python 3.14, ten runs of each of the four tests that use this:
+    each store call finished within 4 turns; beside a spinning thread at
+    ``sys.setswitchinterval(0.1)`` the old shape raised StoreAcquireTimeout in 40 of 40 runs and this
+    one passed 40 of 40; idle, both passed 40 of 40."""
+    task = await _finished_within_turns(work)
+    assert task is not None, (
+        f"a store call over a ready pool was still waiting after {_HEALTHY_BORROW_TURNS} turns"
+    )
+    return task
 
 
 async def test_a_healthy_borrow_is_unaffected() -> None:
@@ -619,17 +658,21 @@ async def test_sqlserver_post_commit_borrow_keeps_the_cancellation_quarantine() 
     """ADR 0159 on the post-commit borrow: a cancellation mid-body still quarantines the connection
     before it is released, so it is never lent again with its transaction open."""
     pool = _ReadyPool()
-    store = _sqlserver_store(pool)
+    store = _sqlserver_store(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT)
     order: list[str] = []
 
     async def quarantine(conn: Any) -> None:
         order.append(f"quarantine {pool.released!r}")
 
     store._release_dirty = quarantine
-    with pytest.raises(asyncio.CancelledError):
+
+    async def cancelled_mid_body() -> None:
         async with store._acquire_after_commit() as conn:
             assert conn is pool.conn
             raise asyncio.CancelledError
+
+    task = await _store_call_within_turns(cancelled_mid_body())
+    assert task.cancelled(), "the body's CancelledError did not propagate out of the borrow"
     assert order == ["quarantine []"], "the cancelled connection was released before quarantine"
     assert pool.released == [pool.conn]
 
@@ -637,17 +680,25 @@ async def test_sqlserver_post_commit_borrow_keeps_the_cancellation_quarantine() 
 async def test_sqlserver_store_releases_a_healthy_borrow() -> None:
     """Positive control for the acquire/release restructure: the connection still goes back."""
     pool = _ReadyPool()
-    store = _sqlserver_store(pool)
-    async with store._acquire() as conn:
-        assert conn is pool.conn
+    store = _sqlserver_store(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT)
+
+    async def borrow_and_return() -> None:
+        async with store._acquire() as conn:
+            assert conn is pool.conn
+
+    (await _store_call_within_turns(borrow_and_return())).result()
     assert pool.released == [pool.conn]
 
 
 async def test_postgres_store_releases_a_healthy_borrow() -> None:
     pool = _ReadyPool()
-    store = _postgres_store(pool)
-    async with store._timed_acquire() as conn:
-        assert conn is pool.conn
+    store = _postgres_store(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT)
+
+    async def borrow_and_return() -> None:
+        async with store._timed_acquire() as conn:
+            assert conn is pool.conn
+
+    (await _store_call_within_turns(borrow_and_return())).result()
     assert pool.released == [pool.conn]
 
 
@@ -663,12 +714,15 @@ async def test_postgres_convenience_reads_stay_out_of_the_worker_acquire_wait_cu
         async def fetch(self, sql: str, *params: Any) -> list[Any]:
             return []
 
-    store = _postgres_store(_P())
-    await store._fetchall("SELECT 1")
+    store = _postgres_store(_P(), timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT)
+    (await _store_call_within_turns(store._fetchall("SELECT 1"))).result()
     assert store._acquire_wait.summary().count == 0
 
-    async with store._timed_acquire():
-        pass
+    async def worker_borrow() -> None:
+        async with store._timed_acquire():
+            pass
+
+    (await _store_call_within_turns(worker_borrow())).result()
     assert store._acquire_wait.summary().count == 1  # the worker path IS still recorded
 
 
