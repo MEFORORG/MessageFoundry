@@ -1247,6 +1247,42 @@ async def test_hold_f2_a_build_its_caller_abandons_is_closed(
     await asyncio.wait_for(closed.wait(), timeout=5)
 
 
+def test_hold_5_a_build_the_loop_shutdown_cancels_is_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The loop's shutdown cancel reaches every task: the caller awaiting a build and, before this
+    fix, the task that held the build itself. What the thread then builds is closed once it
+    finishes. Red (engine PR 2815, Lander hold 6698688363 item 5): the build's own task read as
+    cancelled, so the close returned early and the connector was never closed."""
+    from messagefoundry.pipeline import wiring_runner
+
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+    watch = _LoopWatch(monkeypatch, seconds=0.3)
+    closed: list[object] = []
+
+    async def close(self: object) -> None:
+        closed.append(self)
+
+    monkeypatch.setattr(database.DatabaseDestination, "aclose", close)
+    callers: list[asyncio.Task[Any]] = []
+
+    async def main() -> None:
+        callers.append(
+            asyncio.create_task(
+                wiring_runner._build_off_loop(None, lambda: _db_connector("outbound", folder))
+            )
+        )
+        # Return while the thread is still building, so asyncio.run's shutdown cancels the tasks
+        # and then waits for the default executor's threads.
+        while not watch.threads:
+            await asyncio.sleep(0.01)
+
+    asyncio.run(main())
+    assert callers[0].cancelled()
+    assert len(closed) == 1 and isinstance(closed[0], database.DatabaseDestination)
+
+
 @pytest.mark.parametrize("worker_alive", [True, False], ids=["in-place", "worker-dead"])
 async def test_hold_f2_a_replaced_connector_whose_close_raises_leaves_the_reload_consistent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore, worker_alive: bool
