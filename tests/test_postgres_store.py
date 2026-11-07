@@ -1140,6 +1140,14 @@ async def test_roles_permissions_contract(store) -> None:
     await _assert_roles_contract(store)
 
 
+async def test_enrolment_code_store_contract(store) -> None:
+    """ADR 0207 on the real Postgres backend: the enrolment code's conditional issue, revoke,
+    spend and TOTP fold, the disable's clear, and AC-10's race of two spends on one code."""
+    from tests._enrolment_code_store_contract import assert_enrolment_code_store_contract
+
+    await assert_enrolment_code_store_contract(store)
+
+
 async def test_webauthn_store_contract(store) -> None:
     """ADR 0068 §4 webauthn_credentials contract on the real Postgres backend: multi-row CRUD,
     the 1023-byte credential-id round-trip, duplicate-label integrity violation, and the strict
@@ -1383,6 +1391,14 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
         _assert_bind_and_user_delete_take_one_lock_order,
     )
 
+    await _assert_bind_and_user_delete_take_one_lock_order(store, **_lock_wait_probes(store))
+
+
+def _lock_wait_probes(store: Any) -> dict[str, Any]:
+    """The lock-order tests' probes on this backend: ``holder_of`` names a connection's backend
+    pid, and ``is_blocking`` reads ``pg_locks`` for a request not yet granted whose blocker, per
+    ``pg_blocking_pids``, is that backend."""
+
     async def _backend_pid(conn: Any) -> object:
         return conn.get_server_pid()
 
@@ -1395,9 +1411,21 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
             )
         )
 
-    await _assert_bind_and_user_delete_take_one_lock_order(
-        store, holder_of=_backend_pid, is_blocking=_is_blocking
-    )
+    return {"holder_of": _backend_pid, "is_blocking": _is_blocking}
+
+
+async def test_rotation_racing_a_sweep_is_swept(store) -> None:
+    """BACKLOG #4974 on the real Postgres backend: a session rotated while a bind, an unbind, a
+    revoke of the user's sessions or the every-account revoke runs is swept under its new hash.
+
+    This store's rotation takes no account row. Its sweep waits on the rotated session's row and,
+    under READ COMMITTED, then re-checks the row's newest version, which the re-key left in place
+    under its new hash. docs/SECURITY.md stated that from the code; this runs it. The shared body
+    is the one the SQL Server suite runs, without the second order, which only that store's
+    rotation has. Probes as the lock-order test above."""
+    from tests._federated_unbind_store_contract import _assert_rotation_racing_a_sweep_is_swept
+
+    await _assert_rotation_racing_a_sweep_is_swept(store, **_lock_wait_probes(store))
 
 
 async def test_directory_id_comparison_is_byte_exact_on_postgres(store) -> None:

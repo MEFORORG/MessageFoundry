@@ -828,6 +828,19 @@ SITES: dict[str, Site] = {
     "messagefoundry/store/store.py::_write_closed_store": Site(
         1, OPERATOR, "A fixed SQLite sidecar suffix on the operator's store path."
     ),
+    "messagefoundry/transports/database.py::_libpq_home": Site(
+        2,
+        INTERNAL,
+        "The fixed names `postgresql` and `.postgresql` under the engine process's own home: the "
+        "roaming application-data folder the Windows shell names, else $HOME, else the effective "
+        "user's password-file home, with `os.sep` for an empty one. No message or peer input.",
+    ),
+    "messagefoundry/transports/database.py::_libpq_root_cert": Site(
+        1,
+        INTERNAL,
+        "The fixed name `root.crt` under the libpq default home `_libpq_home` names. A set "
+        "$PGSSLROOTCERT is returned unjoined. No message or peer input.",
+    ),
     "messagefoundry/transports/file.py::FileDestination._write": Site(
         1, GUARDED, _DEST_NAME, "messagefoundry/transports/file.py::render_filename", called=True
     ),

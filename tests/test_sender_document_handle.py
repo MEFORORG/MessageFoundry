@@ -54,6 +54,7 @@ from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.pipeline.ingress_guards import DOC_REF_MARKER_REFUSED_REASON
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
+from tests._log_absence import assert_capture_sees
 
 DEST = "OB_PARTNER"
 
@@ -1822,6 +1823,7 @@ def test_the_retention_strip_reports_an_unreadable_skip_to_its_caller(
         batch = "FHS|MSH|A\r" + body[body.index("OBX|") :]
         assert strip_documents(batch, pruned_at=0.0, on_unreadable=report) == (batch, 0, 0)
         assert calls == ["unreadable", "unreadable"]
+    assert_capture_sees(caplog, "messagefoundry.parsing.binary")
     assert [r for r in caplog.records if r.name.startswith("messagefoundry.parsing")] == []
 
 

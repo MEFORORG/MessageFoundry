@@ -32,7 +32,7 @@ from messagefoundry.auth import totp
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
 from messagefoundry.auth.passwords import hash_password
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, EnrolmentCodeIssueRefused
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry_webconsole._security import UiFetchMetadataMiddleware
@@ -283,3 +283,16 @@ def hold_auth_wall_clock(monkeypatch: pytest.MonkeyPatch, now: list[float]) -> N
     held = SimpleNamespace(time=lambda: now[0], monotonic=time.monotonic)
     monkeypatch.setattr("messagefoundry.auth.service.time", held)
     monkeypatch.setattr("messagefoundry.store.store.time", held)
+
+
+async def enrolment_code_for(service: AuthService, user_id: str) -> str | None:
+    """ADR 0207: a fresh enrolment code for a directory account's first factor, issued as the host
+    command issues one, or ``None`` where none is issued (a local account, a disabled one, or one
+    that already holds a factor). The engine mints it; nothing here is a real credential."""
+    try:
+        issued = await service.issue_enrolment_code(
+            user_id, actor="test-host", issuer_id=None, via="host"
+        )
+    except EnrolmentCodeIssueRefused:
+        return None
+    return issued.code

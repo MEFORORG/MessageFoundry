@@ -206,6 +206,8 @@ operator's `provision-admin` failed with `unable to open database file`. So the 
 does resolve for `icacls`; the lockout is the design working as written, not a failed call.
 
 **Decision: in a hardened data directory the trio gets the directory's principals, explicitly.**
+**AMENDED 2026-11-05:** the one run-as principal may now also be one resolved user account, which may
+not own the directory; see the *Note (2026-11-05)* below.
 `_secure_store_file` (`messagefoundry/store/store.py`), called from the open path and from restore,
 reads the directory's owner and DACL as SDDL. The directory counts as HARDENED when all of these hold:
 inheritance is removed; every entry is an ALLOW with exactly the shape `install-service.ps1` writes --
@@ -237,6 +239,8 @@ still marked inherited (measured). The explicit, protected DACL closes both.
 Now, in a hardened directory, it grants SYSTEM, the one service account, and `BUILTIN\Administrators`,
 each with exactly the right the installer grants on the directory; a directory granting any other
 right or inheritance shape is not hardened (the parser pins `OICI` with `FA` and `0x1301bf`).
+**AMENDED 2026-11-06:** the 2026-11-05 note widens this further, to one resolved user account;
+see its *What it widens* and *Left open*.
 
 - **Narrowing, the strongest fact.** A UAC-filtered session carries Administrators as a DENY-ONLY
   group, so the Administrators entry grants it nothing. The old rewrite granted the opener's own user
@@ -277,13 +281,16 @@ Because the trio's DACL is protected, a later edit to the directory does not rea
 Wave 0 lockout returns for it:
 
 - a run-as account other than a per-service virtual account or LocalSystem: a gMSA, a dedicated user,
-  LocalService or NetworkService;
+  LocalService or NetworkService. **AMENDED 2026-11-05:** a gMSA and a dedicated user are now admitted
+  when they resolve to a user account, per the *Note (2026-11-05)* below; LocalService and
+  NetworkService are still refused;
 - a data directory owned by anyone else. `install-service.ps1` now sets it to Administrators
   (`Set-DataDirOwner`), because the default-owner policy can leave the creating user as owner: under
   "Object creator", and for the hosted runners' built-in Administrator (RID 500), measured owning the
   objects it creates (CI run 36039014999). A directory made some other way can still be refused, and
   the engine logs a WARNING naming the reason when it refuses a directory whose inheritance is off --
-  including one set up for a gMSA, a dedicated user, LocalService or NetworkService, and one carrying
+  including one set up for LocalService or NetworkService (and, before the 2026-11-05 note, a gMSA
+  or a dedicated user), and one carrying
   leftover entries such as CREATOR OWNER. The one deliberate exception is a directory carrying an
   OWNER RIGHTS entry: CPython 3.13+ `mkdtemp` writes every temp directory PROTECTED with SYSTEM,
   Administrators and OWNER RIGHTS (measured), and warning there fired on every engine start in a temp
@@ -301,6 +308,94 @@ leaves any explicit entry for another principal in place, because `icacls /inher
 replaces only the principals it names (measured while building this); that predates this change.
 POSIX is unchanged (`chmod 0600`). Consequences 3 and 4 are not touched here: the key half was answered
 by BACKLOG #1905.
+
+## Note (2026-11-05): one named run-as user account (BACKLOG #3760, #2234)
+
+**The gap.** The 2026-09-24 rule admitted a per-service virtual account and nothing else, so an
+install with `-ServiceAccount` naming a local user or a gMSA left a data directory the store refused.
+`install-service.ps1` writes the same shape for that account as for the virtual one
+(`Set-SecureDataDirAcl` grants it `(OI)(CI)M`, and `Set-DataDirOwner` makes Administrators the
+owner). The store then fell back to the owner-only rewrite, and the Wave 0 lockout returned: a site
+installing that way would have had the service and the provisioning operator lock each other out on
+first deployment.
+
+**Decision (owner ruling 2026-11-05, in the batch 608 Manager's chat; decision
+d20261105T044505299-d76c1b).** The hardened directory may
+grant at most one principal beyond SYSTEM and Administrators (none for a LocalSystem install, as
+before). It is a per-service virtual account as before, or a SID that `LookupAccountSidW` resolves
+to `SidTypeUser` and whose RID is 1000 or more. It gets the same Modify right (`0x1301bf`) and `OICI`
+inheritance the virtual account gets. Unlike the virtual account it may NOT own the directory: any
+standard user can own a directory she made and grant herself that shape, while the installer makes
+Administrators the owner (best-effort: where it cannot, it warns, and the store refuses the
+directory). In `messagefoundry/store/store.py`,
+`_account_shape_refusal` requires a machine- or domain-relative SID (`S-1-5-21-` plus three
+sub-authorities and the RID) with a RID of 1000 or more, and `_account_type_refusal` requires the
+lookup to answer `SidTypeUser`. A failed lookup and every other type are refused: a group or alias
+with an assigned RID has a user's shape, and admitting one would widen the store to every member.
+A RID under 1000 is refused before any lookup, so the built-in Administrator (500) and Guest (501)
+are refused although they are user accounts. The lookup runs last, after every cheaper refusal, and
+once per check (`_hardening_verdict`).
+
+**What did not change.** The rule is still an allow-list. A deny entry, a wrong right or inheritance,
+a second principal of either kind, an owner outside SYSTEM, Administrators and a virtual run-as,
+inheritance left on, a link in the path,
+and the OWNER RIGHTS temp-directory exemption all stand exactly as the 2026-09-24 note states them.
+The trio still names only principals the directory allows.
+
+**What it widens.** One principal kind: a resolved user account that the directory already grants
+Modify in the installer's shape, so the trio grants it no right the directory did not. **The code
+does not check that this account is the one the service runs as.** It admits whichever resolved user
+the directory grants. On a `-ServiceAccount` install that is the account the installer granted. On
+any other directory it is whichever user someone granted. Making such a grant takes WRITE_DAC on
+the directory and leaving it owned by SYSTEM or Administrators, which at least SYSTEM, an
+Administrator and a holder of `SeRestorePrivilege` can do: that privilege writes any DACL and sets
+any owner, and Windows' default policies grant it beyond Administrators, at least to Backup
+Operators, and to Server Operators on a domain controller. `SeTakeOwnershipPrivilege` alone is not
+enough to admit a user for a holder outside SYSTEM and Administrators: taking ownership makes the
+holder's own account the owner, a directory that admits a user must be owned by SYSTEM or
+Administrators, and setting another owner takes `SeRestorePrivilege`. The widening is at least
+this, where "a user" is any account that resolves to `SidTypeUser` with a RID of 1000 or more, a
+computer account included if it resolves that way (*Left open*, below):
+
+- On a directory that names no run-as, as a `-AllowLocalSystem` install leaves it, a grant of
+  Modify in the installer's shape to one user now shares the store with that user. Before this
+  note that directory was refused, and the store fell back to the owner-only rewrite.
+- On a directory that already names a run-as, a virtual account or a user, a grant to one more user
+  is refused as a second principal, and the store falls back to the owner-only rewrite, as it did
+  before this note for a virtual run-as. That rewrite keeps the explicit entries of a store file
+  that already exists, at least the main database file (*Left open*, below), so it does not by
+  itself remove a run-as the trio already named there. A user is admitted there only when its
+  grant REPLACES the existing run-as grant and SYSTEM or Administrators owns the directory.
+
+Tying the admitted SID to the service's configured account was not chosen.
+
+**Left open, at least.** What a gMSA resolves to is unmeasured: no hosted runner has a domain. A
+gMSA is a computer-class object in Active Directory, so it is expected to resolve as `SidTypeUser`;
+if it resolves as anything else, it is refused and the WARNING names the type. A domain account
+resolves through a domain controller or the LSA lookup cache, with no timeout of its own, so a slow
+controller delays the open. A slow controller can also fail it: Windows documents that
+`ERROR_NONE_MAPPED` (1332) can follow a network time-out, so a controller that did not answer in
+time can read as an account that does not exist. On any lookup failure, 1332 or another status, the
+directory is refused as not hardened, so no trio DACL is written, and each store file takes the
+existing owner-only fallback, `_secure_file` (decision d20261106T140017335-d24848). That start still
+opens the store, but the fallback can bring back the Wave 0 lockout between the service and the
+provisioning operator. The fallback grants full control to the account `_current_user` names, read
+from the environment, and keeps a file's explicit entries, because it replaces only the principal
+it names (measured, above). A file that already exists keeps any trio entries it carries: the main
+database file, and a `-wal` or `-shm` still on disk because another process has the store open or a
+crash left them. A file that start creates, a `-wal`, a `-shm` or a new store, carries no explicit
+entries, so where `icacls` succeeds it is left to that account alone. A later start that resolves
+the account rewrites the trio only after it has opened the store, so an opener the fallback shut
+out cannot heal it that way. That rewrite also needs WRITE_DAC on each file, which the service,
+holding Modify, lacks on a file it does not own. So where an elevated operator's open took the
+fallback on a main database file the service does not own, the full-control entry it gave the
+operator's own user stays: each service start fails to remove it and logs a WARNING, until an
+elevated open with the lookup working rewrites the trio. Until then a UAC-filtered session of that
+user can open that file, which the 2026-09-24 note's narrowing no longer covers there. A row on the fallback's behaviour is to be
+filed separately. A computer account (`DOMAIN\HOST$`) is expected to resolve the same way, and
+would then be admitted if a directory granted it Modify in the installer's shape; unmeasured too.
+No run has started the service as a named account. The local-user smoke leg is still not in the
+`windows-service-smoke` matrix (BACKLOG #3760 closing step 2, which waits on #3938).
 
 ## How this was reached
 

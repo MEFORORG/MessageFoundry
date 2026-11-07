@@ -1241,7 +1241,7 @@ async def test_a_refused_totp_as_the_only_factor_is_no_way_out_but_the_admin_res
             await service.change_password(identity, _NEW_PASSWORD)
         with pytest.raises(ValueError, match="last second factor"):
             await service.disable_mfa(identity)
-        issued = await service.admin_reset_mfa(identity.user_id, actor="another-admin")
+        issued = (await service.admin_reset_mfa(identity.user_id, actor="another-admin")).credential
         assert issued is not None
         row = await store.get_user(identity.user_id)
         assert row is not None and not row.totp_enabled and row.password_generated

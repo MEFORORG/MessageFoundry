@@ -255,6 +255,7 @@ from messagefoundry.store.store import (
     DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
+    EnrolmentCodeOutcome,
     EpochBump,
     EpochRaise,
     FailOutcome,
@@ -322,6 +323,9 @@ from messagefoundry.store.store import (
     check_password_generated,
     conditional_way_past,
     delivery_key,
+    enrolment_code_issue,
+    enrolment_code_revoke,
+    enrolment_code_spend,
     escalation_passkeys,
     escalation_verdict,
     existing_roles_only,
@@ -384,12 +388,14 @@ from messagefoundry.store.store import (
     should_record_event,
     tee_audits,
     totp_enable,
+    totp_enable_spending_code,
     totp_removal,
     totp_replace,
     totp_stage,
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
+    user_disabled_change,
     user_insert_params,
     user_reseal_params,
     user_seal_ok,
@@ -436,8 +442,8 @@ _RESET_LANE_CHUNK = 500
 # for its off-loop close before giving up and leaving it to finish detached. A BOUND, not a deadline:
 # the connection is already out of the pool before this wait starts, so expiring it costs nothing but
 # a slower reclaim. Since BACKLOG #2049 a close whose connection still runs the abandoned statement is
-# handed to that statement's own call and not waited for at all. In a narrow race (a call dispatched
-# but not yet inside the gate) the close can still queue behind a call, and this bound caps that wait.
+# handed to that statement's own call and not waited for at all. A close can still queue behind a
+# call the cancellation did not cancel, such as a shielded one, and this bound caps that wait.
 _DIRTY_CLOSE_TIMEOUT = 5.0
 
 # BACKLOG #3023: how many `[store].acquire_timeout`s a session write that follows a committed auth
@@ -769,8 +775,9 @@ _MSSQL_USER_INSERT: Final = (
     " totp_enabled, totp_enrolled_at, totp_recovery_codes, last_totp_step, oidc_issuer,"
     " oidc_subject, directory_object_id, password_claimed_at, channel_scope_source, lock_cycles,"
     " second_step_failed_attempts, second_step_locked_until, second_step_lock_cycles,"
-    " password_generated, session_epoch, cred_digest, authz_seal)"
-    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    " password_generated, session_epoch, cred_digest, enrolment_code_digest,"
+    " enrolment_code_expires_at, enrolment_code_issuer, authz_seal)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 #: store.py's ``_USER_RESEAL`` reporting through ``OUTPUT`` (BACKLOG #2592), which a session-wide
 #: ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283). Used only by ``_write_user``.
@@ -782,7 +789,8 @@ _MSSQL_USER_RESEAL: Final = (
     " last_totp_step=?, oidc_issuer=?, oidc_subject=?, directory_object_id=?,"
     " password_claimed_at=?, channel_scope_source=?, lock_cycles=?,"
     " second_step_failed_attempts=?, second_step_locked_until=?, second_step_lock_cycles=?,"
-    " password_generated=?, session_epoch=?, cred_digest=?, authz_seal=?"
+    " password_generated=?, session_epoch=?, cred_digest=?, enrolment_code_digest=?,"
+    " enrolment_code_expires_at=?, enrolment_code_issuer=?, authz_seal=?"
     " OUTPUT inserted.id WHERE id=? AND authz_seal=?"
 )
 # The approval statements (BACKLOG #2592); store.py's twins state the contract. The writes are used
@@ -2407,6 +2415,10 @@ _SCHEMA: list[str] = [
         -- BACKLOG #2592: the digest of the account's passkeys, and the integrity seal over the
         -- account's row and role rows. Both written only by the store's user write helper.
         cred_digest NVARCHAR(64) NOT NULL DEFAULT '',
+        -- ADR 0207: the outstanding enrolment code's hash_token digest (64 hex characters), its
+        -- expiry, and the issuing Administrator's account id (NULL for a host-issued code).
+        enrolment_code_digest NVARCHAR(64) NULL, enrolment_code_expires_at FLOAT NULL,
+        enrolment_code_issuer NVARCHAR(256) NULL,
         authz_seal NVARCHAR(256) NOT NULL DEFAULT '')""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
@@ -2464,6 +2476,15 @@ _SCHEMA: list[str] = [
         ALTER TABLE users ADD cred_digest NVARCHAR(64) NOT NULL DEFAULT ''""",
     """IF COL_LENGTH('users','authz_seal') IS NULL
         ALTER TABLE users ADD authz_seal NVARCHAR(256) NOT NULL DEFAULT ''""",
+    # ADR 0207: the enrolment code's digest, expiry and issuer, for a users table created before
+    # them. NULL on an existing row is "no code outstanding", and a NULL column stays out of the user
+    # seal (store.py's USER_SEAL_WHEN_SET), so the add re-seals nobody.
+    """IF COL_LENGTH('users','enrolment_code_digest') IS NULL
+        ALTER TABLE users ADD enrolment_code_digest NVARCHAR(64) NULL""",
+    """IF COL_LENGTH('users','enrolment_code_expires_at') IS NULL
+        ALTER TABLE users ADD enrolment_code_expires_at FLOAT NULL""",
+    """IF COL_LENGTH('users','enrolment_code_issuer') IS NULL
+        ALTER TABLE users ADD enrolment_code_issuer NVARCHAR(256) NULL""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -3666,8 +3687,16 @@ class SqlServerStore:
         hung statement hold row X-locks forever. The holder count is bounded by construction:
         only the pooled claimer tasks call the flagged claim, so the per-stage set grows to at
         most the concurrent flagged-claim count = ``pooled_claimers_per_stage`` (the §5 sizing
-        function) and never beyond."""
+        function) and never beyond.
+
+        **A failed or cancelled open exits as the open-time probes do (BACKLOG #2394).** A
+        cancellation hands the connection, and the cursor if it has one, to the call gate and
+        propagates at once, so it never waits on a ``cursor()`` call still running on its executor
+        thread, and nothing frees a handle under that call: the gate closes the cursor that call
+        makes, then the connection, as it returns. An ordinary failure closes both through the
+        gate, cursor first, and a second cancellation cannot cut that close short."""
         conn = await self._connect_claim_conn()
+        cur: Any = None
         try:
             # BACKLOG #2049: a discard after a cancelled claim closes this cursor and connection;
             # the gate makes both wait for a claim statement still running on an executor thread.
@@ -3686,13 +3715,11 @@ class SqlServerStore:
                     stage,
                 )
             cur = await conn.cursor()
-        except BaseException:
+        except BaseException as exc:
             # Never leak the freshly-opened connection when the post-connect steps fail or are
             # cancelled — repeated transient failures must not accumulate dedicated connections.
-            try:
-                await conn.close()
-            except Exception:  # noqa: BLE001 - best-effort; the real failure is propagating
-                log.debug("claim holder connection close after failed open failed", exc_info=True)
+            if isinstance(exc, Exception) or not _abandon_one_shot(conn, cur):
+                await _close_one_shot(conn, cur)  # logs a close failure itself
             raise
         self._claim_holders_open += 1
         self._claim_holders_opened_total += 1
@@ -3741,8 +3768,10 @@ class SqlServerStore:
         holder = free.pop() if free else await self._open_claim_holder(stage)
         try:
             yield holder
-        except BaseException:
-            await self._discard_claim_holder(stage, holder)
+        except BaseException as exc:
+            await self._discard_claim_holder(
+                stage, holder, cancelled=not isinstance(exc, Exception)
+            )
             raise
         else:
             if self._claim_holders_closed:
@@ -3752,12 +3781,23 @@ class SqlServerStore:
             else:
                 self._claim_holders.setdefault(stage, []).append(holder)
 
-    async def _discard_claim_holder(self, stage: str, holder: _ClaimHolder) -> None:
-        """Close a poisoned (or teardown-orphaned) holder. Shielded like the finally-guard: a
-        cancellation delivered at these awaits must not skip ``conn.close()`` (a leaked dedicated
-        connection with consistent-looking counters); best-effort — the real outcome is already
-        propagating. The next flagged claim opens a fresh holder (re-applying the STORE-3
-        timeout)."""
+    async def _discard_claim_holder(
+        self, stage: str, holder: _ClaimHolder, *, cancelled: bool = False
+    ) -> None:
+        """Close a poisoned (or teardown-orphaned) holder; best-effort — the real outcome is
+        already propagating. The next flagged claim opens a fresh holder (re-applying the STORE-3
+        timeout).
+
+        **It exits as the open-time probes do (BACKLOG #2394, #2395).** ``cancelled`` says the
+        claim is unwinding a cancellation, so its statement may still be running on an executor
+        thread. The cursor and the connection then go to the call gate with no await, and close,
+        cursor first, once no pyodbc call is running on them. Otherwise both close through the
+        gate in one job, waited on through :func:`asyncio.wait`, which never cancels it: a second
+        cancellation propagates at once, and the close still runs, so no dedicated connection
+        leaks with consistent-looking counters. **What it does not change:** a claim reaches here
+        only after :meth:`claim_fifo_heads`' shielded LOCK_TIMEOUT reset, which the gate holds
+        behind a running claim statement, so a cancelled claim still waits for that statement
+        there."""
         self._claim_holders_open -= 1
         self._claim_holders_discarded_total += 1
         log.warning(
@@ -3766,43 +3806,24 @@ class SqlServerStore:
             stage,
             self._claim_holders_discarded_total,
         )
-
-        async def _close_holder() -> None:
-            try:
-                await holder.cur.close()
-            except Exception:  # noqa: BLE001 - best-effort teardown must not mask the outcome
-                log.debug("claim holder cursor close failed", exc_info=True)
-            try:
-                await holder.conn.close()
-            except Exception:  # noqa: BLE001 - best-effort teardown must not mask the outcome
-                log.debug("claim holder connection close failed", exc_info=True)
-
-        closer = asyncio.ensure_future(_close_holder())
-        try:
-            await asyncio.shield(closer)
-        except asyncio.CancelledError:
-            # The discard itself was cancelled (e.g. a second cancellation during shutdown):
-            # let the shielded close finish so the connection never leaks, THEN re-raise.
-            await closer
-            raise
+        if cancelled and _abandon_one_shot(holder.conn, holder.cur):
+            return
+        await _close_one_shot(holder.conn, holder.cur)
 
     async def _close_claim_holders(self) -> None:
         """Teardown: close every retained claim holder and mark the holder set CLOSED (idempotent;
         store close). A holder borrowed by an in-flight claim is not in the free lists — the
-        closed flag makes its return path discard (close) it instead of re-retaining it."""
+        closed flag makes its return path discard (close) it instead of re-retaining it. Each holder
+        leaves through the one-shot exit :meth:`_discard_claim_holder` uses (BACKLOG #2394). Every
+        close is started before any is waited on, and the wait never cancels them, so a
+        cancellation during teardown leaves no holder unclosed behind the one it interrupted."""
         self._claim_holders_closed = True
         holders = [h for lst in self._claim_holders.values() for h in lst]
         self._claim_holders.clear()
-        for holder in holders:
-            self._claim_holders_open -= 1
-            try:
-                await holder.cur.close()
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                log.debug("claim holder cursor close failed at teardown", exc_info=True)
-            try:
-                await holder.conn.close()
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                log.debug("claim holder connection close failed at teardown", exc_info=True)
+        self._claim_holders_open -= len(holders)
+        closes = [asyncio.ensure_future(_close_one_shot(h.conn, h.cur)) for h in holders]
+        if closes:
+            await asyncio.wait(closes)  # each close logs its own failure
 
     # --- PHI-at-rest cipher seam for nullable text columns (mirrors MessageStore._enc/_dec) -----
     # Used for summary/metadata (EF-3) and error/last_error/event.detail (H4). null/empty-safe: a NULL
@@ -5538,10 +5559,10 @@ class SqlServerStore:
         :meth:`_fetch_rows` on a clamped read passes, leaves it unbounded and enters no timeout at
         all. A rollback that runs past the bound is treated as one that failed: the connection is
         discarded. Where the call gate already marks the rollback as running, the close is handed
-        to it and lands as it returns (BACKLOG #2049). In the short window before the gate marks
-        it, a separate close can take the gate's lock first; the rollback then runs on a closed
-        handle and fails, with nothing awaiting its error, and the close has already ended the
-        transaction. :meth:`_fetch_rows` passes the lease claim's clamp, so a stalled rollback
+        to it and lands as it returns (BACKLOG #2049). A rollback the bound cancelled before it
+        entered the gate never runs (BACKLOG #2394), so the separate close that follows takes the
+        gate's lock with no rollback left to race it, and the close ends the transaction.
+        :meth:`_fetch_rows` passes the lease claim's clamp, so a stalled rollback
         after a failed claim cannot hold ``_leadership_lock`` past it (BACKLOG #5066).
 
         The discard is :func:`_detach_connection`, the same detach :meth:`_release_dirty` uses, and
@@ -14453,6 +14474,54 @@ class SqlServerStore:
         change = totp_enable(recovery_code_hashes, now, expected_secret_cell=expected_secret_cell)
         return await self._write_user_txn(user_id, change) is not None
 
+    # --- ADR 0207: the directory account's enrolment code (Store protocol states the contract) ---
+    # One conditional sealed write each, through ``_write_user`` in a transaction of its own, with
+    # the account row locked; store.py's change builders hold every condition.
+
+    async def issue_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        code_digest: str,
+        expires_at: float,
+        issuer_id: str | None,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = enrolment_code_issue(
+            code_digest=code_digest, expires_at=expires_at, issuer_id=issuer_id, now=now
+        )
+        return change.outcome(await self._write_user_txn(user_id, change))
+
+    async def revoke_enrolment_code(self, user_id: str, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        return await self._write_user_txn(user_id, enrolment_code_revoke(now)) is not None
+
+    async def spend_enrolment_code(
+        self, user_id: str, *, code_digest: str, now: float | None = None
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = enrolment_code_spend(code_digest=code_digest, now=now)
+        return change.outcome(await self._write_user_txn(user_id, change))
+
+    async def enable_totp_spending_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        code_digest: str,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = totp_enable_spending_code(
+            recovery_code_hashes,
+            now,
+            expected_secret_cell=expected_secret_cell,
+            code_digest=code_digest,
+        )
+        return change.outcome(await self._write_user_txn(user_id, change))
+
     async def replace_totp_enrolment(
         self,
         user_id: str,
@@ -14745,7 +14814,7 @@ class SqlServerStore:
     ) -> None:
         now = time.time() if now is None else now
         await self._write_user_txn(
-            user_id, lambda r: r.changed(disabled=bool(disabled), updated_at=float(now))
+            user_id, lambda r: user_disabled_change(r, disabled=disabled, now=now)
         )
 
     async def update_user_profile(
@@ -14890,7 +14959,7 @@ class SqlServerStore:
                             return False
                     if change is AdminRemoval.DISABLE:
                         await self._write_user(
-                            cur, user_id, lambda r: r.changed(disabled=True, updated_at=float(now))
+                            cur, user_id, lambda r: user_disabled_change(r, disabled=True, now=now)
                         )
                     elif change is AdminRemoval.DELETE:
                         await self._delete_user_rows(cur, user_id)
@@ -15646,16 +15715,20 @@ class SqlServerStore:
         token_hash: str,
         change: Callable[[SessionRecord], SessionRecord],
         *,
+        first: Callable[[Any], Awaitable[None]] | None = None,
         landed: Callable[[Any], Awaitable[None]] | None = None,
         after_commit: bool = False,
     ) -> SessionRecord | None:
         """:meth:`_write_session` in a transaction of its own, committed before it returns.
+        ``first`` runs on the same cursor, in the same transaction, before the write.
         ``landed`` runs on the same cursor, in the same transaction, only when the write landed.
         ``after_commit`` borrows through :meth:`_acquire_after_commit`; only ``rotate_session``
         passes it."""
         borrow = self._acquire_after_commit() if after_commit else self._acquire()
         async with borrow as conn, self._cursor(conn) as cur:
             try:
+                if first is not None:
+                    await first(cur)
                 updated = await self._write_session(cur, token_hash, change)
                 if updated is not None and landed is not None:
                     await landed(cur)
@@ -15725,7 +15798,37 @@ class SqlServerStore:
         clustered-PK row move is width-safe. The lineage link goes in the same transaction, only
         when the re-key landed (vault BACKLOG #3028), its time read then, after any wait for the
         borrow or the row lock. The borrow is :meth:`_acquire_after_commit`'s, for the reason it
-        gives (BACKLOG #3023)."""
+        gives (BACKLOG #3023).
+
+        LOCK ORDER (BACKLOG #4974). The re-key takes its account's ``users`` row under ``UPDLOCK,
+        ROWLOCK`` before its session row, the order the bind, the unbind, the TOTP re-enrolment and
+        the per-account revoke take them in: each locks the account row first and sweeps after. The
+        unbind takes it through its own prior-pair ``UPDLOCK`` read in
+        :meth:`clear_user_federated_subject`, before its account write, and a rebind's first sweep
+        is that transaction's; the bind's own write and the TOTP re-enrolment take it through the
+        write helper, and the per-account revoke through the epoch raise. ``enforce_session_cap``'s
+        trim takes no account row. ``revoke_all_sessions`` locks only the accounts its list read
+        returns, so a session of any other account is not ordered against a re-key. The re-key
+        moves the row to a new clustered key, and a sweep that met the row locked mid-move could
+        find the old key gone and the new one out of its read, or deadlock with the re-key,
+        depending on the plan. With the account row first, a re-key either commits before a sweep of
+        its account locks that row, and the sweep reads the new key, or waits until the sweep
+        commits and then finds the session ended. The session's account is read unlocked first:
+        ``user_id`` never changes, and a session already gone locks nothing. Each path in this file
+        read for this change that locks both rows takes the account row first, so the re-key
+        closes no cycle with any of them. Read from the code; the race is replayed on the SQL
+        Server leg by ``tests/_federated_unbind_store_contract.py``, against store calls only, and
+        not against the TOTP re-enrolment's. docs/SECURITY.md, *Limits of the session sweep*, says
+        which are raced and which are not."""
+
+        async def _account_first(cur: Any) -> None:
+            await cur.execute("SELECT user_id FROM sessions WHERE token_hash=?", (token_hash,))
+            owners = await cur.fetchall()
+            if owners:
+                await cur.execute(
+                    "SELECT id FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?", (str(owners[0][0]),)
+                )
+                await cur.fetchall()
 
         async def _link(cur: Any) -> None:
             retired_at = time.time() if now is None else now
@@ -15734,6 +15837,7 @@ class SqlServerStore:
         rotated = await self._write_session_txn(
             token_hash,
             lambda s: replace(s, token_hash=new_token_hash),
+            first=_account_first,
             landed=_link,
             after_commit=True,
         )

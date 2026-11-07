@@ -384,6 +384,8 @@ async def _assert_totp_contract(store: Any) -> None:
     assert await store.consume_totp_step("totp-u1", 99) is False  # older step
     assert await store.consume_totp_step("totp-u1", 101) is True
     assert await store.consume_totp_step("missing-user", 1) is False
+    assert await store.consume_totp_step("totp-u1", 101) is False  # the high-water mark held
+    assert await store.consume_totp_step("totp-u1", 102) is True
 
     # Disable clears everything.
     await store.disable_totp("totp-u1", now=8.0)

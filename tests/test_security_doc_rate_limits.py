@@ -724,6 +724,8 @@ def test_the_ninth_sweep_rows_rest_on_code_that_still_says_so() -> None:
         "POST /users/{user_id}/reset-mfa",
         "PUT /users/{user_id}/federated-identity",
         "DELETE /users/{user_id}/federated-identity",
+        "POST /users/{user_id}/enrolment-code",
+        "DELETE /users/{user_id}/enrolment-code",
         "PUT /ad-group-map",
         "PUT /ad-group-scope-map",
         "PUT /roles/custom/{role_id}",
@@ -1589,7 +1591,8 @@ _UNLOGGED_PHRASES = ("no warning line", "no log line", "not logged")
 
 
 def _retry_after_values(tree: ast.AST) -> list[str]:
-    """Each ``Retry-After`` an ``HTTPException`` under ``tree`` sends, as it is written.
+    """Each ``Retry-After`` an ``HTTPException`` under ``tree`` sends, as it is written. The engine's
+    pacing refusals raise its subclass ``_GateRefusal`` (BACKLOG #1197), so those count too.
 
     A string literal reads as its value (``"10"`` gives ``10``). Anything else reads as its source
     text, so a computed wait is compared as an expression and never mistaken for a literal.
@@ -1598,7 +1601,7 @@ def _retry_after_values(tree: ast.AST) -> list[str]:
         value.value
         if isinstance(value, ast.Constant) and isinstance(value.value, str)
         else ast.unparse(value)
-        for call in call_sites(tree, "HTTPException")
+        for call in [*call_sites(tree, "HTTPException"), *call_sites(tree, "_GateRefusal")]
         for kw in call.keywords
         if kw.arg == "headers" and isinstance(kw.value, ast.Dict)
         for key, value in zip(kw.value.keys, kw.value.values, strict=True)

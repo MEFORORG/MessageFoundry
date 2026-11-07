@@ -52,6 +52,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore, WebAuthnCredential
 from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin
+from tests._enrolment_code import enrolment_code_for
 
 
 class _FakeNotifier:
@@ -368,12 +369,15 @@ async def test_a_directory_account_enrolls_and_satisfies_an_engine_factor(
         assert out.ok and out.token is not None and out.identity is not None
         assert await service.mfa_satisfied(out.token) is False
 
-        # The ceremony accepts the directory account -- the half that makes the mint above safe.
+        # The ceremony accepts the directory account -- the half that makes the mint above safe --
+        # and, since ADR 0207, binds its first factor only with an Administrator's enrolment code.
         t0 = 1_700_000_000.0
         pin_totp_clock(monkeypatch, t0)
+        code = await enrolment_code_for(service, out.identity.user_id)
+        assert code is not None
         enroll = await service.begin_mfa_enrollment(out.identity)
         confirmed = await service.confirm_mfa_enrollment(
-            out.identity, totp.totp(enroll.secret, now=t0), token=out.token
+            out.identity, totp.totp(enroll.secret, now=t0), token=out.token, enrolment_code=code
         )
         assert confirmed.recovery_codes  # minted for a directory account like any other
         # Confirming ROTATES the session (ASVS 7.2.4, BACKLOG #1146), so the satisfied state is read
@@ -3205,7 +3209,7 @@ async def test_admin_reset_mfa_issues_a_credential_before_it_clears_any_factor(
         monkeypatch.setattr(store, "set_password", spy_set_password)
         monkeypatch.setattr(store, "disable_totp", spy_disable)
         monkeypatch.setattr(store, "delete_all_webauthn_credentials", spy_delete)
-        issued = await service.admin_reset_mfa(identity.user_id, actor="another-admin")
+        issued = (await service.admin_reset_mfa(identity.user_id, actor="another-admin")).credential
         assert issued is not None and len(issued.password) >= 32
         assert order[0] == "set_password", order
         assert order.index("set_password") < order.index("disable_totp")
@@ -3432,7 +3436,7 @@ async def test_a_rotation_landing_between_the_resets_writes_cannot_leave_a_chose
             await real_disable(user_id, **k)
 
         monkeypatch.setattr(store, "disable_totp", rotation_lands_first)
-        issued = await service.admin_reset_mfa(identity.user_id, actor="another-admin")
+        issued = (await service.admin_reset_mfa(identity.user_id, actor="another-admin")).credential
         assert issued is not None
         row = await store.get_user(identity.user_id)
         assert row is not None and row.password_generated and not row.totp_enabled

@@ -85,6 +85,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DbStatus,
     DeadLetterPurge,
+    EnrolmentCodeOutcome,
     FailOutcome,
     FederatedUnbind,
     LatencyHistogram,
@@ -2484,6 +2485,51 @@ class AuthStore(Protocol):
         expected_secret_cell: str | None,
         now: float | None = None,
     ) -> bool: ...
+
+    # --- ADR 0207: a directory account's single-use enrolment code -------------------------------
+    # Three nullable ``users`` columns hold the code's ``hash_token`` digest, its expiry and the
+    # issuing Administrator's account id; never the code. Every write below is ONE conditional
+    # sealed write through the backend's ``_write_user``, so each condition is judged on the record
+    # the write replaces, and only a write that changed a row counts. ``set_user_disabled`` clears
+    # all three when it disables. The change builders in ``store.store`` hold the conditions.
+    #
+    # Set the digest, expiry and issuer, replacing any outstanding code, only where the account is
+    # an enabled directory account holding no engine factor. Returns what it replaced, or None
+    # when nothing was written; a caller must refuse on None and show no code.
+    async def issue_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        code_digest: str,
+        expires_at: float,
+        issuer_id: str | None,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None: ...
+
+    # Clear an outstanding code, expired or not. Returns whether one was cleared.
+    async def revoke_enrolment_code(self, user_id: str, *, now: float | None = None) -> bool: ...
+
+    # The passkey finish's spend: clear the code only where ``code_digest`` still matches, it has
+    # not expired, and the account is an enabled directory account with TOTP off and no passkey.
+    # Returns the outcome, whose ``issuer_id`` is the cleared code's issuer, or None when nothing
+    # was spent.
+    async def spend_enrolment_code(
+        self, user_id: str, *, code_digest: str, now: float | None = None
+    ) -> EnrolmentCodeOutcome | None: ...
+
+    # ``enable_totp`` with the spend folded into the same write (ADR 0207 Amendment A, A3): TOTP
+    # goes on and the code is cleared only where both conditions hold, so an enable that matches
+    # no row spends nothing. Returns the outcome, or None when nothing was written; a caller treats
+    # None exactly as ``enable_totp`` returning False.
+    async def enable_totp_spending_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        code_digest: str,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None: ...
 
     # ADR 0171 Amendment B (BACKLOG #2226), for `admin-reset-totp`: swaps an ENABLED enrolment's
     # secret, recovery codes and step high-water mark in ONE UPDATE, with TOTP on throughout, so the
