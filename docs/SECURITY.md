@@ -990,6 +990,28 @@ text, so an id that is not lower-case hex is recorded as `malformed` rather than
 write is soft: if the audit log refuses it, the answer still stands and the loss is logged at
 ERROR, so the row is the record of a miss only while the audit log accepts writes.
 
+**A session revoke that follows a committed change is retried, and a miss is audited (vault BACKLOG
+#3023).** At least a password change or reset, an MFA reset, a disable, a role, channel-scope or
+custom-role edit, a directory map save, a directory sign-in's role or scope resync and the
+`provision-admin` repair end the account's sessions after their own change has committed. A
+custom-role delete revokes before it deletes, so a refusal there leaves the role in place and
+writes no such row; the directory reconciler's demotion is not covered yet. A store
+refusal of that revoke, such as a pool shortage at the acquire limit, a statement timeout or a lost
+connection, is run again, up to three attempts. A re-run starts only while less than 15 seconds
+have passed since the first attempt began, give or take its half-second pause, and nothing bounds
+how long one attempt runs. At the default `acquire_timeout` a SQL Server pool wait uses up that
+budget on its own, so it is recorded at once rather than run into the request deadline. A refusal
+that reads as a defect is raised at once, unretried and unrecorded: at least a store whose tables,
+columns or grants are not what the statement needs, and SQLite's `ProgrammingError`. A SQL syntax
+error is not always one: SQLite's, and SQL Server's generic 42000, are run again and recorded like a
+fault, while PostgreSQL's, in SQLSTATE class 42, is raised at once. A revoke the service gives up on is logged at ERROR
+and writes one `auth.sessions_revoke_failed` row naming the account, the change, the attempts and
+the error class. A role edit or map save stops at that account, and its row counts the accounts it
+did not reach as `accounts_not_attempted`; the request still fails, the change stands, and the account's other sessions stay
+live until they lapse. The change's own audit row is not written then, so this row is its record.
+Its write is soft, as above: on a store that refuses it too, the ERROR line is the only trace. A
+cancellation, such as the request deadline, skips both the retry and the row (vault BACKLOG #3802).
+
 **Delegated identity & admin device posture (#193 sibling; ASVS 13.2.1 / 13.3.2 / 8.4.2 — the delegation
 boundary).** Three controls whose enforcement is largely the deploying organization's to provide.
 MessageFoundry states the boundary and adds one opt-in precondition check (#203):

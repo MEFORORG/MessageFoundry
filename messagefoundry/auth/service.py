@@ -158,6 +158,7 @@ from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
 from messagefoundry.store.base import (
     AdminStore,
     audit_write_errors,
+    is_store_shape_error,
     store_call_errors,
     store_open_errors,
 )
@@ -189,6 +190,7 @@ from messagefoundry.store.store import (
     LockoutIncrement,
     PasskeyCounts,
     PasskeyRowMalformed,
+    RevokeResult,
     RoleRow,
     SessionRecord,
     TotpState,
@@ -211,6 +213,7 @@ from messagefoundry.store.store import (
     session_sealed_by_retired_key,
     user_seal_ok,
 )
+from messagefoundry.store.transit_attestation import utf16_units
 from messagefoundry.transports.email import envelope_address_problem
 from messagefoundry.transports.rest import opener_tls_context
 
@@ -275,6 +278,15 @@ def _session_write_errors() -> tuple[type[Exception], ...]:
     row's seal is a local HMAC, so no Transit call can refuse it, and an engine ``RuntimeError``
     other than the acquire timeout still reads as a defect."""
     return store_open_errors()
+
+
+def _is_revoke_defect(exc: BaseException) -> bool:
+    """Whether a refusal :func:`_session_write_errors` catches is a defect rather than a fault, so
+    the post-commit revoke raises it at once (vault BACKLOG #3023): one of
+    :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`, or a store that is not the shape the
+    statement needs (:func:`~messagefoundry.store.base.is_store_shape_error`). Re-running either
+    fails the same way, and recording it as a store refusal would hide a bug as a fault."""
+    return isinstance(exc, AUDIT_WRITE_DEFECTS) or is_store_shape_error(exc)
 
 
 class _RotationStoreError(Exception):
@@ -1798,6 +1810,13 @@ PASSKEY_NOT_DISCOVERABLE = (
     "authenticator app first"
 )
 
+#: The detail ``finish_webauthn_registration`` refuses with when the store refused the passkey on
+#: an integrity rule and a re-read finds neither the credential nor the label held (BACKLOG #2733,
+#: pass F findings 3 and 5). Before, every such refusal read as a label clash.
+_PASSKEY_NOT_STORED = (
+    "this passkey could not be stored; start the enrolment again, or choose another label"
+)
+
 
 class FactorEnrolmentRequired(ValueError):
     """The account ``[security].require_mfa`` covers holds no factor with a way past the sign-in lock,
@@ -2966,6 +2985,26 @@ _REMINDER_MARK_PAGE: Final = 50
 #: session writes when it ends nothing, because the id names no session or another account's.
 #: One action for both, and the same detail, so the row cannot tell the two apart either.
 SESSION_REVOKE_MISSED_ACTION: Final = "auth.session_revoke_missed"
+#: Vault BACKLOG #3023: the row :meth:`AuthService._revoke_after_commit` writes when the store refused
+#: the whole-account revoke that follows a committed change on every attempt. The change stands; the
+#: account's other sessions stay live until they lapse, and this row is what says so. Not the row
+#: above, which records a self-service revoke that named no session.
+SESSIONS_REVOKE_FAILED_ACTION: Final = "auth.sessions_revoke_failed"
+#: How many times that revoke runs at most, the pause before each re-run (times its number), and
+#: the seconds after the first attempt past which none is re-run. The revoke is safe to repeat: it
+#: ends unrevoked rows and raises the account's session epoch, and a repeat does both again. A
+#: statement timeout or a lost connection fails fast and is re-run. The budget is checked when an
+#: attempt fails, before the pause, so a re-run can start up to half a second past it, and nothing
+#: bounds how long an attempt runs. A pool shortage on SQL Server
+#: fails only after waiting up to ``2 x acquire_timeout``, 60 s at the default, which is past the
+#: budget, so at the default it is recorded at once: a second such wait would reach the API's
+#: request deadline, which cancels the request before any row is written (vault BACKLOG #3802
+#: holds the cancellation). The budget gates only whether a re-run starts, so an
+#: ``acquire_timeout`` under 7.5 s is re-run, and one large enough can still meet the deadline in a
+#: single wait. Postgres waits out a shortage instead of raising.
+_POST_COMMIT_REVOKE_ATTEMPTS: Final = 3
+_POST_COMMIT_REVOKE_BACKOFF_SECONDS: Final = 0.25
+_POST_COMMIT_REVOKE_BUDGET_SECONDS: Final = 15.0
 #: What a session id can look like: a token hash, lower-case hex, cut to at most its full length.
 _SESSION_ID_SHAPE: Final = re.compile(r"[0-9a-f]{1,64}")
 
@@ -4377,7 +4416,9 @@ class AuthService:
             # Administrator session.
             await self._store.disable_totp(user_id)
             await self._store.delete_all_webauthn_credentials(user_id)
-            await self._store.revoke_user_sessions(user_id)
+            await self._revoke_after_commit(
+                user_id, change="first_administrator_repair", actor=actor
+            )
         else:
             user_id = uuid4().hex
             try:
@@ -4575,7 +4616,9 @@ class AuthService:
             if repaired:
                 # The repair branch's second revoke, as on success below, and ahead of the read
                 # below so a read that raises cannot skip it. Harmless if no role was written.
-                await self._store.revoke_user_sessions(user_id)
+                await self._revoke_after_commit(
+                    user_id, change="first_administrator_repair", actor=actor
+                )
             # Vault BACKLOG #3849 B2: the address clear runs once the role is written, as on success
             # below, so the row is read again first. Only a read of this very row without the role
             # shows the store wrote none and took nothing over, and leaves the record, as
@@ -4604,7 +4647,9 @@ class AuthService:
             # still worked until ``set_password`` above, so a sign-in in that window minted a session
             # the first revoke never saw, and roles are re-read on every request. Revoking once more
             # here ends it before it can act as an Administrator.
-            await self._store.revoke_user_sessions(user_id)
+            await self._revoke_after_commit(
+                user_id, change="first_administrator_repair", actor=actor
+            )
             # Vault BACKLOG #3849 B2: the addresses the earlier holder signed in from are theirs,
             # not the new Administrator's, so they go too, as after an administrator's reset
             # (#2946). Otherwise a sign-in from one of them would read as known and skip the
@@ -7370,7 +7415,9 @@ class AuthService:
             # Directory-side role change (often a downgrade): revoke the user's other live sessions
             # so stale elevated tokens don't linger until expiry (AUTH-AD-REVOKE). The new session
             # is issued below, after this, so the current login is unaffected.
-            await self._store.revoke_user_sessions(user.id)
+            await self._revoke_after_commit(
+                user.id, change="ad_roles_resynced", actor=user.username, client=client
+            )
             await self._audit(
                 "auth.ad_roles_resynced",
                 actor=user.username,
@@ -7570,7 +7617,9 @@ class AuthService:
             # have written the scope since ``user`` was read.
             if not await self._store.withdraw_ad_channel_scope(user.id, user.channel_scope):
                 return await self._load_user(user.id) or user
-            await self._store.revoke_user_sessions(user.id)
+            await self._revoke_after_commit(
+                user.id, change="ad_scope_resynced", actor=user.username, client=client
+            )
             # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
             await self._audit(
                 "auth.ad_scope_resynced",
@@ -7586,7 +7635,9 @@ class AuthService:
         # moved -- the directory taking over an identical manual scope changes no decision, so
         # there is nothing stale to drop -- but that write is still audited below.
         if decision.changes:
-            await self._store.revoke_user_sessions(user.id)
+            await self._revoke_after_commit(
+                user.id, change="ad_scope_resynced", actor=user.username, client=client
+            )
         await self._audit(
             "auth.ad_scope_resynced",
             actor=user.username,
@@ -10536,6 +10587,94 @@ class AuthService:
         )
         return not refused
 
+    async def _revoke_after_commit(
+        self,
+        user_id: str,
+        *,
+        change: str,
+        actor: str | None = None,
+        client: str | None = None,
+        not_attempted: int = 0,
+    ) -> RevokeResult:
+        """Revoke every session of ``user_id`` after a ``change`` that has already committed, such
+        as a password change, a disable or a role change (vault BACKLOG #3023).
+
+        Nothing undoes the change if this fails, so a store refusal (``_session_write_errors``) is
+        run again while :data:`_POST_COMMIT_REVOKE_ATTEMPTS` and
+        :data:`_POST_COMMIT_REVOKE_BUDGET_SECONDS` both allow. A refusal past either is logged at
+        ERROR, recorded as :data:`SESSIONS_REVOKE_FAILED_ACTION` (the comment there says what the
+        row stands for), and raised, so the caller still fails. Any other exception is raised at
+        once, unretried: it reads as a defect, not a fault, and so does a store refusal
+        :func:`_is_revoke_defect` names. ``not_attempted`` is how many accounts of the same change a
+        batch caller will not reach if this one is given up on; the row records it. A
+        cancellation is not an ``Exception``
+        and skips the retry and the row, as in :meth:`_rotate_session_hash` (vault BACKLOG
+        #3802)."""
+        loop = asyncio.get_running_loop()
+        give_up_at = loop.time() + _POST_COMMIT_REVOKE_BUDGET_SECONDS
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await self._store.revoke_user_sessions(user_id)
+            except _session_write_errors() as exc:
+                if _is_revoke_defect(exc):
+                    raise
+                if attempt < _POST_COMMIT_REVOKE_ATTEMPTS and loop.time() < give_up_at:
+                    await asyncio.sleep(_POST_COMMIT_REVOKE_BACKOFF_SECONDS * attempt)
+                    continue
+                await self._record_revoke_miss(
+                    user_id,
+                    exc,
+                    change=change,
+                    attempts=attempt,
+                    actor=actor,
+                    client=client,
+                    not_attempted=not_attempted,
+                )
+                raise
+
+    async def _record_revoke_miss(
+        self,
+        user_id: str,
+        refused: Exception,
+        *,
+        change: str,
+        attempts: int,
+        actor: str | None,
+        client: str | None,
+        not_attempted: int,
+    ) -> None:
+        """The ERROR line, then the :data:`SESSIONS_REVOKE_FAILED_ACTION` row, for a revoke
+        :meth:`_revoke_after_commit` gave up on. The line comes first, so a refused row still
+        leaves a trace."""
+        _log.error(
+            "auth: the session revoke after a committed %s was refused by the store %d time(s) (%s);"
+            " the account's other sessions stay live until they lapse",
+            change,
+            attempts,
+            type(refused).__name__,
+            exc_info=refused,
+        )
+        detail: dict[str, object] = {
+            "user_id": user_id,
+            "change": change,
+            "attempts": attempts,
+            "error": type(refused).__name__,
+        }
+        if not_attempted:
+            detail["accounts_not_attempted"] = not_attempted
+        await write_audit_soft(
+            lambda: self._audit(
+                SESSIONS_REVOKE_FAILED_ACTION, actor=actor, detail=_json(detail), client=client
+            ),
+            log=_log,
+            message="the %s row for that refused revoke could not be written",
+            args=(SESSIONS_REVOKE_FAILED_ACTION,),
+            errors=audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
+
     async def _elevated(
         self,
         token: str,
@@ -13339,7 +13478,9 @@ class AuthService:
         )
         if not written and covered:
             raise FactorEnrolmentRequired()
-        await self._store.revoke_user_sessions(identity.user_id)
+        await self._revoke_after_commit(
+            identity.user_id, change="password_changed", actor=identity.username, client=client
+        )
         await self._audit("auth.password_changed", actor=identity.username, client=client)
         user = await self._load_user(identity.user_id)
         await self._notify_security(
@@ -15005,7 +15146,7 @@ class AuthService:
                     None if stamped is None else stamped.password_changed_at
                 ),
             )
-        await self._store.revoke_user_sessions(user_id)
+        await self._revoke_after_commit(user_id, change="mfa_reset", actor=actor)
         # Straight after the revoke, before the audit row, so a raise from the audit or a notice
         # cannot skip it. It never raises itself.
         await self._clear_login_addresses(user_id, username=user.username)
@@ -15385,6 +15526,18 @@ class AuthService:
         await self._audit("auth.webauthn_enroll_started", actor=identity.username)
         return options
 
+    async def _passkey_label_held(self, user_id: str, label: str) -> bool:
+        """Whether a passkey of ``user_id`` already carries ``label``, compared without case, as
+        SQL Server's collation compares the (user_id, label) index (BACKLOG #2733, pass F)."""
+        wanted = label.casefold()
+        try:
+            held = await self._store.list_webauthn_credentials(user_id)
+        except PasskeyRowMalformed as exc:
+            # Read as no label held: the store's own index still refuses a real clash.
+            _log.warning("a passkey row of user %s did not parse (%s)", user_id, exc)
+            return False
+        return any(cred.label.casefold() == wanted for cred in held)
+
     async def finish_webauthn_registration(
         self,
         identity: Identity,
@@ -15451,7 +15604,11 @@ class AuthService:
         if user is None:
             raise ValueError("no such user")
         label = label.strip()
-        if not label or len(label) > self._WEBAUTHN_LABEL_MAX:
+        # Counted in UTF-16 code units (BACKLOG #2733, pass F finding 4): SQL Server's NVARCHAR(100)
+        # counts those, so a label of astral-plane characters that passed a code-point count was
+        # refused by the column there, as a 500. The same cap on every backend, so a label one
+        # store takes, all three take.
+        if not label or utf16_units(label) > self._WEBAUTHN_LABEL_MAX:
             raise ValueError("label must be 1-100 characters")
         # No staged ceremony is answered BEFORE the floor, as confirm_mfa_enrollment answers "no
         # enrollment in progress" before it: otherwise the same request would get "verification
@@ -15578,19 +15735,26 @@ class AuthService:
         credential_id_hash = _credential_id_hash(result.credential_id)
         if await self._store.get_webauthn_credential(credential_id_hash) is not None:
             raise ValueError("this passkey is already enrolled")
+        # Without case (BACKLOG #2733, pass F finding 4): SQL Server's default collation makes the
+        # (user_id, label) index refuse "laptop" beside "Laptop", where SQLite and Postgres took
+        # both. Asked here, behind every guard above, so a session that has not passed them learns
+        # nothing about the account's labels; the cost is a used ceremony. A check before the
+        # insert, so two enrolments racing case variants can still both land on SQLite and
+        # Postgres, whose indexes keep case.
+        if await self._passkey_label_held(user.id, label):
+            raise ValueError("label already in use")
         spent: EnrolmentCodeOutcome | None = None
         if code_digest is not None:
             # ADR 0207, A3 step 9: a label the account already holds is refused before the spend,
-            # so that refusal costs no code. The insert's integrity error stays the backstop for a
-            # label written concurrently, which does cost it.
+            # so that refusal costs no code. The case-blind check above (BACKLOG #2733) already ran
+            # before this point, so it is that refusal. The insert's integrity error stays the
+            # backstop for a label written concurrently, which does cost it.
             held = await self._verified_passkeys(user)
             if held is None:
                 # The passkey set fails its seal or does not parse, so the credential write below
                 # would refuse anyway: refuse before the spend, as begin_webauthn_registration does,
                 # so the code is not burned on a write that cannot land.
                 raise ValueError("no such user")
-            if any(c.label == label for c in held):
-                raise ValueError("label already in use")
             # A3 step 10: the spend, one conditional write, before the credential is written.
             spent = await self._store.spend_enrolment_code(user.id, code_digest=code_digest)
             if spent is None:
@@ -15660,7 +15824,12 @@ class AuthService:
             # holding this credential id is that refusal, whatever label it carries.
             if await self._store.get_webauthn_credential(credential_id_hash) is not None:
                 raise ValueError("this passkey is already enrolled") from exc
-            raise ValueError("label already in use") from exc
+            # Pass F findings 3 and 5: the label clash is told apart the same way, by a passkey of
+            # this account now holding the label. Anything else, such as a competing row deleted
+            # before these re-reads, or another integrity refusal, is not called a label clash.
+            if await self._passkey_label_held(user.id, label):
+                raise ValueError("label already in use") from exc
+            raise ValueError(_PASSKEY_NOT_STORED) from exc
         if not bound:
             # The store fails closed on a dead session and on an account record that fails its seal
             # too (a missing account it leaves to the foreign key above), so those are told apart
@@ -16451,7 +16620,7 @@ class AuthService:
                 user_id, AdminRemoval.DISABLE, admin_role_id=Role.ADMINISTRATOR.value
             )
             if not refused:
-                await self._store.revoke_user_sessions(user_id)
+                await self._revoke_after_commit(user_id, change="account_disabled", actor=actor)
                 # After the write, so a request that read the row before it predates the exit.
                 self._forget_cert_probe_fault(user_id)
         elif disabled is not None:
@@ -16529,7 +16698,8 @@ class AuthService:
             assigned_by=actor,
         ):
             raise LastAdministratorRefused("cannot remove the last administrator")
-        await self._store.revoke_user_sessions(user_id)  # re-resolve permissions on next login
+        # Re-resolve permissions on the next login.
+        await self._revoke_after_commit(user_id, change="roles_changed", actor=actor)
         await self._audit(
             "user.roles_changed",
             actor=actor,
@@ -16627,7 +16797,9 @@ class AuthService:
             builtin=False,
             permissions=_json([p.value for p in perms]),
         )
-        await self._revoke_sessions_for_role(role_id)
+        await self._revoke_each_after_commit(
+            await self._custom_role_holders(role_id), change="custom_role_saved", actor=actor
+        )
         await self._audit(
             "role.updated",
             actor=actor,
@@ -16647,7 +16819,10 @@ class AuthService:
         whose row fails its integrity seal is deleted like any other (BACKLOG #2592)."""
         if not await self._custom_role_held(role_id):
             raise ValueError("no such custom role")
-        await self._revoke_sessions_for_role(role_id)  # before the rows are gone
+        # Before the rows are gone, so nothing has committed yet: a refusal is raised at once with
+        # the role in place, and not recorded as a miss after a committed change (vault #3023).
+        for user_id in await self._custom_role_holders(role_id):
+            await self._store.revoke_user_sessions(user_id)
         await self._store.delete_custom_role(role_id)
         await self._audit("role.deleted", actor=actor, detail=_json({"role_id": role_id}))
 
@@ -16655,7 +16830,7 @@ class AuthService:
         """The account ids whose sessions an edit or a delete of custom role ``role_id`` would end.
 
         BACKLOG #3401 (ASVS 7.5.2). Read from the stored accounts, never from a caller's identity.
-        :meth:`_revoke_sessions_for_role` revokes exactly this set, so a route asking whether the
+        :meth:`_custom_role_holders` revokes exactly this set, so a route asking whether the
         save ends the caller's own sessions gets the answer the revoke acts on. Empty for a role
         nobody holds, including one that does not exist.
 
@@ -16670,12 +16845,28 @@ class AuthService:
             if any(held.casefold() == wanted for held in user.role_ids)
         )
 
-    async def _revoke_sessions_for_role(self, role_id: str) -> None:
-        """Revoke the live sessions of every user currently holding ``role_id`` so a permission
-        reduction / role deletion re-resolves on their next request (ADR 0045 D3)."""
-        # Sorted, so a revoke a store fault interrupts stops at a repeatable point.
-        for user_id in sorted(await self.sessions_ended_by_custom_role_save(role_id)):
-            await self._store.revoke_user_sessions(user_id)
+    async def _custom_role_holders(self, role_id: str) -> list[str]:
+        """The accounts a custom-role save or delete revokes, sorted, so a revoke a store fault
+        interrupts stops at a repeatable point (ADR 0045 D3)."""
+        return sorted(await self.sessions_ended_by_custom_role_save(role_id))
+
+    async def _revoke_each_after_commit(
+        self, user_ids: Sequence[str], *, change: str, actor: str
+    ) -> int:
+        """:meth:`_revoke_after_commit` for each of ``user_ids``, in order; the count revoked.
+
+        It stops at the first account given up on, whose row records how many accounts it did not
+        reach (vault BACKLOG #3023). Going on would cost each later account the same wait on a
+        store that is failing, and with two or more that passes the request deadline, which
+        cancels the request with no row at all."""
+        revoked = 0
+        for n, user_id in enumerate(user_ids):
+            revoked += (
+                await self._revoke_after_commit(
+                    user_id, change=change, actor=actor, not_attempted=len(user_ids) - n - 1
+                )
+            ).count
+        return revoked
 
     async def admin_reset_password(self, user_id: str, *, actor: str) -> IssuedCredential:
         """Admin-initiated password reset (ASVS 6.4.6 / WP-L3-12). Generate a CSPRNG one-time password
@@ -16708,7 +16899,8 @@ class AuthService:
             must_change_password=True,
             password_generated=True,
         )
-        await self._store.revoke_user_sessions(user_id)  # invalidate any live sessions on reset
+        # Invalidate any live sessions on reset.
+        await self._revoke_after_commit(user_id, change="password_reset", actor=actor)
         await self._clear_login_addresses(user_id, username=user.username)  # as in admin_reset_mfa
         await self._audit(
             "auth.password_reset",
@@ -17389,7 +17581,7 @@ class AuthService:
             raise ChannelScopeSourceConflict(
                 "this channel scope changed hands while the write ran; re-read the user and retry"
             )
-        await self._store.revoke_user_sessions(user_id)
+        await self._revoke_after_commit(user_id, change="channel_scope_changed", actor=actor)
         await self._audit(
             "user.channel_scope_changed",
             actor=actor,
@@ -17497,7 +17689,7 @@ class AuthService:
                 return True
         return False
 
-    async def _revoke_ad_sessions(self) -> int:
+    async def _revoke_ad_sessions(self, *, change: str, actor: str) -> int:
         """Revoke every unrevoked session held by an enabled directory account whose record passes
         its seal, lapsed ones included. Returns the number revoked, which is the
         ``sessions_revoked`` the two map audit rows record; it counts rows, not live sessions.
@@ -17526,15 +17718,15 @@ class AuthService:
         mass-revoke breaker: that breaker exists to catch a directory the engine cannot read, and
         this is an administrator's own step-up-gated edit.
         """
-        revoked = 0
-        for user_id in sorted(await self.sessions_ended_by_ad_map_save()):
-            # Unconditional (BACKLOG #2283). It used to revoke only when ``list_sessions`` found a
-            # row, and that read filters on the wall clock: after a forward clock step past the
-            # absolute lifetime it found none, and those rows would come back on the old mapping
-            # once the clock was set right. ``revoke_user_sessions`` matches every unrevoked row,
-            # whatever the clock says, and costs one statement where the read cost one too.
-            revoked += (await self._store.revoke_user_sessions(user_id)).count
-        return revoked
+        # Unconditional (BACKLOG #2283). It used to revoke only when ``list_sessions`` found a row,
+        # and that read filters on the wall clock: after a forward clock step past the absolute
+        # lifetime it found none, and those rows would come back on the old mapping once the clock
+        # was set right. ``revoke_user_sessions`` matches every unrevoked row, whatever the clock
+        # says, and costs one statement where the read cost one too. Each account through
+        # _revoke_each_after_commit, since the map write has committed (vault BACKLOG #3023).
+        return await self._revoke_each_after_commit(
+            sorted(await self.sessions_ended_by_ad_map_save()), change=change, actor=actor
+        )
 
     async def sessions_ended_by_ad_map_save(self) -> frozenset[str]:
         """The account ids whose sessions a save of either AD group map would end: every enabled
@@ -17553,7 +17745,7 @@ class AuthService:
     async def set_ad_group_map(self, entries: Sequence[tuple[str, str]], *, actor: str) -> None:
         """Replace the AD-group → role map (C3). Revokes directory sessions so it applies at once."""
         await self._store.set_ad_group_role_map(entries)
-        revoked = await self._revoke_ad_sessions()
+        revoked = await self._revoke_ad_sessions(change="ad_role_map_saved", actor=actor)
         await self._audit(
             "ad_group_map.updated",
             actor=actor,
@@ -17567,7 +17759,7 @@ class AuthService:
         at once. This docstring used to end "Takes effect on each AD user's next login", which was
         an accurate description of the defect BACKLOG #1154 names and is no longer true."""
         await self._store.set_ad_group_scope_map(entries)
-        revoked = await self._revoke_ad_sessions()
+        revoked = await self._revoke_ad_sessions(change="ad_scope_map_saved", actor=actor)
         await self._audit(
             "ad_group_scope_map.updated",
             actor=actor,

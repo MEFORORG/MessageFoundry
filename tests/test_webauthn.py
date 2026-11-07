@@ -756,6 +756,106 @@ async def test_a_shared_authenticator_racing_an_enrolment_is_not_a_label_clash(
         await store.close()
 
 
+@pytest.mark.parametrize("racer_label", ["mykey", None], ids=["label-raced", "racer-gone"])
+async def test_only_a_held_label_is_answered_as_a_label_clash(
+    monkeypatch: pytest.MonkeyPatch, racer_label: str | None
+) -> None:
+    # BACKLOG #2733, pass F findings 3 and 5: an integrity refusal used to read as a label clash
+    # whatever caused it. Now a passkey of this account must hold the label at the re-read.
+    # label-raced: a racing tab took "mykey" first, so the clash is real. racer-gone: the racing
+    # row was deleted before the re-read, so neither the credential nor the label is held, and
+    # the answer says the passkey was not stored rather than naming a clash that is not there.
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        opts = json.loads(
+            await service.begin_webauthn_registration(
+                identity, token=token, rp_id=RP, rp_name="MessageFoundry"
+            )
+        )
+        original = store.add_webauthn_credential
+
+        async def raced(cred: WebAuthnCredential, **kwargs: Any) -> bool:
+            racer = dataclasses.replace(
+                cred, credential_id_hash="racer-hash", label=racer_label or cred.label
+            )
+            await original(racer)
+            try:
+                return await original(cred, **kwargs)
+            finally:
+                if racer_label is None:
+                    await store.delete_webauthn_credential(cred.user_id, "racer-hash")
+
+        monkeypatch.setattr(store, "add_webauthn_credential", raced)
+        expected = "label already in use" if racer_label else "could not be stored"
+        with pytest.raises(ValueError, match=expected) as raised:
+            await service.finish_webauthn_registration(
+                identity,
+                SoftAuthenticator(rp_id=RP, origin=ORIGIN).create_response(
+                    base64url_to_bytes(opts["challenge"])
+                ),
+                label="mykey",
+                token=token,
+                rp_id=RP,
+                origin=ORIGIN,
+            )
+        # Both refusals really were the store's label index, not the service's pre-check.
+        assert "UNIQUE constraint failed" in str(raised.value.__cause__)
+    finally:
+        await store.close()
+
+
+async def test_a_label_differing_only_by_case_is_refused_on_every_backend() -> None:
+    # BACKLOG #2733, pass F finding 4: SQL Server's collation refused "MyKey" beside "mykey" in
+    # its index, where SQLite took both. The service now refuses it first, on every backend.
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        _, token = await _enroll(service, identity, token)
+        held = (await store.list_webauthn_credentials(identity.user_id))[0].label
+        opts = json.loads(
+            await service.begin_webauthn_registration(
+                identity, token=token, rp_id=RP, rp_name="MessageFoundry"
+            )
+        )
+        with pytest.raises(ValueError, match="label already in use"):
+            await service.finish_webauthn_registration(
+                identity,
+                SoftAuthenticator(rp_id=RP, origin=ORIGIN).create_response(
+                    base64url_to_bytes(opts["challenge"])
+                ),
+                label=held.swapcase(),
+                token=token,
+                rp_id=RP,
+                origin=ORIGIN,
+            )
+        assert len(await store.list_webauthn_credentials(identity.user_id)) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_label_is_capped_in_utf16_code_units() -> None:
+    # BACKLOG #2733, pass F finding 4: SQL Server's NVARCHAR(100) counts UTF-16 code units, so 51
+    # astral-plane characters (102 units) passed a code-point cap and then failed the column there.
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        await service.begin_webauthn_registration(
+            identity, token=token, rp_id=RP, rp_name="MessageFoundry"
+        )
+        astral = "\U0001d400" * 51  # MATHEMATICAL BOLD CAPITAL A, outside the BMP
+        assert len(astral) == 51  # the control: under the old code-point cap of 100
+        with pytest.raises(ValueError, match="label must be 1-100 characters"):
+            await service.finish_webauthn_registration(
+                identity, "{}", label=astral, token=token, rp_id=RP, origin=ORIGIN
+            )
+    finally:
+        await store.close()
+
+
 async def test_last_factor_delete_refused_while_required() -> None:
     store = await MessageStore.open(":memory:")
     try:

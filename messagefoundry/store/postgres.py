@@ -548,6 +548,12 @@ _NOT_PT_MARKER_Q = _NOT_PT_MARKER.replace("stage", "q.stage").replace(
 )
 
 
+class _GrantRolledBack(Exception):  # noqa: N818 - control-flow signal, not an error condition
+    """Raised inside the first-administrator grant's ``conn.transaction()`` so asyncpg rolls back a
+    role write the grant then refuses (BACKLOG #3078 F2). Caught immediately outside; never escapes
+    the store."""
+
+
 class _FencedWrite(Exception):
     """Sentinel raised INSIDE the enclosing ``conn.transaction()`` so asyncpg rolls the whole
     disposition back — the queue flip, the ``delivered_keys`` row, the ``message_events`` row and the
@@ -3088,14 +3094,18 @@ class PostgresStore:
         ``rotate_session`` and ``revoke_user_sessions`` finish what an auth change started: a reset
         password, a disabled account, a changed role, a completed factor ceremony. By the time they
         run, that change is committed. Under ``[store].acquire_timeout`` a saturated pool would make
-        them raise after it, and nothing retries them: a reset password would leave every other
-        session live with no audit row, and a factor ceremony would leave the old token elevated and
-        unrotated. Waiting for a connection instead finishes the write once the pool frees, which is
-        what both did before BACKLOG #2283 moved them onto the bounded ``_execute``.
+        them raise after it: a reset password would leave every other session live, and a factor
+        ceremony would leave the old token elevated and unrotated. Waiting for a connection instead
+        finishes the write once the pool frees, which is what both did before BACKLOG #2283 moved
+        them onto the bounded ``_execute``.
 
-        This closes the gap at these two statements only. The same callers make other bounded
-        writes after their change commits, such as stamps and audit rows, and any of those can
-        still fail at the limit.
+        Waiting answers a pool shortage only. A statement timeout or a lost connection still fails
+        either write. The auth service runs a revoke that follows a committed change again, a
+        bounded number of times, and audits one refused every time
+        (``AuthService._revoke_after_commit``, vault BACKLOG #3023); a refused rotation is its
+        fail-closed branch. This closes the gap at these two statements only. The same callers make
+        other bounded writes after their change commits, such as stamps and audit rows, and any of
+        those can still fail at the limit.
 
         Not every caller has committed first. At least "sign out everywhere else", an
         administrator's force sign-out and the directory reconciler when it writes no roles have no
@@ -10307,24 +10317,32 @@ class PostgresStore:
             assigned_by=assigned_by,
             now=now,
         )
-        async with self._timed_acquire() as conn, conn.transaction():
-            await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
-            rows = await conn.fetch(
-                _PG_SQL_ADMIN_GUARD_HOLDERS,
-                user_id,
-                admin_role_id,
-            )
-            _, others = await admin_guard_counts(
-                [(str(r["id"]), bool(r["is_target"])) for r in rows],
-                self._row_sealer,
-                lambda holder: self._read_user_record(conn, holder, lock=False),
-                counts_as_admin,
-                role_id=admin_role_id,
-            )
-            if others:
-                return AdminGrant.ADMIN_EXISTS  # nothing written; the commit releases the lock
-            if await self._write_user(conn, user_id, change) is None:
-                return AdminGrant.ACCOUNT_CHANGED
+        try:
+            async with self._timed_acquire() as conn, conn.transaction():
+                await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
+                rows = await conn.fetch(
+                    _PG_SQL_ADMIN_GUARD_HOLDERS,
+                    user_id,
+                    admin_role_id,
+                )
+                _, others = await admin_guard_counts(
+                    [(str(r["id"]), bool(r["is_target"])) for r in rows],
+                    self._row_sealer,
+                    lambda holder: self._read_user_record(conn, holder, lock=False),
+                    counts_as_admin,
+                    role_id=admin_role_id,
+                )
+                if others:
+                    return AdminGrant.ADMIN_EXISTS  # nothing written; the commit releases the lock
+                if await self._write_user(conn, user_id, change) is None:
+                    return AdminGrant.ACCOUNT_CHANGED
+                # BACKLOG #3078 F2, as on SQLite. After the write, which holds the account row FOR
+                # UPDATE as every passkey write does, so a passkey committed before it is seen here
+                # and a later one waits for this commit. The raise rolls the role write back.
+                if await conn.fetchval(_PG_WEBAUTHN_ANY_FOR_USER, user_id) is not None:
+                    raise _GrantRolledBack
+        except _GrantRolledBack:
+            return AdminGrant.ACCOUNT_CHANGED
         return AdminGrant.GRANTED
 
     @staticmethod

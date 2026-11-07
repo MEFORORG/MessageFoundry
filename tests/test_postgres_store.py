@@ -1121,6 +1121,15 @@ async def test_first_admin_grant_counts_only_a_local_administrator_that_signs_in
     await assert_grant_counts_only_a_local_administrator_that_signs_in(store)
 
 
+async def test_first_admin_grant_refuses_a_row_holding_a_passkey(store) -> None:
+    """BACKLOG #3078 F2 on Postgres: the grant's refusal rolls its role write back."""
+    from tests._first_admin_grant_store_contract import (
+        assert_grant_refuses_a_row_holding_a_passkey,
+    )
+
+    await assert_grant_refuses_a_row_holding_a_passkey(store)
+
+
 async def test_concurrent_first_admin_grants_leave_one(store) -> None:
     """BACKLOG #3078 on Postgres: two grants to two accounts on two pooled connections, at once.
     The last-administrator guard's advisory lock serializes them; one is refused."""
@@ -1157,6 +1166,13 @@ async def test_webauthn_store_contract(store) -> None:
     from tests._webauthn_store_contract import _assert_webauthn_store_contract
 
     await _assert_webauthn_store_contract(store)
+
+
+async def test_a_session_for_a_missing_account_is_refused(store) -> None:
+    """BACKLOG #2733 on Postgres: the session's user foreign key, as on SQLite and SQL Server."""
+    from tests._webauthn_store_contract import assert_a_session_for_a_missing_account_is_refused
+
+    await assert_a_session_for_a_missing_account_is_refused(store)
 
 
 async def test_webauthn_conditional_bind_contract(store) -> None:
