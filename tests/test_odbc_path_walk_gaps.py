@@ -1229,7 +1229,7 @@ async def test_hold_f2_a_build_its_caller_abandons_is_closed(
 
     folder = _capath(tmp_path, "0a1b2c3d.0")
     _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
-    _LoopWatch(monkeypatch, seconds=0.3)
+    watch = _LoopWatch(monkeypatch, seconds=0.3)
     closed = asyncio.Event()
 
     async def close(_self: object) -> None:
@@ -1239,7 +1239,11 @@ async def test_hold_f2_a_build_its_caller_abandons_is_closed(
     task = asyncio.create_task(
         wiring_runner._build_off_loop(None, lambda: _db_connector("outbound", folder))
     )
-    await asyncio.sleep(0.05)
+    # Cancel only once the build thread is running: a build still queued is cancelled and never
+    # built, so a fixed sleep would race the executor on a loaded runner.
+    async with asyncio.timeout(5):
+        while not watch.threads:
+            await asyncio.sleep(0.01)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
