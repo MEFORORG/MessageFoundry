@@ -189,8 +189,10 @@ from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
     SESSION_KIND,
     USER_KIND,
+    AnyRowSealer,
     RowSealer,
     RowSealError,
+    require_seal_for_write,
     seal_bytes,
 )
 from messagefoundry.store.schema_verify import (
@@ -1479,6 +1481,24 @@ def seal_session(sealer: RowSealer | None, record: SessionRecord) -> SessionReco
     return replace(record, seal=seal)
 
 
+async def seal_session_async(sealer: AnyRowSealer | None, record: SessionRecord) -> SessionRecord:
+    """:func:`seal_session`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    seal = "" if sealer is None else await sealer.seal_async(SESSION_KIND, record.seal_fields())
+    return replace(record, seal=seal)
+
+
+async def require_session_seal_for_write(
+    sealer: AnyRowSealer | None, record: SessionRecord
+) -> None:
+    """Refuse a write over ``record`` unless its seal holds under the active key: the write path's
+    form of :func:`session_seal_ok` (ADR 0217 (c) step 1). Raises ``RowSealError(SESSION_KIND)``
+    for a failed seal, a seal under a retired key included, as ``main``'s write path does; the
+    quiet end of a retired-key session is the reader's (``AuthService``), not this write's."""
+    await require_seal_for_write(
+        sealer, SESSION_KIND, record.seal_fields(), record.seal, subject=""
+    )
+
+
 def session_seal_ok(sealer: RowSealer | None, record: SessionRecord) -> bool:
     """Whether ``record`` carries a valid seal. Always True with no sealer: a store that holds no
     key writes and checks no seals. With one, a missing or empty seal fails like a wrong one."""
@@ -2713,6 +2733,20 @@ def seal_user(sealer: RowSealer | None, record: UserAuthzRecord) -> UserAuthzRec
     store with no sealer (BACKLOG #2592)."""
     seal = "" if sealer is None else sealer.seal(USER_KIND, record.seal_fields())
     return record.changed(authz_seal=seal)
+
+
+async def seal_user_async(sealer: AnyRowSealer | None, record: UserAuthzRecord) -> UserAuthzRecord:
+    """:func:`seal_user`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    seal = "" if sealer is None else await sealer.seal_async(USER_KIND, record.seal_fields())
+    return record.changed(authz_seal=seal)
+
+
+async def require_user_seal_for_write(sealer: AnyRowSealer | None, record: UserAuthzRecord) -> None:
+    """Refuse a write over ``record`` unless its seal holds under a held key: the write path's form
+    of :func:`user_seal_ok`, a value the encoder cannot read failing too (ADR 0217 (c) step 1)."""
+    await require_seal_for_write(
+        sealer, USER_KIND, record.seal_fields(), record.row.authz_seal, subject=""
+    )
 
 
 def user_seal_ok(sealer: RowSealer | None, record: UserAuthzRecord) -> bool:
@@ -3987,6 +4021,12 @@ class RoleRow:
 def seal_role(sealer: RowSealer | None, row: RoleRow) -> RoleRow:
     """``row`` with its seal set under the active key, or empty with no sealer (BACKLOG #2592)."""
     return replace(row, seal="" if sealer is None else sealer.seal(ROLE_KIND, row.seal_fields()))
+
+
+async def seal_role_async(sealer: AnyRowSealer | None, row: RoleRow) -> RoleRow:
+    """:func:`seal_role`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    seal = "" if sealer is None else await sealer.seal_async(ROLE_KIND, row.seal_fields())
+    return replace(row, seal=seal)
 
 
 def role_seal_ok(sealer: RowSealer | None, row: RoleRow) -> bool:
@@ -16946,7 +16986,7 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             # BACKLOG #2592: the whole row, sealed, in one INSERT.
             await self._db.execute(
-                _USER_INSERT, user_insert_params(seal_user(self._row_sealer, record))
+                _USER_INSERT, user_insert_params(await seal_user_async(self._row_sealer, record))
             )
             # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
             appended = await self._append_audits(audits, now=now)
@@ -16996,8 +17036,7 @@ class MessageStore:
         current = await self._read_user_record(user_id)
         if current is None:
             return None
-        if not user_seal_ok(self._row_sealer, current):
-            raise RowSealError(USER_KIND)
+        await require_user_seal_for_write(self._row_sealer, current)
         changed = change(current)
         if changed is None:
             return None
@@ -17006,7 +17045,7 @@ class MessageStore:
             changed = existing_roles_only(
                 current, changed, [str(r["id"]) for r in await cur.fetchall()]
             )
-        updated = seal_user(self._row_sealer, changed)
+        updated = await seal_user_async(self._row_sealer, changed)
         cur = await self._db.execute(_USER_RESEAL, user_reseal_params(updated, current))
         if cur.rowcount != 1:
             return None
@@ -17045,8 +17084,7 @@ class MessageStore:
         left to seal, so ``admin_reset_mfa`` can still clear a set that fails."""
         current = await self._read_user_record(user_id)
         if current is not None:
-            if not user_seal_ok(self._row_sealer, current):
-                raise RowSealError(USER_KIND)
+            await require_user_seal_for_write(self._row_sealer, current)
             if (
                 self._row_sealer is not None
                 and not removes_all
@@ -17923,7 +17961,8 @@ class MessageStore:
         repaired (the comment above :data:`ROLE_SEAL_EXCLUDED` says why that copies nothing in). A
         caller that builds ``row`` from a stored one checks it first, as
         :meth:`reseal_role_records` does."""
-        await self._db.execute(_ROLE_UPSERT, seal_role(self._row_sealer, row).write_params())
+        sealed = await seal_role_async(self._row_sealer, row)
+        await self._db.execute(_ROLE_UPSERT, sealed.write_params())
 
     async def list_roles(self) -> list[aiosqlite.Row]:
         async with self._read() as db:
@@ -18421,7 +18460,7 @@ class MessageStore:
                 user_epoch=0 if row is None else int(row["session_epoch"]),
                 global_epoch=0 if row is None else global_epoch_or_refuse(row["global_epoch"]),
             )
-            record = seal_session(self._row_sealer, record)
+            record = await seal_session_async(self._row_sealer, record)
             await self._db.execute(_SESSION_INSERT, session_insert_params(record))
             await self._commit()
         return True
@@ -18446,9 +18485,8 @@ class MessageStore:
         current = SessionRecord.from_mapping(dict(row))
         if current.revoked_at is not None:
             return None
-        if not session_seal_ok(self._row_sealer, current):
-            raise RowSealError(SESSION_KIND)
-        updated = seal_session(self._row_sealer, change(current))
+        await require_session_seal_for_write(self._row_sealer, current)
+        updated = await seal_session_async(self._row_sealer, change(current))
         cur = await self._db.execute(_SESSION_RESEAL, session_reseal_params(updated, current))
         return updated if cur.rowcount == 1 else None
 
