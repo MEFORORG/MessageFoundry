@@ -3619,12 +3619,10 @@ because the first attempt meets a cancellation or a raise the helper does not an
 second attempt runs; `enable_totp` itself raises, so no revoke runs; the `auth.session_rotated`
 audit write raises, after the rotation and before `enable_totp`; a cancellation lands during the
 session-cap run that follows the rotation, also before `enable_totp`; or the `auth.mfa_enrolled`
-audit write raises, after `enable_totp` turned TOTP on. Whether TOTP is on in these cases depends
-on whether the enable committed, which a raise or cancellation does not always tell. While the
-session lives, it counts as a full session under `[auth].max_sessions_per_user`. Its token is not
-handed back in any case. The compare is on the stored ciphertext, so at least a store-key rotation
-that re-encrypts the column inside the window refuses too. That refusal reads as `secret_replaced`
-although no second enrolment started.
+audit write raises, after `enable_totp` turned TOTP on. While the session lives, it counts as a full
+session under `[auth].max_sessions_per_user`. Its token is not handed back in any case. The compare
+is on the stored ciphertext, so at least a store-key rotation that re-encrypts the column inside the
+window refuses too. That refusal reads as `secret_replaced` although no second enrolment started.
 `write_lost` means the row still held the verified secret with TOTP off, so the enable lost to
 some other concurrent write. After a `write_lost` or a store-key rotation the staged secret still
 stands. The user signs in again, because the refused confirm hands no token back and asks the
