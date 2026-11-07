@@ -95,7 +95,6 @@ from messagefoundry.config.tls_policy import (
     narrow_to_approved_suites,
 )
 from messagefoundry.connection_events import check_connection_event_kind
-from messagefoundry.exception_origin import engine_worded_text
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store import server_schema_verify
@@ -1676,10 +1675,9 @@ def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
     ``codec_safe_str`` rendering: the CRL judge re-raises a codec error as a ``ValueError`` whose
     own text already quotes the byte, which that rendering prints whole. It names no class, as
     :func:`~messagefoundry.store.base._codec_safe_refusal`'s fallback names none (the third hold
-    on engine PR 2818). Every other ``ValueError`` keeps its chain, and its text only as
-    :func:`~messagefoundry.exception_origin.engine_worded_text` reads it; any other gets a fixed
-    text naming the settings. Its ``__str__`` is never called, since in the handler it can raise or
-    print a byte (the sixth hold).
+    on engine PR 2818). Every other ``ValueError`` keeps its chain under a fixed text naming the
+    settings and what they must hold, which reads nothing from the error (the seventh hold): the
+    builder's own text, the ``ssl`` or ``cryptography`` library's included, is on the cause only.
 
     The class test that comes first, for an ``InsecureHopRefused`` or an ``OSError``, reads the
     class with ``type``, so it runs none of the error's own code (the fourth hold). It runs before
@@ -1692,10 +1690,7 @@ def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
             raise
         reading = _codec_chain_reading(exc)
         if reading is None:
-            text = engine_worded_text(exc, ValueError)
-            if text is None:
-                text = f"{_TLS_UNBUILT}: an error whose text is not shown"
-            raise StoreTlsRefused(text) from exc
+            raise StoreTlsRefused(_TLS_REFUSED) from exc
     raise StoreTlsRefused(f"{_TLS_UNBUILT}: an error {reading}, not quoted")
 
 
@@ -1703,6 +1698,13 @@ def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
 _TLS_UNBUILT = (
     "the PostgreSQL store's TLS context could not be built from [store].ssl_root_cert, "
     "[store].ssl_crl_file or the system trust store"
+)
+
+#: The refusal of every other ``ValueError`` the builder raises at the open (the seventh hold).
+_TLS_REFUSED = (
+    f"{_TLS_UNBUILT}: the pin file must hold a readable CA certificate, the CRL file readable CRLs "
+    "in effect from a CA the hop already trusts, and the hop's suites must narrow to the approved "
+    "list; the error's own text is not shown"
 )
 
 

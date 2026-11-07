@@ -3,10 +3,9 @@
 """Which code raised an exception, read from its traceback (vault BACKLOG #3765 item 5).
 
 The config loader, ``messagefoundry check-privileges`` and the CLI each read this to decide whether
-to print an exception's text. All three share :func:`raised_by_the_engine`'s frame rule. The loader
-also takes the narrower :func:`worded_by_the_engine`, and so does :func:`engine_worded_text`, which
-the store's cipher build and PostgreSQL TLS context refusals and the AD probe's guard refusal read
-(the sixth hold on engine PR 2818); a builtin's text in engine code can still print elsewhere. A leaf that imports only the standard library:
+to print an exception's text. All three share :func:`raised_by_the_engine`'s frame rule, and only
+the loader also takes the narrower :func:`worded_by_the_engine`, so a builtin's text in engine code
+can still print from the other two. A leaf that imports only the standard library:
 ``privilege_probes`` calls it inside exception handlers without loading ``config.wiring``, and
 ``__main__`` without loading anything else.
 
@@ -21,21 +20,15 @@ The innermost frame says where a traceback ends, not who raised what is on it. `
 X(text).with_traceback(exc.__traceback__)``, an ordinary idiom rather than a forgery, keeps the
 engine's frame innermost. So the loader also reads where the raise happened:
 :func:`raised_only_by_the_engine`. That cannot tell the idiom from a module's ``raise exc`` of the
-refusal it caught, so that is withheld too, which is the cheaper failure. The CLI and the probes' other
-texts keep the frame rule alone, because a library raising an engine exception again, as
-``concurrent.futures`` does, must not cost them an engine refusal's text. The callers of
-:func:`engine_worded_text` accept that cost: such a refusal reads as their fixed text.
+refusal it caught, so that is withheld too, which is the cheaper failure. The other two callers keep
+the frame rule alone, because a library raising an engine exception again, as
+``concurrent.futures`` does, must not cost them an engine refusal's text.
 
 A frame says who raised an instance, not what it prints. A module can catch a refusal and assign its
 ``__class__``, which leaves the engine's frame on it and prints through that class's ``__str__``, so
-the loader also reads the real class (``wiring._is_engine_text``). No frame rule here reads
-``args``, so a module that rewrites them, with text or with an object whose own ``__str__`` holds
-the value, still passes.
-
-:func:`engine_worded_text` is that rule applied to text: it reads ``args`` through
-``BaseException``'s own descriptor, and only for an instance whose constructor and ``__str__``
-are those of the base the caller names, so a caller can take an engine refusal's text without
-running any of the error's code."""
+the loader also reads the real class (``wiring._is_engine_text``). No rule here reads ``args``, so a
+module that rewrites them, with text or with an object whose own ``__str__`` holds the value, still
+passes."""
 
 from __future__ import annotations
 
@@ -47,7 +40,6 @@ from typing import Any, Final
 
 __all__ = [
     "ExceptionChainTooLong",
-    "engine_worded_text",
     "exception_chain",
     "raise_statement_file",
     "raised_by_the_engine",
@@ -138,49 +130,6 @@ def raised_through(exc: BaseException, code: CodeType) -> bool:
     function ran (BACKLOG #4883). Read by code object, so a function of the same name elsewhere
     does not count, and an exception never raised has no frame and answers ``False``."""
     return any(tb.tb_frame.f_code is code for tb in _entries(exc))
-
-
-#: The builtin descriptor, so reading the arguments runs none of a subclass's code.
-_ARGS_OF: Final[Any] = BaseException.__dict__["args"]
-#: ``type``'s own descriptors, so reading a class's MRO and dict runs no metaclass code.
-_TYPE_MRO: Final[Any] = vars(type)["__mro__"]
-_TYPE_DICT: Final[Any] = vars(type)["__dict__"]
-#: What a class must not define for its arguments to be what ``raise`` passed and ``str`` prints.
-_TEXT_HOOKS: Final = ("__init__", "__new__", "__str__")
-
-
-def engine_worded_text(exc: BaseException, kind: type[BaseException]) -> str | None:
-    """``exc``'s one ``str`` argument when ``exc`` is a ``kind`` that :func:`worded_by_the_engine`,
-    and its ``__init__``, ``__new__`` and ``__str__`` each resolve to ``kind`` or a class above it,
-    else ``None``, read with none of ``exc``'s own code run (the sixth hold on engine PR 2818). This
-    is the one statement of the rule; the store's and the AD probe's refusals link here.
-
-    ``kind`` must be a class whose ``__init__`` and ``__str__`` are ``BaseException``'s, such as
-    ``ValueError`` or ``InsecureHopRefused``: then the arguments are what the engine ``raise``
-    passed, and what ``str(exc)`` prints. A constructor or ``__str__`` of any other class, a mixin
-    after ``kind`` in the MRO included, could write or print a byte the arguments do not show, so
-    such an error is never read. The class is read with ``type`` and its MRO and dicts through
-    ``type``'s own descriptors.
-
-    It proves less than that the engine wrote the text. Like :func:`worded_by_the_engine`, it does
-    not see what the text holds, since an engine ``raise`` can interpolate another error's text. Nor
-    does it see arguments reassigned after the raise by code that caught the error and raised it
-    again with a bare ``raise``, which adds no frame, or rewritten by a metaclass ``__call__``. A
-    caller that gets ``None`` says something fixed instead."""
-    mro = _TYPE_MRO.__get__(type(exc))
-    if not any(base is kind for base in mro):
-        return None
-    allowed = _TYPE_MRO.__get__(kind)
-    for name in _TEXT_HOOKS:
-        owner = next((base for base in mro if name in _TYPE_DICT.__get__(base)), None)
-        if not any(owner is base for base in allowed):
-            return None
-    if not worded_by_the_engine(exc):
-        return None
-    args = _ARGS_OF.__get__(exc)
-    if len(args) == 1 and type(args[0]) is str:
-        return str(args[0])
-    return None
 
 
 def raise_statement_file(exc: BaseException) -> str | None:

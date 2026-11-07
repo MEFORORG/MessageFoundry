@@ -417,22 +417,23 @@ def test_the_vault_probe_keeps_only_the_marked_refusal_text() -> None:
 # --- BACKLOG #4883, the `_ad_why` item: only the LDAPS guard's refusal keeps its text -----------
 
 
-def test_the_ad_probe_keeps_the_real_ldaps_guard_refusal_whole() -> None:
-    """The control: the guard's own refusal, worded and raised by the engine under an enforcing
-    posture for a domain controller off the box, keeps its text."""
+def test_the_ad_probe_names_the_real_ldaps_guard_refusal_with_fixed_text() -> None:
+    """The guard's own refusal, worded and raised by the engine under an enforcing posture for a
+    domain controller off the box, reads as the fixed text too (the seventh hold on engine PR 2818):
+    nothing is read from it."""
     import ssl
 
     from messagefoundry.auth import ldap
     from messagefoundry.config.settings import AuthSettings
     from messagefoundry.config.tls_policy import HopPosture
-    from messagefoundry.privilege_probes import _ad_why
+    from messagefoundry.privilege_probes import _AD_GUARD_REFUSAL, _ad_why
 
     tls: Any = SimpleNamespace(handshake_context=ssl.create_default_context)
     settings = AuthSettings(ad_server="ldaps://dc.synthetic.test:636")
     refusal = _escaping(lambda: ldap._refuse_ad_revocation(settings, tls, HopPosture(True)))
     assert type(refusal) is InsecureHopRefused, type(refusal)
-    assert _ad_why(refusal) == str(refusal)
-    assert "dc.synthetic.test" in _ad_why(refusal)
+    assert _ad_why(refusal) == _AD_GUARD_REFUSAL
+    assert "[auth].ad_tls_crl_file" in _AD_GUARD_REFUSAL
 
 
 def test_the_ad_probe_names_a_guard_refusal_it_did_not_word_with_fixed_text(
@@ -452,7 +453,7 @@ def test_the_ad_probe_names_a_guard_refusal_it_did_not_word_with_fixed_text(
             AuthSettings(ad_server="ldaps://dc.synthetic.test:636"), tls, None
         )
     assert _ad_why(caught.value) == _AD_GUARD_REFUSAL
-    assert "revocation guard" in _AD_GUARD_REFUSAL
+    assert "revocation" in _AD_GUARD_REFUSAL
 
 
 def test_a_hop_refusal_from_the_bind_password_resolution_keeps_no_text(
@@ -527,7 +528,8 @@ def test_a_value_error_with_a_codec_error_on_any_link_prints_no_byte(
         build_store_cipher(StoreSettings())
     _assert_no_key_byte(_whole(caught.value))
     assert caught.value.__cause__ is None and caught.value.__context__ is None
-    assert f"ValueError {_CHAINED}" in str(caught.value), str(caught.value)
+    assert _CHAINED in str(caught.value), str(caught.value)
+    assert "ValueError" not in str(caught.value), str(caught.value)  # no class name (seventh hold)
 
 
 @pytest.mark.parametrize("kind", [RuntimeError, KeyProviderError, DpapiError])
@@ -541,7 +543,8 @@ def test_a_runtime_error_that_chains_a_codec_error_prints_no_byte(
         build_store_cipher(StoreSettings())
     _assert_no_key_byte(_whole(caught.value))
     assert caught.value.__cause__ is None and caught.value.__context__ is None
-    assert f"{kind.__name__} {_CHAINED}" in str(caught.value), str(caught.value)
+    assert _CHAINED in str(caught.value), str(caught.value)
+    assert kind.__name__ not in str(caught.value), str(caught.value)  # no class name (seventh hold)
 
 
 def test_a_runtime_error_with_no_codec_error_passes_through(
@@ -555,13 +558,15 @@ def test_a_runtime_error_with_no_codec_error_passes_through(
     assert caught.value is own
 
 
-def test_a_holder_of_another_class_is_named_by_its_class(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A DpapiError that holds the codec error names its class, so the refusal says what failed."""
+def test_a_holder_of_another_class_reads_as_the_fixed_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A DpapiError that holds the codec error is refused with the key site's fixed text, which
+    names the settings and reads no class name (the seventh hold on engine PR 2818)."""
     _with_provider(monkeypatch, DpapiError(_decode_error()))
     with pytest.raises(KeyProviderError) as caught:
         build_store_cipher(StoreSettings())
     _assert_no_key_byte(_whole(caught.value))
-    assert str(caught.value).startswith("DpapiError: "), str(caught.value)
+    assert str(caught.value).startswith(store_base._KEY_SOURCE), str(caught.value)
+    assert "DpapiError" not in str(caught.value), str(caught.value)
 
 
 class _UnreadableReason(ValueError):
@@ -599,7 +604,7 @@ def test_the_key_seam_refuses_a_chained_codec_error_without_its_byte(
         getattr(store_base, resolve)(StoreSettings())
     _assert_no_key_byte(_whole(caught.value))
     assert caught.value.__cause__ is None and caught.value.__context__ is None
-    assert f"KeyProviderError {_CHAINED}" in str(caught.value), str(caught.value)
+    assert _CHAINED in str(caught.value), str(caught.value)
 
 
 def test_rotate_key_prints_no_byte_of_a_chained_codec_error(
@@ -694,7 +699,7 @@ def test_the_keyring_refuses_a_codec_error_from_the_retired_keys(
         store_base.resolve_decrypt_keys(StoreSettings())
     _assert_no_key_byte(_whole(caught.value))
     assert caught.value.__cause__ is None and caught.value.__context__ is None
-    assert f"KeyProviderError {_CHAINED}" in str(caught.value), str(caught.value)
+    assert _CHAINED in str(caught.value), str(caught.value)
 
 
 @pytest.mark.parametrize("command", _KEY_REFUSING_COMMANDS)
@@ -864,11 +869,12 @@ class _InterruptingDecodeError(UnicodeDecodeError):
 @pytest.mark.parametrize(
     "entry", ["build_store_cipher", "resolve_active_key", "resolve_decrypt_keys"]
 )
-def test_a_base_exception_from_rendering_the_codec_error_leaves_without_it(
+def test_a_codec_error_whose_attributes_interrupt_is_not_rendered(
     entry: str, make_interrupt: Callable[[], BaseException], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Round one of the repair's review: the walk stops at the codec error itself, and the
-    interrupt rose later, from its rendering, still inside the refusing handler."""
+    """Round one of the repair's review: an interrupt rose from rendering the codec error's
+    attributes inside the refusing handler. Since the seventh hold nothing renders it: the refusal
+    is fixed text, so the attributes are never read and no interrupt rises."""
     interrupt = make_interrupt()
     try:
         raise _InterruptingDecodeError("ascii", _KEY_BYTES, 18, 19, "ordinal not in range(128)")
@@ -877,9 +883,10 @@ def test_a_base_exception_from_rendering_the_codec_error_leaves_without_it(
         error = exc
     assert any(spelling in _whole(error) for spelling in _BYTE_SPELLINGS), "the fixture holds none"
     _with_provider(monkeypatch, error)
-    with pytest.raises(type(interrupt)) as caught:
-        getattr(store_base, entry)(StoreSettings())
-    _assert_left_unchained(caught.value, interrupt, error)
+    escaped = _escaping(lambda: getattr(store_base, entry)(StoreSettings()))
+    assert type(escaped) is StoreCipherConfigError, type(escaped)
+    _assert_no_key_byte(_whole(escaped))
+    assert escaped.__cause__ is None and escaped.__context__ is None
 
 
 class _ClassUnreadable(RuntimeError):
@@ -911,13 +918,13 @@ def test_a_class_test_that_raises_is_still_a_typed_refusal(
 def test_an_error_from_rendering_the_codec_error_is_refused_as_not_judged(
     entry: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Round two of the repair's review: an Exception from the judgement's code after the walk
-    is refused with a fixed text, as a chain that cannot be read is, never raised in its place."""
+    """Round two of the repair's review: an Exception from the judgement's code is refused with a
+    fixed text, as a chain that cannot be read is, never raised in its place. Forced at the walk."""
 
-    def _rendering_fails(exc: BaseException, kind: type[BaseException]) -> str:
-        raise RuntimeError(f"synthetic rendering failure: {exc}")
+    def _judgement_fails(exc: BaseException) -> tuple[BaseException | None, bool]:
+        raise RuntimeError(f"synthetic judgement failure: {exc}")
 
-    monkeypatch.setattr(store_base, "_codec_line", _rendering_fails)
+    monkeypatch.setattr(store_base, "_codec_error_on", _judgement_fails)
     error = _built_from(_decode_error(), ValueError)
     _with_provider(monkeypatch, error)
     with pytest.raises(StoreCipherConfigError) as caught:
@@ -955,9 +962,11 @@ def test_an_error_whose_class_name_cannot_be_read_is_still_refused(
 ) -> None:
     """F2 of the second hold: the judgement read the class name and raised, and the fallback read
     it again, so a bare LookupError left with the judged error, which quotes the byte, behind it.
-    The fallback's text names no class now, so nothing in it can raise."""
+    Since the seventh hold no refusal reads a class name, so the error is refused as the codec
+    error on its chain makes it, its name unread."""
     try:
-        raise _NamelessValueError(f"synthetic key source refused: {_decode_error()}")
+        decode_error = _decode_error()
+        raise _NamelessValueError(f"synthetic key source refused: {decode_error}") from decode_error
     except _NamelessValueError as exc:
         error = exc
     assert any(spelling in str(error) for spelling in _BYTE_SPELLINGS), "the fixture holds none"
@@ -976,7 +985,7 @@ def test_an_error_whose_class_name_cannot_be_read_is_still_refused(
     assert isinstance(escaped, StoreCipherConfigError), _whole(escaped)
     _assert_no_key_byte(_whole(escaped))
     assert escaped.__cause__ is None and escaped.__context__ is None
-    assert "could not be judged" in str(escaped), str(escaped)
+    assert _CHAINED in str(escaped), str(escaped)
 
 
 @pytest.mark.parametrize(
@@ -994,8 +1003,8 @@ def test_an_interrupt_from_the_fallback_leaves_without_a_chain(
     error as its context, and that error's context was the judged one, which quotes the byte."""
     interrupt = make_interrupt()
 
-    def _rendering_fails(exc: BaseException, kind: type[BaseException]) -> str:
-        raise RuntimeError(f"synthetic rendering failure: {exc}")
+    def _judgement_fails(exc: BaseException) -> tuple[BaseException | None, bool]:
+        raise RuntimeError(f"synthetic judgement failure: {exc}")
 
     real_refused = store_base._refused
 
@@ -1004,7 +1013,7 @@ def test_an_interrupt_from_the_fallback_leaves_without_a_chain(
             raise interrupt
         return real_refused(kind, text)
 
-    monkeypatch.setattr(store_base, "_codec_line", _rendering_fails)
+    monkeypatch.setattr(store_base, "_codec_error_on", _judgement_fails)
     monkeypatch.setattr(store_base, "_refused", _fallback_interrupted)
     error = _built_from(_decode_error(), ValueError)
     _with_provider(monkeypatch, error)
@@ -1412,11 +1421,11 @@ def test_the_judgement_reads_the_class_once(monkeypatch: pytest.MonkeyPatch) -> 
     escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
     assert type(escaped) is StoreCipherConfigError, type(escaped)
     _assert_no_key_byte(str(escaped))
-    assert "_ClassChangesOnRereading" in str(escaped), str(escaped)  # the walk did select it
+    assert "that is or holds a codec error" in str(escaped), str(escaped)  # the walk selected it
     assert escaped.__cause__ is None and escaped.__context__ is None
 
 
-@pytest.mark.parametrize("judged", ["unreadable-chain", "unreadable-class-name"])
+@pytest.mark.parametrize("judged", ["unreadable-chain", "judgement-raises"])
 def test_a_judgement_that_fails_closed_logs_what_it_caught(
     judged: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1426,19 +1435,16 @@ def test_a_judgement_that_fails_closed_logs_what_it_caught(
         error: ValueError = _UnreadableReason(f"synthetic: {_decode_error()}")
         swallowed = "KeyError"
     else:
-        try:
-            decode_error = _decode_error()
-            raise _NamelessValueError(f"synthetic: {decode_error}") from decode_error
-        except _NamelessValueError as exc:
-            error = exc
+        error = _built_from(_decode_error(), ValueError)
         swallowed = "LookupError"
+
+        def _judgement_fails(exc: BaseException) -> tuple[BaseException | None, bool]:
+            raise LookupError(f"synthetic: {exc}")
+
+        monkeypatch.setattr(store_base, "_codec_error_on", _judgement_fails)
     _with_provider(monkeypatch, error)
-    _NamelessMeta.armed = judged == "unreadable-class-name"
-    try:
-        with caplog.at_level("WARNING", logger=store_base.__name__):
-            escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
-    finally:
-        _NamelessMeta.armed = False
+    with caplog.at_level("WARNING", logger=store_base.__name__):
+        escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
     assert type(escaped) is StoreCipherConfigError, type(escaped)
     logged = [r.getMessage() for r in caplog.records if r.name == store_base.__name__]
     assert any(swallowed in line for line in logged), logged
@@ -1460,23 +1466,24 @@ class _SchemeKeySource:
         return ()
 
 
-def test_the_cipher_build_keeps_an_engine_worded_subclass_text(
+def test_the_cipher_build_gives_an_engine_subclass_the_fixed_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Round 1 of the sixth hold's review: only an exact ``ValueError`` kept its text, so an
-    engine subclass that defines no constructor or ``__str__`` of its own, such as
-    ``UnknownSchemeError`` or the TLS layer's ``CrlNotInEffect``, lost its diagnosis."""
+    """An engine refusal such as ``UnknownSchemeError`` reads as the build's fixed text, which
+    names the settings; its own text stays on the cause (the seventh hold on engine PR 2818)."""
     monkeypatch.setattr(
         store_base, "resolve_key_provider", lambda settings, posture=None: _SchemeKeySource()
     )
     escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
     assert type(escaped) is StoreCipherConfigError, type(escaped)
-    assert "names an unknown scheme" in str(escaped), str(escaped)
+    assert str(escaped) == store_base._UNTEXTED, str(escaped)
+    assert "names an unknown scheme" in str(escaped.__cause__)
 
 
-def test_the_postgres_tls_wrap_keeps_an_engine_worded_text(tmp_path: Path) -> None:
-    """The positive arm of the wrap: a pin file that holds no certificate is refused by an engine
-    ``raise`` naming the setting, and that text is kept."""
+def test_the_postgres_tls_wrap_gives_the_fixed_text(tmp_path: Path) -> None:
+    """A pin file that holds no certificate is refused by an engine ``raise`` naming the setting.
+    The refusal is the wrap's fixed text, which names the settings; the builder's text, the ``ssl``
+    library's included, stays on the cause (the seventh hold on engine PR 2818)."""
     from messagefoundry.config.settings import StoreBackend
     from messagefoundry.config.tls_policy import StoreTlsRefused
     from messagefoundry.store import postgres
@@ -1492,63 +1499,8 @@ def test_the_postgres_tls_wrap_keeps_an_engine_worded_text(tmp_path: Path) -> No
     )
     escaped = _escaping(lambda: postgres._verifying_context_at_open(settings))
     assert type(escaped) is StoreTlsRefused, type(escaped)
-    assert "[store].ssl_root_cert" in str(escaped) and "could not be read" in str(escaped)
-
-
-class _OwnStr(ValueError):
-    def __str__(self) -> str:
-        return "synthetic: printed by its own __str__"
-
-
-class _OwnInit(ValueError):
-    def __init__(self, text: str) -> None:
-        super().__init__(f"synthetic: rewritten {text}")
-
-
-class _Plain(ValueError):
-    pass
-
-
-class _RewritingMixin(Exception):
-    def __init__(self, text: str) -> None:
-        super().__init__(f"synthetic: rewritten {text}")
-
-
-class _MixinAfterTheBase(ValueError, _RewritingMixin):
-    """The mixin comes after ``ValueError`` in the MRO, so its ``__init__`` writes the arguments."""
-
-
-@pytest.mark.parametrize(
-    ("error", "kept"),
-    [
-        (ValueError(_SETTING_TEXT), True),
-        (_Plain(_SETTING_TEXT), True),
-        (_OwnStr(_SETTING_TEXT), False),
-        (_OwnInit(_SETTING_TEXT), False),
-        (_MixinAfterTheBase(_SETTING_TEXT), False),
-        (KeyError(_SETTING_TEXT), False),
-        (ValueError(_SETTING_TEXT, "second"), False),
-    ],
-    ids=[
-        "exact",
-        "plain-subclass",
-        "own-str",
-        "own-init",
-        "mixin-after-the-base",
-        "not-a-kind",
-        "two-arguments",
-    ],
-)
-def test_engine_worded_text_keeps_only_what_a_raise_passed(
-    error: BaseException, kept: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The class rule alone, with the frame rule granted: a class below the base that defines a
-    constructor or ``__str__`` of its own is never read."""
-    from messagefoundry import exception_origin
-
-    monkeypatch.setattr(exception_origin, "worded_by_the_engine", lambda exc: True)
-    text = exception_origin.engine_worded_text(error, ValueError)
-    assert text == (_SETTING_TEXT if kept else None), text
+    assert str(escaped) == postgres._TLS_REFUSED, str(escaped)
+    assert "could not be read" in str(escaped.__cause__)
 
 
 def test_a_log_call_that_fails_does_not_replace_the_refusal(
@@ -1565,3 +1517,114 @@ def test_a_log_call_that_fails_does_not_replace_the_refusal(
     escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
     assert type(escaped) is StoreCipherConfigError, type(escaped)
     assert escaped.__cause__ is None and escaped.__context__ is None
+
+
+# --- the seventh hold on engine PR 2818: every refusal text is fixed, read from nothing --------
+
+
+class _NameSaysTheByte(type):
+    """A metaclass whose classes' ``__name__`` prints the codec error, byte and all."""
+
+    @property
+    def __name__(cls) -> str:  # type: ignore[override]  # the read is the point
+        return f"Synthetic[{_decode_error()}]"
+
+
+class _ByteNamedError(ValueError, metaclass=_NameSaysTheByte):
+    """A ValueError whose class name, read the ordinary way, quotes the byte."""
+
+
+@pytest.mark.parametrize(
+    "entry", ["build_store_cipher", "resolve_active_key", "resolve_decrypt_keys"]
+)
+def test_a_class_name_that_quotes_the_byte_is_not_read(
+    entry: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Attack 1 of the seventh hold: the refusal put ``kind.__name__`` in its text, and a
+    metaclass ``__name__`` property returned the codec error's text."""
+    try:
+        decode_error = _decode_error()
+        raise _ByteNamedError("synthetic key source refused") from decode_error
+    except _ByteNamedError as exc:
+        error = exc
+    _with_provider(monkeypatch, error)
+    escaped = _escaping(lambda: getattr(store_base, entry)(StoreSettings()))
+    assert type(escaped) is StoreCipherConfigError, type(escaped)
+    _assert_no_key_byte(str(escaped))
+    assert _CHAINED in str(escaped), str(escaped)
+
+
+class _TypedStrSaysTheByte(StoreCipherConfigError):
+    """Already of the refusal type, with a ``__str__`` of its own that prints a byte."""
+
+    def __str__(self) -> str:
+        return f"synthetic: {_decode_error()}"
+
+
+def test_a_refusal_subclass_with_its_own_str_is_not_passed_bare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attack 2 of the seventh hold: the pass-through let any ``StoreCipherConfigError`` through as
+    it was, so a subclass's own ``__str__`` printed the byte. Only the exact type passes now."""
+    error = _TypedStrSaysTheByte("synthetic")
+    _with_provider(monkeypatch, error)
+    escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
+    assert type(escaped) is StoreCipherConfigError, type(escaped)
+    assert str(escaped) == store_base._UNTEXTED
+    assert escaped.__cause__ is error
+
+
+def test_an_exact_refusal_passes_as_it_is(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The control for attack 2: one exactly of the refusal type is not wrapped again."""
+    error = StoreCipherConfigError("synthetic: already typed")
+    _with_provider(monkeypatch, error)
+    assert _escaping(lambda: build_store_cipher(StoreSettings())) is error
+
+
+class _RewritingCall(type):
+    """A metaclass whose ``__call__`` rewrites the arguments after the constructor ran."""
+
+    def __call__(cls, *args: Any, **kwargs: Any) -> Any:
+        made = super().__call__(*args, **kwargs)
+        made.args = (f"synthetic: rewritten {_decode_error()}",)
+        return made
+
+
+class _RewrittenScheme(ValueError, metaclass=_RewritingCall):
+    """Defines no constructor or ``__str__`` of its own, so a class-hook rule takes it as plain."""
+
+
+def test_arguments_rewritten_by_a_metaclass_call_are_not_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attack 3 of the seventh hold: an engine ``raise`` of a class whose metaclass ``__call__``
+    rewrote ``args`` passed the engine-worded rule, which returned the byte. Here the engine's own
+    ``read_scheme_tag`` raises it."""
+    from messagefoundry.store import crypto
+
+    monkeypatch.setattr(crypto, "UnknownSchemeError", _RewrittenScheme)
+    monkeypatch.setattr(
+        store_base, "resolve_key_provider", lambda settings, posture=None: _SchemeKeySource()
+    )
+    escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
+    assert type(escaped) is StoreCipherConfigError, type(escaped)
+    assert str(escaped) == store_base._UNTEXTED
+    _assert_no_key_byte(str(escaped))
+
+
+def test_a_failed_log_call_is_logged_with_fixed_text(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Item 5 of the seventh hold: a log call that failed vanished; a fixed ERROR line says so."""
+    real_warning = store_base.log.warning
+
+    def _warning_fails(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("synthetic: the logger failed")
+
+    monkeypatch.setattr(store_base.log, "warning", _warning_fails)
+    _with_provider(monkeypatch, _UnreadableReason(f"synthetic: {_decode_error()}"))
+    with caplog.at_level("ERROR", logger=store_base.__name__):
+        escaped = _escaping(lambda: build_store_cipher(StoreSettings()))
+    assert type(escaped) is StoreCipherConfigError, type(escaped)
+    assert store_base._LOG_FAILED in [r.getMessage() for r in caplog.records], caplog.records
+    assert real_warning is not _warning_fails

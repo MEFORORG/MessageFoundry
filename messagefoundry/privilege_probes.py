@@ -43,7 +43,6 @@ from typing import TYPE_CHECKING, Any
 from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
 from messagefoundry.exception_origin import (
     ExceptionChainTooLong,
-    engine_worded_text,
     exception_chain,
     raised_by_the_engine,
     raised_through,
@@ -211,12 +210,11 @@ def _ad_why(exc: BaseException) -> str:
 
     That guard (BACKLOG #2193) refuses with an ``InsecureHopRefused`` whose text names the hop,
     the domain controller's host and the setting that clears it, and reads no password.
-    ``provision-admin`` and ``serve`` print the same refusal whole. Here its text is kept only as
-    :func:`~messagefoundry.exception_origin.engine_worded_text` reads it; any other reads as
-    :data:`_AD_GUARD_REFUSAL`, a fixed text that names the guard and points at the refusal ``serve``
-    prints. None of the error's code runs (the fifth and sixth holds on engine PR 2818): the class
-    is tested with ``type``, never ``isinstance``, which reads ``__class__``, and ``str(exc)``,
-    whose ``__str__`` can raise or print a byte, is never called.
+    ``provision-admin`` and ``serve`` print the same refusal whole. Here it reads as
+    :data:`_AD_GUARD_REFUSAL`, a fixed text naming the guard and its setting, which reads nothing
+    from the error (the seventh hold on engine PR 2818): the class is tested with ``type``, never
+    ``isinstance``, which reads ``__class__``, and neither its text, arguments nor class name is
+    read. The traceback test runs guarded: if it raises, the refusal reads as its type name.
 
     The test is an ``InsecureHopRefused`` whose traceback passes through
     ``auth.ldap._refuse_ad_revocation`` (:func:`raised_through`). So it accepts one raised by
@@ -227,19 +225,22 @@ def _ad_why(exc: BaseException) -> str:
     from messagefoundry.auth.ldap import _refuse_ad_revocation
     from messagefoundry.config.tls_policy import InsecureHopRefused
 
-    if issubclass(type(exc), InsecureHopRefused) and raised_through(
-        exc, _refuse_ad_revocation.__code__
-    ):
-        text = engine_worded_text(exc, InsecureHopRefused)
-        return _AD_GUARD_REFUSAL if text is None else strip_control_chars(text)
-    return _why(exc)
+    if not issubclass(type(exc), InsecureHopRefused):
+        return _why(exc)
+    try:
+        through_the_guard = raised_through(exc, _refuse_ad_revocation.__code__)
+    except Exception:  # noqa: BLE001 -- a traceback that cannot be read is not the guard's
+        logger.warning("AD probe: a hop refusal's traceback could not be read; named by its type")
+        return "InsecureHopRefused"
+    return _AD_GUARD_REFUSAL if through_the_guard else _why(exc)
 
 
-#: What the AD probe says of a hop refusal raised through the LDAPS revocation guard whose text it
-#: does not keep (:func:`_ad_why`).
+#: What the AD probe says of a hop refusal raised through the LDAPS revocation guard
+#: (:func:`_ad_why`). Fixed: it reads nothing from the refusal.
 _AD_GUARD_REFUSAL = (
-    "InsecureHopRefused: the LDAPS bind to AD was refused while its revocation guard ran; the "
-    "refusal serve prints names the hop and how to clear it"
+    "InsecureHopRefused: the LDAPS bind to AD checks no certificate revocation and the posture "
+    "refuses it; set [auth].ad_tls_crl_file to a CRL from the CA that issues the domain "
+    "controller's certificate (the refusal serve prints names the host)"
 )
 
 
