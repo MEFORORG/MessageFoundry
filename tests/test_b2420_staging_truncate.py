@@ -1053,6 +1053,25 @@ def test_a_lone_surrogate_in_the_name_is_spelled_and_does_not_raise(
     path = f"('' + {dr_backup._ps_literal(head)} + [char]0xDC80 + {dr_backup._ps_literal(tail)})"
     assert dr_backup._ps_path(verbatim) == path
     _head(refusal, path)
+    assert f"Remove-Item -LiteralPath {path} -Recurse -Force ;" in refusal
+
+
+def test_a_lone_surrogate_in_the_name_does_not_raise_from_the_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback, for a path that cannot be formed, names the directory through `_ps_path` too,
+    outside any guard. Red before the fix: the surrogate raised there, out of a function that must
+    never raise."""
+    name = "mefor-backup-\udc80."
+
+    def _refuse(path: Path) -> str:
+        raise OSError("synthetic: the verbatim path cannot be formed")
+
+    monkeypatch.setattr(dr_backup, "_win_verbatim", _refuse)
+    refusal = _refusal_for(name, tmp_path, monkeypatch)
+    assert refusal.isprintable()
+    assert "it is named ('' + 'mefor-backup-' + [char]0xDC80 + '.')" in refusal
+    assert "Remove-Item" not in refusal
 
 
 def test_a_caller_adds_its_text_before_the_check(

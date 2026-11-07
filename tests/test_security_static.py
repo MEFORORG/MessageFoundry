@@ -684,6 +684,25 @@ _UNSCANNABLE_RE_PATTERNS = {
     "messagefoundry/uploads.py": (
         r"f'^\\.[0-9a-f]{{32}}(?:{re.escape(_BLOB_SUFFIX)}|{re.escape(_META_SUFFIX)})\\.[0-9a-f]{{{_TMP_TOKEN_BYTES * 2}}}\\.tmp\\Z'",
     ),
+    # BACKLOG #2420 -- the DR staging refusal's trailing checks. Unresolvable BY CONSTRUCTION: the
+    # matcher that finds the checks ending a message is spliced from the constants the refusal
+    # names its lead, its check and its quotes with (_CHECKS_LEAD, _TEST_PATH, _PS_QUOTES), so
+    # those three cannot drift between the text and the split. Writing them out as literals would
+    # restore static scannability and lose that coupling. The rest is NOT coupled: the [char]
+    # spelling, the parentheses and ' + ' of _ps_path, and the ' ; ' join_before_checks writes are
+    # spelled on both sides by hand and can drift apart. The shape is non-catastrophic by
+    # inspection: a literal lead, then checks joined by the literal ' ; ', anchored at \Z. A check
+    # opens with the literal 'Test-Path -LiteralPath ' and is one quoted literal or one
+    # parenthesised run of parts joined by ' + '. A quoted literal is one quote, then a run whose
+    # branches are a non-quote class and a doubled quote, which cannot both match at one position,
+    # then one quote. A [char] part is fixed width. The repetitions nest. Backtracking can close a
+    # quoted run at the first quote of a doubled pair, but a closing quote must be followed by
+    # ' ; ', ' + ', ')' or the end, and the second quote of the pair is none of them, so that split
+    # fails at the next character. The caller uses the unanchored ``.search``, which starts again
+    # only where the literal lead occurs.
+    "messagefoundry/pipeline/dr_backup.py": (
+        "f'{re.escape(_CHECKS_LEAD)}({_CHECK}(?: ; {_CHECK})*)\\\\Z'",
+    ),
     # BACKLOG #1142 -- the icacls line-1 path echo. Unresolvable BY CONSTRUCTION: the pattern is built
     # from the trust-anchor path being checked, which is runtime configuration, so there is no literal
     # to write. The per-character template is written inside the call, so it is part of this pin and
@@ -695,22 +714,6 @@ _UNSCANNABLE_RE_PATTERNS = {
     # reason: there is nothing after the group to retry against. No nested quantifier and no
     # backtracking. The caller uses the anchored ``.match``, which this scanner does not read; a
     # switch to ``.search`` would re-walk the path part at every start position.
-    # BACKLOG #2420 -- the DR staging refusal's trailing checks. Unresolvable BY CONSTRUCTION: the
-    # matcher that finds the checks ending a message is spliced from the SAME constants the refusal
-    # WRITES them with (_CHECKS_LEAD, _TEST_PATH, and the _PS_LITERAL / _PS_PART spellings
-    # _ps_literal and _ps_path produce), so it cannot drift from the text it splits. Writing them
-    # out as literals would restore static scannability and lose that coupling. The shape is
-    # non-catastrophic by inspection: a literal lead, then checks joined by the literal ' ; ',
-    # anchored at \Z. A check opens with the literal 'Test-Path -LiteralPath ' and is one quoted
-    # literal or one parenthesised run of parts joined by ' + '. A quoted literal is one quote,
-    # then a run whose branches are a non-quote class and a doubled quote, which cannot both match
-    # at one position, then one closing quote. A [char] part is fixed width. The repetitions nest,
-    # but every outer iteration opens on a literal separator (' ; ' or ' + ') and a quoted run can
-    # stop only at a quote that is not doubled, so an outer repetition has one way to split any
-    # prefix and there is nothing to re-walk.
-    "messagefoundry/pipeline/dr_backup.py": (
-        "f'{re.escape(_CHECKS_LEAD)}({_CHECK}(?: ; {_CHECK})*)\\\\Z'",
-    ),
     "messagefoundry/auth/trust_anchors.py": (
         r"""''.join((re.escape(ch) if ch.isascii() else '..' if ord(ch) > 65535 else '.' for ch in anchor_path)) + '(?:\\s+|$)'""",
     ),
