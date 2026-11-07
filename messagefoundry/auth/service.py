@@ -2748,6 +2748,12 @@ def _opened_totp_state(secret: str | None) -> TotpState:
     return "usable" if reason is None else "unknown"
 
 
+def _passkey_counts_nothing(cred: WebAuthnCredential) -> bool:
+    """A :data:`PasskeyCounts` that counts no passkey: a conditional write's rule where no passkey
+    can sign in, at least without the ``[webauthn]`` extra."""
+    return False
+
+
 async def lockable_account_census(
     store: AdminStore, settings: AuthSettings, *, way_past_rp_id: str | None = None
 ) -> LockableAccountCensus:
@@ -13390,30 +13396,30 @@ class AuthService:
 
         This method opens the TOTP cell ONCE, in the store's conditional write (BACKLOG #3948
         finding 13); a route that asks :meth:`must_enrol_before_rotating` first opens it once more
-        there, before the current password. The early refusal here opens none: it refuses an
-        account with no TOTP on and no passkey that counts, as :meth:`_has_way_past` would, and
-        leaves a TOTP that is on to the write's own judgement, which refuses a KNOWN refusal there.
-        The cost of that: such a refusal now comes after the argon2 hash.
+        there, before the current password. The early refusal
+        (:meth:`_refuse_rotation_without_way_past`) opens none, except on an account whose passkey
+        set did not verify: it refuses an account with no TOTP on and no passkey that counts, as
+        :meth:`_has_way_past` would, and leaves a TOTP that is on to the write's own judgement,
+        which refuses a KNOWN refusal there. The cost of that: such a refusal now comes after the
+        argon2 hash. Without the ``[webauthn]`` extra the write counts no passkey, as
+        :meth:`_has_way_past` counts none.
         """
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
             return violations
         user = await self._load_user(identity.user_id)
         covered = user is not None and self._covered_by_requirement(user, identity.roles)
-        if (
-            covered
-            and user is not None
-            and not user.totp_enabled
-            and not await self._holds_gate_passkey(user)
-        ):
-            raise FactorEnrolmentRequired()
+        if covered and user is not None:
+            await self._refuse_rotation_without_way_past(user)
         written = await self._store.set_password(
             identity.user_id,
             password_hash=await self._argon2(hash_password, new_password),
             must_change_password=must_change,
             password_generated=False,
             require_way_past=_opened_totp_state if covered else None,
-            passkey_counts=self._gate_counts,
+            # Without the [webauthn] extra no passkey can sign in, so the write counts none, as
+            # _has_way_past counts none (BACKLOG #3948).
+            passkey_counts=self._gate_counts if webauthn.available() else _passkey_counts_nothing,
         )
         if not written and covered:
             raise FactorEnrolmentRequired()
@@ -13427,6 +13433,25 @@ class AuthService:
             client=client,
         )
         return []
+
+    async def _refuse_rotation_without_way_past(self, user: VerifiedUser) -> None:
+        """The rotation's early refusal, before the argon2 hash: raise
+        :class:`FactorEnrolmentRequired` where ``user`` holds no factor with a way past that can be
+        told without opening the TOTP cell. The passkeys are read through
+        :meth:`_verified_passkeys`, as :meth:`_has_way_past` reads them, so a row that does not
+        parse is no exception and a set that fails its seal is reported. Such a set counts for
+        nothing, so only the TOTP can pass, and it is judged here, a second open of the cell, but
+        only on an account whose passkey set did not verify. Otherwise a TOTP that is on is left
+        to the write's own judgement (BACKLOG #3948 finding 13)."""
+        held: list[WebAuthnCredential] | None = []
+        if self._way_past_rp_id is not None and user.has_passkeys and webauthn.available():
+            held = await self._verified_passkeys(user)
+        if held is None:
+            if not await self._totp_way_past(user):
+                raise FactorEnrolmentRequired()
+            return
+        if not user.totp_enabled and not any(self._gate_counts(c) for c in held):
+            raise FactorEnrolmentRequired()
 
     # --- MFA: native TOTP second factor (every account, WP-14, ASVS 6.3.3) -----
 
@@ -13543,10 +13568,13 @@ class AuthService:
         return passkey_is_way_past_under(cred, self._way_past_rp_id)
 
     async def must_enrol_before_rotating(self, identity: Identity) -> bool:
-        """Whether a password change by ``identity`` would be refused with
-        :class:`FactorEnrolmentRequired` right now. The route and the console ask it FIRST, so they
-        send the holder to enrolment before asking for a password the service would then refuse.
-        The service still refuses on its own; this is a courtesy, not the control."""
+        """Whether ``identity``'s account is covered by the requirement and holds no way past the
+        sign-in lock (:meth:`_has_way_past`): no TOTP that is on and not a KNOWN refusal, and no
+        passkey the gates count. That is the predicate :meth:`change_password` applies, its write
+        on the row it locks, so the two can differ when a factor changes between them. The route
+        and the console ask it FIRST, so they send the holder to enrolment before asking for a
+        password the service would then refuse. The service still refuses on its own; this is a
+        courtesy, not the control."""
         user = await self._load_user(identity.user_id)
         return (
             user is not None

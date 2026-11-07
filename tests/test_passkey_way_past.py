@@ -2234,3 +2234,120 @@ async def test_a_passkey_row_that_does_not_parse_names_the_account_in_the_census
         assert census.passkey_only == ()
     finally:
         await store.close()
+
+
+# --- the rotation's passkey half reads as its courtesy check does (BACKLOG #3948) ----------------
+
+
+async def _refused_totp_beside_a_passkey(
+    store: MessageStore,
+) -> tuple[AuthService, Identity, list[int]]:
+    """A covered Administrator holding a discoverable passkey and a refused-marker TOTP, so only
+    the passkey can be the way past. Returns the service, the identity and a list that grows by
+    one on every argon2 hash the service runs."""
+    service = _service(store)
+    identity, token, _ = await login_admin(service)
+    await _register(service, identity, token)
+    await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
+    hashes: list[int] = []
+    argon2 = service._argon2
+
+    async def counted(fn: Any, *args: Any) -> Any:
+        hashes.append(1)
+        return await argon2(fn, *args)
+
+    service._argon2 = counted  # type: ignore[method-assign]
+    return service, identity, hashes
+
+
+async def _password_hash(store: MessageStore, user_id: str) -> str | None:
+    row = await store.get_user(user_id)
+    assert row is not None
+    return row.password_hash
+
+
+@pytest.mark.parametrize("available", [False, True], ids=["no-extra", "extra"])
+async def test_without_the_webauthn_extra_a_passkey_does_not_open_the_rotation(
+    available: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the extra no passkey can sign in, so the rotation's write counts none, as the
+    courtesy check counts none: a refused TOTP beside a discoverable passkey is refused. The
+    control: with the extra, the passkey is the way past and the rotation lands. RED when: the
+    write counts the passkey whatever the extra."""
+    from messagefoundry.auth import webauthn as wa
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, _ = await _refused_totp_beside_a_passkey(store)
+        monkeypatch.setattr(wa, "available", lambda: available)
+        assert await service.must_enrol_before_rotating(identity) is not available
+        before = await _password_hash(store, identity.user_id)
+        if available:
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+            assert await _password_hash(store, identity.user_id) != before
+            return
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert await _password_hash(store, identity.user_id) == before
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("corrupt", [True, False], ids=["malformed", "control"])
+async def test_a_passkey_row_that_does_not_parse_refuses_the_rotation_before_the_hash(
+    corrupt: bool,
+) -> None:
+    """The rotation reads the passkey set through the service's verified read, so a row that does
+    not parse counts for nothing and is never an exception: beside a refused TOTP the change is
+    the enrolment refusal, before any argon2 hash. The control: the same account with its row
+    intact rotates. RED when: the set is read only in the store's write, which raises after the
+    hash."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, hashes = await _refused_totp_beside_a_passkey(store)
+        if not corrupt:
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+            assert hashes == [1]
+            return
+        await _corrupt_passkey_rows(store, identity.user_id, "not json")
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert hashes == [], "the refusal came after the argon2 hash"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("tampered", [True, False], ids=["tampered", "control"])
+async def test_a_passkey_set_that_fails_its_seal_is_reported_by_the_rotation(
+    tampered: bool, tmp_path: Path
+) -> None:
+    """A passkey set that fails the digest its account's seal covers counts for nothing, and the
+    rotation reports it, as every verified passkey read does: a refused TOTP beside it is the
+    enrolment refusal, with an integrity audit row naming the passkey set. The control: an intact
+    set writes no such row and the rotation lands. RED when: the set is judged only in the store's
+    write, which refuses without a report."""
+    from messagefoundry.store.crypto import generate_key, make_cipher
+
+    store = await MessageStore.open(
+        tmp_path / "keyed.db", cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+        assert store.row_sealer() is not None, "the arm needs a keyed store"
+        service, identity, _ = await _refused_totp_beside_a_passkey(store)
+        before = len(await store.list_audit(limit=500))
+        if tampered:
+            await store._db.execute("UPDATE webauthn_credentials SET label = 'outside-the-store'")
+            await store._db.commit()
+            with pytest.raises(FactorEnrolmentRequired):
+                await service.change_password(identity, _NEW_PASSWORD)
+        else:
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+        reported = [
+            json.loads(detail)
+            for action, detail in await _audit_rows(store, before)
+            if action == "integrity.authority_seal_failed"
+        ]
+        expected = [{"kind": "passkeys", "user_id": identity.user_id}] if tampered else []
+        assert reported == expected
+    finally:
+        await store.close()
