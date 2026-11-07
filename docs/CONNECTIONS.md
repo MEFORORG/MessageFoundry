@@ -512,9 +512,12 @@ is listed.
 loaded CA whose key signed the leaf, found by signature and never by the leaf's issuer field alone,
 so a second CA in `tls_ca_file` that issues a listed name is refused. A leaf signed by an
 intermediate the client sends counts only when that intermediate is itself loaded in `tls_ca_file`.
-At start the listener warns about a key naming no loaded CA, or naming two with one subject and
-different keys; no sender is admitted under such a key. The HTTP listener's `intake_client_subjects`
-row above says the same, at more length.
+At start the listener warns about a key naming no loaded certificate the map can name, or naming
+two with one subject and different keys; no sender is admitted under such a key. The start can also warn about, or refuse,
+the `tls_ca_file` itself: which loaded certificates the map can name, and the start checks and
+warnings, are stated once, in the HTTP intake row of
+[SECURITY.md](SECURITY.md#table-b--data-plane-ingest-listeners). The HTTP listener's
+`intake_client_subjects` row above says the same, at more length.
 
 **What a refused sender gets.** The connection completes its TLS handshake, then the listener reads
 from the sender and hands each message that read completed to the engine's refusal, which records
@@ -870,7 +873,7 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `intake_api_key` | — | the credential for `api_key`/`bearer` — a **secret**, `env()` only (a literal, a `default=` or a `cast=` is refused at the factory). |
 | `intake_api_key_next` | — | rotation slot, accepted **alongside** `intake_api_key` so a partner key rotates with no outage: set it, have the partner cut over, promote it, then clear it. Leaving it set keeps a retired credential live. |
 | `intake_api_key_header` | `"x-api-key"` | which header carries the `api_key` credential. A header **name**, not a secret. |
-| `intake_client_subjects` | — | `mtls_subject` allow-list, **keyed by the CA that issues each partner's certificate**: a table whose keys are issuing-CA DNs and whose values are lists of **qualified** subject names, `"CN:partner.example"` / `"SAN:DNS:partner.example"`. In TOML, `[inbound.settings.intake_client_subjects]` then `'CN=Acme Partner CA,O=Acme' = ["CN:partner.example"]`; in code, `intake_client_subjects={"CN=Acme Partner CA,O=Acme": ["CN:partner.example"]}`. A subject is admitted only when the CA under its key signed the leaf, found by signature and never by the leaf's issuer field alone, so a certificate with a listed subject is refused `403` when the loaded CA that signed it is not the one the subject is listed under (vault BACKLOG #2287). **Only a CA loaded from `tls_ca_file` counts**: a leaf signed by an intermediate the client sends is refused unless that intermediate is itself loaded in `tls_ca_file`. To admit one, load the intermediate beside the root that signed it (the listener does not accept a partial chain) and key its subjects by the intermediate's DN. Write the key as `cryptography`'s `Name.rfc4514_string()` renders the CA's subject, single-quoted in TOML; a key that does not round-trip to itself is refused naming the form to write, and the old flat list is refused at load. At start the listener warns about a key naming no loaded CA, or naming two with one subject and different keys (as during a key rollover); no certificate is admitted under such a key until one of the two leaves `tls_ca_file`. Only `mtls_subject` reads the table, so setting it under any other `intake_auth` is refused. Qualifying the namespace is what stops a spoofed commonName colliding with a pinned SAN; a bare `partner.example` is refused at the factory rather than silently matching nothing. [ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md), amendment 2026-10-30, has the reasoning. |
+| `intake_client_subjects` | — | `mtls_subject` allow-list, **keyed by the CA that issues each partner's certificate**: a table whose keys are issuing-CA DNs and whose values are lists of **qualified** subject names, `"CN:partner.example"` / `"SAN:DNS:partner.example"`. In TOML, `[inbound.settings.intake_client_subjects]` then `'CN=Acme Partner CA,O=Acme' = ["CN:partner.example"]`; in code, `intake_client_subjects={"CN=Acme Partner CA,O=Acme": ["CN:partner.example"]}`. A subject is admitted only when the CA under its key signed the leaf, found by signature and never by the leaf's issuer field alone, so a certificate with a listed subject is refused `403` when the loaded CA that signed it is not the one the subject is listed under (vault BACKLOG #2287). **Only a CA loaded from `tls_ca_file` counts**: a leaf signed by an intermediate the client sends is refused unless that intermediate is itself loaded in `tls_ca_file`. To admit one, load the intermediate beside the root that signed it (the listener does not accept a partial chain) and key its subjects by the intermediate's DN. Write the key as `cryptography`'s `Name.rfc4514_string()` renders the CA's subject, single-quoted in TOML; a key that does not round-trip to itself is refused naming the form to write, and the old flat list is refused at load. At start the listener warns about a key naming no loaded certificate the map can name, or naming two with one subject and different keys (as during a key rollover); no certificate is admitted under such a key until one of the two leaves `tls_ca_file`. The start can also warn about, or refuse, the `tls_ca_file` itself: which loaded certificates the map can name, and the start checks and warnings, are stated once, in the HTTP intake row of [SECURITY.md](SECURITY.md#table-b--data-plane-ingest-listeners). Only `mtls_subject` reads the table, so setting it under any other `intake_auth` is refused. Qualifying the namespace is what stops a spoofed commonName colliding with a pinned SAN; a bare `partner.example` is refused at the factory rather than silently matching nothing. [ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md), amendment 2026-10-30, has the reasoning. |
 | `intake_auth_health` | `"require"` | whether `GET`/`HEAD` health probes must authenticate too. **`"allow"` is a real exemption**: it hands anyone who can reach the socket an unauthenticated "is MessageFoundry up, and where" oracle. Set it only when a load-balancer check cannot carry the credential. It applies under `api_key` and `bearer` only: under `mtls_subject` the certificate is checked at accept, before the method is read, so a probe still needs a listed certificate. |
 | `intake_auth_rate_limit` | `10` | **failed** intake-auth attempts per minute per peer, then `429` + `Retry-After`. A *successful* authentication never consumes budget, so this bounds guessing without capping throughput. `None`/`0` disables. |
 | `intake_auth_rate_limit_global` | `60` | **failed** attempts per minute across all peers. Consulted only for peers with no successful authentication in the window, so one attacker cannot `429` an authenticated partner. `None`/`0` disables. |
@@ -2271,7 +2274,37 @@ Two limits follow from this:
 - **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
   libpq still reads its CA from its default location or from the `PGSSLROOTCERT` environment
-  variable of the service.
+  variable of the service. The engine checks that file when it builds a psqlODBC connection
+  (BACKLOG #3090). It skips the check when `SSLmode` is `disable` or unset, because psqlODBC
+  then sends `disable` to libpq. It checks the file as it checks an `sslca`. So it refuses the
+  build in at least these cases:
+  - the file holds an encryption header or a private key;
+  - the path names another host;
+  - the engine can `stat` the file, but cannot read it, or it is over 1 MiB.
+
+  Off Windows, a `stat` failure that says no file is there, or that libpq could not `stat` it
+  either, is left to libpq, which loads no such file. That covers at least a missing name, a path
+  through a file, a name too long, a link loop and a permission denial. Other `stat` failures are
+  refused unless they say no file is there, at least an I/O fault such as `EIO`, `ETIMEDOUT` or
+  `ESTALE`. libpq stats the file again at every connect, so it may load the file once the fault
+  clears. A network fault the system reports as a denial or as a missing name is still left.
+
+  On Windows, the host check first walks the path, reading each name in it, before the file
+  itself is judged. The walk refuses at least a folder in the path the system could not read or
+  resolve, as on a denial or a device, sharing or network fault, and then says the file could not
+  be read. It also refuses at least a chain of links it will not follow further, a path through a
+  file and a share Windows could not reach, saying the file must be a plain local path, not a
+  share, a network drive, a link to one, or a path the check cannot read. A denial or fault on the
+  file's own name can pass the walk, since Windows answers it from the folder's listing; the
+  read then refuses it as a file that could not be read. A missing name, other than such a share,
+  ends the walk and is left to libpq.
+
+  The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
+  application-data folder. Elsewhere it is under `~/.postgresql`. The engine finds this home as
+  libpq 15 and later do. Another libpq version may read a different home. With libpq 16 and
+  later, `PGSSLROOTCERT=system` names no file, so the engine reads nothing. The check reads the
+  environment of the process that builds. So `messagefoundry check` judges its own machine's file.
+  The check runs at build, not at each connect. No ACL check covers the file.
 
 ##### Values on the generic dialect
 
@@ -4464,8 +4497,10 @@ Facts that are easy to get wrong, stated plainly first:
   **Two session writes wait longer, on purpose (BACKLOG #2283 on Postgres, #3023 on SQL
   Server).** `rotate_session` and `revoke_user_sessions` mostly run after their caller's own change
   has committed: a password reset, a disable, a role change, a completed second factor. Nothing
-  retries them, so a pool shortage at the ordinary limit would fail them after that change. Callers
-  with no earlier write, such as "sign out everywhere else", wait the same way.
+  retries a rotation, and the auth service runs a revoke again only within a short budget (vault
+  BACKLOG #3023), which one SQL Server pool wait uses up, so a pool shortage at the ordinary limit
+  would fail them after that change. Callers with no
+  earlier write, such as "sign out everywhere else", wait the same way.
 
   - On **SQL Server** they wait up to **2 times `acquire_timeout`**, 60 s at the default, and then
     raise `StoreAcquireTimeout` like any other borrow. The wait is still bounded. The limit comes
@@ -4481,8 +4516,10 @@ Facts that are easy to get wrong, stated plainly first:
 
   On both, `[store].command_timeout` still bounds the statement unless it is set to 0, and a lost
   connection still fails it. An HTTP request's own deadline still cancels the wait, and a cancelled
-  wait writes nothing and records nothing. A revoke that fails leaves the account's other sessions
-  unrevoked, and the change's own audit row and notice are lost with it. A rotation that fails,
+  wait writes nothing and records nothing. A revoke the store refuses after a committed change is
+  run again within a bounded budget, and one the service gives up on is recorded, as
+  [SECURITY.md](SECURITY.md) states; it leaves the account's other sessions unrevoked, and the
+  change's own audit row and notice are lost with it. A rotation that fails,
   including one that reached the SQL Server limit, is answered as a lost session: the old session
   is revoked, best effort, an `auth.session_rotation_failed` row with reason `store_error` records
   in `revokes_landed` whether every revoke landed, and the caller signs in again. The same callers
@@ -4769,7 +4806,7 @@ reading this page already applies to a file the scan never opened.
 | SFTP (remote-file) | 30 s on the TCP connect, the SSH banner exchange and authentication (`timeout`, `banner_timeout` and `auth_timeout` on `paramiko.SSHClient.connect`), plus 120 s on opening the SFTP session (BACKLOG #1936), on **each read** from the established SFTP channel, and on each step of an upload that stops making progress (BACKLOG #2082). All are hard-coded in `transports/remotefile.py`; `Sftp()` exposes no timeout argument, so none is operator-configurable. The bounds are **not complete**: the "Timeouts are per-connector, not universal" paragraph under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) says what each covers and where a gap is left | the `paramiko` session is closed in `finally` per poll or delivery | **Delivery:** at connect, a rejected host key is **permanent**, and an authentication refusal is permanent and flagged as a credential fault. A banner, key-exchange or authentication timeout, a connection dropped before the key exchange completes, and an `OSError`/`EOFError` are transient (BACKLOG #1999; the bullet under [Remote file](#remote-file--sftp--ftp) says where the rules are stated). After connect, a missing remote path is permanent, and at least the session-open and read timeouts are transient. With `validate_directory` on, the pre-upload directory check re-raises any failure but a credential refusal as transient, these included. A write that stops making progress for 120 s (`SFTP_WRITE_STALL_SECONDS`, per step, BACKLOG #2082), an `EOFError` and a helper thread that cannot start are transient; a `paramiko.SFTPError` is permanent. **Source:** the poller does not act on that split; a failed connect, listing or retrieve is logged and tried again on the next poll | `RetryPolicy` |
 | FTP / FTPS (remote-file) | 30 s **whole-socket** — the same hard-coded module fallback, handed to `ftplib.FTP_TLS(timeout=…)` / `ftplib.FTP(timeout=…)`, which sets it on the control **and** data connections. `Ftp()` exposes no timeout argument, so it is **not** operator-configurable | the `ftplib` session is closed in `finally` per poll or delivery | `ftplib.all_errors` maps to transient, with at least two exceptions: a 5xx reply, and a 4xx at the login that names the credential. While the session opens, both are classed as the bullet under [Remote file](#remote-file--sftp--ftp) states (BACKLOG #2083). After it opens, a 5xx is permanent | `RetryPolicy` |
 | Reference-set sync (`FileRef`) | **none engine-owned** — filesystem / SMB-redirector I/O, the same posture as the File connector | the file handle is context-managed and closed per pass | a load error is logged and the previous encrypted snapshot is retained | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
-| REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed. A Digest challenge the engine will not answer (`auth-challenge-refused`, ADR 0095 Amendment B) and a send-time hop refusal (`insecure-hop-refused`) are configuration faults: under the default `credential_fault_policy` the lane stops and the queue stays. A 2xx reply body that is over the bound, cut short or misframed is never sent again; the *A 2xx reply over the byte bound* table under REST says whether it is delivered or refused | `RetryPolicy`; the finite `retry_max_attempts` default is what a synchronous feed needs — **keep it and set a short `timeout_seconds`** |
+| REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed. A Digest challenge the engine will not answer, on the delivery or the token hop (`auth-challenge-refused`, ADR 0095 Amendment B; on an `https://` token endpoint, a Digest proxy's 407 to the `CONNECT`), and a send-time hop refusal (`insecure-hop-refused`) are configuration faults: under the default `credential_fault_policy` the lane stops and the queue stays. A 2xx reply body that is over the bound, cut short or misframed is never sent again; the *A 2xx reply over the byte bound* table under REST says whether it is delivered or refused | `RetryPolicy`; the finite `retry_max_attempts` default is what a synchronous feed needs — **keep it and set a short `timeout_seconds`** |
 | SOAP destination | `timeout_seconds` 30 s | as REST | as REST | as REST |
 | FHIR destination + `fhir_lookup` | `timeout_seconds` 30 s on both (the lookup carries its own per-connection value), plus the same 30 s Handler-side result bridge (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker without cancelling the in-flight request | as REST; the lookup runs on the thread executor and returns the connection immediately | the destination as REST, configuration faults and the 2xx reply rule included; a lookup failure, a refused Digest challenge among them, raises into the Handler and fails the message — never a silent empty result | destination: `RetryPolicy`. `fhir_lookup`: **single-shot, no retry** |
 | DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent; the two configuration faults and the 2xx reply rule as REST (a web proxy's Digest challenge only, since DICOMweb has no origin Digest) | `RetryPolicy` |
@@ -4790,7 +4827,7 @@ reading this page already applies to a file the scan never opened.
 | Kerberos / SPNEGO SSO (`kerberos_spn`) | **none engine-owned** — the OS provider owns any KDC timeout | the SPNEGO context is per-request | a failed step raises `LdapError` and audits a login reject | **single-shot**, single-leg — no NTLM fallback, no multi-leg handshake |
 | OIDC IdP — token endpoint (`oidc_token_endpoint`) | 10 s — `auth/oidc/flow.py`'s **own** `exchange_code(timeout=…)` default (`AuthService._oidc_exchange` passes none). The JWKS leg's 10 s is a **separate** literal, `oidc_http.DEFAULT_IDP_TIMEOUT_SECONDS`; the two coincide but are independent | the response is context-managed; the body is size-capped | a non-200 or oversize body fails the login closed | **single-shot** — one POST per login |
 | OIDC IdP — JWKS fetch (`oidc_jwks_uri`) | 10 s — `oidc_http.DEFAULT_IDP_TIMEOUT_SECONDS`, the constant `jwks_fetcher` is the only consumer of | the response is context-managed; the size cap is enforced on the socket read | a fetch failure fails verification closed | **single-shot**, further damped by the refetch floor |
-| SMART token endpoint (`smart_token_url`) | `smart_timeout_seconds` 30 s | the response is context-managed; the token is cached in memory | a mint failure fails the delivery | **single-shot** — re-minted only on the next attempt or a `401` |
+| SMART token endpoint (`smart_token_url`) | `smart_timeout_seconds` 30 s | the response is context-managed; the token is cached in memory | a mint failure fails the delivery; a web proxy's Digest challenge the engine will not answer, met on the mint, is `auth-challenge-refused`, as on the REST row | **single-shot** — re-minted only on the next attempt or a `401` |
 | OAuth2 token endpoint (`oauth2_token_url`) | `oauth2_timeout_seconds` 30 s | as SMART | as SMART | **single-shot** |
 | AI broker (`[ai].endpoint`) | 60 s — a **hard-coded module constant, not operator-configurable** (`[ai]` has no timeout field) | the response is context-managed; the call runs off the event loop via `to_thread` | a mis-configuration, an un-allowlisted host, or an HTTP error raises to the API route | **single-shot** — one POST per assist, no retry |
 | DR backup destination (`[backup].destination`, ADR 0049) | **no engine-owned timeout** — filesystem / SMB-redirector I/O, the same posture as the File connector | handles are context-managed; the archive is fsync'd, then verified, and only then renamed onto its canonical name | a failed or verify-failed run is logged + audited and keeps a `.failed` name, so it is never a keep-N candidate — in that prune or any later one (ADR 0049) | **single-shot per scheduled pass** — retried only by the next daily pass |

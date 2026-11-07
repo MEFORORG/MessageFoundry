@@ -189,8 +189,10 @@ def test_a_hand_start_with_no_stderr_does_not_run_under_either_variable(
     tmp_path: Path, start: Callable[[Path, str | None], str]
 ) -> None:
     """Vault BACKLOG #2914: a hand start that has no stderr does not run the stand-in under either
-    variable, and runs it when neither is set. ``docs/DANGEROUS-FUNCTIONALITY.md`` section 3 rests on
-    this test. Each fresh ``tmp_path`` subfolder holds one start, so no state carries over.
+    variable, and runs it when neither is set. ``docs/DANGEROUS-FUNCTIONALITY.md`` section 3's
+    stand-in readings rest on this test; its readings of the installed launcher were taken by hand,
+    and nothing here repeats them. Each fresh ``tmp_path`` subfolder holds one start, so no state
+    carries over.
 
     Skipped where the control shows the stand-in had a stderr anyway: such a host cannot show the
     defect, so a pass there would prove nothing. Under a variable a run is a failure, not a skip,

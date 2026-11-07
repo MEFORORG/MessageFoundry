@@ -64,6 +64,7 @@ from messagefoundry.store.store import (
     audit_row_hash,
     load_audit_chain,
 )
+from tests._log_absence import assert_capture_sees
 from tests.test_provision_first_administrator import _tty
 
 _PASSWORD = "a-long-enough-operator-passphrase"
@@ -265,6 +266,7 @@ async def test_the_flag_discriminates_keyless_by_choice_and_keyed_from_fresh(
         )
     try:
         assert fresh.audit_chain_unkeyed() is False
+        assert_capture_sees(caplog, "messagefoundry.store.store")
         assert not [r for r in caplog.records if "genesis row" in r.getMessage()]
     finally:
         await fresh.close()

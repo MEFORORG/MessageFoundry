@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.anon import (
+from messagefoundry_toolkit.anon import (
     DEFAULT_RULES,
     AnonError,
     FieldRule,
@@ -32,14 +32,14 @@ from messagefoundry.anon import (
     leak_report,
     load_rules,
 )
-from messagefoundry.anon import rules as rules_module
-from messagefoundry.anon.keying import (
+from messagefoundry_toolkit.anon import rules as rules_module
+from messagefoundry_toolkit.anon.keying import (
     MAX_SALT_BYTES,
     MIN_SALT_ENTROPY_BITS,
     MIN_SALT_LEN,
     _estimated_entropy_bits,
 )
-from messagefoundry.anon.surrogates import Seps, scrub_site_codes, surrogate_field
+from messagefoundry_toolkit.anon.surrogates import Seps, scrub_site_codes, surrogate_field
 
 # The OBX-5 allowlist below is asserted on BOTH adapters. The tee copy is a standalone vendored
 # sibling (ADR 0030 §1) that cannot import `messagefoundry`, so it is imported here by its own name.
@@ -69,7 +69,7 @@ _SEPS = Seps()
 def synthetic_site_prefix(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     """Inject a SYNTHETIC two-digit site-code prefix into the externalized detector, so the site-code
     tests exercise the real mechanism without any real prefix living in this (now-scanned) file."""
-    from messagefoundry.anon import surrogates
+    from messagefoundry_toolkit.anon import surrogates
 
     monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", "[site_prefix]\n99\n")
     surrogates.reload_site_prefixes()
@@ -312,7 +312,7 @@ def test_obx5_freetext_preserved_only_for_allowlisted_value_type() -> None:
 # --- OBX-5 preserve allowlist (both adapters) -------------------------------------------------------
 #
 # The rule, and why it is an allowlist rather than a blocklist, is stated once at
-# `messagefoundry.anon.surrogates.preserve_obx5_value`. What is pinned here is that BOTH adapters
+# `messagefoundry_toolkit.anon.surrogates.preserve_obx5_value`. What is pinned here is that BOTH adapters
 # apply it: the engine drives a parsed `Message`, the tee a pure stdlib splitter, and the two reach
 # OBX-2/OBX-5 differently, so each case runs through both. Whole-message engine/tee equality stays
 # in tests/test_anon_parity.py, which carries these fixtures in its own corpus.
@@ -770,7 +770,7 @@ def test_site_prefix_fixture_leaves_module_globals_consistent_with_the_environme
     source is actually configured, which is exactly the condition the original bug needed — and is why
     CI, which does not set one for the test job, never saw the failure.
     """
-    from messagefoundry.anon import surrogates
+    from messagefoundry_toolkit.anon import surrogates
 
     live = surrogates._SITE_PREFIXES
     surrogates.reload_site_prefixes()

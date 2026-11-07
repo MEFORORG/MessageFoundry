@@ -297,6 +297,18 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     "messagefoundry/auth/trust_anchors.py::anchor_cadata": Exempt(
         "loads a PEM into a scratch context to prove OpenSSL parses it; never handshakes"
     ),
+    "messagefoundry/pki.py::_refuse_unless_openssl_loads": Exempt(
+        "loads a client CA file into a scratch context to compare what OpenSSL took with the mTLS "
+        "issuer index (BACKLOG #4948); never handshakes"
+    ),
+    "messagefoundry/pki.py::_all_load_as_no_ca": Exempt(
+        "loads certificates into a scratch context to ask whether OpenSSL reads any as a CA "
+        "(BACKLOG #4948); never handshakes"
+    ),
+    "messagefoundry/pki.py::_openssl_reads_as_ca": Exempt(
+        "loads one certificate into a scratch context to ask whether OpenSSL reads it as a CA "
+        "(BACKLOG #4948); never handshakes"
+    ),
     "messagefoundry/config/tls_policy.py::<module>": Exempt(
         "reads the stock client security level at import; never handshakes"
     ),

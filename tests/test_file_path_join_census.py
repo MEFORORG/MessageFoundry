@@ -477,8 +477,8 @@ SITES: dict[str, Site] = {
     "messagefoundry/_child_bootstrap.py::_load_this_build": Site(
         1, INTERNAL, "A fixed name in the engine's own package directory."
     ),
-    "messagefoundry/anon/leak.py::_scanner": Site(1, INTERNAL, _PKG_LITERAL),
-    "messagefoundry/anon/surrogates.py::_resolve_token_text": Site(
+    "messagefoundry_toolkit/anon/leak.py::_scanner": Site(1, INTERNAL, _PKG_LITERAL),
+    "messagefoundry_toolkit/anon/surrogates.py::_resolve_token_text": Site(
         1, INTERNAL, "One fixed path under the folder that holds the package."
     ),
     "messagefoundry/api/tls.py::_generated_pair": Site(
@@ -652,7 +652,7 @@ SITES: dict[str, Site] = {
         "can reach the join (vault BACKLOG #2595).",
         "messagefoundry/engine_secrets.py::open_secrets_directory",
     ),
-    "messagefoundry/generators/_core.py::write_corpus": Site(
+    "messagefoundry_toolkit/generators/_core.py::write_corpus": Site(
         2,
         OPERATOR,
         "A trigger checked against the registry before the join, and a numbered file name, under "
@@ -813,6 +813,12 @@ SITES: dict[str, Site] = {
     "messagefoundry/startupcode.py::_pth_items": Site(
         1, INTERNAL, "`.pth` names from listing a site-packages directory, to inventory them."
     ),
+    "messagefoundry/store/custody.py::read_systemd_credential": Site(
+        1,
+        OPERATOR,
+        "The credential name the caller configures, refused unless it is a plain file name, under "
+        "the directory systemd names in $CREDENTIALS_DIRECTORY.",
+    ),
     "messagefoundry/store/store.py::MessageStore._db_size_bytes": Site(
         1, OPERATOR, _SQLITE_SIDECARS
     ),
@@ -821,6 +827,19 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/store/store.py::_write_closed_store": Site(
         1, OPERATOR, "A fixed SQLite sidecar suffix on the operator's store path."
+    ),
+    "messagefoundry/transports/database.py::_libpq_home": Site(
+        2,
+        INTERNAL,
+        "The fixed names `postgresql` and `.postgresql` under the engine process's own home: the "
+        "roaming application-data folder the Windows shell names, else $HOME, else the effective "
+        "user's password-file home, with `os.sep` for an empty one. No message or peer input.",
+    ),
+    "messagefoundry/transports/database.py::_libpq_root_cert": Site(
+        1,
+        INTERNAL,
+        "The fixed name `root.crt` under the libpq default home `_libpq_home` names. A set "
+        "$PGSSLROOTCERT is returned unjoined. No message or peer input.",
     ),
     "messagefoundry/transports/file.py::FileDestination._write": Site(
         1, GUARDED, _DEST_NAME, "messagefoundry/transports/file.py::render_filename", called=True

@@ -65,6 +65,7 @@ from messagefoundry.pipeline.cert_expiry import (
 from messagefoundry.pipeline.crl_reload import reload_replaced_crls
 from messagefoundry.pki import CrlSignature, judge_crl_signatures
 from messagefoundry.redaction import log_timestamp, safe_text
+from tests._log_absence import assert_capture_sees
 from tests.test_cert_expiry import _RecordingSink
 
 
@@ -843,6 +844,7 @@ def test_an_unchecked_later_crl_calls_its_log_once_and_takes_no_outer_path(
 
     assert refusal is not None and refusal[1].startswith(_CANNOT_JUDGE), refusal
     assert causes == [error], causes
+    assert_capture_sees(caplog, "messagefoundry.pipeline.cert_expiry")
     assert not [r for r in caplog.records if r.getMessage() == _SCAN_FAILED_LINE], caplog.records
 
 
