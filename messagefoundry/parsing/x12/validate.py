@@ -50,9 +50,9 @@ class X12SegmentError:
     """One conformance violation, reduced to **PHI-safe structural locators only**.
 
     ``code`` is the X12 error code pyx12 maps it to, preferring the generated ack's code list (997 AK
-    when the ack is a 997, 999 IK otherwise, e.g. ``"8"``) and taking the other list's code where
-    pyx12 has only that one, or pyx12's own error name where it maps to neither; ``message`` is a
-    synthesized, value-free description;
+    when the ack is a 997, or with no ack when the last group is 004010; 999 IK otherwise; e.g.
+    ``"8"``) and taking the other list's code where pyx12 has only that one, or pyx12's own error name
+    where it maps to neither; ``message`` is a synthesized, value-free description;
     ``segment_id`` / ``element_position`` / ``line`` / ``loop`` locate it; ``element_name`` is the
     *schema* data-element label (e.g. ``"Transaction Set Creation Date"``), never the input value."""
 
@@ -132,11 +132,28 @@ def _mute_pyx12_logger() -> None:
 
 
 def _ack_transaction(ack_text: str) -> str | None:
-    """Identify a generated ack as ``"999"`` or ``"997"`` by its ST01, structurally (no value parse)."""
-    for token in ("ST*999", "ST*997"):
-        if token in ack_text:
-            return token.split("*", 1)[1]
+    """Identify a generated ack as ``"999"`` or ``"997"`` by the ST01 of its ST segment, split with the
+    ack's own ISA separators. A substring search would misread sender text the ack echoes (a GS03
+    ``TEST`` then a GS02 ``999APP`` reads ``ST*999``)."""
+    # ISA is fixed-width: the element separator is byte 3 and the segment terminator byte 105.
+    if not ack_text.startswith("ISA") or len(ack_text) < 106:
+        return None
+    element_sep, segment_term = ack_text[3], ack_text[105]
+    for segment in ack_text.split(segment_term):
+        fields = segment.strip().split(element_sep)
+        if fields[0] == "ST" and len(fields) > 1 and fields[1] in ("997", "999"):
+            return fields[1]
     return None
+
+
+def _report_prefers_5010(report: dict[str, Any]) -> bool:
+    """The 997/999 code-list choice for a pass that generated no ack (an inbound FA, say). pyx12 picks
+    the ack from the last GS08 it walked, a 997 for ``004010``, so this follows the last group."""
+    vriic = ""
+    for interchange in report.get("interchanges", []):
+        for group in interchange.get("groups", []):
+            vriic = str(group.get("vriic") or "")
+    return not vriic.startswith("004010")
 
 
 def _segment_error(code: str, seg: dict[str, Any], err: dict[str, Any]) -> X12SegmentError:
@@ -188,8 +205,9 @@ def _flatten_errors(
 ) -> list[X12SegmentError]:
     """Walk pyx12's nested JSON error report (interchange → group → transaction → segment → element),
     flattening every recorded error into a PHI-safe :class:`X12SegmentError`. ``prefer_5010`` is False
-    only when the pass generated a 997: pyx12 picks one ack per document (from the last GS08), so the
-    codes follow that ack rather than each group's own version."""
+    when the pass generated a 997, or generated no ack and the last group is ``004010``: pyx12 picks
+    one ack per document (from the last GS08), so the codes follow that ack rather than each group's
+    own version."""
     out: list[X12SegmentError] = []
     for interchange in report.get("interchanges", []):
         # ISA-level codes are the same in the 997 and the 999 (TA1 note codes), so no version is needed.
@@ -261,7 +279,11 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     ack_text = fd_ack.getvalue().strip()
     ack = ack_text or None
     ack_transaction = _ack_transaction(ack_text) if ack else None
-    errors = tuple(_flatten_errors(report, resolve, prefer_5010=ack_transaction != "997"))
+    if ack_transaction is None:
+        prefer_5010 = _report_prefers_5010(report)
+    else:
+        prefer_5010 = ack_transaction != "997"
+    errors = tuple(_flatten_errors(report, resolve, prefer_5010=prefer_5010))
     return X12ValidationResult(
         valid=valid and not errors,
         errors=errors,

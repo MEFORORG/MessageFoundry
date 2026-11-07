@@ -344,3 +344,42 @@ def test_validate_resolves_codes_against_the_ack_it_generated(
     seen.clear()
     result = validate(_interchange("ST*837*0001*005010X222A1~", "SE*2*0001~"))
     assert result.ack_transaction == "999" and seen and all(seen)
+
+
+def test_a_997_whose_sender_text_holds_999_is_still_a_997(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The 997 echoes GS03 "TEST" then GS02 "999APP", so its GS line holds the text "ST*999"; only the ST
+    # segment's own ST01 names the ack.
+    msg = _conformant_270(dob="19431399").replace("GS*HS*SENDERAPP*RECVAPP*", "GS*HS*999APP*TEST*")
+    real = load_x12_code_resolver()
+    seen: list[bool] = []
+
+    def recording(err_cde: str, prefer_5010: bool = True) -> str | None:
+        seen.append(prefer_5010)
+        return real(err_cde, prefer_5010=prefer_5010)
+
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_code_resolver", lambda: recording)
+    result = validate(msg)
+    assert result.ack is not None and "ST*999" in result.ack
+    assert result.ack_transaction == "997"
+    assert seen and not any(seen)
+
+
+def test_a_4010_pass_with_no_ack_reports_the_4010_codes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An inbound 004010 997 (GS01 FA) gets no ack, so the code list comes from the group's GS08. A
+    # not-used segment is spliced into pyx12's real report: 004010 says "2", only the 999 says "I4".
+    isa = _ISA_270
+    gs = "GS*FA*SENDERAPP*RECVAPP*20060501*1200*1*X*004010~"
+    msg = isa + gs + "ST*997*0001~AK1*HS*1~AK9*A*1*1*1~SE*5*0001~GE*1*1~IEA*1*000000001~"
+    real_loads = _X12_VALIDATE.json_loads_or_refusal
+
+    def splice(raw: str) -> tuple[object, object]:
+        report, refused = real_loads(raw)
+        txn = report["interchanges"][0]["groups"][0]["transactions"][0]
+        bad = {"seg_id": "REF", "errors": [{"err_cde": "SEG_2_segment_not_used"}], "elements": []}
+        txn["segments"].append(bad)
+        return report, refused
+
+    monkeypatch.setattr(_X12_VALIDATE, "json_loads_or_refusal", splice)
+    result = validate(msg)
+    assert result.ack is None
+    assert [e.code for e in result.errors if e.segment_id == "REF"] == ["2"]
