@@ -465,7 +465,8 @@ def certificate_thumbprint(setting: str, certificate: str, public_key: _PublicKe
     ``certificate`` is inline PEM or a path to a PEM file, read under the signing key's rules. A
     certificate that does not parse, holds some other public key, or is outside its validity window
     is refused: a header naming a certificate the IdP will not accept fails every sign-in, so it
-    fails at startup instead. Nothing watches the window after startup."""
+    fails at startup instead. Only a path-valued OIDC client certificate is watched after startup,
+    by the cert expiry monitor (``pipeline/cert_expiry.py``, ``certs_from_settings``)."""
     material = _read_key_material(setting, certificate, kind="certificate")
     spki = serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
     cert: x509.Certificate | None = None

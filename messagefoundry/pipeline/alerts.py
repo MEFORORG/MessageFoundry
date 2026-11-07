@@ -460,7 +460,8 @@ class AlertSink(Protocol):
 
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
         """A served TLS certificate is expired or within the configured warn window. ``name`` labels
-        which cert (``"api"`` or the connection name); ``path`` is the PEM file; ``not_after`` is the
+        which cert (``"api"``, a connection name, or a setting's dotted name such as
+        ``"auth.oidc_client_certificate"``); ``path`` is the PEM file; ``not_after`` is the
         ISO expiry; ``days_remaining`` is negative once expired. No key material is read or logged.
         Emitted by the :class:`~messagefoundry.pipeline.cert_expiry.CertExpiryRunner`."""
         ...

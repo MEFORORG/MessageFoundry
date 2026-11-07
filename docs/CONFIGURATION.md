@@ -827,7 +827,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `oidc_client_private_key_password` | str | — | passphrase for an encrypted key; supply via env (`MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY_PASSWORD`). A value in the file is accepted with a WARNING at load |
 | `oidc_client_assertion_algorithm` | str | `RS256` | one of `RS256`, `PS256`, `ES256`, `RS384`, `ES384`; must match the key (ES256 needs P-256, ES384 needs P-384). `none` and HMAC algorithms are not in the set and are refused at load |
 | `oidc_client_assertion_key_id` | str | — | optional JWS `kid`, for an IdP that holds several keys for the client. A blank value, or one with leading or trailing whitespace, is refused at load |
-| `oidc_client_certificate` | str | — | optional X.509 certificate holding the signing key's public half: inline PEM or a path to a PEM file (public, not a secret). When set, every assertion carries its `x5t#S256` thumbprint, which is how an IdP that registers a certificate rather than a key finds it (Entra ID; it also recommends `PS256`). A certificate that does not parse, does not hold the key's public half, or is outside its validity window refuses to start. A running engine checks that window only at start, so given as a path it is watched by [`[cert_monitor]`](#cert_monitor) as `auth.oidc_client_certificate`, which raises a `cert_expiry` alert ahead of `notAfter` (BACKLOG #296). Inline PEM is not watched: give a path to have its expiry alerted |
+| `oidc_client_certificate` | str | — | optional X.509 certificate holding the signing key's public half: inline PEM or a path to a PEM file (public, not a secret). When set, every assertion carries its `x5t#S256` thumbprint, which is how an IdP that registers a certificate rather than a key finds it (Entra ID; it also recommends `PS256`). A certificate that does not parse, does not hold the key's public half, or is outside its validity window refuses to start. The signer checks that window only at start; [`[cert_monitor]`](#cert_monitor) says when the monitor watches it after that |
 | `oidc_client_assertion_audience` | str | `token_endpoint` | the assertion's `aud`: `token_endpoint` sends `oidc_token_endpoint` (OIDC Core section 9; Entra ID and Okta require it), `issuer` sends `oidc_issuer` for an IdP that asks for its issuer identifier. Both are pinned and allow-listed, so the assertion is never addressed anywhere else |
 | `oidc_authorization_endpoint` / `oidc_token_endpoint` / `oidc_jwks_uri` | str | — | https, **operator-pinned** (no `.well-known` discovery) |
 | `oidc_allowed_endpoints` | list[str] | `[]` | defence-in-depth host allow-list; **refused empty when enabled**; every OIDC endpoint host must be listed |
@@ -2116,8 +2116,10 @@ connecting** — a handshake can only reveal a cert that is still being presente
 carries, labelled with their dotted names and alerted as `cert_expiry` like a served cert: the SQL
 Server store pin `store.ssl_root_cert` (on the secure posture only), and
 `auth.oidc_client_certificate`, the certificate the OIDC `private_key_jwt` client assertion names
-(BACKLOG #296), whenever it is set as a path. Inline PEM in that setting is not a file and is not
-watched.
+(BACKLOG #296), when OIDC is on with `private_key_jwt` and the setting names an existing file.
+Inline PEM in that setting is not a file and is not watched. The signer reads that certificate once,
+at start, so after replacing the file restart the engine: until then the monitor reads the new file
+while every assertion still names the old certificate.
 
 **CRL files.** The same scan reads each configured CRL file and alerts when its `nextUpdate` is past
 or within `warn_days`. Past `nextUpdate`, every TLS handshake the CRL verifies fails, not only those of

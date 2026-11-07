@@ -26,6 +26,7 @@ import asyncio
 import datetime
 import gc
 import logging
+import os
 import ssl
 import time
 from collections.abc import Callable, Hashable, Mapping, Sequence
@@ -237,16 +238,26 @@ def certs_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
       ``ssl_root_cert`` is a CA bundle the driver validates itself, so it is not listed.
     - ``auth.oidc_client_certificate``, whose thumbprint each OIDC ``private_key_jwt`` client
       assertion carries (BACKLOG #296). The signer checks its validity window only at start.
-      Watched whenever set, as the ``[auth]`` CRL knobs are. Inline PEM names no file, so only a
-      path is listed; ``-----BEGIN`` is the signer's own test for inline PEM."""
+      Listed only where the signer loads it (OIDC on, ``private_key_jwt``), so a leftover value
+      raises no alert for a credential nothing sends. Inline PEM names no file, so only a path is
+      listed (``-----BEGIN`` is the signer's own test for inline PEM), and only a value naming an
+      existing file: a mis-set value, such as a bare base64 body, is never echoed into the log or
+      the inventory as a "path", the rule the signer keeps for this value (BACKLOG #1664). The
+      signer reads the file once, so the row watches the file, not the copy the signer holds."""
     certs: list[MonitoredCert] = []
     store, pin = settings.store, settings.store.ssl_root_cert
     # Only where the store sends it: an escaped weakened posture sends no pin.
     sends_pin = store.encrypt and not store.trust_server_certificate
     if store.backend is StoreBackend.SQLSERVER and sends_pin and isinstance(pin, str) and pin:
         certs.append(MonitoredCert("store.ssl_root_cert", pin))
-    oidc_cert = settings.auth.oidc_client_certificate
-    if isinstance(oidc_cert, str) and oidc_cert.strip() and "-----BEGIN" not in oidc_cert:
+    auth, oidc_cert = settings.auth, settings.auth.oidc_client_certificate
+    if (
+        auth.oidc_enabled
+        and auth.oidc_private_key_jwt
+        and isinstance(oidc_cert, str)
+        and "-----BEGIN" not in oidc_cert
+        and os.path.isfile(oidc_cert)
+    ):
         certs.append(MonitoredCert("auth.oidc_client_certificate", oidc_cert))
     return certs
 

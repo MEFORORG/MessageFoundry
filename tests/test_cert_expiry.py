@@ -800,15 +800,46 @@ def test_no_store_pin_row_without_a_sqlserver_pin(tmp_path: Path) -> None:
 # Each client assertion carries the certificate's x5t#S256 thumbprint. The signer checks its validity
 # window only when the auth service is built at start, so the monitor is what warns ahead of notAfter.
 
+#: A mis-set env() holding a bare base64 body: no header, so the signer's rule reads it as a path.
+_NOT_A_PATH = "MIIBSyntheticBase64BodyNotAPath0123456789abcdefABCDEF"
+
+
+def _oidc(
+    certificate: str | None, *, store: StoreSettings | None = None, **over: Any
+) -> ServiceSettings:
+    """Synthetic settings with OIDC on and the private_key_jwt method. Settings load never reads the
+    key or the certificate, so neither needs to exist for these rows."""
+    fields: dict[str, Any] = {
+        "ad_enabled": True,
+        "ad_server": "ldaps://dc.corp.example",
+        "ad_user_search_base": "DC=corp,DC=example",
+        "ad_bind_dn": "CN=svc,DC=corp,DC=example",
+        "ad_bind_password": "x",
+        "ad_domain": "corp.example",
+        "oidc_enabled": True,
+        "oidc_issuer": "https://idp.example",
+        "oidc_client_id": "mefor-test",
+        "oidc_authorization_endpoint": "https://idp.example/authorize",
+        "oidc_token_endpoint": "https://idp.example/token",
+        "oidc_jwks_uri": "https://idp.example/jwks",
+        "oidc_allowed_endpoints": ["idp.example"],
+        "oidc_token_endpoint_auth_method": "private_key_jwt",
+        "oidc_client_private_key": "oidc-client-key.pem",
+        "oidc_client_certificate": certificate,
+    }
+    return ServiceSettings(
+        auth=AuthSettings(**{**fields, **over}),
+        api=ApiSettings(public_origin="https://ops.example"),
+        store=store if store is not None else StoreSettings(),
+    )
+
 
 def test_the_oidc_client_certificate_is_watched_and_warns_ahead_of_not_after(
     tmp_path: Path,
 ) -> None:
     cert = tmp_path / "oidc-client.pem"
     _write_cert(cert, not_after=_REF + datetime.timedelta(days=10))
-    rows = certs_from_settings(
-        ServiceSettings(auth=AuthSettings(oidc_client_certificate=str(cert)))
-    )
+    rows = certs_from_settings(_oidc(str(cert)))
     assert rows == [MonitoredCert("auth.oidc_client_certificate", str(cert))]
     sink = _RecordingSink()
     checks = _runner(rows, sink, warn_days=30).run_once()
@@ -824,20 +855,47 @@ def test_the_oidc_client_certificate_rides_beside_the_store_pin(tmp_path: Path) 
     pin = tmp_path / "db-server.pem"
     _write_cert(pin, not_after=_REF + datetime.timedelta(days=10))
     cert = tmp_path / "oidc-client.pem"
-    settings = _store(StoreBackend.SQLSERVER, pin).model_copy(
-        update={"auth": AuthSettings(oidc_client_certificate=str(cert))}
-    )
+    _write_cert(cert, not_after=_REF + datetime.timedelta(days=10))
+    settings = _oidc(str(cert), store=_store(StoreBackend.SQLSERVER, pin).store)
     assert [mc.label for mc in certs_from_settings(settings)] == [
         "store.ssl_root_cert",
         "auth.oidc_client_certificate",
     ]
 
 
+def test_a_certificate_the_signer_never_loads_adds_no_row(tmp_path: Path) -> None:
+    # The same existing file adds no row where nothing sends it: OIDC off with a leftover value,
+    # which settings load accepts, and OIDC on with the secret method. The first test above is the
+    # positive control: the same file under private_key_jwt does add a row.
+    cert = tmp_path / "oidc-client.pem"
+    _write_cert(cert, not_after=_REF + datetime.timedelta(days=10))
+    off = ServiceSettings(auth=AuthSettings(oidc_client_certificate=str(cert)))
+    assert certs_from_settings(off) == []
+    secret = _oidc(
+        None,
+        oidc_token_endpoint_auth_method="client_secret_post",
+        oidc_client_private_key=None,
+        oidc_client_secret="synthetic-secret",
+    )
+    assert certs_from_settings(secret) == []
+
+
 @pytest.mark.parametrize(
-    "value", [None, "", "  ", "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"]
+    "value",
+    [None, "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", _NOT_A_PATH],
 )
-def test_an_inline_or_unset_oidc_client_certificate_adds_no_row(value: str | None) -> None:
-    # POSITIVE CONTROL for the tests above: unset or blank adds no row, and inline PEM, which names
-    # no file, is never handed to open() as a path.
-    settings = ServiceSettings(auth=AuthSettings(oidc_client_certificate=value))
-    assert certs_from_settings(settings) == []
+def test_an_unset_inline_or_non_file_oidc_client_certificate_adds_no_row(
+    value: str | None,
+) -> None:
+    # Inline PEM names no file and is never handed to open() as a path; neither is a value that
+    # names no file.
+    assert certs_from_settings(_oidc(value)) == []
+
+
+def test_a_mis_set_oidc_client_certificate_is_never_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.DEBUG):
+        rows = certs_from_settings(_oidc(_NOT_A_PATH))
+        _runner(rows, _RecordingSink(), warn_days=30).run_once()
+    assert _NOT_A_PATH not in caplog.text
