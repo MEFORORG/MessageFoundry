@@ -871,19 +871,22 @@ def can_add_a_file(directory: Path) -> bool | None:
     """Whether this process may create a FILE in ``directory``, as a key file's write must, or
     ``None`` when that cannot be told (PR 2804 thirteenth hold).
 
-    Windows: the directory's owner, group and access list are read and handed to the system's
-    own access check, with an impersonation copy of this process's token, asking for the
-    add-file right alone. The access list decides: no privilege is applied, so an elevated
-    token with the restore privilege, which opens the directory with backup semantics whatever
-    the list says, still answers no where the list denies add-file, as the key file's own
-    create does (PR 2804 fifteenth hold). A right to add a folder does not answer yes, as it
-    does for :func:`messagefoundry.startupcode._can_add_files`, which asks about planting
-    start-up code. Any failure to read the descriptor or run the check is ``None``. Elsewhere
-    ``os.access`` asks the kernel for write and search, with the effective ids where the
-    platform supports that.
+    Windows: the directory is opened, following a junction or link to its target as the key
+    file's create does, and the owner, group and access list are read from that handle and handed
+    to the system's own access check, with an impersonation copy of this process's token, asking
+    for the add-file right alone. The access list decides: no privilege is applied, so a token
+    with the restore privilege enabled, which opens the directory with backup semantics whatever
+    the list says, still answers no where the list denies add-file, as the key file's own create
+    does (PR 2804 fifteenth hold). A right to add a folder does not answer yes, as it does for
+    :func:`messagefoundry.startupcode._can_add_files`, which asks about planting start-up code.
+    Where the list cannot be read, because it does not grant this account the right to read it,
+    the directory is opened asking for add-file instead: access denied is no and an open is yes,
+    a yes that such a privilege can give. Any other failure is ``None``. Elsewhere ``os.access``
+    asks the kernel for write and search, with the effective ids where the platform supports that.
 
-    What it does not see, at least: the mandatory integrity label, which is not read; and a
-    thread impersonating another account, since the process token is the one checked."""
+    What it does not see, at least: the mandatory integrity label, which is not read; a thread
+    impersonating another account, since the process token is the one checked; and, on the
+    fallback open, the privilege's yes above."""
     if sys.platform != "win32":
         try:
             effective = os.access in os.supports_effective_ids
@@ -906,8 +909,32 @@ def can_add_a_file(directory: Path) -> bool | None:
         advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     except OSError:  # pragma: no cover - both are always present on win32
         return None
+    pvoid_p = ctypes.POINTER(ctypes.c_void_p)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
     kernel32.GetCurrentProcess.restype = wintypes.HANDLE
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    advapi32.GetSecurityInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+    ]
+    advapi32.GetSecurityInfo.restype = wintypes.DWORD
     advapi32.OpenProcessToken.argtypes = [
         wintypes.HANDLE,
         wintypes.DWORD,
@@ -917,13 +944,6 @@ def can_add_a_file(directory: Path) -> bool | None:
         wintypes.HANDLE,
         ctypes.c_int,
         ctypes.POINTER(wintypes.HANDLE),
-    ]
-    advapi32.GetFileSecurityW.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
     ]
     advapi32.AccessCheck.argtypes = [
         ctypes.c_void_p,
@@ -935,51 +955,84 @@ def can_add_a_file(directory: Path) -> bool | None:
         ctypes.POINTER(wintypes.DWORD),
         ctypes.POINTER(wintypes.BOOL),
     ]
-    # OWNER, GROUP and DACL: AccessCheck needs the first two present in the descriptor.
-    wanted = 0x1 | 0x2 | 0x4
-    needed = wintypes.DWORD(0)
-    advapi32.GetFileSecurityW(str(directory), wanted, None, 0, ctypes.byref(needed))
-    if not needed.value:
-        return None
-    descriptor = ctypes.create_string_buffer(needed.value)
-    if not advapi32.GetFileSecurityW(
-        str(directory), wanted, descriptor, needed, ctypes.byref(needed)
-    ):
-        return None
-    process_token = wintypes.HANDLE()
-    # TOKEN_QUERY | TOKEN_DUPLICATE
-    if not advapi32.OpenProcessToken(
-        kernel32.GetCurrentProcess(), 0x0008 | 0x0002, ctypes.byref(process_token)
-    ):
+    invalid = wintypes.HANDLE(-1).value
+
+    def open_directory(access: int) -> int | None:
+        opened: int | None = kernel32.CreateFileW(
+            str(directory),
+            access,
+            0x07,  # share read, write and delete
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS: a directory opens only with it
+            None,
+        )
+        return opened
+
+    handle = open_directory(0x00020000)  # READ_CONTROL
+    if handle is None or handle == invalid:
+        if ctypes.get_last_error() != 5:  # 5: ERROR_ACCESS_DENIED
+            return None
+        # The list is not readable to this account: ask the system for add-file directly.
+        probe = open_directory(0x0002)  # FILE_ADD_FILE, and nothing else
+        if probe is None or probe == invalid:
+            return False if ctypes.get_last_error() == 5 else None
+        kernel32.CloseHandle(probe)
+        return True
+    descriptor = ctypes.c_void_p()
+    try:
+        # OWNER, GROUP and DACL: AccessCheck needs the first two present in the descriptor.
+        status = advapi32.GetSecurityInfo(
+            handle,
+            1,  # SE_FILE_OBJECT
+            0x1 | 0x2 | 0x4,
+            None,
+            None,
+            None,
+            None,
+            ctypes.byref(descriptor),
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+    if status != 0 or not descriptor.value:
         return None
     try:
-        checked = wintypes.HANDLE()
-        # SecurityImpersonation: AccessCheck takes an impersonation token, never a primary one.
-        if not advapi32.DuplicateToken(process_token, 2, ctypes.byref(checked)):
+        process_token = wintypes.HANDLE()
+        # TOKEN_QUERY | TOKEN_DUPLICATE
+        if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(), 0x0008 | 0x0002, ctypes.byref(process_token)
+        ):
             return None
         try:
-            # The file generic rights, so any generic entry maps as a file's would.
-            mapping = _GenericMapping(0x120089, 0x120116, 0x1200A0, 0x1F01FF)
-            privileges = ctypes.create_string_buffer(256)
-            privileges_size = wintypes.DWORD(256)
-            granted = wintypes.DWORD(0)
-            allowed = wintypes.BOOL(False)
-            if not advapi32.AccessCheck(
-                descriptor,
-                checked,
-                0x0002,  # FILE_ADD_FILE, and nothing else
-                ctypes.byref(mapping),
-                privileges,
-                ctypes.byref(privileges_size),
-                ctypes.byref(granted),
-                ctypes.byref(allowed),
-            ):
+            checked = wintypes.HANDLE()
+            # SecurityImpersonation: AccessCheck takes an impersonation token, never a primary.
+            if not advapi32.DuplicateToken(process_token, 2, ctypes.byref(checked)):
                 return None
-            return bool(allowed.value) and bool(granted.value & 0x0002)
+            try:
+                # The file generic rights, so any generic entry maps as a file's would.
+                mapping = _GenericMapping(0x120089, 0x120116, 0x1200A0, 0x1F01FF)
+                privileges = ctypes.create_string_buffer(256)
+                privileges_size = wintypes.DWORD(256)
+                granted = wintypes.DWORD(0)
+                allowed = wintypes.BOOL(False)
+                if not advapi32.AccessCheck(
+                    descriptor,
+                    checked,
+                    0x0002,  # FILE_ADD_FILE, and nothing else
+                    ctypes.byref(mapping),
+                    privileges,
+                    ctypes.byref(privileges_size),
+                    ctypes.byref(granted),
+                    ctypes.byref(allowed),
+                ):
+                    return None
+                return bool(allowed.value) and bool(granted.value & 0x0002)
+            finally:
+                kernel32.CloseHandle(checked)
         finally:
-            kernel32.CloseHandle(checked)
+            kernel32.CloseHandle(process_token)
     finally:
-        kernel32.CloseHandle(process_token)
+        kernel32.LocalFree(descriptor)
 
 
 def key_directory_volume_problem(directory: Path) -> str | None:

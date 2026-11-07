@@ -103,6 +103,7 @@ from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
     CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS,
+    STORE_MARKER_TABLES,
     UPLOAD_RESERVATION_STALE_AFTER,
     ConnectionFlagLockTimeout,
     Row,
@@ -2206,16 +2207,16 @@ class PostgresStore:
     async def schema_meta_anywhere(
         cls, settings: StoreSettings, *, posture: HopPosture | None = None
     ) -> bool | None:
-        """Whether a schema this connection's search_path names holds a ``schema_meta`` table or
-        any other table the store builds (PR 2804 fourteenth and fifteenth holds), or ``None`` when
-        that cannot be shown. The path is ``db_schema`` when it is set, else the role's own path,
-        read by :func:`_search_path_schemas`; an element it cannot read as one schema name is
-        ``None``. Names reach the catalog through ``::name``, which truncates as Postgres does.
+        """Whether a schema this connection's search_path names holds one of
+        :data:`STORE_MARKER_TABLES` (PR 2804 fourteenth and fifteenth holds), or ``None`` when that
+        cannot be shown. The path is ``db_schema`` when it is set, else the role's own path, read
+        by :func:`_search_path_schemas`; an element it cannot read as one schema name, or a path
+        that names none, is ``None``. Names are bound as ``text[]`` and cast to ``name[]`` in SQL,
+        which truncates as Postgres does, where a bound ``name`` too long is refused.
         Read from ``pg_catalog.pg_class``, which lists every relation to every role whatever its
         schema privileges, where ``to_regclass`` skips a schema the role has no USAGE on. A schema
         the path does not name, such as another install's ``db_schema``, is not asked. A missing
         row is ``None``. Reads only."""
-        tables = sorted({"schema_meta", *_declared_schema().columns})
         async with (
             cls._one_connection_store(settings, posture=posture) as store,
             store._timed_acquire() as conn,
@@ -2226,15 +2227,15 @@ class PostgresStore:
             if setting is None:
                 return None
             schemas = _search_path_schemas(str(setting["path"]), str(setting["who"]))
-            if schemas is None:
+            if not schemas:
                 return None
             row = await conn.fetchrow(
                 "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c"
                 " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
-                " WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::name[])"
-                " AND c.relname = ANY($2::name[])) AS found",
+                " WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1::text[]::name[])"
+                " AND c.relname = ANY($2::text[]::name[])) AS found",
                 schemas,
-                tables,
+                list(STORE_MARKER_TABLES),
             )
         if row is None or row["found"] is None:
             return None

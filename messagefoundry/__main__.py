@@ -8823,6 +8823,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         for a store schema there that the login cannot reach, and for a catalog it cannot show:
         neither is minted over. What the catalog read cannot see, at least, is in
         :func:`~messagefoundry.store.base.server_store_schema_found_anywhere`."""
+        from messagefoundry.config.settings import StoreBackend
         from messagefoundry.store import base as store_base
         from messagefoundry.store.base import store_connect_errors, store_driver_errors
         from messagefoundry.store.custody_host import HostCustodyRefused
@@ -8840,19 +8841,28 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 "again"
             ) from unread
         if anywhere is None:
+            if settings.store.backend is StoreBackend.POSTGRES:
+                why = (
+                    "the search_path names no schema, or a schema name this check does not read, "
+                    "so no key was minted. Set [store].db_schema, or the role's search_path when "
+                    "it is not set, to a plain lower-case schema name, then run the command again"
+                )
+            else:
+                why = (
+                    "the view definition permission on the login's default schema and on dbo is "
+                    "not shown as held, so no key was minted. Grant this login that permission on "
+                    "both, or run with a login that holds it, then run the command again"
+                )
             raise HostCustodyRefused(
                 "this login reads no store in the database, but cannot show that none is there: "
-                "on SQL Server, the view definition permission on its default schema and on dbo is "
-                "not shown as held, and on PostgreSQL the search_path holds a name this check does "
-                "not read, so no key was minted. Grant that permission there, or set a plain "
-                "search_path, or run with a login that holds it, then run the command again"
+                f"{why}"
             )
         if anywhere:
             raise HostCustodyRefused(
-                "the schemas this login resolves hold store tables (schema_meta or another) that "
-                "the login cannot reach, so no key was minted over it. Grant this login that "
-                "store's schema, or point [store] at a new database or schema, then run the "
-                "command again"
+                "the schemas this login resolves hold tables this store builds, which its open "
+                "did not read as a store: a store this login cannot reach, or one partly created. "
+                "No key was minted over them. Grant this login that store's schema if it is one, "
+                "or point [store] at a new database or schema, then run the command again"
             )
         return "none"
 

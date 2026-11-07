@@ -30,7 +30,7 @@ from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.custody_posture import KeyCustodyPosture, key_custody_loosenings
 from messagefoundry.store import custody, custody_host
-from messagefoundry.store.base import Store, open_store
+from messagefoundry.store.base import STORE_MARKER_TABLES, Store, open_store
 from messagefoundry.store.custody import (
     HostBlob,
     MasterKey,
@@ -2014,13 +2014,52 @@ def test_a_custody_directory_that_grants_folders_but_not_files_is_refused_before
     assert cleaned.returncode == 0, cleaned.stderr
 
 
+@windows_only
+def test_the_add_file_check_reads_a_junctions_target_not_the_link(tmp_path: Path) -> None:
+    # PR 2804 fifteenth hold, review round 1: reading the descriptor by path read a junction's
+    # own list, while the key file's create follows the junction to its target. The check now
+    # reads the list through a handle opened on the target.
+    import csv
+    import subprocess
+
+    whoami = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"], check=True, capture_output=True, text=True
+    )
+    user = "*" + next(csv.reader([whoami.stdout.strip()]))[1]
+    denied = tmp_path / "denied"
+    denied.mkdir()
+    link = tmp_path / "link"
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(denied)], capture_output=True, text=True
+    )
+    if made.returncode != 0:
+        pytest.skip(f"a junction could not be made here: {made.stderr.strip()}")
+    # The positive control: through the junction, before the deny, a file may be added.
+    assert restricted_file.can_add_a_file(link) is True
+    subprocess.run(
+        ["icacls", str(denied), "/deny", f"{user}:(WD)"], check=True, capture_output=True
+    )
+    try:
+        assert restricted_file.can_add_a_file(denied) is False
+        assert restricted_file.can_add_a_file(link) is False
+        with pytest.raises(PermissionError):
+            (link / "probe.bin").write_bytes(b"x")
+    finally:
+        cleaned = subprocess.run(
+            ["icacls", str(denied), "/remove:d", user], check=False, capture_output=True
+        )
+    assert cleaned.returncode == 0, cleaned.stderr
+
+
 @host_file_platforms
+@pytest.mark.parametrize("backend", [StoreBackend.POSTGRES, StoreBackend.SQLSERVER])
 @pytest.mark.parametrize("anywhere", [None, True, False])
 def test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     anywhere: bool | None,
+    backend: StoreBackend,
 ) -> None:
     # PR 2804 fourteenth hold, item 4: the pre-check read a server open's "no store" as absent and
     # minted. That open sees only what its login resolves (a search_path, a default schema, the
@@ -2041,7 +2080,7 @@ def test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none(
     async def _open(settings: StoreSettings, **kwargs: object) -> Store:
         if kwargs.get("custody") is None:
             raise HostCustodyMissing("no host blob and no handoff here (stand-in)")
-        raise base.StoreNotFoundError.server_schema(StoreBackend.POSTGRES, "mefor")
+        raise base.StoreNotFoundError.server_schema(backend, "mefor")
 
     async def _anywhere(*_args: object, **_kwargs: object) -> bool | None:
         return anywhere
@@ -2056,7 +2095,7 @@ def test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none(
     monkeypatch.setattr(cli, "_read_new_password", lambda _prompt: "correct horse battery")
     monkeypatch.chdir(tmp_path)
     (tmp_path / "messagefoundry.toml").write_text(
-        '[store]\nbackend = "postgres"\nkey_provider = "host"\n'
+        f'[store]\nbackend = "{backend.value}"\nkey_provider = "host"\n'
         'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
         "[security]\nrequire_mfa = false\n"
     )
@@ -2069,8 +2108,17 @@ def test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none(
         assert shown == ["recovery key shown"], err
         return
     assert shown == [], err  # refused before any recovery key was shown
-    assert "no key was minted" in err, err
+    assert "no key was minted" in err.lower(), err
     assert not (secrets / custody_host.HOST_FILE_NAME).exists()
+    # Fifteenth hold, review round 1: the text names only this backend's cause, and a found
+    # store is not said to be unreachable, which a partly created one in the login's own schema
+    # is not. Neither advises changing what exists.
+    if anywhere is None:
+        other = "view definition" if backend is StoreBackend.POSTGRES else "search_path"
+        assert other not in err, err
+    else:
+        assert "cannot reach, so" not in err and "partly created" in err, err
+    assert not _advises_changing(err), err
 
 
 class _CatalogConn:
@@ -2115,9 +2163,11 @@ def _postgres_catalog(
         ("MeforStore", ["meforstore"]),
         ('"Mefor Store"', ["Mefor Store"]),
         ("mefor-prod", None),  # hyphenated: not a simple name, so it cannot be shown
-        ("app.mefor", None),  # dotted: not a schema name the check can read
-        ("a" * 70, ["a" * 70]),  # long: kept whole, and ::name truncates it as Postgres does
+        ("app.mefor", None),  # dotted: a name this check does not read
+        ("a" * 70, ["a" * 70]),  # long: bound whole as text, and the cast to name truncates it
         ('"a,b"', None),  # a quoted name with a comma splits, and cannot be read
+        ("", None),  # names no schema: a check that asked about nothing cannot show none
+        (" , ", None),
     ],
 )
 def test_the_postgres_catalog_check_reads_only_search_path_names_it_can_parse(
@@ -2126,7 +2176,8 @@ def test_the_postgres_catalog_check_reads_only_search_path_names_it_can_parse(
     # PR 2804 fifteenth hold, item 2: parse_ident raised on a hyphenated name, did not truncate a
     # long one, and read a dotted one as the wrong schema, so the check could read "no store"
     # over a store it never asked about. Now a search_path element the check cannot parse reads
-    # as "cannot show" (None), which refuses, and names reach the catalog through ::name.
+    # as "cannot show" (None), which refuses. Names are bound as text[] and cast in SQL, since
+    # asyncpg binds name[] in binary and the server refuses a bound name too long.
     import asyncio
 
     from messagefoundry.store.postgres import PostgresStore
@@ -2140,7 +2191,7 @@ def test_the_postgres_catalog_check_reads_only_search_path_names_it_can_parse(
         return
     assert found is False, conn.calls
     query, args = conn.calls[1]
-    assert "::name[]" in query, query
+    assert query.count("::text[]::name[]") == 2, query
     assert list(args[0]) == expected, args  # type: ignore[call-overload]
 
 
@@ -2166,7 +2217,7 @@ def test_the_postgres_catalog_check_asks_for_store_tables_as_well(
 ) -> None:
     # PR 2804 fifteenth hold, item 5 (R4): a schema holding the store's tables but no schema_meta
     # read as "no store", and the create adopted that data under a new key. The check now asks
-    # for every table the store builds, not schema_meta alone.
+    # for the store's own marker tables, not schema_meta alone.
     import asyncio
 
     from messagefoundry.store.postgres import PostgresStore
@@ -2175,7 +2226,21 @@ def test_the_postgres_catalog_check_asks_for_store_tables_as_well(
     settings = StoreSettings().model_copy(update={"backend": StoreBackend.POSTGRES})
     assert asyncio.run(PostgresStore.schema_meta_anywhere(settings)) is True
     tables = list(conn.calls[1][1][1])  # type: ignore[call-overload]
-    assert "schema_meta" in tables and "audit_log" in tables, tables
+    assert tables == list(STORE_MARKER_TABLES), tables
+
+
+def test_the_store_marker_tables_are_declared_and_not_generic() -> None:
+    # PR 2804 fifteenth hold, review round 1: every declared table counted as a store, so an
+    # unrelated application's users or messages table in a shared schema refused a mint. The
+    # markers are tables only this store builds, each declared on both server backends.
+    from messagefoundry.store.postgres import _declared_schema as postgres_schema
+    from messagefoundry.store.sqlserver import _declared_schema as sqlserver_schema
+
+    assert "schema_meta" in STORE_MARKER_TABLES and "audit_log" in STORE_MARKER_TABLES
+    for declared in (postgres_schema().columns, sqlserver_schema().columns):
+        assert set(STORE_MARKER_TABLES) <= set(declared), set(STORE_MARKER_TABLES) - set(declared)
+    generic = {"users", "sessions", "roles", "messages", "queue", "state", "nodes", "reference"}
+    assert not generic & set(STORE_MARKER_TABLES)
 
 
 class _SqlServerCursor:
@@ -2253,7 +2318,7 @@ def test_the_sqlserver_catalog_check_asks_for_store_tables_as_well(
     query, args = cur.calls[1]
     names = args[0]
     assert isinstance(names, tuple) and query.count("?") == len(names), (query, args)
-    assert "schema_meta" in names and "audit_log" in names, (query, args)
+    assert names == STORE_MARKER_TABLES, (query, args)
 
 
 @host_file_platforms
