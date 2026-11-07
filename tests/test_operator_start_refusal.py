@@ -10,10 +10,12 @@ BACKLOG #3859: a refused start or restart records the listener failed, with one 
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import json
 import logging
 from collections.abc import AsyncIterator, Callable
+from concurrent.futures.thread import BrokenThreadPool
 from datetime import UTC, datetime, time
 from pathlib import Path
 from typing import Any
@@ -367,3 +369,91 @@ async def test_a_gate_refused_window_open_alerts_once_over_three_ticks(
         assert [name for name, _ in sink.stopped] == ["IB_LIVE"], sink.stopped
     finally:
         await runner.stop()
+
+
+# --- Lander hold 6703229134, item 2: an executor fault on the inbound build -----------------------
+
+
+def _down_loopback_listener() -> Registry:
+    """One MLLP listener on loopback, left down at start, that every start gate passes, so an
+    operator start reaches the connector build."""
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "IB_DOWN",
+            ConnectionSpec(ConnectorType.MLLP, {"port": 0}),
+            router="r",
+            auto_start=False,
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    return reg
+
+
+@pytest.mark.parametrize("fault", ["cancelled", "broken", "shut-down"])
+@pytest.mark.parametrize("action", ["start", "restart"])
+async def test_an_executor_fault_on_an_operator_start_answers_409_and_is_audited(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, action: str, fault: str
+) -> None:
+    """The executor cancels the inbound's build, fails it as a broken pool, or refuses it because
+    it was shut down. The build never ran, so this is no refusal of the build's own, yet the start
+    must still reach the route as a WiringError with the fault as its cause, so the route answers
+    409 and writes the refused row. Red (Lander hold 6703229134, item 2): a bare RuntimeError or
+    BrokenThreadPool escaped _build_off_loop, which the route answered with a 500 and no row."""
+    engine = Engine(
+        store,
+        inbound_bind_host="127.0.0.1",
+        hop_posture=HopPosture(enforcing=False),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(_down_loopback_listener())
+    await engine.start()
+    loop = asyncio.get_running_loop()
+    real = loop.run_in_executor
+    faults: list[BaseException] = []
+
+    def faulty(executor: Any, fn: Any, *args: Any) -> asyncio.Future[Any]:
+        if "_build_off_loop" not in getattr(fn, "__qualname__", ""):
+            return real(executor, fn, *args)
+        if fault == "shut-down":
+            raise RuntimeError("Executor shutdown has been called")
+        queued: asyncio.Future[Any] = loop.create_future()
+        if fault == "cancelled":
+            queued.cancel()
+        else:
+            queued.set_exception(BrokenThreadPool("a thread initializer failed"))
+        return queued
+
+    original = wiring_runner.RegistryRunner._checked_inbound_start
+
+    async def recording(self: RegistryRunner, name: str) -> None:
+        try:
+            await original(self, name)
+        except BaseException as exc:
+            faults.append(exc)
+            raise
+
+    monkeypatch.setattr(wiring_runner.RegistryRunner, "_checked_inbound_start", recording)
+    try:
+        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        monkeypatch.setattr(loop, "run_in_executor", faulty)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            r = await client.post(f"/connections/IB_DOWN/{action}")
+        monkeypatch.setattr(loop, "run_in_executor", real)
+        assert r.status_code == 409, r.text
+        assert len(faults) == 1 and isinstance(faults[0], WiringError), faults
+        cause = faults[0].__cause__
+        assert isinstance(cause, BrokenThreadPool if fault == "broken" else RuntimeError), cause
+        rows = await store.list_audit(action="connection_control", limit=10)
+        assert len(rows) == 1
+        assert json.loads(rows[0]["detail"] or "{}") == {
+            "connection": "IB_DOWN",
+            "action": action,
+            "role": "source",
+            "running": False,
+            "refused": True,
+        }
+        rr = engine.registry_runner
+        assert rr is not None and not rr.inbound_running("IB_DOWN")
+    finally:
+        await engine.stop()

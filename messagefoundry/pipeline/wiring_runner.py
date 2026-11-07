@@ -12553,7 +12553,12 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
     and E). The build is held by a thread
     future and not by a task, so the loop's shutdown cancel, which reaches every task, cannot drop
     what it builds (Lander hold 6698688363, item 5). As in :func:`asyncio.to_thread`, the thread
-    runs in the default executor, in a copy of the caller's context."""
+    runs in the default executor, in a copy of the caller's context.
+
+    An executor fault, a build it cancelled, failed as a broken pool or refused because it was shut
+    down, raises :class:`WiringError` with the fault as its cause, as a refused build does, so every
+    caller records it as one rather than letting a bare ``RuntimeError`` escape (Lander hold
+    6703229134, item 2). The build never ran, so nothing was built to close."""
 
     def stamped() -> T:
         with active_hop_posture(posture):
@@ -12580,17 +12585,34 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
             return
         if queued.cancelled():
             # A failure, not a cancellation: the caller was not cancelled, and must not read as if.
-            built.set_exception(RuntimeError("the executor cancelled the connector build"))
+            built.set_exception(
+                _executor_fault(RuntimeError("the executor cancelled the connector build"))
+            )
         elif (exc := queued.exception()) is not None:
-            built.set_exception(exc)
+            # Only the executor fails ``queued`` with run() not begun, so this is never the build's
+            # own failure. A BaseException that is not an Exception passes through unchanged.
+            built.set_exception(_executor_fault(exc) if isinstance(exc, Exception) else exc)
 
-    loop.run_in_executor(None, run).add_done_callback(settle)
+    try:
+        queued = loop.run_in_executor(None, run)
+    except RuntimeError as exc:  # the executor was shut down, or its pool is broken
+        raise _executor_fault(exc) from exc
+    queued.add_done_callback(settle)
     try:
         # Not shielded: a cancelled caller cancels this wrapper, which cancels a build still queued.
         return await asyncio.wrap_future(built, loop=loop)
     except asyncio.CancelledError:
         built.add_done_callback(functools.partial(_close_abandoned_build, loop))
         raise
+
+
+def _executor_fault(exc: Exception) -> WiringError:
+    """The :class:`WiringError` for an executor ``exc`` that kept a build from running
+    (:func:`_build_off_loop`), with ``exc`` as its cause, as ``raise ... from exc`` sets it."""
+    fault = WiringError(f"connector build failed: {exc}")
+    fault.__cause__ = exc
+    fault.__suppress_context__ = True
+    return fault
 
 
 #: Close tasks for connectors whose build finished after its caller was cancelled, held so the
