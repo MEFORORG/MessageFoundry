@@ -828,6 +828,12 @@ SITES: dict[str, Site] = {
     "messagefoundry/store/store.py::_write_closed_store": Site(
         1, OPERATOR, "A fixed SQLite sidecar suffix on the operator's store path."
     ),
+    "messagefoundry/transports/database.py::_capath_folder_clear": Site(
+        1,
+        REVIEWED,
+        "A name from listing the sslcapath folder the operator configured, joined only to probe the "
+        "entry with lstat or the path walk; nothing is opened or read through it.",
+    ),
     "messagefoundry/transports/file.py::FileDestination._write": Site(
         1, GUARDED, _DEST_NAME, "messagefoundry/transports/file.py::render_filename", called=True
     ),
