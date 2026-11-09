@@ -807,7 +807,8 @@ _INCLUDE = (
 )
 _CONSTRAINT = (
     "names a constraints file, which this check does not follow;"
-    " set PIP_CONSTRAINT to that file instead wherever requirements.txt is installed"
+    " remove the line and give that file to the command that writes requirements.lock instead"
+    " (uv pip compile -c FILE); if the file is requirements.lock itself, just remove the line"
 )
 
 #: (the line after ``foo==1.0``, the ::error:: it raises, whether the pins audit's grep also sees it).

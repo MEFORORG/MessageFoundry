@@ -353,8 +353,8 @@ jobs:
       # unnamed URL has no name to look up, and an editable installs a source tree or checkout that
       # no lock pin holds. A requirement it cannot parse fails, and so does a line of options with
       # no requirement that pip cannot read. An include or constraint line (-r, --requirement, -c or
-      # --constraint, in any spelling pip takes, with no editable on the line) fails too: this step
-      # follows no file a line names, and no new lock clears such a line.
+      # --constraint, abbreviated or attached as pip allows, with no editable on the line) fails
+      # too: this step follows no file a line names, and no new lock clears such a line.
       - name: Check requirements.lock is not stale against requirements.txt
         if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
         run: |
@@ -558,7 +558,9 @@ for group in logical_lines("requirements.txt"):
             errors.append(
                 (
                     f"{line} names a constraints file, which this check does not follow",
-                    "set PIP_CONSTRAINT to that file instead wherever requirements.txt is installed",
+                    "remove the line and give that file to the command that writes"
+                    " requirements.lock instead (uv pip compile -c FILE); if the file is"
+                    " requirements.lock itself, just remove the line",
                 )
             )
         continue
