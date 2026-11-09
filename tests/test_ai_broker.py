@@ -14,6 +14,7 @@ from __future__ import annotations
 import http.client
 import json
 import urllib.error
+import urllib.request
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
@@ -34,7 +35,7 @@ from messagefoundry.transports.ai_broker import (
     ai_broker_from_settings,
     endpoint_host_allowed,
 )
-from messagefoundry.transports.rest import _NO_REDIRECT_OPENER
+from messagefoundry.transports.rest import _shared_no_redirect_opener
 from tests._admin_account import create_local_user_chosen
 from tests._malformed_reply import MALFORMED_REPLIES, RaisingOpener, RefusedAndMalformed
 
@@ -162,7 +163,7 @@ def test_broker_requires_endpoint_and_key() -> None:
 def test_broker_uses_no_redirect_opener_and_no_api_import() -> None:
     broker = ai_broker_from_settings(_managed_ai())
     # Reuses rest.py's shared hardened, TLS-verifying, no-redirect opener (never a bespoke one).
-    assert broker._opener is _NO_REDIRECT_OPENER
+    assert broker._opener is _shared_no_redirect_opener()
     # One-way deps (CLAUDE.md §4): the broker MUST NOT import api/. Check actual import STATEMENTS (a
     # docstring may legitimately name the api route it serves), not any textual mention.
     src = Path(ai_broker_mod.__file__).read_text(encoding="utf-8")
@@ -246,6 +247,34 @@ async def test_ai_chat_managed_endpoint_returns_reply(
     assert body["data_scope"] == "code_only"  # server-enforced scope, echoed back
     # The server handed the broker exactly the IDE prompt (no server-side widening / PHI injection).
     assert stub_broker == ["write a handler that forwards to OB"]
+
+
+async def test_ai_chat_builds_the_broker_off_the_event_loop(
+    engine: Engine, stub_broker: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #2484: the broker's constructor builds rest.py's shared opener on first use, so the
+    # route must not run that build on the loop's thread. The cached opener is cleared so the cold
+    # build runs here, whatever earlier tests built.
+    import threading
+
+    from messagefoundry.transports import rest
+
+    loop_thread = threading.get_ident()
+    build_threads: list[int] = []
+    real_build = rest._no_redirect_opener
+
+    def recording() -> urllib.request.OpenerDirector:
+        build_threads.append(threading.get_ident())
+        return real_build()
+
+    monkeypatch.setattr(rest, "_shared_opener", None)
+    monkeypatch.setattr(rest, "_no_redirect_opener", recording)
+    app = create_app(engine, ai_settings=_managed_ai(), allow_no_auth=True)
+    async with _client(app) as c:
+        r = await c.post("/ai/chat", json={"prompt": "hi"})
+    assert r.status_code == 200
+    assert len(build_threads) == 1
+    assert build_threads[0] != loop_thread
 
 
 async def test_ai_chat_ignores_ide_claimed_scope_and_denies_overclaim(

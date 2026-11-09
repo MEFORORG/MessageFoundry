@@ -544,7 +544,7 @@ def test_alert_webhook_drain_is_bounded(
     opener = _FakeOpener(resp)
     import messagefoundry.pipeline.alert_sinks as sinks
 
-    monkeypatch.setattr(sinks._NO_REDIRECT_OPENER, "open", opener.open)
+    monkeypatch.setattr(sinks._shared_no_redirect_opener(), "open", opener.open)
     with caplog.at_level(logging.WARNING, logger=bounded_read.logger.name):
         transport._post({"type": "queue_buildup", "connection": "OB_X"})  # no raise
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
@@ -572,7 +572,7 @@ def test_alert_webhook_over_cap_reply_with_no_2xx_to_show_still_raises(
     resp.status = status  # type: ignore[assignment]
     import messagefoundry.pipeline.alert_sinks as sinks
 
-    monkeypatch.setattr(sinks._NO_REDIRECT_OPENER, "open", _FakeOpener(resp).open)
+    monkeypatch.setattr(sinks._shared_no_redirect_opener(), "open", _FakeOpener(resp).open)
     with (
         caplog.at_level(logging.WARNING, logger=bounded_read.logger.name),
         pytest.raises(ResponseTooLargeError),
@@ -880,7 +880,7 @@ def test_an_alert_already_accepted_is_not_reported_as_a_failed_send(
     import messagefoundry.pipeline.alert_sinks as sinks
 
     monkeypatch.setattr(
-        sinks._NO_REDIRECT_OPENER, "open", _FakeOpener(_wire(_FIXED_TRUNCATED)).open
+        sinks._shared_no_redirect_opener(), "open", _FakeOpener(_wire(_FIXED_TRUNCATED)).open
     )
     transport._post({"type": "queue_buildup", "connection": "OB_X"})  # no raise
 

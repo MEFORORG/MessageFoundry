@@ -65,7 +65,7 @@ from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import MLLPDestination
 from messagefoundry.transports.remotefile import RemoteFileDestination, RemoteFileSource
 from messagefoundry.transports.rest import (
-    _NO_REDIRECT_OPENER,
+    _shared_no_redirect_opener,
     http_family_trust_anchor,
     opener_tls_context,
 )
@@ -328,9 +328,9 @@ def test_a_fhir_lookup_read_hop_is_admitted_when_a_crl_reaches_its_own_opener(
 ) -> None:
     with active_hop_posture(ENFORCING):
         executor = _lookup({"url": f"https://{REMOTE}/fhir"}, policy=_crl_policy(bare_crl))
-    # The opener this lookup will really dial through, not the shared import-time one.
+    # The opener this lookup will really dial through, not the shared one.
     opener = executor._opener["epic"]
-    assert opener is not _NO_REDIRECT_OPENER
+    assert opener is not _shared_no_redirect_opener()
     assert context_checks_revocation(opener_tls_context(opener, connector="probe")) is True
 
 
@@ -347,7 +347,9 @@ def test_a_configured_crl_does_not_admit_a_fhir_lookup_it_cannot_reach(bare_crl:
         executor = FhirLookupExecutor(
             both, egress=_OPEN_EGRESS, trust_anchor_policy=_crl_policy(bare_crl)
         )
-    assert executor._opener["onbox"] is _NO_REDIRECT_OPENER  # no CRL reached the on-box hop
+    assert (
+        executor._opener["onbox"] is _shared_no_redirect_opener()
+    )  # no CRL reached the on-box hop
     with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="fhir_lookup:epic"):
         FhirLookupExecutor(both, egress=_OPEN_EGRESS)
     with active_hop_posture(ENFORCING):
