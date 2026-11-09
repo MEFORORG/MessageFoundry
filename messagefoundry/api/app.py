@@ -11350,9 +11350,9 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
     "This account's sessions are not revoked: {probes} of its directory probes running failed to "
     "reach the directory. Check its entry, and any outage, referral or configuration alert."
 )
-#: What one page for many such accounts says, where more than five stand unreachable at once
-#: (``AuthService._note_unreached_accounts``), so a flapping directory opens one instance rather
-#: than one per signed-in account. It counts only the accounts entering on its pass, and says
+#: What one page for many such accounts says, on a pass that rolls them up
+#: (``AuthService._record_unreached_accounts`` decides when), so a flapping directory opens one
+#: instance rather than one per signed-in account. It counts only the accounts entering on its pass, and says
 #: so: a later rollup updates the same open instance's text, so a count that read as a total
 #: would be replaced by a smaller one while more accounts stood (BACKLOG #3709). No process can
 #: say how many stand: each counts its own, and the instance is shared. ``probes`` is the

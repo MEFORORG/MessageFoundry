@@ -937,7 +937,8 @@ An account the directory keeps failing to answer for opens one `ad_reconcile_abo
 per account too, with reason `account_unreachable` and source
 `directory-reconciler-unreached:<username>` (vault BACKLOG #3100), once `ad_reconcile_outage_passes`
 of its probes running have failed, or one instance under the bare `directory-reconciler-unreached`
-source when more than five such accounts stand at once. Nothing resolves either automatically.
+source on a rolled-up pass, which the `ad_reconcile_outage_passes` row states. Nothing resolves
+either automatically.
 Resolve a per-account one by hand once the WARNING says the account was answered for again, and the
 bare one once each account its rows name has been.
 

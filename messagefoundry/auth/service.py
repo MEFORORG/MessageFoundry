@@ -8410,8 +8410,8 @@ class AuthService:
             # code that is not an answer is also reported at WARNING by ldap.py itself, once per
             # operation and code (BACKLOG #3010), in engine text that never quotes the directory's
             # diagnostic message. An undecodable response does not reach here (the arm above).
-            # An account this arm reads on every probe while the directory answers others is
-            # bounded by a page, not a strike (`_note_unreached_accounts`, BACKLOG #3100 step 2).
+            # An account this arm reads on every probe is bounded by a page, not a strike
+            # (`_note_unreached_accounts`, BACKLOG #3100 step 2).
             _log.debug("directory probe failed for %s: %s", user.username, exc)
             # Vault BACKLOG #3696. A group search past its deadline or its entry cap is still
             # unjudged, so still UNAVAILABLE, but it says which bound refused it, so it pages.
@@ -8550,11 +8550,9 @@ class AuthService:
         search refused for its bound is an answer: the user search answered, and it pages on its
         own (vault BACKLOG #3696). An account the pass did not probe keeps its count.
 
-        **A flapping directory must not page every account.** Where the accounts already paged
-        and those entering would be more than :data:`_UNREACHED_ROLLUP_ABOVE`, as a directory that
-        answers a few probes in each pass would make them, the lifespan task pages once for those
-        entering, and each still gets its own row. :meth:`_record_unreached_accounts` decides that
-        (``unreached_rollup``) on the rows it wrote.
+        **A flapping directory must not page every account.** Whether the lifespan task pages
+        once for those entering (``unreached_rollup``) is decided by
+        :meth:`_record_unreached_accounts`, on the rows it wrote; each still gets its own row.
 
         The latch is set only at the end of the pass, for the accounts whose row was written
         (:meth:`_latch_unreached_accounts`), so a pass that raises, or whose row is refused,
@@ -8755,8 +8753,9 @@ class AuthService:
           every other account is still judged (BACKLOG #2538). So does a probe the directory
           refused for its configuration, such as a deleted search base (BACKLOG #3010), and a
           probe that raised something the engine could not read, a probe fault (BACKLOG #3100);
-        * an account whose probe keeps failing to reach the directory while it answers others
-          pages once that lasts (BACKLOG #3100), and so does a whole-directory outage (#3709);
+        * an account whose probe keeps failing to reach the directory pages once that lasts
+          (BACKLOG #3100; :meth:`_note_unreached_accounts` says when), and so does a
+          whole-directory outage (#3709);
         * a principal must come back absent, disabled, undetermined or unkeyed
           ``ad_session_recheck_strikes`` passes running;
         * a PRESENT principal whose directory groups would change its roles, or withdraw or narrow
