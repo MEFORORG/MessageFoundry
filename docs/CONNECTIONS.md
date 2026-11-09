@@ -2197,10 +2197,11 @@ names. A missing folder, or a value that names a file, is left to the driver. Th
 these checks itself, so every build judges the entries and a refusal fails it. A running engine
 builds a connector in a worker thread, off its event loop, at least at a lane start (at boot, at
 an operator start and when a reload or a DR activation binds a lane), in a reload's build check,
-a dry-run reload's included, and its rebuilds, and in a connection test. Outside the build check, a
-build the executor never began, because it refused or dropped the work, is built on the event loop
-instead, with a WARNING; the build check has no such fallback, so a refusing executor fails the
-reload there. `messagefoundry check` runs no event loop, so it builds in place.
+a dry-run reload's included, and its rebuilds, and in a connection test. What happens to a build
+at any of these points when the executor cannot run it is stated once, in
+[`SECURITY.md`](SECURITY.md), in the paragraph *A reload's `config_reload_failed` row names why in
+`reason`*. `messagefoundry check` runs no event loop, so it
+builds in place.
 The lane check runs this check again on all four
 keywords, and on Windows on the folder entries too, at least when the lane is built or an operator starts it and before a reload that builds it or keeps it
 running, so a path that leads to another host after the build is refused there as a setting.

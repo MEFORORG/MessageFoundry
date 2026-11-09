@@ -2581,11 +2581,14 @@ included, and released, any error the reload raises that none of the other reaso
 raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`. That reason is
 for the config directory itself: at least one that is missing, and one moved away between the
 reload's target check and its read of the directory. An executor fault is named by its own type,
-for example `BrokenThreadPool`, at least when the reload's build check meets it, and so is one
-wrapped as `WiringBuildFault`, which names its cause's type. Either way the row never carries the
-error's text. A connector build itself that the executor never began is built on the event loop
-instead, with a WARNING in the engine log, and fails nothing; the build check has no such
-fallback. The row does not claim the old graph is still serving: at least a
+for example `BrokenThreadPool`, at least when a lane's anchor check meets it. The row never
+carries the error's text. A connector build or build check that the executor refused at submit,
+before a worker took it, or cancelled or failed before it began, runs on the event loop instead,
+with a WARNING in the engine log, so that hop does not fail; a bad config is still refused. Work
+still queued behind a busy or hung pool waits for it and is not run on the loop. Other
+worker-thread hops have no such fallback, at least a lane's anchor check and a reload's reads of
+its config directory, so a pool that stays broken still fails the reload or the start. The row does not claim
+the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
 fails, which is logged. A cluster convergence reload records such a fault with reason
