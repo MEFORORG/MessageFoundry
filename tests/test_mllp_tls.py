@@ -1367,7 +1367,12 @@ def test_a_connection_the_listener_cannot_take_is_closed_and_accepting_goes_on(
         listening = socket.socket()
         server = mllp_module._AcceptingServer([listening], on_socket, name="IB_TEST")
         try:
-            for _ in range(5):
+            # A turn cap with an early exit, not a fixed count: how many turns one accept takes is
+            # the accept loop's business. Not `_until`: its wall-clock wait would let the failing
+            # fake reach its call limit and end the accept loop.
+            for _ in range(50):
+                if fails_after.calls:
+                    break
                 await asyncio.sleep(0)
             assert accepted.fileno() == -1, "the connection it could not take was left open"
             assert fails_after.calls >= 1, "the accept loop stopped after the fault"
