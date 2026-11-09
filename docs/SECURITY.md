@@ -2587,7 +2587,7 @@ before a worker took it, or cancelled or failed before it began, runs on the eve
 with a WARNING in the engine log, so that hop does not fail; a bad config is still refused. Work
 still queued behind a busy or hung pool waits for it and is not run on the loop. Other
 worker-thread hops have no such fallback, at least a lane's anchor check and a reload's reads of
-its config directory, so a pool that stays broken still fails the reload or the start. The row does not claim
+its config directory, so a pool that stays broken still fails the reload. The row does not claim
 the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
