@@ -110,7 +110,7 @@ def test_a_null_read_cannot_judge_and_is_never_clean() -> None:
 
 
 def test_a_held_write_role_beside_a_null_is_still_over_granted() -> None:
-    """A partial read can only understate an over-grant, so what was read as held is reported."""
+    """What was read as held is reported, whatever another role read."""
     reading = classify_login_roles(_row(("db_datawriter",), null=("sysadmin",)))
     assert reading.verdict is LoginRoleVerdict.OVER_GRANTED
     assert reading.held == ("database role db_datawriter",)
