@@ -4808,7 +4808,7 @@ def classify_login_roles(row: Sequence[Any]) -> LoginRoleReading:
 
     Read three ways, as ``store/sqlserver.py`` ``_probed_grant`` reads the store login: ``1`` held,
     ``0`` not held, NULL **not read**. Any other value, such as the text ``"1"``, ``1.0`` or ``2``,
-    is not read either. ``IS_SRVROLEMEMBER`` and ``IS_ROLEMEMBER`` answer NULL for a
+    is not read either, where ``_probed_grant`` still reads it as not held. ``IS_SRVROLEMEMBER`` and ``IS_ROLEMEMBER`` answer NULL for a
     name that does not resolve for this login, and a NULL folded to "not a member" would be a false
     clean. A role read as held is still reported when another read NULL, because a partial read can
     only understate an over-grant, never invent one.
