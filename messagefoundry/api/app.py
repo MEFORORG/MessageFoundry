@@ -11352,10 +11352,13 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
 )
 #: What one page for many such accounts says, where more than five stand unreachable at once
 #: (``AuthService._note_unreached_accounts``), so a flapping directory opens one instance rather
-#: than one per signed-in account.
+#: than one per signed-in account. ``accounts`` counts every account standing, paged before or
+#: entering now, because a later rollup updates the same open instance's text (BACKLOG #3709).
+#: ``probes`` is the shortest run among those entering: probes, not passes, which differ under a
+#: probe budget smaller than the estate.
 _UNREACHED_ROLLUP_TEXT: Final[str] = (
-    "{accounts} accounts' sessions are not revoked: their directory probes failed {probes} passes "
-    "running. Check the directory and the path to it; audit rows name each account."
+    "{accounts} accounts' sessions are not revoked ({entering} new): each one's directory probes "
+    "failed at least {probes} times running. Check the directory; audit rows name each account."
 )
 
 
@@ -11545,14 +11548,16 @@ def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
     reconciler has neither struck nor revoked it. Once per entry, like a paging refusal, and with
     no inverse: an operator resolves it. The account name is in the source only, as for a paging
     refusal. On a rolled-up pass (``plan.unreached_rollup``), one page under the bare source covers
-    those entering, naming none."""
+    those entering, naming none, and counts every account standing (``plan.unreached_standing``)."""
     if plan.unreached_rollup:
         sink.ad_reconcile_aborted(
             _UNREACHED_ALERT_SOURCE,
             reason=UNREACHED_ACCOUNT,
             probed=plan.asked,
             detail=_UNREACHED_ROLLUP_TEXT.format(
-                accounts=len(plan.unreached), probes=min(n for _u, _n, n in plan.unreached)
+                accounts=plan.unreached_standing,
+                entering=len(plan.unreached),
+                probes=min(n for _u, _n, n in plan.unreached),
             ),
         )
         return

@@ -8552,7 +8552,9 @@ class AuthService:
         **A flapping directory must not page every account.** Where the accounts already paged
         and those entering would be more than :data:`_UNREACHED_ROLLUP_ABOVE`, as a directory that
         answers a few probes in each pass would make them, the lifespan task pages once for those
-        entering (``unreached_rollup``), and each still gets its own row.
+        entering (``unreached_rollup``), and each still gets its own row. That page counts every
+        account standing (``unreached_standing``), not only those entering, since a later rollup
+        updates the same open instance's text.
 
         The latch is set only at the end of the pass, for the accounts whose row was written
         (:meth:`_latch_unreached_accounts`), so a pass that raises, or whose row is refused,
@@ -8579,10 +8581,12 @@ class AuthService:
             runs[probe.user_id] = count = runs.get(probe.user_id, 0) + 1
             if count >= threshold and probe.user_id not in paged and not covered:
                 entered.append((probe.user_id, probe.username, count))
+        standing = len(paged) + len(entered)
         return replace(
             plan,
             unreached=tuple(entered),
-            unreached_rollup=bool(entered) and len(paged) + len(entered) > _UNREACHED_ROLLUP_ABOVE,
+            unreached_rollup=bool(entered) and standing > _UNREACHED_ROLLUP_ABOVE,
+            unreached_standing=standing,
         )
 
     async def _record_unreached_accounts(
@@ -8630,7 +8634,11 @@ class AuthService:
         # The rollup only for what was written: a rollup with nothing written would page nothing,
         # and the lifespan task reads the run's length off the entries (final-round finding 1).
         return replace(
-            plan, unreached=tuple(written), unreached_rollup=plan.unreached_rollup and bool(written)
+            plan,
+            unreached=tuple(written),
+            unreached_rollup=plan.unreached_rollup and bool(written),
+            # A refused account is not latched, so it does not stand yet (BACKLOG #3709).
+            unreached_standing=plan.unreached_standing - (len(plan.unreached) - len(written)),
         )
 
     def _latch_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:

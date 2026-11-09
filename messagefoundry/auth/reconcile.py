@@ -359,6 +359,11 @@ class ReconcilePlan:
     #: for those entering rather than once per account. A directory that answers only a few probes
     #: in each pass would otherwise open an instance per signed-in account.
     unreached_rollup: bool = False
+    #: Set with ``unreached`` (BACKLOG #3709): how many accounts stand unreachable after this pass,
+    #: those already paged and those entering whose row was written. A rolled-up page counts these,
+    #: not only the accounts entering, because a later rollup updates the open instance's text and
+    #: would otherwise replace the earlier count with a smaller one.
+    unreached_standing: int = 0
     #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3709): how many
     #: passes running, this one included, have read the directory unreachable
     #: (:attr:`directory_outage`), in this process. 0 on a pass that reached it. A pass whose

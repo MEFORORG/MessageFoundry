@@ -2937,6 +2937,39 @@ async def test_a_flapping_directory_pages_once_for_many_unreached_accounts() -> 
         await store.close()
 
 
+async def test_a_later_rollup_counts_every_account_standing_not_only_those_entering() -> None:
+    """BACKLOG #3709. A later rollup under the bare source updates the open instance's text. When
+    it counted only the accounts entering on its own pass, one more account entering after seven
+    replaced "7 accounts" with "1 accounts", though eight stood.
+
+    RED when: the later rollup's text counts only the account entering."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ["ok", "late"] + [f"flap{i}" for i in range(7)]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        sink = _InverseSink()
+        ldap.unreachable = set(names[2:])
+        for _ in range(3):
+            first = await _pass(service, sink)
+        assert first.unreached_rollup and first.unreached_standing == 7
+        ldap.unreachable = set(names[1:])  # "late" joins; the seven still fail
+        for _ in range(3):
+            later = await _pass(service, sink)
+        assert [name for _uid, name, _n in later.unreached] == ["late"]
+        assert later.unreached_rollup and later.unreached_standing == 8
+        rollups = [p for _k, s, p in sink.events if s == "directory-reconciler-unreached"]
+        assert len(rollups) == 2
+        assert rollups[0]["detail"].startswith("7 accounts' sessions are not revoked (7 new)")
+        assert rollups[1]["detail"].startswith("8 accounts' sessions are not revoked (1 new)")
+        assert "at least 3 times running" in rollups[1]["detail"]
+    finally:
+        await store.close()
+
+
 async def test_a_rollup_whose_rows_are_all_refused_pages_nothing_and_does_not_raise(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2967,6 +3000,7 @@ async def test_a_rollup_whose_rows_are_all_refused_pages_nothing_and_does_not_ra
         for _ in range(3):
             plan = await _pass(service, sink)  # raised ValueError on the third pass before the fix
         assert plan.unreached == () and not plan.unreached_rollup
+        assert plan.unreached_standing == 0, "a refused account was counted as standing"
         assert _unreached_events(sink) == []
         assert not [e for e in sink.events if e[1] == "directory-reconciler-unreached"]
     finally:
