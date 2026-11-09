@@ -440,14 +440,13 @@ instruction is its whole scope, and it announces and declares before its first s
 than on arrival. Its card is [`docs/roles/special.card.md`](docs/roles/special.card.md); the
 playbook is korus `roles/SPECIAL.md`, read at `origin/main`.
 
-**A MANAGER AND THE LANDER MAY SPAWN A SESSION. EVERY OTHER SEAT NEEDS PERMISSION FIRST (owner
-ruling 2026-09-16).** The case it exists for is a PR that needs a fix with no Manager alive. Then
+**A MANAGER AND THE LANDER MAY SPAWN A SESSION, AND A BUILDER MAY FOR ITS OWN FIXES. EVERY OTHER
+SEAT NEEDS PERMISSION FIRST (owner rulings 2026-09-16 and 2026-11-09).** The case it exists for is a PR that needs a fix with no Manager alive. Then
 the Lander spawns a Manager rather than fixing the PR itself, because authoring plus landing means
 nobody checked it. A Manager seat added, the same day, that spawning should be rare: a subagent
 cannot outlive a mistake, and a spawned session can. The full notices are in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md
-text moved in wave 2*. **A Builder may now spawn a session for its own fixes, as a class B act
-(owner ruling 2026-11-09, tier T3; [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 12).**
-The same ruling makes taking over a verified-dead holder's worktree, branch or claim class B, once
+text moved in wave 2*. The Builder's spawn is class B (tier T3,
+[`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 12). The same ruling makes taking over a verified-dead holder's worktree, branch or claim class B, once
 the work is anchored, and dead means more than 2 hours, the held-PR repair window below.
 
 **The Lander may send a repair Builder subagent to a held PR whose author has gone quiet**
