@@ -765,7 +765,9 @@ function Set-DataDirOwner {
     <#
       Make BUILTIN\Administrators the OWNER of the data directory (ADR 0183 Wave 0b). The engine gives
       the store trio the directory's principals only when the directory's owner is SYSTEM,
-      Administrators or the service account, because an owner keeps WRITE_DAC whatever the DACL says.
+      Administrators or a per-service virtual run-as account (NT SERVICE\<name>), because an owner
+      keeps WRITE_DAC whatever the DACL says. A named user run-as account, a local user or a gMSA,
+      never qualifies as the owner.
       New-Item leaves the owner to the host's default-owner policy: Administrators for an elevated
       member under the default, but the creating USER under "Object creator", and the hosted CI
       runners' built-in Administrator (RID 500) was measured owning the objects it creates (CI run

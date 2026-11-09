@@ -41,6 +41,7 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 from messagefoundry.transports import mllp as mllp_mod
 from messagefoundry.transports.mllp import CR, EB, MLLPSource, build_ack, frame
+from tests._log_absence import assert_capture_sees
 from tests.test_x12_connection_events import Event, _Peer, _sink
 
 _ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -374,6 +375,7 @@ async def test_no_reply_a_stop_whose_last_attempt_succeeds_loses_nothing(
         events = await _drive(source, _ThenEof(frame(_ADT)), _Peer(), stop_then_recover)
     assert seen == [_ADT.encode()] * 2
     assert _kinds_of(events) == ["established", "closed"]
+    assert_capture_sees(caplog, "messagefoundry.transports.mllp")
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
