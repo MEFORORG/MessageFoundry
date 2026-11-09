@@ -178,6 +178,18 @@ through Transit before `_elevated_hash` does; an Outage there refuses the reques
 stamp, so nothing is left elevated. The lapse check also reads the account record, and an Outage
 on that check revokes the session too, though the session's own seal held.
 
+A second correction, added 2026-11-09, which RETRACTS the two notes above where they disagree:
+the lapse check is NOT always the first Transit call after a stamp lands, and an Outage before it
+is NOT always harmless. A review that day found Transit calls between a committed stamp and
+`_elevated_hash` in at least `verify_mfa` (its second stamp and `record_login_success`), the
+passkey assertion (`record_login_success`), and `reauth` and the federated re-auth callback (the
+factor-binding check). An Outage at any of them escapes as a 500 and leaves the stamped old hash
+live and unrotated. "Revoke both" as built covers the lapse check and the rotation only; whether
+it should cover the whole window from the first stamp to the rotation is an open question for the
+owner. Separately, the sentence above that says "the SQLite session writer turns the type back
+into `RowSealError`" is out of date: since slice 1b-ii every backend's session writer does, through
+`session_writer_seal_check`.
+
 ## Context
 
 Engine `main` seals identity and authorization rows (sessions, users with their role grants, custom

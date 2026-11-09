@@ -264,9 +264,9 @@ def _rotation_store_errors() -> tuple[type[Exception], ...]:
     """What a session rotation treats as refused, at the lapse check in
     :meth:`AuthService._elevated_hash` and at the load and re-key in
     :meth:`AuthService._rotate_session_hash`: every type :func:`_session_write_errors` names, plus a
-    Transit Outage (owner ruling 2026-11-08 on ADR 0217, "Revoke both"). Both sites need it, since
-    :meth:`AuthService._rotate_session_token` reaches the second without the first. Not cached, so a
-    test that clears :func:`_session_write_errors`' cache changes this tuple too."""
+    Transit Outage (owner ruling 2026-11-08 on ADR 0217, "Revoke both"). Both sites need it: the
+    lapse check cannot cover the re-key, whose new seal is a Transit call of its own. Not cached, so
+    a test that clears :func:`_session_write_errors`' cache changes this tuple too."""
     return (*_session_write_errors(), TransitSealUnavailableError)
 
 
@@ -303,8 +303,8 @@ class _RotationStoreError(Exception):
     row records it as ``revokes_landed``. ``reason`` is the audit row's ``reason``, from
     :func:`_rotation_failure_reason`."""
 
-    def __init__(self, old_revoked: bool, *, reason: str = "store_error") -> None:
-        super().__init__("session rotation refused by the store")
+    def __init__(self, old_revoked: bool, *, reason: str) -> None:
+        super().__init__("session rotation refused")
         self.old_revoked = old_revoked
         self.reason = reason
 
@@ -10417,7 +10417,7 @@ class AuthService:
             f"a revoke was refused too ({', '.join(refused)})" if refused else "it was revoked"
         )
         _log.warning(
-            "auth: a session rotation was refused by %s (%s); %s",
+            "auth: a session rotation, or the check before it, was refused by %s (%s); %s",
             "the Transit sealer" if isinstance(cause, TransitSealUnavailableError) else "the store",
             type(cause).__name__,
             outcome,
@@ -10499,9 +10499,12 @@ class AuthService:
         check's own reads take :func:`_rotation_store_errors`, so a Transit Outage there revokes the
         old hash too (owner ruling 2026-11-08 on ADR 0217, "Revoke both"). This is the site the
         ruling binds on the elevation path: the lapse check loads the session before the rotation
-        does, so an Outage after the ceremony's stamp meets this load first. Those reads are the
-        session's and the account's: an Outage on the account record's check revokes the session
-        too, though the session's own seal held."""
+        does. It is NOT the only Transit call after the ceremony's stamp: at least ``verify_mfa``,
+        the passkey assertion and ``reauth`` make sealed reads or writes between their stamp and
+        this method, and an Outage there escapes with the stamped hash live (ADR 0217, the second
+        2026-11-09 correction; an open owner question). The lapse check's reads are the session's
+        and the account's: an Outage on the account record's check revokes the session too, though
+        the session's own seal held."""
         rotated: str | None = None
         failure: dict[str, object] = {"reason": "session_gone"}
         try:
