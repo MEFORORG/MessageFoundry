@@ -455,14 +455,17 @@ def split_line(group):
     return " ".join(words[:first]).strip(), words[first:]
 
 
-def parsed(group):
-    # The requirement on a logical line, parsed by the packaging copy pip carries. None for a line
+def requirement(text):
+    # A logical line's requirement text, parsed by the packaging copy pip carries. None for a line
     # with no requirement; its text when packaging cannot read it.
-    text = split_line(group)[0]
     try:
         return Requirement(text) if text else None
     except InvalidRequirement:
         return text
+
+
+def parsed(group):
+    return requirement(split_line(group)[0])
 
 
 def named(group, name):
@@ -489,8 +492,9 @@ def unnamed(text):
 
 
 def editable(word):
-    # pip's -e or --editable in each spelling its option parser takes: "-e ./foo", "-e./foo",
-    # "--editable=./foo", and the long name cut to "--ed" or longer, which no other option shares.
+    # pip's -e or --editable (pip 26's cmdoptions.editable) in each spelling its optparse parser
+    # takes: "-e ./foo", "-e./foo", "--editable=./foo", and the long name cut to "--ed" or longer,
+    # which no other requirements-file option of pip 26 shares.
     name = word.split("=", 1)[0]
     return word.startswith("-e") or (len(name) >= 4 and "--editable".startswith(name))
 
@@ -504,10 +508,10 @@ for group in logical_lines("requirements.lock"):
         locked.setdefault(canonicalize_name(req.name), set()).update(exact)
 stale = []
 for group in logical_lines("requirements.txt"):
-    req = parsed(group)
+    text, options = split_line(group)
+    req = requirement(text)
     if req is None:
         # pip installs an editable when a line holds options and no requirement.
-        options = split_line(group)[1]
         if any(map(editable, options)):
             line = " ".join(options).strip()
             print(f"::notice::{line} is editable, so it is not checked against requirements.lock")
