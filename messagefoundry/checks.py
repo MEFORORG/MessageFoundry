@@ -2086,10 +2086,8 @@ def _settings_source(
       Server connection, beside a bare config dir. Triggering on any of them would end the documented
       fail-safe SKIP for a bare dir and run every leg against an instance nobody declared.
 
-    An explicit ``--service-config`` naming a file that does not exist never falls through to the
-    environment. ``serve`` refuses that file outright, so reading defaults plus the environment in its
-    place would pass a config ``serve`` will not start. It is returned as ``toml``, and its load
-    fails the leg (:func:`_resolve_service_toml`).
+    An explicit ``--service-config`` is always ``toml``, existing or not, so it never falls through
+    to the environment (:func:`_resolve_service_toml`).
 
     Under ``--project-root``, a ``./messagefoundry.toml`` in the working directory also keeps the
     SKIP, named in its text (:func:`_unread_working_dir_toml`).

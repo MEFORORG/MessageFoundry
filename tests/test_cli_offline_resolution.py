@@ -246,23 +246,20 @@ def test_offline_ac3_reads_the_env_dir_variable_as_serve_does(
     if command == "check":
         argv.append("--no-lint")
 
-    monkeypatch.setenv("MEFOR_ENVIRONMENTS_DIR", "envs")
-    assert load_settings(config_path=svc).environments.dir == "envs"  # serve's reader
-    rc = main(argv)
-    err = capsys.readouterr().err
-    if present == "envs":
-        assert rc != 2 and "no value file" not in err, err
-    else:
-        assert rc == 2 and str(tmp_path / "envs" / "prod.toml") in err, err
-
-    # Control: with the variable unset, the file's dir decides, the other way round.
-    monkeypatch.delenv("MEFOR_ENVIRONMENTS_DIR")
-    rc = main(argv)
-    err = capsys.readouterr().err
-    if present == "environments":
-        assert rc != 2 and "no value file" not in err, err
-    else:
-        assert rc == 2 and str(tmp_path / "environments" / "prod.toml") in err, err
+    # The variable set, then unset as the control: whichever dir serve's reader names decides.
+    for variable in ("envs", None):
+        if variable is None:
+            monkeypatch.delenv("MEFOR_ENVIRONMENTS_DIR")
+        else:
+            monkeypatch.setenv("MEFOR_ENVIRONMENTS_DIR", variable)
+        expected = load_settings(config_path=svc).environments.dir
+        assert expected == (variable or "environments")
+        rc = main(argv)
+        err = capsys.readouterr().err
+        if present == expected:
+            assert rc != 2 and "no value file" not in err, err
+        else:
+            assert rc == 2 and str(tmp_path / expected / "prod.toml") in err, err
 
 
 def test_graph_and_dryrun_honor_relative_config_under_root(
