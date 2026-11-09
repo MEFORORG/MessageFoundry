@@ -12693,7 +12693,7 @@ def _security(args: argparse.Namespace) -> int:
 
         ``degraded`` is why ``sec`` is not the [security] the caller meant to report, as when `set`
         could not re-read the [security] it saved (vault BACKLOG #8171, item 38). It marks the report
-        partial too, beside any reason the load gives."""
+        partial, and is the reason given."""
         full: ServiceSettings | None = saved
         partial_reason: str | None = None
         # An ABSENT file is not a degraded read -- the shipped defaults ARE the effective posture
@@ -12810,12 +12810,14 @@ def _security(args: argparse.Namespace) -> int:
         # Vault BACKLOG #2599 added a FIFTH, named for the same reason: the config-source escape is an
         # environment variable, and security_loosenings() reads it from the process that calls it. Here
         # that is the operator's shell, not the service.
-        reasons = [r for r in (degraded, partial_reason) if r is not None]
+        # `set` passes ``saved`` whenever it passes ``degraded``, so the load above did not run.
+        if degraded is not None:
+            partial_reason = degraded
         return {
             "loosenings": loosenings,
-            "loosenings_partial": bool(reasons),
+            "loosenings_partial": partial_reason is not None,
             # None unless the report is partial. Then: why it is.
-            "loosenings_partial_reason": "; ".join(reasons) or None,
+            "loosenings_partial_reason": partial_reason,
             "loosenings_scope": (
                 "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]/"
                 "[cert_monitor]/[backup]/[secrets]/[ai]); the "
@@ -12873,7 +12875,8 @@ def _security(args: argparse.Namespace) -> int:
 
     # Also how a relocated legacy key is refused at edit time rather than at the next start.
     saved: list[ServiceSettings] = []
-    saved_sec: list[SecuritySettings | str] = []
+    saved_sec: list[SecuritySettings] = []
+    reread_failed: list[str] = []
     check_candidate = _post_write_settings_check(security_edit.SecurityEditError, keep=saved)
 
     def validate(candidate: Path) -> None:
@@ -12895,7 +12898,7 @@ def _security(args: argparse.Namespace) -> int:
                 "so the loosenings are reported from the [security] checked before the edit"
             )
             logging.getLogger(__name__).warning("security set: %s", reason)
-            saved_sec.append(reason)
+            reread_failed.append(reason)
 
     try:
         data = args.data if args.data is not None else sys.stdin.read()
@@ -12917,9 +12920,9 @@ def _security(args: argparse.Namespace) -> int:
             return _emit_error(f"invalid [security] value: {exc}", as_json=args.json)
         result = security_edit.set_security(path, updates, validate=validate)
         # The candidate the write validated, so the preview reports the posture the edit left.
-        reread = saved_sec[-1] if saved_sec else None
-        view = reread if isinstance(reread, SecuritySettings) else sec
-        degraded = reread if isinstance(reread, str) else None
+        # set_security runs validate once, so at most one of the two lists holds an entry.
+        view = saved_sec[-1] if saved_sec else sec
+        degraded = reread_failed[-1] if reread_failed else None
         result.update(_posture(view, saved[-1] if saved else None, degraded=degraded))
     except _OperatorJsonError as exc:
         return _emit_error(str(exc), as_json=args.json)

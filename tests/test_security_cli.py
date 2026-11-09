@@ -290,9 +290,10 @@ def test_set_preview_does_not_refuse_an_edit_whose_candidate_read_raises(
     monkeypatch: pytest.MonkeyPatch,
     error: str,
 ) -> None:
-    """The preview's read of the candidate is for the report only, so a SecurityEditError or an
-    OSError from it falls back to the pre-check view rather than refusing an edit the whole-file
-    load accepted (vault BACKLOG #2600). Only the candidate's read raises; the live file reads.
+    """The preview's read of the candidate is for the report only, so a SecurityEditError, an
+    OSError or a ValidationError from it falls back to the pre-check view rather than refusing an
+    edit the whole-file load accepted (vault BACKLOG #2600). Only the candidate's read raises; the
+    live file reads.
 
     The fallback logs a WARNING naming the exception's type and nothing of its text, which can
     quote the file's values, and the report says it is partial and why, so the pre-check view
@@ -323,7 +324,7 @@ def test_set_preview_does_not_refuse_an_edit_whose_candidate_read_raises(
 
         def failing_candidate(service_config: str | Path) -> dict:
             if Path(service_config) != toml:
-                if error == "validation":  # a [security] that fails alone
+                if error == "validation":  # as a concurrent edit before the lock can leave it
                     return {"require_mfa": "secret-sentinel-0451"}
                 if error == "os":
                     raise OSError("secret-sentinel-0451")
