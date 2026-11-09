@@ -400,10 +400,11 @@ async def test_the_gates_and_the_store_judge_a_totp_cell_with_one_helper(
 async def test_a_password_change_opens_the_totp_cell_in_the_early_refusal_and_in_the_write(
     monkeypatch: pytest.MonkeyPatch, store: MessageStore
 ) -> None:
-    """BACKLOG #3948: a password change by a covered account with TOTP on opens the TOTP cell twice,
-    once in the early refusal before the argon2 hash and once in the store's conditional write
-    after it. Under a Transit cipher each open is one round trip. RED when either site stops
-    opening the cell, or a third open is added."""
+    """BACKLOG #3948: this characterises the OPEN remainder of the row, not a desired contract.
+    A password change by a covered account with TOTP on opens the TOTP cell twice, once in the
+    early refusal before the argon2 hash and once in the store's conditional write after it, as on
+    main. Under a Transit cipher each open is one round trip. RED when either site stops opening
+    the cell, or a third open is added; fixing the row to open it once is meant to turn this RED."""
     service, identity, _password, _steps, _codes = await _totp_admin(
         store, monkeypatch, before_confirm=lambda: None
     )

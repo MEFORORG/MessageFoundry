@@ -2363,12 +2363,13 @@ class AuthStore(Protocol):
     #
     # ADR 0197 Amendment A: ``password_generated`` is REQUIRED, with no default, for the reason
     # ``create_user`` gives: the generated paths pass True and every holder-chosen path passes False.
-    # ``require_way_past`` makes the write CONDITIONAL on a way past the sign-in lock, in the same
-    # transaction as the write: a TOTP the caller's rule does not refuse, or (wave 2) a passkey
-    # recorded as discoverable, read from the set the account's seal covers. So an
-    # ``admin_reset_mfa`` or a passkey removal that lands between the caller's check and this write
-    # makes it match no row. Returns whether a row was written; a conditional caller refuses on
-    # False.
+    # ``require_way_past`` makes the write CONDITIONAL on a way past the sign-in lock: a TOTP the
+    # caller's rule does not refuse, or (wave 2) a passkey recorded as discoverable, read from the
+    # set the account's seal covers under the writer lock. The TOTP is judged by the caller's rule
+    # BEFORE that lock (``judge_totp``); under it the write holds only where the account's TOTP is
+    # still the cell that was judged (``TotpJudgement.moved``). So an ``admin_reset_mfa`` or a
+    # passkey removal that lands between the caller's check and this write makes it match no row.
+    # Returns whether a row was written; a conditional caller refuses on False.
     async def set_password(
         self,
         user_id: str,
