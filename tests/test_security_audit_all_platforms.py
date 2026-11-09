@@ -553,7 +553,8 @@ def _requirements_pip_audit_reads(raw: bytes) -> list[str]:
     """The requirement lines pip-requirements-parser 32.0.1 makes of the copy: ``join_lines`` joins
     a line ending in a backslash, unless it is a comment, to the next, with its backslashes stripped;
     ``split_comments`` drops each comment and blank line; a line left that does not start with an
-    option is a requirement. Written apart from the module's model but from the same parser source,
+    option is a requirement. It does not count an ``-e`` line, which the parser does, and which no
+    copy the auditor hands on holds. Written apart from the module's model but from the same parser source,
     so it shares any misreading of that source; the recorded counts below are the parser's own."""
     comment = re.compile(r"(^|\s+)(#.*)$")
     logical: list[str] = []
@@ -612,6 +613,19 @@ def test_a_backslash_pin_before_a_skipped_one_is_refused_by_the_count(
     assert "does not pin" not in err, err
 
 
+def test_a_pin_the_strip_leaves_as_options_alone_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A pin the strip empties leaves its options as a line of their own, which the count model
+    cannot classify; main refuses that copy rather than skip the check."""
+    status, ran, printed, read, err = _counted_and_read(
+        tmp_path, capsys, f";os_name == 'nt' --hash=sha256:{_DIGEST}\n"
+    )
+    assert [len(reqs) for reqs in read] == printed, (printed, read)
+    assert (status, ran) == (2, [])
+    assert _COUNT_REFUSED in err, err
+
+
 _COUNT_REFUSED = "its copy would not hand pip-audit's parser the number of requirements counted"
 
 
@@ -649,8 +663,9 @@ def _counted_and_read(
 def test_a_copy_whose_parser_count_matches_is_audited(
     head: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The control for the refusal above: where the parser reads every counted pin from the copy,
-    as it does when a comment line takes the backslash, pip-audit gets the copy."""
+    """The control for the refusal above: where the parser reads as many requirements from the copy
+    as were counted, as it does when a comment line takes the backslash, pip-audit gets the copy.
+    The check is of the count: the parser reads that URL without its trailing backslash."""
     status, _, printed, read, _ = _counted_and_read(tmp_path, capsys, head)
     assert status == 0
     assert printed == [2] and [len(reqs) for reqs in read] == printed, (printed, read)
