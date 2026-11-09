@@ -116,7 +116,8 @@ _CANCELLED_REMOVAL_WORKERS = 2
 # How long a pair removal, or a ``rotate-key`` re-seal's replace, waits for the uploads root's
 # cross-process pair lock (:func:`_pair_lock`, BACKLOG #3181 item 5). Each holder keeps it only
 # across its unlinks, or across one re-check and one rename, so a wait this long means a stalled
-# file system. Then an engine removal goes on without the lock, and the re-seal skips the half.
+# file system. Then an engine removal goes on without the lock, and the re-seal skips the half, or
+# at the pass's first check writes nothing.
 # Under the 5 s bounds above, so a removal that waits it out still ends inside them.
 _PAIR_LOCK_TIMEOUT_SECONDS = 2.0
 
@@ -2162,18 +2163,17 @@ class UploadStore:
                 exc.strerror or type(exc).__name__,
             )
             return ResealResult(root_missing=True)
-        writable = True
+        blocked: str | None = None
         if pairs:
             try:
-                # Once, before any file is read: a lock this account cannot take refuses every
-                # write, and finding that out per half would decrypt and re-encrypt each upload
-                # first. Then every half that needs a write is a skip, so the run fails and nothing
-                # is written; a half already under the active key needs none, and is not one.
+                # Once, before any file is decrypted. Finding a lock it cannot take per half would
+                # decrypt and re-encrypt each upload first, then wait out the lock for each write.
+                # So whatever the cause, every half that needs a write is a skip, the run fails and
+                # nothing is written; a half already under the active key needs none, and is not one.
                 with _pair_lock(self._root / LOCK_FILE_NAME, for_reseal=True):
                     pass
             except OSError as exc:
-                # A lock still held past the wait is contention, so each write tries it again.
-                writable = _pair_lock_busy(exc)
+                blocked = _RESEAL_BLOCKED[_pair_lock_failure(exc)]
         resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = 0
         for fid, _sidecar in pairs:
             try:
@@ -2189,9 +2189,9 @@ class UploadStore:
             # _encrypt_blob). Body FIRST, as save() writes it: the sidecar is the listing key, and a
             # keyed store refuses a plaintext value (BACKLOG #1169). Sealing the sidecar first would
             # let an interrupted pass list an upload whose body is still refused.
-            body = self._reseal_half(cipher, fid, blob_path, "body", writable=writable)
+            body = self._reseal_half(cipher, fid, blob_path, "body", blocked=blocked)
             meta = self._reseal_half(
-                cipher, fid, meta_path, "meta", over=(body, blob_path), writable=writable
+                cipher, fid, meta_path, "meta", over=(body, blob_path), blocked=blocked
             )
             resealed += (body in _WRITTEN) + (meta in _WRITTEN)
             # Once per pair, whichever half failed. A skipped pair counts in sealed_plaintext too
@@ -2237,7 +2237,7 @@ class UploadStore:
         kind: Literal["body", "meta"],
         *,
         over: tuple[_Half, Path] | None = None,
-        writable: bool = True,
+        blocked: str | None = None,
     ) -> _Half:
         """Re-seal one half of upload ``fid`` and say what became of it. A sidecar passes ``over``,
         the body half's result and its path, because a plaintext sidecar is sealed only over a body
@@ -2253,9 +2253,10 @@ class UploadStore:
         **The write never re-creates a removed file (BACKLOG #3181 item 5).** ``rotate-key`` refuses
         a held store only on SQLite, so an engine on a server store can delete an upload while this
         runs, and a plain replace brought the sidecar back. The replace now happens under
-        :func:`_pair_lock`, only while the path is still the file this ``lstat`` saw. Without
-        ``writable`` (the pair lock was refused, not just busy), a half that needs a write is a skip
-        before it is decrypted."""
+        :func:`_pair_lock`, only while the path is still the file this ``lstat`` saw. ``blocked``
+        names why the pass's first pair-lock check failed: the lock was busy, refused or timed
+        out, or the uploads root was gone. With it, a half that needs a write is a skip before it is
+        decrypted. A write that finds the root gone, or the lock not to be had, is a skip too."""
         try:
             info = path.lstat()
             if S_ISLNK(info.st_mode):
@@ -2334,12 +2335,9 @@ class UploadStore:
             if body is _Half.SKIPPED:
                 _log.warning("uploaded file %s (meta): left unsealed, its body was not", fid)
                 return _Half.SKIPPED
-        if not writable:
+        if blocked is not None:
             _log.warning(
-                "uploaded file %s (%s): skipped, the uploads pair lock could not be taken, so "
-                "nothing is written",
-                fid,
-                kind,
+                "uploaded file %s (%s): skipped, nothing is written: %s", fid, kind, blocked
             )
             return _Half.SKIPPED
         try:
@@ -2378,6 +2376,17 @@ class UploadStore:
                 fid,
                 kind,
                 changed,
+            )
+            return _Half.SKIPPED
+        except FileNotFoundError:
+            # The target's own absence is _ChangedUnderReseal, so this is the root, or this pass's
+            # temp file in it. Its error would name the lock file when the root went before the
+            # lock's open, so it is not logged as the cause.
+            _log.warning(
+                "uploaded file %s (%s): skipped, could not be written: the uploads directory, or "
+                "this pass's temp file in it, is gone",
+                fid,
+                kind,
             )
             return _Half.SKIPPED
         except OSError as exc:
@@ -3242,11 +3251,34 @@ class _PairLockBusy(TimeoutError):
     """``edit_lock``'s ``busy_error`` for the pair lock: another holder kept it past the wait."""
 
 
-def _pair_lock_busy(exc: BaseException) -> bool:
-    """Whether ``exc`` from :func:`_pair_lock` is contention rather than a refusal. ``edit_lock``
-    also raises ``busy_error`` for a lock path planted as a link, chained from the ``ELOOP``; that
-    one is a refusal."""
-    return isinstance(exc, _PairLockBusy) and exc.__cause__ is None
+type _PairLockFailure = Literal["busy", "gone", "timeout", "refused"]
+
+
+def _pair_lock_failure(exc: OSError) -> _PairLockFailure:
+    """Why :func:`_pair_lock` could not take the lock. ``busy``: another holder kept it past the wait.
+    ``gone``: the uploads root is not there. ``timeout``: the OS timed out (``ETIMEDOUT``), as a
+    network file system can; that is neither contention nor a refusal. ``refused``: anything else,
+    such as a lock file another account owns. ``edit_lock`` also raises ``busy_error`` for a lock
+    path planted as a link, chained from the ``ELOOP``; that one is a refusal."""
+    if isinstance(exc, _PairLockBusy):
+        return "refused" if exc.__cause__ is not None else "busy"
+    if isinstance(exc, FileNotFoundError):
+        return "gone"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    return "refused"
+
+
+#: What a busy pair lock tells the ``rotate-key`` operator to do.
+_RERUN_WHEN_FREE = "re-run rotate-key once whatever holds the lock releases it"
+
+#: What a re-seal half skipped for a failed first pair-lock check logs as the cause.
+_RESEAL_BLOCKED: dict[_PairLockFailure, str] = {
+    "busy": f"the uploads pair lock was still held when the wait ran out; {_RERUN_WHEN_FREE}",
+    "gone": "the uploads directory was gone",
+    "timeout": "the file system timed out taking the uploads pair lock",
+    "refused": "the uploads pair lock could not be taken",
+}
 
 
 # The lock files whose refusal an engine removal has already logged at ERROR in this process, so a
@@ -3278,9 +3310,10 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
     cause: a lock file another account created, as when ``rotate-key`` ran as root or as an
     administrator. A lock whose directory is gone is not logged: there is nothing left to remove.
     A lock still held when the wait runs out is not a refusal: it is logged at WARNING each time,
-    with ``edit_lock``'s own reason, and never uses up that one ERROR.
-    **The re-seal fails closed (``for_reseal``):** a lock it cannot take is logged and raised, so
-    that half is a skip and nothing is written."""
+    with ``edit_lock``'s own reason, and never uses up that one ERROR. Nor is an OS timeout, which
+    is logged at WARNING each time as a timeout (:func:`_pair_lock_failure`).
+    **The re-seal fails closed (``for_reseal``):** a lock it cannot take is logged and raised. At
+    the pass's first check that stops every write; at a half's write, that half is a skip."""
     with contextlib.ExitStack() as held:
         try:
             held.enter_context(
@@ -3288,24 +3321,33 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
             )
         except OSError as exc:
             lock = scrub_log_argument(str(lock_path_for(path)))
-            if _pair_lock_busy(exc):
+            failure = _pair_lock_failure(exc)
+            consequence = (
+                "rotate-key writes nothing under it"
+                if for_reseal
+                else "This removal goes on without it, so a rotate-key run meanwhile could "
+                "re-create the removed upload"
+            )
+            if failure == "busy":
                 _log.warning(
-                    "uploaded-logs pair lock: %s. %s",
+                    "uploaded-logs pair lock: %s. %s%s",
                     codec_safe_str(exc),
-                    "rotate-key writes a file only once it takes this lock; a file it could not "
-                    "is a skip, which a re-run settles"
-                    if for_reseal
-                    else "This removal goes on without it, so a rotate-key run meanwhile could "
-                    "re-create the removed upload",
+                    consequence,
+                    f"; {_RERUN_WHEN_FREE}" if for_reseal else "",
                 )
-                if for_reseal:
-                    raise
-            elif for_reseal and isinstance(exc, FileNotFoundError):
+            elif failure == "timeout":
                 _log.warning(
-                    "rotate-key could not open the uploads pair lock %s: its directory is gone",
+                    "uploaded-logs pair lock %s: the file system timed out taking it (%s). %s",
                     lock,
+                    codec_safe_str(exc),
+                    consequence,
                 )
-                raise
+            elif failure == "gone":
+                if for_reseal:
+                    _log.warning(
+                        "rotate-key could not open the uploads pair lock %s: its directory is gone",
+                        lock,
+                    )
             elif for_reseal:
                 _log.error(
                     "rotate-key could not take the uploads pair lock %s (%s), so it writes no "
@@ -3315,8 +3357,7 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
                     lock,
                     codec_safe_str(exc),
                 )
-                raise
-            elif not isinstance(exc, FileNotFoundError):
+            else:
                 with _unlocked_logged_lock:
                     first = lock not in _unlocked_logged
                     _unlocked_logged.add(lock)
@@ -3330,6 +3371,8 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
                     lock,
                     codec_safe_str(exc),
                 )
+            if for_reseal:
+                raise
         yield
 
 

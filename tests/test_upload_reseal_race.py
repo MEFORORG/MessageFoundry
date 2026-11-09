@@ -13,6 +13,7 @@ the one it read. The race tests below fail on the code before the fix: the delet
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 import threading
@@ -23,7 +24,7 @@ from typing import Any
 import pytest
 
 from messagefoundry import uploads as uploads_mod
-from messagefoundry.config.atomic_edit import LOCK_FILE_NAME, edit_lock
+from messagefoundry.config.atomic_edit import LOCK_FILE_NAME, edit_lock, lock_path_for
 from messagefoundry.store.crypto import AesGcmCipher, cell_aad, generate_key, make_cipher
 from messagefoundry.uploads import UploadStore
 from tests._upload_root import upload_names
@@ -238,7 +239,35 @@ async def test_discard_waits_through_run_to_completion_held_from_the_start(
 
 def _refused(path: Path, **_: Any) -> Any:
     """A pair lock refused, as a 0600 lock file another account created refuses it."""
-    raise PermissionError(13, "Permission denied", str(path))
+    raise PermissionError(errno.EACCES, "Permission denied", str(path))
+
+
+def _busy(path: Path, **kwargs: Any) -> Any:
+    """The pair lock still held past the wait, as ``edit_lock`` reports it."""
+    raise kwargs["busy_error"](f"another edit of {path} is still in progress after 2s")
+
+
+def _timed_out(path: Path, **_: Any) -> Any:
+    """A pair lock the OS timed out on (``ETIMEDOUT``), as a network file system can."""
+    raise TimeoutError(errno.ETIMEDOUT, "Connection timed out", str(path))
+
+
+def _root_gone(path: Path, **_: Any) -> Any:
+    """A pair lock whose open finds the uploads root gone."""
+    raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(path))
+
+
+def _record_decrypts(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
+    """The AAD of every value the re-seal decrypts to re-encrypt, in order."""
+    reads: list[bytes] = []
+    real = uploads_mod._reencrypt_value
+
+    def _reencrypt(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
+        reads.append(aad)
+        return real(cipher, stored, aad)
+
+    monkeypatch.setattr(uploads_mod, "_reencrypt_value", _reencrypt)
+    return reads
 
 
 def _refuse_the_lock(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -276,14 +305,7 @@ def test_a_reseal_that_cannot_take_the_lock_writes_nothing_and_fails(
     fids = [_seed(root, old), _seed(root, old)]
     before = {n: (root / n).read_bytes() for n in upload_names(root)}
     _refuse_the_lock(monkeypatch)
-    reads: list[str] = []
-    real = uploads_mod._reencrypt_value
-
-    def _reencrypt(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
-        reads.append("read")
-        return real(cipher, stored, aad)
-
-    monkeypatch.setattr(uploads_mod, "_reencrypt_value", _reencrypt)
+    reads = _record_decrypts(monkeypatch)
     with caplog.at_level(logging.ERROR, logger="messagefoundry.uploads"):
         result = asyncio.run(_store(root, new, old).reseal_to_active())
     assert result.skipped == len(fids) and result.incomplete
@@ -292,13 +314,18 @@ def test_a_reseal_that_cannot_take_the_lock_writes_nothing_and_fails(
     assert "Run rotate-key as the account the engine runs as" in caplog.text, caplog.text
 
 
-def _busy_at(monkeypatch: pytest.MonkeyPatch, *, names: Callable[[str], bool]) -> None:
-    """The pair lock still held past the wait, as ``edit_lock`` reports it, for the lock taken on a
-    path whose name ``names`` selects; the real lock for every other path."""
+def _busy_at(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    names: Callable[[str], bool],
+    fail: Callable[..., Any] = _busy,
+) -> None:
+    """The pair lock fails as ``fail`` makes it (busy by default) for the lock taken on a path whose
+    name ``names`` selects; the real lock for every other path."""
 
     def _lock(path: Path, **kwargs: Any) -> Any:
         if names(path.name):
-            raise kwargs["busy_error"](f"another edit of {path} is still in progress after 2s")
+            return fail(path, **kwargs)
         return edit_lock(path, **kwargs)
 
     monkeypatch.setattr(uploads_mod, "edit_lock", _lock)
@@ -343,7 +370,7 @@ def test_a_busy_lock_at_a_reseal_write_is_a_skip_that_does_not_blame_the_account
         result = asyncio.run(_store(root, new, old).reseal_to_active())
     assert result.skipped == 1 and result.incomplete
     assert {n: (root / n).read_bytes() for n in upload_names(root)} == before
-    assert "a re-run settles" in caplog.text, caplog.text
+    assert "re-run rotate-key once whatever holds the lock releases it" in caplog.text, caplog.text
     assert "Run rotate-key as the account" not in caplog.text
 
 
@@ -363,28 +390,110 @@ def test_a_refused_lock_over_uploads_already_current_is_no_skip(
     assert result.skipped == 0 and not result.incomplete
 
 
-def test_a_busy_lock_at_the_reseal_pre_check_still_lets_each_write_try(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("lock", "cause"),
+    [
+        (
+            _busy,
+            "the uploads pair lock was still held when the wait ran out; re-run rotate-key once",
+        ),
+        (_timed_out, "the file system timed out taking the uploads pair lock"),
+        (_root_gone, "the uploads directory was gone"),
+    ],
+    ids=["busy", "timeout", "gone"],
+)
+def test_a_first_lock_check_that_fails_stops_the_reseal_before_any_decrypt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    lock: Callable[..., Any],
+    cause: str,
 ) -> None:
-    """Contention at the up-front probe is not a refusal, so each half's write takes the lock
-    itself, and a lock that freed meanwhile re-seals the upload."""
+    """The lock fails at the pass's first check and at every later try. The pass decrypts nothing,
+    takes the lock no second time, writes nothing, and fails, and each skip names the cause rather
+    than giving account advice."""
     root = tmp_path / "uploads"
     old, new = generate_key(), generate_key()
-    _seed(root, old)
-    _busy_at(monkeypatch, names=lambda name: name == LOCK_FILE_NAME)
-    result = asyncio.run(_store(root, new, old).reseal_to_active())
-    assert result.resealed == 2 and result.skipped == 0 and not result.incomplete
+    fids = [_seed(root, old), _seed(root, old)]
+    before = {n: (root / n).read_bytes() for n in upload_names(root)}
+    tries: list[str] = []
+
+    def _lock(path: Path, **kwargs: Any) -> Any:
+        tries.append(path.name)
+        return lock(path, **kwargs)
+
+    monkeypatch.setattr(uploads_mod, "edit_lock", _lock)
+    monkeypatch.setattr(uploads_mod, "_unlocked_logged", set())
+    reads = _record_decrypts(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert reads == []
+    assert tries == [LOCK_FILE_NAME]
+    assert result.skipped == len(fids) and result.incomplete and result.resealed == 0
+    assert {n: (root / n).read_bytes() for n in upload_names(root)} == before
+    assert f"uploaded file {fids[0]} (body): skipped, nothing is written: {cause}" in caplog.text
+    assert "Run rotate-key as the account" not in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
 
 
-def test_a_planted_link_at_the_lock_path_is_a_refusal_not_contention() -> None:
-    """``edit_lock`` raises ``busy_error`` for a link too, chained from the ELOOP; that one is a
-    refusal, so it gets the account ERROR rather than the re-run WARNING."""
+def test_an_os_timeout_on_an_engine_removal_is_a_warning_not_the_account_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An OS timeout is neither another account's lock file nor a busy lock: the removal goes on,
+    one WARNING names the timeout, and the once-per-process ERROR is not used up."""
+    root = tmp_path / "uploads"
+    key = generate_key()
+    fid = _seed(root, key)
+    engine = _store(root, key)
+    monkeypatch.setattr(uploads_mod, "edit_lock", _timed_out)
+    monkeypatch.setattr(uploads_mod, "_unlocked_logged", set())
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert engine._discard_cancelled_sync(fid) is True
+    assert upload_names(root) == []
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
+    assert "the file system timed out taking it" in caplog.text, caplog.text
+    assert "another account owns it" not in caplog.text
+    assert uploads_mod._unlocked_logged == set()
+
+
+def test_a_root_gone_at_a_half_write_does_not_blame_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first check takes the lock; a half's write then finds the root gone at the lock's open.
+    That half is a skip whose warning names the missing directory, not the lock file."""
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    fid = _seed(root, old)
+    _busy_at(
+        monkeypatch,
+        names=lambda name: name != LOCK_FILE_NAME,
+        fail=lambda path, **_: _root_gone(lock_path_for(path)),
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert result.skipped == 1 and result.incomplete
+    half = [
+        r.getMessage() for r in caplog.records if f"uploaded file {fid} (body)" in r.getMessage()
+    ]
+    assert half == [
+        f"uploaded file {fid} (body): skipped, could not be written: the uploads directory, or "
+        "this pass's temp file in it, is gone"
+    ], caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
+
+
+def test_pair_lock_failures_are_classified_apart() -> None:
+    """``edit_lock`` raises ``busy_error`` for a planted link too, chained from the ELOOP; that one
+    is a refusal. An OS ``ETIMEDOUT`` is a timeout, neither contention nor a refusal."""
     try:
         try:
-            raise OSError(40, "Too many levels of symbolic links")
+            raise OSError(errno.ELOOP, "Too many levels of symbolic links")
         except OSError as loop:
             raise uploads_mod._PairLockBusy("x is a link") from loop
     except OSError as exc:
-        assert not uploads_mod._pair_lock_busy(exc)
-    assert uploads_mod._pair_lock_busy(uploads_mod._PairLockBusy("still in progress"))
-    assert not uploads_mod._pair_lock_busy(TimeoutError(110, "Connection timed out"))
+        assert uploads_mod._pair_lock_failure(exc) == "refused"
+    failure = uploads_mod._pair_lock_failure
+    assert failure(uploads_mod._PairLockBusy("still in progress")) == "busy"
+    assert failure(TimeoutError(errno.ETIMEDOUT, "Connection timed out")) == "timeout"
+    assert failure(FileNotFoundError(errno.ENOENT, "gone")) == "gone"
+    assert failure(PermissionError(errno.EACCES, "Permission denied")) == "refused"
