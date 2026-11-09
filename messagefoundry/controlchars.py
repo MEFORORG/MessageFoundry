@@ -286,6 +286,17 @@ def scrub_control_chars(text: str) -> str:
     return text.translate(_LOG_TRANSLATION)
 
 
+def escape_lone_surrogates(text: str) -> str:
+    """``text`` with each surrogate code point spelled as the log spells it (:func:`_log_escape`),
+    and every other character, line breaks included, left as it is. ``text`` itself when it holds
+    none, so the common case costs one scan. For text that must stay as rendered but still has to
+    survive a strict UTF-8 encode: the off-box forwarder's replay of a spooled line (BACKLOG
+    #2279)."""
+    if not has_lone_surrogate(text):
+        return text
+    return "".join(_log_escape(ord(ch)) if _is_surrogate(ord(ch)) else ch for ch in text)
+
+
 def scrub_log_argument(text: str) -> str:
     """:func:`scrub_control_chars` for one argument of a log call, with CR and LF escaped first.
 

@@ -203,7 +203,7 @@ Seeds are the committed synthetic samples under `samples/messages/` plus small i
 
 **Do not seed from captured traffic.** libFuzzer prints and writes the input it crashed on, so a
 real corpus would put payload content into a CI log and into a crash artifact. De-identify first
-(`messagefoundry/anon/`, ADR 0030) and keep such a run local. Synthetic messages come from
+(`messagefoundry_toolkit/anon/`, ADR 0030) and keep such a run local. Synthetic messages come from
 `messagefoundry-toolkit generate`; that corpus is git-ignored and should stay so.
 
 ## Reproducing a finding from a CI run

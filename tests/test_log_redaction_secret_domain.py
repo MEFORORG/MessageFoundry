@@ -83,6 +83,7 @@ import pytest
 
 from messagefoundry import secretscrub as scrub_mod
 from messagefoundry.logging_setup import CredentialScrubFilter, _install_phi_filters
+from messagefoundry.redaction import safe_text
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 from messagefoundry.support import redact as redact_mod
 from messagefoundry.support.redact import REDACTION_PLACEHOLDER, redact_log_line
@@ -2392,6 +2393,540 @@ def test_the_swallow_tests_fail_without_the_stop(monkeypatch: pytest.MonkeyPatch
     # separator. A floor rather than the exact count, so a later widening of a terminator set does not
     # red this for the wrong reason; it is far above zero, which is the property that matters.
     assert len(leaked) >= 500, f"only {len(leaked)} family lines leaked without the stop"
+
+
+# --- BACKLOG #2966: a plain value running on into a later braced password --------------------------
+#
+# A plain value ran on over a later ``_CREDENTIAL_KV`` label and stopped at the space inside its
+# braces, so the braced value's tail printed. Why the value now takes that label up to the closer and
+# writes the tail back masked, and which shapes are left, is stated once, on ``_BRACED_RUN_ON`` in
+# ``messagefoundry/secretscrub.py``.
+
+#: The braced value's two words. Synthetic. The first, before the space, holds "-" and "_", so the
+#: bundle's long-base64 sweep cannot be what hides it; the second is the tail, and holds only lower
+#: case letters, because a tail holding anything else is refused and prints as before.
+_BRACED_WORDS = ("bv-br_a-71", "bvbrbwq")
+
+#: The five shapes the row was measured on: a ``MEFOR_`` value, a ``MEFOR_`` DSN, and the token,
+#: session and api_key labels, each then ``;PWD=`` with a braced value holding a space.
+BRACED_AFTER_PLAIN = tuple(
+    f"connect failed {first}={value};PWD={{{_BRACED_WORDS[0]} {_BRACED_WORDS[1]}}} for svc"
+    for first, value in (
+        ("MEFOR_X", "bv-Fst_0-70"),
+        ("MEFOR_STORE_DSN", "Server=h"),
+        ("token", "bv-Fst_0-70"),
+        ("session", "bv-Fst_0-70"),
+        ("api_key", "bv-Fst_0-70"),
+    )
+)
+
+
+@pytest.mark.parametrize(
+    "line", BRACED_AFTER_PLAIN, ids=("mefor", "mefor-dsn", "token", "session", "api-key")
+)
+def test_a_plain_value_does_not_print_a_later_braced_password(line: str) -> None:
+    """No word of the braced value prints on any surface, and the first label stays visible.
+
+    The installed chain is not one of these surfaces: its query filter still prints the tail on the
+    ``token=`` line, before this pass runs. That half is the query filter's own."""
+    first = line.split()[2].split("=")[0]
+    # Each "-" or "_" piece of the words, not the whole words, so a tail printed in part counts.
+    pieces = {piece for word in _BRACED_WORDS for piece in re.split(r"[-_]", word)}
+    # The five pieces are "bv", "br", "a", "71" and "bvbrbwq"; an empty set would pass the absence below.
+    # Top level, not inside the loop, so the lint counts it as having run.
+    assert len(pieces) >= 5, pieces
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        printed = sorted(
+            piece
+            for piece in pieces
+            if re.search(rf"(?<![A-Za-z0-9]){piece}(?![A-Za-z0-9])", out) and piece not in first
+        )
+        assert not printed, f"{surface}: {printed} printed -- got {out!r}"
+        assert f"{first}=" in out, f"{surface}: the label {first} was lost -- got {out!r}"
+
+
+def test_the_braced_tail_is_written_back_masked_with_its_closer() -> None:
+    """The tail keeps its spaces and closer, and each of its letters is masked to "x". Pinned exactly, on both copies and the store path."""
+    assert scrub_credentials("MEFOR_X=a;PWD={pp ww}") == "MEFOR_X=<redacted> xx}"
+    assert scrub_credentials("token=a;PWD={pp w  ab} tail") == "token=<redacted> x  xx} tail"
+    assert redact_log_line("MEFOR_X=a;PWD={pp ww}") == f"MEFOR_X={REDACTION_PLACEHOLDER} xx}}"
+    assert _store_detail("MEFOR_X=a;PWD={pp ww}") == f"MEFOR_X={REDACTION_PLACEHOLDER} xx}}"
+
+
+def _without_the_braced_run_on(module: ModuleType) -> dict[str, re.Pattern[str]]:
+    """``module``'s stopped patterns with the braced stop and run-on cut out. That is not the plain
+    classes as they stood before BACKLOG #2966: the fast path still refuses a "{". It is enough for the
+    braced shapes, which hold none in front of the label. Each source must hold both fragments, or the
+    cut proves nothing."""
+    never = NEVER_MATCHES.pattern
+    rebuilt: dict[str, re.Pattern[str]] = {}
+    for name in _STOPPED_PATTERNS:
+        pattern: re.Pattern[str] = getattr(module, name)
+        source = pattern.pattern
+        assert module._BRACED_LABEL in source, f"{module.__name__}.{name} has no braced stop"
+        assert module._BRACED_RUN_ON in source, f"{module.__name__}.{name} has no braced run-on"
+        source = source.replace(module._BRACED_RUN_ON, never).replace(module._BRACED_LABEL, never)
+        rebuilt[name] = re.compile(source, pattern.flags)
+    return rebuilt
+
+
+def test_the_braced_shapes_print_without_the_run_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE POSITIVE CONTROL. With the braced stop and run-on cut out of both copies, every shape
+    prints the braced value's second word on the write-time pass and the bundle, as it did before
+    BACKLOG #2966. Otherwise the test above cannot fail."""
+    for module in (scrub_mod, redact_mod):
+        for name, pattern in _without_the_braced_run_on(module).items():
+            monkeypatch.setattr(module, name, pattern)
+    for line in BRACED_AFTER_PLAIN:
+        for surface, apply in (
+            ("scrub_credentials", scrub_credentials),
+            ("bundle", redact_log_line),
+        ):
+            out = apply(line)
+            assert _BRACED_WORDS[1] in out, f"{surface}: {line!r} did not print -- got {out!r}"
+
+
+#: Lines review found printing a value on the first form of the braced run-on, each hidden by the
+#: patterns before BACKLOG #2966, with the value that printed. A label inside the braces after their
+#: first white space, which the old class left for the pass that wrote the placeholder and every pass
+#: after it; a placeholder in the tail; a line break before the separator; and white space after it,
+#: where the fast path and the walk disagreed. Each must print nothing on the write-time pass or the
+#: bundle. On the first form each one printed its value, or for the line break joined three lines.
+_BRACED_REVIEW_LINES: tuple[tuple[str, str], ...] = (
+    ("MEFOR_X=a;PWD={pp token=tA1-x}tB2-x", "tB2-x"),
+    ("token=a;PWD={pp Bearer bA1-xyzw}bB2-x", "bB2-x"),
+    ("password=a.PWD={pp private_key=kA1-x}kB2-x", "kB2-x"),
+    ("api_key=a&passwd={pA1-x session=sA1-x}sB2-x", "sB2-x"),
+    ("passwd='qA1-x{pa\u017f\u017fword={qB2-x x_pwd=qC3-x}qD4-x", "qD4-x"),
+    # Review round 2: a scheme word when the run-on is in the scheme pass itself, and a label after
+    # a percent escape, where the check in front of each run does not look.
+    ("retry Bearer abcd.PWD={c Bearer dA1-x}eB2-x tail", "eB2-x"),
+    ("password=a.PWD={b %3Bpassword=cA1-x}dB2-x x", "dB2-x"),
+    ("token=A0a;secret={Ba1 %26token=Bb2}cC3-x", "cC3-x"),
+    # A value-class terminator inside the braces: the run-on took the ``;password=`` a later pass
+    # reads, which the old class stopped in front of.
+    ("x_pwd='a/PWD:{b;password=c=Bearer d }eA1-x", "eA1-x"),
+)
+
+
+@pytest.mark.parametrize("line, value", _BRACED_REVIEW_LINES, ids=range(len(_BRACED_REVIEW_LINES)))
+def test_a_label_inside_the_braces_is_left_to_the_passes(line: str, value: str) -> None:
+    """A braced value holding a label after its first white space is not taken by the run-on, so the
+    later label's value is hidden as it was before BACKLOG #2966."""
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        assert value not in out, f"{surface}: {value} printed -- got {ascii(out)}"
+
+
+def test_a_placeholder_and_a_line_break_in_a_braced_value_survive() -> None:
+    """A tail holding the bundle's ``[REDACTED]`` or a later label is refused by the run-on, so the
+    line reads as before and the placeholder stays, and the run-on does not cross a line break before
+    the separator. A tail holding the PHI pass's placeholder is refused too, pinned last."""
+    bundled = redact_log_line("token=a;PWD={p mfb64:v1:QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=} next")
+    assert bundled == f"token={REDACTION_PLACEHOLDER} {REDACTION_PLACEHOLDER}}} next"
+    assert (
+        scrub_credentials("token=a;PWD={p MEFOR_Y=b c}") == "token=<redacted> MEFOR_Y=<redacted> c}"
+    )
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply("MEFOR_X=a;PWD\n=\n{b c} rest")
+        assert out.count("\n") == 2, f"{surface}: a line break was lost -- got {ascii(out)}"
+    # A record break the log and bundle readers split at is not white space the run-on may cross.
+    for brk in ("\v", "\f", "\x1c", "\x85", "\u2028", "\u2029"):
+        assert scrub_credentials(f"token=a;PWD={{pp{brk}ww}}") == f"token=<redacted>{brk}ww}}"
+    assert scrub_credentials("token=a;PWD={p [redacted] vq9}") == "token=<redacted> [redacted] vq9}"
+    # A capital letter after the first white space refuses the braced label: the line reads as before.
+    assert scrub_credentials("token=a;PWD={p w Summer2024}") == "token=<redacted> w Summer2024}"
+
+
+def test_the_bundle_copy_of_the_braced_tail_is_the_write_time_one() -> None:
+    """The bundle restates the braced fragments so the regex scanner can read them. Its tail and its
+    braced head are the write-time ones, and its braced label takes the same credential words."""
+    assert redact_mod._SPACED_BRACED_HEAD == scrub_mod._SPACED_BRACED_HEAD
+    assert redact_mod._SPACED_BRACED_TAIL == scrub_mod._SPACED_BRACED_TAIL
+    heads = [re.compile(module._BRACED_HEAD) for module in (scrub_mod, redact_mod)]
+    for word in (*scrub_mod._CREDENTIAL_WORDS, "token", "session", "pwds", "xpwd", "PWD"):
+        for sep in ("=", ":", " =", "'="):
+            readings = {head.fullmatch(word + sep) is not None for head in heads}
+            assert len(readings) == 1, f"the copies disagree on {word + sep!r}"
+
+
+def test_white_space_after_the_separator_gives_the_old_result_on_both_paths() -> None:
+    """``PWD= {b c}`` is not a braced label, so the fast path and the walk agree: the line prints as
+    it did before BACKLOG #2966 whether or not a "{" comes earlier in the value. A residual."""
+    for apply in (scrub_credentials, redact_log_line):
+        assert apply("token=a;PWD= {b c}").endswith(" {b c}")
+        assert apply("token=a{;PWD= {b c}").endswith(" {b c}")
+
+
+#: White space between a braced label's keyword and its separator. The log and bundle readers split
+#: a record at most of these, and the run-on would delete them.
+_BRACED_HEAD_BREAKS = (
+    " ",
+    "\t",
+    "\v",
+    "\f",
+    "\x1c",
+    "\x1d",
+    "\x1e",
+    "\x85",
+    "\u2028",
+    "\u2029",
+    "\u00a0",
+)
+
+
+def _braced_head_line(brk: str) -> str:
+    return f"MEFOR_X=a;PWD{brk}={{pp ww}} rest"
+
+
+#: A braced label with white space before its separator, and a scheme word, a label or an HL7
+#: segment ID in the braces before their first white space, with the value it must not print. The
+#: value in front stops at that white space, so the head of the braces is left to the later passes,
+#: which hid the value past the closer. Review round 4 found each printing it while the head took
+#: spaces and tabs there; the last on the bundle only.
+_BRACED_SPACED_HEAD_LINES: tuple[tuple[str, str], ...] = (
+    ("MEFOR_STORE_DSN=Server=h;PWD ={Bearer vq1}vq2", "vq2"),
+    ("MEFOR_X=a;PWD ={MEFOR_Y: vq1}vq2 rest", "vq2"),
+    ("api_key=a;passwd :{token: vq1}vq2", "vq2"),
+    ("MEFOR_X=a;PWD\t:{x%3Bbearer vq1}vq2", "vq2"),
+    ("token=a;PWD ={PID|vq1 vq2} rest vq3", "vq3"),
+)
+
+
+def _widen_the_braced_head(monkeypatch: pytest.MonkeyPatch, gap: str) -> None:
+    """Both copies' stopped patterns with ``gap`` allowed between the braced label's keyword and its
+    separator, which takes none now."""
+    for module in (scrub_mod, redact_mod):
+        head = module._BRACED_HEAD
+        assert head.endswith(r"\b[:=]"), f"{module.__name__}._BRACED_HEAD takes a gap"
+        wide = head[: -len("[:=]")] + gap + "[:=]"
+        for name in _STOPPED_PATTERNS:
+            pattern: re.Pattern[str] = getattr(module, name)
+            assert head in pattern.pattern, f"{module.__name__}.{name} has no braced head"
+            monkeypatch.setattr(
+                module, name, re.compile(pattern.pattern.replace(head, wide), pattern.flags)
+            )
+
+
+def test_a_break_before_the_braced_separator_is_kept() -> None:
+    """A braced label takes its ":" or "=" right after the keyword, so the run-on never deletes white
+    space there. Anything else gives the old result, which keeps the character."""
+    for brk in _BRACED_HEAD_BREAKS:
+        for surface, apply in _SWALLOW_SURFACES:
+            out = apply(_braced_head_line(brk))
+            assert brk in out, f"{surface}: {ascii(brk)} was deleted -- got {ascii(out)}"
+
+
+def test_a_break_before_the_braced_separator_is_deleted_by_a_wider_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL. With the braced label's head widened back to any white space but a
+    line feed or carriage return, as it was before, the run-on deletes each break but the space,
+    which the tail writes back, on both copies."""
+    _widen_the_braced_head(monkeypatch, r"[^\S\r\n]*+")
+    for brk in _BRACED_HEAD_BREAKS[1:]:
+        for surface, apply in (
+            ("scrub_credentials", scrub_credentials),
+            ("bundle", redact_log_line),
+        ):
+            out = apply(_braced_head_line(brk))
+            assert brk not in out, f"{surface}: {ascii(brk)} was kept -- got {ascii(out)}"
+
+
+@pytest.mark.parametrize(
+    ("line", "value"), _BRACED_SPACED_HEAD_LINES, ids=range(len(_BRACED_SPACED_HEAD_LINES))
+)
+def test_white_space_before_the_braced_separator_leaves_the_head_to_the_passes(
+    line: str, value: str
+) -> None:
+    """The run-on does not take a braced label with white space before its separator, so the head of
+    the braces is still read by the passes that hid the value past the closer."""
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        if "PID|" in line and surface != "redact_log_line":
+            continue  # The HL7 segment is read by the bundle's PHI pass alone, on either code.
+        assert value not in out, f"{surface}: {value} printed -- got {ascii(out)}"
+
+
+def test_the_spaced_head_lines_print_when_the_head_takes_a_space_or_tab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL. With spaces and tabs allowed before the separator, as the previous form
+    did, and the round-2 denylist tail, which took the digits in these tails, each line prints its
+    value on the write-time pass or the bundle."""
+    _widen_the_braced_head(monkeypatch, r"[ \t]*+")
+    _restore_an_earlier_tail(monkeypatch)
+    for line, value in _BRACED_SPACED_HEAD_LINES:
+        outs = [scrub_credentials(line), redact_log_line(line)]
+        assert any(value in out for out in outs), f"{line!r} printed no value -- got {outs!r}"
+
+
+#: The run class and segment checks the earlier, denylist forms of the tail had, for the positive
+#: controls: the round-2 form took lower case letters and digits, and the forms before it any letter.
+_DENYLIST_TAIL_RUN = "(?-i:[a-z0-9])++"
+_EARLIER_TAIL_RUN = "(?-i:[A-Za-z0-9])++"
+_EARLIER_SEGMENT_CHECKS = (
+    r"|(?-i:[A-Z][A-Z0-9]{2})(?![A-Za-z0-9])|[A-Za-z0-9]*?(?-i:MSH|BHS|FHS)(?![A-Za-z0-9])"
+)
+
+
+def _denylist_tail(
+    module: ModuleType,
+    *,
+    run: str = _DENYLIST_TAIL_RUN,
+    segment_checks: bool = False,
+    take_lt: bool = False,
+) -> str:
+    """The braced tail as the denylist forms spelled it, before the allowlist: a space or a tab, then
+    anything but the characters and words each review refused, with ``module``'s own label refusal."""
+    refused = "%;,&" if take_lt else "%;,&<"
+    checks = _EARLIER_SEGMENT_CHECKS if segment_checks else ""
+    return (
+        r"[ \t](?:[^{}'\""
+        + refused
+        + r"\r\n\v\f\x1c-\x1eA-Za-z0-9\x80-\U0010ffff]|\}\}"
+        + r"|(?!"
+        + module._RUN_ON_LABEL
+        + r"|(?i:bearer|basic|digest)\s"
+        + checks
+        + r")"
+        + run
+        + r")*+"
+    )
+
+
+def _member_masked_tail(m: re.Match[str]) -> str:
+    """The braced tail as the denylist forms wrote it back: masked by the connection-string member
+    mask, which keeps a digit's class and some words whole."""
+    if "braced_tail" not in m.re.groupindex:
+        return ""
+    start, end = m.span("braced_tail")
+    return "" if start < 0 else scrub_mod._mask_member_value(m.string, start, end)
+
+
+def _restore_an_earlier_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run: str = _DENYLIST_TAIL_RUN,
+    segment_checks: bool = False,
+    take_lt: bool = False,
+) -> None:
+    """Both copies' stopped patterns with the braced tail put back to a denylist form, and the tail
+    written back by the connection-string member mask, as the denylist forms wrote it."""
+    for module in (scrub_mod, redact_mod):
+        monkeypatch.setattr(module, "_braced_tail", _member_masked_tail)
+        tail = module._SPACED_BRACED_TAIL
+        bare = _denylist_tail(module, run=run, segment_checks=segment_checks, take_lt=take_lt)
+        for name in _STOPPED_PATTERNS:
+            pattern: re.Pattern[str] = getattr(module, name)
+            assert tail in pattern.pattern, f"{module.__name__}.{name} has no braced tail"
+            monkeypatch.setattr(
+                module, name, re.compile(pattern.pattern.replace(tail, bare), pattern.flags)
+            )
+
+
+#: Lines whose braced tail holds something outside the allowlist, a date glued to a label and an
+#: ``mrn`` before a "[", that the round-2 denylist took, with the value it then printed in the bundle
+#: and on the store path, and what the code before the run-on wrote on the write-time pass and in the
+#: bundle and the store path, which they write again. The write-time pass alone printed the value
+#: before too; the bundle and the store path are where the PHI pass after it hid it.
+_OUTSIDE_THE_ALLOWLIST_LINES: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "Bearer abcd.PWD={pp 2024-01-01t09:15private_key=vq9}vq10 rest",
+        "vq10",
+        "Bearer <redacted> 2024-01-01t09:15private_key=vq9}vq10 rest",
+        f"Bearer {REDACTION_PLACEHOLDER} [redacted]private_key={REDACTION_PLACEHOLDER} rest",
+    ),
+    (
+        "token=a;PWD={pp mrn[vq7code=x}",
+        "vq7code",
+        "token=<redacted> mrn[vq7code=x}",
+        f"token={REDACTION_PLACEHOLDER} mrn[[redacted]=x}}",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("line", "value", "scrubbed", "bundled"), _OUTSIDE_THE_ALLOWLIST_LINES, ids=range(2)
+)
+def test_a_braced_tail_outside_the_allowlist_prints_as_before(
+    line: str, value: str, scrubbed: str, bundled: str
+) -> None:
+    """The braced label is refused, so the line reads exactly as it did before the run-on, pinned on
+    the write-time pass, the bundle and the store path."""
+    assert scrub_credentials(line) == scrubbed
+    assert redact_log_line(line) == bundled
+    assert _store_detail(line) == bundled
+    assert safe_text(redact_log_line(line)) == bundled
+    assert value not in bundled
+
+
+def test_the_outside_lines_print_their_value_under_the_denylist_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL. With the tail put back to the round-2 denylist, each line prints its
+    value in the bundle and on the store path."""
+    _restore_an_earlier_tail(monkeypatch)
+    for line, value, _, _ in _OUTSIDE_THE_ALLOWLIST_LINES:
+        for surface, out in (("bundle", redact_log_line(line)), ("store", _store_detail(line))):
+            assert value in out, f"{surface}: {line!r} hid -- got {ascii(out)}"
+
+
+def test_only_lower_case_letters_and_spaces_are_taken_after_the_first_space() -> None:
+    """The allowlist, character by character: a tail of lower case letters and plain spaces is
+    masked, and a tail holding any other character, or opening on a tab, prints as before."""
+    assert scrub_credentials("token=a;PWD={pp ab cd  ef}") == "token=<redacted> xx xx  xx}"
+    for odd in ("1", "A", ".", "-", "_", "[", "é", "ſ", "\t", " ", "}}"):
+        line = f"token=a;PWD={{pp ab{odd}cd}}"
+        assert scrub_credentials(line) == f"token=<redacted> ab{odd}cd}}", ascii(line)
+    assert scrub_credentials("token=a;PWD={pp\tab}") == "token=<redacted>\tab}"
+    # Every word is masked, a word ending in a scheme word or ``mrn`` included.
+    assert scrub_credentials("MEFOR_X=a;PWD={pp hunterbasic abcmrn dog}") == (
+        "MEFOR_X=<redacted> xxxxxxxxxxx xxxxxx xxx}"
+    )
+    # A scheme word, or a JSON literal the PHI pass keeps bare, refuses the label.
+    for word in ("bearer", "basic", "digest", "true", "false", "null", "redacted"):
+        line = f"token=a;PWD={{pp ab {word} cd}}"
+        assert scrub_credentials(line) == f"token=<redacted> ab {word} cd}}", line
+    assert scrub_credentials("token=a;PWD={pp trueish nullx}") == "token=<redacted> xxxxxxx xxxxx}"
+
+
+def test_every_stopped_pattern_carries_the_braced_tail_group() -> None:
+    """:func:`~messagefoundry.secretscrub._braced_tail` writes nothing back for a pattern without the
+    group, which is the dropped-tail form, so a group renamed in one copy alone must go red here."""
+    for module in (scrub_mod, redact_mod):
+        for name in _STOPPED_PATTERNS:
+            pattern: re.Pattern[str] = getattr(module, name)
+            assert "braced_tail" in pattern.groupindex, f"{module.__name__}.{name} lost the group"
+
+
+#: Braces whose tail holds what the bundle's PHI pass reads by its letters: an XML tag, an HL7
+#: segment ID before a delimiter an ``MSH`` header declared, and the header itself. The masked tail
+#: is written back before that pass runs, so it no longer saw them, and the value past the closer
+#: printed in the bundle (review round 5). Each is refused now, and the line reads as before.
+_BRACED_PHI_READER_LINES: tuple[tuple[str, str], ...] = (
+    ("token=a;PWD={pp <name>}vq2</name> rest", "vq2"),
+    ("MEFOR_X=a;PWD={pp <ns:given>}vq2</ns:given> rest", "vq2"),
+    ("token=a;PWD={pp MSH*!#\\$*}PID*vq2 rest", "vq2"),
+    ("MSH#^~\\$#h MEFOR_X=a;PWD={pp NK1#}vq2 vq3", "vq2"),
+)
+
+
+@pytest.mark.parametrize(("line", "value"), _BRACED_PHI_READER_LINES, ids=range(4))
+def test_a_braced_tail_holding_what_the_phi_pass_reads_is_left_to_it(line: str, value: str) -> None:
+    """The bundle hides the value past the closer, as it did before the run-on."""
+    out = redact_log_line(line)
+    assert value not in out, f"{value} printed -- got {ascii(out)}"
+
+
+def test_the_phi_reader_lines_print_when_the_tail_takes_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL. With the tail taking a "<" and capital letters again, each line prints
+    its value in the bundle."""
+    _restore_an_earlier_tail(monkeypatch, run=_EARLIER_TAIL_RUN, take_lt=True)
+    for line, value in _BRACED_PHI_READER_LINES:
+        out = redact_log_line(line)
+        assert value in out, f"{line!r} hid -- got {ascii(out)}"
+
+
+def _store_detail(line: str) -> str:
+    """The store path: a driver error redacted by the bundle's redactor, as ``store/privilege.py``
+    writes its detail, then the store's own :func:`safe_text` chokepoint over it."""
+    return safe_text(redact_log_line(line), limit=100_000)
+
+
+#: A segment ID or a name glued behind digits inside the braces' tail, after a value the PHI pass
+#: reads. The masked tail rewrote ``PID`` to ``xxx`` and ``Jane`` to ``xxxx``, so once the SSN or
+#: date in front was redacted a second PHI round on the store path no longer saw a segment or a name,
+#: and the text past the closer printed, which the patterns before BACKLOG #2966 hid there. Reviews
+#: found the shapes; each tail holds a capital letter, which the tail now refuses, so it reads as
+#: before.
+_GLUED_SEGMENT_LINES: tuple[tuple[str, str], ...] = (
+    ("token=a;PWD={pp 123-45-6789PID| ..}vq rest", "rest"),
+    ("MEFOR_X=a;PWD={pp q 123-45-6789PID|vq1}vq3 rest", "vq3"),
+    ("token=a;PWD={pp 123-45-6789NK1| ..} vq3", "vq3"),
+    ("MEFOR_X=a;PWD={pp a|123-45-6789Jane Doe}vq02|vq03", "vq02"),
+    ("token=a;PWD={pp a|19800505T12Jane Doe}vq02|vq03", "vq02"),
+    ("MEFOR_X=a;PWD={pp a|Jane Doe123-45-6789}vq02|vq03", "vq02"),
+)
+
+
+@pytest.mark.parametrize(("line", "value"), _GLUED_SEGMENT_LINES, ids=range(6))
+def test_a_segment_id_glued_behind_digits_in_a_braced_tail_is_left_to_the_phi_pass(
+    line: str, value: str
+) -> None:
+    """The store path hides the value past the closer, as it did before the run-on, and so does the
+    bundle on the line with a structured PHI field after it, which makes the PHI pass run twice."""
+    out = _store_detail(line)
+    assert value not in out, f"store: {value} printed -- got {ascii(out)}"
+    if "Jane" in line:
+        out = redact_log_line(line + " PatientName=x")
+        assert value not in out, f"bundle: {value} printed -- got {ascii(out)}"
+
+
+def test_the_glued_segment_lines_print_when_the_tail_reads_only_a_run_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL. With the tail taking capital letters again and refusing a
+    segment-shaped triple only at the START of a run, and a run ending in ``MSH``, ``BHS`` or ``FHS``,
+    as the earlier forms did, each line prints its value on the store path."""
+    _restore_an_earlier_tail(monkeypatch, run=_EARLIER_TAIL_RUN, segment_checks=True)
+    for line, value in _GLUED_SEGMENT_LINES:
+        out = _store_detail(line)
+        assert value in out, f"{line!r} hid -- got {ascii(out)}"
+
+
+def test_the_bare_scheme_pass_writes_the_braced_tail_back_masked() -> None:
+    """A bare ``Bearer`` value takes a later braced label too, on the scheme pass's own path, and
+    writes the tail back masked with its closer, on both copies."""
+    line = "retry Bearer abcd.PWD={pp wq} next"
+    assert scrub_credentials(line) == "retry Bearer <redacted> xx} next"
+    assert redact_log_line(line) == f"retry Bearer {REDACTION_PLACEHOLDER} xx}} next"
+
+
+def _braced_check_run(length: int) -> str:
+    """A token value holding about ``length`` characters of unclosed ``.PWD={a`` labels, then a
+    space: the value walks to the space, and every label starts a braced walk. The separator is "."
+    and not ";", because the braced walk stops at a ";", so a ";" would cut the control's walk short
+    too and it could not show the hazard."""
+    return "token=x" + ".PWD={a" * (length // 7) + ' "'
+
+
+def test_the_braced_stop_grows_linearly_in_line_length() -> None:
+    """The braced stop walks a "{" at every credential label inside a plain value, on text an attacker
+    can influence. THE POSITIVE CONTROL lets the walk cross a "{", as :data:`_GUARDED_BRACED_VALUE`
+    does: every label's walk then runs to the end of the value, which is quadratic. The shipped walk
+    ends at the next "{"."""
+    for module in (scrub_mod, redact_mod):
+        shipped: re.Pattern[str] = module._BEARER
+        head = module._SPACED_BRACED_HEAD
+        assert head in shipped.pattern, f"{module.__name__}._BEARER lost its braced walk"
+        control = re.compile(
+            shipped.pattern.replace(head, head.replace("[^{}", "[^}")), shipped.flags
+        )
+
+        def growth(pattern: re.Pattern[str], short: int, long: int) -> float:
+            return _growth_between(
+                lambda text: pattern.sub("x", text),
+                _braced_check_run(short),
+                _braced_check_run(long),
+                rounds=5,
+            )
+
+        # The control at an eighth of the length, the same 8x span: a quadratic still reads far
+        # above the bound there, and at the full length it cost about 6.5 s a run.
+        control_growth = growth(control, 512, 4096)
+        assert control_growth > _MAX_GROWTH, (
+            f"{module.__name__}: the quadratic control grew only {control_growth:.1f}x, so this "
+            "input cannot show the hazard and the shipped reading proves nothing"
+        )
+        shipped_growth = growth(shipped, *_GROWTH_LENGTHS)
+        assert shipped_growth <= _MAX_GROWTH, (
+            f"{module.__name__}._BEARER grew {shipped_growth:.1f}x for 8x the line length, against "
+            f"{control_growth:.1f}x for the quadratic control"
+        )
 
 
 # --- the change must not print anything the patterns before it hid ---------------------------------

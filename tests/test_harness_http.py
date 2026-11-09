@@ -48,10 +48,13 @@ from harness.sinks.rest import RestSink
 from harness.sinks.soap import SoapSink
 from messagefoundry.apiclient import EngineClient
 from messagefoundry.config.wiring import EnvRef, Registry, load_config
-from messagefoundry.generators import _core, all_types  # noqa: F401  (registers message types)
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.store import MessageStatus
+from messagefoundry_toolkit.generators import (  # noqa: F401  (registers message types)
+    _core,
+    all_types,
+)
 from tests._harness_engine import (
     HARNESS_CONFIG,
     ephemeral_overrides,

@@ -210,11 +210,15 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
     saves' console routes bind and their continuations mint.
 
     BACKLOG #3374 added ``OidcStepUpFlow``, the live step-up flow the ``/ui/oidc`` callback reads
-    to charge a step-up return to the staged user's ceremony budget."""
+    to charge a step-up return to the staged user's ceremony budget.
+
+    ADR 0207 (vault BACKLOG #2609) added ``EnrolmentCodeRefused``, which the TOTP confirm form
+    answers on itself, and the two enrolment-code actions the user page's lanes bind."""
     assert surface.auth_service_symbols == (
         "AuthService",
         "DirectoryRefusal",
         "Elevation",
+        "EnrolmentCodeRefused",
         "FEDERATED_BINDING_CHANGED",
         "LoginOutcome",
         "MfaStatus",
@@ -223,6 +227,8 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
         "OidcStepUpFlow",
         "PasskeyProof",
         "RolesGained",
+        "STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_ISSUE",
+        "STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_REVOKE",
         "STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY",
         "STEP_UP_ACTION_ADMIN_RESET_MFA",
         "STEP_UP_ACTION_ADMIN_RESET_PASSWORD",

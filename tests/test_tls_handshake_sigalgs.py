@@ -98,6 +98,7 @@ from messagefoundry.tray import probe as tray_probe
 from messagefoundry.verify import smoke
 from tests._ast_sites import call_sites, callee_name
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
+from tests._log_absence import assert_capture_sees
 from tests._py315_tripwires import PY315_TLS_TRIPWIRE
 
 # --- TLS codepoints (RFC 8446 section 4.2.3; RFC 5246 section 7.4.1.4.1) ----------------------------
@@ -1050,6 +1051,7 @@ def test_a_build_refusing_every_list_raises_runtime_error(
     ):
         tls_policy.narrow_signature_algorithms(ctx)
     assert ctx.sigalg_calls == [_PINNED_MARKED, _PINNED_PLAIN, _CATALOGUE_WITHOUT_SHA224]
+    assert_capture_sees(caplog, tls_sigalgs.logger)
     assert not [r for r in caplog.records if "ML-DSA" in r.getMessage()]
     assert tls_sigalgs._SIGALGS_MLDSA_WARNED is False
 

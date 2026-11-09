@@ -21,11 +21,11 @@ from types import ModuleType
 
 import pytest
 
-from messagefoundry.anon import DEFAULT_RULES, FieldRule, SurrogateKind
-from messagefoundry.anon import anonymize as engine_anonymize
-from messagefoundry.anon import anonymize_checked as engine_anonymize_checked
-from messagefoundry.anon import leak as engine_leak
-from messagefoundry.anon.surrogates import normalized_message as engine_normalized
+from messagefoundry_toolkit.anon import DEFAULT_RULES, FieldRule, SurrogateKind
+from messagefoundry_toolkit.anon import anonymize as engine_anonymize
+from messagefoundry_toolkit.anon import anonymize_checked as engine_anonymize_checked
+from messagefoundry_toolkit.anon import leak as engine_leak
+from messagefoundry_toolkit.anon.surrogates import normalized_message as engine_normalized
 from tee.__main__ import main as tee_main
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import anonymize_checked as tee_anonymize_checked

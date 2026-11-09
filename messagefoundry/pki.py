@@ -19,8 +19,10 @@ import datetime
 import ipaddress
 import logging
 import os
+import ssl
 import string
-from collections.abc import Iterable, Iterator
+from collections import Counter
+from collections.abc import Iterable, Iterator, Mapping, Set
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -597,6 +599,9 @@ _UNREAD_EXTENSIONS = (x509.UnsupportedGeneralNameType, CryptographyDeprecationWa
 #: (:func:`_crl_extensions`). It stays here for any other deprecation the parse warns of, so such
 #: a CA is skipped alone rather than ending the whole judgment (vault BACKLOG #3506).
 #: :func:`_signature_state` reads a CRL whose own extensions raise one of these as ``unlisted``.
+#: :class:`IssuerIndex` also refuses a file holding a CA that raises one, and its ``issuer_of``
+#: names no issuer for a client LEAF that raises one, so narrowing this tuple reaches both (BACKLOG
+#: #4948).
 _UNREADABLE_CA = (ValueError, x509.InvalidVersion, *_UNREAD_EXTENSIONS)
 
 #: One name as :func:`_issuer_name_key` compares it: per RDN, in order, the sorted attributes.
@@ -895,10 +900,15 @@ def _crl_issuer_key(name: x509.Name) -> CrlIssuerKey:
     **It reads a private attribute.** The string type comes from ``cryptography``'s
     ``NameAttribute._type``. If a release drops it, every CRL is refused. A start and a reload
     name that cause. The expiry monitor's check of a CA file says only that it cannot judge the
-    CRL. Comparing the exact text instead would reopen the T61String gap with no sign.
+    CRL. The namesake warning's self-signed read (:func:`_self_issued`) can no longer compare
+    names: a CA with a namesake, in which no other fault is found and whose own authority key
+    identifier is missing or carries no key identifier, gets the warning that the engine cannot
+    compare them. Comparing the exact text instead would reopen the T61String gap with no sign.
 
     **Latin-1 here covers UTF-8 bytes only.** A one-byte text type whose bytes are not valid
-    UTF-8 already fails ``cryptography``'s parse, so the file is refused."""
+    UTF-8 already fails ``cryptography``'s parse, so the file is refused. A certificate's issuer,
+    which :func:`_strict_ca_faults` reads, is parsed only when it is read, so there the read raises
+    and the caller handles it: the certificate itself loads."""
     return tuple(tuple(sorted(map(_crl_attribute_key, rdn))) for rdn in name.rdns)
 
 
@@ -1633,6 +1643,13 @@ def canonical_dn(text: str) -> str | None:
 class _Anchor:
     cert: x509.Certificate
     subject: str
+    der: bytes
+    #: Whether OpenSSL reads it as a CA. One it does not can sign nothing in a chain OpenSSL
+    #: verifies, so it names only itself, as a pinned client certificate (BACKLOG #4948).
+    ca: bool
+    #: Its certificate block's number in the file, counted as the parse refusal counts it, so a
+    #: warning can name it.
+    position: int
 
 
 class IssuerIndex:
@@ -1649,17 +1666,30 @@ class IssuerIndex:
     only when ``verify_directly_issued_by`` holds: its subject equals the leaf's issuer name exactly
     AND its key verifies the leaf's signature. A client-sent intermediate is never a loaded CA, so it
     never counts. A self-signed client certificate loaded as an anchor issued itself, so it names
-    itself, whether or not it is marked as a CA."""
+    itself, whether or not it is marked as a CA.
 
-    def __init__(self, cadata: str) -> None:
-        seen: set[bytes] = set()  # de-duplicates a certificate listed twice
+    The index holds exactly the CA certificates OpenSSL loads from ``cadata``, and a count of others
+    OpenSSL's count can match, or the build raises ``ValueError`` naming ``label`` (BACKLOG #4948).
+    :func:`_pem_certificate_blocks` finds them, but it models OpenSSL's PEM reader and is not that reader, so the result is then checked against
+    OpenSSL itself (:func:`_refuse_unless_openssl_loads`). A CA the index named but OpenSSL never
+    loaded could be named for a leaf whose chain ran through a client-sent copy of it; a CA OpenSSL
+    loaded but the index missed could hide a same-DN twin, so a leaf under one would be named
+    although the two cannot be told apart. A certificate block ``cryptography`` cannot parse
+    refuses too, as the index could not say whether OpenSSL holds it."""
+
+    def __init__(self, cadata: str, *, label: str = "the client CA file") -> None:
+        copies: Counter[bytes] = Counter()  # a certificate listed twice is one anchor
         self._by_subject_name: dict[x509.Name, list[_Anchor]] = {}
-        # Distinct KEYS per rendered subject. A re-issued CA certificate with the same key, or a root
-        # beside its own cross-certificate, is one signer and not ambiguous; two keys under one name
-        # are, because the map names only the name.
+        # Distinct KEYS per rendered subject, of the certificates issuer_of can name. A re-issued CA
+        # certificate with the same key, or a root beside its own cross-certificate, is one signer
+        # and not ambiguous; two keys under one name are, because the map names only the name.
         self._subject_keys: dict[str, set[bytes]] = {}
-        self.unreadable = 0
-        for block in _pem_certificate_blocks(cadata.encode("ascii", "replace")):
+        # Subjects whose keys include a self-signed certificate OpenSSL reads as no CA, so
+        # unmatched_keys does not call it a CA.
+        self._pinned_subjects: set[str] = set()
+        read: list[tuple[x509.Certificate, str, bytes, bytes, int]] = []
+        blocks = _pem_certificate_blocks(cadata.encode("ascii", "replace"))
+        for position, block in enumerate(blocks, start=1):
             try:
                 cert = x509.load_pem_x509_certificate(block)
                 subject = cert.subject.rfc4514_string()
@@ -1667,29 +1697,42 @@ class IssuerIndex:
                 key = cert.public_key().public_bytes(
                     serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
                 )
-            except (ValueError, UnsupportedAlgorithm):
-                self.unreadable += 1  # OpenSSL may load what cryptography will not; never nameable
-                continue
-            if der in seen:
-                continue  # the same certificate twice is one anchor
-            seen.add(der)
-            self._by_subject_name.setdefault(cert.subject, []).append(_Anchor(cert, subject))
-            self._subject_keys.setdefault(subject, set()).add(key)
+            except (*_UNREADABLE_CA, UnsupportedAlgorithm) as exc:
+                raise ValueError(
+                    f"{label}: certificate block {position} in this file cannot be parsed for the "
+                    "mTLS issuer map, though the TLS library may load it, so the map could not "
+                    "hold what the handshake trusts. Remove or re-issue that certificate"
+                ) from exc
+            copies[der] += 1
+            if copies[der] == 1:
+                read.append((cert, subject, der, key, position))
+        cas = _refuse_unless_openssl_loads(cadata, copies, label=label)
+        for cert, subject, der, key, position in read:
+            anchor = _Anchor(cert, subject, der, ca=der in cas, position=position)
+            self._by_subject_name.setdefault(cert.subject, []).append(anchor)
+            # One OpenSSL reads as no CA signs nothing it verifies, so issuer_of names it only as
+            # itself, when it signs itself. One that does not is named for no leaf, and is no
+            # same-DN twin (BACKLOG #4948).
+            if anchor.ca or _directly_issued(cert, cert):
+                self._subject_keys.setdefault(subject, set()).add(key)
+                if not anchor.ca:
+                    self._pinned_subjects.add(subject)
 
     def issuer_of(self, leaf_der: bytes) -> str:
         """The subject of the one loaded CA that directly issued ``leaf_der``, or ``""``.
 
-        ``""`` when no loaded CA issued it, when it does not parse, or when another loaded CA with a
-        DIFFERENT key shares the issuing CA's subject: the map is keyed by name, so it could not tell
-        the two apart. Never raises."""
+        ``""`` when no loaded CA issued it, when it does not parse, or when another loaded CA, or a
+        self-signed certificate pinned as itself, with a DIFFERENT key shares the issuing CA's
+        subject: the map is keyed by name, so it could not tell the two apart. A loaded certificate
+        OpenSSL reads as no CA names only a leaf that is that certificate. Never raises."""
         try:
             leaf = x509.load_der_x509_certificate(leaf_der)
             issuers = [
                 anchor
                 for anchor in self._by_subject_name.get(leaf.issuer, [])
-                if _directly_issued(leaf, anchor.cert)
+                if (anchor.ca or anchor.der == leaf_der) and _directly_issued(leaf, anchor.cert)
             ]
-        except ValueError:
+        except _UNREADABLE_CA:
             return ""
         subjects = {anchor.subject for anchor in issuers}
         if len(subjects) != 1:
@@ -1705,11 +1748,363 @@ class IssuerIndex:
             if count == 0:
                 problems[key] = "names no CA certificate loaded from [api].tls_client_ca_file"
             elif count > 1:
+                signers = (
+                    "certificates, CAs or self-signed certificates pinned as themselves,"
+                    if key in self._pinned_subjects
+                    else "CA certificates"
+                )
                 problems[key] = (
-                    f"names {count} loaded CA certificates with the same subject and different keys, "
+                    f"names {count} loaded {signers} with the same subject and different keys, "
                     "so they cannot be told apart and no certificate maps under it"
                 )
         return problems
+
+    def namesake_warnings(self) -> list[str]:
+        """Warnings about each loaded certificate OpenSSL reads as no CA that has the subject of a
+        loaded CA, naming the blocks, for the caller to log at start with the file it read: one per
+        such certificate and CA, or one per CA, naming each such certificate, for a CA in which
+        :func:`_strict_ca_faults` finds a reason strict verification refuses it. That finds at
+        least some reasons, not every one, so a CA refused for another reason gets the first form
+        (BACKLOG #4948). Never raises.
+
+        OpenSSL finds a leaf's issuer among the loaded certificates by name. It may take the
+        namesake, then refuse the chain because it is no CA. It can rule the namesake out in at
+        least one way this reads: a key identifier on the namesake that differs from the CA's rules
+        it out for a leaf whose authority key identifier names the CA's key. It does not rule it
+        out for a leaf of that CA with no authority key identifier, and strict verification
+        accepts such a leaf when it is version 1, which has no extensions: measured on OpenSSL
+        3.5.7, a real listener refused one in at least one listing order. So a namesake with a
+        differing key identifier still warns, naming those leaves.
+
+        A CA that strict verification refuses as a CA is a different fault. At least the contexts
+        the API and the HTTP and MLLP listeners build this index beside verify strictly
+        (``harden_verify_flags``, a no-op only where the runtime lacks the flag), and strict
+        verification refuses every client verified through such a CA whether or not a namesake is
+        loaded. :func:`_strict_ca_faults` reads at least some of the reasons from the CA's own
+        version and extensions, each measured on OpenSSL 3.5.7 for a version-3 client naming its
+        key and for a version-1 client. When it finds any, the warning names the CA and those
+        reasons as the cause, whatever key identifier the namesake has, once per CA, naming every
+        namesake. A CA whose extensions ``cryptography`` cannot read may or may not be one strict
+        verification refuses, or have a key identifier OpenSSL reads, so that case gets the warning
+        that every client may be refused, says what it cannot tell, and says to check the CA too.
+        For a CA whose issuer name ``cryptography`` cannot read, only the authority key identifier
+        faults go unread; with no other fault found, its warning, in whichever wording the
+        namesake's key identifier gives, says the issuer name cannot be read, that strict
+        verification refuses every client through the CA if it is not self-signed, and to check
+        the CA too (:data:`_UNREAD_TEXT`). Where an engine defect stops the names being compared,
+        it says that instead. The index does not count a namesake toward the same-DN ambiguity
+        unless it signs itself, so :meth:`unmatched_keys` may give no reason, and this is the only
+        start signal. Names are grouped by :func:`_namesake_key`. A warning only:
+        it changes no allow, deny or refusal."""
+        by_name: dict[_NameKey, list[_Anchor]] = {}
+        # In block order, so each group's lists and warnings are too, and the groups follow the
+        # block each first appears in.
+        for anchor in sorted(
+            (anchor for anchors in self._by_subject_name.values() for anchor in anchors),
+            key=lambda a: a.position,
+        ):
+            by_name.setdefault(_namesake_key(anchor.cert.subject), []).append(anchor)
+        warnings: list[str] = []
+        for anchors in by_name.values():
+            others = [anchor for anchor in anchors if not anchor.ca]
+            ca_anchors = [anchor for anchor in anchors if anchor.ca]
+            if not others or not ca_anchors:
+                continue  # no namesake here, so read no extension for nothing
+            other_ids: list[tuple[_Anchor, bytes | None]] | None = None  # read only if needed
+            for ca in ca_anchors:
+                faults = _strict_ca_faults(ca)
+                unread = faults if isinstance(faults, str) else None
+                if faults and not isinstance(faults, str):
+                    warnings.append(_ca_cause_warning(ca, others, faults))
+                    continue
+                # Extensions that did not read are not read again. Ones that did are cached, so
+                # the CA's key identifier reads here.
+                ca_key_id = None if unread == "extensions" else _key_identifier(ca)[0]
+                if other_ids is None:
+                    other_ids = [(other, _key_identifier(other)[0]) for other in others]
+                for other, key_id in other_ids:
+                    why = ""
+                    if unread:
+                        # Only unread extensions hide which clients rule the namesake out.
+                        rules_out = (
+                            ", or which client certificates of that CA carry an authority key "
+                            f"identifier that rules block {other.position} out"
+                            if key_id is not None
+                            else ""  # only the extensions text has a place for it
+                        )
+                        why = " " + _UNREAD_TEXT[unread].format(n=ca.position, rules_out=rules_out)
+                    if key_id is not None and ca_key_id is not None and key_id != ca_key_id:
+                        effect = (
+                            f"may take block {other.position}, whose key identifier differs from "
+                            "the CA's, as the issuer of a client certificate that CA issued with no "
+                            "authority key identifier, and then refuse that client certificate. "
+                            "Strict verification accepts such a certificate when it is version 1, "
+                            f"which has no extensions.{why} Remove block {other.position}, or "
+                            "re-issue it under another subject"
+                        )
+                    else:
+                        effect = (
+                            f"may take block {other.position} as the issuer of a client "
+                            "certificate that CA issued, and then refuse every client certificate "
+                            f"of that CA.{why} Remove block {other.position}, or re-issue it under "
+                            "another subject"
+                        )
+                    warnings.append(
+                        f"certificate block {other.position} ({other.subject}) is not a CA but has "
+                        f"the subject of the CA certificate in block {ca.position}. The TLS library "
+                        f"{effect}"
+                    )
+        return warnings
+
+
+#: What reading a certificate's extensions raises, at least, when ``cryptography`` cannot read
+#: them. A ``UserWarning``, such as for a three-letter country in a directory name, is raised only
+#: where warnings are errors.
+_UNREAD_CA_EXTENSIONS = (x509.DuplicateExtension, ValueError, UserWarning, *_UNREAD_EXTENSIONS)
+
+#: What :func:`_strict_ca_faults` could not read of a CA, and what the namesake warning adds for
+#: it, given the CA's block number ``n``. A CA whose issuer name is not read has no authority key
+#: identifier carrying a key identifier. What such a CA does to its clients was measured on
+#: OpenSSL 3.5.7, and the cases measured are listed once, in the docstring of
+#: ``test_what_a_ca_whose_issuer_cannot_be_read_does_to_its_clients_is_measured`` in
+#: ``tests/test_inbound_http_intake_issuer.py`` (BACKLOG #4948).
+_Unread = Literal["extensions", "issuer name", "name comparison"]
+_NOT_SELF_SIGNED = (
+    ", so this check cannot tell whether block {n} is self-signed. If it is not, strict "
+    "verification refuses every client certificate whose chain runs through block {n}, with its "
+    "issuer loaded or not: without it no chain is found, and with it block {n} needs an "
+    "authority key identifier carrying a key identifier, which it lacks. Check block {n} too."
+)
+_UNREAD_TEXT: dict[_Unread, str] = {
+    "extensions": "The extensions of block {n} cannot be read here, so this check cannot tell "
+    "whether block {n} itself is the cause, as a CA strict verification refuses would be"
+    "{rules_out}. Check block {n} too.",
+    "issuer name": "The issuer name of block {n} cannot be read here" + _NOT_SELF_SIGNED,
+    "name comparison": "The engine cannot compare the issuer name of block {n} with its subject"
+    + _NOT_SELF_SIGNED,
+}
+
+
+def _strict_ca_faults(ca: _Anchor) -> list[str] | _Unread:
+    """At least some of the reasons strict verification refuses ``ca`` as a CA, read from its own
+    version and extensions. When it finds none and cannot read what it needs, it says what: a
+    version-3 CA's ``"extensions"``, or, where an authority key identifier fault needs it, its
+    ``"issuer name"``, or the ``"name comparison"`` an engine defect stops (:func:`_self_issued`).
+    A version-1 CA whose extensions do not read still carries
+    extensions, so it gets that fault. The reasons read are not complete: an empty list means
+    none of these was found, not that strict verification accepts it.
+
+    Each was measured on OpenSSL 3.5.7, alone in a CA, to refuse a version-3 and a version-1
+    client (BACKLOG #4948); a CA that is not self-signed was measured beside its issuer, as
+    strict verification checks its authority key identifier only once it has a chain past it.
+    Whether it is self-signed is read by name, by :func:`_self_issued`, which models OpenSSL's
+    comparison. Each way it models was measured against OpenSSL 3.5.7 for at least one pair of
+    names, but it is a model and not OpenSSL's comparison, so it may still differ in ways not
+    measured. OpenSSL refuses a CA with no basic constraints as an invalid CA before any other
+    strict check, so then only that reason is named. OpenSSL reads a certificate with a key usage
+    without ``keyCertSign`` as no CA, so that reason reaches here only where its read and this
+    one differ."""
+    if ca.cert.version == x509.Version.v1:
+        try:
+            bare = not len(ca.cert.extensions)
+        except _UNREAD_CA_EXTENSIONS as exc:
+            _log.debug(
+                "certificate block %d: its extensions cannot be read (%s); a version-1 CA "
+                "carrying them is refused either way",
+                ca.position,
+                type(exc).__name__,
+            )
+            bare = False  # an extension that does not read is still there
+        return [
+            "it is version 1, so it has no extensions: no basic constraints, key usage or subject "
+            "key identifier"
+            if bare
+            # Measured on OpenSSL 3.5.7: strict verification refuses it with error 93.
+            else "it is version 1 but carries extensions, which strict verification refuses in a "
+            "certificate before version 3"
+        ]
+    try:
+        extensions = ca.cert.extensions
+    except _UNREAD_CA_EXTENSIONS as exc:
+        _log.debug(
+            "certificate block %d: its extensions cannot be read (%s); the namesake warning "
+            "cannot tell whether strict verification refuses it as a CA",
+            ca.position,
+            type(exc).__name__,
+        )
+        return "extensions"
+    try:
+        constraints = extensions.get_extension_for_class(x509.BasicConstraints)
+    except x509.ExtensionNotFound:
+        return ["it has no basic constraints"]
+    if not constraints.value.ca:  # OpenSSL reads it as no CA, so this is where the reads differ
+        return []
+    faults = [] if constraints.critical else ["its basic constraints are not critical"]
+    try:
+        usage = extensions.get_extension_for_class(x509.KeyUsage).value
+    except x509.ExtensionNotFound:
+        faults.append("it has no key usage")
+    else:
+        if not usage.key_cert_sign:
+            faults.append("its key usage does not include keyCertSign")
+    try:
+        if extensions.get_extension_for_class(x509.SubjectKeyIdentifier).critical:
+            faults.append("its subject key identifier is critical")
+    except x509.ExtensionNotFound:
+        faults.append("it has no subject key identifier")
+    try:
+        authority = extensions.get_extension_for_class(x509.AuthorityKeyIdentifier)
+    except x509.ExtensionNotFound:
+        lacks = "has no authority key identifier"
+    else:
+        if authority.critical:
+            faults.append("its authority key identifier is critical")
+        if authority.value.key_identifier is not None:
+            return faults
+        lacks = "its authority key identifier carries no key identifier"
+    # A self-signed CA may omit its authority key identifier; one with an issuer may not. Only
+    # this reads the issuer name, so one that does not read loses only this fault.
+    # The subject was parsed when the index was built, and cryptography keeps it, so only the
+    # issuer can fail here.
+    try:
+        issuer, subject = ca.cert.issuer, ca.cert.subject
+    except (ValueError, UserWarning) as exc:
+        _log.debug(
+            "certificate block %d: its issuer name cannot be read (%s); the namesake warning "
+            "cannot tell whether it may omit its authority key identifier",
+            ca.position,
+            type(exc).__name__,
+        )
+        return faults or "issuer name"
+    try:
+        issued = not _self_issued(issuer, subject)
+    # _crl_attribute_key: an engine defect, not a fault in the file. The namesake warning, which
+    # the caller logs with its file, says so. Only the type is logged, as the sibling handlers
+    # do: this catches any ValueError, and another one's text could carry a certificate field.
+    except ValueError as exc:
+        _log.debug(
+            "certificate block %d: the engine cannot compare its issuer name with its subject "
+            "(%s); the namesake warning cannot tell whether it may omit its authority key "
+            "identifier",
+            ca.position,
+            type(exc).__name__,
+        )
+        return faults or "name comparison"
+    if issued:
+        faults.append(
+            f"it is not self-signed and {lacks}, which strict verification requires once its "
+            "issuer is loaded"
+        )
+    return faults
+
+
+#: ASCII white space other than the space, each to a space, as OpenSSL's ``ossl_isspace`` reads
+#: white space in a name: ASCII only.
+_ASCII_SPACE = str.maketrans("\t\n\v\f\r", "     ")
+
+
+def _self_issued(issuer: x509.Name, subject: x509.Name) -> bool:
+    """Whether ``issuer`` and ``subject`` are one name, modelling OpenSSL's comparison:
+    :func:`_crl_issuer_key`'s form (ASCII case folded, a one-byte text type read as Latin-1, the
+    string type dropped for text types and kept for any other), with ASCII white space dropped
+    around each text value and each run of it inside read as one space. Raises ``ValueError``
+    where :func:`_crl_issuer_key` does."""
+    return _openssl_name_key(issuer) == _openssl_name_key(subject)
+
+
+def _openssl_name_key(name: x509.Name) -> CrlIssuerKey:
+    """``name`` as :func:`_self_issued` compares it: :func:`_crl_issuer_key`'s form with ASCII
+    white space folded in each text value. Compare it only with another key from here."""
+    return tuple(
+        tuple(
+            sorted(
+                (oid, tag, " ".join(filter(None, value.translate(_ASCII_SPACE).split(" "))))
+                if tag == 0 and isinstance(value, str)
+                else (oid, tag, value)
+                for oid, tag, value in rdn
+            )
+        )
+        for rdn in _crl_issuer_key(name)
+    )
+
+
+def _ca_cause_warning(ca: _Anchor, others: list[_Anchor], faults: list[str]) -> str:
+    """The one namesake warning for ``ca``, a CA :func:`_strict_ca_faults` found ``faults`` in,
+    naming every certificate in ``others``, each one that is no CA with its subject.
+
+    Two terms of the remedy were measured with ``openssl verify -x509_strict`` on OpenSSL 3.5.7.
+    With a CRL check, a leaf whose CA signed the CRL under a key usage without ``cRLSign`` is
+    refused (error 35), and without that check it is not. An intermediate whose authority key
+    identifier carries a key identifier other than its issuer's finds no issuer (error 2)."""
+    named = _listed(f"{other.position} ({other.subject})" for other in others)
+    numbers = _listed(str(other.position) for other in others)
+    blocks, is_, cas, has, it = (
+        ("block", "is", "a CA", "has", "it")
+        if len(others) == 1
+        else ("blocks", "are", "CAs", "have", "them")
+    )
+    reasons = "this reason" if len(faults) == 1 else "these reasons"
+    at = ca.position  # keeps each line of the message whole
+    return (
+        f"certificate {blocks} {named} {is_} not {cas} but {has} the subject of the CA certificate "
+        f"in block {at}. Strict verification, as OpenSSL 3.5.7 was measured to apply it, refuses "
+        f"every client certificate whose chain runs through block {at}, whether or not {blocks} "
+        f"{numbers} {is_} loaded, because it refuses block {at} as a CA for at least {reasons}: "
+        f"{'; '.join(faults)}. Re-issue block {at}, with the same subject and key, as a version-3 "
+        "CA with at least critical basic constraints CA:TRUE, key usage keyCertSign, and cRLSign "
+        f"too where the hop checks a CRL that block {at} signs, a subject key identifier equal to "
+        "the key identifier its client certificates' authority key identifiers carry, and, unless "
+        "it is self-signed, an authority key identifier carrying its issuer's subject key "
+        "identifier, neither key identifier critical; a client certificate whose authority "
+        f"key identifier names the issuer and serial number of block {at}, or another key "
+        f"identifier, must then be re-issued too. Or remove block {at} if it is not needed. While "
+        f"block {at} stays loaded, also remove {blocks} {numbers} or re-issue {it} under another "
+        "subject"
+    )
+
+
+def _listed(items: Iterable[str]) -> str:
+    """``items`` as an English list: ``a``, ``a and b``, ``a, b and c``."""
+    *head, last = items
+    return f"{', '.join(head)} and {last}" if head else last
+
+
+def _namesake_key(name: x509.Name) -> _NameKey:
+    """``name`` as :meth:`IssuerIndex.namesake_warnings` groups it: :func:`_issuer_name_key`'s
+    form, with white space around a value dropped and each run of it inside read as one space, as
+    OpenSSL reads it. Looser than OpenSSL here would cost only a warning. It still differs from
+    OpenSSL in at least the ways :func:`_issuer_name_key` records for string types, and it reads a
+    value in a one-byte text type as ``cryptography`` decodes it, where OpenSSL reads Latin-1
+    (:func:`_crl_issuer_key`), so a namesake that differs from a CA only there is not warned
+    about."""
+    return tuple(tuple(sorted(map(_namesake_attribute, rdn))) for rdn in name.rdns)
+
+
+def _namesake_attribute(
+    attribute: x509.NameAttribute[str | bytes],
+) -> tuple[str, bool, str | bytes]:
+    oid, is_bytes, value = _attribute_key(attribute)
+    return oid, is_bytes, " ".join(value.split()) if isinstance(value, str) else value
+
+
+def _key_identifier(anchor: _Anchor) -> tuple[bytes | None, bool]:
+    """``anchor``'s subject key identifier, or ``None`` when it has none or its extensions cannot
+    be read, and whether they were read; no caller reads that flag now. An unreadable one on the
+    namesake or the CA gives the wider warning, so it can only overstate it."""
+    try:
+        return anchor.cert.extensions.get_extension_for_class(
+            x509.SubjectKeyIdentifier
+        ).value.digest, True
+    except x509.ExtensionNotFound:
+        return None, True
+    except _UNREAD_CA_EXTENSIONS as exc:
+        _log.debug(
+            "certificate block %d: its key identifier cannot be read (%s); the namesake warning "
+            "assumes it may have none",
+            anchor.position,
+            type(exc).__name__,
+        )
+        return None, False
 
 
 def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
@@ -1720,13 +2115,187 @@ def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
     return True
 
 
+def _refuse_unless_openssl_loads(
+    cadata: str, indexed: Mapping[bytes, int], *, label: str
+) -> set[bytes]:
+    """The CA certificates OpenSSL's ``load_verify_locations(cadata=)`` loads from ``cadata``, as
+    DER, or ``ValueError`` unless ``indexed``, each certificate the index read with how many
+    copies of it it read, holds exactly those, and a count of other certificates OpenSSL's count can
+    match (BACKLOG #4948). This is the authority; the PEM scan only proposes.
+
+    Asked of a scratch context, as ``config.tls_policy.crl_scratch_context`` asks one about a CRL
+    file, so the live context is never written to. ``get_ca_certs`` lists every CA certificate the
+    store holds, as DER, so the CA sets are compared directly, both ways, as sets: OpenSSL does not
+    always drop a certificate it is given twice (measured on OpenSSL 3.5.7, a CA listed twice after
+    another CA with its DN and a third between them), and a second copy signs nothing a first does
+    not. A certificate the index holds that is not in that list must be one OpenSSL reads as no CA,
+    asked of a context holding only those, or it would be a CA the index read and OpenSSL never
+    loaded. OpenSSL lists no other certificate, so those are compared only by count, and as it may
+    keep one listed twice once or twice, its count must lie between the distinct ones read and
+    every copy read. A count that balances over two different such certificates is not caught
+    here, so :meth:`IssuerIndex.issuer_of` lets one name only a leaf that is itself."""
+    scratch = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # loads no roots
+    try:
+        scratch.load_verify_locations(cadata=cadata)
+    except (ssl.SSLError, ValueError) as exc:
+        # The live context loaded these bytes first, so it refused them too.
+        raise ValueError(
+            f"{label}: the TLS library refuses this file, so the mTLS issuer map could not hold "
+            "what the handshake trusts"
+        ) from exc
+    listed = scratch.get_ca_certs(binary_form=True)
+    cas = set(listed)
+    others = indexed.keys() - cas
+    other_copies = sum(indexed[der] for der in others)
+    loaded_others = scratch.cert_store_stats()["x509"] - len(listed)
+    if missed := len(cas - indexed.keys()):
+        problem = (
+            f"loads {missed} CA certificate(s) from this file that the mTLS issuer map did not "
+            "read. Write each certificate as a plain PEM block"
+        )
+    elif not _all_load_as_no_ca(others):
+        reads = [_openssl_reads_as_ca(der) for der in others]
+        if extra := reads.count(True):
+            problem = (
+                f"does not load {extra} CA certificate(s) the mTLS issuer map read from this file. "
+                "Remove any empty or non-certificate PEM block before them, which can stop the TLS "
+                "library reading the file"
+            )
+        else:
+            problem = (
+                f"cannot load {len(reads) - reads.count(False)} certificate(s) the mTLS issuer map "
+                "read from this file. Remove or re-issue them"
+            )
+    elif not len(others) <= loaded_others <= other_copies:
+        remedy = (
+            "Remove any empty or non-certificate PEM block, which can stop the TLS library "
+            "reading the file"
+            if loaded_others < len(others)
+            else "Write each certificate as a plain PEM block"
+        )
+        problem = (
+            f"loads {loaded_others} certificate(s) that are not CAs from this file, where the "
+            f"mTLS issuer map read {len(others)} ({other_copies} with copies). {remedy}"
+        )
+    else:
+        return cas
+    raise ValueError(
+        f"{label}: the TLS library {problem}. Until then the map could name a CA the handshake "
+        "never trusts or miss one it does"
+    )
+
+
+def _all_load_as_no_ca(ders: Set[bytes]) -> bool:
+    """Whether OpenSSL loads every distinct certificate in ``ders`` and reads none as a CA, in one
+    context holding only them. Distinct certificates are never merged, so the count is exact."""
+    if not ders:
+        return True
+    alone = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    try:
+        alone.load_verify_locations(cadata=b"".join(ders))
+    except ssl.SSLError:
+        return False
+    stats = alone.cert_store_stats()
+    return stats["x509"] == len(ders) and stats["x509_ca"] == 0
+
+
+def _openssl_reads_as_ca(der: bytes) -> bool | None:
+    """Whether OpenSSL reads the certificate ``der`` as a CA, in a context holding it alone, or
+    ``None`` when it cannot load it. Asked only to say which certificate a refusal is about."""
+    alone = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    try:
+        alone.load_verify_locations(cadata=der)
+    except ssl.SSLError:
+        return None
+    return alone.cert_store_stats()["x509_ca"] == 1
+
+
+#: PEM labels OpenSSL's ``load_verify_locations(cadata=)`` loads a certificate from and
+#: ``cryptography`` parses, at least: ``CERTIFICATE`` and the legacy ``X509 CERTIFICATE``, measured
+#: on OpenSSL 3.5.7 (BACKLOG #4948). Missing the legacy one left a CA the handshake trusts out of
+#: the index, so every partner under it would have been refused, with a start warning naming the
+#: wrong cause.
+_PEM_CERTIFICATE_LABELS = frozenset({b"CERTIFICATE", b"X509 CERTIFICATE"})
+
+#: OpenSSL reads a long line in pieces of this many bytes, and a marker opening a piece counts as
+#: opening a line: on OpenSSL 3.5.7 a BEGIN after 254, 508, 762 or 1016 bytes of text loads, and one
+#: after 253, 255, 300 or 509 does not (BACKLOG #4948). The same rule is applied to an END marker
+#: by analogy; that end was not measured. :func:`_begins_line`, the CRL scan's rule, differs on
+#: purpose: it refuses such a file instead.
+_OPENSSL_LINE_PIECE = 254
+
+#: The bytes OpenSSL's PEM reader strips from the end of each line it reads: every byte at or below
+#: a space, the LF and CR included.
+_OPENSSL_STRIPPED = bytes(range(0x21))
+
+
+def _pem_reader_lines(pem: bytes) -> Iterator[bytes]:
+    """Each line of ``pem`` as OpenSSL's PEM reader reads one: up to and including a LF, at most
+    :data:`_OPENSSL_LINE_PIECE` bytes, with its trailing bytes at or below a space stripped.
+
+    A piece that strips to nothing right after a full piece with no LF is not yielded: in a block's
+    body OpenSSL reads it as the end of that long line, not as a blank line
+    (``prev_partial_line_read``), so a base64 line wrapped at a piece boundary does not gain a blank
+    line inside its block. OpenSSL starts each body afresh, so after an overlong BEGIN line that
+    piece IS a blank line to it; dropping it there matters only to the silent-stop shapes
+    :func:`_pem_certificate_blocks` names."""
+    at, partial = 0, False
+    while at < len(pem):
+        stop = pem.find(b"\n", at, at + _OPENSSL_LINE_PIECE)
+        stop = at + _OPENSSL_LINE_PIECE if stop < 0 else stop + 1
+        line = pem[at:stop].rstrip(_OPENSSL_STRIPPED)
+        if line or not partial:
+            yield line
+        partial = stop - at == _OPENSSL_LINE_PIECE and pem[stop - 1 : stop] != b"\n"
+        at = stop
+
+
 def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
-    """Each ``CERTIFICATE`` PEM block in ``pem``, in order."""
-    begin, end = b"-----BEGIN CERTIFICATE-----", b"-----END CERTIFICATE-----"
-    at = 0
-    while (start := pem.find(begin, at)) >= 0:
-        stop = pem.find(end, start)
-        if stop < 0:
-            return
-        at = stop + len(end)
-        yield pem[start:at]
+    """Each ``CERTIFICATE`` or ``X509 CERTIFICATE`` PEM block in ``pem``, in order, as OpenSSL's
+    reader would find it, at least on the shapes measured (BACKLOG #4948).
+
+    Lines are read as :func:`_pem_reader_lines` reads them. A block of ANY label opens at a line that
+    starts ``-----BEGIN `` and ends ``-----``, so a marker in a comment opens none. It ends at the
+    next line starting ``-----END ``, whatever lies between: OpenSSL reads every line up to it as
+    the body. The body of a block under another label is skipped whole, as OpenSSL skips it, so a
+    certificate nested inside such a block is never read. An END line naming another label, or no
+    END line at all, makes OpenSSL refuse the file, so the scan ends there; the check against
+    OpenSSL then refuses it too.
+
+    A certificate block is handed on rebuilt from the lines OpenSSL's reader splits it into, so
+    ``cryptography`` never sees the trailing bytes OpenSSL stripped. A NUL with text after it
+    stays in the line handed on: OpenSSL reads past such a NUL in at least its header check and its
+    data-line length limit, and on some shapes stops loading the file there, so a line cut at the
+    NUL would name a CA the context never loaded.
+
+    This scan still differs from OpenSSL on shapes it can load, at least these. A CA whose base64
+    line has a NUL with more text after it is loaded by OpenSSL, and this scan hands
+    ``cryptography`` the whole line, which it refuses. OpenSSL silently stops loading the file at
+    some blocks of any label, while this scan reads on: measured on OpenSSL 3.5.7, at least a block
+    whose body decodes to no data (such as an empty block, or one whose only lines follow a
+    ``Name: value`` header line with no blank line after it), a block whose body opens with a
+    blank line, or with a header line and a blank line, and holds a data line over 64 characters,
+    and a block with a ``:`` in its label or in a body line, which OpenSSL reads as a header line.
+    :class:`IssuerIndex` refuses such a file at least where the scan reads a certificate OpenSSL
+    did not, because it checks this scan's result against what OpenSSL loaded
+    (:func:`_refuse_unless_openssl_loads`). A block of these shapes after the last certificate
+    hides nothing, and the file builds."""
+    lines = _pem_reader_lines(pem)
+    for line in lines:
+        if not (line.startswith(b"-----BEGIN ") and line.endswith(b"-----")):
+            continue
+        # OpenSSL compares the label with strcmp, which stops at a NUL.
+        label = line.removeprefix(b"-----BEGIN ").removesuffix(b"-----").partition(b"\0")[0]
+        keep = label in _PEM_CERTIFICATE_LABELS
+        body: list[bytes] = []
+        for end in lines:
+            if end.startswith(b"-----END "):
+                break
+            if keep:
+                body.append(end)  # past any NUL: cutting at one named CAs OpenSSL never loaded
+        else:
+            end = b""  # no END line at all
+        if end != b"-----END " + label + b"-----":
+            return  # no END, or one of another label: OpenSSL refuses the file
+        if keep:
+            yield b"\n".join([b"-----BEGIN " + label + b"-----", *body, end, b""])

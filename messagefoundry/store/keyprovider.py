@@ -23,6 +23,9 @@ consumes — ``active_key()`` is the base64 of a 32-byte DEK (or ``None`` → id
 * ``auto`` (default) — the env-then-DPAPI ladder, **byte-identical** to the pre-seam ``resolve_active_key``.
 * ``env`` — the ``MEFOR_STORE_ENCRYPTION_KEY`` value (``settings.encryption_key``).
 * ``dpapi`` — the Windows DPAPI-protected ``encryption_key_file`` decrypted into memory.
+* ``host`` — the key custody host blob the engine minted with the store (vault BACKLOG #3411,
+  :mod:`messagefoundry.store.custody_host`). ``open_store`` reads it itself, so it can pin the store
+  id; :class:`HostKeyProvider` is what every other caller of this seam gets.
 * ``aws_kms`` | ``azure_kv`` | ``gcp_kms`` | ``vault`` | ``pkcs11`` — external HSM/KMS/Vault providers that
   **envelope-decrypt** a wrapped DEK inside an isolated security module. These are **lazy, optional
   extras** that are **not built here** (ADR 0019 §3/§5 — one provider per follow-on PR), so the base
@@ -36,6 +39,8 @@ from __future__ import annotations
 import importlib
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from messagefoundry.custody_posture import HOST_KEY_PROVIDER
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import StoreSettings
@@ -141,8 +146,40 @@ class AutoKeyProvider:
         return _split_retired(self._settings.encryption_keys_retired)
 
 
-#: Built-in providers — fully reproduce today's behavior, no external dependency. The ONE dispatch
-#: from a ``[store].key_provider`` name to its class: :func:`resolve_key_provider` builds from it and
+class HostKeyProvider:
+    """``host`` — the store key derived from the key custody host blob (vault BACKLOG #3411). It
+    converts a handoff as a store open does, since in the service it may be asked first (the upload
+    cipher is built before the store opens). ``posture`` is the caller's, and ``None`` counts as
+    enforcing for the account check.
+
+    A custody refusal from here reaches a caller of ``resolve_active_key``,
+    ``resolve_decrypt_keys`` or ``build_store_cipher`` as a new ``KeyProviderError`` that keeps its
+    custody text, the paths and any remedy, as
+    :class:`~messagefoundry.store.custody_host.HostCustodyRefused` says (BACKLOG #4882)."""
+
+    def __init__(self, settings: StoreSettings, posture: HopPosture | None = None) -> None:
+        self._settings = settings
+        self._enforcing = posture is None or posture.enforcing
+
+    def key_file(self) -> None:
+        """The host blob is checked by the custody reader itself, not as a key file here."""
+        return None
+
+    def active_key(self) -> str:
+        from messagefoundry.store.custody_host import host_store_key, load_host_custody
+
+        return host_store_key(load_host_custody(self._settings, enforcing=self._enforcing))
+
+    def retired_keys(self) -> Sequence[str]:
+        return ()
+
+
+#: The ``[store].key_provider`` of the key custody host blob, spelled once in the leaf module.
+HOST_PROVIDER = HOST_KEY_PROVIDER
+
+#: Built-in providers — fully reproduce today's behavior, no external dependency. The dispatch
+#: from a ``[store].key_provider`` name to its class for every provider but ``host``, which also
+#: takes the posture and is built in :func:`resolve_key_provider`: :func:`resolve_key_provider` builds from it and
 #: :func:`provider_key_file` asks it which file is loaded, so the two cannot name different providers.
 _BUILTIN_PROVIDER_CLASSES: dict[
     str, type[AutoKeyProvider] | type[EnvKeyProvider] | type[DpapiKeyProvider]
@@ -168,7 +205,11 @@ _EXTERNAL_PROVIDERS: dict[str, str] = {
 }
 
 #: Every accepted ``[store].key_provider`` value (built-in + external), for validation + error messages.
-KNOWN_PROVIDERS: tuple[str, ...] = (*_BUILTIN_PROVIDERS, *tuple(_EXTERNAL_PROVIDERS))
+KNOWN_PROVIDERS: tuple[str, ...] = (
+    *_BUILTIN_PROVIDERS,
+    HOST_PROVIDER,
+    *tuple(_EXTERNAL_PROVIDERS),
+)
 
 #: The one local key setting a PINNED built-in provider reads, and how an operator sets it (BACKLOG
 #: #2077). ``auto`` reads both. A pinned ``env`` or ``dpapi`` ignores the other, so a key set only
@@ -186,7 +227,8 @@ def provider_reads_a_configured_key(settings: StoreSettings) -> bool:
     network, and ``store.base._checked_active_key`` refuses "no key" from one. A pinned built-in
     provider counts only when the source IT reads is set (BACKLOG #2077). ``auto``, and an unknown
     name that :func:`resolve_key_provider` refuses at open, count when either local source is set."""
-    if settings.key_provider in _EXTERNAL_PROVIDERS:
+    if settings.key_provider in _EXTERNAL_PROVIDERS or settings.key_provider == HOST_PROVIDER:
+        # The host provider refuses at open when it finds no blob, so it never opens keyless.
         return True
     pinned = _PINNED_KEY_SOURCE.get(settings.key_provider)
     if pinned is not None:
@@ -274,6 +316,14 @@ def resolve_key_provider(
     ``posture`` reaches an external provider only; the built-ins dial nothing. ``None`` counts as
     enforcing there."""
     name = settings.key_provider
+    if name == HOST_PROVIDER:
+        return HostKeyProvider(settings, posture)
+    # Every caller that resolves a key, not only a store open, refuses a host blob beside another
+    # provider (vault BACKLOG #3411).
+    from messagefoundry.store.custody_host import HostCustodyRefused, foreign_custody_refusal
+
+    if (refusal := foreign_custody_refusal(settings)) is not None:
+        raise HostCustodyRefused(refusal)
     builtin = _BUILTIN_PROVIDER_CLASSES.get(name)
     if builtin is not None:
         return builtin(settings)

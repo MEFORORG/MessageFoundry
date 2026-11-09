@@ -242,9 +242,9 @@ release pull request that leaves a test-held pin behind (items 2 to 4 and the RE
 version.
 
 1. `messagefoundry/__init__.py`: `__version__`. Every other engine pin below must match it.
-2. `packaging/messagefoundry-harness/pyproject.toml`: the `messagefoundry[harness]==` pin.
-   `tests/test_packaging.py::test_the_harness_pins_the_engine_at_the_version_it_ships_with` is the
-   gate.
+2. `packaging/messagefoundry-harness/pyproject.toml`: the `messagefoundry[harness]==` pin and the
+   `messagefoundry-toolkit==` pin. `tests/test_packaging.py::test_the_harness_pins_the_engine_at_the_version_it_ships_with`
+   and `::test_the_harness_pins_the_toolkit_at_the_version_it_ships_with` are the gates.
 3. `packaging/messagefoundry-toolkit/pyproject.toml`: the `messagefoundry==` pin.
    `tests/test_packaging.py::test_the_toolkit_pins_the_engine_at_the_version_it_ships_with` is the
    gate.

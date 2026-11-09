@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 from harness._console_widgets import ConfigurableTable
 from harness.file_transport import DropResult, FileDropWorker, FolderWatcher
 from harness.mllp import Received, SendItem
-from messagefoundry.generators import (
+from messagefoundry_toolkit.generators import (
     _core,
     all_types,  # noqa: F401  (registers the built-in message types)
 )

@@ -2216,10 +2216,11 @@ def _run_connscale_remote(argv: list[str]) -> int:
         description="DRIVER-ONLY connscale (WS-C): drive already-running engines off-box + bind the "
         "correlation sink locally. Never spawns an engine. Each process signs in for itself as the "
         "rig Administrator, so N processes from one address need at least N on the engine's "
-        "session cap (MEFOR_AUTH_MAX_SESSIONS_PER_USER) and on its per-address and all-clients "
-        "sign-in limits per window (MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP, "
-        "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL); the batch_ab engine half raises each one its own "
-        "driver fleet would meet, unless the environment already sets it.",
+        "per-address and all-clients sign-in limits per window (MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP, "
+        "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL), and room on its session cap "
+        "(MEFOR_AUTH_MAX_SESSIONS_PER_USER) for each process's second session too; the batch_ab "
+        "engine half sets all three, sized to its own driver fleet, unless the environment already "
+        "sets one, and runs no cell when that value is too small for its largest cell's fleet.",
     )
     parser.add_argument(
         "--engine-url",

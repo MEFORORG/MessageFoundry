@@ -41,9 +41,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from messagefoundry.generators import _core, all_types  # noqa: F401 — registers the generators
 from messagefoundry.parsing import normalize
 from messagefoundry.parsing.peek import Peek
+from messagefoundry_toolkit.generators import (  # noqa: F401 — registers the generators
+    _core,
+    all_types,
+)
 
 # The benchmark's unit of work: a small PHI-free routing tuple (named fields + the segment id list).
 Routing = tuple[str | None, str | None, str | None, str | None, tuple[str, ...]]

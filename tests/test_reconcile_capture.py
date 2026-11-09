@@ -20,9 +20,9 @@ import pytest
 
 from harness.reconcile import __main__ as reconcile_cli
 from harness.reconcile.capture import CaptureSink
-from messagefoundry.anon import Keyer, anonymize_checked, load_rules
-from messagefoundry.anon.leak import CoverageTally
 from messagefoundry.transports.mllp import DEFAULT_MAX_FRAME_BYTES, MLLPDecoder, frame
+from messagefoundry_toolkit.anon import Keyer, anonymize_checked, load_rules
+from messagefoundry_toolkit.anon.leak import CoverageTally
 from tests._mllp_over_cap import send_over_cap, send_valid_then_over_cap
 
 _ANON_SALT = "capture-salt-0123456789abcdef"  # synthetic; long enough for the Keyer's floor

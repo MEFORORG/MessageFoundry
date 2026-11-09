@@ -22,11 +22,11 @@ from types import ModuleType
 
 import pytest
 
-import messagefoundry.anon.hl7 as engine_hl7
-import messagefoundry.anon.rules as engine_rules
+import messagefoundry_toolkit.anon.hl7 as engine_hl7
+import messagefoundry_toolkit.anon.rules as engine_rules
 import tee.anon.hl7 as tee_hl7
 import tee.anon.rules as tee_rules
-from messagefoundry.anon import anonymize as engine_anonymize
+from messagefoundry_toolkit.anon import anonymize as engine_anonymize
 from tee.anon import anonymize as tee_anonymize
 
 _BOTH = pytest.mark.parametrize("rules_module", (engine_rules, tee_rules), ids=("engine", "tee"))

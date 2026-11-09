@@ -91,7 +91,8 @@ def _absent(path: str) -> bool:
 def key_file_problem(path: str, *, what: str, remedy: str, absent_ok: bool = False) -> str | None:
     """Why the engine may not use the key file at ``path``, or ``None`` when it may.
 
-    A known broad group must not be able to read or change the file. ``what`` names the file for
+    A known broad group or an application package must not be able to read or change the file
+    (:func:`~messagefoundry.restricted_file.broad_access_problem`). ``what`` names the file for
     the operator and ``remedy`` says what to do about it; the reason never carries the file's
     contents. With ``absent_ok``, a missing file passes: the loader that opens it refuses it and
     says why, which is the fault the operator needs to hear about. It prints and logs nothing:

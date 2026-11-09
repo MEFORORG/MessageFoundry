@@ -477,8 +477,8 @@ SITES: dict[str, Site] = {
     "messagefoundry/_child_bootstrap.py::_load_this_build": Site(
         1, INTERNAL, "A fixed name in the engine's own package directory."
     ),
-    "messagefoundry/anon/leak.py::_scanner": Site(1, INTERNAL, _PKG_LITERAL),
-    "messagefoundry/anon/surrogates.py::_resolve_token_text": Site(
+    "messagefoundry_toolkit/anon/leak.py::_scanner": Site(1, INTERNAL, _PKG_LITERAL),
+    "messagefoundry_toolkit/anon/surrogates.py::_resolve_token_text": Site(
         1, INTERNAL, "One fixed path under the folder that holds the package."
     ),
     "messagefoundry/api/tls.py::_generated_pair": Site(
@@ -652,7 +652,7 @@ SITES: dict[str, Site] = {
         "can reach the join (vault BACKLOG #2595).",
         "messagefoundry/engine_secrets.py::open_secrets_directory",
     ),
-    "messagefoundry/generators/_core.py::write_corpus": Site(
+    "messagefoundry_toolkit/generators/_core.py::write_corpus": Site(
         2,
         OPERATOR,
         "A trigger checked against the registry before the join, and a numbered file name, under "
@@ -714,6 +714,24 @@ SITES: dict[str, Site] = {
         "A subdirectory name listed from a staging directory this module made, while that "
         "directory is held; the child is then opened as itself and refused if it names another "
         "path (BACKLOG #4992).",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_win_hold_below": Site(
+        1,
+        REVIEWED,
+        "The names walked below a held staging directory, joined only to compare against the held "
+        "directory's final path; never opened (BACKLOG #2420).",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_win_opens_another": Site(
+        1,
+        REVIEWED,
+        "A listed name joined to its directory only to ask whether Win32 would rewrite it; never "
+        "opened (BACKLOG #2420).",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_win_verbatim": Site(
+        1,
+        REVIEWED,
+        "A staging directory's own name joined to its parent only to print the verbatim path an "
+        "operator may remove it by; never opened (BACKLOG #2420).",
     ),
     "messagefoundry/pipeline/dr_backup.py::_fd_walk": Site(
         1,
@@ -813,6 +831,18 @@ SITES: dict[str, Site] = {
     "messagefoundry/startupcode.py::_pth_items": Site(
         1, INTERNAL, "`.pth` names from listing a site-packages directory, to inventory them."
     ),
+    "messagefoundry/store/custody.py::read_systemd_credential": Site(
+        1,
+        OPERATOR,
+        "The credential name the caller configures, refused unless it is a plain file name, under "
+        "the directory systemd names in $CREDENTIALS_DIRECTORY.",
+    ),
+    "messagefoundry/store/custody_host.py::_custody_paths": Site(
+        2,
+        OPERATOR,
+        "The two fixed custody file names under the directory MEFOR_SECRETS_DIRECTORY names, or "
+        "the operator's [store].path directory.",
+    ),
     "messagefoundry/store/store.py::MessageStore._db_size_bytes": Site(
         1, OPERATOR, _SQLITE_SIDECARS
     ),
@@ -821,6 +851,25 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/store/store.py::_write_closed_store": Site(
         1, OPERATOR, "A fixed SQLite sidecar suffix on the operator's store path."
+    ),
+    "messagefoundry/transports/database.py::_capath_folder_clear": Site(
+        1,
+        OPERATOR,
+        "A name from listing the sslcapath folder the operator configured, joined to judge the "
+        "entry before the driver is given that folder.",
+    ),
+    "messagefoundry/transports/database.py::_libpq_home": Site(
+        2,
+        INTERNAL,
+        "The fixed names `postgresql` and `.postgresql` under the engine process's own home: the "
+        "roaming application-data folder the Windows shell names, else $HOME, else the effective "
+        "user's password-file home, with `os.sep` for an empty one. No message or peer input.",
+    ),
+    "messagefoundry/transports/database.py::_libpq_root_cert": Site(
+        1,
+        INTERNAL,
+        "The fixed name `root.crt` under the libpq default home `_libpq_home` names. A set "
+        "$PGSSLROOTCERT is returned unjoined. No message or peer input.",
     ),
     "messagefoundry/transports/file.py::FileDestination._write": Site(
         1, GUARDED, _DEST_NAME, "messagefoundry/transports/file.py::render_filename", called=True

@@ -1615,7 +1615,11 @@ def test_parser_table_drift_is_reported() -> None:
     )
     # One site in both tables.
     assert _parser_drift(
-        _replace_once(text, "`hl7structures.py` |", "`hl7structures.py`, `api/multipart.py` |"),
+        _replace_once(
+            text,
+            "`messagefoundry_toolkit/hl7structures.py` |",
+            "`messagefoundry_toolkit/hl7structures.py`, `api/multipart.py` |",
+        ),
         live,
     )
     # A planted parser the page does not name.

@@ -79,6 +79,10 @@ _KEY_MATERIAL = frozenset(
         # Vault BACKLOG #2596: an HMAC key HKDF-derived from the audit-chain key, binding a held
         # reload to the environment value file outside the config directory.
         "Reload hold value-file binding",
+        # Vault BACKLOG #2609, ADR 0207: a single-use CSPRNG code that authorizes binding a
+        # directory account's first engine factor. Scoped here rather than beside the recovery codes
+        # because the row states a usage scope, and the scope is what keeps the code to that one step.
+        "Directory-account enrolment code",
     }
 )
 
@@ -92,6 +96,8 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "WebAuthn credentials": "COSE PUBLIC keys supplied by the authenticator; the engine holds no "
     "private half and the row already says they are verification material, not a secret",
     "Config fingerprint": "a keyless content hash for change attribution",
+    "mTLS issuer index cross-check": "reads PUBLIC CA certificates into a scratch TLS context it "
+    "then discards (BACKLOG #4948); it holds no private key and grants no trust",
     "Engine/console seam identity": "a keyless content hash over PUBLIC type signatures, field "
     "names, enum members and Literal values -- a change detector for the engine/console handshake "
     "(BACKLOG #1220), not a key, a secret, or a message authenticator. Nothing user- or PHI-derived "

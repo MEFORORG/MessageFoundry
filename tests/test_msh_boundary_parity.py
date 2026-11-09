@@ -3,8 +3,9 @@
 """BACKLOG #3759 items 3.1 and 3.2: the ``MSH``-boundary readings in ``parsing/split.py``.
 
 The four readings (the split, the ingress guard's, the delivery's and the whole-file byte scan)
-spelled the boundary each its own way, and a clean outbound payload paid two scans. They now share
-their literals, and one scan settles a clean payload. That was a refactor, so every decision must
+spelled the boundary each its own way, and a clean outbound payload paid two scans. They now find
+it through one predicate, ``split._next_boundary`` (BACKLOG #4972), and one scan settles a clean
+payload. Those were refactors, so every decision must
 be the one the code made before it: each reading is checked against a copy of its body as it
 stood before, over every string of up to four tokens drawn from the shapes the readings tell
 apart, and a seeded sample of longer ones.
@@ -23,7 +24,7 @@ import itertools
 import random
 import re
 from collections.abc import Callable
-from typing import SupportsIndex
+from typing import Any, SupportsIndex
 
 import pytest
 
@@ -159,6 +160,41 @@ def test_the_whole_file_byte_scan_is_unchanged(encoding: str) -> None:
 def test_the_batch_split_is_unchanged() -> None:
     assert [text for text in CORPUS if split.split_batch(text) != _old_split_batch(text)] == []
     assert [body for body in BODIES if split.split_batch(body) != _old_split_batch(body)] == []
+
+
+#: The earliest boundary each multi-spelling ``_Boundary`` names, written as one plain regex.
+_EARLIEST_OUTBOUND = re.compile(r"[\r\n]" + BOM + r"*MSH")
+_EARLIEST_RAW_BYTES = re.compile(rb"[\r\n]MSH")
+
+
+def _earliest(pattern: re.Pattern[Any], text: Any, start: int) -> int:
+    found = pattern.search(text, start)
+    return -1 if found is None else found.start()
+
+
+@pytest.mark.parametrize("start", [0, 1, 3])
+def test_the_predicate_returns_the_earliest_boundary(start: int) -> None:
+    # The boolean readings throw the index away, and the split takes the one-spelling path, so the
+    # parity tests above would not see a multi-spelling search return a later boundary (BACKLOG
+    # #4972). Each answer is held to a plain regex for the same boundary.
+    assert [
+        text
+        for text in CORPUS
+        if split._next_boundary(text, start, split._OUTBOUND)
+        != _earliest(_EARLIEST_OUTBOUND, text, start)
+    ] == []
+    assert [
+        body
+        for body in BODIES
+        if split._next_boundary(body, start, split._RAW_BYTES)
+        != _earliest(_EARLIEST_RAW_BYTES, body, start)
+    ] == []
+
+
+def test_a_boundary_spelling_longer_than_one_break_is_refused() -> None:
+    # _next_boundary begins its searches one before the first MSH, so it would miss a CRLF spelling.
+    with pytest.raises(ValueError, match="one line-break character"):
+        split._Boundary("MSH", ("\r\nMSH",))
 
 
 def test_a_clean_outbound_payload_pays_one_scan() -> None:

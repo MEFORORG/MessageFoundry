@@ -15,13 +15,13 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.anon import DEFAULT_RULES, SurrogateKind
-from messagefoundry.anon import anonymize as engine_anonymize
-from messagefoundry.anon import anonymize_checked as engine_anonymize_checked
-from messagefoundry.anon import keying as engine_keying
-from messagefoundry.anon import leak as engine_leak
-from messagefoundry.anon import rules as engine_rules
-from messagefoundry.anon import surrogates as engine_surrogates
+from messagefoundry_toolkit.anon import DEFAULT_RULES, SurrogateKind
+from messagefoundry_toolkit.anon import anonymize as engine_anonymize
+from messagefoundry_toolkit.anon import anonymize_checked as engine_anonymize_checked
+from messagefoundry_toolkit.anon import keying as engine_keying
+from messagefoundry_toolkit.anon import leak as engine_leak
+from messagefoundry_toolkit.anon import rules as engine_rules
+from messagefoundry_toolkit.anon import surrogates as engine_surrogates
 from tee.anon import DEFAULT_RULES as TEE_DEFAULT_RULES
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import anonymize_checked as tee_anonymize_checked
