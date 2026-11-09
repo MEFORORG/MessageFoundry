@@ -156,9 +156,10 @@ class RowSealKeyRetiredError(Exception):
     """A store write helper read a SESSION whose seal is genuine but was made under a retired key,
     and did not write over it (owner ruling 2026-11-07 on ADR 0217). Not an integrity failure: the
     session was minted before the key changed. The ruled handling is a quiet end at the callers
-    (owner confirmation 2026-11-07), which is not built yet: until it is, every backend's session
-    writer turns this type back into :class:`RowSealError`, as main declines such a write
-    (``session_writer_seal_check`` in ``store.py``).
+    (owner confirmation 2026-11-07), built in slice 1b-iv: every backend's session writer raises
+    this type (``session_writer_seal_check`` in ``store.py``), a revoke's kept-session re-stamp
+    ends the session with the rest, and ``AuthService``'s stamp and rotation legs end it with
+    ``key_changed=True``.
 
     A sibling of :class:`RowSealError` and :class:`RowSealUnverifiableError`, never a subclass, so
     no Forged fallback runs on it and a catch site that does not name it lets it propagate rather

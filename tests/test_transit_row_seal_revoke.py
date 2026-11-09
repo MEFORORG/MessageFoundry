@@ -26,6 +26,7 @@ from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.row_seal import (
     RowSealError,
+    RowSealKeyRetiredError,
     RowSealUnverifiableError,
     TransitRowSealer,
     TransitSealUnavailableError,
@@ -240,7 +241,12 @@ class _MssqlCur:
 
 @pytest.mark.parametrize(
     "kind",
-    [RowSealUnverifiableError, TransitSealUnverifiableError, TransitSealUnavailableError],
+    [
+        RowSealUnverifiableError,
+        TransitSealUnverifiableError,
+        TransitSealUnavailableError,
+        RowSealKeyRetiredError,  # ruling 3, slice 1b-iv: ended quietly with the rest
+    ],
     ids=lambda k: k.__name__,
 )
 @pytest.mark.parametrize("backend", ["postgres", "sqlserver"])

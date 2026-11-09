@@ -3006,8 +3006,8 @@ class AuthStore(Protocol):
         one helper per backend, which verifies the row it read before it re-seals it and refuses
         rather than re-seal a row that fails. On every backend that refusal goes through
         :func:`~messagefoundry.store.row_seal.require_seal_for_write`, which says what it raises
-        (ADR 0217 slices 1b-i and 1b-ii), and each session writer turns the retired-key type back
-        into ``RowSealError``, as on ``main``.
+        (ADR 0217 slices 1b-i and 1b-ii), the retired-key type included, which its callers end
+        quietly (slice 1b-iv).
         A revoke blanks the seal, which needs no key. :class:`AuthService` checks the seals, in its
         one session loader; the store's readers return rows unchecked."""
         ...

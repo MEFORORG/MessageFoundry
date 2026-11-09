@@ -625,6 +625,17 @@ capped per store at `MAX_SUBJECT_ALERTS` distinct rows per window and then `:*`;
 A refused row is logged at ERROR and the page still goes. An Outage is still paged at once and is
 not audited, as the table says.
 
+**Slice 1b-iv builds the quiet end at the callers (build ruling 3 of 2026-11-07).** Every
+backend's session writer now raises `RowSealKeyRetiredError` itself, writing nothing. The store's
+`write_kept_session`, which `_keep_or_end_session` runs on all three backends, reads it as
+declined, so the kept session is ended and counted with the rest, with an INFO line and no audit
+row or page. `AuthService._sealed_stamp` and `_rotate_session_hash` end it through
+`_session_seal_failed(..., key_changed=True)`, as the loader does, and the stamp still reads as
+refused, so no success is recorded. The census answers the ruling's open question: the rotation
+site needs its own handler, since without one the type escapes it as an error.
+`revoke_other_sessions` and `revoke_every_session` need none, because the store's revoke no longer
+raises the type. The census found no other catch site that fails open, so no other site changed.
+
 **Other legs that read a map** decide access and write nothing: at least the client-certificate
 identity (`identity_for_cert_user_id`), the step-up role test (`_directory_roles_lost`) and the
 enrolment and re-bind legs. On the step-up, enrolment and re-bind legs an Unverifiable map takes

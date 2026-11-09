@@ -21,6 +21,7 @@ from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
     RowSealError,
+    RowSealKeyRetiredError,
     RowSealUnverifiableError,
     TransitRowSealer,
     TransitSealUnavailableError,
@@ -178,12 +179,12 @@ async def test_an_hmac_only_outage_after_a_good_check_writes_nothing(
     assert row == (seal, 0)
 
 
-async def test_a_session_under_a_retired_key_is_declined_on_a_write_as_on_main(
+async def test_a_session_under_a_retired_key_is_declined_on_a_write_as_its_own_type(
     tmp_path: Path,
 ) -> None:
     """The helper names it RowSealKeyRetiredError (owner ruling 2026-11-07), found in one check;
-    the SQLite writer still declines it as RowSealError and writes nothing, as every backend does,
-    so the reader's quiet end stays the only end until the callers name the new type."""
+    the SQLite writer raises that type and writes nothing, as every backend does, so its callers
+    end the session quietly (slice 1b-iv)."""
     path = tmp_path / "retired.db"
     store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
     try:
@@ -197,7 +198,7 @@ async def test_a_session_under_a_retired_key_is_declined_on_a_write_as_on_main(
         seal = _seal_of(path, "SELECT seal FROM sessions WHERE token_hash=?", (token,))
         new = FakeBackend()
         store._row_sealer = TransitRowSealer(new, retired_key_names=[RETIRED])
-        with pytest.raises(RowSealError):
+        with pytest.raises(RowSealKeyRetiredError):
             await store.mark_session_reauthed(token)
         assert new.verify_calls == 1  # one check, no second Transit call
         conn = sqlite3.connect(path)

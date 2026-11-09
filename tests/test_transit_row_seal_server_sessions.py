@@ -208,9 +208,10 @@ async def test_a_forged_session_is_refused_and_writes_nothing(backend: str) -> N
 
 
 @pytest.mark.parametrize("backend", sorted(_STORES))
-async def test_a_session_under_a_retired_key_is_declined_as_on_main(backend: str) -> None:
-    """The store's check names a retired-key session as its own type; the writer turns it back
-    into ``RowSealError``, as on ``main`` and as SQLite's writer does (owner ruling 2026-11-07)."""
+async def test_a_session_under_a_retired_key_is_declined_as_its_own_type(backend: str) -> None:
+    """The store's check names a retired-key session as its own type, and the writer raises it
+    and writes nothing, as SQLite's writer does, so its callers end it quietly (owner ruling
+    2026-11-07, "Quiet end at callers", built in slice 1b-iv)."""
     row = await _sealed_row(TransitRowSealer(FakeBackend(active=RETIRED)))
     seen: Seen = []
     store = _STORES[backend](row, seen)
@@ -218,7 +219,7 @@ async def test_a_session_under_a_retired_key_is_declined_as_on_main(backend: str
     # The row is a retired-key session, not a Forged one: the check itself names it so.
     with pytest.raises(RowSealKeyRetiredError):
         await require_session_seal_for_write(store._row_sealer, SessionRecord(**row))
-    with pytest.raises(RowSealError) as refused:
+    with pytest.raises(RowSealKeyRetiredError) as refused:
         await store.mark_session_mfa_verified(_HASH, now=_NOW)
-    assert type(refused.value) is RowSealError
+    assert type(refused.value) is RowSealKeyRetiredError
     assert _writes(seen) == []

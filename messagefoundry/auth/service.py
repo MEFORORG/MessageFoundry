@@ -164,6 +164,7 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     AnyRowSealer,
     RowSealError,
+    RowSealKeyRetiredError,
     SealFailureThrottle,
     TransitSealUnavailableError,
     TransitSealUnverifiableError,
@@ -10439,6 +10440,12 @@ class AuthService:
             except RowSealError:  # BACKLOG #2592: the row failed its seal; nothing was written
                 await self._session_seal_failed(old_hash)
                 return None
+            except RowSealKeyRetiredError:
+                # Owner ruling 2026-11-07 on ADR 0217, "Quiet end at callers": the row changed
+                # between the load and the re-key to one sealed under a retired key. Genuine, so
+                # it is ended as the loader ends one, with nothing reported as a seal failure.
+                await self._session_seal_failed(old_hash, key_changed=True)
+                return None
             except _rotation_store_errors() as exc:
                 raise _RotationStoreError(
                     await self._revoke_unrotated(old_hash, hash_token(new_token), exc),
@@ -10784,6 +10791,11 @@ class AuthService:
         except RowSealError:
             outcome.refused = True
             await self._session_seal_failed(token_hash)
+        except RowSealKeyRetiredError:
+            # Owner ruling 2026-11-07 on ADR 0217, "Quiet end at callers": refused like a failed
+            # seal, so no success is recorded, but ended quietly, as the loader ends one.
+            outcome.refused = True
+            await self._session_seal_failed(token_hash, key_changed=True)
         else:
             window = _STAMP_WINDOW.get()
             if window is not None and not window.closed and window.stamped is None:

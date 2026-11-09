@@ -1503,8 +1503,7 @@ async def require_session_seal_for_write(
     Unverifiable one, :class:`~messagefoundry.store.row_seal.TransitSealUnavailableError` for an
     Outage, and :class:`~messagefoundry.store.row_seal.RowSealKeyRetiredError` for a genuine seal
     under a retired key. Every backend's session writer calls :func:`session_writer_seal_check`,
-    which turns that last one back into ``RowSealError`` until the ruled quiet end at the callers
-    is built (ADR 0217, *Build rulings*)."""
+    whose callers end that last one quietly (ADR 0217, *Build rulings*, ruling 3)."""
     await require_seal_for_write(
         sealer, SESSION_KIND, record.seal_fields(), record.seal, subject=""
     )
@@ -1656,9 +1655,17 @@ async def write_kept_session(
     """Await a revoke's re-stamp of the session it keeps, reading a Transit Unverifiable or Outage
     answer as declined (``None``), so the caller ends that session as it ends the rest (decisions
     d20261109T165402853-83b348 and d20261109T165406730-2505f2 on ADR 0217); ``outcome`` takes the
-    refusal. A Forged session still raises ``RowSealError``, as on ``main``."""
+    refusal. A Forged session still raises ``RowSealError``, as on ``main``. A session sealed under a
+    retired key is declined too, quietly, with an INFO line and no refusal (owner ruling 2026-11-07
+    on ADR 0217): it is genuine, minted before the key changed, and the caller ends it."""
     try:
         return await write
+    except RowSealKeyRetiredError:
+        log.info(
+            "the session a revoke keeps was sealed under a retired store key; it is ended with "
+            "the rest"
+        )
+        return None
     except transit_seal_refusals() as exc:
         outcome.refused(
             exc, what="the kept session's re-stamp", kind=SESSION_KIND, ident=token_hash
@@ -1667,22 +1674,17 @@ async def write_kept_session(
 
 
 async def session_writer_seal_check(sealer: AnyRowSealer | None, record: SessionRecord) -> None:
-    """:func:`require_session_seal_for_write` as every backend's session writer runs it: a session
-    under a retired key raises ``RowSealError(SESSION_KIND)``, as on ``main``, and every other
-    answer raises as that function says.
+    """:func:`require_session_seal_for_write` as every backend's session writer runs it: every
+    answer raises as that function says, a session under a retired key as
+    :class:`~messagefoundry.store.row_seal.RowSealKeyRetiredError`.
 
-    The helper names a retired-key session as its own type (owner ruling 2026-11-07), but ending
-    it in the writer would hide the end from every caller: ``revoke_user_sessions`` would miscount
-    its kept session and the stamp legs would record a success for a session just ended. So the
-    write declines it as before, and the reader's quiet end (``AuthService``, ``key_changed``)
-    stays the one end, until each caller of the writer names the new type (the catch census)."""
-    retired = False
-    try:
-        await require_session_seal_for_write(sealer, record)
-    except RowSealKeyRetiredError:
-        retired = True
-    if retired:
-        raise RowSealError(SESSION_KIND)
+    The write declines a retired-key session and the callers end it quietly (owner ruling
+    2026-11-07 on ADR 0217, built in slice 1b-iv): a revoke's kept-session re-stamp ends it with
+    the rest (:func:`write_kept_session`), and ``AuthService``'s stamp and rotation legs end it as
+    the reader does (``key_changed``). The writer does not end it itself, which would hide the
+    end from those callers: ``revoke_user_sessions`` would miscount its kept session and a stamp
+    leg would record a success for a session just ended."""
+    await require_session_seal_for_write(sealer, record)
 
 
 async def require_role_seal_for_write(sealer: AnyRowSealer | None, row: RoleRow) -> None:
