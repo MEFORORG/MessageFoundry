@@ -22,7 +22,9 @@ primitive — never raw string-slicing of structured HL7.
 from __future__ import annotations
 
 import codecs
+import itertools
 import re
+from dataclasses import dataclass
 
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import normalize, starts_with_msh
@@ -36,16 +38,16 @@ __all__ = [
     "split_by_obr",
 ]
 
-# The one message boundary every reading in this module uses: a line that starts with ``MSH``. We
-# match it *without* the trailing field separator so a batch whose MSH-1 isn't ``|`` (e.g.
-# ``MSH^...``) still splits per-message instead of being read as one giant message — after a line
-# break a segment id is always exactly three chars, so only an ``MSH`` segment starts with "MSH".
-# Normalized text ends a line with CR alone; a payload or file that is not normalized may use LF too.
-# The readings below share these literals, but each still reads its own lead and its own marks,
-# so keep them in step by hand. AC-7's test in tests/test_one_frame_one_message.py compares the
-# delivery reading with the ingress one on a handful of shapes, not every input, and
-# tests/test_msh_boundary_parity.py holds each reading to its answer before the BACKLOG #3759
-# refactor.
+# The message boundary: a line that starts with ``MSH``. It is matched *without* the trailing field
+# separator so a batch whose MSH-1 isn't ``|`` (e.g. ``MSH^...``) still splits per-message instead
+# of being read as one giant message — after a line break a segment id is always exactly three
+# chars, so only an ``MSH`` segment starts with "MSH". Every reading in this module finds it through
+# the one predicate, :func:`_next_boundary`, and a :class:`_Boundary` says how the text each is
+# given spells it. Each reading still reads its own lead (whitespace, a byte order mark, an
+# FHS/BHS header, or none), so keep the leads in step by hand. AC-7's test in
+# tests/test_one_frame_one_message.py compares the delivery reading with the ingress one on a
+# handful of shapes, not every input, and tests/test_msh_boundary_parity.py holds each reading to
+# its answer before the BACKLOG #3759 refactor.
 _MSH = "MSH"
 _CR_MSH = "\r" + _MSH
 _LF_MSH = "\n" + _MSH
@@ -53,55 +55,109 @@ _MSH_BYTES = _MSH.encode("ascii")
 _CR_MSH_BYTES = _CR_MSH.encode("ascii")
 _LF_MSH_BYTES = _LF_MSH.encode("ascii")
 
-# Split a normalized (``\r``-delimited) payload before each non-leading ``MSH`` segment.
-# ``_CR_MSH`` holds no regex metacharacter, so it goes in unescaped: the static ReDoS scanner in
-# tests/test_security_static.py resolves a pattern composed from constants, but not one passed
-# through ``re.escape``.
-_MSH_BOUNDARY = re.compile("(?=" + _CR_MSH + ")")
+#: The byte order mark, U+FEFF, named rather than written so the source stays ASCII.
+_BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
+
+
+@dataclass(frozen=True, slots=True)
+class _Boundary[S: (str, bytes)]:
+    """How one kind of text spells a boundary, for :func:`_next_boundary`.
+
+    ``lines`` holds each line break that can end a line in that text, followed by ``msh``. Each
+    break is one character: :func:`_next_boundary` begins its searches one before the first
+    ``msh``, so a longer break would be missed, and ``__post_init__`` refuses one.
+    ``marked``, when set, is a mark and a pattern for a wider boundary: a line break, then one or
+    more of that mark, then ``msh``. The pattern is searched only when the text holds the mark past
+    the start, so a text without one never pays it."""
+
+    msh: S
+    lines: tuple[S, ...]
+    marked: tuple[S, re.Pattern[S]] | None = None
+
+    def __post_init__(self) -> None:
+        if not self.lines or any(
+            len(line) != len(self.msh) + 1 or not line.endswith(self.msh) for line in self.lines
+        ):
+            raise ValueError("each boundary spelling is one line-break character, then MSH")
+
+
+#: Text :func:`~messagefoundry.parsing.peek.normalize` wrote, which ends every line with CR alone.
+_NORMALIZED = _Boundary(_MSH, (_CR_MSH,))
+#: An outbound payload, which is not normalized, so a line may end with LF too. A later ``MSH`` line
+#: that byte order marks lead, as two texts read without stripping their marks would join, is a
+#: boundary here too (ADR 0209). ``_MSH`` holds no regex metacharacter, so it goes in unescaped: the
+#: static ReDoS scanner in tests/test_security_static.py resolves a pattern composed from constants,
+#: but not one passed through ``re.escape``.
+_OUTBOUND = _Boundary(_MSH, (_CR_MSH, _LF_MSH), (_BOM, re.compile(r"[\r\n]" + _BOM + "+" + _MSH)))
+#: A received file's bytes, before any decode, so a line may end with LF too.
+_RAW_BYTES = _Boundary(_MSH_BYTES, (_CR_MSH_BYTES, _LF_MSH_BYTES))
+
+
+def _next_boundary[S: (str, bytes)](text: S, start: int, boundary: _Boundary[S]) -> int:
+    """The index of the line break that begins the earliest boundary in ``text`` whose line break
+    is at ``start`` or later, or -1 when there is none. ``start`` is 0 or more: ``str.find`` reads
+    a negative one from the end.
+
+    With one spelling, one scan answers. With more, a boundary's ``MSH`` is past ``start``, so one
+    scan for ``MSH`` settles a text holding none, rather than one scan per spelling. Otherwise the
+    first ``MSH`` it finds is the earliest a boundary can end with, so the line-break searches begin
+    one before it and read nothing that scan already passed, and each later one stops where an
+    earlier one hit. C-level scans and no copy."""
+    lines, marked = boundary.lines, boundary.marked
+    if marked is None and len(lines) == 1:
+        return text.find(lines[0], start)
+    first = text.find(boundary.msh, start + 1)
+    if first < 0:
+        return -1
+    at = first - 1  # first > start, so this is start or later
+    # A boundary at `at` ends with the first MSH, so no boundary, marked or not, begins earlier.
+    for line in lines:
+        if text.startswith(line, at):
+            return at
+    best = -1
+    for line in lines:
+        # Bounded so it can only find a boundary that begins before the one already found.
+        hit = text.find(line, at) if best < 0 else text.find(line, at, best + len(line) - 1)
+        if hit >= 0:
+            best = hit
+    # A marked boundary's marks sit between its break and its MSH, so its break can be before `at`,
+    # and its first mark is past `start`, so a mark in the lead alone does not start the search.
+    # One that begins before `best` also ends by it, since no line break follows its first
+    # character, so both searches stop there.
+    if marked is not None:
+        end = len(text) if best < 0 else best
+        if text.find(marked[0], start + 1, end) >= 0:
+            found = marked[1].search(text, start, end)
+            if found is not None:
+                best = found.start()
+    return best
+
 
 #: The first character the parser keeps: it strips the whitespace around a body before it reads it.
 _FIRST_KEPT = re.compile(r"\S")
 
 
-def _boundary_scan_start[S: (str, bytes)](text: S, start: int, msh: S) -> int:
-    """Where a search for a boundary at ``start`` or later need begin, or -1 when ``text`` holds
-    none. Such a boundary's line break is at ``start`` or later, so its ``MSH`` is past it: one
-    scan for ``MSH`` settles a text holding none, rather than one scan per line end. Otherwise the
-    first ``MSH`` it finds is the earliest a boundary can end with, so the line-end searches begin
-    one before it and read nothing this scan already passed."""
-    first = text.find(msh, start + 1)
-    return -1 if first < 0 else first - 1  # first > start, so this is start or later
-
-
 def _holds_more_than_one_message(text: str) -> bool:
     """Whether normalized (``\\r``-delimited) ``text`` holds more than one ``MSH`` segment, by the
     parser's own reading: it strips the whitespace around the body, then treats every line whose
-    first three characters are ``MSH`` as a header. C-level scans and no copy. The ingress guard's
-    reading (ADR 0206 rule 5). The boundary is the one :func:`split_batch` splits on
-    (``_MSH_BOUNDARY``), so a File source hands that guard one message at a time; keep the two in
-    step, and :func:`_sends_more_than_one_message` with them."""
+    first three characters are ``MSH`` as a header. The ingress guard's reading (ADR 0206 rule 5).
+    The boundary is the one :func:`split_batch` splits on, so a File source hands that guard one
+    message at a time."""
     first = _FIRST_KEPT.search(text)
     if first is None:
         return False
     start = first.start()
-    later = text.find(_CR_MSH, start)
+    later = _next_boundary(text, start, _NORMALIZED)
     if later < 0:
         return False
     # Led by MSH, one later MSH line makes two messages; otherwise it takes two.
-    return text.startswith(_MSH, start) or text.find(_CR_MSH, later + 1) >= 0
+    return text.startswith(_MSH, start) or _next_boundary(text, later + 1, _NORMALIZED) >= 0
 
-
-#: The byte order mark, U+FEFF, named rather than written so the source stays ASCII.
-_BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
 
 #: ``MSH`` after whitespace and any byte order mark. Wider than the parser's ``_LEADS_WITH_MSH`` by
 #: the mark alone, which :func:`split_batch` reads past too: a receiver that drops the mark reads
 #: the messages behind it.
 _LEADS_WITH_MSH_PAST_BOM = re.compile(r"[\s" + _BOM + r"]*" + _MSH)
-
-#: A later ``MSH`` line that a byte order mark leads, as two texts read without stripping their
-#: marks would join. Searched only when the payload holds a mark, so a clean payload never pays it.
-_LATER_MSH_PAST_BOM = re.compile(r"[\r\n]" + _BOM + "+" + _MSH)
 
 
 def _sends_more_than_one_message(payload: str) -> bool:
@@ -109,19 +165,9 @@ def _sends_more_than_one_message(payload: str) -> bool:
     and holds another line that starts with ``MSH``, or with marks and then ``MSH`` (ADR 0209). The
     payload is not normalized, so a line break is a CR or an LF, and on an ``MSH``-led payload with
     no mark the answer is :func:`_holds_more_than_one_message`'s on the normalized text. A payload
-    not led by ``MSH`` answers False. A payload with no ``MSH`` after its lead pays one scan; each
-    later search stops at its first hit, and none copies."""
+    not led by ``MSH`` answers False. A payload with no ``MSH`` after its lead pays one scan."""
     lead = _LEADS_WITH_MSH_PAST_BOM.match(payload)
-    if lead is None:
-        return False
-    start = lead.end()
-    # A marked boundary's MSH is past start + 1 too, so a payload with none there holds neither.
-    at = _boundary_scan_start(payload, start, _MSH)
-    if at < 0:
-        return False
-    if payload.find(_CR_MSH, at) >= 0 or payload.find(_LF_MSH, at) >= 0:
-        return True
-    return _BOM in payload and _LATER_MSH_PAST_BOM.search(payload, start) is not None
+    return lead is not None and _next_boundary(payload, lead.end(), _OUTBOUND) >= 0
 
 
 #: A UTF-8 byte order mark after the leading whitespace the content sniff tolerates. A match, not a
@@ -157,10 +203,16 @@ def split_batch(raw: str | bytes) -> list[str]:
     reports it as malformed rather than silently dropping it).
     """
     text = normalize(raw)  # \r-delimited, decoupled from the inbound line endings
-    first, *rest = _MSH_BOUNDARY.split(text)
-    # Every later chunk is the boundary's own CR, then MSH.
-    messages = [chunk[1:] for chunk in rest]
-    head = first.lstrip(_LEADING_WS_STR)  # the leading noise the content sniff tolerates
+    bounds: list[int] = []
+    at = _next_boundary(text, 0, _NORMALIZED)
+    while at >= 0:
+        bounds.append(at)
+        at = _next_boundary(text, at + 1, _NORMALIZED)
+    bounds.append(len(text))
+    # Each later message runs from past its boundary's own CR up to the next boundary.
+    messages = [text[cut + 1 : end] for cut, end in itertools.pairwise(bounds)]
+    # The leading noise the content sniff tolerates.
+    head = text[: bounds[0]].lstrip(_LEADING_WS_STR)
     while head.startswith(_ENVELOPE_HEADERS):
         head = head.partition("\r")[2].lstrip(_LEADING_WS_STR)
     if head.strip():  # a chunk of other whitespace alone is not a message either
@@ -229,8 +281,7 @@ def _needs_a_decode(raw: bytes, encoding: str) -> bool:
         return True
     if name == "utf-8" and _LEADING_BOM.match(raw):
         return True
-    at = _boundary_scan_start(raw, 0, _MSH_BYTES)
-    return at >= 0 and (raw.find(_CR_MSH_BYTES, at) >= 0 or raw.find(_LF_MSH_BYTES, at) >= 0)
+    return _next_boundary(raw, 0, _RAW_BYTES) >= 0
 
 
 def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: str) -> str:

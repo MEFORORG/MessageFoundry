@@ -22,6 +22,13 @@ this line.**
 
 ### Added
 
+- **Directory-account enrolment codes (ADR 0207, BACKLOG #2609).** A directory account's user page
+  offers "Issue enrolment code" and "Revoke enrolment code", each behind its own single-use step-up,
+  and the issue shows the code once with the handover rule. An MFA reset of an enabled directory
+  account shows the code it issued. The TOTP confirm form and the passkey page carry an enrolment
+  code field when the session owes one, the passkey page script sends it in its body, and the
+  account page tells a directory user with no factor to ask an Administrator through the site's
+  identity check, not by mail or chat.
 - **The sign-in page offers a combined passkey sign-in.** A "Sign in with password and passkey"
   button runs a usernameless passkey ceremony (`POST /ui/login/passkey`, which charges the sign-in
   window first and sets the challenge's handle as an HttpOnly cookie) and submits the assertion with
@@ -69,6 +76,19 @@ this line.**
 
 ### Security
 
+- **One issued continuation mints one grant, even when two re-auths race it.** `POST /ui/reauth`
+  and the federated start `POST /ui/reauth/oidc` now take the issue before the password check or
+  the flow is staged, so a second tab re-authenticating toward the same confirm page meanwhile
+  mints nothing. A wrong password, or a refused IdP prompt, gives the issue back, so the retry still
+  continues. Auto-retry actions and action-bound confirm pages each have their own cap of eight
+  issues per session, so a run of confirm pages no longer evicts an action the operator is
+  confirming. (vault BACKLOG #3241, added items 7 to 9)
+- **A bookmarked confirm page costs one re-auth, not two.** A link to an action-bound confirm page
+  opened from outside the browser is not issued, so `GET /ui/reauth` toward it now shows a link to
+  the page instead of a password form whose re-auth would mint nothing. Following the link issues
+  the page, and the one re-auth then mints its grant. The bulk purge confirm page also keeps its
+  destination and scope selection across the re-auth, up to the 512-character cap on `next`.
+  (vault BACKLOG #3241, added item 2 and step 1)
 - **A channel-scoped caller's bad flag direction gets the audited 403.** `POST
   /ui/connections/{name}/flag` answered 404 for a direction other than `inbound` or `outbound`
   before the engine handler's scope check, so on a first deployment such a caller's probe there

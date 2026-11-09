@@ -47,6 +47,7 @@ from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore, UserRecord, WebAuthnCredential  # noqa: E402
 from tests._admin_account import login_admin  # noqa: E402
+from tests._enrolment_code import enrolment_code_for  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 from tests._totp_clock import pin_totp_clock  # noqa: E402
 
@@ -116,13 +117,24 @@ async def _enrol_totp_elsewhere(service: AuthService, at: float) -> str:
     identity, token = await _sign_in(service)
     enrollment = await service.begin_mfa_enrollment(identity)
     code = totp.totp(enrollment.secret, now=at)
-    assert (await service.confirm_mfa_enrollment(identity, code, token=token)).ok
+    # ADR 0207: this directory account's first factor binds only with an issued code.
+    issued = await enrolment_code_for(service, identity.user_id)
+    assert (
+        await service.confirm_mfa_enrollment(identity, code, token=token, enrolment_code=issued)
+    ).ok
     return enrollment.secret
 
 
 async def _finish(service: AuthService, identity: Identity, token: str, response: str) -> Elevation:
     return await service.finish_webauthn_registration(
-        identity, response, label="key", token=token, rp_id=_RP, origin=_ORIGIN
+        identity,
+        response,
+        label="key",
+        token=token,
+        rp_id=_RP,
+        origin=_ORIGIN,
+        # ADR 0207: None once the account holds a factor, which the factor check refuses first.
+        enrolment_code=await enrolment_code_for(service, identity.user_id),
     )
 
 
@@ -151,6 +163,11 @@ async def test_a_ceremony_staged_before_totp_enrolment_cannot_finish_after_it(
     # Audited as the begin gate's refusal of a pending session is.
     rows = await store.list_audit(action="auth.mfa_denied")
     assert {"path": "finish_webauthn_registration"} in [json.loads(r["detail"]) for r in rows]
+    # ADR 0207 AC-5: on this unstamped directory session the refusal also writes the code row.
+    refused = await store.list_audit(action="auth.enrolment_code_refused")
+    assert {"reason": "factor_present", "ceremony": "webauthn"} in [
+        json.loads(r["detail"]) for r in refused
+    ]
     # The refusal took the challenge, so the stale ceremony is dead, not waiting for a retry.
     with pytest.raises(ValueError, match="ceremony expired"):
         await _finish(service, identity, token, response)

@@ -507,11 +507,15 @@ def _lane_report(d: StageDispatcher, lane: str) -> str:
     else:
         exc = task.exception()
         task_state = f"raised {exc!r}" if exc is not None else "finished"
+    st = d._states.get(lane)
     return (
         f"      {lane}: phase={getattr(d.phase(lane), 'name', None)}"
         f" park_until={d.park_until(lane)} streak={d.infra_error_streak(lane)}"
         f" dirty={d.is_dirty(lane)} timer_armed={d._timer_deadline.get(lane)}"
         f" lane_task={task_state}"
+        # BACKLOG #2273: which lane owns a slot, and a pause that has not landed yet.
+        f" slot_held={st.slot_held if st else None}"
+        f" pause_pending={st.pause_pending if st else None}"
     )
 
 
@@ -599,6 +603,18 @@ def _verdict(d: StageDispatcher, lane: str | None = None) -> str:
     )
 
 
+def _counters(d: StageDispatcher, i: int | str) -> str:
+    """One dispatcher's COUNTERS line, shared by the expiry report and the drain-failure message."""
+    return (
+        f"dispatcher[{i}] stage={d._stage.value}"
+        f" empty_claims(total,wake_fanout,idle_poll)={d.empty_claims}"
+        f" claim_lock_timeouts={d.claim_lock_timeouts}"  # BACKLOG #1270 — the route discriminator
+        f" claim_head_skips={d.claim_head_skips}"  # BACKLOG #1270 — the other route's counter
+        f" busy_violations={d.busy_violations} processing_lanes={d.processing_lanes}"
+        f" slots_free={d.slots_free}"
+    )
+
+
 async def _expiry_report(pred: Callable[[], bool] | None = None, lane: str | None = None) -> str:
     """Everything a reader needs to tell the #344 hypotheses apart, without a second CI round-trip."""
     lines = ["_wait_until expired."]
@@ -613,14 +629,7 @@ async def _expiry_report(pred: Callable[[], bool] | None = None, lane: str | Non
             lane if lane is not None else (next(iter(d._states)) if len(d._states) == 1 else None)
         )
         lines.append(f"  {_verdict(d, subject)}")
-        lines.append(
-            f"  dispatcher[{i}] stage={d._stage.value}"
-            f" empty_claims(total,wake_fanout,idle_poll)={d.empty_claims}"
-            f" claim_lock_timeouts={d.claim_lock_timeouts}"  # BACKLOG #1270 — the route discriminator
-            f" claim_head_skips={d.claim_head_skips}"  # BACKLOG #1270 — the other route's counter
-            f" busy_violations={d.busy_violations} processing_lanes={d.processing_lanes}"
-            f" slots_free={d._slots_free}"
-        )
+        lines.append(f"  {_counters(d, i)}")
         # NB distinct loop names: a bare `for lane in ...` here would REBIND the `lane` parameter and
         # give the next dispatcher's verdict a stale subject.
         lines.extend(_lane_report(d, ln) for ln in d._states)
@@ -786,6 +795,39 @@ async def _drain_to_quiescence(
             " dispatcher stranded the lane, not the store"
         )
     return False
+
+
+async def _drain_failure(d: StageDispatcher, store: Any, lanes: list[str], what: str) -> str:
+    """The failure message for a ``_drain_to_quiescence`` that returned False (BACKLOG #2273).
+
+    ``_idle()`` also requires ``processing_lanes == 0``, which is ``len(_lane_tasks)``: every
+    serializer task not yet removed, a finished one included until its done callback pops it. So the
+    lane phases and the pending rows alone cannot explain every miss: a task under a lane that reads
+    IDLE, or under a lane outside ``lanes``, fails the drain with both lists empty. The counters line
+    and a report per lane holding a task name that case; ``lane_task=`` says whether it is alive."""
+    # Every dispatcher reading first, in one instant: the store read below awaits, and the claimer and
+    # serializer tasks keep running across it, so a reading taken after it could contradict one before.
+    not_idle = _not_idle(d, lanes)
+    label = _LIVE_DISPATCHERS.index(d) if d in _LIVE_DISPATCHERS else "?"  # "?" = not registered
+    lines = [
+        f"{what} did not reach quiescence; not idle: {not_idle}",
+        f"  paused or pause-pending: {_pause_state(d, lanes)}",
+        f"  {_counters(d, label)}",
+    ]
+    # Each lane holding a serializer task (bounded by max_processing_lanes), each lane holding a slot,
+    # then each other lane not IDLE, so a READY, CLAIMING, PARKED or STOPPED lane carries its timer and
+    # dirty state too. dict.fromkeys keeps the order and reports a lane once.
+    held_slot = [x for x, st in d._states.items() if st.slot_held]
+    reported = dict.fromkeys([*d._lane_tasks, *held_slot, *(x for x, _ in not_idle)])
+    lines.extend(_lane_report(d, ln) for ln in reported)
+    # Bounded and swallowed, as in _expiry_report: a diagnostic that hangs or raises would mask the
+    # failure it is meant to explain.
+    try:
+        pending: object = await asyncio.wait_for(_pending_lanes(store, lanes), timeout=5.0)
+    except Exception as exc:  # noqa: BLE001 — a diagnostic must never mask the real failure
+        pending = f"<store read unavailable: {exc!r}>"
+    lines.append(f"  still pending, read from the store after the lines above: {pending}")
+    return "\n".join(lines)
 
 
 def _first_occurrence_order(
@@ -1168,10 +1210,7 @@ async def test_busy_violation_soak_200_lanes(store: Any) -> None:
         contention = (
             f"claim head skips={d.claim_head_skips}, lock-timeout aborts={d.claim_lock_timeouts}"
         )
-        assert drained, (
-            f"soak did not reach quiescence; still pending: {await _pending_lanes(store, lanes)}"
-            f" ({contention})"
-        )
+        assert drained, await _drain_failure(d, store, lanes, "soak")
 
         # --- invariants ---
         assert d.busy_violations == 0
@@ -2894,10 +2933,7 @@ async def test_pause_resume_soak_busy_violations(store: Any) -> None:
         # Resume EVERY lane, then force-drain to quiescence (see _resume_all, _drain_to_quiescence).
         assert await _resume_all(d, lanes), f"lanes still paused: {_pause_state(d, lanes)}"
         drained = await _drain_to_quiescence(d, store, lanes, mc)
-        assert drained, (
-            f"pause/resume soak did not reach quiescence; not idle: {_not_idle(d, lanes)}"
-            f"; still pending: {await _pending_lanes(store, lanes)}"
-        )
+        assert drained, await _drain_failure(d, store, lanes, "pause/resume soak")
 
         assert d.busy_violations == 0
         assert stub.concurrency_violations == 0
@@ -2911,11 +2947,103 @@ async def test_pause_resume_soak_busy_violations(store: Any) -> None:
 
 
 def _counters_line(report: str) -> str:
-    """The expiry report's per-dispatcher COUNTERS line, so an assertion about that line cannot be
-    satisfied by the same number appearing in the prose verdict above it."""
+    """The per-dispatcher COUNTERS line of an expiry report or a drain-failure message, so an
+    assertion about that line cannot be satisfied by the same number appearing in the prose above it."""
     lines = [ln for ln in report.splitlines() if ln.lstrip().startswith("dispatcher[")]
     assert len(lines) == 1, f"expected exactly one dispatcher line, got {len(lines)}: {lines!r}"
     return lines[0]
+
+
+def _lane_lines(msg: str) -> list[tuple[str, str]]:
+    """The per-lane report lines of a drain-failure message, as (lane, line), duplicates kept."""
+    return [
+        (ln.strip().split(":", 1)[0], ln.strip())
+        for ln in msg.splitlines()
+        if ": phase=" in ln and ln.startswith("      ")
+    ]
+
+
+class _RaisingListStore:
+    """A store whose lane listing raises: the drain-failure message must survive its own store read."""
+
+    async def list_fifo_lanes(self, stage: str) -> list[tuple[str, int]]:
+        raise RuntimeError("store probe")
+
+
+async def test_drain_failure_names_a_task_held_outside_the_drained_lanes(store: Any) -> None:
+    """A drain that fails on ``processing_lanes`` alone says so (BACKLOG #2273).
+
+    The held lane is gated in PROCESSING but is not among the lanes the drain reads, which is the
+    shape a serializer task alive under an IDLE-reading lane leaves: the lane phases and the pending
+    rows are both empty, and only the counters line and the per-lane report show what held the drain.
+    The release arm is the control: the same helper, once the task ends, reads zero and no lane."""
+    mc = ManualClock(1000.0)
+    stub = RecordingStub(store, mc.time)
+    held, drained_lane = "IB_DRAIN_HELD", "IB_DRAIN_FREE"
+    await _seed(store, held, [100.0])
+    await _seed(store, drained_lane, [100.0])
+    gate = asyncio.Event()
+    stub.gate(held, gate)
+    d = _make(store, stub, {held, drained_lane}, max_processing_lanes=4, clock=mc)
+    await d.start()
+    try:
+        # Both heads dispatched (the stub records before it waits on a gate); only the held one stays.
+        # Per lane through `_wait_lane_until`, not a bare `_wait_until`: the periodic sweep is off, so
+        # a start-up claim that comes back EMPTY (a 1222 lock timeout or a head skip on a server
+        # store) strands that lane in terminal IDLE with its head undispatched, and only the stand-in
+        # re-readies it. The subject is the dispatch record, so a re-ready cannot mask the assertion.
+        def head_dispatched(lane: str) -> Callable[[], bool]:
+            return lambda: any(r.lane == lane for r in stub.records)
+
+        for lane in (held, drained_lane):
+            await _wait_lane_until(d, lane, head_dispatched(lane), note="its head dispatched")
+        assert await _wait_until(lambda: d.processing_lanes == 1 and len(stub.records) == 2)
+        # A short budget still runs one full round of the unchanged drain, including its fixed 3 s idle
+        # wait; it cannot go idle while the gate holds, so the drain returns False.
+        assert not await _drain_to_quiescence(d, store, [drained_lane], mc, budget=0.01)
+        msg = await _drain_failure(d, store, [drained_lane], "drain probe")
+        # The two lists the old message carried are empty here, so they alone could not explain it.
+        lines = msg.splitlines()
+        assert lines[0] == "drain probe did not reach quiescence; not idle: []", msg
+        assert lines[-1] == "  still pending, read from the store after the lines above: []", msg
+        counters = _counters_line(msg).split()
+        assert "processing_lanes=1" in counters, msg
+        assert "slots_free=3" in counters, msg  # 4 slots, one held
+        # Present, not a value: a server store's real locking may move either contention counter.
+        for name in ("claim_head_skips=", "claim_lock_timeouts="):
+            assert any(tok.startswith(name) for tok in counters), msg
+        # Exactly one line, for the held lane: the task-less, IDLE drained lane is left out.
+        ((lane, line),) = _lane_lines(msg)
+        assert lane == held, msg
+        for field in ("phase=PROCESSING", "lane_task=ALIVE", "slot_held=True"):
+            assert field in line, msg
+
+        # The held lane inside the drained lanes is task-holding, slot-holding AND not idle: one line.
+        inside = await _drain_failure(d, store, [held, drained_lane], "drain probe")
+        assert inside.splitlines()[0].endswith(f"not idle: [('{held}', 'PROCESSING')]"), inside
+        assert [ln for ln, _ in _lane_lines(inside)] == [held], inside
+
+        # A store read that raises is reported in place; the dispatcher readings still print.
+        broken = await _drain_failure(d, _RaisingListStore(), [drained_lane], "drain probe")
+        assert broken.splitlines()[-1].endswith(
+            "<store read unavailable: RuntimeError('store probe')>"
+        ), broken
+        assert "processing_lanes=1" in _counters_line(broken).split(), broken
+
+        gate.set()
+        assert await _wait_until(
+            lambda: (
+                d.processing_lanes == 0
+                and all(d.phase(x) in (None, _LanePhase.IDLE) for x in (held, drained_lane))
+            )
+        )
+        released = await _drain_failure(d, store, [drained_lane], "drain probe")
+        rel_counters = _counters_line(released).split()
+        assert "processing_lanes=0" in rel_counters and "slots_free=4" in rel_counters, released
+        assert _lane_lines(released) == [], released
+    finally:
+        gate.set()
+        await d.stop()
 
 
 # --- the harness's own instruments (BACKLOG #1270) ------------------------------------------------

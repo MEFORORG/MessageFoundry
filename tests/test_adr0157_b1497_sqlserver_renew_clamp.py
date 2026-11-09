@@ -40,6 +40,7 @@ from messagefoundry.pipeline.cluster import build_coordinator
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.sqlserver import _clamped_statement_timeout
+from tests._log_absence import assert_capture_sees
 
 # --- the whole-second conversion ---------------------------------------------
 
@@ -734,6 +735,7 @@ def test_loading_settings_logs_no_renew_bound_warning(
     caplog.set_level(logging.WARNING)
     s = _load(tmp_path, _SQLSERVER)
     assert s.sqlserver_renew_bound_warning() is not None
+    assert_capture_sees(caplog, "messagefoundry.config.settings")
     assert not [r for r in caplog.records if _TWICE_THE_CLAMP in r.getMessage()]
 
 

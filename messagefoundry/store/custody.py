@@ -4,9 +4,8 @@
 
 The design is the key custody ADR draft, accepted for build by the owner on 2026-11-04 and held in
 the vault at ``docs/security/security-architecture-review-2026-10-01/adr-drafts/ADR-DRAFT-key-custody.md``
-(rules 1 to 4, 3b and 13; vault BACKLOG #3411, slice S3). This module holds the primitives only.
-Nothing in the engine calls them yet: no command mints a store with them, and no store opens with
-them.
+(rules 1 to 4, 3b and 13; vault BACKLOG #3411, slice S3). This module holds the primitives only;
+:mod:`messagefoundry.store.custody_host` wires them into the ``host`` key provider.
 
 What is here:
 
@@ -28,7 +27,8 @@ What is here:
   the host file is refused, and the credential reader refuses a set ``$CREDENTIALS_DIRECTORY``
   rather than report the credential unavailable. Each kind of file is read only from the file
   systems its own allowlist names, and the host file is written only to one, checked while it is
-  still empty. No key custody file is kept for SYSTEM, LOCAL SERVICE or NETWORK SERVICE.
+  still empty. No key custody file is kept for SYSTEM, LOCAL SERVICE or NETWORK SERVICE, nor on
+  Linux for root or nobody.
 * **The handoff blob** (:func:`write_handoff_file`): machine-scope DPAPI, in a file created with
   the draft's descriptor, DELETE added for the service: SYSTEM and Administrators with full
   control, the service account with read and delete, and no one else. It carries the key from the
@@ -75,6 +75,8 @@ __all__ = [
     "MasterKey",
     "RecoveryKey",
     "StoreId",
+    "check_handoff_writable",
+    "check_host_writable",
     "consume_handoff_file",
     "protect_host_blob",
     "read_handoff_file",
@@ -108,10 +110,12 @@ class CredentialUnavailable(CustodyError):
 
 class HandoffLeftBehind(Exception):
     """The handoff was converted, and ``convert`` returned, but the handoff file is still there: its
-    delete was refused, or its name outlived the delete. Deliberately NOT a :class:`CustodyError`,
-    so a caller that refuses a start on a custody refusal cannot take this for one: every
-    :class:`CustodyError` of :func:`consume_handoff_file` comes before the conversion ran, and this
-    comes after, once the host file it wrote exists."""
+    delete was refused, or its name outlived the delete. Deliberately NOT a :class:`CustodyError`:
+    this is raised only once ``convert`` has returned, so the host file it wrote exists and holds
+    the key. A :class:`CustodyError` of :func:`consume_handoff_file` says nothing either way: one
+    raised before ``convert`` was called left no host file, and one ``convert`` itself raised may
+    come after it wrote one, so a caller that must know asks for the host file rather than infer
+    it from the class."""
 
 
 # --- the three minted values ----------------------------------------------------------------------
@@ -283,9 +287,13 @@ def _header_problem(data: bytes, magic: bytes, version: int, what: str) -> str |
 # --- the host blob --------------------------------------------------------------------------------
 
 _HOST_BLOB_MAGIC = b"MFHB"
-_HOST_BLOB_VERSION = 1
-# magic, version (1 byte), master key, current store id, count of earlier ids (2 bytes, big-endian)
-_HOST_BLOB_HEAD = struct.Struct(f">4sB{MASTER_KEY_BYTES}s{STORE_ID_BYTES}sH")
+#: Version 2 added the recovery proof. Version 1 had none, and no install holds one, so it is not
+#: read.
+_HOST_BLOB_VERSION = 2
+# magic, version (1 byte), master key, current store id, when the recovery key was last proved
+# (whole seconds since the epoch, 8 bytes; 0 for never), count of earlier ids (2 bytes), all
+# big-endian
+_HOST_BLOB_HEAD = struct.Struct(f">4sB{MASTER_KEY_BYTES}s{STORE_ID_BYTES}sQH")
 #: Far more restores than any store will see, and small enough that a planted count cannot make a
 #: parse allocate much.
 _MAX_EARLIER_STORE_IDS = 4096
@@ -293,14 +301,20 @@ _MAX_EARLIER_STORE_IDS = 4096
 
 @dataclass(frozen=True, slots=True, repr=False)
 class HostBlob:
-    """What the host provider holds: the master key, the current store id, and the earlier ids.
+    """What the host provider holds: the master key, the current store id, the earlier ids, and
+    when the recovery key was last proved.
 
     An earlier id seals nothing new; it is kept to read what was written under it (draft rule 4,
-    *What a restore does*). Its repr names the store ids and redacts the key."""
+    *What a restore does*). ``recovery_proved_at`` is when the recovery key last came back from
+    outside and opened the recovery wrap, in whole seconds since the epoch, or ``None`` for never;
+    a store whose key is unproved runs, and is named as a loosening (draft rule 4). It is held here,
+    in the blob only the engine's account opens, and not in the store's keyring row, which a
+    database writer could set. Its repr names the store ids and the proof and redacts the key."""
 
     master_key: MasterKey
     store_id: StoreId
     earlier_store_ids: tuple[StoreId, ...] = ()
+    recovery_proved_at: int | None = None
 
     def __post_init__(self) -> None:
         # Held as a tuple whatever was passed, so the ids checked below cannot change afterwards.
@@ -314,6 +328,9 @@ class HostBlob:
             raise CustodyError(
                 f"a host blob holds at most {_MAX_EARLIER_STORE_IDS} earlier store ids"
             )
+        proved = self.recovery_proved_at
+        if proved is not None and not 0 < proved < 1 << 63:
+            raise CustodyError("a host blob's recovery proof is a time after the epoch")
 
     def serialize(self) -> bytes:
         head = _HOST_BLOB_HEAD.pack(
@@ -321,13 +338,14 @@ class HostBlob:
             _HOST_BLOB_VERSION,
             self.master_key.material(),
             self.store_id.value,
+            self.recovery_proved_at or 0,
             len(self.earlier_store_ids),
         )
         return head + b"".join(s.value for s in self.earlier_store_ids)
 
     @classmethod
     def parse(cls, data: bytes | bytearray) -> HostBlob:
-        """Read a serialized host blob. Raises :class:`CustodyError` for anything but version 1 in
+        """Read a serialized host blob. Raises :class:`CustodyError` for anything but version 2 in
         exactly its own length. The message never quotes the bytes, and the bytes are dropped from
         this frame before the raise, so a traceback that renders frame locals does not find them."""
         blob, problem = _decode_host_blob(bytes(data))
@@ -339,7 +357,8 @@ class HostBlob:
     def __repr__(self) -> str:
         earlier = ", ".join(s.hex() for s in self.earlier_store_ids)
         return (
-            f"HostBlob(master_key=<redacted>, store_id={self.store_id.hex()}, earlier=[{earlier}])"
+            f"HostBlob(master_key=<redacted>, store_id={self.store_id.hex()}, earlier=[{earlier}], "
+            f"recovery_proved_at={self.recovery_proved_at})"
         )
 
 
@@ -351,7 +370,7 @@ def _decode_host_blob(data: bytes) -> tuple[HostBlob | None, str]:
         return None, problem
     if len(data) < _HOST_BLOB_HEAD.size:
         return None, "the host blob is shorter than its fixed part"
-    _magic, _version, key, store_id, count = _HOST_BLOB_HEAD.unpack_from(data)
+    _magic, _version, key, store_id, proved, count = _HOST_BLOB_HEAD.unpack_from(data)
     if count > _MAX_EARLIER_STORE_IDS:
         return None, f"a host blob holds at most {_MAX_EARLIER_STORE_IDS} earlier store ids"
     if len(data) != _HOST_BLOB_HEAD.size + count * STORE_ID_BYTES:
@@ -361,7 +380,7 @@ def _decode_host_blob(data: bytes) -> tuple[HostBlob | None, str]:
         StoreId(tail[i : i + STORE_ID_BYTES]) for i in range(0, len(tail), STORE_ID_BYTES)
     )
     try:
-        return HostBlob(MasterKey(key), StoreId(store_id), earlier), ""
+        return HostBlob(MasterKey(key), StoreId(store_id), earlier, proved or None), ""
     except CustodyError as exc:
         return None, str(exc)
 
@@ -653,13 +672,15 @@ def _read_posix_checked(path: Path, policy: _PosixPolicy) -> bytes:
     of its own and answer that it has no POSIX list, is refused without being named, and a list
     that is not read is never taken as a list shown absent. Any other POSIX host is refused before
     the file is opened, for the same reason: this engine reads the access control list on Linux
-    only. ``FileNotFoundError`` propagates as it is; every other failure is a
+    only. So is an engine that runs as root or nobody, before the file is opened.
+    ``FileNotFoundError`` propagates as it is; every other failure is a
     :class:`CustodyError`, raised outside any handler."""
     if sys.platform != "linux":
         raise CustodyError(
             f"{path} is refused: a custody file is read on Linux and Windows only, because only "
             "there does this engine read its access control list"
         )
+    _refuse_a_shared_posix_engine_account(f"{path} is refused")
     from messagefoundry.restricted_file import linux_file_system_refusal, posix_access_acl
 
     fd = -1
@@ -857,8 +878,8 @@ def write_host_file(path: Path, blob: HostBlob) -> None:
     access list names SYSTEM, Administrators and the calling account, each with full control. A
     calling account of SYSTEM, LOCAL SERVICE or NETWORK SERVICE is refused before the blob is
     protected (:func:`~messagefoundry.restricted_file.custody_account_problem`), as the read
-    refuses it. Linux: the blob itself, in a file of mode ``0600`` owned by the calling account and
-    carrying no POSIX access control list, one it inherits from its directory's default list
+    refuses it, and so is root or nobody on Linux. Linux: the blob itself, in a file of mode
+    ``0600`` owned by the calling account and carrying no POSIX access control list, one it inherits from its directory's default list
     included (draft rules 3b and 5).
 
     The volume is checked on the still-empty file before a byte is written, as the read checks it:
@@ -877,8 +898,56 @@ def write_host_file(path: Path, blob: HostBlob) -> None:
         _refuse_a_shared_engine_account("the host file was not written")
         data = protect_host_blob(blob)
     else:
+        _refuse_a_shared_posix_engine_account("the host file was not written")
         data = blob.serialize()
     write_restricted_file(path, data, local_volume_only=True)
+
+
+#: The uid most Linux distributions give ``nobody``.
+_NOBODY_UID = 65534
+
+
+def _posix_engine_account_problem(euid: int, name: str | None) -> str | None:
+    """Why a Linux engine running as ``euid`` (account ``name``, ``None`` when it has none) may keep
+    no key custody file, or ``None``. Kept free of I/O so the decision is testable everywhere."""
+    if euid == 0:
+        return (
+            "the engine runs as root, which reaches every file on the host, so a key bound to it "
+            "is bound to no one service; run the engine as its own service user"
+        )
+    if euid == _NOBODY_UID or name == "nobody":
+        return (
+            "the engine runs as nobody, an account many services share; run the engine as its own "
+            "service user"
+        )
+    return None
+
+
+def _refuse_a_shared_posix_engine_account(what: str) -> None:
+    """Linux: raise :class:`CustodyError`, prefixed with ``what``, when this process runs as root
+    or nobody. A no-op elsewhere."""
+    if sys.platform != "linux":
+        return
+    import pwd
+
+    euid = os.geteuid()
+    try:
+        name: str | None = pwd.getpwuid(euid).pw_name
+    except KeyError:  # a uid with no passwd entry, as in some containers
+        name = None
+    problem = _posix_engine_account_problem(euid, name)
+    if problem is not None:
+        raise CustodyError(f"{what}: {problem}")
+
+
+def check_host_writable() -> None:
+    """Raise :class:`CustodyError` when :func:`write_host_file` would refuse this process's
+    account: SYSTEM, LOCAL SERVICE or NETWORK SERVICE on Windows, root or nobody on Linux. So a
+    minting command can ask before it mints anything or shows a recovery key."""
+    if sys.platform == "win32":
+        _refuse_a_shared_engine_account("the host file would not be written")
+    else:
+        _refuse_a_shared_posix_engine_account("the host file would not be written")
 
 
 def _refuse_a_shared_engine_account(what: str) -> None:
@@ -912,7 +981,9 @@ def read_host_file(path: Path) -> HostBlob:
 # --- the handoff blob (Windows) -------------------------------------------------------------------
 
 
-def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> None:
+def write_handoff_file(
+    path: Path, blob: HostBlob, *, service_account: str, enforcing: bool = True
+) -> None:
     """Write the handoff blob: ``blob`` under machine-scope DPAPI, in a NEW file created restricted.
 
     Its access list is the draft's descriptor (rule 5) with DELETE added to the service's entry,
@@ -944,39 +1015,22 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
     is any account that is not ONE account, as ``LookupAccountSidW`` reports it
     (:func:`~messagefoundry.restricted_file.handoff_grantee_problem`): a group or an alias, such as
     Administrators or Backup Operators, a domain, or a SID it maps to nothing, unless that SID has
-    the shape of one service's own SID. A user account and a virtual service account pass.
+    the shape of one service's own SID. A user account and a virtual service account pass. With
+    ``enforcing`` (``[security].enforcement = enforce``, the default here so a caller that does not
+    say is refused), an account that is not local to this host is refused too
+    (:func:`~messagefoundry.restricted_file.custody_non_local_account_problem`): a domain user, a
+    group managed service account or a computer account. Outside ``enforce`` it is written, and
+    the engine names that account as a loosening when it reads its key.
 
     Windows only: raises :class:`~messagefoundry.secrets_dpapi.DpapiUnavailable` elsewhere, because
     a POSIX host needs no handoff."""
     from messagefoundry.restricted_file import write_restricted_file
-    from messagefoundry.secrets_dpapi import DpapiUnavailable, dpapi_protect
+    from messagefoundry.secrets_dpapi import dpapi_protect
 
-    if sys.platform != "win32":
-        raise DpapiUnavailable("the handoff blob is Windows-only; a POSIX host needs no handoff")
+    service_sid = check_handoff_writable(service_account, enforcing=enforcing)
     from messagefoundry.auth.anchor_path import ADMINISTRATORS_SID
-    from messagefoundry.restricted_file import (
-        RestrictedFileError,
-        _administrators_enabled,
-        _lookup_sid_kind,
-        _OwnerRefused,
-        _resolve_sid,
-        handoff_grantee_problem,
-    )
+    from messagefoundry.restricted_file import _OwnerRefused
 
-    service_sid = _resolve_sid(service_account)
-    refused: str | None = None
-    try:
-        refused = handoff_grantee_problem(service_sid, _lookup_sid_kind)
-    except RestrictedFileError as exc:
-        refused = str(exc)
-    if refused is not None:
-        raise CustodyError(f"the handoff was not written for {service_account!r}: {refused}")
-    if not _administrators_enabled():
-        raise CustodyError(
-            "the handoff was not written: it must be owned by Administrators, and this process's "
-            "token does not hold that group enabled (an administrator who is not elevated holds "
-            "it for deny only); run it from an elevated prompt"
-        )
     try:
         # write_restricted_file refuses a grant that resolves to a package SID or a broad group.
         write_restricted_file(
@@ -990,6 +1044,55 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
         )
     except _OwnerRefused as exc:
         raise CustodyError(f"the handoff was not written: {exc}") from exc
+
+
+def check_handoff_writable(service_account: str, *, enforcing: bool = True) -> str:
+    """The SID a handoff for ``service_account`` would grant, once every refusal
+    :func:`write_handoff_file` makes before it protects the blob has passed: the grantee checks and
+    an elevated token. So a minting command can ask before it mints anything or shows a recovery
+    key. Raises :class:`CustodyError` for each refusal, and
+    :class:`~messagefoundry.secrets_dpapi.DpapiUnavailable` off Windows."""
+    from messagefoundry.secrets_dpapi import DpapiUnavailable
+
+    if sys.platform != "win32":
+        raise DpapiUnavailable("the handoff blob is Windows-only; a POSIX host needs no handoff")
+    from messagefoundry.restricted_file import (
+        RestrictedFileError,
+        _administrators_enabled,
+        _lookup_account_name,
+        _lookup_sid_kind,
+        _resolve_sid,
+        custody_non_local_account_problem,
+        handoff_grantee_problem,
+        local_account_domain_sid,
+    )
+
+    refused: str | None = None
+    service_sid = ""
+    try:
+        if service_account.removeprefix("*").upper().startswith("S-1-"):
+            service_sid = _resolve_sid(service_account)
+        else:
+            # A name is resolved without the key-file grant's kind gate, so a name and its SID
+            # literal are judged alike, by handoff_grantee_problem (a gMSA may answer a computer).
+            found = _lookup_account_name(service_account)
+            if found is None:
+                raise RestrictedFileError(f"the account {service_account!r} could not be resolved")
+            service_sid = found[0]
+        refused = handoff_grantee_problem(service_sid, _lookup_sid_kind)
+        if refused is None and enforcing:
+            refused = custody_non_local_account_problem(service_sid, local_account_domain_sid())
+    except RestrictedFileError as exc:
+        refused = str(exc)
+    if refused is not None:
+        raise CustodyError(f"the handoff was not written for {service_account!r}: {refused}")
+    if not _administrators_enabled():
+        raise CustodyError(
+            "the handoff was not written: it must be owned by Administrators, and this process's "
+            "token does not hold that group enabled (an administrator who is not elevated holds "
+            "it for deny only); run it from an elevated prompt"
+        )
+    return service_sid
 
 
 def read_handoff_file(path: Path) -> HostBlob:
@@ -1046,15 +1149,18 @@ def consume_handoff_file(path: Path, convert: Callable[[HostBlob], None]) -> Hos
         except OSError as exc:
             reason = f"could not be deleted through the handle that read it ({_os_reason(exc)})"
     if reason is None:
+        lingering = "its name is still there"
         try:
             os.lstat(path)
         except FileNotFoundError:
             return blob
-        except OSError:
-            pass  # a name still pending its delete answers access denied: it is still there
+        except OSError as exc:
+            # A name still pending its delete answers access denied; any other answer is named, so
+            # an error the check could not read is never taken for a deleted handoff.
+            lingering = f"its name could not be shown gone ({_os_reason(exc)})"
         reason = (
-            "was deleted through the handle that read it, and its name is still there: another "
-            "handle may still hold it, and the name goes when that closes"
+            f"was deleted through the handle that read it, and {lingering}: another handle may "
+            "still hold it, and the name goes when that closes"
         )
     raise HandoffLeftBehind(
         f"{path} was converted, but {reason}; check that it is gone, and delete it if it is not"

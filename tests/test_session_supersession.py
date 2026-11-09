@@ -14,11 +14,13 @@ end. These pin what a route test cannot see:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
@@ -29,6 +31,9 @@ from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.oidc import FederatedPrincipal
 from messagefoundry.auth.service import (
     _LOGOUT_LINEAGE_SECONDS,
+    _LOGOUT_MISS_ROW_WINDOW_SECONDS,
+    _LOGOUT_MISS_ROWS_ALL,
+    _LOGOUT_MISS_ROWS_PER_SOURCE,
     AuthService,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -37,6 +42,7 @@ from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
 from tests._logout_rows import (
     logout_details,
+    logout_entries,
     logout_rows,
     seal_failed_details,
     temp_password_expired_rows,
@@ -611,20 +617,276 @@ async def test_a_logout_ends_the_session_a_rotation_in_flight_re_keyed(
     ]
 
 
-async def test_every_sign_out_that_ends_nothing_writes_its_row(store: MessageStore) -> None:
-    # BACKLOG #3749: no budget drops these rows. A sign-out that presents a token writes its
-    # auth.logout row, so 150 misses from one client with nothing proven write 150 rows. A later
-    # bound on this flood would change this test on purpose; docs/SECURITY.md names the gap.
-    service = await _service(store, session_idle_timeout_minutes=30)
-    count = 150
+# --- BACKLOG #4735, #3749 item 6: the bound on the rows of sign-outs that name no caller and end
+# nothing. It replaces the test that wrote 150 rows for 150 misses (#4735 step 2a). ---
+
+
+_MISS_ROWS = 2 * _LOGOUT_MISS_ROWS_ALL  # room for every row the tests below can write
+_SERVICE_LOG = "messagefoundry.auth.service"
+
+
+@pytest.fixture
+def miss_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The bound's monotonic clock, frozen, so every miss of a test lands in one window however
+    slow the runner; a test steps it by adding to the one item."""
+    clock = [time.monotonic()]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    return clock
+
+
+async def _misses(service: AuthService, count: int, client: str | None) -> None:
+    """``count`` sign-outs from ``client`` that name no caller and end nothing."""
     for n in range(count):
-        assert (
-            await service.logout(f"no-such-token-{n}", client="203.0.113.9", proven_at=None)
-            == "nothing_to_revoke"
+        token = f"no-such-token-{client}-{n}-{uuid4().hex}"
+        assert await service.logout(token, client=client, proven_at=None) == "nothing_to_revoke"
+
+
+async def _own_miss_rows(store: MessageStore) -> list[object]:
+    """The client address of each ``nothing_to_revoke`` row a miss wrote for itself, newest first."""
+    return [
+        client
+        for _, client, detail in await logout_entries(store, limit=_MISS_ROWS)
+        if detail.get("outcome") == "nothing_to_revoke"
+    ]
+
+
+async def _counted(store: MessageStore) -> list[tuple[object, object, object]]:
+    """Each count row, oldest first, as its actor, client address and ``count``."""
+    entries = await logout_entries(store, limit=_MISS_ROWS)
+    return [
+        (actor, client, detail.get("count"))
+        for actor, client, detail in reversed(entries)
+        if detail.get("outcome") == "unrecorded"
+    ]
+
+
+async def test_a_source_writes_its_share_of_miss_rows_and_its_next_miss_is_counted(
+    store: MessageStore, miss_clock: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    """RED when: a source's share is not the stated one, or a miss past it is dropped uncounted,
+    or its count row raises no WARNING line giving the same count."""
+    service = await _service(store)
+
+    def _warnings() -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "messagefoundry.auth.service" and r.levelno == logging.WARNING
+        ]
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+        await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, "203.0.113.9")
+        # CONTROL: at its share, every miss wrote its own row, and nothing was counted.
+        assert await _own_miss_rows(store) == ["203.0.113.9"] * _LOGOUT_MISS_ROWS_PER_SOURCE
+        assert await _counted(store) == []
+        assert _warnings() == []
+        await _misses(service, 1, "203.0.113.9")
+    assert len(await _own_miss_rows(store)) == _LOGOUT_MISS_ROWS_PER_SOURCE
+    assert await _counted(store) == [(None, None, 1)], "the first miss past the bound was dropped"
+    assert _warnings() == [
+        "1 sign-outs that ended nothing went past the audit bound; one auth.logout row counts them"
+    ]
+
+
+async def test_ten_flooding_sources_and_the_unaddressed_leave_another_source_its_rows(
+    store: MessageStore, miss_clock: list[float]
+) -> None:
+    """RED when: a set of sources, the hold's ten addresses among them, or callers with no address,
+    can spend the rows of a source that has not flooded (BACKLOG #4735 step 1 (b))."""
+    service = await _service(store)
+    flooders = [f"198.51.100.{n}" for n in range(1, 11)]
+    for address in flooders:
+        await _misses(service, 2 * _LOGOUT_MISS_ROWS_PER_SOURCE, address)
+    await _misses(service, 2 * _LOGOUT_MISS_ROWS_PER_SOURCE, None)
+    flooded = await _own_miss_rows(store)
+    assert len(flooded) == (len(flooders) + 1) * _LOGOUT_MISS_ROWS_PER_SOURCE
+    assert flooded.count(None) == _LOGOUT_MISS_ROWS_PER_SOURCE, "no address is one shared source"
+    await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, "192.0.2.77")
+    rows = await _own_miss_rows(store)
+    assert rows.count("192.0.2.77") == _LOGOUT_MISS_ROWS_PER_SOURCE, "a flood silenced a source"
+
+
+async def test_a_flood_from_many_sources_stops_at_the_aggregate_and_is_counted(
+    store: MessageStore, miss_clock: list[float]
+) -> None:
+    """RED when: misses spread over many sources grow the rows past the stated aggregate, the
+    aggregate fires before it is reached, or a miss past it leaves no count (step 1 (a))."""
+    service = await _service(store)
+    sources = [
+        f"2001:db8::{n:x}" for n in range(_LOGOUT_MISS_ROWS_ALL // _LOGOUT_MISS_ROWS_PER_SOURCE)
+    ]
+    for address in sources:
+        await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, address)
+    # CONTROL: at the aggregate exactly, every miss wrote its own row and none was counted.
+    assert len(await _own_miss_rows(store)) == _LOGOUT_MISS_ROWS_ALL
+    assert await _counted(store) == []
+    await _misses(service, 3, "192.0.2.80")
+    assert len(await _own_miss_rows(store)) == _LOGOUT_MISS_ROWS_ALL
+    # The first miss past it is counted at once; the rest wait for the window to pass.
+    assert [n for _, _, n in await _counted(store)] == [1]
+    miss_clock[0] += _LOGOUT_MISS_ROW_WINDOW_SECONDS + 1
+    await _misses(service, 1, "192.0.2.81")
+    counts = [n for _, _, n in await _counted(store)]
+    assert counts == [1, 2], "the misses past the bound were not all counted"
+    assert (await _own_miss_rows(store))[0] == "192.0.2.81", "a new window wrote no row"
+
+
+async def test_a_cancelled_count_row_keeps_its_count_for_the_next_one(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, miss_clock: list[float]
+) -> None:
+    """RED when: a count row whose write is cancelled loses its count, which no ERROR line logs."""
+    service = await _service(store)
+    real = service._audit
+
+    async def _cancel_count(
+        action: str,
+        *,
+        actor: str | None = None,
+        detail: str | None = None,
+        client: str | None = None,
+    ) -> None:
+        if '"unrecorded"' in str(detail):
+            raise asyncio.CancelledError
+        await real(action, actor=actor, detail=detail, client=client)
+
+    await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, "203.0.113.9")
+    monkeypatch.setattr(service, "_audit", _cancel_count)
+    with pytest.raises(asyncio.CancelledError):
+        await _misses(service, 1, "203.0.113.9")
+    monkeypatch.setattr(service, "_audit", real)
+    miss_clock[0] += _LOGOUT_MISS_ROW_WINDOW_SECONDS + 1
+    # Admitted misses only, so the one count row can only be the cancelled row's 1.
+    await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, "203.0.113.9")
+    assert [n for _, _, n in await _counted(store)] == [1]
+
+
+async def test_a_sign_out_that_names_its_caller_is_never_bounded(
+    store: MessageStore, miss_clock: list[float]
+) -> None:
+    """RED when: the bound drops a row of a sign-out that names its caller, as POST /auth/logout
+    does, or such sign-outs charge the caller-less budget. Every such sign-out writes its row, so
+    concurrent calls on one token write one each, kept on purpose (step 2)."""
+    service = await _service(store)
+    count = _LOGOUT_MISS_ROWS_ALL + 5
+    for n in range(count):
+        outcome = await service.logout(
+            f"no-such-token-{n}", client="203.0.113.9", proven_at=None, actor="op"
         )
+        assert outcome == "nothing_to_revoke"
     rows = await logout_rows(store, limit=count * 2)
-    assert len(rows) == count, "a sign-out that ended nothing wrote no row"
-    assert set(rows) == {(None, "203.0.113.9", "nothing_to_revoke")}
+    assert rows == [("op", "203.0.113.9", "nothing_to_revoke")] * count
+    assert await _counted(store) == []
+    # The budget is untouched: a caller-less miss from the same address still writes its row.
+    await _misses(service, 1, "203.0.113.9")
+    assert (await logout_rows(store, limit=1)) == [(None, "203.0.113.9", "nothing_to_revoke")]
+
+
+async def test_a_sign_out_that_ends_a_session_is_audited_past_the_bound(
+    store: MessageStore, miss_clock: list[float]
+) -> None:
+    """RED when: a spent bound costs a sign-out that ended a session its row."""
+    service = await _service(store)
+    token = await _token(service)
+    await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE + 1, "203.0.113.9")
+    for n in range(_LOGOUT_MISS_ROWS_ALL // _LOGOUT_MISS_ROWS_PER_SOURCE):
+        await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, f"198.51.100.{n}")
+    # CONTROL: the bound is spent, so a fresh source's miss writes no row of its own.
+    await _misses(service, 1, "192.0.2.90")
+    assert "192.0.2.90" not in await _own_miss_rows(store)
+    assert await service.logout(token, client="203.0.113.9", proven_at=None) == "revoked"
+    assert (await logout_rows(store, limit=_MISS_ROWS))[0] == ("op", "203.0.113.9", "revoked")
+
+
+async def test_a_refusing_audit_store_logs_at_most_one_error_line_per_bounded_row(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    miss_clock: list[float],
+) -> None:
+    """RED when: with the audit store refusing writes, a flood of misses logs an ERROR line per
+    request past the bound (#4735 step 3, the QA comment's critic note 4)."""
+    service = await _service(store)
+
+    async def _refuse(*_: object, **__: object) -> None:
+        raise RuntimeError("audit store refused the write")
+
+    monkeypatch.setattr(service, "_audit", _refuse)
+    sources = _LOGOUT_MISS_ROWS_ALL // _LOGOUT_MISS_ROWS_PER_SOURCE + 10
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+        for n in range(sources):
+            await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, f"2001:db8::{n:x}")
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    # Each row the bound admits, plus the one count row its first refusal writes.
+    assert len(errors) == _LOGOUT_MISS_ROWS_ALL + 1
+    assert errors[-1].startswith("1 sign-outs that ended nothing went past the audit bound")
+
+
+async def test_a_refused_count_row_keeps_its_count_and_names_no_row_it_did_not_write(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    miss_clock: list[float],
+) -> None:
+    """RED when: a count row the store refuses loses its count, or its WARNING line still says a
+    row counts the misses (round-3 findings 2 and 3 on BACKLOG #4735)."""
+    service = await _service(store)
+    real = service._audit
+
+    async def _refuse_count(
+        action: str,
+        *,
+        actor: str | None = None,
+        detail: str | None = None,
+        client: str | None = None,
+    ) -> None:
+        if '"unrecorded"' in str(detail):
+            raise RuntimeError("audit store refused the write")
+        await real(action, actor=actor, detail=detail, client=client)
+
+    await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, "203.0.113.9")
+    monkeypatch.setattr(service, "_audit", _refuse_count)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+        await _misses(service, 1, "203.0.113.9")
+    assert not [
+        r for r in caplog.records if r.name == _SERVICE_LOG and r.levelno == logging.WARNING
+    ], "a WARNING line named a count row that was never written"
+    monkeypatch.setattr(service, "_audit", real)
+    miss_clock[0] += _LOGOUT_MISS_ROW_WINDOW_SECONDS + 1
+    # Admitted misses only, so the one count row can only be the refused row's 1.
+    await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, "203.0.113.9")
+    assert [n for _, _, n in await _counted(store)] == [1]
+
+
+async def test_a_sign_out_reads_the_owner_of_the_session_it_ended_once(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sign-out, and a sign-in's supersession, each read the owner of the session it ended once,
+    and the row names that owner. A pin, not a fix: both already did so before BACKLOG #4771 item
+    18 asked for one owner lookup, so this test was green before it was written."""
+    service = await _service(store, session_idle_timeout_minutes=30)
+    owner = await store.get_user_by_username("op")
+    assert owner is not None
+    reads: list[str] = []
+    real = service._load_user
+
+    async def _counting(user_id: str) -> object:
+        reads.append(user_id)
+        return await real(user_id)
+
+    token = await _token(service)
+    monkeypatch.setattr(service, "_load_user", _counting)
+    assert await service.logout(token, client=None, proven_at=None) == "revoked"
+    assert reads.count(owner.id) == 1
+    assert (await logout_rows(store))[0] == ("op", None, "revoked")
+    monkeypatch.setattr(service, "_load_user", real)
+    prior = await _token(service)
+    monkeypatch.setattr(service, "_load_user", _counting)
+    reads.clear()
+    await service._supersede_session_hash(hash_token(prior), client=None)
+    assert reads.count(owner.id) == 1
+    assert (await _superseded(store))[0]["actor"] == "op"
 
 
 # --- BACKLOG #3749: a session the gate would refuse is not recorded as the end of a live one ---
