@@ -1103,6 +1103,22 @@ async def test_concurrent_admin_removals_leave_one(store) -> None:
     await assert_concurrent_removals_leave_one(store)
 
 
+async def test_role_write_if_held_contract(store) -> None:
+    """Vault BACKLOG #3085 on Postgres: the reconciler's compare-and-set role write writes only
+    while the record holds the set the caller read."""
+    from tests._role_write_if_held_contract import assert_role_write_if_held_contract
+
+    await assert_role_write_if_held_contract(store)
+
+
+async def test_concurrent_role_writes_from_one_read_write_once(store) -> None:
+    """Vault BACKLOG #3085 on Postgres: two writes from one read on two pooled connections, at once.
+    The ``FOR UPDATE`` read serializes them; one writes."""
+    from tests._role_write_if_held_contract import assert_concurrent_role_writes_write_once
+
+    await assert_concurrent_role_writes_write_once(store)
+
+
 async def test_first_admin_grant_contract(store) -> None:
     """BACKLOG #3078 on Postgres: the first-administrator grant refuses while another enabled
     administrator exists, and over credentials the caller did not write."""
@@ -1119,6 +1135,15 @@ async def test_first_admin_grant_counts_only_a_local_administrator_that_signs_in
     )
 
     await assert_grant_counts_only_a_local_administrator_that_signs_in(store)
+
+
+async def test_first_admin_grant_refuses_a_row_holding_a_passkey(store) -> None:
+    """BACKLOG #3078 F2 on Postgres: the grant's refusal rolls its role write back."""
+    from tests._first_admin_grant_store_contract import (
+        assert_grant_refuses_a_row_holding_a_passkey,
+    )
+
+    await assert_grant_refuses_a_row_holding_a_passkey(store)
 
 
 async def test_concurrent_first_admin_grants_leave_one(store) -> None:
@@ -1157,6 +1182,13 @@ async def test_webauthn_store_contract(store) -> None:
     from tests._webauthn_store_contract import _assert_webauthn_store_contract
 
     await _assert_webauthn_store_contract(store)
+
+
+async def test_a_session_for_a_missing_account_is_refused(store) -> None:
+    """BACKLOG #2733 on Postgres: the session's user foreign key, as on SQLite and SQL Server."""
+    from tests._webauthn_store_contract import assert_a_session_for_a_missing_account_is_refused
+
+    await assert_a_session_for_a_missing_account_is_refused(store)
 
 
 async def test_webauthn_conditional_bind_contract(store) -> None:

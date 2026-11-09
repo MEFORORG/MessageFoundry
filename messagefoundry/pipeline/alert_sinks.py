@@ -1522,7 +1522,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # ADR 0079 mechanism 2: the mass-revoke breaker tripped and the pass applied nothing, or one
         # or more probes were referred (BACKLOG #2538), refused for the configuration (BACKLOG
         # #3010) or faulted (BACKLOG #3100) and left unjudged, or the directory stayed unreachable
-        # for a run of passes (BACKLOG #3709); `reason` tells which. The
+        # for a run of passes (BACKLOG #3709), or one account's probe kept failing to reach it
+        # (BACKLOG #3100); at least those, and `reason` tells which. The
         # fixed source label keys the throttle, so a standing misconfiguration that trips every pass
         # pages once per cooldown rather than once per pass. `detail` is the latched operator explanation,
         # and it is what the instance's reason column shows (detail wins over reason there).

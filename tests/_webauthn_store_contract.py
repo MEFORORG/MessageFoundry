@@ -278,8 +278,9 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
     )
 
     # Sign-count CAS (the consume_totp_step precedent), answered by the one locked write (BACKLOG
-    # #3774): "moved" iff stored == expected; "mismatch" when the passkey exists with another count
-    # (the clone signal), which writes nothing; "gone" when there is no such passkey. 0->0 (synced
+    # #3774): "moved" iff stored == expected; "mismatch" when the passkey exists with another count,
+    # which writes nothing; "gone" when there is no such passkey. The service treats both misses as
+    # a clone signal (ADR 0068 decision 4, amendment of 2026-10-17). 0->0 (synced
     # passkey) succeeds repeatedly and stays 0; last_used_at is stamped.
     assert await store.update_webauthn_sign_count("h1", expected=5, new=6, used_at=60.0) == "moved"
     assert (
@@ -325,6 +326,18 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
         "a passkey for an account that does not exist",
     )
     assert await store.get_webauthn_credential("h-orphan") is None
+
+
+async def assert_a_session_for_a_missing_account_is_refused(store: Any) -> None:
+    """BACKLOG #2733, pass F: the session's user foreign key, beside the passkey's above. SQL Server
+    lacked it, so a sign-in there committed a session for an account that does not exist, where
+    SQLite and Postgres refused it. Kept here, with the passkey case, so the three suites that run
+    this module run both."""
+    await _assert_integrity_refused(
+        store.create_session(token_hash="o" * 64, user_id="no-such-account", expires_at=9e9),
+        "a session for an account that does not exist",
+    )
+    assert await store.get_session("o" * 64) is None
 
 
 async def _assert_totp_contract(store: Any) -> None:

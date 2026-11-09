@@ -215,7 +215,7 @@ pytest==9.2.0 ; (python_full_version < '3.15' and platform_python_implementation
     #   pytest-rerunfailures
     #   pytest-timeout
     #   pytest-xdist
-pytest-asyncio==1.4.1 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
+pytest-asyncio==1.4.1.post1 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
     # via messagefoundry
 pytest-rerunfailures==16.7 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
     # via messagefoundry
@@ -225,7 +225,7 @@ pytest-xdist==3.8.0 ; (python_full_version < '3.15' and platform_python_implemen
     # via messagefoundry
 python-dateutil==2.9.0.post0 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
     # via fhirpathpy
-pyx12==4.0.0 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
+pyx12==4.0.1 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
     # via messagefoundry
 pyyaml==6.0.3 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
     # via messagefoundry

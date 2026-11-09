@@ -305,6 +305,7 @@ from messagefoundry.auth.reconcile import (
     PAGING_DEADLINE,
     PROBE_FAULT_ABORT,
     REFERRAL_ABORT,
+    UNREACHED_ACCOUNT,
     ReconcilePlan,
 )
 from messagefoundry.auth.service import (
@@ -11333,6 +11334,22 @@ _PAGING_REFUSAL_TEXT: Final[Mapping[str, str]] = {
     PAGING_DEADLINE: "past [auth].ad_group_search_deadline",
     PAGING_CAP: "past the engine's cap on groups or pages",
 }
+#: The source label prefix of a lasting unreachable account's ``ad_reconcile_aborted`` instance
+#: (BACKLOG #3100 closing step 2), keyed on the account as a paging refusal's is, for the same
+#: reason.
+_UNREACHED_ALERT_SOURCE = "directory-reconciler-unreached"
+#: What it tells the operator. Short, and the consequence first, for the store's 200 characters.
+_UNREACHED_ALERT_TEXT: Final[str] = (
+    "This account's sessions are not revoked: {probes} of its directory probes running failed to "
+    "reach the directory. Check its entry, and any outage, referral or configuration alert."
+)
+#: What one page for many such accounts says, where more than five stand unreachable at once
+#: (``AuthService._note_unreached_accounts``), so a flapping directory opens one instance rather
+#: than one per signed-in account.
+_UNREACHED_ROLLUP_TEXT: Final[str] = (
+    "{accounts} accounts' sessions are not revoked: their directory probes failed {probes} passes "
+    "running. Check the directory and the path to it; audit rows name each account."
+)
 
 
 def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSink) -> None:
@@ -11390,19 +11407,20 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     referred, refused or raise a fault.
 
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
-    held, aborted, skipped, referred, misconfigured, faulted or unkeyed-binding row no longer ends
-    the pass (BACKLOG #2137): the service logs it at ERROR and returns the plan, so these alerts
-    still fire. Since BACKLOG #3018 the same holds for a revocation's own ``auth.ad_session_revoked``
-    row and a rename's rows. A pass that still raises part-way, such as on a store fault ending one
-    account's sessions, returns no plan, so no alert is raised for the revocations it applied before
-    that point. Their rows stand, except a row that was refused: that account has neither its row
-    nor its alert. ``AuthService._audit_reconciler_row`` says which errors are soft.
+    held, aborted, skipped, referred, misconfigured, faulted, unreached or unkeyed-binding row no
+    longer ends the pass (BACKLOG #2137): the service logs it at ERROR and returns the plan, so
+    these alerts still fire. Since BACKLOG #3018 the same holds for a revocation's own
+    ``auth.ad_session_revoked`` row and a rename's rows. A pass that still raises part-way, such as
+    on a store fault ending one account's sessions, returns no plan, so no alert is raised for the
+    revocations it applied before that point. Their rows stand, except a row that was refused: that
+    account has neither its row nor its alert. ``AuthService._audit_reconciler_row`` says which
+    errors are soft.
 
-    Each standing alert but the probe fault's, the configuration refusal's and a paging refusal's
-    also gets its inverse, which pages nobody and resolves the open instance (BACKLOG #2136):
-    ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
-    ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance, and
-    under the outage's source for the outage's (BACKLOG #3709). The
+    Each standing alert but at least the probe fault's, the configuration refusal's, a paging
+    refusal's and an unreached account's (BACKLOG #3100) also gets its inverse, which pages nobody
+    and resolves the open instance (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and
+    ``ad_reconcile_hold_released``, and ``ad_reconcile_breaker_cleared`` under the referral's source
+    for the referral's instance, and under the outage's source for the outage's (BACKLOG #3709). The
     auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,
     ``plan.hold_clear``, ``plan.referral_clear``, ``plan.outage_clear``; see
     ``AuthService._mark_reconcile_clears`` and ``AuthService._note_directory_outage``), so
@@ -11416,6 +11434,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         # A paging refusal is not the outage, so an outage-shaped pass still pages for it (vault
         # BACKLOG #3696). An outage applies no revocation, so nothing here pages ahead of it.
         _alert_paging_refusals(plan, sink)
+        # BACKLOG #3100: an account can enter on an outage-shaped pass, one whose probe sample
+        # held only unreachable accounts, unless the lasting outage page is raised or stands.
+        _alert_unreached_accounts(plan, sink)
         if plan.outage_page:
             # BACKLOG #3709. After the paging refusals, which page once per account, so a sink that
             # raises here cannot cost one.
@@ -11441,6 +11462,7 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     # After the breaker and the revocations, which do not recur either, and before the referral,
     # the fault and the hold, which page again on the next pass (vault BACKLOG #3696).
     _alert_paging_refusals(plan, sink)
+    _alert_unreached_accounts(plan, sink)  # BACKLOG #3100 closing step 2, the same way
     if plan.referred:
         # BACKLOG #2538. After the breaker and the revocations, matching the service's order.
         sink.ad_reconcile_aborted(
@@ -11506,6 +11528,33 @@ def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
                 "Directory role and scope changes do not reach this account's sessions: its group "
                 f"search was refused, {what}. A disable or deletion still revokes them."
             ),
+        )
+
+
+def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
+    """Page each account that has just entered the lasting unreachable state (BACKLOG #3100
+    closing step 2; ``AuthService._note_unreached_accounts`` says when one enters). Its probe
+    failed to reach the directory on that many of its passes running, so the
+    reconciler has neither struck nor revoked it. Once per entry, like a paging refusal, and with
+    no inverse: an operator resolves it. The account name is in the source only, as for a paging
+    refusal. On a rolled-up pass (``plan.unreached_rollup``), one page under the bare source covers
+    those entering, naming none."""
+    if plan.unreached_rollup:
+        sink.ad_reconcile_aborted(
+            _UNREACHED_ALERT_SOURCE,
+            reason=UNREACHED_ACCOUNT,
+            probed=plan.asked,
+            detail=_UNREACHED_ROLLUP_TEXT.format(
+                accounts=len(plan.unreached), probes=min(n for _u, _n, n in plan.unreached)
+            ),
+        )
+        return
+    for _user_id, username, probes in plan.unreached:
+        sink.ad_reconcile_aborted(
+            f"{_UNREACHED_ALERT_SOURCE}:{username}",
+            reason=UNREACHED_ACCOUNT,
+            probed=plan.asked,
+            detail=_UNREACHED_ALERT_TEXT.format(probes=probes),
         )
 
 
