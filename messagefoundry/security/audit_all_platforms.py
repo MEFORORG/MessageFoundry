@@ -41,7 +41,8 @@ WHAT IT DOES, in order, exiting with the first non-zero status:
    requirement's first word that starts with ``-`` to its option parser, so a ``--hash`` on the
    requirement's own line, after its marker, is an option and stays; then it splits off the marker
    at the first ``;``, in a ``name @ <url>`` requirement too, and at the first ``; `` after a bare
-   URL. (pip refuses a ``name @ <url>`` whose URL holds a ``;``.)
+   URL whose scheme pip's ``is_url`` takes, which a bare ``git:`` or ``svn:`` is not. (pip refuses
+   a ``name @ <url>`` whose URL holds a ``;``.)
 3. ``pip-audit -r <copy> --desc --disable-pip --strict`` plus any extra arguments (``--ignore-vuln
    <ID>`` for a triaged advisory, which therefore goes AFTER the lock).
 

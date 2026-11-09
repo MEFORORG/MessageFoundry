@@ -25,6 +25,7 @@ import pytest
 
 from messagefoundry.childenv import python_module_argv
 from messagefoundry.security.audit_all_platforms import (
+    _URL_SCHEMES,
     PUBLISHED_DISTRIBUTIONS,
     _run,
     _skip_private_refusal,
@@ -474,6 +475,18 @@ def test_a_bare_vcs_scheme_is_no_url_so_its_marker_is_stripped(
     assert (status, copies) == (0, [[f"{url} {digest}", f"bar==2 {digest}"]])
     assert "2 pinned requirements audited, 1 un-gated" in out
     assert f"  {url} ; sys_platform=='zz'\n" in out
+
+
+def test_the_url_schemes_are_the_parsers() -> None:
+    """The set is pip-requirements-parser 32.0.1's ``is_url`` list, copied here as that file writes
+    it (pip 26.3's ``vcs.all_schemes`` holds the same 22), so a drift in the module's table shows."""
+    vcs_all_schemes = [
+        "bzr+http", "bzr+https", "bzr+ssh", "bzr+sftp", "bzr+ftp", "bzr+lp", "bzr+file",
+        "git+http", "git+https", "git+ssh", "git+git", "git+file",
+        "hg+file", "hg+http", "hg+https", "hg+ssh", "hg+static-http",
+        "svn+ssh", "svn+http", "svn+https", "svn+svn", "svn+file",
+    ]  # fmt: skip
+    assert frozenset(["http", "https", "file", "ftp", *vcs_all_schemes]) == _URL_SCHEMES
 
 
 @pytest.mark.parametrize(
