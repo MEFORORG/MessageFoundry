@@ -1007,9 +1007,10 @@ def ws_accept_allowed(scope: Mapping[str, Any]) -> bool:
         return answer is True
     route = scope.get("route")
     if route is not None and route_has_gate(route):
-        # The gate dependency ran before the body. If it returned, it admitted the caller. If it
-        # refused, it raised, so the body never ran and no accept follows: the denial response
-        # Starlette sends for that raise is the gate's own refusal, and passes here.
+        # The gate dependency ran before the body and recorded nothing. If it returned, it admitted
+        # the caller. If it refused, it raised, so the body never ran and no accept follows: the
+        # denial response Starlette sends for that raise is the gate's own refusal, and passes
+        # here. A dependency that recorded a refusal before raising is refused above instead.
         return True
     # A public mark is the only declaration left. An in-body mark is not enough. FastAPI's router
     # sets no route for a plain Starlette WebSocket route, so the scope's own endpoint is read then.

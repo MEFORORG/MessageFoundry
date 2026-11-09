@@ -500,19 +500,16 @@ async def test_a_recorded_refusal_stands_on_a_public_socket(
 
 
 async def test_a_gate_dependencys_own_denial_passes(engine: Engine) -> None:
-    """A gate dependency that refuses raises before the body runs, so the denial Starlette sends
-    for the raise is the gate's own answer: it goes out as sent, and nothing is accepted."""
+    """A gate dependency that refuses by raising, with no answer recorded, stops before the body
+    runs, so the denial Starlette sends for the raise is the gate's own answer: it goes out as
+    sent, and nothing is accepted."""
     peer = _Peer(
         _planted(engine, None, _Outcome()), "/zz/dependency-refuses", None, denial_extension=True
     )
     await peer.run()
     assert _ACCEPT not in peer.kinds, peer.sent
-    start = peer.sent[0]
-    assert start["type"] == "websocket.http.response.start" and start["status"] == 403, peer.sent
-    assert any(
-        m["type"] == "websocket.http.response.body" and b"synthetic refusal" in m.get("body", b"")
-        for m in peer.sent
-    ), peer.sent
+    start, body = _denial_start_and_body(peer)
+    assert start["status"] == 403 and b"synthetic refusal" in body, peer.sent
 
 
 async def test_the_cookie_gate_leaves_a_native_clients_admission_standing(engine: Engine) -> None:
