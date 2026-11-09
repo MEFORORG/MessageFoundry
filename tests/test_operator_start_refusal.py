@@ -518,6 +518,24 @@ async def test_a_build_the_pool_queued_before_it_failed_to_start_a_thread_is_bui
     assert runs == [answer]
 
 
+async def test_a_refusal_the_on_loop_build_raises_does_not_chain_the_executor_fault() -> None:
+    """A build made on the loop after a refused submit raises its own refusal with no context, so
+    its traceback never reads as if the executor caused the config refusal."""
+    loop = asyncio.get_running_loop()
+
+    def refuse_submit(_executor: Any, _fn: Callable[[], object], *_args: Any) -> Any:
+        raise RuntimeError("can't start new thread")
+
+    def build() -> object:
+        raise WiringError("the build's own refusal")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(loop, "run_in_executor", refuse_submit)
+        with pytest.raises(WiringError) as raised:
+            await wiring_runner._build_off_loop(None, build)
+    assert raised.value.__context__ is None
+
+
 @pytest.mark.parametrize("outcome", ["built", "refused"])
 async def test_a_build_a_worker_took_before_the_pool_failed_to_start_a_thread_is_its_own_answer(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, outcome: str

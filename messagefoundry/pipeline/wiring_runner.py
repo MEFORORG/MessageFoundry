@@ -3765,10 +3765,18 @@ class RegistryRunner:
         """:meth:`build_test_connector` for a caller on the event loop: the configuration is
         resolved here, on the loop, and only the build runs in a worker thread
         (:func:`_build_off_loop`), since a build can list folders and read files (engine PR 2815,
-        hold F2). Raises as that method does. A build the executor never began runs on the loop
-        instead, so an executor fault never fails a test (Lander hold 6730392844, item 3)."""
+        hold F2). Raises as that method does: anything else that reaches here, which the build's
+        own normaliser never saw, is a :class:`WiringError` too, so the route's ``except
+        WiringError`` stays exhaustive and records it as a refused build (Lander hold 6703229134,
+        item 2). A build the executor never began runs on the loop instead (Lander hold
+        6730392844, item 3)."""
         direction, build = self._test_connector_build(name)
-        return direction, await _build_off_loop(self._hop_posture, build)
+        try:
+            return direction, await _build_off_loop(self._hop_posture, build)
+        except WiringError:
+            raise
+        except Exception as exc:
+            raise WiringError(f"connector build failed: {exc}") from exc
 
     def _test_connector_build(
         self, name: str
@@ -12586,8 +12594,8 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
     A build the executor never began, because it refused the work at submit (shut down, a broken
     pool, or no thread it could start) or cancelled or failed it while queued, runs on the loop
     instead, as every build did before builds left the loop, with a WARNING naming the cause. So
-    an executor fault never leaves a connector unbuilt, intake down included (Lander hold
-    6730392844, item 3). ``run()`` never began there, so nothing is built twice. A build the pool
+    an executor fault at this hop never leaves a connector unbuilt (Lander hold 6730392844, item
+    3); another worker-thread hop, such as a lane's anchor check, has no such fallback. ``run()`` never began there, so nothing is built twice. A build the pool
     queued before it failed to start a thread is cancelled first, or, if a worker already took it,
     awaited, and its own result or refusal is the answer. A build that began and then failed
     raises its own error."""
@@ -12632,19 +12640,25 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
         queued = loop.run_in_executor(None, run)
     except RuntimeError as exc:  # the executor was shut down, or its pool is broken
         # A pool can queue the work item and then fail to start a thread for it, so a later
-        # dequeue must find the build cancelled and build nothing, since it is built here.
-        if built.cancel():
+        # dequeue must find the build cancelled and build nothing, since it is built below.
+        refused = built.cancel()
+        if refused:
             _log_build_on_loop(safe_exc(exc))
-            return context.run(stamped)
-        # A worker already took it, so the build's own outcome is the answer, awaited below
-        # (Lander hold 6704342060, item 2). The fault is logged, since nothing else reports it.
-        log.warning(
-            "the executor failed after a worker took a connector build; the build's own outcome "
-            "stands: %s",
-            safe_exc(exc),
-        )
+        else:
+            # A worker already took it, so the build's own outcome is the answer, awaited below
+            # (Lander hold 6704342060, item 2). The fault is logged, since nothing else reports it.
+            log.warning(
+                "the executor failed after a worker took a connector build; the build's own "
+                "outcome stands: %s",
+                safe_exc(exc),
+            )
     else:
+        refused = False
         queued.add_done_callback(settle)
+    if refused:
+        # Outside the handler, so a refusal the build raises does not carry the executor's fault
+        # as its context into the tracebacks that log it.
+        return context.run(stamped)
     try:
         # Not shielded: a cancelled caller cancels this wrapper, which cancels a build still queued.
         return await asyncio.wrap_future(built, loop=loop)

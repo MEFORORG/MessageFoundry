@@ -1181,7 +1181,8 @@ _WALKS_BEYOND_SPELLING = sys.platform == "win32"
 #: How many entries of an ``sslcapath`` folder :func:`_capath_entries_leave_host` judges. A folder
 #: holding more is refused rather than judged in part, which bounds the time a build or a lane
 #: check spends listing it. A serving engine builds a connector, and runs the lane check, in a
-#: worker thread, never on the event loop (``pipeline.wiring_runner``; engine PR 2815, hold F2). A
+#: worker thread (``pipeline.wiring_runner``; engine PR 2815, hold F2), and builds on the event loop
+#: only a connector the executor never began, where the bound also bounds the loop's stall. A
 #: CA folder holds a few hundred at most (one file and one link per CA), and each entry that is not
 #: a link costs one ``lstat`` (:func:`_capath_entry_clear`).
 _MAX_CAPATH_ENTRIES = 4096
@@ -1371,8 +1372,8 @@ def _refuse_weak_driver_wrap(
 #: How much of an ``sslca``, ``sslcert`` or ``sslkey`` file :func:`_read_driver_file` reads: 1 MiB,
 #: the cap :mod:`messagefoundry.keywrap` puts on a key file (vault BACKLOG #3090, step 8). A CA
 #: bundle is tens or hundreds of KiB, and a client certificate with its key a few KiB. The read
-#: runs when the connection is built, in a worker thread on a serving engine, so the cap bounds
-#: that stall too.
+#: runs when the connection is built, in a worker thread on a serving engine, or on its event
+#: loop when the executor never began the build, so the cap bounds that stall too.
 _MAX_DRIVER_CA_FILE_BYTES = 1 << 20
 #: ``ERROR_INVALID_NAME``: Windows' answer for a path it cannot spell, such as one with a leading
 #: space before the drive letter.

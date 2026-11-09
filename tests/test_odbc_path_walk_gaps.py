@@ -739,7 +739,8 @@ def _not_found_at_open(monkeypatch: pytest.MonkeyPatch, folder: Path, winerror: 
 
     def not_found(path: str) -> Any:
         if os.fspath(path) == str(folder):
-            exc = FileNotFoundError(2, "not found at open")
+            # With the path, as a real scandir error carries it, so the leak check can fail.
+            exc = FileNotFoundError(2, "not found at open", str(folder))
             if winerror is not None:
                 exc.winerror = winerror  # type: ignore[attr-defined]
             raise exc
