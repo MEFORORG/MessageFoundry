@@ -79,6 +79,7 @@ from typing import (
     TypedDict,
     assert_never,
     cast,
+    overload,
     runtime_checkable,
 )
 from uuid import uuid4
@@ -3236,11 +3237,27 @@ def log_unopened_totp(user_id: str) -> None:
     )
 
 
+@overload
+async def judge_totp(
+    opener: Callable[[str, str | None], str | None],
+    usable: TotpUsable,
+    user: UserRecord | None,
+) -> TotpJudgement: ...
+
+
+@overload
 async def judge_totp(
     opener: Callable[[str, str | None], str | None],
     usable: TotpUsable | None,
     user: UserRecord | None,
-) -> TotpCounts | None:
+) -> TotpJudgement | None: ...
+
+
+async def judge_totp(
+    opener: Callable[[str, str | None], str | None],
+    usable: TotpUsable | None,
+    user: UserRecord | None,
+) -> TotpJudgement | None:
     """The :data:`TotpCounts` a backend passes to :func:`holds_way_past`,
     :func:`removal_keeps_way_past`, :func:`totp_removal` and :func:`lockout_increment`.
 
@@ -3260,6 +3277,25 @@ async def judge_totp(
     if user is not None and cell is not None:
         state = await judge_totp_cell(opener, usable, user.id, cell)
     return TotpJudgement(cell=cell, state=state)
+
+
+async def rotation_totp_counts(
+    conditional: bool,
+    opener: Callable[[str, str | None], str | None],
+    usable: TotpUsable | None,
+    judged: TotpJudgement | None,
+    get_user: Callable[[str], Awaitable[UserRecord | None]],
+    user_id: str,
+) -> TotpJudgement | None:
+    """The TOTP judgement a ``set_password`` passes to :func:`password_change`, made before the
+    write takes its lock: ``None`` where the write is not ``conditional``, else the caller's own
+    judgement where it passed one (``totp_judged``), else :func:`judge_totp` of the account read
+    now. Under the lock either counts only for the cell it judged (:meth:`TotpJudgement.moved`)."""
+    if not conditional:
+        return None
+    if judged is not None:
+        return judged
+    return await judge_totp(opener, usable, await get_user(user_id))
 
 
 async def judge_totp_cell(
@@ -17657,18 +17693,14 @@ class MessageStore:
     ) -> bool:
         now = time.time() if now is None else now
         conditional = conditional_way_past(require_way_past)
-        # The TOTP judged before the writer lock, by the caller where it passed ``totp_judged``,
-        # else here (judge_totp), and confirmed under the lock by its cell either way.
-        totp_counts = (
-            (
-                totp_judged
-                if totp_judged is not None
-                else await judge_totp(
-                    self.open_totp_secret, require_way_past, await self.get_user(user_id)
-                )
-            )
-            if conditional
-            else None
+        # The TOTP judged before the writer lock, confirmed under it by its cell.
+        totp_counts = await rotation_totp_counts(
+            conditional,
+            self.open_totp_secret,
+            require_way_past,
+            totp_judged,
+            self.get_user,
+            user_id,
         )
         async with _writer_guard(self._db, self._lock):
             # The passkeys the condition reads are read under the same writer lock as the write.

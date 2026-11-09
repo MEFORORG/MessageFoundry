@@ -372,6 +372,7 @@ from messagefoundry.store.store import (
     roles_if_held,
     roll_audit_key_range,
     rotation_reseal,
+    rotation_totp_counts,
     scope_if_source,
     scope_withdrawal,
     seal_approval,
@@ -9865,16 +9866,13 @@ class PostgresStore:
     ) -> bool:
         now = time.time() if now is None else now
         conditional = conditional_way_past(require_way_past)
-        totp_counts = (
-            (
-                totp_judged
-                if totp_judged is not None
-                else await judge_totp(
-                    self.open_totp_secret, require_way_past, await self.get_user(user_id)
-                )
-            )
-            if conditional
-            else None
+        totp_counts = await rotation_totp_counts(
+            conditional,
+            self.open_totp_secret,
+            require_way_past,
+            totp_judged,
+            self.get_user,
+            user_id,
         )
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             # The passkeys the condition reads are read in the write's own transaction, after the

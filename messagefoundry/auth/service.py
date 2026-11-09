@@ -207,6 +207,7 @@ from messagefoundry.store.store import (
     VerifiedUser,
     WebAuthnCredential,
     ad_map_seal_ok,
+    judge_totp,
     judge_totp_cell,
     passkey_cell_undecodable,
     passkey_digest,
@@ -14045,27 +14046,23 @@ class AuthService:
         """The rotation's early refusal, before the argon2 hash: raise
         :class:`FactorEnrolmentRequired` where ``user`` holds no factor with a way past, in the
         order :meth:`_has_way_past` asks. The TOTP is judged first, with no passkey read: one that
-        is on and not a KNOWN refusal (:meth:`_totp_way_past`, an unknown one included) is the way
-        past. Otherwise, where no passkey can count (none held, no configured relying party, or no
-        ``[webauthn]`` extra), it refuses with no read. Only where a passkey can count is the set
-        read, through :meth:`_verified_passkeys`, so a row that does not parse is no exception and a
-        set that fails its seal is reported; such a set counts for nothing, and so does one with a
-        cell the driver cannot decode while fetching (:func:`passkey_cell_undecodable`), as the
-        census counts it. Any other read error raises, before the hash.
+        is on and not a KNOWN refusal (:func:`judge_totp`, an unknown one included) is the way past.
+        Otherwise the passkey half is :meth:`_holds_gate_passkey`'s: where no passkey can count
+        (none held, no configured relying party, or no ``[webauthn]`` extra) it refuses with no
+        read, and elsewhere it reads the set through :meth:`_verified_passkeys`, so a row that does
+        not parse is no exception and a set that fails its seal is reported. Such a set counts for
+        nothing, and so does one with a cell the driver cannot decode while fetching
+        (:func:`passkey_cell_undecodable`), as the census counts it. Any other read error raises,
+        before the hash.
 
         Returns the TOTP judgement, which the store's conditional write takes in place of opening
         the cell again (``totp_judged``), so the rotation opens it once (BACKLOG #3948)."""
-        state = await self._totp_state(user)
-        judged = TotpJudgement(
-            cell=user.totp_secret_cell if user.totp_enabled else None,
-            state="refused" if state is None else state,
-        )
-        if state in ("usable", "unknown"):
+        judged = await judge_totp(self._store.open_totp_secret, _opened_totp_state, user)
+        if judged.state != "refused":
             return judged
-        if not (user.has_passkeys and self.passkeys_count_as_way_past() and webauthn.available()):
-            raise FactorEnrolmentRequired()
         try:
-            held = await self._verified_passkeys(user)
+            if await self._holds_gate_passkey(user):
+                return judged
         except (UnicodeDecodeError, sqlite3.OperationalError) as exc:
             if not passkey_cell_undecodable(exc):
                 raise
@@ -14075,10 +14072,7 @@ class AuthService:
                 _log.warning(
                     "the passkeys of user %s could not be read (%s)", user.id, type(exc).__name__
                 )
-            held = None
-        if not any(self._gate_counts(c) for c in held or ()):
-            raise FactorEnrolmentRequired()
-        return judged
+        raise FactorEnrolmentRequired()
 
     # --- MFA: native TOTP second factor (every account, WP-14, ASVS 6.3.3) -----
 
