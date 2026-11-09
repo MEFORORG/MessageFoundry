@@ -14305,7 +14305,7 @@ class SqlServerStore:
         if sealer is None:
             return 0, 0
         cipher = self._cipher
-        if not isinstance(cipher, AesGcmCipher):  # no in-process keys, so no sealer either
+        if not isinstance(cipher, AesGcmCipher):  # no in-process keys: a Transit sealer, if any
             return 0, 0
         change = rotation_reseal(sealer, cipher.active_marker_prefix, self._reencrypt_value)
         # Only records the pass has work on; store.py's reseal_user_records says why.

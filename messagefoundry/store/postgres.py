@@ -9590,7 +9590,7 @@ class PostgresStore:
         if sealer is None:
             return 0, 0
         cipher = self._cipher
-        if not isinstance(cipher, AesGcmCipher):  # no in-process keys, so no sealer either
+        if not isinstance(cipher, AesGcmCipher):  # no in-process keys: a Transit sealer, if any
             return 0, 0
         change = rotation_reseal(
             sealer,

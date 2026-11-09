@@ -203,8 +203,9 @@ class TransitCipher(_UnmarkedPolicy):
 
     def authz_root(self) -> None:
         """No in-heap DEK, so no in-process authorization root (BACKLOG #2592). Row seals under this
-        provider are Transit's own HMAC, a separate piece of work; until it lands this cipher writes
-        and checks no row seals."""
+        provider are Transit's own HMAC under the audit key: the store's
+        :class:`~messagefoundry.store.row_seal.TransitRowSealer` (ADR 0217 slice 1b-iii), which
+        ``row_sealer_for_cipher`` builds for this cipher, not a sealer keyed from this root."""
         return None
 
     def retired_authz_roots(self) -> Sequence[bytes]:

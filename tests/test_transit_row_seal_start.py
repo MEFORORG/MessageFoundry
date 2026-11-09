@@ -72,6 +72,56 @@ async def test_the_start_probe_passes_and_refuses(caplog: pytest.LogCaptureFixtu
         assert any("startup refused" in r.getMessage() for r in caplog.records), broken
 
 
+async def test_the_managed_lifespan_probes_before_the_restore_and_clears_its_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The managed lifespan registers the authority-seal-transit page, probes, and only then runs
+    the restore record, so a failed probe refuses the start with no authority row touched, and the
+    teardown clears the page. Control: a passing probe reaches the restore, and the page is
+    registered while the app serves."""
+    import messagefoundry.api.app as appmod
+    import messagefoundry.store.row_seal as row_seal_mod
+    from messagefoundry.api import create_managed_app
+    from messagefoundry.config.settings import AlertsSettings, AuthSettings
+
+    calls: list[str] = []
+
+    async def _restore(store: object, sink: object) -> None:
+        calls.append("restore")
+
+    async def _probe(sealer: object) -> None:
+        calls.append("probe")
+        if refuse:
+            raise RowSealStartRefused()
+
+    monkeypatch.setattr(appmod, "_record_a_restore", _restore)
+    monkeypatch.setattr(appmod, "probe_row_sealer_at_start", _probe)
+
+    def _app() -> Any:
+        return create_managed_app(
+            db_path=tmp_path / "lifespan.db",
+            poll_interval=0.05,
+            auth_settings=AuthSettings(),
+            alerts_settings=AlertsSettings(security_notifications_required=False),
+            egress_settings=EgressSettings(deny_by_default=False),
+        )
+
+    refuse = True
+    app = _app()
+    with pytest.raises(RowSealStartRefused):
+        async with app.router.lifespan_context(app):
+            pytest.fail("the lifespan served after its probe refused")
+    assert calls == ["probe"]
+    assert row_seal_mod._transit_outage_alert is None
+    refuse = False
+    calls.clear()
+    app = _app()
+    async with app.router.lifespan_context(app):
+        assert calls == ["probe", "restore"]
+        assert row_seal_mod._transit_outage_alert is not None
+    assert row_seal_mod._transit_outage_alert is None
+
+
 async def test_the_engine_refuses_to_start_when_the_probe_fails(tmp_path: Path) -> None:
     """The probe runs in ``Engine.start``, before recovery or any listener, for whatever backend
     the store is. Control: the same store and engine start with Transit up."""

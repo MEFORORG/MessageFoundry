@@ -24,8 +24,8 @@ latest one.
 **Whose key.** The seal key is derived from the store key's authorization root and the store id
 (:func:`~messagefoundry.store.crypto.derive_row_seal_key`). The key id in a stored seal is a one-way
 digest of that derived key, so it changes when either input changes. A process with no in-process
-root (a keyless store, or one whose keys live only in an external module) has no
-:class:`RowSealer`, and then writes and checks no seals.
+root has no :class:`RowSealer`. A keyless store then writes and checks no seals; a
+``vault_transit`` store seals through Transit instead, with :class:`TransitRowSealer` (ADR 0217).
 
 **One encoder.** :func:`seal_bytes` writes a scheme tag, the row's kind, and then each field as its
 name, a one-byte type and its value, every part length-prefixed. So ``None``, the empty string and the
@@ -367,9 +367,9 @@ class RowSealer:
 
 # --- The Transit row sealer (ADR 0217, "The four answers, defined once") ---------------------------
 #
-# Not yet returned by RowSealer.for_cipher: wiring it into the stores' write and read paths is the
-# rest of ADR 0217 slice 1. Until then a vault_transit store still writes and checks no seals, as on
-# main; this class changes nothing it does not yet reach.
+# Every backend builds it for a vault_transit cipher through row_sealer_for_cipher (ADR 0217 slice
+# 1b-iii), so a vault_transit store seals and checks its authority rows through Transit, and the
+# engine probes it at start.
 
 
 class TransitSealUnavailableError(Exception):
@@ -980,18 +980,23 @@ def report_transit_outage(reason: str) -> None:
         log.warning("the authority-seal-transit page could not be delivered")
 
 
-def revoke_seal_refusals() -> tuple[type[Exception], ...]:
-    """What a revoke's account-epoch raise, or its kept session's re-stamp, takes as a refusal and
-    goes ahead without (decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2 on
-    ADR 0217): Forged (``RowSealError``), Unverifiable on the write path
-    (``RowSealUnverifiableError``) and on a read (``TransitSealUnverifiableError``), and the Outage
-    (``TransitSealUnavailableError``). Every distinct class is named, so none rides on a parent."""
+def transit_seal_refusals() -> tuple[type[Exception], ...]:
+    """What a revoke's kept-session re-stamp reads as declined (decisions
+    d20261109T165402853-83b348 and d20261109T165406730-2505f2 on ADR 0217): Unverifiable on the
+    write path (``RowSealUnverifiableError``) and on a read (``TransitSealUnverifiableError``), and
+    the Outage (``TransitSealUnavailableError``). Every distinct class is named, so none rides on a
+    parent. :func:`revoke_seal_refusals` adds Forged, so the two cannot drift apart."""
     return (
-        RowSealError,
         RowSealUnverifiableError,
         TransitSealUnverifiableError,
         TransitSealUnavailableError,
     )
+
+
+def revoke_seal_refusals() -> tuple[type[Exception], ...]:
+    """What a revoke's account-epoch raise takes as a refusal and goes ahead without: Forged
+    (``RowSealError``) and every :func:`transit_seal_refusals` type."""
+    return (RowSealError, *transit_seal_refusals())
 
 
 def report_revoke_seal_refusal(exc: Exception, *, what: str) -> None:

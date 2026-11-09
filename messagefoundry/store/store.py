@@ -194,14 +194,12 @@ from messagefoundry.store.row_seal import (
     RowSealer,
     RowSealError,
     RowSealKeyRetiredError,
-    RowSealUnverifiableError,
-    TransitSealUnavailableError,
-    TransitSealUnverifiableError,
     report_revoke_seal_refusal,
     require_seal_for_write,
     revoke_seal_refusals,
     row_sealer_for_cipher,
     seal_bytes,
+    transit_seal_refusals,
 )
 from messagefoundry.store.schema_verify import (
     SchemaMismatchError,
@@ -1518,11 +1516,7 @@ async def write_kept_session(write: Awaitable[SessionRecord | None]) -> SessionR
     still raises ``RowSealError``, as on ``main``."""
     try:
         return await write
-    except (
-        RowSealUnverifiableError,
-        TransitSealUnverifiableError,
-        TransitSealUnavailableError,
-    ) as exc:
+    except transit_seal_refusals() as exc:
         report_revoke_seal_refusal(exc, what="the kept session's re-stamp")
         return None
 

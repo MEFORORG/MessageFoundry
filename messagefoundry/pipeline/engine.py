@@ -1860,8 +1860,10 @@ class Engine:
             enforcement=self._security_enforcement,
         )
         # ADR 0217 slice 1b-iii (owner ruling 2026-11-07): a Transit row sealer proves it can hmac
-        # and verify under the audit key before anything reads an authority row. A failed probe
-        # refuses the start, failing closed, before recovery or any listener, on every backend.
+        # and verify under the audit key. A failed probe refuses the start, failing closed, before
+        # recovery or any listener, on every backend. The managed lifespan probes earlier too,
+        # before its restore and auth service touch an authority row; this one covers an engine
+        # started without that lifespan.
         await probe_row_sealer_at_start(self.store.row_sealer())
         # All-stages recovery: returns any row a crash left `inflight` — ingress rows mid-route and
         # outbound rows mid-delivery alike — to `pending` so the staged workers re-claim them

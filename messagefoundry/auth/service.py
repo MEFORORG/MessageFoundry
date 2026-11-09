@@ -14212,8 +14212,9 @@ class AuthService:
                 # MFA). (Initial enrollment has no factor to verify, so this never fires there —
                 # keeping the enrollment step-up gate honest, WP-14.)
                 # The window from this stamp to the rotation (_stamp_to_rotation): a refusal in it,
-                # at least the second stamp, record_login_success or the audit row, revokes the
-                # stamped hash and answers session_lost.
+                # at least the second stamp or record_login_success, or a store refusal of the audit
+                # row, revokes the stamped hash and answers session_lost. A Transit Outage at the
+                # audit row raises CipherError, which the window does not take.
                 elevation = Elevation(session_lost=True)
                 async with self._stamp_to_rotation(
                     ceremony="mfa_verify", actor=user.username, client=client

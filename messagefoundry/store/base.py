@@ -2996,8 +2996,8 @@ class AuthStore(Protocol):
     # --- sessions ------------------------------------------------------------
     def row_sealer(self) -> AnyRowSealer | None:
         """The sealer this store writes authority-row integrity seals with, or ``None`` when its
-        cipher holds no in-process key, in which case no seal is written or checked (BACKLOG
-        #2592). ``row_sealer_for_cipher`` returns a
+        cipher is keyless, in which case no seal is written or checked (BACKLOG #2592).
+        ``row_sealer_for_cipher`` returns a
         :class:`~messagefoundry.store.row_seal.TransitRowSealer` for a ``vault_transit`` cipher
         (ADR 0217 slice 1b-iii), else the local
         :class:`~messagefoundry.store.row_seal.RowSealer`.

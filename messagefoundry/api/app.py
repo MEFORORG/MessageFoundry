@@ -530,7 +530,11 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.crypto import audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
-from messagefoundry.store.row_seal import TRANSIT_OUTAGE_SUBJECT, set_transit_outage_alert
+from messagefoundry.store.row_seal import (
+    TRANSIT_OUTAGE_SUBJECT,
+    probe_row_sealer_at_start,
+    set_transit_outage_alert,
+)
 from messagefoundry.store.store import (
     VIEWED_EVENT,
     AuditAppend,
@@ -12483,6 +12487,17 @@ def create_managed_app(
         # aiosqlite's connection worker is NON-DAEMON, so skipping it left the process unable to
         # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
         try:
+            # Decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2 (ADR 0217): a
+            # revoke that goes without an account's epoch raise, or ends its kept session, on a
+            # Vault transit outage pages authority-seal-transit on the authority-seal sink. First,
+            # so the restore's revoke below pages too; cleared in the teardown below.
+            set_transit_outage_alert(
+                authority_seal_alert(notifier or LoggingAlertSink(), subject=TRANSIT_OUTAGE_SUBJECT)
+            )
+            # ADR 0217 slice 1b-iii: the Transit row sealer's start probe, before the restore and
+            # the auth service read or write any authority row. A failed probe refuses the start.
+            # Engine.start runs it again, for an engine started without this lifespan.
+            await probe_row_sealer_at_start(store.row_sealer())
             # BACKLOG #2614: the first start on a restored store ends the archive's sessions and
             # records the restore, before the auth service exists and so before any request.
             await _record_a_restore(store, notifier or LoggingAlertSink())
@@ -12510,14 +12525,6 @@ def create_managed_app(
                         # BACKLOG #2193: the SMTP login's revocation guard, as on the alerts sink.
                         posture=_hop_posture,
                     )
-                # Decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2 (ADR 0217): a
-                # revoke that goes without an account's epoch raise, or ends its kept session, on a
-                # Vault transit outage pages authority-seal-transit on the authority-seal sink.
-                set_transit_outage_alert(
-                    authority_seal_alert(
-                        notifier or LoggingAlertSink(), subject=TRANSIT_OUTAGE_SUBJECT
-                    )
-                )
                 auth = AuthService(
                     store,
                     auth_settings,
@@ -12793,6 +12800,9 @@ def create_managed_app(
                     )
             yield
         finally:
+            # This lifespan's authority-seal-transit page, so a later app in the process does not
+            # page through this one's sink (ADR 0217).
+            set_transit_outage_alert(None)
             # BACKLOG #2087, #3191: every step after the yield runs whatever the steps before it
             # did. A step that raises, overruns its bound or is cut by a cancel is logged and the
             # next one runs, so a cancel delivered mid-teardown still drains, stops the engine and
