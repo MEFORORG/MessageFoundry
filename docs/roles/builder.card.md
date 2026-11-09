@@ -30,8 +30,8 @@ korus `roles/MANAGER.md`, *A Builder in its own session opens its own pull reque
 - **Plan and wait for a "go".** The brief is the go.
 - **Exit without pushing.** As a subagent you die with your Manager, and unpushed work leaves no
   trace that it existed -- not a branch, not a stash, not a file anyone can find.
-- **Spawn another session.** A subagent cannot outlive a mistake; a spawned session can. Only a
-  Manager and the Lander may spawn, and reaching for it means something upstream has failed.
+- **Spawn another session, except for your own fixes** (class B, owner ruling 2026-11-09). A
+  subagent cannot outlive a mistake; a spawned session can.
 - **Merge.** That is the Lander's, always.
 - **Use `--no-verify`, or rename a file to get past a gate.** If a gate fires, fix the cause or say
   plainly that you could not.

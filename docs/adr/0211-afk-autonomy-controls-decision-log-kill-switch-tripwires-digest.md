@@ -606,3 +606,27 @@ with its age, as a Class C prune question (plan 6.3). The digest deletes nothing
 A gate that reaches the log reads about one REST request per UTC day in the 60-day window that
 has an issue, plus the listing: the digest's read, once per unreviewed Class B record. It is not
 cached; the cache that Consequences names for the digest would cut both.
+
+## Amendment 2026-11-09: the T1 fast path
+
+The owner's ruling of 2026-11-09, recorded verbatim in [AUTONOMY-PLAN.md](../AUTONOMY-PLAN.md)
+section 12, replaced the 60-sample owner calibration gate with automated signals and made the
+blind sample optional. Three things change here.
+
+- **Calibration** (`Get-DecisionCalibration`) is the automated signals over the seat's Class B
+  decisions in the trailing 14 days: the reversal rate, and the rates of decisions any `outcome`
+  record marks `red-after-merge` or `held`, each a breach above 5 percent. No decisions in the
+  window is no breach. Owner ratings still count when given: any trailing window of up to 60
+  holding more than 3 disagreements is a breach, with the 60 fresh ratings to recover. Fewer than
+  60 ratings no longer holds a class back, so AC-7's *"calibrated only at 60 rated samples"* and
+  the gate section's *"Today it answers REVIEW (or HALT) for every seat"* are superseded.
+- **The gate needs the act to say what it touches**: `-Touches <paths>` or `-TouchesNothing`.
+  Neither is REVIEW, and so is a path `Get-DecisionClassCPath` names or cannot classify. The
+  paths are the session's own statement and the list is a denylist naming at least the Class C
+  paths, so a NO-REVIEW still never shows the act is not a security control. The record schema
+  gains `touches`, still version 1, filled empty for an older record.
+- **The digest's calibration table** gains the two signal rates.
+
+**Designed, not built:** a writer that records `red-after-merge` and `held` as they happen. Until
+one exists those two signals count only what a seat logs by hand. The UNKNOWN cost reading still
+answers REVIEW, and the kill switch, the reversal budget and the chain limit are unchanged.

@@ -344,7 +344,7 @@ tool too.
 | Seat | Life | Owns | Must not |
 |---|---|---|---|
 | **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads the backlog ledger (in the vault since 2026-09-13; `docs/BACKLOG.md` here is a stub), writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes, and **decides when to cut a PR and what goes in it**, usually one PR per wave (owner ruling 2026-09-23). It briefs at full speed with no work-in-progress limit: at least the open PR count, the merge queue and the merge rate never limit briefing, and no item count caps a wave PR (owner ruling 2026-10-26). Usage limits still bind, at least the weekly HOLD NEW WORK state, under the owner's ruling of 2026-10-31 that the weekly window carries the stop, and the 90 percent Workflow gate; korus `roles/COMMON.md`, read at `origin/main`, *The three usage states*, holds the states, levels and triggers and names where the rate constants live, and the same file's *Prohibitions that bind before any task starts* states the gate. The user-scope usage watch hook `watch.py` is a copy that prints the current state and the gate only on a config root that wires it, and COMMON wins where the two disagree; where nothing prints them, for example in a cloud session or on an unwired root, they bind all the same. `decision.ps1` grades the class B HOLD level from `~/.claude/mefor-usage/thresholds.json` wherever that file sets one (`scripts/coord/_decisionlog.ps1`, `Get-DecisionRungLevels`), so it can grade against a number other than COMMON's. ASVS record work, which it dispatches to vault Builders (owner ruling 2026-09-23; see the note below). | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
-| **Builder** | ephemeral, one per brief | The change, the commit, and the push. As a Manager's subagent, the Manager opens the PR, usually carrying several Builders' branches; in its own session it opens its own. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR as a Manager's subagent; that is the Manager's. Plan and wait for a "go". Spawn another session. |
+| **Builder** | ephemeral, one per brief | The change, the commit, and the push. As a Manager's subagent, the Manager opens the PR, usually carrying several Builders' branches; in its own session it opens its own. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR as a Manager's subagent; that is the Manager's. Plan and wait for a "go". Spawn another session, except one for its own fixes (owner ruling 2026-11-09). |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below), and flagging the hygiene its own merges leave: installed-hook drift after a hook-changing PR, and merged branches whose worktrees remain (owner ruling 2026-09-26). Standing authority on the engine repo and the vault, with no per-action owner approval. It may resolve a conflict, including one that touches code (owner ruling 2026-09-29). The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED; its notice, which also covers the *what an item SAYS* half this row's Must-not column used to carry, is in `docs/METHOD.md`. | Merge a change with no proof that code review ran on it (owner ruling 2026-09-29). The merge bullet under *Branch, commit one layer, open the PR* says what counts. Arm auto-merge outside the two cases in the 2026-10-07 note below (owner ruling 2026-10-07), or without the three safeguards that follow it. Decide which of two deliberate changes to an item survives. |
 | **Special** | as the owner needs it | Work the owner assigns directly, outside the other four seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
@@ -445,7 +445,10 @@ ruling 2026-09-16).** The case it exists for is a PR that needs a fix with no Ma
 the Lander spawns a Manager rather than fixing the PR itself, because authoring plus landing means
 nobody checked it. A Manager seat added, the same day, that spawning should be rare: a subagent
 cannot outlive a mistake, and a spawned session can. The full notices are in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md
-text moved in wave 2*.
+text moved in wave 2*. **A Builder may now spawn a session for its own fixes, as a class B act
+(owner ruling 2026-11-09, tier T3; [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 12).**
+The same ruling makes taking over a verified-dead holder's worktree, branch or claim class B, once
+the work is anchored, and dead means more than 2 hours, the held-PR repair window below.
 
 **The Lander may send a repair Builder subagent to a held PR whose author has gone quiet**
 (decided by the Lander under the owner's delegation of 2026-10-29, decision
@@ -525,7 +528,8 @@ table instead. A Builder still gets one turn: it puts an owner question in its r
 *"Sign R1-R9"*).** For the four weeks from that signature to 2026-12-02, no seat adds a new gate,
 hook, required context, seat or method rule, except a fix for a red `main` or a security control.
 Existing machinery is still repaired, and review effort is not touched. The freeze lapses on
-2026-12-02. The drafting Manager reads R5 as not freezing R1-R9 themselves, so building what they
+2026-12-02. The owner exempted the 2026-11-09 autonomy change from it (plan section 12), and only
+that change. The drafting Manager reads R5 as not freezing R1-R9 themselves, so building what they
 require is carrying them out, not new machinery; that reading is recorded beside the signed text
 and is not part of the signature. The signature covers R1-R9 as they stand in vault
 `docs/LEDGER-INFLOW-RULINGS-DRAFT.md` at commit `22579b25071c`, anchored at the vault ref
@@ -612,12 +616,15 @@ Manager's watch reached the cloud session 29 seconds after its question.
   **It waits for the owner's explicit "go" only on a plan that holds a class C item**, such as new
   product scope. A routine plan is class B under [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md)
   section 3 (plan section 5.2, owner approval 2026-10-21): the Manager logs it with
-  `scripts/coord/decision.ps1` (ADR 0211), and acts only after an adversarial review affirms it.
-  **Every class B decision takes that review for now**, whatever the sample count: plan section
-  10 opens the no-review path only in its last wave, per seat, as calibration passes. Plan section
-  5.2 retires the go *"once section 4 is built"*, and section 4 is only partly built, so this
-  retirement runs ahead of the plan's order; SAIDS section 6.2 and its A.6 record the gap. Point
-  the brief at the relevant existing code; it measurably improves the result.
+  `scripts/coord/decision.ps1` (ADR 0211), and acts only after an adversarial review affirms it,
+  **unless it meets the T1 fast path** (owner ruling 2026-11-09): plan R4 lists its conditions,
+  and `decision.ps1 -Gate` checks the ones it can see. Ledger rows and work an accepted ADR names
+  as its direction are class B, and the Manager picks and decomposes ledger work itself (tiers T3
+  and T4); a genuinely new product direction stays class C. Edits to the rules that bind the fleet
+  stay class C: T2 was not adopted. Plan section 5.2 retires the go *"once section 4 is built"*,
+  and section 4 is only partly built, so this retirement runs ahead of the plan's order; SAIDS
+  section 6.2 and its A.6 record the gap. Point the brief at the relevant existing code; it
+  measurably improves the result.
 - The rest of the Manager's dispatch rules bind only that seat. Korus `roles/MANAGER.md` carries
   them; read it at `origin/main`. Every brief ends with push, then report. A brief names who else is
   running, what paths they touch, and whether they share the worktree. Hand down readings, not
