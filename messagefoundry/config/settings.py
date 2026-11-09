@@ -8007,6 +8007,18 @@ def environment_named_by_env(environ: Mapping[str, str] | None = None) -> str | 
     return value if isinstance(value, str) and value.strip() else None
 
 
+def environments_dir_named_by_env(environ: Mapping[str, str] | None = None) -> str | None:
+    """The ``[environments].dir`` that ``MEFOR_ENVIRONMENTS_DIR`` sets, or ``None`` when it is unset.
+
+    Read through :func:`_env_overrides`, as :func:`load_settings` reads it, and returned as given, a
+    blank value included, since the loader takes that too. The offline subcommands locate
+    ``<dir>/<env>.toml`` without loading settings, so they need the variable that beats the file's
+    ``dir`` in ``serve``'s settings (vault BACKLOG #2355)."""
+    environ = os.environ if environ is None else environ
+    value = _env_overrides(environ).get("environments", {}).get("dir")
+    return value if isinstance(value, str) else None
+
+
 def insecure_bind_escape(settings: ServiceSettings, *, flag: bool = False) -> bool:
     """The cleartext-listener escape, folded the one way every caller folds it (ADR 0118, BACKLOG
     #1672): ``serve --allow-insecure-bind`` OR ``[security].require_encryption_for_remote = false``.

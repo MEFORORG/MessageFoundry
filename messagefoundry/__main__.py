@@ -440,8 +440,11 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     check.add_argument("--config", default="samples/config", help="config modules directory")
     _add_anchor_flags(
         check,
-        env_help=" check also reads it as serve --env does, above [ai].environment, so with no "
-        "messagefoundry.toml its settings checks grade that instance instead of skipping.",
+        env_help="active environment NAME, read as serve --env reads it (ADR 0050 AC-6): it selects "
+        "environments/<env>.toml values and overrides [ai].environment, above the file and "
+        "MEFOR_AI_ENVIRONMENT, so the settings checks apply serve's posture refusal to that name, and "
+        "with no messagefoundry.toml they grade that instance instead of skipping. With no --env, "
+        "check adopts no required-env refusal.",
     )
     check.add_argument(
         "--messages", default=None, help="HL7 fixtures dir (dryrun gates when it has *.hl7)"
@@ -1361,15 +1364,16 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     return parser, _DISPATCH
 
 
-def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str = "") -> None:
+def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str | None = None) -> None:
     """Add the project-root / active-env / service-config trio to an OFFLINE subcommand (ADR 0050 §3).
 
     ``validate``/``graph``/``dryrun``/``check`` carried only ``--config`` before, so the commit/CI gate
     could resolve a DIFFERENT environment view than ``serve`` (review C3). These flags let the gate
     anchor the same bundle root and select the same active environment ``serve`` does — value
     resolution only, WITHOUT adopting serve's required-active-env / explicit-posture refusal (AC-6).
-    ``check`` is the exception for ``--env``: its settings legs read it as ``serve --env`` does, so
-    its ``posture`` leg judges that name (vault BACKLOG #2355).
+    ``check`` is the exception for ``--env``, by ADR 0050's amended AC-6: its settings legs read it
+    as ``serve --env`` does, so its ``posture`` leg judges that name (vault BACKLOG #2355).
+    ``env_help`` replaces the ``--env`` help for it.
     """
     p.add_argument(
         "--project-root",
@@ -1381,9 +1385,9 @@ def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str = "") -> None
     p.add_argument(
         "--env",
         default=None,
-        help="active environment NAME (selects environments/<env>.toml values). With no --env the gate "
-        "behaves exactly as before (no env values loaded); it never adopts serve's required-env refusal."
-        + env_help,
+        help=env_help
+        or "active environment NAME (selects environments/<env>.toml values). With no --env the gate "
+        "behaves exactly as before (no env values loaded); it never adopts serve's required-env refusal.",
     )
     p.add_argument(
         "--service-config",
@@ -1440,7 +1444,15 @@ def _env_dir_name(service_config: str | None) -> str:
     Read from the resolved ``service_config`` TOML (a tiny, settings-free tomllib read) so the offline
     AC-3 check honors a CUSTOM ``dir = "envs"`` instead of false-positive-failing on the hardcoded
     literal. Best-effort: no/unreadable/malformed file -> the default. The full ``load_settings`` is
-    deliberately avoided here (the offline gate stays settings-free, like validate/graph/dryrun)."""
+    deliberately avoided here (the offline gate stays settings-free, like validate/graph/dryrun).
+
+    ``MEFOR_ENVIRONMENTS_DIR`` beats the file, as it does in ``serve``'s ``load_settings``, so this
+    names the directory ``serve`` and ``check``'s build-check read (vault BACKLOG #2355)."""
+    from messagefoundry.config.settings import environments_dir_named_by_env
+
+    named = environments_dir_named_by_env()
+    if named is not None:
+        return named
     if service_config is None:
         return "environments"
     try:

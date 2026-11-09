@@ -219,6 +219,52 @@ def test_offline_ac3_custom_env_dir_missing_file_still_fails_loud(
     assert "envs" in err and "prod.toml" in err
 
 
+# --- AC-3 offline: MEFOR_ENVIRONMENTS_DIR beats the file's dir, as in serve (vault BACKLOG #2355) ---
+
+
+@pytest.mark.parametrize("command", ["check", "validate"])
+@pytest.mark.parametrize("present", ["envs", "environments"])
+def test_offline_ac3_reads_the_env_dir_variable_as_serve_does(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    present: str,
+) -> None:
+    # serve's load_settings puts MEFOR_ENVIRONMENTS_DIR above the file's [environments].dir, and its
+    # AC-3 check looks for <root>/<that dir>/<env>.toml. The offline pre-check read the file alone,
+    # so it failed loud on a file serve finds, and passed a layout serve refuses.
+    from messagefoundry.config.settings import load_settings
+
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text('[environments]\ndir = "environments"\n', encoding="utf-8")
+    (tmp_path / present).mkdir()
+    (tmp_path / present / "prod.toml").write_text('peer_host = "10.0.0.9"\n', encoding="utf-8")
+    argv = [command, "--project-root", str(tmp_path), "--service-config", str(svc)]
+    argv += ["--config", str(cfg), "--env", "prod"]
+    if command == "check":
+        argv.append("--no-lint")
+
+    monkeypatch.setenv("MEFOR_ENVIRONMENTS_DIR", "envs")
+    assert load_settings(config_path=svc).environments.dir == "envs"  # serve's reader
+    rc = main(argv)
+    err = capsys.readouterr().err
+    if present == "envs":
+        assert rc != 2 and "no value file" not in err, err
+    else:
+        assert rc == 2 and str(tmp_path / "envs" / "prod.toml") in err, err
+
+    # Control: with the variable unset, the file's dir decides, the other way round.
+    monkeypatch.delenv("MEFOR_ENVIRONMENTS_DIR")
+    rc = main(argv)
+    err = capsys.readouterr().err
+    if present == "environments":
+        assert rc != 2 and "no value file" not in err, err
+    else:
+        assert rc == 2 and str(tmp_path / "environments" / "prod.toml") in err, err
+
+
 def test_graph_and_dryrun_honor_relative_config_under_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
