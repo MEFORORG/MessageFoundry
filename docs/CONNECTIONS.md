@@ -3171,7 +3171,7 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 | `url` | — (required) | the FHIR service **base** URL (e.g. `https://host/fhir`); `http`/`https` only. Use `env()`. |
 | `fhir_version` | `R4B` | `R4B` (default) / `R5` / `STU3` — explicit (no plain-R4 on pydantic-v2 wheels) |
 | `format` | `json` | `json` only; FHIR-XML is deferred to a hardened-`lxml` path |
-| `interaction` | `create` | `create` (`POST {base}/{ResourceType}`) / `update` (`POST {base}` with a one-entry `transaction` `Bundle` whose entry is `PUT {ResourceType}/{id}`; see [the id stays out of the URL](#an-update-keeps-the-resource-id-out-of-the-url)) / `transaction` / `batch` (`POST {base}` with a `Bundle`). Takes an `env()`, whose value, default included, is read only when the connection is built |
+| `interaction` | `create` | `create` (`POST {base}/{ResourceType}`) / `update` (`POST {base}` with a one-entry `transaction` `Bundle` whose entry is `PUT {ResourceType}/{id}`; see [the id stays out of the URL](#an-update-keeps-the-resource-id-out-of-the-url)) / `transaction` / `batch` (`POST {base}` with a `Bundle`). Takes an `env()`. The build resolves it, and `GET /security/posture` resolves it against the running graph's values, to tell whether the connection sends updates in the path form |
 | `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware update, sent like `update` with the ETag in the entry, or in an `If-Match` header with `update_url_form="path"`). Takes an `env()`, checked when the connection is built |
 | `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`) |
 | `update_url_form` | `transaction` | how an `update` or `if-match` is sent. `transaction` keeps the id out of the URL. `path` is the plain `PUT {base}/{ResourceType}/{id}` with the ETag in an `If-Match` header, for a server with no `transaction` interaction. `path` is a **listed loosening**; see [vendor compatibility](#vendor-compatibility-and-the-path-form-opt-in). Takes an `env()`, checked when the connection is built |
@@ -3347,8 +3347,10 @@ With `update_url_form="path"`, an `update` or `if-match` is sent as `PUT {base}/
 - The `if-match` ETag goes in the `If-Match` header, and a static `If-Match` in `headers` stays on the
   request.
 - The reply is the plain resource, so capture and `capture_response_headers` work as on any `PUT`.
-- The setting applies only to `update` and `if-match`. Set on any other connection, it is refused at load,
-  because it would do nothing.
+- The setting applies only to `update` and `if-match`. Set on any other connection, it is refused when the
+  connection is built, because it would do nothing. It is refused at load too when the literal values beside
+  it already rule out an update. An `env()` `interaction` or `conditional` that could still be an update
+  leaves the check to the build.
 
 **It puts each message's resource id back in the request URL**, and so in the receiving server's access
 logs. That relaxes owner ruling R3 (ASVS 14.2.1), so it is a listed loosening in
