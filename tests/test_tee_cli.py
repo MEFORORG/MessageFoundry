@@ -453,30 +453,37 @@ def test_compare_out_help_states_that_an_existing_file_is_replaced() -> None:
     )
 
 
-@pytest.mark.parametrize("name", ["second-hard-link", "trailing-separator"])
-def test_compare_out_replaces_a_hard_linked_or_trailing_separator_name(
-    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_compare_out_replaces_a_second_hard_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # PR 2390 note 9 (vault BACKLOG #3166): compare replaces on every OS, Windows included, so a
-    # second hard link keeps the old contents, and a trailing separator, which Path drops, still
-    # names the file the report replaces.
-    out = tmp_path / "out.json"
+    # second hard link to the old file keeps the old contents.
     other = tmp_path / "elsewhere.json"
-    if name == "second-hard-link":
-        other.write_text("untouched\n", encoding="utf-8")
-        os.link(other, out)
-        assert os.stat(out).st_nlink == 2  # control: the target really has a second link
-    else:
-        out.write_text("stale\n", encoding="utf-8")
+    other.write_text("untouched\n", encoding="utf-8")
+    out = tmp_path / "out.json"
+    os.link(other, out)
+    assert os.stat(out).st_nlink == 2  # control: the target really has a second link
+    assert _write_out("compare", tmp_path, monkeypatch, out) == 0
+    data = out.read_bytes()
+    assert b"untouched" not in data
+    assert json.loads(data)["summary"]["matched"] == 1
+    assert other.read_text(encoding="utf-8") == "untouched\n"
+    assert os.stat(out).st_nlink == 1
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_compare_out_replaces_a_name_with_a_trailing_separator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PR 2390 note 9 (vault BACKLOG #3166): a trailing separator, which Path drops, still names the
+    # file the report replaces, on every OS.
+    out = tmp_path / "out.json"
+    out.write_text("stale\n", encoding="utf-8")
     # A str, since Path itself would drop the separator before the CLI saw it.
-    named = str(out) + os.sep if name == "trailing-separator" else str(out)
-    assert _write_out("compare", tmp_path, monkeypatch, named) == 0
+    assert _write_out("compare", tmp_path, monkeypatch, str(out) + os.sep) == 0
     data = out.read_bytes()
     assert b"stale" not in data
     assert json.loads(data)["summary"]["matched"] == 1
-    if name == "second-hard-link":
-        assert other.read_text(encoding="utf-8") == "untouched\n"
-        assert os.stat(out).st_nlink == 1
     assert not list(tmp_path.glob("*.tmp"))
 
 

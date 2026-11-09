@@ -308,10 +308,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "wider than 0600. compare replaces an existing regular file; the replace can be refused, "
             "for example for a read-only file on Windows. On Windows the replaced report takes its "
             "folder's access list, so an access list hardened on the old file is not kept. On POSIX, "
-            "a target that resolves, through any link, to a character "
-            "device, or to a pipe or socket this account owns, is written through instead of "
-            "replaced. On Windows compare also writes through a named stream, for example NUL, CON or "
-            "a named pipe."
+            "a target that resolves, through any link, to a character device, or to a pipe or socket "
+            "this account owns, is written through instead of replaced. On Windows compare also "
+            "writes through a named stream, for example NUL, CON or a named pipe."
         ),
     )
     compare.add_argument(
