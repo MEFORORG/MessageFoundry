@@ -952,3 +952,55 @@ async def probe_row_sealer_at_start(sealer: AnyRowSealer | None) -> None:
         )
         raise RowSealStartRefused() from exc
     log.info("the Vault transit row sealer passed its start probe (key version %d)", version)
+
+
+#: The page an Outage on an authority row raises (ADR 0217, *The four answers*).
+TRANSIT_OUTAGE_SUBJECT = "authority-seal-transit"
+
+_transit_outage_alert: Callable[[str], None] | None = None
+
+
+def set_transit_outage_alert(alert: Callable[[str], None] | None) -> None:
+    """Register the process's ``authority-seal-transit`` page, or clear it with ``None``. The API
+    registers it at startup on the alert sink the authority-seal page uses; a store reports through
+    :func:`report_transit_outage`, so no backend needs a sink of its own."""
+    global _transit_outage_alert
+    _transit_outage_alert = alert
+
+
+def report_transit_outage(reason: str) -> None:
+    """Page ``authority-seal-transit`` with ``reason``, which names no row value, token or Vault
+    reply. Never raises: a page that fails must not change what a revoke does."""
+    alert = _transit_outage_alert
+    if alert is None:
+        return
+    try:
+        alert(reason)
+    except Exception:  # noqa: BLE001 -- an alert failure must never break a revoke
+        log.warning("the authority-seal-transit page could not be delivered")
+
+
+def revoke_seal_refusals() -> tuple[type[Exception], ...]:
+    """What a revoke's account-epoch raise, or its kept session's re-stamp, takes as a refusal and
+    goes ahead without (decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2 on
+    ADR 0217): Forged (``RowSealError``), Unverifiable on the write path
+    (``RowSealUnverifiableError``) and on a read (``TransitSealUnverifiableError``), and the Outage
+    (``TransitSealUnavailableError``). Every distinct class is named, so none rides on a parent."""
+    return (
+        RowSealError,
+        RowSealUnverifiableError,
+        TransitSealUnverifiableError,
+        TransitSealUnavailableError,
+    )
+
+
+def report_revoke_seal_refusal(exc: Exception, *, what: str) -> None:
+    """Log a refusal :func:`revoke_seal_refusals` took, naming its class only, and page
+    ``authority-seal-transit`` when it is an Outage. ``what`` says which write went without."""
+    log.warning(
+        "%s was refused (%s); the revoke ends the sessions anyway", what, type(exc).__name__
+    )
+    if isinstance(exc, TransitSealUnavailableError):
+        report_transit_outage(
+            f"{what} met a Vault transit outage; the revoke went ahead without it"
+        )

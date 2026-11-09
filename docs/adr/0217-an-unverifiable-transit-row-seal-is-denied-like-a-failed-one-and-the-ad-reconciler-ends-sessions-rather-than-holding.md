@@ -539,6 +539,20 @@ repetition left to the sink's re-alert throttle, as for the map page.
 the revoked session rows revives them once the user row verifies. That is a rollback of store
 state, the class #2592 step 7 owns, and it needs the write access the seals assume an attacker has.
 
+**The interim step, built before the owed raise (decisions d20261109T165402853-83b348 and
+d20261109T165406730-2505f2, 2026-11-09).** `session_epoch_owed` and its retry task stay unbuilt.
+Until they land, `_bump_session_epoch` on all three backends, and so every account's raise in the
+`revoke_all_sessions` loop, catches each refusal by its own class: `RowSealError` (Forged),
+`RowSealUnverifiableError` and `TransitSealUnverifiableError` (Unverifiable), and
+`TransitSealUnavailableError` (Outage). It logs the class name, pages `authority-seal-transit` on
+an Outage, and returns no raised epoch, so the transaction still marks every session revoked, as
+`main` already did for a Forged row. A Transit refusal (Unverifiable or Outage) of the kept
+session's re-stamp in `_write_session` declines it, so `_keep_or_end_session` ends that session
+with the rest. A Forged kept session still raises, as on `main`. Until the owed raise is built, an
+account whose raise went without has no raised epoch, so the residual the owed row closes (a
+restored earlier copy of a revoked session row) stays open for that account on a per-account
+revoke; `revoke_all_sessions` still raises the global session epoch first, with no seal.
+
 **Other legs that read a map** decide access and write nothing: at least the client-certificate
 identity (`identity_for_cert_user_id`), the step-up role test (`_directory_roles_lost`) and the
 enrolment and re-bind legs. On the step-up, enrolment and re-bind legs an Unverifiable map takes

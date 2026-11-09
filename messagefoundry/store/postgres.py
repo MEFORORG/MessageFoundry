@@ -194,6 +194,8 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     AnyRowSealer,
     RowSealError,
+    report_revoke_seal_refusal,
+    revoke_seal_refusals,
     row_sealer_for_cipher,
 )
 from messagefoundry.store.schema_verify import IndexShape
@@ -392,6 +394,7 @@ from messagefoundry.store.store import (
     verify_audit_rows,
     webauthn_insert_params,
     without_role,
+    write_kept_session,
 )
 from messagefoundry.store.transit_attestation import TransitBoundAttestation
 from messagefoundry.support.redact import redact_log_line
@@ -9576,8 +9579,8 @@ class PostgresStore:
         bump = EpochBump()
         try:
             return bump.raised(await self._write_user(conn, user_id, bump))
-        except RowSealError:
-            log.warning("an account's record failed its integrity seal; its sessions end anyway")
+        except revoke_seal_refusals() as exc:  # store.py's twin says why
+            report_revoke_seal_refusal(exc, what="an account's session epoch raise")
             return None
 
     async def reseal_user_records(self) -> tuple[int, int]:
@@ -10926,7 +10929,7 @@ class PostgresStore:
         """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, inside
         ``conn``'s transaction (follow-up to BACKLOG #4975); store.py's
         ``MessageStore._keep_or_end_session`` states the contract."""
-        if restamp.kept(await self._write_session(conn, token_hash, restamp)):
+        if restamp.kept(await write_kept_session(self._write_session(conn, token_hash, restamp))):
             return RevokeResult(revoked, kept=True)
         status = await conn.execute(
             _PG_END_DECLINED_KEPT_SESSION_SQL, now, restamp.user_id, token_hash

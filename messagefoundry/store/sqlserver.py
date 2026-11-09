@@ -183,6 +183,8 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     AnyRowSealer,
     RowSealError,
+    report_revoke_seal_refusal,
+    revoke_seal_refusals,
     row_sealer_for_cipher,
 )
 from messagefoundry.store.schema_verify import IndexShape
@@ -396,6 +398,7 @@ from messagefoundry.store.store import (
     verify_audit_rows,
     webauthn_insert_params,
     without_role,
+    write_kept_session,
 )
 from messagefoundry.store.transit_attestation import TransitBoundAttestation
 from messagefoundry.support.redact import redact_log_line
@@ -14291,8 +14294,8 @@ class SqlServerStore:
         bump = EpochBump()
         try:
             return bump.raised(await self._write_user(cur, user_id, bump))
-        except RowSealError:
-            log.warning("an account's record failed its integrity seal; its sessions end anyway")
+        except revoke_seal_refusals() as exc:  # store.py's twin says why
+            report_revoke_seal_refusal(exc, what="an account's session epoch raise")
             return None
 
     async def reseal_user_records(self) -> tuple[int, int]:
@@ -15840,7 +15843,7 @@ class SqlServerStore:
         inside an open transaction (follow-up to BACKLOG #4975); store.py's
         ``MessageStore._keep_or_end_session`` states the contract. The end is counted from its
         ``OUTPUT`` rowset, as the sweep is (BACKLOG #2283)."""
-        if restamp.kept(await self._write_session(cur, token_hash, restamp)):
+        if restamp.kept(await write_kept_session(self._write_session(cur, token_hash, restamp))):
             return RevokeResult(revoked, kept=True)
         await cur.execute(_MSSQL_END_DECLINED_KEPT_SESSION_SQL, (now, restamp.user_id, token_hash))
         ended = len(await cur.fetchall()) == 1

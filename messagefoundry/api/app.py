@@ -530,6 +530,7 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.crypto import audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
+from messagefoundry.store.row_seal import TRANSIT_OUTAGE_SUBJECT, set_transit_outage_alert
 from messagefoundry.store.store import (
     VIEWED_EVENT,
     AuditAppend,
@@ -12509,6 +12510,14 @@ def create_managed_app(
                         # BACKLOG #2193: the SMTP login's revocation guard, as on the alerts sink.
                         posture=_hop_posture,
                     )
+                # Decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2 (ADR 0217): a
+                # revoke that goes without an account's epoch raise, or ends its kept session, on a
+                # Vault transit outage pages authority-seal-transit on the authority-seal sink.
+                set_transit_outage_alert(
+                    authority_seal_alert(
+                        notifier or LoggingAlertSink(), subject=TRANSIT_OUTAGE_SUBJECT
+                    )
+                )
                 auth = AuthService(
                     store,
                     auth_settings,

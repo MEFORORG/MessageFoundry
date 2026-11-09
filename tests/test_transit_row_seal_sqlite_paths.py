@@ -400,23 +400,25 @@ async def test_the_role_and_user_reseals_run_through_transit(
 # --- the session sweeps and stamps: census pins ---------------------------------------------------
 
 
-async def test_epoch_raise_census_an_unverifiable_account_keeps_its_sessions(
+async def test_epoch_raise_census_an_unverifiable_account_has_its_sessions_ended(
     transit: tuple[MessageStore, FakeBackend, Path],
 ) -> None:
-    """Census pin (1b-iv): ``_bump_session_epoch`` catches RowSealError only. On main a Forged
-    account's sessions end anyway; an Unverifiable one's raise escapes and the sweep rolls back,
-    so its sessions stay live. The control is the Forged account, whose sessions end."""
+    """Census pin, re-pinned by decisions d20261109T165402853-83b348 and
+    d20261109T165406730-2505f2 (ADR 0217, the interim step): ``_bump_session_epoch`` takes an
+    Unverifiable raise as it takes a Forged one, so the account's sessions end anyway. Before
+    those decisions this pin held the escape and the rolled-back sweep. The control is the Forged
+    account, whose sessions end as on main."""
     store, _, path = transit
     await _user(store, "u-1")
     await _user(store, "u-2")
     planted = await _session(store, "u-1")
     forged = await _session(store, "u-2")
     _plant(path, "users", "authz_seal", "id", "u-1")
-    with pytest.raises(RowSealUnverifiableError):
-        await store.revoke_user_sessions("u-1")
-    assert _sql(
+    assert (await store.revoke_user_sessions("u-1")).count == 1
+    (planted_revoked_at,) = _sql(
         path, "SELECT revoked_at FROM sessions WHERE token_hash=?", (hash_token(planted),)
-    ) == [(None,)]
+    )[0]
+    assert planted_revoked_at is not None
     _sql(path, "UPDATE users SET display_name=? WHERE id=?", ("bent", "u-2"))
     result = await store.revoke_user_sessions("u-2")
     assert result.count == 1
@@ -426,24 +428,31 @@ async def test_epoch_raise_census_an_unverifiable_account_keeps_its_sessions(
     assert revoked_at is not None
 
 
-async def test_kept_session_census_an_unverifiable_kept_session_escapes(
+async def test_kept_session_census_an_unverifiable_kept_session_is_ended(
     transit: tuple[MessageStore, FakeBackend, Path],
 ) -> None:
-    """Census pin (1b-iv): ``_keep_or_end_session`` restamps through the session writer, whose
-    Unverifiable answer escapes ``revoke_other_sessions``' and ``revoke_every_session``'s
-    RowSealError catches; the sweep rolls back, ending no other session."""
+    """Census pin, re-pinned by decisions d20261109T165402853-83b348 and
+    d20261109T165406730-2505f2 (ADR 0217, the interim step): ``_keep_or_end_session`` reads an
+    Unverifiable re-stamp as declined, so the kept session ends with the rest and the sweep
+    commits. Before those decisions this pin held the escape and the rolled-back sweep."""
     store, _, path = transit
     await _user(store, "u-1")
     kept = await _session(store, "u-1")
     other = await _session(store, "u-1")
     _plant(path, "sessions", "seal", "token_hash", hash_token(kept))
-    with pytest.raises(RowSealUnverifiableError):
-        await store.revoke_user_sessions("u-1", except_token_hash=hash_token(kept))
-    with pytest.raises(RowSealUnverifiableError):
-        await store.revoke_all_sessions(except_token_hash=hash_token(kept))
-    assert _sql(
-        path, "SELECT revoked_at FROM sessions WHERE token_hash=?", (hash_token(other),)
-    ) == [(None,)]
+    result = await store.revoke_user_sessions("u-1", except_token_hash=hash_token(kept))
+    assert not result.kept and result.ended_kept and result.count == 2
+    for token in (kept, other):
+        (revoked_at,) = _sql(
+            path, "SELECT revoked_at FROM sessions WHERE token_hash=?", (hash_token(token),)
+        )[0]
+        assert revoked_at is not None
+    # revoke_all on a fresh pair takes the same path.
+    kept = await _session(store, "u-1")
+    other = await _session(store, "u-1")
+    _plant(path, "sessions", "seal", "token_hash", hash_token(kept))
+    result = await store.revoke_all_sessions(except_token_hash=hash_token(kept))
+    assert not result.kept and result.ended_kept and result.count == 2
 
 
 async def test_session_stamp_census_an_unverifiable_session_escapes(

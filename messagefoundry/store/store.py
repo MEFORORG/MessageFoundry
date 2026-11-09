@@ -194,7 +194,12 @@ from messagefoundry.store.row_seal import (
     RowSealer,
     RowSealError,
     RowSealKeyRetiredError,
+    RowSealUnverifiableError,
+    TransitSealUnavailableError,
+    TransitSealUnverifiableError,
+    report_revoke_seal_refusal,
     require_seal_for_write,
+    revoke_seal_refusals,
     row_sealer_for_cipher,
     seal_bytes,
 )
@@ -1504,6 +1509,22 @@ async def require_session_seal_for_write(
     await require_seal_for_write(
         sealer, SESSION_KIND, record.seal_fields(), record.seal, subject=""
     )
+
+
+async def write_kept_session(write: Awaitable[SessionRecord | None]) -> SessionRecord | None:
+    """Await a revoke's re-stamp of the session it keeps, reading a Transit Unverifiable or Outage
+    answer as declined (``None``), so the caller ends that session as it ends the rest (decisions
+    d20261109T165402853-83b348 and d20261109T165406730-2505f2 on ADR 0217). A Forged session
+    still raises ``RowSealError``, as on ``main``."""
+    try:
+        return await write
+    except (
+        RowSealUnverifiableError,
+        TransitSealUnverifiableError,
+        TransitSealUnavailableError,
+    ) as exc:
+        report_revoke_seal_refusal(exc, what="the kept session's re-stamp")
+        return None
 
 
 async def session_writer_seal_check(sealer: AnyRowSealer | None, record: SessionRecord) -> None:
@@ -18919,8 +18940,10 @@ class MessageStore:
         revoke's writer transaction (follow-up to BACKLOG #4975). ``revoked`` is the sweep's count;
         an ended kept session is added to it. A declined session left live would be refused at
         its next request anyway, but meanwhile it would hold a slot under the session cap and its
-        refusal would read as a seal failure, so it is ended here, as the sweep ends the rest."""
-        if restamp.kept(await self._write_session(token_hash, restamp)):
+        refusal would read as a seal failure, so it is ended here, as the sweep ends the rest. A
+        Transit refusal of the re-stamp declines it too, so the kept session is ended
+        (:func:`write_kept_session`)."""
+        if restamp.kept(await write_kept_session(self._write_session(token_hash, restamp))):
             return RevokeResult(revoked, kept=True)
         cur = await self._db.execute(
             _END_DECLINED_KEPT_SESSION_SQL, (now, restamp.user_id, token_hash)
@@ -19083,8 +19106,10 @@ class MessageStore:
         bump = EpochBump()
         try:
             return bump.raised(await self._write_user(user_id, bump))
-        except RowSealError:
-            log.warning("an account's record failed its integrity seal; its sessions end anyway")
+        except revoke_seal_refusals() as exc:
+            # Decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2 (ADR 0217): a
+            # Transit Unverifiable or Outage answer goes without the raise too, as Forged does.
+            report_revoke_seal_refusal(exc, what="an account's session epoch raise")
             return None
 
     async def enforce_session_cap(
