@@ -122,14 +122,26 @@ def test_a_driver_that_answers_booleans_reads_the_same() -> None:
     assert classify_login_roles(row).held == ("database role db_owner",)
 
 
-@pytest.mark.parametrize("value", ["1", "0", 2, -1, 1.0, Decimal(1), b"\x01"])
-def test_a_value_other_than_0_or_1_cannot_judge_and_is_never_clean(value: object) -> None:
-    """Only 0, 1 and a bool read. Any other answer, such as a driver's text "1", is unread, so it
-    can never fold to "not held" and read clean (vault BACKLOG #8171, item 45)."""
+@pytest.mark.parametrize("value", ["1", "0", 2, -1, 0.0, Decimal(0), b"\x01"])
+def test_a_value_other_than_1_or_an_integer_0_cannot_judge_and_is_never_clean(
+    value: object,
+) -> None:
+    """Only a 1 or an integer or bool 0 reads. Any other answer, such as a driver's text "1", is
+    unread, so it can never fold to "not held" and read clean (vault BACKLOG #8171, item 45)."""
     row = tuple(value if r == "db_owner" else 0 for r in _ROLES)
     reading = classify_login_roles(row)
     assert reading.verdict is LoginRoleVerdict.CANNOT_JUDGE
     assert reading.unread == ("database role db_owner",) and reading.held == ()
+
+
+@pytest.mark.parametrize("value", [1.0, Decimal(1)])
+def test_a_1_in_another_numeric_type_is_still_held(value: object) -> None:
+    """A 1 can only add a finding, so a driver that answers it as a float or a Decimal still names
+    the role rather than dropping the over-grant to "cannot judge"."""
+    row = tuple(value if r == "db_owner" else 0 for r in _ROLES)
+    reading = classify_login_roles(row)
+    assert reading.verdict is LoginRoleVerdict.OVER_GRANTED
+    assert reading.held == ("database role db_owner",) and reading.unread == ()
 
 
 def test_a_row_of_the_wrong_width_did_not_run() -> None:
