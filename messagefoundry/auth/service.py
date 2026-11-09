@@ -2986,13 +2986,19 @@ async def lockable_account_census(
         except PasskeyRowMalformed as exc:
             _log.warning("a passkey row of user %s did not parse (%s)", user.id, exc)
             creds = []
-        except (UnicodeDecodeError, sqlite3.OperationalError) as exc:
+        except UnicodeDecodeError:
             # A cell the driver cannot decode while fetching (escalation_passkeys names both), on
             # an account this census may now read for the reset list alone: counted for nothing,
             # as a row that does not parse is, rather than losing every other account's finding.
+            # The arm binds no name: a decode error's message quotes the cell, so none is rendered.
+            _log.warning(
+                "the passkeys of user %s could not be read (%s)", user.id, "UnicodeDecodeError"
+            )
+            creds = []
+        except sqlite3.OperationalError as exc:
+            # The same cell, as sqlite3 reports it (told apart only by its message).
             if not passkey_cell_undecodable(exc):
                 raise
-            # The class name only: a decode error's message quotes the cell.
             _log.warning(
                 "the passkeys of user %s could not be read (%s)", user.id, type(exc).__name__
             )
@@ -14059,11 +14065,17 @@ class AuthService:
         try:
             if await self._holds_gate_passkey(user):
                 return
-        except (UnicodeDecodeError, sqlite3.OperationalError) as exc:
+        except UnicodeDecodeError:
+            # The class name only: a decode error's message quotes the cell, so the arm binds no
+            # name. Throttled per account, as _verified_passkeys throttles a row that does not parse.
+            if self._seal_failures_reported.due(f"passkey-decode:{user.id}"):
+                _log.warning(
+                    "the passkeys of user %s could not be read (%s)", user.id, "UnicodeDecodeError"
+                )
+        except sqlite3.OperationalError as exc:
+            # The same cell, as sqlite3 reports it (told apart only by its message).
             if not passkey_cell_undecodable(exc):
                 raise
-            # The class name only: a decode error's message quotes the cell. Throttled per
-            # account, as _verified_passkeys throttles a row that does not parse.
             if self._seal_failures_reported.due(f"passkey-decode:{user.id}"):
                 _log.warning(
                     "the passkeys of user %s could not be read (%s)", user.id, type(exc).__name__

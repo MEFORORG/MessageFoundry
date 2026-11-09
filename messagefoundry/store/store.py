@@ -3411,7 +3411,10 @@ async def escalation_passkeys(
         return await read_passkeys()
     except PasskeyRowMalformed as exc:
         failure = type(exc).__name__
-    except (UnicodeDecodeError, sqlite3.OperationalError) as exc:
+    except UnicodeDecodeError:
+        # No name is bound: a decode error's message quotes the cell, so none is rendered.
+        failure = "UnicodeDecodeError"
+    except sqlite3.OperationalError as exc:
         if not passkey_cell_undecodable(exc):
             raise
         failure = type(exc).__name__
