@@ -3004,8 +3004,11 @@ class AuthStore(Protocol):
 
         The store writes the seals: every session write that changes a sealed column goes through
         one helper per backend, which verifies the row it read before it re-seals it and refuses
-        rather than re-seal a row that fails, as
-        :func:`~messagefoundry.store.row_seal.require_seal_for_write` says with what.
+        rather than re-seal a row that fails. Which types that refusal raises differs by backend.
+        SQLite's goes through :func:`~messagefoundry.store.row_seal.require_seal_for_write`, which
+        says what it raises, and its session writer turns the retired-key type back into
+        ``RowSealError``. Postgres and SQL Server still check with the sync ``session_seal_ok`` and
+        raise only ``RowSealError`` (until ADR 0217 slice 1b-ii ports them).
         A revoke blanks the seal, which needs no key. :class:`AuthService` checks the seals, in its
         one session loader; the store's readers return rows unchecked."""
         ...

@@ -373,7 +373,10 @@ class RowSealer:
 class TransitSealUnavailableError(Exception):
     """A Transit call for a row seal did not complete, or did not answer as Transit answers: the
     **Outage** answer. Not an integrity failure: the row may be sound. It refuses the request or
-    rolls the write back, ends nothing, and records no seal failure.
+    rolls the write back, ends nothing, and records no seal failure, with at least two exceptions
+    the owner ruled on 2026-11-08 (ADR 0217, *Build rulings, 2026-11-08*). At a session rotation it
+    ends the session ("Revoke both"). In the session loader's retired-key lookup it ends the
+    session and records a seal failure ("Revoke, then report").
 
     Deliberately neither a :class:`~messagefoundry.store.crypto.CipherError` nor a
     :class:`RowSealError` (ADR 0217 (c) step 2), so no ``except CipherError`` and no forged-row

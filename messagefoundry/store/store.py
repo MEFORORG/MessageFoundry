@@ -1512,9 +1512,11 @@ def session_seal_ok(sealer: RowSealer | None, record: SessionRecord) -> bool:
 
 # The awaitable read checks below serve either sealer (ADR 0217 slice 1b). Under the local sealer
 # each answers exactly as its sync twin, where it has one. Under Transit an Unverifiable or
-# Outage answer raises as itself (``TransitSealUnverifiableError``, ``TransitSealUnavailableError``):
-# no caller handles either type yet, so each fails closed by raising, and what each caller does
-# with them is the catch census of slices 2 and 1b-iv.
+# Outage answer raises as itself (``TransitSealUnverifiableError``, ``TransitSealUnavailableError``).
+# At least two callers now handle them, under the owner rulings of 2026-11-08: the session loader
+# catches both from ``session_sealed_by_retired_key_async``, and a session rotation catches the
+# Outage. Every other caller still fails closed by raising; what each does is the catch census of
+# slices 2 and 1b-iv.
 
 
 async def session_seal_ok_async(sealer: AnyRowSealer | None, record: SessionRecord) -> bool:

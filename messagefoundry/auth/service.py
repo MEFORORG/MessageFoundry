@@ -10639,8 +10639,11 @@ class AuthService:
         :meth:`_session_seal_failed`, which ends it (BACKLOG #2592).
 
         Under Transit the retired-key lookup is itself a Transit call. When it raises, the row is
-        still ended first and then reported as an integrity failure (``key_changed=False``), never
-        left live (owner ruling 2026-11-08 on ADR 0217, "Revoke, then report")."""
+        still ended first and then reported as an integrity failure (``key_changed=False``) (owner
+        ruling 2026-11-08 on ADR 0217, "Revoke, then report"). The end is best effort, as
+        :meth:`_session_seal_failed` says: a revoke the store refuses is logged, and the row stays
+        live until it lapses. The caught type is not recorded: the report reads as any other seal
+        failure."""
         if await session_seal_ok_async(sealer, session):
             return True
         try:

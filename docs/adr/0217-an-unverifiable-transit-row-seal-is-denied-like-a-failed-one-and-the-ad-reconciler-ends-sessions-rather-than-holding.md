@@ -132,7 +132,9 @@ them here.
 
 **Build rulings, 2026-11-07.** The owner answered three questions the slice 1 build raised, in the
 Manager's chat (`AskUserQuestion`), and the Manager relayed them to the build. No PR comment or
-anchor records them yet; this paragraph is the record in this file.
+anchor records them yet; this paragraph is the record in this file. (Note added 2026-11-09: that
+sentence was true when written. Since then the anchor branch named above,
+`anchor/adr0217-build-rulings-20261107` at 116049cb02, records them.)
 
 - **The strict parse:** "add the sentence" -- difference 6 above.
 - **The start probe:** it also makes a fixed-input `transit/verify`, so a token without the verify
@@ -161,6 +163,14 @@ Manager's chat (`AskUserQuestion`), relayed to the build.
 - **The session loader's retired-key lookup: "Revoke, then report".** When the lookup that tells a
   retired-key session apart raises under Transit, the row is ended first and then reported as an
   integrity failure (`key_changed=False`), never left live.
+
+Two notes on the 2026-11-08 rulings as built, added 2026-11-09. "Revoke both" names two hashes,
+but at the session load no new hash exists yet, so there only the old hash is revoked; at the
+re-key both are. On the elevation path the first load is the lapse check in `_elevated_hash`, and
+the Outage is caught there. Every revoke under either ruling is best effort: a revoke the store
+refuses is logged and leaves the row live until it lapses, so "never left live" holds only when
+the revoke lands. A rotation refused by an Outage is audited as `auth.session_rotation_failed`
+with reason `transit_unavailable`, not `store_error`.
 
 ## Context
 
