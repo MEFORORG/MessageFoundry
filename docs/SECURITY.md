@@ -226,7 +226,7 @@ body, the early sign-in check above still answers before it. A route passes in o
   not trusted on its own (vault BACKLOG #2955): the in-body WebSocket gates, at least `authorize_ws`
   and the web console's `authorize_ui_ws`, record on the handshake whether they admitted the caller,
   the latest answer standing. `WebSocketAcceptGate` reads that record before it lets an accept
-  through. A recorded refusal refuses accept on every socket, whatever its route declares. With no
+  through. When the latest recorded answer is a refusal, it refuses accept on every socket, whatever its route declares. With no
   recorded answer, a socket passes only where its route declares its authorization another way: a
   gate dependency or a `public_route` mark. On a socket it refuses, it refuses a denial response
   the body sends the same way, whatever its status, so none of its status, headers or body goes

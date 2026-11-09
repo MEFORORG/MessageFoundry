@@ -965,9 +965,10 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
 # that ignored a refusal, or never reached its gate, would still accept. So every WebSocket gate
 # records on the handshake's scope whether it admitted the caller, through :func:`record_ws_gate`,
 # and :class:`WebSocketAcceptGate` refuses ``websocket.accept``, and a denial response of any
-# status, on a socket whose scope does not read admitted. A recorded refusal refuses accept on every
-# socket, whatever its route declares. A scope that records no answer still passes where the route
-# declares its authorization some other way: a gate dependency, which ran before the body did, or a
+# status, on a socket whose scope does not read admitted. When the latest recorded answer is a
+# refusal, it refuses accept on every socket, whatever its route declares. A scope that records no
+# answer still passes where the route declares its authorization some other way: a gate dependency,
+# which ran before the body did, or a
 # ``public_route`` mark. An undeclared socket the refusal reaches never gets this far, because
 # :func:`refuse_undeclared_route` refuses it first; one outside the refusal, such as a socket in a
 # mount, is refused here at accept instead unless a gate it calls records an admission.
