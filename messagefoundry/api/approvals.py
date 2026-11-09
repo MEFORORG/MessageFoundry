@@ -729,7 +729,13 @@ class ApprovalGate:
             # A release whose status write failed may have written its outcome row anyway, and
             # then the trail knows what the status does not. Only an unknown outcome is
             # 'interrupted'; a known one is settled to what the trail says.
-            known = await self._recorded_outcome(row)
+            # The catch-up path runs inside a queue request, where a whole-chain walk does not
+            # belong, so only a true start reads the trail; a catch-up row is 'interrupted'.
+            known = (
+                None
+                if claimed_before is not None or trail_ok is False
+                else await self._recorded_outcome(row)
+            )
             if known is not None:
                 # list_audit checks no row MAC, so an outcome row is trusted only while the keyed
                 # chain verifies: a row written by someone without the key must not become a
@@ -1964,7 +1970,13 @@ class ApprovalGate:
                 action,
             )
             moved = await self._settle_status_only(approval_id, status=status, approver=approver)
-            if moved is False and await self._reads_status(approval_id, status):
+            # An 'interrupted' row cannot say whose write put it there: an operator interrupt
+            # from another process lands the same status, so it always falls through.
+            if (
+                moved is False
+                and status != "interrupted"
+                and await self._reads_status(approval_id, status)
+            ):
                 # The row is already at this outcome, so the likeliest cause: the combined write
                 # COMMITTED and only its reply was lost: its row is then already in the log, and
                 # writing another would duplicate the outcome with a false flag. A row at any other
@@ -2613,8 +2625,9 @@ class ApprovalGate:
     # --- stranded 'executing' releases (BACKLOG #1562) -----------------------------------------------
 
     async def list_executing(self) -> list[dict[str, Any]]:
-        """Every release still claimed as ``executing``, oldest claim first, each with what
-        :meth:`interrupt_stranded` would judge of its owner now (BACKLOG #1562).
+        """Releases still claimed as ``executing``, oldest claim first, up to the store read's
+        cap, each with what :meth:`interrupt_stranded` would judge of its owner now (BACKLOG
+        #1562).
 
         A release whose owner never returns stays ``executing``, and the restart reconcile only
         ever moves a process's own rows, so this is where an operator finds one. Params are left

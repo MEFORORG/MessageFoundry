@@ -1400,7 +1400,7 @@ The two gates audit differently. Under the default audit setting, `authorize_ws`
 
 The catalogue is `Permission` in [`auth/permissions.py`](../messagefoundry/auth/permissions.py); the
 enum value **is** the wire/storage string. "Routes" counts engine route objects gated on that permission
-under `create_app()` (they sum to 104, not 100, because BOTH `/messages/export` routes,
+under `create_app()` (they sum to 106, not 102, because BOTH `/messages/export` routes,
 `/messages/{id}/outbound` and `POST /uploads/{id}/resend` require two).
 
 | Constant | Permission | PHI | Routes | Gates |
@@ -1659,7 +1659,7 @@ tuple: they act only on the caller's own account.
 | `POST` | `/approvals/{approval_id}/approve` | `approvals:approve` | `require_step_up` — a fresh step-up, as the resolve asks (owner ruling 2026-10-13, #3241 R4); the requester can never approve their own request; data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/approvals/{approval_id}/reject` | `approvals:approve` | `require_paced` |
 | `POST` | `/approvals/{approval_id}/resolve` | `approvals:approve` | `require_step_up` — records an `interrupted` release as `effects_applied` or `effects_not_applied`; never re-runs it, and the requester can never resolve their own request (BACKLOG #1562) |
-| `GET` | `/approvals/executing` | `approvals:approve` | `require` — every release still claimed as `executing`, with its claim owner and what an interrupt would judge of that owner now; params are not listed (BACKLOG #1562) |
+| `GET` | `/approvals/executing` | `approvals:approve` | `require` — releases still claimed as `executing`, up to the store read's cap, with their claim owner and what an interrupt would judge of that owner now; params are not listed (BACKLOG #1562) |
 | `POST` | `/approvals/{approval_id}/interrupt` | `approvals:approve` | `require_step_up` — moves a stranded `executing` release to `interrupted`, refused while its owner may be live; an owner with no heartbeat to read needs `attest_owner_stopped`; never runs the operation (BACKLOG #1562) |
 | `POST` | `/cluster/stepdown` | `cluster:control` | `require_step_up` |
 | `POST` | `/dr/activate` | `dr:operate` | `require_step_up` |
@@ -2963,12 +2963,13 @@ trail sometimes can, and the restart reads it.
 The claim records which engine process owns the release, in the row's `claim_owner` column. At its
 next start, before the API serves an approval, that process settles each `executing` row it owns.
 It first reads the trail for the row's outcome row, written by the releasing approver. Where it
-finds exactly one `approval.approved` or `approval.failed`, and no `approval.interrupted`, and the
-audit chain verifies under a key the engine holds, it moves the row to that status, `approved` or
-`failed`, with an `approval.reconciled` row naming the outcome row it read. Every other row moves
-to `interrupted`, with an `approval.interrupted` row: no outcome row, an `approval.interrupted`
-one, two that disagree, a trail it cannot read in full, or a chain that does not verify that way,
-a keyless walk included. Each row is in the same write as its move, written against `system`, and carries `reason`
+finds `approval.approved` or `approval.failed` rows that all agree, and no `approval.interrupted`,
+and the audit chain verifies under a key the engine holds, it moves the row to that status,
+`approved` or `failed`, with an `approval.reconciled` row naming the newest outcome row it read.
+Every other row moves to `interrupted`, with an `approval.interrupted` row: no outcome row, an
+`approval.interrupted` one, rows that disagree, a trail it cannot read in full, or a chain that does
+not verify that way, a keyless walk included. Only the start itself reads the trail; the catch-up
+an embedded engine shard runs once its name is known moves each leftover row to `interrupted`. Each row is in the same write as its move, written against `system`, and carries `reason`
 `engine_restart`, the claim owner and the claim time. The move keeps the row's `decided_at` as the
 claim time, so an `interrupted` row a restart settled shows when it was claimed, not when the
 engine restarted. Nothing re-runs. The operator checks the effects of an `interrupted` row and
@@ -2991,7 +2992,8 @@ stays `executing`. Nothing settles it on a timer, because no check here can tell
 a slow one. An operator settles it instead, through two routes (owner-delegated decision of
 2026-10-29, `d20261029T205247402-81159c`):
 
-- `GET /approvals/executing` lists every `executing` row, with its claim owner, its claim time,
+- `GET /approvals/executing` lists `executing` rows, up to the store read's cap and leaving out
+  any that fail their seal, with its claim owner, its claim time,
   whether this process owns it, and what an interrupt would judge of its owner now. It needs
   `approvals:approve`. `GET /approvals` does not list `executing` rows.
 - `POST /approvals/{id}/interrupt` moves one to `interrupted`, so it takes the resolve above. It
