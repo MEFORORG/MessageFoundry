@@ -436,6 +436,7 @@ def _lines_pip_audit_reads(raw: bytes) -> list[str]:
 _COOKIE = re.compile(rb"coding[:=]\s*([-\w.]+)")
 _DIGEST = "a" * 64
 _EVIL = f"evil==1 --hash=sha256:{_DIGEST}"
+_REFUSED = "its copy does not read back, the way pip-audit reads it, as the text whose pins"
 
 
 def _audit_copies(src: Path) -> tuple[int, list[list[str]]]:
@@ -479,8 +480,27 @@ def test_a_copy_pip_audit_would_read_short_is_refused(
     # Was exit 0, "2 pinned requirements audited", and one copy without the evil pin.
     assert copies == [], (status, out, copies)
     assert status == 2
-    assert "does not read back the way pip-audit reads it" in err, err
-    assert "evil" not in err and "bar==" not in err, err
+    assert _REFUSED in err, err
+    # Neither the lock's pins nor its codec name, which is the lock's own text.
+    assert "evil" not in err and "bar==" not in err and "escape" not in err, err
+
+
+def test_a_copy_pip_audit_would_read_by_its_own_locale_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lone CR keeps the declaration on pip's second byte-line, but the copy's newline puts it on
+    the third, where pip-audit does not look, so pip-audit decodes the copy by its own locale. That
+    is a child process whose UTF-8 mode need not be the auditor's: an auditor started with -X utf8
+    read U+2028 back and passed, while a cp1252 pip-audit kept evil inside the comment."""
+    monkeypatch.setattr("locale.getpreferredencoding", lambda do_setlocale=True: "utf-8")
+    src = tmp_path / "x.lock"
+    src.write_bytes(
+        b"# x\r# y\n# coding: utf-8\n# note \xe2\x80\xa8"
+        + f"{_EVIL}\nbar==1 --hash=sha256:{_DIGEST}\n".encode("ascii")
+    )
+    status, copies = _audit_copies(src)
+    assert (status, copies) == (2, []), copies  # was exit 0
+    assert _REFUSED in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -518,7 +538,7 @@ def test_a_copy_whose_read_back_fails_is_refused_without_the_error_text(
     status, copies = _audit_copies(src)
     assert (status, copies) == (2, [])
     err = capsys.readouterr().err
-    assert "does not read back the way pip-audit reads it" in err, err
+    assert _REFUSED in err, err
     assert "invalid continuation" not in err and "xe9" not in err, err
 
 

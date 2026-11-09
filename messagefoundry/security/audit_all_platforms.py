@@ -242,24 +242,23 @@ _PIP_AUDIT_BOMS = (
 )
 
 
-def _read_as_pip_audit(raw: bytes) -> str:
-    """The copy as pip-audit reads it: ``auto_decode`` in pip-requirements-parser 32.0.1, which
-    ``RequirementsFile.from_file`` in pip-audit 2.10.1 calls.
+def _read_as_pip_audit(raw: bytes) -> str | None:
+    """The copy as pip-audit reads it, or ``None`` where that depends on pip-audit's locale.
 
-    Not :func:`_decode_lock`, which reads a lock as pip 26 does: this reader strips the mark it
-    finds, honours a declaration only on a first-two-lines comment of the bytes as written (so a
-    codec that escapes the copy's newlines hides its own declaration), falls back to the locale
-    rather than UTF-8 first, and leaves newlines as they are. Raises ``UnicodeError`` or
-    ``LookupError`` as the decode it picks does.
+    pip-audit 2.10.1's ``RequirementsFile.from_file`` decodes with pip-requirements-parser 32.0.1's
+    ``auto_decode``: by a byte-order mark, in this order; failing one, by a declaration in a comment
+    on either of the first two lines of the bytes as written, so a codec that escapes the copy's
+    newlines hides its own declaration; failing that, by the locale of the pip-audit process. That
+    process is a child whose UTF-8 mode need not be this one's, so this process cannot know that
+    last decode, and ``None`` asks the caller to refuse. Newlines are left as they are, as pip-audit
+    leaves them. Raises ``UnicodeError`` or ``LookupError`` as the decode it picks does.
     """
     for bom, codec in _PIP_AUDIT_BOMS:
         if raw.startswith(bom):
             return raw[len(bom) :].decode(codec)
     declared = (_CODING.search(ln) for ln in raw.split(b"\n")[:2] if ln[:1] == b"#")
     cookie = next((m for m in declared if m is not None), None)
-    if cookie is not None:
-        return raw.decode(cookie[1].decode("ascii"))
-    return raw.decode(locale.getpreferredencoding(False) or sys.getdefaultencoding())
+    return None if cookie is None else raw.decode(cookie[1].decode("ascii"))
 
 
 #: A comment as pip finds one: at the start of a line, or after whitespace.
@@ -532,14 +531,16 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         # encode does not round-trip (unicode_escape escapes every newline, raw_unicode_escape a
         # line separator after a backslash) folds pins into a comment, and pip-audit audits fewer
         # than were counted. Comparing the whole text holds for every codec, with no list of them.
+        # The line names neither the codec, which is the lock's own text of any length, nor the
+        # error, which quotes what it failed on.
         try:
             faithful = _read_as_pip_audit(copy.read_bytes()) == audited
-        except (UnicodeError, LookupError):
+        except (OSError, UnicodeError, LookupError):
             faithful = False
         if not faithful:
             print(
-                f"::error::{args.lock}: its copy, written as {copy_encoding}, does not read back "
-                "the way pip-audit reads it as the text whose pins were counted",
+                f"::error::{args.lock}: its copy does not read back, the way pip-audit reads it, "
+                "as the text whose pins were counted",
                 file=sys.stderr,
             )
             return 2
