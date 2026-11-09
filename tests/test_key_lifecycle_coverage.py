@@ -129,6 +129,9 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     # will wrap the store key. Nothing calls them yet, and the lifecycle page has no row of their
     # own; the DEK row is the one that governs the store key they are built to hold.
     "messagefoundry/store/custody.py": frozenset({_DEK}),
+    # Vault BACKLOG #3411 (B3b): the host key provider mints the store's custody and derives the
+    # store key from its master key.
+    "messagefoundry/store/custody_host.py": frozenset({_DEK}),
     # BACKLOG #2592: the row-seal key is HKDF-derived from the DEK's authorization root.
     "messagefoundry/store/row_seal.py": frozenset({_DEK}),
     # BACKLOG #2593: opens queue payload cells, sealed under the DEK, under their routing tag.

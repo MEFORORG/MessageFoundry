@@ -32,7 +32,8 @@ from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mappi
 from dataclasses import dataclass
 from functools import cache, partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import (
@@ -47,6 +48,7 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     is_vault_hop_refusal,
 )
+from messagefoundry.custody_posture import HOST_KEY_PROVIDER
 from messagefoundry.exception_origin import exception_chain
 from messagefoundry.redaction import prints_a_codec_error
 from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
@@ -77,6 +79,7 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
+    OPEN_STORE_PIN,
     UPLOAD_RESERVATION_STALE_AFTER,
     AdMap,
     AdminGrant,
@@ -125,6 +128,7 @@ from messagefoundry.store.store import (
     SessionRecord,
     SignCountAnswer,
     Stage,
+    StorePin,
     StreamingAttachmentsUnsupported,
     TotpUsable,
     UserRecord,
@@ -135,6 +139,7 @@ from messagefoundry.store.store import (
 log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; both carry an optional driver, imported lazily
+    from messagefoundry.store.custody import HostBlob
     from messagefoundry.store.postgres import PostgresStore
     from messagefoundry.store.sqlserver import SqlServerStore
 
@@ -169,7 +174,9 @@ __all__ = [
     "Store",
     "StoreLifecycle",
     "KeylessAuditChainRefused",
+    "SCHEMA_SEED_FILTERS",
     "StoreNotFoundError",
+    "TableCensusIncomplete",
     "StreamingAttachmentsUnsupported",
     "PROVISION_SCHEMA_COMMAND",
     "SchemaDdlLockTimeout",
@@ -181,7 +188,9 @@ __all__ = [
     "make_spec",
     "open_store",
     "probe_store_privileges",
+    "server_store_schema_found_anywhere",
     "provision_store_schema",
+    "seed_filter_clause",
     "sqlite_settings",
     "store_driver_errors",
     "warm_pool_connections",
@@ -200,6 +209,30 @@ class DbaDelegatedError(RuntimeError):
     reimplemented in the engine, so the snapshot raises this rather than producing a half-baked copy. The
     BackupRunner / ``backup`` CLI catch it and fall back to a config-only backup (or skip) per
     ``[backup].config_only_on_server_db``."""
+
+
+class TableCensusIncomplete(RuntimeError):
+    """:meth:`Store.table_occupancy` could not show that it lists every table in the store's
+    schema: on SQL Server the login does not hold ``VIEW DEFINITION`` on that schema, or the
+    server did not answer whether it does, so ``sys.tables`` may hide a table that holds rows. The
+    text names the schema and the grant that clears it, never a row."""
+
+
+#: The row a schema build seeds into each table before anything uses the store, as a filter that
+#: matches every OTHER row: :meth:`Store.table_occupancy` reads such a table as held only when a
+#: row past its seed exists. ``global_session_epoch`` is seeded with its one row at epoch 0; a
+#: revoke-all raises it, which is state a mint must not take over. A constant fragment, the same
+#: on all three backends, never built from input.
+SCHEMA_SEED_FILTERS: Final[Mapping[str, str]] = MappingProxyType(
+    {"global_session_epoch": "NOT (id = 1 AND epoch = 0)"}
+)
+
+
+def seed_filter_clause(table: str) -> str:
+    """The ``WHERE`` clause a census probe of ``table`` appends, from :data:`SCHEMA_SEED_FILTERS`
+    by exact name, or nothing. Each backend's :meth:`Store.table_occupancy` calls this one."""
+    seed = SCHEMA_SEED_FILTERS.get(table)
+    return "" if seed is None else f" WHERE {seed}"
 
 
 class ReferenceKeyCollision(ValueError):
@@ -1820,6 +1853,34 @@ class QueueStore(StoreLifecycle, Protocol):
 
     # --- store health / metrics ----------------------------------------------
     async def db_status(self) -> DbStatus: ...
+
+    async def table_occupancy(self) -> Mapping[str, bool]:
+        """The store's own tables, read from the database's catalog rather than from this build's
+        DDL, mapped to whether each holds a row. A table in :data:`SCHEMA_SEED_FILTERS` reads as
+        held only when it holds a row past the one a schema build seeds. Names are exactly as the
+        catalog stores them.
+
+        Which tables: on SQLite, the main schema's tables in ``sqlite_master`` less virtual
+        tables (whose module may not be loaded here) and SQLite's own ``sqlite_*``; a virtual
+        table's shadow tables are ordinary tables there and count. On Postgres, the ordinary and
+        partitioned tables in the schema of the store's own ``schema_meta`` (as ``search_path``
+        resolves it), less the tables an extension owns (PostGIS's ``spatial_ref_sys``). On SQL
+        Server, the tables in the schema of the store's own ``schema_meta`` (as ``OBJECT_ID``
+        resolves it), less those SQL Server ships and external ones. On both server backends no
+        ``schema_meta`` means no tables.
+
+        What it cannot see, at least: rows a row-level security policy (Postgres) or a security
+        policy filter (SQL Server) hides from this login, which read as empty and raise nothing;
+        and on SQL Server a table whose metadata the login may not see, which ``sys.tables`` does
+        not list. SQL Server alone raises :class:`TableCensusIncomplete` unless the login holds
+        ``VIEW DEFINITION`` on the whole schema. That grant lists a table a table-level ``DENY``
+        of ``SELECT`` covers, which then fails its probe; it does not show that no table-level
+        ``DENY`` of ``VIEW DEFINITION``, or of a permission that covers it such as ``CONTROL``,
+        hides one. SQLite and Postgres make no such check. A listed table that
+        cannot be read raises the driver's error. Existence only: no cell is read except the two
+        plaintext integers a seed filter compares (``global_session_epoch.id`` and ``.epoch``),
+        so an open under a throwaway key decrypts nothing (vault BACKLOG #3411)."""
+        ...
 
     def pool_status(self) -> PoolStatus | None:
         """A read-only snapshot of this backend's connection pool, or ``None`` on a backend with no
@@ -3520,15 +3581,20 @@ def resolve_decrypt_keys(
             # Copied here, so a provider whose sequence reads as it is iterated is refused here too.
             retired_keys = list(provider.retired_keys())
         except Exception as exc:
+            # The traceback of whatever leaves keeps this frame, the judgement's own escape
+            # included, so the key the provider answered is dropped first; assigned rather than
+            # deleted, since the call that raised may have left it unbound.
+            active = None
             caught, refusal = exc, _codec_safe_refusal(exc)
         else:
             return _keyring(active, retired_keys)
-        # As at :func:`resolve_active_key`.
+        # As at :func:`resolve_active_key`, and with neither the caught error nor the refusal left
+        # bound, even where the call raises, so no cycle through this frame keeps either.
         try:
             refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
+            raise refusal from None
         finally:
-            del caught  # dropped even where the call raises, at the recursion limit included
-        raise refusal from None
+            del caught, refusal
     finally:
         _flush_unjudged()
 
@@ -3551,7 +3617,9 @@ def _keyring(active: str | None, retired_keys: Sequence[str]) -> list[str]:
     return keyring
 
 
-def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = None) -> Cipher:
+def build_store_cipher(
+    settings: StoreSettings, *, posture: HopPosture | None = None, host_key: str | None = None
+) -> Cipher:
     """Build the at-rest cipher for ``settings`` — the SAME construction ``open_store`` uses (active key
     + retired decrypt-only keyring, ``write_v2=aad_bind``). Exposed so a store-DECOUPLED PHI-at-rest
     surface — the offline uploaded-logs files (ADR 0134) — encrypts under the identical DEK / keyring /
@@ -3563,6 +3631,10 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     client setting it refuses. Each comes from the settings or the key provider before the store
     reads a row, so a caller can treat that class as "could not start" where a bare ``ValueError``
     from the open could mean anything (vault BACKLOG #3054, item 8).
+
+    ``host_key`` is the key :func:`open_store` derived from the host blob it read itself, under the
+    ``host`` key provider (vault BACKLOG #3411), so the blob is read once per open; ``None`` resolves
+    the key through the provider as every other caller does.
 
     ``posture`` is the instance posture the caller holds. It reaches the two Vault hops a cipher
     build can dial, the key provider and the Transit cipher, whose revocation guard is keyed on it
@@ -3583,16 +3655,17 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     texts = _TRANSIT_BUILD_TEXTS if settings.cipher_provider == "vault_transit" else _BUILD_TEXTS
     try:
         try:
-            return _build_store_cipher(settings, posture)
+            return _build_store_cipher(settings, posture, host_key)
         except Exception as exc:
+            del host_key  # the store data key, dropped first, as at resolve_decrypt_keys
             caught, refusal = exc, _codec_safe_refusal(exc)
-        # As at :func:`resolve_active_key`. A hop refusal is a ``StoreCipherConfigError`` here, as
-        # every ``ValueError`` from the build is, so each command's key arm still reports it.
+        # As at :func:`resolve_decrypt_keys`. A hop refusal is a ``StoreCipherConfigError`` here,
+        # as every ``ValueError`` from the build is, so each command's key arm still reports it.
         try:
             refusal = _in_place_of(caught, refusal, texts, StoreCipherConfigError)
+            raise refusal from None
         finally:
-            del caught  # as at resolve_active_key
-        raise refusal from None
+            del caught, refusal
     finally:
         _flush_unjudged()
 
@@ -3994,7 +4067,9 @@ class StoreCipherConfigError(ValueError):
     not it holds a codec error, and one whose judgement raised an ``Exception``."""
 
 
-def _build_store_cipher(settings: StoreSettings, posture: HopPosture | None) -> Cipher:
+def _build_store_cipher(
+    settings: StoreSettings, posture: HopPosture | None, host_key: str | None = None
+) -> Cipher:
     if settings.cipher_provider == "vault_transit":
         # ADR 0138: bulk at-rest crypto INSIDE Vault/OpenBao Transit — the plaintext DEK never enters
         # engine heap (ASVS 13.3.3). Lazy-imported so the base install pulls no Vault SDK; fails closed at
@@ -4009,7 +4084,7 @@ def _build_store_cipher(settings: StoreSettings, posture: HopPosture | None) -> 
         )
     retired = [k.strip() for k in settings.encryption_keys_retired.split(",") if k.strip()]
     return make_cipher(
-        resolve_active_key(settings, posture=posture),
+        host_key if host_key is not None else resolve_active_key(settings, posture=posture),
         retired,
         write_v2=settings.aad_bind,
         allow_unmarked=settings.allow_unmarked_ciphertext,
@@ -4428,6 +4503,8 @@ async def open_store(
     posture: HopPosture | None = None,
     keyless_chain_refusal: str | None = KEYLESS_REFUSED_BY_NO_OPT_OUT,
     refusal_hook: UnmarkedRefusalHook | None = None,
+    custody: HostBlob | None = None,
+    recovery_wrap: bytes = b"",
 ) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
 
@@ -4491,6 +4568,24 @@ async def open_store(
     refuse an unmarked value -- the sweep finds a planted row, or the eager ``state``/``reference``
     cache load reads one and aborts the open -- and only a hook armed this early can alert on those.
     ``None`` leaves the refusal to the log, as a CLI utility's open does.
+
+    **Key custody (vault BACKLOG #3411).** Under ``[store].key_provider = 'host'`` the open reads
+    the host blob itself (:func:`~messagefoundry.store.custody_host.load_host_custody`; a writable
+    open converts a handoff on the service's first start), derives the store key from it, and holds
+    the store to the blob's store ids at EVERY open: a new store's audit genesis record is written
+    with the current id, and an existing store's must name one the blob names, or the open raises
+    :class:`~messagefoundry.store.store.StoreIdPinRefused` with the handle closed. ``custody`` is
+    the blob a minting command holds in memory and passes instead (``provision-admin`` creating the
+    store it minted for; a handoff it wrote is not its to read). Under any other provider a host
+    blob or a handoff in the custody directory refuses the open, and ``custody`` must be ``None``.
+    ``recovery_wrap`` is the minting command's recovery wrap, written into the new store's genesis
+    record beside its store id (draft rule 4). A writable open checks the pin once the schema is in
+    place and before its first write (``store.store.check_open_store_pin``), so a store that is not
+    the blob's is refused before anything is written to it, its salt bind and at-rest sweep
+    included.
+    Every custody refusal is a :class:`~messagefoundry.store.keyprovider.KeyProviderError`, with a
+    fixed text and no cause or context; :func:`_host_custody_for_open` says which errors on the
+    custody path are replaced (BACKLOG #4882).
     """
     if create and read_only:
         raise ValueError("open_store: create and read_only exclude each other")
@@ -4504,7 +4599,22 @@ async def open_store(
     # crypto inside Vault/OpenBao Transit so the DEK never enters heap (ASVS 13.3.3). No key → identity.
     # The posture goes to the cipher build as it is. `None` is not replaced by the ambient
     # posture there: on a Vault hop an unknown posture counts as enforcing (vault BACKLOG #2983).
-    cipher = build_store_cipher(settings, posture=posture)
+    # The host blob's checked read, a DPAPI call and, on a first start, a conversion, or for any
+    # other provider the look for a host blob beside it: file system work, off the loop.
+    pin, host_key = await asyncio.to_thread(
+        _host_custody_for_open,
+        settings,
+        custody,
+        posture=posture,
+        read_only=read_only,
+        recovery_wrap=recovery_wrap,
+    )
+    try:
+        cipher = build_store_cipher(settings, posture=posture, host_key=host_key)
+    finally:
+        # The store data key itself, dropped whether the build refused or not, so this frame does
+        # not hold it on the build's refusal. The cipher and audit key built from it stay below.
+        del host_key
     setter = getattr(cipher, "set_refusal_hook", None)
     if refusal_hook is not None and callable(setter):
         setter(refusal_hook)
@@ -4519,16 +4629,22 @@ async def open_store(
     # while the posture claimed the most isolated MAC available. Every backend now takes both and
     # gates on "either secret present" (`_audit_keyed_capable`).
     audit_mac_fn = cipher.audit_mac_fn()
-    store = await _open_backend(
-        settings,
-        cipher=cipher,
-        audit_mac_key=audit_mac_key,
-        audit_mac_fn=audit_mac_fn,
-        message_events=message_events,
-        posture=posture,
-        create=create,
-        read_only=read_only,
-    )
+    # The pin rides a context variable to the genesis read every backend shares (vault BACKLOG
+    # #3411); reset at once, so no later open in this context inherits it.
+    pinned = OPEN_STORE_PIN.set(pin)
+    try:
+        store = await _open_backend(
+            settings,
+            cipher=cipher,
+            audit_mac_key=audit_mac_key,
+            audit_mac_fn=audit_mac_fn,
+            message_events=message_events,
+            posture=posture,
+            create=create,
+            read_only=read_only,
+        )
+    finally:
+        OPEN_STORE_PIN.reset(pinned)
     if keyless_chain_refusal is not None and audit_mac_key is None and audit_mac_fn is None:
         await _refuse_to_start_a_keyless_chain(
             store,
@@ -4536,6 +4652,85 @@ async def open_store(
             key_named=bool(settings.encryption_key or settings.encryption_key_file),
         )
     return store
+
+
+def _host_custody_for_open(
+    settings: StoreSettings,
+    custody: HostBlob | None,
+    *,
+    posture: HopPosture | None,
+    read_only: bool,
+    recovery_wrap: bytes = b"",
+) -> tuple[StorePin | None, str | None]:
+    """``(pin, key)`` for an open under the ``host`` key provider, or ``(None, None)`` for any other
+    provider once no host blob or handoff is found beside it (vault BACKLOG #3411). See
+    :func:`open_store`.
+
+    A caller passing ``custody`` or ``recovery_wrap`` under another provider gets a
+    ``ValueError`` first. After that, a custody refusal the engine built (a ``KeyProviderError``
+    recorded as built, :func:`_recorded`) passes through as it is. Any other ``Exception`` from
+    the custody steps is replaced by
+    :func:`~messagefoundry.store.custody_host.custody_refusal_at_open`'s refusal, which keeps a
+    recorded error's own text and reads nothing from any other, raised outside the handler, so it
+    has no cause and no context (BACKLOG #4882). At least an ``OSError`` from a step the custody
+    reads do not wrap is one: the custody directory's resolve, the minted blob's settings check,
+    pin and key, and the observation."""
+    from messagefoundry.store.custody_host import custody_refusal_at_open
+
+    if settings.key_provider != HOST_KEY_PROVIDER and (custody is not None or recovery_wrap):
+        raise ValueError("open_store: custody is for the 'host' key provider only")
+    try:
+        try:
+            return _host_custody_steps(
+                settings, custody, posture=posture, read_only=read_only, recovery_wrap=recovery_wrap
+            )
+        except Exception as exc:
+            # Judged by identity and by type(), so none of the error's own code runs.
+            if _recorded_text(exc) is not None and issubclass(type(exc), KeyProviderError):
+                raise  # a custody refusal the engine built, already with no chain
+            caught = exc
+        # Built and raised outside the handler, never bound here, and the replaced error dropped,
+        # so no cycle through this frame keeps either.
+        try:
+            raise custody_refusal_at_open(caught)
+        finally:
+            del caught
+    finally:
+        _flush_unjudged()  # the replaced class, logged once no handler is running
+
+
+def _host_custody_steps(
+    settings: StoreSettings,
+    custody: HostBlob | None,
+    *,
+    posture: HopPosture | None,
+    read_only: bool,
+    recovery_wrap: bytes,
+) -> tuple[StorePin | None, str | None]:
+    """:func:`_host_custody_for_open`'s work, before an error from it is judged."""
+    from messagefoundry.store.custody_host import (
+        HostCustodyRefused,
+        check_host_custody_settings,
+        foreign_custody_refusal,
+        host_store_key,
+        load_host_custody,
+        store_pin,
+    )
+
+    if settings.key_provider != HOST_KEY_PROVIDER:
+        refusal = foreign_custody_refusal(settings)
+        if refusal is not None:
+            # Recorded, so open_store passes it through with its remedy rather than replace it.
+            raise _recorded(HostCustodyRefused(refusal), refusal)
+        return None, None
+    if custody is None:
+        enforcing = posture is None or posture.enforcing
+        custody = load_host_custody(
+            settings, enforcing=enforcing, convert=not read_only, observe=True
+        )
+    else:
+        check_host_custody_settings(settings)
+    return store_pin(custody, recovery_wrap), host_store_key(custody)
 
 
 async def _refuse_to_start_a_keyless_chain(
@@ -4661,6 +4856,25 @@ def _server_store_class(backend: StoreBackend) -> type[SqlServerStore] | type[Po
 
         return PostgresStore
     raise NotImplementedError(f"store backend {backend.value!r} is not implemented yet")
+
+
+async def server_store_schema_found_anywhere(
+    settings: StoreSettings, *, posture: HopPosture | None = None
+) -> bool | None:
+    """Whether a schema the open resolves holds an object under a name the store's create
+    gives a schema-wide object, whoever built it, read from the catalog rather than through the
+    login's own name resolution, or ``None`` when the login cannot show that (PR 2804 fourteenth
+    to sixteenth holds). Such an object breaks the create, so a mint beside one is refused too.
+    The names are at least the tables, with the indexes on Postgres and the named constraints on
+    SQL Server. Postgres: the search_path's schemas, in ``pg_class`` and ``pg_type``, which every
+    role reads whatever its schema privileges. SQL Server: the login's default schema and ``dbo``, in ``sys.objects``, counted
+    only where the login holds ``VIEW DEFINITION`` on both. A schema outside those, such as
+    another install's ``db_schema``, is not asked. What it cannot see, at least: on SQL Server a
+    table-level ``DENY`` of ``VIEW DEFINITION`` on such a table itself. A read-only check on a
+    one-connection pool. Raises what the connection and the driver raise."""
+    return await _server_store_class(settings.backend).schema_meta_anywhere(
+        settings, posture=posture
+    )
 
 
 async def probe_store_privileges(

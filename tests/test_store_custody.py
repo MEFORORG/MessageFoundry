@@ -205,11 +205,24 @@ def test_host_blob_round_trips() -> None:
         assert HostBlob.parse(blob.serialize()) == blob
 
 
-def test_an_unknown_host_blob_version_is_refused() -> None:
+@pytest.mark.parametrize("version", [1, 3])
+def test_an_unknown_host_blob_version_is_refused(version: int) -> None:
+    # Version 1 had no recovery proof; it is refused like any version this engine does not write.
     data = bytearray(_blob().serialize())
-    data[4] = 2
-    with pytest.raises(CustodyError, match="version 2, and this engine reads version 1 only"):
+    data[4] = version
+    with pytest.raises(
+        CustodyError, match=f"version {version}, and this engine reads version 2 only"
+    ):
         HostBlob.parse(bytes(data))
+
+
+def test_the_recovery_proof_round_trips_and_reads_none_for_never() -> None:
+    proved = HostBlob(MasterKey(_MASTER), StoreId(b"\x11" * 16), (), 1_800_000_000)
+    assert HostBlob.parse(proved.serialize()).recovery_proved_at == 1_800_000_000
+    assert HostBlob.parse(_blob().serialize()).recovery_proved_at is None
+    assert "recovery_proved_at=1800000000" in repr(proved)
+    with pytest.raises(CustodyError, match="recovery proof"):
+        HostBlob(MasterKey(_MASTER), StoreId(b"\x11" * 16), (), -1)
 
 
 @pytest.mark.parametrize(
@@ -1151,7 +1164,8 @@ def test_windows_an_engine_on_a_shared_account_reads_no_handoff(
 def test_windows_a_handoff_made_for_this_account_round_trips(tmp_path: Path) -> None:
     path = tmp_path / "handoff.key"
     me = _engine_sid()
-    custody.write_handoff_file(path, _blob(), service_account=f"*{me}")
+    # enforcing=False: the account may be a domain one on a dev box; the rule is the wiring's test.
+    custody.write_handoff_file(path, _blob(), service_account=f"*{me}", enforcing=False)
     assert _aces(path) == {(0, _FULL, _SYSTEM), (0, _FULL, _ADMINS), (0, _READ_DELETE, me)}
     assert custody.read_handoff_file(path) == _blob()
     assert custody.consume_handoff_file(path, lambda blob: None) == _blob()
@@ -1175,7 +1189,7 @@ def test_windows_an_elevated_handoff_is_owned_by_administrators_and_reads(tmp_pa
     from messagefoundry.store import store as store_mod
 
     path = tmp_path / "handoff.key"
-    custody.write_handoff_file(path, _blob(), service_account=f"*{_engine_sid()}")
+    custody.write_handoff_file(path, _blob(), service_account=f"*{_engine_sid()}", enforcing=False)
     parsed = store_mod._parse_sddl_dacl(store_mod._read_dacl_sddl(path, owner=True) or "")
     assert parsed is not None and parsed.owner == _ADMINS
     assert custody.read_handoff_file(path) == _blob()
