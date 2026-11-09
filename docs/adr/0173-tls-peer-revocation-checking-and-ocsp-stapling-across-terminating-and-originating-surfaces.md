@@ -835,9 +835,7 @@ an attested hop its record says no certificate revocation checking (OCSP/CRL) is
 the guard credits a CRL that the handshake still consults. That record and that ALLOW contradict
 each other. Whether such a context's CRL should admit the hop is not decided here. The AI broker writes its own records, not the
 guard's, and its line keeps the unrelaxed words: no context that skips time validity reaches it,
-because it dials rest.py's shared opener, which never relaxes. The
-REST, SOAP and FHIR hops pass no such flag, so their line keeps the partial over-statement this
-paragraph describes; their refusal text is left open in §13 too. *(Note 2026-11-04: the open limit above is closed by
+because it dials rest.py's shared opener, which never relaxes. *(Note 2026-11-04: the open limit above is closed by
 vault BACKLOG #5086. `capture()` reads the time-validity flag off any context it is handed, so a
 context that skips time validity earns no CRL credit without the flag either, takes the relaxed
 words and, where the caller passes no remedy, `EXPIRY_RELAXED_WAYS_ACROSS`; "Only the flag sets
@@ -1615,6 +1613,3 @@ refused with a CRL on the relaxed context, admitted and audited on the attestati
 credit, warned when not enforcing, and admitted by the same CRL without the relaxation, for each
 hop.
 
-**Left open.** The REST, SOAP and FHIR refusals on this shape still name the default remedy, which
-offers `[tls].crl_file`; they hand the guard no opener, so that lever cannot cross them. This
-amendment does not change those three call sites.

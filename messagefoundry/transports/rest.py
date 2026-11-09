@@ -1624,8 +1624,9 @@ def refuse_unrevoked_verified_hop(
     revocation_attested_reason: str | None = None,
     opener: urllib.request.OpenerDirector | None,
     ways_across: str | None = None,
+    expiry_relaxed: bool = False,
     connection: str | None,
-    description: str = "delivers over verified https but performs no certificate revocation checking",
+    description: str | None = None,
 ) -> None:
     """Refuse a VERIFYING ``https`` hop that does no certificate revocation checking (#201, ADR 0078 amend).
 
@@ -1671,11 +1672,19 @@ def refuse_unrevoked_verified_hop(
     :data:`ECH_HOP_WAYS_ACROSS`, so its refusal offers only a lever that can cross it. ``None``
     keeps the default.
 
+    ``expiry_relaxed`` is passed through to :meth:`RevocationHopGuard.capture`. A hop whose opener
+    sets ``tls_allow_expired`` passes it true, beside ``opener=None``, so its refusal names
+    ``tls_allow_expired`` and offers :data:`~messagefoundry.config.tls_policy.EXPIRY_RELAXED_WAYS_ACROSS`
+    rather than a ``[tls].crl_file``, which cannot admit that hop (vault BACKLOG #2977 item 2). It
+    changes the record's words only: with no opener the guard credits no CRL either way. The
+    record's lead then drops "no revocation check", as on MLLP and the DICOM SCU: a CRL that
+    reaches such a hop still refuses a leaf it lists, and the relaxed record says what it lacks.
+
     ``connection`` is the declaring connection's name, recorded in the audit line logged when an
     attestation crosses the refusal, so the record leads back to the declaration (ADR 0173).
 
-    ``description`` says what the hop does over verified https, in the refusal's own words. The
-    default fits a destination. A hop that only reads, such as the ``FhirLookup`` read path, passes
+    ``description`` says what the hop does over verified https, in the refusal's own words.
+    ``None`` is the destination's wording. A hop that only reads, such as the ``FhirLookup`` read path, passes
     its own, so its refusal does not say it delivers (BACKLOG #2987). The refusal appends
     ``to <host>`` to it.
 
@@ -1683,15 +1692,21 @@ def refuse_unrevoked_verified_hop(
     BACKLOG #1924)."""
     if scheme != "https":
         return
+    if description is None:
+        description = "delivers over verified https" + (
+            "" if expiry_relaxed else " but performs no certificate revocation checking"
+        )
     RevocationHopGuard.capture(
         host=_hop_guard_host(url, cell=connector),
-        cell=f"{connector} (verified TLS, no revocation check)",
+        cell=f"{connector} (verified TLS"
+        + (", tls_allow_expired)" if expiry_relaxed else ", no revocation check)"),
         description=description,
         attested=revocation_attested,
         attested_reason=revocation_attested_reason,
         connection=connection,
         context=None if opener is None else opener_tls_context(opener, connector=connector),
         ways_across=ways_across,
+        expiry_relaxed=expiry_relaxed,
     ).enforce_construction()
 
 
@@ -2931,9 +2946,8 @@ class RestDestination(DestinationConnector):
             #
             # Last in __init__, below every statement that builds or replaces `self._opener`, and no
             # opener with an ECH sidecar or tls_allow_expired: see refuse_unrevoked_verified_hop.
-            no_crl_evidence = self._ech_sidecar is not None or bool(
-                s.get("tls_allow_expired", False)
-            )
+            allow_expired = bool(s.get("tls_allow_expired", False))
+            no_crl_evidence = self._ech_sidecar is not None or allow_expired
             refuse_unrevoked_verified_hop(
                 scheme,
                 self.url,
@@ -2942,6 +2956,9 @@ class RestDestination(DestinationConnector):
                 revocation_attested_reason=config.tls_revocation_attested_reason,
                 opener=None if no_crl_evidence else self._opener,
                 ways_across=ECH_HOP_WAYS_ACROSS if self._ech_sidecar is not None else None,
+                # The sidecar, not the engine, dials the partner on an ECH hop, so the relaxation
+                # never reaches it there and the ECH remedy above stands.
+                expiry_relaxed=self._ech_sidecar is None and allow_expired,
                 connection=config.name,
             )
         if self._ech_sidecar is not None and ech_sidecar_is_cleartext(self._ech_sidecar):
