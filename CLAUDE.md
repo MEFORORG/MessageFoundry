@@ -191,17 +191,19 @@ messagefoundry/
   pipeline/        # engine.py (Engine), wiring_runner.py (RegistryRunner), dryrun.py
   transports/      # base.py (connector registry), mllp.py, file.py, dicom.py (C-STORE SCP + SCU/C-ECHO), dicomweb.py (STOW-RS, ADR 0025), smart.py (SMART Backend Services token provider, ADR 0024)   ← "connectors"
   parsing/         # peek.py + _builtin_hl7.py (tolerant, hot path), tree.py, validate.py (hl7apy, strict); x12/ (X12 EDI codec, ADR 0012), dicom/ (DICOM codec, ADR 0025), binary.py (base64 carriage, ADR 0028)
-  anon/            # de-identification framework (ADR 0030; vendored to tee/anon/)
   store/           # base.py (Store protocol + open_store factory), store.py (SQLite WAL inbox/outbox), sqlserver.py, postgres.py
   auth/            # authn + RBAC core (no FastAPI): permissions/roles, Identity, passwords, tokens, ldap, service.py
   api/             # FastAPI app.py + models.py + security.py (auth deps) + auth_routes.py (the engine's only external surface)
   apiclient/       # Qt-free / FastAPI-free engine-client library (ADR 0088) — the shared HTTP client (httpx)
-  generators/      # conformant synthetic HL7 generators (adt.py, …) — `messagefoundry-toolkit generate`; corpus git-ignored
   security/        # security assets shipped in the wheel (ADR 0144)
   support/         # support-bundle assembly + redaction (bundle.py, redact.py)
   verify/          # deployment verifier — `messagefoundry verify` (checks.py, smoke.py, federation.py)
   tray/            # Windows tray service-manager (ADR 0113) — stdlib ctypes, no PySide6; wraps service/service_status only
   checks.py        # `messagefoundry check` commit/CI gate (validate + dryrun + advisory lint)
+messagefoundry_toolkit/  # the `messagefoundry-toolkit` distribution's package: authoring commands (ADR 0201)
+  anon/            # de-identification framework (ADR 0030; vendored to tee/anon/)
+  generators/      # conformant synthetic HL7 generators (adt.py, …) — `messagefoundry-toolkit generate`; corpus git-ignored
+  hl7schema.py, hl7structures.py  # HL7 v2.5.1 schema emitters behind the IDE's bundled JSON (ADR 0104)
 ide/               # VS Code extension (TypeScript): setup, promote, test bench, AI commands
 environments/      # per-environment <env>.toml value files for env() lookups (dev/staging/prod)
 samples/           # config/ (example Connection/Router/Handler modules) + send_mllp.py sender
@@ -283,8 +285,15 @@ ASVS Tracker.
 NOT a renamed Console, so a Console rule does not transfer by substitution. **The REGULATOR went
 on 2026-09-19, NOTHING replaced it, and NO SEAT ATTRIBUTES A RED NOW.** A red is the Lander's to
 triage and route, or the owner's to rule on. The Watchdog is **not the Regulator's successor**: it
-returns evidence and no verdict. `docs/roles/seats.json` resolves both names to a retirement
-notice. The full notices are in [`docs/METHOD.md`](docs/METHOD.md), *Retired CLAUDE.md notices*.
+returns evidence and no verdict. **The STEWARD is retired too: the owner said so on 2026-11-05, and
+when it went is not recorded.** No successor seat is recorded, and the usage controls stayed: korus
+`roles/COMMON.md`, read at `origin/main`, holds them, the states under *The three usage states*,
+which names the seats they bind, and the Workflow gate under *Prohibitions that bind before any
+task starts*. The user-scope usage watch hook, `watch.py`, prints the weekly ladder and the Workflow gate only on a
+config root that wires it; where nothing prints them, for example in a cloud session or on an
+unwired root, they bind all the same. `docs/roles/seats.json` resolves all three names to a
+retirement notice. The full notices, the Steward's under *The Steward, retired before 2026-11-05*,
+are in [`docs/METHOD.md`](docs/METHOD.md), *Retired CLAUDE.md notices*.
 
 If a document you are reading names a retired seat or a retired rule, treat **that
 naming** as stale and follow this section. **Do not extend it to the whole document.** A retired rule
@@ -334,12 +343,11 @@ tool too.
 
 | Seat | Life | Owns | Must not |
 |---|---|---|---|
-| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads the backlog ledger (in the vault since 2026-09-13; `docs/BACKLOG.md` here is a stub), writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes, and **decides when to cut a PR and what goes in it**, usually one PR per wave (owner ruling 2026-09-23). It briefs at full speed with no work-in-progress limit: at least the open PR count, the merge queue and the merge rate never limit briefing, and no item count caps a wave PR (owner ruling 2026-10-26). Usage limits still bind, at least a Steward hold and the Workflow gate; korus `roles/STEWARD.md` and `roles/COMMON.md` define them. ASVS record work, which it dispatches to vault Builders (owner ruling 2026-09-23; see the note below). | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
+| **Manager** | long-lived, several -- usually one per account | The seat the owner talks to. Reads the backlog ledger (in the vault since 2026-09-13; `docs/BACKLOG.md` here is a stub), writes a disposable brief citing an item, dispatches subagent Builders in its own process, polls for state, pushes, and **decides when to cut a PR and what goes in it**, usually one PR per wave (owner ruling 2026-09-23). It briefs at full speed with no work-in-progress limit: at least the open PR count, the merge queue and the merge rate never limit briefing, and no item count caps a wave PR (owner ruling 2026-10-26). Usage limits still bind, at least the weekly HOLD NEW WORK state, under the owner's ruling of 2026-10-31 that the weekly window carries the stop, and the 90 percent Workflow gate; korus `roles/COMMON.md`, read at `origin/main`, *The three usage states*, holds the states, levels and triggers and names where the rate constants live, and the same file's *Prohibitions that bind before any task starts* states the gate. The user-scope usage watch hook `watch.py` is a copy that prints the current state and the gate only on a config root that wires it, and COMMON wins where the two disagree; where nothing prints them, for example in a cloud session or on an unwired root, they bind all the same. `decision.ps1` grades the class B HOLD level from `~/.claude/mefor-usage/thresholds.json` wherever that file sets one (`scripts/coord/_decisionlog.ps1`, `Get-DecisionRungLevels`), so it can grade against a number other than COMMON's. ASVS record work, which it dispatches to vault Builders (owner ruling 2026-09-23; see the note below). | Build. Attribute a red -- nobody does that now. Enqueue or merge -- both are the Lander's. Wait on inbound messages; it polls instead. Exit with a worker's work unpushed. |
 | **Builder** | ephemeral, one per brief | The change, the commit, and the push. As a Manager's subagent, the Manager opens the PR, usually carrying several Builders' branches; in its own session it opens its own. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR as a Manager's subagent; that is the Manager's. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
-| **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
 | **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below), and flagging the hygiene its own merges leave: installed-hook drift after a hook-changing PR, and merged branches whose worktrees remain (owner ruling 2026-09-26). Standing authority on the engine repo and the vault, with no per-action owner approval. It may resolve a conflict, including one that touches code (owner ruling 2026-09-29). The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED; its notice, which also covers the *what an item SAYS* half this row's Must-not column used to carry, is in `docs/METHOD.md`. | Merge a change with no proof that code review ran on it (owner ruling 2026-09-29). The merge bullet under *Branch, commit one layer, open the PR* says what counts. Arm auto-merge outside the two cases in the 2026-10-07 note below (owner ruling 2026-10-07), or without the three safeguards that follow it. Decide which of two deliberate changes to an item survives. |
-| **Special** | as the owner needs it | Work the owner assigns directly, outside the other five seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
+| **Special** | as the owner needs it | Work the owner assigns directly, outside the other four seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
 
 **THE LANDER MAY RESOLVE A CONFLICT THAT TOUCHES CODE. OWNER RULING 2026-09-29, IN SESSION.** The
 owner was told two documents disagreed on this case and answered: *"fix that to allow the Lander to do
@@ -932,7 +940,7 @@ these as hard rules:
 - **CLI `dryrun`/`generate` output can contain full message bodies** (stdout/stderr) — never run
   them against real PHI, and never redirect their output to a committed file, ticket, or CI log.
 - **De-identification is built** ([ADR 0030](docs/adr/0030-anonymization-test-harness-tee.md)). The
-  centralized framework lives in `messagefoundry/anon/` (vendored to `tee/anon/`): deterministic
+  centralized framework lives in `messagefoundry_toolkit/anon/` (vendored to `tee/anon/`): deterministic
   secret-per-dataset pseudonymization, HL7 v2 first. It builds test datasets via the tee
   `anonymize-captures` subcommand + the test harness. **Centralize the rules — don't inline
   ad-hoc de-id logic**; use this framework, don't reimplement one beside it.

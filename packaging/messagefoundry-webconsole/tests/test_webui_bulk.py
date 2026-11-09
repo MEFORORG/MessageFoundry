@@ -1005,9 +1005,11 @@ async def test_purge_confirm_stale_stepup_redirects_to_reauth(engine: Engine) ->
         assert await service.has_recent_step_up(tok) is False  # the stale window is
         r = await c.get("/ui/connections/purge-confirm", params={"scope": "all", "dest": "out1"})
         assert r.status_code == 303
-        # The EXACT continuation: this GET passes no reauth_next, so _reauth_redirect falls back to
-        # quote(request.url.path), which drops scope/dest -- the operator re-picks after re-auth.
-        assert r.headers["location"] == "/ui/reauth?next=/ui/connections/purge-confirm"
+        # The EXACT continuation: since vault BACKLOG #3241 the selection rides the re-auth, so the
+        # operator does not re-pick it after re-authenticating.
+        assert r.headers["location"] == (
+            "/ui/reauth?next=/ui/connections/purge-confirm%3Fscope%3Dall%26dest%3Dout1"
+        )
 
 
 async def test_purge_bulk_per_dest_409_unknown_and_scope(engine: Engine, tmp_path: Path) -> None:

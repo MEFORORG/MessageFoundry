@@ -114,11 +114,20 @@ _UPLOAD_MISS = (
     "(base64 body, json.dumps metadata)"
 )
 
+#: The four store refusal sites of engine PR 2818's eighth hold: each raises outside its own
+#: handler, so the error it caught is on neither chain link; ``from None`` there suppresses at most
+#: an exception a caller is handling. The refusal's text is fixed, or recorded from the settings
+#: alone, and never read from the caught error.
+_RAISED_AFTER_HANDLER = (
+    _SAFE + "raised after its own handler exited, so the caught error is on neither chain link; "
+    "from None suppresses at most a caller's handled exception; the text is never read from it"
+)
+
 #: One entry per (site key, count). Read the module docstring before adding one.
 _ALLOWED: tuple[_Allowed, ...] = (
     # ---- SAFE: the suppressed exception carries nothing the raised one does not already say.
     _Allowed(
-        "messagefoundry/anon/rules.py::_coerce_kind::ValueError::RuleError",
+        "messagefoundry_toolkit/anon/rules.py::_coerce_kind::ValueError::RuleError",
         _SAFE + "enum miss quoting the rule's own kind name, which the new message also quotes",
     ),
     _Allowed(
@@ -216,6 +225,23 @@ _ALLOWED: tuple[_Allowed, ...] = (
         "messagefoundry/pipeline/_sandbox_worker.py::_Broker._ask::(OSError, SandboxError)::error",
         _SAFE + "the lookup error quotes the pipe or frame refusal, which names a frame and never "
         "its content (decode_frame keeps only safe_exc text)",
+    ),
+    # The store key seam, cipher build and PostgreSQL TLS open (engine PR 2818, eighth hold).
+    _Allowed(
+        "messagefoundry/store/base.py::build_store_cipher::<no handler>::refusal",
+        _RAISED_AFTER_HANDLER,
+    ),
+    _Allowed(
+        "messagefoundry/store/base.py::resolve_active_key::<no handler>::refusal",
+        _RAISED_AFTER_HANDLER,
+    ),
+    _Allowed(
+        "messagefoundry/store/base.py::resolve_decrypt_keys::<no handler>::refusal",
+        _RAISED_AFTER_HANDLER,
+    ),
+    _Allowed(
+        "messagefoundry/store/postgres.py::_verifying_context_at_open::<no handler>::refusal",
+        _RAISED_AFTER_HANDLER,
     ),
     _Allowed(
         "messagefoundry/store/store.py::parse_audit_anchor::ValueError::AuditAnchorError",

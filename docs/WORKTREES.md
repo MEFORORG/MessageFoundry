@@ -311,8 +311,11 @@ script header is the source of record for what is parked and what refuses (docs/
 a session's or a subagent's worktree. The occupancy check reads the directory a session was
 *launched* in. A subagent started with `isolation: worktree` is recorded under its **parent's**
 directory, so its tree would read as empty. A deletion route whose check fails open on a
-population is worse than no route to it, so there is none. (BACKLOG #1038, Manager decision
-batch 184.) Removing one of those trees stays the user's decision.
+population is worse than no route to it, so a session has none. (BACKLOG #1038, Manager decision
+batch 184.) Removing one of those trees stays the user's decision. The user's one standing route is
+the opt-in nightly step, `run-daily-prune.ps1 -RemoveFinishedClaudeWorktrees` (owner request
+2026-11-05), which refuses `-Apply` inside Claude Code; *Run it nightly* below says what it checks
+and what it cannot see.
 
 One layout overlaps. `new.ps1` run from a linked worktree makes its sibling **beside that
 worktree**, and for a harness-made worktree that is also under `.claude/worktrees`. `-Path`
@@ -667,6 +670,54 @@ same invocation wherever one is possible (a refusal test refuses the whole run b
 `-Apply` re-check itself is driven by a **gh shim on PATH** whose merge probe performs a side effect —
 a session arrives, the fence dies, the metadata is touched — before answering, which reproduces the
 race deterministically with no threads and no sleeps.
+
+### Run it nightly with `install-daily-prune.ps1`
+
+[`install-daily-prune.ps1`](../scripts/worktree/install-daily-prune.ps1) registers a daily Windows
+scheduled task, as you and never as SYSTEM, that runs
+[`run-daily-prune.ps1`](../scripts/worktree/run-daily-prune.ps1) from the **primary** checkout. The
+runner calls `prune-merged.ps1`, appends what it printed to a dated log under
+`%LOCALAPPDATA%\MessageFoundry\worktree-prune`, and passes its exit code back. The task **dry-runs
+unless registered with `-Apply`**, and the installer refuses to run inside Claude Code (`-Json`, which
+registers nothing, excepted). Run it from a plain terminal:
+
+```powershell
+pwsh -File scripts\worktree\install-daily-prune.ps1 -Json                                   # the plan; registers nothing
+pwsh -File scripts\worktree\install-daily-prune.ps1 -At 03:00                               # dry-run task
+pwsh -File scripts\worktree\install-daily-prune.ps1 -At 03:00 -Apply -RemoveFinishedClaudeWorktrees
+```
+
+**`-RemoveFinishedClaudeWorktrees` is the one opt-in that reaches `.claude/worktrees`** (owner request,
+2026-11-05). `prune-merged.ps1` still removes nothing there; it lists the trees that look finished under
+`REPORT-ONLY`, and its `-Json` carries them as `reportOnly` rows with `path`, `branch`, `idleHours`,
+`claudeManaged` and `whyFinished`. With the switch, the runner runs `prune-merged.ps1 -Json` a second
+time, after the prune, and takes that fresh list, never an earlier table. It keeps the rows under a
+`.claude/worktrees/` segment and hands them to
+[`finished-worktree-removal.ps1`](../scripts/worktree/finished-worktree-removal.ps1), which re-checks
+each one immediately before acting; any one failing refuses that tree. **The list of re-checks is
+stated once, in that script's header**; read it there. Cannot-tell refuses, as in `remove.ps1`.
+
+**This step overrides BACKLOG #1038's decline, on the owner's explicit request of 2026-11-05.** #1038
+gave this population no scripted deletion route, because the fence alone fails open on it. The fence
+reads the directory a session was launched in, and a subagent under `isolation: worktree` is recorded
+under its parent's (*What `-Path` does not reach* above). What covers a live subagent is the rest: the
+harness locks a live agent's worktree (observed 2026-11-05 with the reason `claude agent <id> (pid
+<n>)`), and work there moves the git metadata or the watched working-tree mtimes within `-IdleHours`.
+**The residual: a session that holds no lock, runs no git command, and writes none of those for that
+long is not seen**, and its tree can be removed under it. Its committed work survives through refs,
+since the branch is never deleted. The ignored cache directories go with the tree, and what is inside
+one is read only for a few data-like names; an ignored entry git lists outside them, such as a `.env`
+or a `*.db` store, refuses it. The header says what else the step does not see.
+The removal is a plain `git -C <primary> worktree remove <path>` with **no `--force`**, so git's own
+refusal on a locked or dirty tree stays a last fence. The branch survives it. Each path is logged as it
+is decided, as `REMOVED`, `WOULD-REMOVE` (without `-Apply`), `REFUSED`, `DECLINED` (every re-check
+passed and git still refused), `FAILED` or `ORPHANED`, with its reason, then a summary line with the
+counts and the drive's free space. A refusal or a decline is data and leaves the exit code alone; a
+failure raises it to `1`, and an orphan raises it to `3` and goes into `prune-merged.ps1`'s orphan
+ledger, so later runs keep reporting it. A list that could not be read skips the step, raising the
+code to `2` on a dry run and to `1` under `-Apply`, since the prune before it may have removed
+siblings. With `-Apply` the runner refuses to run inside Claude Code. Tests:
+[`tests/test_worktree_finished_claude_removal.py`](../tests/test_worktree_finished_claude_removal.py).
 
 ## A scheduled hygiene report that deletes nothing — `hygiene-report.ps1`
 

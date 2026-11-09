@@ -68,7 +68,7 @@ from messagefoundry.childenv import hook_environment
 from messagefoundry.config.settings import DrSettings, StoreBackend
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pipeline.dr_backup import VerifyResult, run_restore_verify
+from messagefoundry.pipeline.dr_backup import VerifyResult, join_before_checks, run_restore_verify
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import Store
@@ -176,6 +176,9 @@ class DrResult:
     #: (vault BACKLOG #3067). ``None`` when the engine callback reported neither.
     drained: bool | None = None
     held_on_parked_outbounds: int | None = None
+    #: Activate only: each follow-on step of the profile's reload that did not complete, such as
+    #: ``outbound_close`` (engine PR 2815). The profile is live; an operator has a step to finish.
+    failures: tuple[str, ...] = ()
 
 
 @dataclass
@@ -223,7 +226,7 @@ class DrCoordinator:
         settings: DrSettings,
         *,
         store_settings: object,
-        activate_profile: Callable[[], Awaitable[None]],
+        activate_profile: Callable[[], Awaitable[Mapping[str, str] | None]],
         deactivate_profile: Callable[[], Awaitable[Mapping[str, object] | None]],
         config_fingerprint_provider: Callable[[], Awaitable[str | None]] | None = None,
         alert_sink: AlertSink | None = None,
@@ -281,6 +284,9 @@ class DrCoordinator:
         # The last completed hand-back, so a retry that finds the box passive answers with that
         # release's outcome (its depth left) rather than with nothing known.
         self._last_release: DrResult | None = None
+        # The steps the activation that made the box active left unfinished, so a retry that finds
+        # it active still names them (Lander hold 6702318430, item A). Set once its profile applies.
+        self._activation_failures: tuple[str, ...] = ()
         # The activation running under the lock, read by its abort rows; None between them.
         self._attempt: _ActivationProgress | None = None
         # Serialize activate/release so a double-promotion can't race the cold-seed/VIP/profile steps.
@@ -290,6 +296,12 @@ class DrCoordinator:
     def active(self) -> bool:
         """Whether the DR run-profile is currently on (the box is serving the critical feeds)."""
         return self._active
+
+    @property
+    def activation_failures(self) -> tuple[str, ...]:
+        """The steps the activation that made the box active left unfinished, such as
+        ``outbound_close``; empty while the box is not active (Lander hold 6702318430, item B)."""
+        return self._activation_failures if self._active else ()
 
     @property
     def settings(self) -> DrSettings:
@@ -344,6 +356,7 @@ class DrCoordinator:
                     action="activate",
                     active=True,
                     threshold=self._settings.priority_threshold.value,
+                    failures=self._activation_failures,
                 )
             # A hand-back still owed its row is recorded before a new promotion can follow it.
             if self._unrecorded_release is not None:
@@ -472,10 +485,14 @@ class DrCoordinator:
         # #2751).
         progress.step = "profile"
         anchor_abort: str | None = None
+        # The steps the profile's reload could not finish, such as closing a connector it replaced.
+        # The profile is live then, so they go on the row and the result rather than abort it.
+        step_failures: Mapping[str, str] | None = None
         try:
             self._active = True
             self._last_release = None  # an earlier fail-back's outcome no longer describes this box
-            await self._activate_profile()
+            self._activation_failures = ()  # nor do an earlier activation's unfinished steps
+            step_failures = await self._activate_profile()
         except Exception as exc:
             self._active = False
             refusal = trust_anchor_cause(exc)
@@ -513,6 +530,7 @@ class DrCoordinator:
             # __context__, which the API route chains its own error from.
             await self._record_aborted("profile", anchor_abort, actor, now)
         progress.profile_applied = True
+        self._activation_failures = tuple(step_failures or ())
 
         # Owed from here: a write cut short is made good by the next activate or release call.
         detail: dict[str, object] = {
@@ -522,6 +540,11 @@ class DrCoordinator:
             "seed_segment": progress.seed_segment,
             "vip_hook_ran": progress.hook_ran,
         }
+        if step_failures:
+            # Step labels only, as the config_reload row records them. The detail text, which
+            # names a lane and an error, stays in the server log (the row is forwarded off the box).
+            detail["degraded"] = True
+            detail["failed_steps"] = sorted(step_failures)
         self._unrecorded_activation = (detail, actor, now)
         # Provenance is read only once the profile is applied and the row is owed, so a cancellation
         # while it is read still leaves the box recorded as active (vault BACKLOG #3067). Its fields
@@ -544,6 +567,7 @@ class DrCoordinator:
             verify_status=verify.status,
             seed_segment=progress.seed_segment,
             vip_hook_ran=progress.hook_ran,
+            failures=self._activation_failures,
         )
 
     # --- release (fail-back) -------------------------------------------------
@@ -942,17 +966,27 @@ class DrCoordinator:
         if verify.status == "KEY_MISMATCH":
             await self._record_aborted(
                 "key",
-                "the DR site does not hold the DEK the cold-seed archive is encrypted under "
-                f"(KEY_MISMATCH: {verify.reason or 'key fingerprint differs'}) — env/external KeyProvider "
-                "required at the DR site (DPAPI is machine-bound); refusing to activate (ADR 0048 AC-9)",
+                # Added before any staging check the reason ends in, so nothing follows a check.
+                join_before_checks(
+                    "the DR site does not hold the DEK the cold-seed archive is encrypted under "
+                    f"(KEY_MISMATCH: {verify.reason or 'key fingerprint differs'}",
+                    "",
+                    ") — env/external KeyProvider required at the DR site (DPAPI is "
+                    "machine-bound); refusing to activate (ADR 0048 AC-9)",
+                ),
                 actor,
                 now,
             )
         if not verify.ok:
             await self._record_aborted(
                 "seed",
-                f"cold-seed restore-verify {verify.status}: {verify.reason or 'archive did not verify'} "
-                "— refusing to activate against an unverified store (ADR 0048 fail-closed, AC-9)",
+                join_before_checks(
+                    f"cold-seed restore-verify {verify.status}: "
+                    f"{verify.reason or 'archive did not verify'}",
+                    " ",
+                    "— refusing to activate against an unverified store (ADR 0048 fail-closed, "
+                    "AC-9)",
+                ),
                 actor,
                 now,
             )

@@ -16,10 +16,13 @@ module keeps its own clock throughout, pinned where a code must land in a known 
 
 from __future__ import annotations
 
+import ast
+import functools
 import json
 import time
 import urllib.parse
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -28,12 +31,22 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from pydantic import ValidationError
 
 from messagefoundry.auth import oidc, totp, webauthn
+from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.service import TOO_EARLY, AuthService, Elevation
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
+from tests._ast_sites import (
+    call_sites,
+    callee_name,
+    calls_to,
+    code_names,
+    named_func,
+    parse_source,
+)
+from tests._enrolment_code import enrolment_code_for
 from tests._fake_directory import DirectoryOf
 from tests._totp_clock import pin_totp_clock
 from tests.test_auth_oidc_service import (
@@ -509,6 +522,8 @@ async def test_a_directory_sessions_first_passkey_inside_the_floor_is_refused(
         assert not await service.mfa_satisfied(out.token), "the session must owe its factor"
         identity = await service.identity_for_user_id(session.user_id)
         assert identity is not None
+        # ADR 0207: this directory account's first factor binds only with an issued code.
+        code = await enrolment_code_for(service, identity.user_id)
         auth = SoftAuthenticator(rp_id=rp, origin=origin)
         options = json.loads(
             await service.begin_webauthn_registration(
@@ -522,7 +537,13 @@ async def test_a_directory_sessions_first_passkey_inside_the_floor_is_refused(
         now = [session.created_at + MFA_FLOOR - 0.001]
         _fake_service_wall_clock(monkeypatch, now)
         early = await service.finish_webauthn_registration(
-            identity, response, label="key", token=out.token, rp_id=rp, origin=origin
+            identity,
+            response,
+            label="key",
+            token=out.token,
+            rp_id=rp,
+            origin=origin,
+            enrolment_code=code,
         )
 
         assert early == Elevation()
@@ -534,7 +555,13 @@ async def test_a_directory_sessions_first_passkey_inside_the_floor_is_refused(
         # CONTROL: past the floor, the SAME response binds the passkey and satisfies the session.
         now[0] = session.created_at + MFA_FLOOR + 0.001
         served = await service.finish_webauthn_registration(
-            identity, response, label="key", token=out.token, rp_id=rp, origin=origin
+            identity,
+            response,
+            label="key",
+            token=out.token,
+            rp_id=rp,
+            origin=origin,
+            enrolment_code=code,
         )
         assert served.ok and served.token is not None
         assert await service.mfa_satisfied(served.token)
@@ -564,6 +591,133 @@ async def test_a_directory_sessions_first_passkey_inside_the_floor_is_refused(
             answers.append(str(refused.value))
         assert answers == [service._CEREMONY_EXPIRED] * 2
         assert len(await _audit_rows(store, "auth.webauthn_failed")) == audited
+    finally:
+        await store.close()
+
+
+# --- the floor's call sites, read from the service's syntax tree (BACKLOG #3194 item 4) -----------
+
+_FLOOR_CALLS = frozenset({"_second_factor_too_early", "_enrolment_too_early"})
+_STAMP = "mark_session_mfa_verified"
+#: Stamps a session's factor at its mint, where no sign-in precedes it, so there is no pair to floor.
+#: Named here so the test fails if it goes, rather than keep an exemption nobody needs.
+_STAMPS_AT_MINT = frozenset({"_issue_session"})
+
+
+@functools.cache
+def _service_source() -> str:
+    return Path(service_module.__file__).read_text(encoding="utf-8")
+
+
+def _is_floor_guard(stmt: ast.stmt) -> bool:
+    """``if await self.<floor helper>(...):`` whose body refuses: the test is the awaited call
+    itself, so a negated, short-circuited or constant-guarded floor does not count."""
+    return (
+        isinstance(stmt, ast.If)
+        and isinstance(stmt.test, ast.Await)
+        and isinstance(stmt.test.value, ast.Call)
+        and callee_name(stmt.test.value) in _FLOOR_CALLS
+        and any(isinstance(s, (ast.Return, ast.Raise)) for s in stmt.body)
+    )
+
+
+def _unfloored_legs(tree: ast.Module) -> tuple[set[str], list[str]]:
+    """``(every function that stamps directly, those with no floor guard ahead of the stamp)``.
+
+    The guard must be a statement of the function's OWN body, not one nested in a branch, a loop,
+    a ``try`` or an inner function, and it must come before the function's first stamp in source
+    order, so it runs on every path that reaches a stamp. Direct stamps only: a stamp through a
+    helper is not followed, because the mint is such a helper and every sign-in calls it. Nor is
+    what the guard's body returns read, so a body that returns into a stamping helper passes."""
+    first_stamp = {
+        node.name: min(call.lineno for call in sites)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and (sites := call_sites(node, _STAMP))
+    }
+    unfloored = [
+        name
+        for name in sorted(first_stamp.keys() - _STAMPS_AT_MINT)
+        if not any(
+            _is_floor_guard(stmt) and stmt.lineno < first_stamp[name]
+            for stmt in named_func(tree, name).body
+        )
+    ]
+    return set(first_stamp), unfloored
+
+
+def test_every_leg_that_stamps_a_sessions_factor_asks_the_floor_first() -> None:
+    """RED when: a function in ``auth/service.py`` calls ``mark_session_mfa_verified`` without a
+    top-level ``if await`` of ``_second_factor_too_early`` or ``_enrolment_too_early`` that refuses,
+    ahead of the call (vault BACKLOG #3194 item 4). A new leg that can satisfy a pending session
+    must be floored, so it cannot complete the login-to-MFA pair faster than a person can.
+    ``tests/test_auth_session_lifecycle.py`` follows stamps through helpers for its own question,
+    which ceremonies stamp."""
+    stamping, unfloored = _unfloored_legs(parse_source(_service_source()))
+    assert stamping >= _STAMPS_AT_MINT, "the mint no longer stamps; drop its exemption"
+    # Positive control: the four factor legs the floor was built for are found, so an empty walk
+    # cannot pass.
+    assert {
+        "verify_mfa",
+        "finish_webauthn_assertion",
+        "confirm_mfa_enrollment",
+        "finish_webauthn_registration",
+    } <= stamping
+    assert unfloored == [], f"stamps a session's factor with no floor ahead of it: {unfloored}"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "if await self._second_factor_X(",  # no floor call at all
+        "if not await self._second_factor_too_early(",  # the wrong polarity
+        "if False and await self._second_factor_too_early(",  # a guard that never runs
+        "if True:\n            pass\n        elif await self._second_factor_too_early(",  # a branch
+    ],
+    ids=["removed", "negated", "short-circuited", "in-a-branch"],
+)
+def test_the_stamping_guard_reds_on_a_floor_that_does_not_guard(mutation: str) -> None:
+    """The negative control for the test above: the same scan over ``finish_webauthn_assertion``
+    with its floor guard broken in each listed way names that leg."""
+    source = _service_source()
+    leg = source.index("    async def finish_webauthn_assertion(")
+    guard = source.index("if await self._second_factor_too_early(", leg)
+    broken = (
+        source[:guard] + mutation + source[guard + len("if await self._second_factor_too_early(") :]
+    )
+    # A plain parse: the shared cache is for real sources, and a mutant would only evict them.
+    assert _unfloored_legs(ast.parse(broken))[1] == ["finish_webauthn_assertion"]
+
+
+def test_both_floor_helpers_read_one_predicate() -> None:
+    """RED when: ``_second_factor_too_early`` or ``_enrolment_too_early`` tests the session's mint,
+    its factor stamp or the floor setting itself rather than through ``_mfa_floor_holds`` and
+    ``_mfa_floor_on`` (vault BACKLOG #3194 item 4), so the two copies of the rule could drift."""
+    tree = parse_source(_service_source())
+    own_reads = {"created_at", "mfa_verified_at", "mfa_verify_min_elapsed_seconds"}
+    for name in sorted(_FLOOR_CALLS):
+        node = named_func(tree, name)
+        read = sorted(code_names(node) & own_reads)
+        assert read == [], f"{name} reads {read} itself"
+        assert calls_to(node, {"_mfa_floor_holds"}), f"{name} skips the predicate"
+    # Negative control: the scan sees a direct read of the setting.
+    assert code_names(ast.parse("x = self._settings.mfa_verify_min_elapsed_seconds")) & own_reads
+
+
+async def test_the_floor_predicate() -> None:
+    store = await MessageStore.open(":memory:")
+    try:
+        for floor, verified_at, elapsed, held in [
+            (MFA_FLOOR, None, MFA_FLOOR - 0.001, True),  # inside
+            (MFA_FLOOR, None, MFA_FLOOR, False),  # at the floor
+            (MFA_FLOOR, 5.0, 0.0, False),  # factor stamped
+            (0.0, None, 0.0, False),  # floor off
+        ]:
+            service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=floor))
+            # A mint at 0.0, so `now - created_at` is `elapsed` exactly, whatever the floor.
+            session = SimpleNamespace(created_at=0.0, mfa_verified_at=verified_at)
+            got = service._mfa_floor_holds(session, elapsed)  # type: ignore[arg-type]
+            assert got is held, (floor, verified_at, elapsed)
     finally:
         await store.close()
 
@@ -710,5 +864,34 @@ async def test_a_step_up_callback_just_inside_the_floor_is_refused_and_just_past
             service, signed_in.token, clock, OIDC_FLOOR + 0.001, monkeypatch, rsa_key
         )
         assert served.elevation.ok and served.elevation.token is not None, served
+    finally:
+        await store.close()
+
+
+async def test_the_step_up_callbacks_own_store_reads_do_not_count_as_the_persons_time(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the step-up callback's age counts the store reads made after its flow is consumed
+    (vault BACKLOG #3221 item K5), as it did while the age ran to the moment it was read, below
+    ``_step_up_actor``'s reads. The callback arrives inside the floor and each session read then
+    takes longer than the floor. The flow cache stamps the consume and the age ends there, so a
+    slow store cannot carry a too-early callback past the floor."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, clock = await _floored_federated_service(store, rsa_key, monkeypatch)
+        signed_in = await _oidc_login(service, monkeypatch, rsa_key)
+        assert signed_in.ok and signed_in.token is not None
+        flow_id, _url = await _begin(service, signed_in.token)
+        real_load = service._load_session
+
+        async def slow_load(token_hash: str) -> Any:
+            clock[0] += 2 * OIDC_FLOOR
+            return await real_load(token_hash)
+
+        monkeypatch.setattr(service, "_load_session", slow_load)
+        clock[0] += OIDC_FLOOR / 2
+        early = await _return_from_idp(service, monkeypatch, rsa_key, flow_id)
+        assert not early.elevation.ok and early.reason == TOO_EARLY, early
+        assert not await service.has_recent_step_up(signed_in.token)
     finally:
         await store.close()

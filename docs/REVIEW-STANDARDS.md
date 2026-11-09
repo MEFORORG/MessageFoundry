@@ -42,8 +42,8 @@ that looks like a real person, partner or site: a plausible name with a real-sha
 address, a customer/vendor token, or a routable IPv4. Source:
 [CLAUDE.md](../CLAUDE.md) section 5, *Product security rules outlive any method rewrite*, [CLAUDE.md](../CLAUDE.md) section 9, and [PHI.md](PHI.md) section 9.
 
-**R7. De-identification goes through `messagefoundry/anon/` and mirrors `tee/anon/`.** Flag new
-masking or pseudonymizing code written beside the framework, an edit to `messagefoundry/anon/` not
+**R7. De-identification goes through `messagefoundry_toolkit/anon/` and mirrors `tee/anon/`.** Flag new
+masking or pseudonymizing code written beside the framework, an edit to `messagefoundry_toolkit/anon/` not
 mirrored to `tee/anon/`, or prose calling default `anonymize_checked` output HIPAA Safe Harbor.
 Source: [CLAUDE.md](../CLAUDE.md) section 9, and [PHI.md](PHI.md) section 9.
 

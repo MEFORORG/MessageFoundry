@@ -29,11 +29,12 @@ from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind, DirectoryProbe
 from messagefoundry.auth.notifications import LOGIN_NEW_IP, SecurityEvent
-from messagefoundry.auth.service import AuthService, LoginOutcome
+from messagefoundry.auth.service import AuthService, LoginOutcome, MfaReset
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import LOGIN_ADDRESS_RESET_MARKER, MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._enrolment_code import enrolment_code_for
 from tests.test_auth_oidc_service import (
     AUTH_CODE,
     DEFAULT_SUB,
@@ -126,7 +127,14 @@ async def _enrol_totp(
     step."""
     enroll = await service.begin_mfa_enrollment(identity)
     code = totp.totp(enroll.secret, now=now) if now is not None else fresh_totp(enroll.secret)
-    elevation = await service.confirm_mfa_enrollment(identity, code, token=token, client=client)
+    # ADR 0207: a directory account's first factor binds only with an issued code; None otherwise.
+    elevation = await service.confirm_mfa_enrollment(
+        identity,
+        code,
+        token=token,
+        client=client,
+        enrolment_code=await enrolment_code_for(service, identity.user_id),
+    )
     assert elevation.ok, "the enrolment confirm was refused"
     return enroll.secret
 
@@ -1155,11 +1163,16 @@ async def test_a_programming_error_in_the_record_does_not_lose_the_enrolment_rep
             calls.append(method)
             raise fault("synthetic programming error")
 
+        code = await enrolment_code_for(owed, out.identity.user_id)  # ADR 0207
         monkeypatch.setattr(store, method, _broken)
         enroll = await owed.begin_mfa_enrollment(out.identity)
         with caplog.at_level(logging.ERROR, logger=service_module._log.name):
             elevation = await owed.confirm_mfa_enrollment(
-                out.identity, fresh_totp(enroll.secret), token=out.token, client="10.1.1.1"
+                out.identity,
+                fresh_totp(enroll.secret),
+                token=out.token,
+                client="10.1.1.1",
+                enrolment_code=code,
             )
         assert elevation.ok and elevation.token is not None
         assert elevation.recovery_codes
@@ -1182,7 +1195,7 @@ async def test_an_admin_reset_clears_the_known_address_record(reset: str, client
         uid = await _operator(service)
         assert (await service.login("oper", PW, client="10.1.1.1")).ok
         assert "10.1.1.1" in await store.list_known_login_addresses(uid, since=0.0)
-        issued = await getattr(service, reset)(uid, actor="boss")
+        issued = _credential(await getattr(service, reset)(uid, actor="boss"))
         assert issued is not None
         assert await store.list_known_login_addresses(uid, since=0.0) == [
             LOGIN_ADDRESS_RESET_MARKER
@@ -1212,7 +1225,10 @@ async def test_an_mfa_reset_clears_a_directory_accounts_known_address_record() -
         )
         await store.remember_login_address("id-dir", "10.1.1.1", now=time.time())
         assert await store.list_known_login_addresses("id-dir", since=0.0) == ["10.1.1.1"]
-        assert await service.admin_reset_mfa("id-dir", actor="boss") is None
+        reset = await service.admin_reset_mfa("id-dir", actor="boss")
+        assert reset.credential is None
+        # ADR 0207 section 5: an enabled directory account's reset issues an enrolment code.
+        assert reset.enrolment_code is not None
         assert await store.list_known_login_addresses("id-dir", since=0.0) == [
             LOGIN_ADDRESS_RESET_MARKER
         ]
@@ -1267,7 +1283,7 @@ async def test_a_cleared_account_with_no_last_login_is_judged_new_not_no_baselin
         await store.remember_login_address(uid, "10.1.1.1", now=time.time())
         user = await store.get_user(uid)
         assert user is not None and user.last_login_at is None
-        issued = await getattr(service, reset)(uid, actor="boss")
+        issued = _credential(await getattr(service, reset)(uid, actor="boss"))
         assert issued is not None
         out = await service.login("oper", issued.password, client="10.1.1.1")
         assert out.ok
@@ -1351,7 +1367,7 @@ async def test_a_failed_clear_logs_and_does_not_refuse_the_reset(
 
         monkeypatch.setattr(store, method, _broken)
         with caplog.at_level(logging.ERROR, logger=service_module._log.name):
-            issued = await getattr(service, reset)(uid, actor="boss")
+            issued = _credential(await getattr(service, reset)(uid, actor="boss"))
         assert issued is not None and issued.password
         assert any(
             r.levelno == logging.ERROR
@@ -1380,3 +1396,9 @@ async def test_a_client_naming_the_marker_is_never_written() -> None:
         assert await store.list_known_login_addresses(uid, since=1.0) == []
     finally:
         await store.close()
+
+
+def _credential(result: object) -> Any:
+    """The generated credential a reset issued: ``admin_reset_password`` returns it, and
+    ``admin_reset_mfa`` returns it inside its ``MfaReset`` (ADR 0207 added the enrolment code)."""
+    return result.credential if isinstance(result, MfaReset) else result

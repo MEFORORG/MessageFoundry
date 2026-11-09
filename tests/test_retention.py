@@ -31,6 +31,7 @@ from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.store import MessageStore, OutboxStatus, open_store
 from messagefoundry.store.store import DbStatus, DiskFreeStatus
+from tests._log_absence import assert_capture_sees
 
 DAY = 86_400.0
 
@@ -798,6 +799,7 @@ async def test_a_pass_whose_truncate_did_not_finish_warns_and_records_it(
     clean = await RetentionRunner(store, settings, clock=lambda: 30 * DAY).run_once()
     assert clean.wal_checkpointed is True
     assert clean.wal_left_untruncated is False
+    assert_capture_sees(caplog, retention_mod.__name__)
     assert not [r for r in caplog.records if "WAL truncate" in r.getMessage()]
 
     monkeypatch.setattr(store, "wal_checkpoint", busy)

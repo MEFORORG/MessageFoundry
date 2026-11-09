@@ -1297,7 +1297,7 @@ def test_the_scripts_direct_form_must_set_a_codec_or_an_error_handler() -> None:
 #
 # Two deserve naming. packaging/ IS the second pytest collection root -- pyproject's `testpaths`
 # names `packaging/messagefoundry-webconsole/tests` -- so the paragraph above about test trees
-# applies to it in full. tee/ vendors messagefoundry/anon/ behind a CLI that prints to an operator
+# applies to it in full. tee/ vendors messagefoundry_toolkit/anon/ behind a CLI that prints to an operator
 # console, and it imports nothing from the engine -- so the chokepoint this gate demands is out of
 # its reach. Its first console-bound glyph has no remedy here but ASCII until tee vendors its own
 # copy of the chokepoint, the way it vendors anon/. That is an open question, not solved here: a
@@ -1329,10 +1329,17 @@ _TESTS = _ROOT / "tests"
 #: nothing in it is exempted today; it is pinned as the toolkit's entry point.
 _REACH_ROOTS: tuple[tuple[str, Path, int, tuple[str, ...]], ...] = (
     ("messagefoundry", _ENGINE, 250, ("__main__.py", "pipeline/wiring_runner.py")),
-    # ADR 0201 moved engine tooling here, so it keeps the engine's gate. All three files are
-    # top-level; __main__.py is a console entry point hardened at the chokepoint, and
-    # adr_analyze.py is the module that moved.
-    ("messagefoundry_toolkit", _TOOLKIT, 3, ("__main__.py", "adr_analyze.py")),
+    # ADR 0201 moved engine tooling here, so it keeps the engine's gate. __main__.py is a console
+    # entry point hardened at the chokepoint, adr_analyze.py is the first module that moved, and
+    # anon/leak.py pins the nested shape slice 6 brought with the anon/ package. generators/adt.py
+    # pins the second nested package, which slice 7 brought. The floor is about half the 34 files
+    # counted at slice 7.
+    (
+        "messagefoundry_toolkit",
+        _TOOLKIT,
+        17,
+        ("__main__.py", "adr_analyze.py", "anon/leak.py", "generators/adt.py"),
+    ),
     ("harness", _HARNESS, 60, ("__main__.py", "reconcile/__main__.py")),
     # Its ONLY nested file, measured 2026-09-29: 1 of 1,021. If it is ever legitimately removed,
     # the pin check below fails LOUDLY and points here rather than reporting a clean tree.
@@ -1594,7 +1601,7 @@ def test_the_extension_would_have_caught_both_sites_it_was_built_for() -> None:
 #
 # The rule is keyed on `__main__.py` -- what `python -m <package>` runs -- and that is a FLOOR. A
 # module with its own `if __name__ == "__main__":` block is out of scope here: at least
-# `harness/load/ingress_probe.py`, `messagefoundry/generators/adt.py` and
+# `harness/load/ingress_probe.py`, `messagefoundry_toolkit/generators/adt.py` and
 # `messagefoundry/pipeline/_sandbox_worker.py` have one, and the last speaks a protocol over its
 # pipes, where re-encoding the stream would change a wire format rather than harden a console.
 # `tee/__main__.py` is outside this rule: tee/ imports nothing from the engine, so the chokepoint

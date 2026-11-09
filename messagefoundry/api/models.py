@@ -652,8 +652,8 @@ class ReloadResult(BaseModel):
     is not a clean reload — the new graph is live and an operator has a step to finish by hand.
     Reporting outright failure there would describe an engine that does not exist; reporting plain
     success would hide the step. The step labels are stable and PHI-free
-    (``config_fingerprint``, ``reference_sync``, ``cluster_propagate``, and ``audit`` when the
-    ``config_reload`` audit row failed after the swap, BACKLOG #1940).
+    (``config_fingerprint``, ``reference_sync``, ``cluster_propagate``, ``outbound_close``, and
+    ``audit`` when the ``config_reload`` audit row failed after the swap, BACKLOG #1940).
 
     ``restart_required`` names each settings trust anchor whose consumer loaded its bytes at start
     (for example ``[auth].ad_tls_ca_cert_file``) and whose file has changed on disk since. The
@@ -1399,6 +1399,9 @@ class DrStatus(BaseModel):
     active: bool
     threshold: str
     activation_mode: str
+    #: The steps the activation that made the box active left unfinished, such as
+    #: ``outbound_close`` (engine PR 2815); empty while the box is not active.
+    failures: list[str] = []
 
 
 class ServiceStatusInfo(BaseModel):
@@ -1433,6 +1436,11 @@ class DrActionResult(BaseModel):
     #: stay held on outbounds the engine parks. A release that did not drain says so here.
     drained: bool | None = None
     held_on_parked_outbounds: int | None = None
+    #: Activate only (engine PR 2815): the profile is live and a follow-on step did not complete,
+    #: so ``failures`` names each, with the step labels ``ReloadResult.failures`` uses, such as
+    #: ``outbound_close``. A 200 with ``degraded`` True is not a clean activation.
+    degraded: bool = False
+    failures: list[str] = []
 
 
 class DrActivateRequest(RequestModel):

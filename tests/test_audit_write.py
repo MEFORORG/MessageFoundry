@@ -30,6 +30,7 @@ from messagefoundry.auth import service as auth_service_module
 from messagefoundry.config.fingerprint import ConfigDirMissing
 from messagefoundry.store.base import audit_write_errors, store_call_errors
 from tests._ast_sites import call_sites, parse_source
+from tests._log_absence import assert_capture_sees
 
 _LOG = logging.getLogger("tests.audit_write")
 _ENGINE = Path(__file__).resolve().parents[1] / "messagefoundry"
@@ -52,6 +53,7 @@ def test_a_written_row_returns_true_and_logs_nothing(caplog: pytest.LogCaptureFi
             write_audit_soft(_ok, log=_LOG, message="lost %s", args=("row",), defects=())
         )
     # Only this logger: asyncio.run may log its selector at DEBUG, depending on the root level.
+    assert_capture_sees(caplog, _LOG)
     assert [r for r in caplog.records if r.name == _LOG.name] == []
 
 
