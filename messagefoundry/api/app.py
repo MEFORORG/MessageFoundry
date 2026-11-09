@@ -11352,13 +11352,12 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
 )
 #: What one page for many such accounts says, where more than five stand unreachable at once
 #: (``AuthService._note_unreached_accounts``), so a flapping directory opens one instance rather
-#: than one per signed-in account. ``accounts`` counts every account standing, paged before or
-#: entering now, because a later rollup updates the same open instance's text (BACKLOG #3709).
-#: ``probes`` is the shortest run among those entering: probes, not passes, which differ under a
-#: probe budget smaller than the estate.
+#: than one per signed-in account. ``accounts`` is ``ReconcilePlan.unreached_standing``.
+#: ``probes`` is the shortest run among those entering only: probes, not passes, which differ
+#: under a probe budget smaller than the estate (BACKLOG #3709).
 _UNREACHED_ROLLUP_TEXT: Final[str] = (
-    "{accounts} accounts' sessions are not revoked ({entering} new): each one's directory probes "
-    "failed at least {probes} times running. Check the directory; audit rows name each account."
+    "{accounts} accounts' sessions are not revoked ({entering} new, each after {probes} or more "
+    "failed directory probes running). Check the directory; audit rows name each account."
 )
 
 

@@ -33,7 +33,11 @@ import aiosqlite
 import pytest
 from pydantic import ValidationError
 
-from messagefoundry.api.app import _OUTAGE_ALERT_SOURCE, _alert_reconcile_plan
+from messagefoundry.api.app import (
+    _OUTAGE_ALERT_SOURCE,
+    _UNREACHED_ALERT_SOURCE,
+    _alert_reconcile_plan,
+)
 from messagefoundry.auth import channel_scope, reconcile
 from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import (
@@ -2961,11 +2965,11 @@ async def test_a_later_rollup_counts_every_account_standing_not_only_those_enter
             later = await _pass(service, sink)
         assert [name for _uid, name, _n in later.unreached] == ["late"]
         assert later.unreached_rollup and later.unreached_standing == 8
-        rollups = [p for _k, s, p in sink.events if s == "directory-reconciler-unreached"]
+        rollups = [p for _k, s, p in sink.events if s == _UNREACHED_ALERT_SOURCE]
         assert len(rollups) == 2
-        assert rollups[0]["detail"].startswith("7 accounts' sessions are not revoked (7 new)")
-        assert rollups[1]["detail"].startswith("8 accounts' sessions are not revoked (1 new)")
-        assert "at least 3 times running" in rollups[1]["detail"]
+        assert rollups[0]["detail"].startswith("7 accounts' sessions are not revoked (7 new, ")
+        assert rollups[1]["detail"].startswith("8 accounts' sessions are not revoked (1 new, ")
+        assert "each after 3 or more failed directory probes running" in rollups[1]["detail"]
     finally:
         await store.close()
 
