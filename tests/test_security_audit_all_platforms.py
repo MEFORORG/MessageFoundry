@@ -12,7 +12,10 @@ pip-audit). ``tests/test_audit_all_platforms.py`` pins the engine's workflows to
 
 from __future__ import annotations
 
+import codecs
+import locale
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -406,6 +409,117 @@ def test_a_declared_codec_never_hands_pip_audit_a_truncated_copy(
     assert "its copy is not writable as idna: UnicodeEncodeError: 'idna' codec cannot encode" in err
     assert "label too long" in err, err
     assert "evil" not in err and "worse" not in err, err
+
+
+def _lines_pip_audit_reads(raw: bytes) -> list[str]:
+    """The copy's lines as pip-audit 2.10.1 gets them: pip-requirements-parser 32.0.1's
+    ``auto_decode`` (a mark, else a first-two-lines declaration, else the locale), then
+    ``str.splitlines``. Written here apart from the module's own reader, so the test does not take
+    the code under test as its oracle."""
+    boms = [
+        (codecs.BOM_UTF8, "utf-8"),
+        (codecs.BOM_UTF16, "utf-16"),
+        (codecs.BOM_UTF16_BE, "utf-16-be"),
+        (codecs.BOM_UTF16_LE, "utf-16-le"),
+        (codecs.BOM_UTF32, "utf-32"),
+        (codecs.BOM_UTF32_BE, "utf-32-be"),
+        (codecs.BOM_UTF32_LE, "utf-32-le"),
+    ]
+    text = next((raw[len(bom) :].decode(name) for bom, name in boms if raw.startswith(bom)), None)
+    if text is None:
+        cookies = [m for ln in raw.split(b"\n")[:2] if ln[:1] == b"#" and (m := _COOKIE.search(ln))]
+        encoding = cookies[0][1].decode("ascii") if cookies else locale.getpreferredencoding(False)
+        text = raw.decode(encoding)
+    return [ln.strip() for ln in text.splitlines()]
+
+
+_COOKIE = re.compile(rb"coding[:=]\s*([-\w.]+)")
+_DIGEST = "a" * 64
+_EVIL = f"evil==1 --hash=sha256:{_DIGEST}"
+
+
+def _audit_copies(src: Path) -> tuple[int, list[list[str]]]:
+    """``main``'s status on ``src``, and each copy pip-audit was handed, as it reads the lines."""
+    copies: list[list[str]] = []
+
+    def run(cmd: list[str]) -> int:
+        if "pip_audit" in cmd:
+            copies.append(_lines_pip_audit_reads(Path(cmd[cmd.index("-r") + 1]).read_bytes()))
+        return 0
+
+    return main([str(src)], run=run), copies
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # unicode_escape escapes every newline, so the copy is one line, its declaration is no
+        # longer at the start of a line, and pip-audit reads one pin with the rest as its options.
+        (f"bar==1 --hash=sha256:{_DIGEST}\n# coding: unicode_escape\n{_EVIL}\n").encode("ascii"),
+        # raw_unicode_escape decodes the two escapes below to a backslash and a line separator,
+        # which str.splitlines breaks on; it encodes the pair back as a backslash and an escaped
+        # line separator, which it decodes as written, so pip-audit reads evil inside the comment.
+        (
+            f"bar==1 --hash=sha256:{_DIGEST}\n# coding: raw_unicode_escape\n"
+            f"# note \\u005c\\u2028{_EVIL}\n"
+        ).encode("ascii"),
+    ],
+    ids=["unicode_escape", "raw_unicode_escape"],
+)
+def test_a_copy_pip_audit_would_read_short_is_refused(
+    raw: bytes, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Lander hold on PR 2840 (issuecomment-6734482781): a declared codec whose encode does not
+    round-trip handed pip-audit a copy with fewer pins than the count, and the run exited 0. The copy
+    is now read back as pip-audit reads it and refused unless that is the counted text."""
+    src = tmp_path / "x.lock"
+    src.write_bytes(raw)
+    status, copies = _audit_copies(src)
+    out, err = capsys.readouterr()
+    # Was exit 0, "2 pinned requirements audited", and one copy without the evil pin.
+    assert copies == [], (status, out, copies)
+    assert status == 2
+    assert "does not read back the way pip-audit reads it" in err, err
+    assert "evil" not in err and "bar==" not in err, err
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        f"# owner: \N{LATIN CAPITAL LETTER A WITH ACUTE}vila\n"
+        f"idna==3.20 ; os_name == 'nt' --hash=sha256:{_DIGEST}\n{_EVIL}\n".encode(),
+        b"# -*- coding: latin-1 -*-\n# note: caf\xe9\n"
+        + f"idna==3.20 ; os_name == 'nt' --hash=sha256:{_DIGEST}\n{_EVIL}\n".encode("ascii"),
+    ],
+    ids=["utf-8", "latin-1-declared"],
+)
+def test_a_copy_that_reads_back_whole_hands_pip_audit_every_pin(tmp_path: Path, raw: bytes) -> None:
+    """The control for the refusal above: an ordinary lock still reaches pip-audit, every pin in it."""
+    src = tmp_path / "x.lock"
+    src.write_bytes(raw)
+    status, copies = _audit_copies(src)
+    assert status == 0
+    assert len(copies) == 1
+    assert f"idna==3.20 --hash=sha256:{_DIGEST}" in copies[0], copies
+    assert _EVIL in copies[0], copies
+
+
+def test_a_copy_whose_read_back_fails_is_refused_without_the_error_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-back that raises is refused with the same fixed line, naming none of the error."""
+
+    def fail(raw: bytes) -> str:
+        raise UnicodeDecodeError("utf-8", b"\xe9", 0, 1, "invalid continuation byte")
+
+    monkeypatch.setattr("messagefoundry.security.audit_all_platforms._read_as_pip_audit", fail)
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    status, copies = _audit_copies(src)
+    assert (status, copies) == (2, [])
+    err = capsys.readouterr().err
+    assert "does not read back the way pip-audit reads it" in err, err
+    assert "invalid continuation" not in err and "xe9" not in err, err
 
 
 def test_utf8_failing_falls_back_to_the_locale_as_pip_does(

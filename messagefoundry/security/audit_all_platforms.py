@@ -229,6 +229,39 @@ def read_lock(path: Path) -> str:
     return _decode_lock(path.read_bytes())[0]
 
 
+#: pip-requirements-parser 32.0.1's ``BOMS``, in its order: it tries a native UTF-16 mark before a
+#: UTF-32-LE one, which begins with it, so this order is not :data:`_BOMS`'s.
+_PIP_AUDIT_BOMS = (
+    (codecs.BOM_UTF8, "utf-8"),
+    (codecs.BOM_UTF16, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16-be"),
+    (codecs.BOM_UTF16_LE, "utf-16-le"),
+    (codecs.BOM_UTF32, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32-be"),
+    (codecs.BOM_UTF32_LE, "utf-32-le"),
+)
+
+
+def _read_as_pip_audit(raw: bytes) -> str:
+    """The copy as pip-audit reads it: ``auto_decode`` in pip-requirements-parser 32.0.1, which
+    ``RequirementsFile.from_file`` in pip-audit 2.10.1 calls.
+
+    Not :func:`_decode_lock`, which reads a lock as pip 26 does: this reader strips the mark it
+    finds, honours a declaration only on a first-two-lines comment of the bytes as written (so a
+    codec that escapes the copy's newlines hides its own declaration), falls back to the locale
+    rather than UTF-8 first, and leaves newlines as they are. Raises ``UnicodeError`` or
+    ``LookupError`` as the decode it picks does.
+    """
+    for bom, codec in _PIP_AUDIT_BOMS:
+        if raw.startswith(bom):
+            return raw[len(bom) :].decode(codec)
+    declared = (_CODING.search(ln) for ln in raw.split(b"\n")[:2] if ln[:1] == b"#")
+    cookie = next((m for m in declared if m is not None), None)
+    if cookie is not None:
+        return raw.decode(cookie[1].decode("ascii"))
+    return raw.decode(locale.getpreferredencoding(False) or sys.getdefaultencoding())
+
+
 #: A comment as pip finds one: at the start of a line, or after whitespace.
 _COMMENT = re.compile(r"(^|\s+)#.*$")
 
@@ -481,16 +514,32 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         return status
     with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP") or None) as tmp:
         copy = Path(tmp) / args.lock.name
+        audited = "".join(kept)
         try:
             # One complete encode call, not write_text: a text stream never finalizes its encoder,
             # and the idna codec holds back the last label until it is final, so a text-mode write
             # dropped everything after the copy's last "." and pip-audit audited only what came
             # before it. Bytes also skip newline translation; pip-audit reads "\n" on every host.
-            copy.write_bytes("".join(kept).encode(copy_encoding))
+            copy.write_bytes(audited.encode(copy_encoding))
         except UnicodeError as exc:
             print(
                 f"::error::{args.lock}: its copy is not writable as {copy_encoding}: "
                 f"{safe_exc(exc)}",
+                file=sys.stderr,
+            )
+            return 2
+        # The count above is of `audited`, so pip-audit must read exactly that back. A codec whose
+        # encode does not round-trip (unicode_escape escapes every newline, raw_unicode_escape a
+        # line separator after a backslash) folds pins into a comment, and pip-audit audits fewer
+        # than were counted. Comparing the whole text holds for every codec, with no list of them.
+        try:
+            faithful = _read_as_pip_audit(copy.read_bytes()) == audited
+        except (UnicodeError, LookupError):
+            faithful = False
+        if not faithful:
+            print(
+                f"::error::{args.lock}: its copy, written as {copy_encoding}, does not read back "
+                "the way pip-audit reads it as the text whose pins were counted",
                 file=sys.stderr,
             )
             return 2
