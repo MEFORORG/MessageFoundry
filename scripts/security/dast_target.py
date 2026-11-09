@@ -77,6 +77,16 @@ class DastTargetUnusable(RuntimeError):
     could not be minted). The runner turns this into exit 2 — could not measure — never a clean pass."""
 
 
+class DastReproofRefused(DastTargetUnusable):
+    """The engine refused an action-bound re-proof. ``status`` is what ``POST /me/reauth`` answered,
+    so the sweep can tell a refusal of the one action from a session that died (401) or a limiter
+    that tripped (429), either of which would refuse every later re-proof too."""
+
+    def __init__(self, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 @dataclass(frozen=True)
 class DastTarget:
     """A live, authenticated scan target."""
@@ -332,10 +342,11 @@ async def dast_target(
                     payload = None
                 rekeyed = payload.get("token") if isinstance(payload, dict) else None
             if not isinstance(rekeyed, str) or not rekeyed:
-                raise DastTargetUnusable(
+                raise DastReproofRefused(
                     f"POST /me/reauth answered {response.status_code} to an action-bound re-proof, "
                     "or returned no token. A reach pass that cannot pass a step-up wall measured "
-                    "the wall, so this run measured nothing behind it."
+                    "the wall, so this run measured nothing behind it.",
+                    status=response.status_code,
                 )
             return rekeyed
 

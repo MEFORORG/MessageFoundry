@@ -210,8 +210,9 @@ class RouteRow:
 def gate_of(call: object) -> tuple[str, tuple[str, ...], str | None] | None:
     """``(gate name, permission wire strings, action)`` for a route dependency built by one of the
     ``require*()`` factories, by reading the closure cells the factory captured. Recurses through the
-    ``base`` cell, because require_paced / require_phi_read / require_step_up* wrap ``require``'s
-    closure. Returns ``None`` for a dependency that carries no gate mark.
+    ``base`` cell, for a gate that wraps another gate's closure, as the web console's
+    ``require_ui_*`` gates do; the engine's derived gates capture ``permissions`` themselves (BACKLOG
+    #1197). Returns ``None`` for a dependency that carries no gate mark.
 
     A gate is recognised by the mark its factory sets (``mark_route_gate``), never by its name
     (vault BACKLOG #2604). A dependency merely NAMED ``require_*`` is no gate, and the engine's

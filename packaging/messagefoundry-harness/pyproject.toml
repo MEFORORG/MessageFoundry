@@ -64,6 +64,14 @@ dependencies = [
     # ::test_the_harness_pins_the_engine_at_the_version_it_ships_with is the gate, and it names both
     # files in its failure.
     "messagefoundry[harness]==0.5.2",
+    # The toolkit, for the synthetic HL7 generators (ADR 0201 slice 7). harness/compose.py,
+    # file_panel.py, send.py, load/corpus.py, scenarios/ and fuzz/mutate.py import
+    # `messagefoundry_toolkit.generators`, which left the engine wheel. Pinned exactly for the same
+    # reason as the engine: the toolkit is lockstep too, so its version is the engine's. A version
+    # bump moves this line with the one above; the same CONTRIBUTING.md list names both.
+    # `tests/test_packaging.py::test_the_harness_pins_the_toolkit_at_the_version_it_ships_with` is
+    # the gate.
+    "messagefoundry-toolkit==0.5.2",
 ]
 
 [project.scripts]

@@ -35,7 +35,7 @@ from __future__ import annotations
 import opcode
 import os
 from collections.abc import Iterator
-from types import TracebackType
+from types import CodeType, TracebackType
 from typing import Any, Final
 
 __all__ = [
@@ -44,6 +44,7 @@ __all__ = [
     "raise_statement_file",
     "raised_by_the_engine",
     "raised_only_by_the_engine",
+    "raised_through",
     "worded_by_the_engine",
 ]
 
@@ -122,6 +123,13 @@ def raised_by_the_engine(exc: BaseException) -> bool:
     frame, and its text quotes ``value``. Use :func:`worded_by_the_engine` where that matters."""
     entries = _entries(exc)
     return bool(entries) and _in_the_engine(entries[-1])
+
+
+def raised_through(exc: BaseException, code: CodeType) -> bool:
+    """Whether a frame of ``exc``'s traceback runs ``code``, so ``exc`` was raised while that
+    function ran (BACKLOG #4883). Read by code object, so a function of the same name elsewhere
+    does not count, and an exception never raised has no frame and answers ``False``."""
+    return any(tb.tb_frame.f_code is code for tb in _entries(exc))
 
 
 def raise_statement_file(exc: BaseException) -> str | None:

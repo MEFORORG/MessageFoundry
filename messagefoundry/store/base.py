@@ -25,11 +25,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
+import threading
+import weakref
 from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache, partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import (
@@ -38,8 +42,16 @@ from messagefoundry.config.settings import (
     StoreBackend,
     StoreSettings,
 )
-from messagefoundry.config.tls_policy import HopPosture
-from messagefoundry.redaction import codec_safe_str, prints_a_codec_error
+from messagefoundry.config.tls_policy import (
+    _VAULT_HOP_MODULE,
+    HopPosture,
+    InsecureHopRefused,
+    is_vault_hop_refusal,
+)
+from messagefoundry.custody_posture import HOST_KEY_PROVIDER
+from messagefoundry.exception_origin import exception_chain
+from messagefoundry.redaction import prints_a_codec_error
+from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT,
@@ -58,7 +70,7 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.document_strip import StripResult
-from messagefoundry.store.keyprovider import resolve_key_provider
+from messagefoundry.store.keyprovider import KeyProviderError, resolve_key_provider
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import (
     StorePrivilegeReport,
@@ -67,6 +79,7 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
+    OPEN_STORE_PIN,
     UPLOAD_RESERVATION_STALE_AFTER,
     AdMap,
     AdminGrant,
@@ -85,6 +98,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DbStatus,
     DeadLetterPurge,
+    EnrolmentCodeOutcome,
     FailOutcome,
     FederatedUnbind,
     LatencyHistogram,
@@ -114,6 +128,7 @@ from messagefoundry.store.store import (
     SessionRecord,
     SignCountAnswer,
     Stage,
+    StorePin,
     StreamingAttachmentsUnsupported,
     TotpUsable,
     UserRecord,
@@ -124,6 +139,7 @@ from messagefoundry.store.store import (
 log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; both carry an optional driver, imported lazily
+    from messagefoundry.store.custody import HostBlob
     from messagefoundry.store.postgres import PostgresStore
     from messagefoundry.store.sqlserver import SqlServerStore
 
@@ -158,7 +174,9 @@ __all__ = [
     "Store",
     "StoreLifecycle",
     "KeylessAuditChainRefused",
+    "SCHEMA_SEED_FILTERS",
     "StoreNotFoundError",
+    "TableCensusIncomplete",
     "StreamingAttachmentsUnsupported",
     "PROVISION_SCHEMA_COMMAND",
     "SchemaDdlLockTimeout",
@@ -170,7 +188,9 @@ __all__ = [
     "make_spec",
     "open_store",
     "probe_store_privileges",
+    "server_store_schema_found_anywhere",
     "provision_store_schema",
+    "seed_filter_clause",
     "sqlite_settings",
     "store_driver_errors",
     "warm_pool_connections",
@@ -189,6 +209,30 @@ class DbaDelegatedError(RuntimeError):
     reimplemented in the engine, so the snapshot raises this rather than producing a half-baked copy. The
     BackupRunner / ``backup`` CLI catch it and fall back to a config-only backup (or skip) per
     ``[backup].config_only_on_server_db``."""
+
+
+class TableCensusIncomplete(RuntimeError):
+    """:meth:`Store.table_occupancy` could not show that it lists every table in the store's
+    schema: on SQL Server the login does not hold ``VIEW DEFINITION`` on that schema, or the
+    server did not answer whether it does, so ``sys.tables`` may hide a table that holds rows. The
+    text names the schema and the grant that clears it, never a row."""
+
+
+#: The row a schema build seeds into each table before anything uses the store, as a filter that
+#: matches every OTHER row: :meth:`Store.table_occupancy` reads such a table as held only when a
+#: row past its seed exists. ``global_session_epoch`` is seeded with its one row at epoch 0; a
+#: revoke-all raises it, which is state a mint must not take over. A constant fragment, the same
+#: on all three backends, never built from input.
+SCHEMA_SEED_FILTERS: Final[Mapping[str, str]] = MappingProxyType(
+    {"global_session_epoch": "NOT (id = 1 AND epoch = 0)"}
+)
+
+
+def seed_filter_clause(table: str) -> str:
+    """The ``WHERE`` clause a census probe of ``table`` appends, from :data:`SCHEMA_SEED_FILTERS`
+    by exact name, or nothing. Each backend's :meth:`Store.table_occupancy` calls this one."""
+    seed = SCHEMA_SEED_FILTERS.get(table)
+    return "" if seed is None else f" WHERE {seed}"
 
 
 class ReferenceKeyCollision(ValueError):
@@ -1810,6 +1854,34 @@ class QueueStore(StoreLifecycle, Protocol):
     # --- store health / metrics ----------------------------------------------
     async def db_status(self) -> DbStatus: ...
 
+    async def table_occupancy(self) -> Mapping[str, bool]:
+        """The store's own tables, read from the database's catalog rather than from this build's
+        DDL, mapped to whether each holds a row. A table in :data:`SCHEMA_SEED_FILTERS` reads as
+        held only when it holds a row past the one a schema build seeds. Names are exactly as the
+        catalog stores them.
+
+        Which tables: on SQLite, the main schema's tables in ``sqlite_master`` less virtual
+        tables (whose module may not be loaded here) and SQLite's own ``sqlite_*``; a virtual
+        table's shadow tables are ordinary tables there and count. On Postgres, the ordinary and
+        partitioned tables in the schema of the store's own ``schema_meta`` (as ``search_path``
+        resolves it), less the tables an extension owns (PostGIS's ``spatial_ref_sys``). On SQL
+        Server, the tables in the schema of the store's own ``schema_meta`` (as ``OBJECT_ID``
+        resolves it), less those SQL Server ships and external ones. On both server backends no
+        ``schema_meta`` means no tables.
+
+        What it cannot see, at least: rows a row-level security policy (Postgres) or a security
+        policy filter (SQL Server) hides from this login, which read as empty and raise nothing;
+        and on SQL Server a table whose metadata the login may not see, which ``sys.tables`` does
+        not list. SQL Server alone raises :class:`TableCensusIncomplete` unless the login holds
+        ``VIEW DEFINITION`` on the whole schema. That grant lists a table a table-level ``DENY``
+        of ``SELECT`` covers, which then fails its probe; it does not show that no table-level
+        ``DENY`` of ``VIEW DEFINITION``, or of a permission that covers it such as ``CONTROL``,
+        hides one. SQLite and Postgres make no such check. A listed table that
+        cannot be read raises the driver's error. Existence only: no cell is read except the two
+        plaintext integers a seed filter compares (``global_session_epoch.id`` and ``.epoch``),
+        so an open under a throwaway key decrypts nothing (vault BACKLOG #3411)."""
+        ...
+
     def pool_status(self) -> PoolStatus | None:
         """A read-only snapshot of this backend's connection pool, or ``None`` on a backend with no
         pool (SQLite). The **server-only** observability surface behind ``/status``'s additive ``pool``
@@ -2485,6 +2557,51 @@ class AuthStore(Protocol):
         now: float | None = None,
     ) -> bool: ...
 
+    # --- ADR 0207: a directory account's single-use enrolment code -------------------------------
+    # Three nullable ``users`` columns hold the code's ``hash_token`` digest, its expiry and the
+    # issuing Administrator's account id; never the code. Every write below is ONE conditional
+    # sealed write through the backend's ``_write_user``, so each condition is judged on the record
+    # the write replaces, and only a write that changed a row counts. ``set_user_disabled`` clears
+    # all three when it disables. The change builders in ``store.store`` hold the conditions.
+    #
+    # Set the digest, expiry and issuer, replacing any outstanding code, only where the account is
+    # an enabled directory account holding no engine factor. Returns what it replaced, or None
+    # when nothing was written; a caller must refuse on None and show no code.
+    async def issue_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        code_digest: str,
+        expires_at: float,
+        issuer_id: str | None,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None: ...
+
+    # Clear an outstanding code, expired or not. Returns whether one was cleared.
+    async def revoke_enrolment_code(self, user_id: str, *, now: float | None = None) -> bool: ...
+
+    # The passkey finish's spend: clear the code only where ``code_digest`` still matches, it has
+    # not expired, and the account is an enabled directory account with TOTP off and no passkey.
+    # Returns the outcome, whose ``issuer_id`` is the cleared code's issuer, or None when nothing
+    # was spent.
+    async def spend_enrolment_code(
+        self, user_id: str, *, code_digest: str, now: float | None = None
+    ) -> EnrolmentCodeOutcome | None: ...
+
+    # ``enable_totp`` with the spend folded into the same write (ADR 0207 Amendment A, A3): TOTP
+    # goes on and the code is cleared only where both conditions hold, so an enable that matches
+    # no row spends nothing. Returns the outcome, or None when nothing was written; a caller treats
+    # None exactly as ``enable_totp`` returning False.
+    async def enable_totp_spending_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        code_digest: str,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None: ...
+
     # ADR 0171 Amendment B (BACKLOG #2226), for `admin-reset-totp`: swaps an ENABLED enrolment's
     # secret, recovery codes and step high-water mark in ONE UPDATE, with TOTP on throughout, so the
     # account never passes through zero factors. The same transaction ends the account's sessions
@@ -2752,6 +2869,29 @@ class AuthStore(Protocol):
         the same."""
         ...
 
+    async def set_user_roles_if_held(
+        self,
+        user_id: str,
+        role_ids: Sequence[str],
+        *,
+        expected_role_ids: Iterable[str],
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """:meth:`set_user_roles` as a COMPARE-AND-SET on the roles the caller read, reporting
+        whether it wrote (vault BACKLOG #3085).
+
+        The directory reconciler decides a role write from a row it read earlier, and another
+        writer, such as a second reconciler or a directory sign-in, may have written the roles in
+        between. So the write compares the record's roles, as sets, with ``expected_role_ids`` in
+        its own transaction, under the row's lock. If they differ, or the row is gone, nothing is
+        written and this returns ``False``. Of two calls that read one set and write another,
+        only the first writes. The compare is on the set, not the record, so a newer write
+        of the same set is not detected.
+        Otherwise it writes as :meth:`set_user_roles` does, with the same ``UnknownRoleError`` and
+        seal refusals."""
+        ...
+
     async def remove_unless_last_admin(
         self,
         user_id: str,
@@ -2812,16 +2952,20 @@ class AuthStore(Protocol):
         ``expected_password_hash``, and no TOTP secret when ``expected_totp_secret_cell`` is
         ``None`` or TOTP on with that staged cell when it is not. When those no longer hold it
         writes nothing and returns :attr:`AdminGrant.ACCOUNT_CHANGED`; a missing account, and a
-        compare on the seal lost to a concurrent write, answer the same.
+        compare on the seal lost to a concurrent write, answer the same. So does an account holding
+        any passkey (BACKLOG #3078 F2): ``provision-admin`` enrols none and clears an earlier
+        holder's first, so one present at the grant was enrolled by that holder in the repair
+        window, and the role is not written beside it.
 
         **It is serialized against every other call of this and of :meth:`remove_unless_last_admin`
         on the same database**, under the same lock, not only in this process. So two provisioning
         runs with different usernames, each of which saw no administrator ``counts_as_admin``
         passes, cannot both be granted:
         the one whose grant commits second reads the first and is refused. SQLite has no such lock
-        across processes and relies on its single writer instead; its implementation re-runs the
-        transaction a bounded number of times when the write fails busy, and raises past that bound
-        rather than answering a refusal."""
+        across processes and relies on its single writer instead, taken at the transaction's start
+        with ``BEGIN IMMEDIATE``; its implementation re-runs the transaction a bounded number of
+        times when that still answers busy, and raises past that bound rather than answering a
+        refusal."""
         ...
 
     async def set_user_channel_scope(
@@ -3350,10 +3494,38 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
     ``dpapi`` with only ``MEFOR_STORE_ENCRYPTION_KEY``, or ``env`` with only a key file.
 
     ``posture`` is the instance posture the caller holds, for an external provider's hop guard
-    (vault BACKLOG #2983). ``None`` counts as enforcing there."""
-    return _checked_active_key(
-        resolve_key_provider(settings, posture=posture).active_key(), settings
-    )
+    (vault BACKLOG #2983). ``None`` counts as enforcing there.
+
+    Three kinds of provider error are raised as :func:`_codec_safe_refusal` gives them, with a
+    fixed text, no byte and no chain (BACKLOG #4882), as by :func:`build_store_cipher`: one that is
+    a codec error, holds one, or has one on a link :func:`_codec_error_on` reaches; one whose chain
+    cannot be read whole, whether or not it holds a codec error; and one whose judgement raised an
+    ``Exception``, whose text names no class. Any other provider error is replaced by a new one
+    from :func:`_fresh_refusal`, with a fixed text chosen by its class and no chain: none is passed
+    through (the eighth hold on engine PR 2818). Either way, a ``BaseException`` that is not an
+    ``Exception``, such as a ``KeyboardInterrupt``,
+    raised by the judgement's own code, and anything the fallback refusal itself raises, such as
+    a ``RecursionError``, propagate in place of the refusal or the error, with no cause and no
+    context. This covers at least the callers that resolve the key without
+    building the cipher, such as ``rotate-key``. The key check after a provider answers is not
+    judged here."""
+    try:
+        try:
+            key = resolve_key_provider(settings, posture=posture).active_key()
+        except Exception as exc:
+            caught, refusal = exc, _codec_safe_refusal(exc)
+        else:
+            return _checked_active_key(key, settings)
+        # Outside the handler, so nothing raised here, at the recursion limit included, has the
+        # caught error as its context; and the caught error is dropped, so the refusal's traceback
+        # holds no frame local that reaches it.
+        try:
+            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
+        finally:
+            del caught  # dropped even where the call raises, at the recursion limit included
+        raise refusal from None
+    finally:
+        _flush_unjudged()
 
 
 def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
@@ -3369,13 +3541,17 @@ def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
 
     if key:
         return key
+    # Each text is built from the settings alone, so it is recorded (:func:`_recorded`) and a site
+    # that replaces the refusal keeps it.
     if settings.key_provider in _EXTERNAL_PROVIDERS:
-        raise KeyProviderError(
+        text = (
             f"[store].key_provider={settings.key_provider!r} resolved no key; refusing to use "
             "the identity (plaintext) cipher in its place."
         )
+        raise _recorded(KeyProviderError(text), text)
     if (unread := unread_key_refusal(settings)) is not None:
-        raise KeyProviderError(f"resolved no key, refusing to continue: {unread}")
+        text = f"resolved no key, refusing to continue: {unread}"
+        raise _recorded(KeyProviderError(text), text)
     return key
 
 
@@ -3389,13 +3565,46 @@ def resolve_decrypt_keys(
     *any* value the store could read — e.g. the DR restore-verify checking a backup taken under a
     now-retired key after a rotation (ADR 0049 AC-5: "incl. retired keys") — uses this, not just the
     active key. Order is active-first; duplicates and empties are dropped; an unset active key yields an
-    empty list (identity cipher). ``posture`` is as on :func:`resolve_active_key`."""
-    provider = resolve_key_provider(settings, posture=posture)
+    empty list (identity cipher). ``posture`` is as on :func:`resolve_active_key`.
+
+    The three refusals there apply here too, and here also to the key check (BACKLOG #4882): an
+    error from the provider or the key check that has a codec error on it, whose chain cannot be
+    read whole whether or not it holds one, or whose judgement raised an ``Exception``, is raised
+    as :func:`_codec_safe_refusal` gives it. Any other is replaced as there. Either way, a
+    ``BaseException`` that is not an ``Exception``, raised by the judgement's own code, and
+    anything the fallback refusal itself raises propagate in place of the refusal or the error,
+    with no cause and no context."""
+    try:
+        try:
+            provider = resolve_key_provider(settings, posture=posture)
+            active = _checked_active_key(provider.active_key(), settings)
+            # Copied here, so a provider whose sequence reads as it is iterated is refused here too.
+            retired_keys = list(provider.retired_keys())
+        except Exception as exc:
+            # The traceback of whatever leaves keeps this frame, the judgement's own escape
+            # included, so the key the provider answered is dropped first; assigned rather than
+            # deleted, since the call that raised may have left it unbound.
+            active = None
+            caught, refusal = exc, _codec_safe_refusal(exc)
+        else:
+            return _keyring(active, retired_keys)
+        # As at :func:`resolve_active_key`, and with neither the caught error nor the refusal left
+        # bound, even where the call raises, so no cycle through this frame keeps either.
+        try:
+            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
+            raise refusal from None
+        finally:
+            del caught, refusal
+    finally:
+        _flush_unjudged()
+
+
+def _keyring(active: str | None, retired_keys: Sequence[str]) -> list[str]:
+    """``active`` then each retired key, empties and repeats dropped, active first."""
     ordered: list[str] = []
-    active = _checked_active_key(provider.active_key(), settings)
     if active:
         ordered.append(active)
-    for retired in provider.retired_keys():
+    for retired in retired_keys:
         if retired:
             ordered.append(retired)
     # De-dup while preserving order (active first) so a key listed both active + retired isn't tried twice.
@@ -3408,61 +3617,459 @@ def resolve_decrypt_keys(
     return keyring
 
 
-def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = None) -> Cipher:
+def build_store_cipher(
+    settings: StoreSettings, *, posture: HopPosture | None = None, host_key: str | None = None
+) -> Cipher:
     """Build the at-rest cipher for ``settings`` — the SAME construction ``open_store`` uses (active key
     + retired decrypt-only keyring, ``write_v2=aad_bind``). Exposed so a store-DECOUPLED PHI-at-rest
     surface — the offline uploaded-logs files (ADR 0134) — encrypts under the identical DEK / keyring /
     rotation posture as the message store, without reaching into a live ``Store`` instance's private
     cipher. No key configured → the identity cipher (plaintext), exactly like the store.
 
-    A ``ValueError`` from the build is raised as :class:`StoreCipherConfigError`, which subclasses
-    it: at least a key that is not base64 of 32 bytes, an unknown ``cipher_provider`` and a Transit
+    A ``ValueError`` from the build, a hop refusal included, is raised as a new
+    :class:`StoreCipherConfigError`, which subclasses it: at least a key that is not base64 of 32 bytes, an unknown ``cipher_provider`` and a Transit
     client setting it refuses. Each comes from the settings or the key provider before the store
     reads a row, so a caller can treat that class as "could not start" where a bare ``ValueError``
     from the open could mean anything (vault BACKLOG #3054, item 8).
+
+    ``host_key`` is the key :func:`open_store` derived from the host blob it read itself, under the
+    ``host`` key provider (vault BACKLOG #3411), so the blob is read once per open; ``None`` resolves
+    the key through the provider as every other caller does.
 
     ``posture`` is the instance posture the caller holds. It reaches the two Vault hops a cipher
     build can dial, the key provider and the Transit cipher, whose revocation guard is keyed on it
     (vault BACKLOG #2983). ``None`` counts as enforcing there, so a caller with no posture gets
     the strict answer.
 
-    **A codec error is not chained (BACKLOG #3471).** Its own text names a byte of what it decoded,
-    and its ``.object`` holds all of it, so a key source that yields bytes that are not text would
-    put key material in the refusal and in any traceback of it. A ``ValueError`` from the build
-    that is one, holds one, or has one on the links :func:`_carries_a_codec_error` follows, is
-    rendered with :func:`~messagefoundry.redaction.codec_safe_str` and raised outside the handler.
-    Every other ``ValueError`` keeps its text and its chain. An error of another class, such as a
-    ``KeyProviderError`` or ``DpapiError``, passes through untouched."""
+    **A codec error is not chained (BACKLOG #3471, #4882).** Its own text names a byte of what it
+    decoded, and its ``.object`` holds all of it, so a key source that yields bytes that are not
+    text would put key material in the refusal and in any traceback of it. An error from the build
+    of any class with a codec error on it is raised as :func:`_codec_safe_refusal` gives it, with
+    no byte and no chain, and so is one whose chain cannot be read whole or whose judgement raised
+    an ``Exception``. Every other error is replaced by a new one from :func:`_fresh_refusal`, with
+    no chain: a ``ValueError`` as :class:`StoreCipherConfigError` with :data:`_UNTEXTED`, and
+    another class with a fixed text chosen by its class. A refusal the engine built itself keeps
+    the text the engine recorded for it, never read from the instance. Nothing is passed through,
+    and no text is read from the error into the refusal (the seventh and eighth holds on engine PR
+    2818); a Vault hop refusal's argument only chooses between two fixed texts (the tenth hold)."""
+    texts = _TRANSIT_BUILD_TEXTS if settings.cipher_provider == "vault_transit" else _BUILD_TEXTS
     try:
-        return _build_store_cipher(settings, posture)
-    except ValueError as exc:
-        if not _carries_a_codec_error(exc):
-            raise StoreCipherConfigError(str(exc)) from exc
-        refusal = codec_safe_str(exc)
-    raise StoreCipherConfigError(refusal)
+        try:
+            return _build_store_cipher(settings, posture, host_key)
+        except Exception as exc:
+            del host_key  # the store data key, dropped first, as at resolve_decrypt_keys
+            caught, refusal = exc, _codec_safe_refusal(exc)
+        # As at :func:`resolve_decrypt_keys`. A hop refusal is a ``StoreCipherConfigError`` here,
+        # as every ``ValueError`` from the build is, so each command's key arm still reports it.
+        try:
+            refusal = _in_place_of(caught, refusal, texts, StoreCipherConfigError)
+            raise refusal from None
+        finally:
+            del caught, refusal
+    finally:
+        _flush_unjudged()
 
 
-def _carries_a_codec_error(exc: BaseException) -> bool:
-    """Whether ``exc``, or an error on its chain, is a codec error or prints one (BACKLOG #3471).
-    Each link is followed by its ``__cause__``, else its ``__context__``, as a traceback prints it;
-    a ``__context__`` beside a ``__cause__`` is not read."""
-    seen: set[int] = set()
-    link: BaseException | None = exc
-    while link is not None and id(link) not in seen:
-        seen.add(id(link))
-        if isinstance(link, UnicodeError) or prints_a_codec_error(link):
-            return True
-        link = link.__cause__ or link.__context__
-    return False
+def _in_place_of(
+    caught: Exception, refusal: Exception | None, texts: _SiteTexts, hop_as: type[Exception]
+) -> Exception:
+    """``refusal``, as :func:`_codec_safe_refusal` gave it, or, where it gave none, a new one from
+    :func:`_fresh_refusal`; called outside the handler. The replaced error's class is logged by
+    name alone (:func:`_log_unjudged`), so a replaced error is not swallowed silently."""
+    if refusal is not None:
+        return refusal
+    if _recorded_text(caught) is None:  # one the engine built is not news
+        _log_unjudged("an error was replaced with a fixed text", type(caught))
+        # Its cause's class too, read through the descriptor, since a provider wraps most
+        # failures in one class and the cause is what tells them apart.
+        cause = _CAUSE.__get__(caught)
+        if cause is not None:
+            _log_unjudged("the replaced error's cause", type(cause))
+    return _fresh_refusal(caught, texts, hop_as)
+
+
+#: The fixed texts :func:`_fresh_refusal` chooses from, by the replaced error's class: a hop
+#: refusal, a DPAPI error, DPAPI unavailable, a ``ValueError``, and any other class.
+_SiteTexts = tuple[str, str, str, str, str]
+
+
+def _fresh_refusal(
+    exc: Exception, texts: _SiteTexts, hop_as: type[Exception] = InsecureHopRefused
+) -> Exception:
+    """A new refusal in ``exc``'s place, for a site where :func:`_codec_safe_refusal` gave none,
+    of the class its callers expect, chosen by ``exc``'s class as read with ``type``: an
+    ``InsecureHopRefused``, a ``DpapiError``, a ``DpapiUnavailable``, a
+    :class:`StoreCipherConfigError` for any other ``ValueError``, else a ``KeyProviderError``. Its
+    text is the matching one of the site's ``texts``, or, for a refusal the engine built itself
+    (:func:`_recorded_text`), the text recorded when it was built. No text is read from ``exc``
+    into the refusal, nor its class name (the eighth hold on engine PR 2818).
+
+    Two more texts are chosen where ``exc`` or its cause, read through ``BaseException``'s own
+    descriptor, is exactly the Vault hop's marked refusal
+    (:func:`~messagefoundry.config.tls_policy.is_vault_hop_refusal`), so a Vault hop the engine
+    refused stays apart from one that crossed and failed later. A store revocation refusal
+    (:func:`_is_vault_revocation_refusal`, which reads that refusal's argument to choose)
+    gets :data:`_VAULT_REVOCATION_TEXT`, which offers the attestation; any other marked refusal gets
+    :data:`_VAULT_HOP_TEXT`, which does not (the tenth hold on engine PR 2818)."""
+    kind = type(exc)
+    recorded = _recorded_text(exc)
+    hop, dpapi, unavailable, value, other = texts
+    for link in (exc, _CAUSE.__get__(exc)):
+        if is_vault_hop_refusal(link):
+            vault = (
+                _VAULT_REVOCATION_TEXT if _is_vault_revocation_refusal(link) else _VAULT_HOP_TEXT
+            )
+            hop = value = other = vault
+            break
+    made: type[Exception]
+    if issubclass(kind, InsecureHopRefused):
+        made, text = hop_as, hop
+    elif issubclass(kind, DpapiError):
+        made, text = DpapiError, dpapi
+    elif issubclass(kind, DpapiUnavailable):
+        made, text = DpapiUnavailable, unavailable
+    elif issubclass(kind, ValueError):
+        made, text = StoreCipherConfigError, value
+    else:
+        made, text = KeyProviderError, other
+    text = recorded or text
+    return _recorded(made(text), text)
+
+
+#: Each refusal the engine built here, by ``id``, with the text it was built with. Keyed by
+#: identity and checked by identity, so an error cannot claim an entry through its own ``__eq__``
+#: or ``__hash__``; an entry leaves when its refusal is collected.
+_BUILT: dict[int, tuple[weakref.ref[Exception], str]] = {}
+
+
+def _recorded(refusal: Exception, text: str) -> Exception:
+    """``refusal``, recorded as built by the engine with ``text``."""
+    key = id(refusal)
+    _BUILT[key] = (weakref.ref(refusal, lambda _gone: _BUILT.pop(key, None)), text)
+    return refusal
+
+
+def _recorded_text(exc: BaseException) -> str | None:
+    """The text the engine built ``exc`` with, when ``exc`` is itself one of its refusals, else
+    ``None``. The instance's own ``args`` are never read: code that caught the refusal could have
+    reassigned them."""
+    entry = _BUILT.get(id(exc))
+    return entry[1] if entry is not None and entry[0]() is exc else None
+
+
+def _codec_safe_refusal(exc: Exception) -> Exception | None:
+    """The refusal to raise in ``exc``'s place, outside the handler, when ``exc`` is a codec error,
+    holds one, or has one on a link :func:`~messagefoundry.exception_origin.exception_chain`
+    reaches, or ``None`` when it has none (BACKLOG #3471, #4882). That walk reads each link's
+    ``__cause__`` and ``__context__`` both, a suppressed context included, since a text can be
+    built from it, and each member of an exception group.
+
+    - One that is, holds or has on its chain a codec error, and one whose chain cannot be read
+      whole, too long or raising as it is read, is refused with a fixed text that says which, and
+      reads nothing from the error or the codec error: no text, no argument, no class name (the
+      seventh hold on engine PR 2818). So a chain that cannot be read whole is never judged clean.
+
+    A ``ValueError`` is refused as :class:`StoreCipherConfigError` and any other class as
+    ``KeyProviderError``, which at least every CLI command with a key arm reports as a key that
+    could not be resolved.
+
+    An ``Exception`` the judgement's own code raises outside the walk, which catches its own,
+    such as a ``RecursionError`` at the recursion limit, is refused the same way, as one that could
+    not be judged, with a fixed text that names no class, so the fallback runs none of ``exc``'s
+    code, and the error it caught is logged by its class name (:func:`_log_unjudged`). A
+    ``BaseException`` that is not an ``Exception``, such as a ``KeyboardInterrupt`` from a link's
+    own code or from an attribute read of the codec error, and anything the fallback itself
+    raises, such as a ``MemoryError``, propagate in place of any refusal, with no cause and no
+    context.
+
+    WHY THE LINKS ARE CLEARED (the holds on engine PR 2818). Each caller judges an error while
+    handling it, so what the judgement or the fallback raises has that error as its context,
+    directly or through the judgement's own error, and that error's text may quote the byte. The
+    handler clears ``__cause__`` and ``__context__``, and resets ``__suppress_context__``, which
+    clearing the cause sets, then re-raises with a bare ``raise``, which sets neither again. It
+    writes each through ``BaseException``'s own descriptor (:data:`_CAUSE` and its siblings), as
+    ``BaseException.__cause__.__set__(escaping, None)``, never by assignment to the instance,
+    which runs a subclass's ``__setattr__``; one that raises would leave in the handler with the
+    judged error as context (the third hold). It makes no Python call of its own: at the
+    recursion limit such a call raises a fresh ``RecursionError`` in the handler, chained back to
+    the judged error. The context is cleared first, since it is the link every escaping error
+    has. At least these are left as they are: an exception group's members, the escaping error's
+    own arguments, its traceback's frame locals, an interrupt delivered in the caller's handler
+    outside the judgement's code, a finalizer that dropping a link's last reference runs, and an
+    interrupt a signal handler raises at one of the three descriptor calls, each a C call where a
+    signal handler can run. Raised before the first call clears the context, such an interrupt
+    keeps the escaping error, still chained to the judged one, as its context; raised after it,
+    only a cause the escaping error was given."""
+    try:
+        try:
+            return _refusal_for(exc)
+        except Exception as judging:  # noqa: BLE001 -- fail closed: the judgement ran exc's own code
+            swallowed = type(judging)
+        # Held, and written once the site has left its handler, so nothing the log call raises is
+        # chained to ``judging`` or to the judged error.
+        refusal = _refused(type(exc), _UNJUDGED)
+        _log_unjudged("an error could not be judged for a codec error", swallowed)
+        return refusal
+    except BaseException as escaping:
+        _CONTEXT.__set__(escaping, None)
+        _CAUSE.__set__(escaping, None)
+        _SUPPRESS_CONTEXT.__set__(escaping, False)
+        raise
+
+
+#: The text for every other ``ValueError`` from the build. It names the settings and the failure
+#: modes the build checks, and reads nothing from the error (the seventh hold on engine PR 2818);
+#: the refusal is raised after the handler has exited, so the error is not on its chain (the
+#: eighth hold).
+_UNTEXTED = (
+    "the store cipher could not be built from the settings: check [store].cipher_provider "
+    "('aesgcm' or 'vault_transit'), the Vault Transit settings when it is vault_transit, and every "
+    "store key, active or retired, from MEFOR_STORE_ENCRYPTION_KEY, its key file, "
+    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED or [store].key_provider, each of which must be valid "
+    "base64 of 32 bytes (generate one with `messagefoundry gen-key`); the error's own text is not "
+    "shown"
+)
+
+#: What each refusal :func:`_refusal_for` gives opens with: the settings it may come from.
+_KEY_SOURCE = (
+    "the store key or cipher settings ([store].key_provider, [store].cipher_provider and the keys "
+    "or Vault settings they read) were refused"
+)
+
+#: The fallback refusal's text. Like every refusal text here it reads nothing from the error.
+_UNJUDGED = f"{_KEY_SOURCE}: an error that could not be judged, its class and text not shown"
+
+#: :func:`_fresh_refusal`'s text, at both sites, for a Vault hop marked refusal that is not one of
+#: the store's revocation refusals, at least an http:// address, a proxy's cleartext
+#: credentials or an unchecked client key. It offers no attestation and reads nothing from the
+#: refusal.
+_VAULT_HOP_TEXT = (
+    f"{_KEY_SOURCE}: the store's Vault hop was refused by the engine's own hop checks, its text "
+    "not shown; check that MEFOR_STORE_VAULT_ADDR is an https:// address, any proxy variable, and "
+    "the Vault CA and client settings"
+)
+
+#: :func:`_fresh_refusal`'s text, at both sites, for the store's revocation refusals, of the Vault
+#: leg or the proxy leg. It keeps the remedy that needs no attestation, and offers the attestation
+#: only on the precondition those refusals' own levers state (``strict_requests``'
+#: ``_STORE_REVOCATION_LEVER`` and ``_STORE_PROXY_LEG_LEVER``), which only the operator can judge.
+_VAULT_REVOCATION_TEXT = (
+    f"{_KEY_SOURCE}: the store's Vault hop was refused because it checks no certificate "
+    "revocation, its text not shown; a loopback Vault reached with no proxy crosses without an "
+    "attestation, so check MEFOR_STORE_VAULT_ADDR and any proxy variable; otherwise, if revocation "
+    "for this hop is covered outside the engine, set [store].vault_revocation_attested = true with "
+    "a [store].vault_revocation_attested_reason that covers the Vault server's certificate and any "
+    "https:// proxy's the hop goes through"
+)
+
+
+def _is_vault_revocation_refusal(refusal: BaseException) -> bool:
+    """Whether ``refusal``, already exactly the Vault hop's marked refusal, is one of the store's
+    two revocation refusals: the Vault leg's, as ``strict_requests.is_unrevoked_vault_hop_refusal``
+    with ``"store"`` answers it, or the proxy leg's, whose text after the connector label is
+    exactly ``_UNREVOKED_PROXY_LEG`` and ``_STORE_PROXY_LEG_LEVER``. A ``[secrets]`` refusal
+    answers ``False``.
+
+    Both tests read the refusal's text, so they run only on one whose single argument is an exact
+    ``str``, read through ``BaseException``'s own descriptor, and so run none of the refusal's
+    code. The answer only chooses between two fixed texts and nothing read is printed, but the
+    argument can have been reassigned after the refusal was built: a reassigned one can at most
+    choose the other fixed text. The module is read from ``sys.modules``, as
+    ``is_vault_hop_refusal`` reads it; a judge or constant that is missing, or a judge that
+    raises, answers ``False``, so the refusal is never replaced by the judge's own error."""
+    args = _ARGS.__get__(refusal)
+    if len(args) != 1 or type(args[0]) is not str:
+        return False
+    module = sys.modules.get(_VAULT_HOP_MODULE)
+    if module is None:
+        return False
+    proxy_leg = getattr(module, "_UNREVOKED_PROXY_LEG", None)
+    proxy_lever = getattr(module, "_STORE_PROXY_LEG_LEVER", None)
+    store_proxy_leg = (
+        f"{proxy_leg} {proxy_lever}"
+        if type(proxy_leg) is str and type(proxy_lever) is str
+        else None
+    )
+    if store_proxy_leg is not None and args[0].partition(": ")[2] == store_proxy_leg:
+        return True
+    judge = getattr(module, "is_unrevoked_vault_hop_refusal", None)
+    if judge is None:
+        return False
+    try:
+        return judge(refusal, "store") is True
+    except Exception:  # noqa: BLE001 -- fail to the text that offers no attestation
+        return False
+
+
+#: :func:`_fresh_refusal`'s texts at the key seam (``resolve_active_key``, ``resolve_decrypt_keys``).
+_KEY_SEAM_TEXTS: _SiteTexts = (
+    f"{_KEY_SOURCE}: the hop to the key source was refused, its text not shown; check the key "
+    "provider's address, its TLS settings and the instance posture",
+    f"{_KEY_SOURCE}: the protected store key file ([store].encryption_key_file) could not be "
+    "read as a key, its text not shown; check that it was protected for this account and holds "
+    "an ASCII base64 key",
+    f"{_KEY_SOURCE}: DPAPI is not available on this platform; use another key source",
+    f"{_KEY_SOURCE}: a key was refused, its text not shown; every store key must be valid base64 "
+    "of 32 bytes (generate one with `messagefoundry gen-key`)",
+    f"{_KEY_SOURCE}: the key source failed, its text not shown; check [store].key_provider and "
+    "its settings",
+)
+
+#: :func:`_fresh_refusal`'s texts at ``build_store_cipher``: the key seam's, with
+#: :data:`_UNTEXTED` for a ``ValueError``.
+_BUILD_TEXTS: _SiteTexts = (*_KEY_SEAM_TEXTS[:3], _UNTEXTED, _KEY_SEAM_TEXTS[4])
+
+#: The cipher build's texts under ``cipher_provider = 'vault_transit'``, chosen by that setting: an
+#: error of the Transit cipher's own build names its settings, not ``[store].key_provider``.
+_TRANSIT_BUILD_TEXTS: _SiteTexts = (
+    *_BUILD_TEXTS[:4],
+    f"{_KEY_SOURCE}: the Vault Transit cipher could not be built, its text not shown; check "
+    "[store].cipher_provider = 'vault_transit', MEFOR_STORE_VAULT_ADDR, MEFOR_STORE_VAULT_TOKEN, "
+    "MEFOR_STORE_TRANSIT_KEY and the Transit key's type, and that the [vault] extra is installed",
+)
+
+#: The log line when the log call for a fail-closed judgement itself failed. It has no argument.
+_LOG_FAILED = "store: a codec judgement failed closed, and its log line could not be written"
+
+#: ``type``'s own ``__name__`` descriptor, so naming a class runs no metaclass code.
+_NAME_OF_A_TYPE: Any = vars(type)["__name__"]
+
+
+#: Log lines :func:`_log_unjudged` holds until a site has left its handler, per thread.
+_UNLOGGED = threading.local()
+
+
+def _log_unjudged(what: str, swallowed: type[BaseException]) -> None:
+    """Hold a log line for the class of an error the codec judgement caught to fail closed
+    (CLAUDE.md section 6), by its name alone: never its text, nor the judged error's, either of
+    which may quote the byte. A name that is not an ASCII identifier is not printed, as one a class
+    built from data could carry it. The line is written by :func:`_flush_unjudged`, which each site
+    calls once it has left its ``except`` block, so no log call runs while the judged error is
+    being handled: a handler that fails would print it as the context of its own error (the eighth
+    hold on engine PR 2818)."""
+    name = _NAME_OF_A_TYPE.__get__(swallowed)
+    shown = name if type(name) is str and name.isascii() and name.isidentifier() else "unnamed"
+    held: list[tuple[str, str]] = getattr(_UNLOGGED, "lines", [])
+    held.append((what, shown))
+    _UNLOGGED.lines = held
+
+
+def _flush_unjudged() -> None:
+    """Write the lines :func:`_log_unjudged` held, as WARNINGs with no ``exc_info``. If a log call
+    fails, :data:`_LOG_FAILED` is logged as an ERROR instead, with no argument, so the failure is
+    not silent. If that fails too, the logger itself is broken and nothing is left to report with;
+    it is not raised, so the refusal is not replaced, and the refusal is then the only record."""
+    held: list[tuple[str, str]] = getattr(_UNLOGGED, "lines", [])
+    _UNLOGGED.lines = []
+    for what, shown in held:
+        _write_unjudged(what, shown)
+
+
+def _write_unjudged(what: str, shown: str) -> None:
+    """One held line, as :func:`_flush_unjudged` says."""
+    try:
+        log.warning("%s (%s); refused with a fixed text", what, shown)
+    except Exception:  # noqa: BLE001 -- the log call is what failed; say so with fixed text
+        try:
+            log.error(_LOG_FAILED)
+        except Exception:  # noqa: BLE001 -- the logger is broken; see the docstring
+            return
+
+
+#: ``BaseException``'s own link descriptors, which ``BaseException.__cause__`` and its siblings
+#: resolve to, so clearing a link runs no subclass code (the third hold on engine PR 2818). Read
+#: through ``vars``, since the stubs give ``BaseException.__cause__`` the instance attribute's
+#: type, which has no ``__set__``.
+_CAUSE: Any = vars(BaseException)["__cause__"]
+_CONTEXT: Any = vars(BaseException)["__context__"]
+_SUPPRESS_CONTEXT: Any = vars(BaseException)["__suppress_context__"]
+
+#: ``BaseException``'s own ``args`` descriptor. Not a link and never cleared: it is only read, by
+#: :func:`_is_vault_revocation_refusal`, so the read runs no subclass code.
+_ARGS: Any = vars(BaseException)["args"]
+
+
+def _refusal_for(exc: Exception) -> Exception | None:
+    """:func:`_codec_safe_refusal`'s judgement, which may run ``exc``'s own code in the walk. The
+    refusal's text is fixed and reads nothing from ``exc`` or the codec error it finds (the seventh
+    hold on engine PR 2818); only its class, read with ``type``, picks the refusal's type. The walk
+    that selects the codec error still tests each link with ``isinstance``, which can read
+    ``__class__``, and reads each link's arguments."""
+    codec, read_whole = _codec_error_on(exc)
+    if not read_whole:
+        text = f"{_KEY_SOURCE}: an error whose chain cannot be read whole, its text not shown"
+    elif codec is None:
+        return None
+    elif codec is exc:
+        text = f"{_KEY_SOURCE}: an error that is or holds a codec error, its text not shown"
+    else:
+        text = f"{_KEY_SOURCE}: an error whose chain holds a codec error, its text not shown"
+    return _refused(type(exc), text)
+
+
+def _refused(kind: type[Exception], text: str) -> Exception:
+    """``text`` as :class:`StoreCipherConfigError` for a ``ValueError`` ``kind``, else as
+    ``KeyProviderError``. ``kind`` is the judged error's class as read with ``type``, which runs none
+    of its code."""
+    made = StoreCipherConfigError if issubclass(kind, ValueError) else KeyProviderError
+    return _recorded(made(text), text)
+
+
+def _codec_error_on(exc: BaseException) -> tuple[BaseException | None, bool]:
+    """The first error :func:`~messagefoundry.exception_origin.exception_chain` reaches from
+    ``exc``, ``exc`` first, that is a codec error or prints one, or ``None``; and whether the chain
+    was read whole. It was not when the walk raised, too long or from a link's own code, and then
+    no error is named (BACKLOG #4882). A ``BaseException`` that is not an ``Exception``
+    propagates; each caller clears its links, as :func:`_codec_safe_refusal` says."""
+    try:
+        codec = next(
+            (
+                e
+                for e in exception_chain(exc)
+                if isinstance(e, UnicodeError) or prints_a_codec_error(e)
+            ),
+            None,
+        )
+    except Exception as walking:  # noqa: BLE001 -- fail closed: too long, or a link's own code
+        swallowed = type(walking)
+    else:
+        return codec, True
+    _log_unjudged("an error's chain could not be read whole for a codec error", swallowed)
+    return None, False
+
+
+def _codec_chain_reading(exc: BaseException) -> str | None:
+    """For the PostgreSQL store's TLS context wrap, what to say of ``exc`` in place of its text:
+    ``"from a codec error"`` where a codec error is on its chain as :func:`_codec_error_on` reads
+    it, ``"whose chain cannot be read whole"`` where that read did not finish, else ``None``
+    (BACKLOG #3471, #4882). Whatever it answers, the wrap reads nothing else from ``exc`` (the
+    seventh hold on engine PR 2818). A ``BaseException`` from the walk, such as a
+    ``KeyboardInterrupt``, propagates with no cause and no context, its links cleared through
+    ``BaseException``'s descriptors as :func:`_codec_safe_refusal` says."""
+    try:
+        codec, read_whole = _codec_error_on(exc)
+    except BaseException as interrupt:
+        _CONTEXT.__set__(interrupt, None)
+        _CAUSE.__set__(interrupt, None)
+        _SUPPRESS_CONTEXT.__set__(interrupt, False)
+        raise
+    if not read_whole:
+        return "whose chain cannot be read whole"
+    return None if codec is None else "from a codec error"
 
 
 class StoreCipherConfigError(ValueError):
-    """The store cipher could not be built from the settings; see :func:`build_store_cipher`. Its
-    text is the build error's, which names settings and variables, never a key. A codec error's
-    is rendered without the bytes it names (BACKLOG #3471)."""
+    """The store cipher could not be built from the settings; see :func:`build_store_cipher`. A
+    ``ValueError`` from the build is replaced by a new one with a fixed text and no chain (the
+    eighth hold on engine PR 2818): :data:`_UNTEXTED`, or the text the key resolution recorded for
+    its own refusal. Three kinds get :func:`_codec_safe_refusal`'s fixed text instead (BACKLOG
+    #3471, #4882): one with a codec error on it, one whose chain cannot be read whole, whether or
+    not it holds a codec error, and one whose judgement raised an ``Exception``."""
 
 
-def _build_store_cipher(settings: StoreSettings, posture: HopPosture | None) -> Cipher:
+def _build_store_cipher(
+    settings: StoreSettings, posture: HopPosture | None, host_key: str | None = None
+) -> Cipher:
     if settings.cipher_provider == "vault_transit":
         # ADR 0138: bulk at-rest crypto INSIDE Vault/OpenBao Transit — the plaintext DEK never enters
         # engine heap (ASVS 13.3.3). Lazy-imported so the base install pulls no Vault SDK; fails closed at
@@ -3477,7 +4084,7 @@ def _build_store_cipher(settings: StoreSettings, posture: HopPosture | None) -> 
         )
     retired = [k.strip() for k in settings.encryption_keys_retired.split(",") if k.strip()]
     return make_cipher(
-        resolve_active_key(settings, posture=posture),
+        host_key if host_key is not None else resolve_active_key(settings, posture=posture),
         retired,
         write_v2=settings.aad_bind,
         allow_unmarked=settings.allow_unmarked_ciphertext,
@@ -3896,6 +4503,8 @@ async def open_store(
     posture: HopPosture | None = None,
     keyless_chain_refusal: str | None = KEYLESS_REFUSED_BY_NO_OPT_OUT,
     refusal_hook: UnmarkedRefusalHook | None = None,
+    custody: HostBlob | None = None,
+    recovery_wrap: bytes = b"",
 ) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
 
@@ -3959,6 +4568,24 @@ async def open_store(
     refuse an unmarked value -- the sweep finds a planted row, or the eager ``state``/``reference``
     cache load reads one and aborts the open -- and only a hook armed this early can alert on those.
     ``None`` leaves the refusal to the log, as a CLI utility's open does.
+
+    **Key custody (vault BACKLOG #3411).** Under ``[store].key_provider = 'host'`` the open reads
+    the host blob itself (:func:`~messagefoundry.store.custody_host.load_host_custody`; a writable
+    open converts a handoff on the service's first start), derives the store key from it, and holds
+    the store to the blob's store ids at EVERY open: a new store's audit genesis record is written
+    with the current id, and an existing store's must name one the blob names, or the open raises
+    :class:`~messagefoundry.store.store.StoreIdPinRefused` with the handle closed. ``custody`` is
+    the blob a minting command holds in memory and passes instead (``provision-admin`` creating the
+    store it minted for; a handoff it wrote is not its to read). Under any other provider a host
+    blob or a handoff in the custody directory refuses the open, and ``custody`` must be ``None``.
+    ``recovery_wrap`` is the minting command's recovery wrap, written into the new store's genesis
+    record beside its store id (draft rule 4). A writable open checks the pin once the schema is in
+    place and before its first write (``store.store.check_open_store_pin``), so a store that is not
+    the blob's is refused before anything is written to it, its salt bind and at-rest sweep
+    included.
+    Every custody refusal is a :class:`~messagefoundry.store.keyprovider.KeyProviderError`, with a
+    fixed text and no cause or context; :func:`_host_custody_for_open` says which errors on the
+    custody path are replaced (BACKLOG #4882).
     """
     if create and read_only:
         raise ValueError("open_store: create and read_only exclude each other")
@@ -3972,7 +4599,22 @@ async def open_store(
     # crypto inside Vault/OpenBao Transit so the DEK never enters heap (ASVS 13.3.3). No key → identity.
     # The posture goes to the cipher build as it is. `None` is not replaced by the ambient
     # posture there: on a Vault hop an unknown posture counts as enforcing (vault BACKLOG #2983).
-    cipher = build_store_cipher(settings, posture=posture)
+    # The host blob's checked read, a DPAPI call and, on a first start, a conversion, or for any
+    # other provider the look for a host blob beside it: file system work, off the loop.
+    pin, host_key = await asyncio.to_thread(
+        _host_custody_for_open,
+        settings,
+        custody,
+        posture=posture,
+        read_only=read_only,
+        recovery_wrap=recovery_wrap,
+    )
+    try:
+        cipher = build_store_cipher(settings, posture=posture, host_key=host_key)
+    finally:
+        # The store data key itself, dropped whether the build refused or not, so this frame does
+        # not hold it on the build's refusal. The cipher and audit key built from it stay below.
+        del host_key
     setter = getattr(cipher, "set_refusal_hook", None)
     if refusal_hook is not None and callable(setter):
         setter(refusal_hook)
@@ -3987,16 +4629,22 @@ async def open_store(
     # while the posture claimed the most isolated MAC available. Every backend now takes both and
     # gates on "either secret present" (`_audit_keyed_capable`).
     audit_mac_fn = cipher.audit_mac_fn()
-    store = await _open_backend(
-        settings,
-        cipher=cipher,
-        audit_mac_key=audit_mac_key,
-        audit_mac_fn=audit_mac_fn,
-        message_events=message_events,
-        posture=posture,
-        create=create,
-        read_only=read_only,
-    )
+    # The pin rides a context variable to the genesis read every backend shares (vault BACKLOG
+    # #3411); reset at once, so no later open in this context inherits it.
+    pinned = OPEN_STORE_PIN.set(pin)
+    try:
+        store = await _open_backend(
+            settings,
+            cipher=cipher,
+            audit_mac_key=audit_mac_key,
+            audit_mac_fn=audit_mac_fn,
+            message_events=message_events,
+            posture=posture,
+            create=create,
+            read_only=read_only,
+        )
+    finally:
+        OPEN_STORE_PIN.reset(pinned)
     if keyless_chain_refusal is not None and audit_mac_key is None and audit_mac_fn is None:
         await _refuse_to_start_a_keyless_chain(
             store,
@@ -4004,6 +4652,85 @@ async def open_store(
             key_named=bool(settings.encryption_key or settings.encryption_key_file),
         )
     return store
+
+
+def _host_custody_for_open(
+    settings: StoreSettings,
+    custody: HostBlob | None,
+    *,
+    posture: HopPosture | None,
+    read_only: bool,
+    recovery_wrap: bytes = b"",
+) -> tuple[StorePin | None, str | None]:
+    """``(pin, key)`` for an open under the ``host`` key provider, or ``(None, None)`` for any other
+    provider once no host blob or handoff is found beside it (vault BACKLOG #3411). See
+    :func:`open_store`.
+
+    A caller passing ``custody`` or ``recovery_wrap`` under another provider gets a
+    ``ValueError`` first. After that, a custody refusal the engine built (a ``KeyProviderError``
+    recorded as built, :func:`_recorded`) passes through as it is. Any other ``Exception`` from
+    the custody steps is replaced by
+    :func:`~messagefoundry.store.custody_host.custody_refusal_at_open`'s refusal, which keeps a
+    recorded error's own text and reads nothing from any other, raised outside the handler, so it
+    has no cause and no context (BACKLOG #4882). At least an ``OSError`` from a step the custody
+    reads do not wrap is one: the custody directory's resolve, the minted blob's settings check,
+    pin and key, and the observation."""
+    from messagefoundry.store.custody_host import custody_refusal_at_open
+
+    if settings.key_provider != HOST_KEY_PROVIDER and (custody is not None or recovery_wrap):
+        raise ValueError("open_store: custody is for the 'host' key provider only")
+    try:
+        try:
+            return _host_custody_steps(
+                settings, custody, posture=posture, read_only=read_only, recovery_wrap=recovery_wrap
+            )
+        except Exception as exc:
+            # Judged by identity and by type(), so none of the error's own code runs.
+            if _recorded_text(exc) is not None and issubclass(type(exc), KeyProviderError):
+                raise  # a custody refusal the engine built, already with no chain
+            caught = exc
+        # Built and raised outside the handler, never bound here, and the replaced error dropped,
+        # so no cycle through this frame keeps either.
+        try:
+            raise custody_refusal_at_open(caught)
+        finally:
+            del caught
+    finally:
+        _flush_unjudged()  # the replaced class, logged once no handler is running
+
+
+def _host_custody_steps(
+    settings: StoreSettings,
+    custody: HostBlob | None,
+    *,
+    posture: HopPosture | None,
+    read_only: bool,
+    recovery_wrap: bytes,
+) -> tuple[StorePin | None, str | None]:
+    """:func:`_host_custody_for_open`'s work, before an error from it is judged."""
+    from messagefoundry.store.custody_host import (
+        HostCustodyRefused,
+        check_host_custody_settings,
+        foreign_custody_refusal,
+        host_store_key,
+        load_host_custody,
+        store_pin,
+    )
+
+    if settings.key_provider != HOST_KEY_PROVIDER:
+        refusal = foreign_custody_refusal(settings)
+        if refusal is not None:
+            # Recorded, so open_store passes it through with its remedy rather than replace it.
+            raise _recorded(HostCustodyRefused(refusal), refusal)
+        return None, None
+    if custody is None:
+        enforcing = posture is None or posture.enforcing
+        custody = load_host_custody(
+            settings, enforcing=enforcing, convert=not read_only, observe=True
+        )
+    else:
+        check_host_custody_settings(settings)
+    return store_pin(custody, recovery_wrap), host_store_key(custody)
 
 
 async def _refuse_to_start_a_keyless_chain(
@@ -4129,6 +4856,25 @@ def _server_store_class(backend: StoreBackend) -> type[SqlServerStore] | type[Po
 
         return PostgresStore
     raise NotImplementedError(f"store backend {backend.value!r} is not implemented yet")
+
+
+async def server_store_schema_found_anywhere(
+    settings: StoreSettings, *, posture: HopPosture | None = None
+) -> bool | None:
+    """Whether a schema the open resolves holds an object under a name the store's create
+    gives a schema-wide object, whoever built it, read from the catalog rather than through the
+    login's own name resolution, or ``None`` when the login cannot show that (PR 2804 fourteenth
+    to sixteenth holds). Such an object breaks the create, so a mint beside one is refused too.
+    The names are at least the tables, with the indexes on Postgres and the named constraints on
+    SQL Server. Postgres: the search_path's schemas, in ``pg_class`` and ``pg_type``, which every
+    role reads whatever its schema privileges. SQL Server: the login's default schema and ``dbo``, in ``sys.objects``, counted
+    only where the login holds ``VIEW DEFINITION`` on both. A schema outside those, such as
+    another install's ``db_schema``, is not asked. What it cannot see, at least: on SQL Server a
+    table-level ``DENY`` of ``VIEW DEFINITION`` on such a table itself. A read-only check on a
+    one-connection pool. Raises what the connection and the driver raise."""
+    return await _server_store_class(settings.backend).schema_meta_anywhere(
+        settings, posture=posture
+    )
 
 
 async def probe_store_privileges(

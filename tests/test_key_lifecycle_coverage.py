@@ -125,6 +125,13 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     # The store DEK and everything keyed on it or derived from it (the audit-chain HMAC subkey, the
     # rotation-fingerprint MAC, the GCM invocation bound, the DR archive codec).
     "messagefoundry/store/crypto.py": frozenset({_DEK}),
+    # Vault BACKLOG #3411: the key custody primitives mint the master key and the recovery key that
+    # will wrap the store key. Nothing calls them yet, and the lifecycle page has no row of their
+    # own; the DEK row is the one that governs the store key they are built to hold.
+    "messagefoundry/store/custody.py": frozenset({_DEK}),
+    # Vault BACKLOG #3411 (B3b): the host key provider mints the store's custody and derives the
+    # store key from its master key.
+    "messagefoundry/store/custody_host.py": frozenset({_DEK}),
     # BACKLOG #2592: the row-seal key is HKDF-derived from the DEK's authorization root.
     "messagefoundry/store/row_seal.py": frozenset({_DEK}),
     # BACKLOG #2593: opens queue payload cells, sealed under the DEK, under their routing tag.
@@ -178,7 +185,7 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     # Secret keys the engine holds or feeds.
     "messagefoundry/auth/totp.py": frozenset({_TOTP}),
     "messagefoundry/auth/service.py": frozenset({_TOTP}),
-    "messagefoundry/anon/keying.py": frozenset({_ANON_SALT}),
+    "messagefoundry_toolkit/anon/keying.py": frozenset({_ANON_SALT}),
     "tee/anon/keying.py": frozenset({_ANON_SALT}),
     "tee/__main__.py": frozenset({_ANON_SALT}),
     # BACKLOG #1174: the per-process key that seals the state and reference caches.

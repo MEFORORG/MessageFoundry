@@ -32,6 +32,7 @@ from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.transports import dicom as dicom_module
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.dicom import DicomScpSource, DicomScuDestination
+from tests._log_absence import assert_capture_sees
 
 _MIB = 1024 * 1024
 
@@ -95,6 +96,7 @@ def test_the_scps_default_is_unchanged(caplog: pytest.LogCaptureFixture) -> None
         raw = _scp_from({"ae_title": "MEFOR_SCP", "port": 0})
     assert built._max_object_bytes == raw._max_object_bytes == _SCP_CEILING
     assert built._max_inflated_bytes == raw._max_inflated_bytes
+    assert_capture_sees(caplog, "messagefoundry.transports.dicom")
     assert not [r for r in caplog.records if "max_object_bytes" in r.getMessage()]
 
 

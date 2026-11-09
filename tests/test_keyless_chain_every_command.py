@@ -601,8 +601,8 @@ def test_a_key_that_does_not_resolve_exits_2(
     command: str, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A key the settings name that cannot be resolved stops the open before it reads a row: here
-    `vault_transit` with no Transit key named. Exit 2, could not start, as `rotate-key` and
-    `provision-admin` exit on the same errors. It used to reach the dispatch floor and exit 1."""
+    `vault_transit` with no Transit key named. Exit 2, could not start, as `provision-admin` exits on
+    the same errors. It used to reach the dispatch floor and exit 1."""
     db = shell / "keyed.db"
     _keyed_chain(db, generate_key())
     monkeypatch.setenv("MEFOR_STORE_CIPHER_PROVIDER", "vault_transit")
@@ -610,7 +610,10 @@ def test_a_key_that_does_not_resolve_exits_2(
     captured = capsys.readouterr()
     assert rc == 2, (captured.out, captured.err)
     text = _refusal_text(command, captured.out, captured.err)
-    assert "MEFOR_STORE_TRANSIT_KEY" in text, text
+    from messagefoundry.store import base as store_base
+
+    # A fixed text since the eighth hold on engine PR 2818.
+    assert store_base._TRANSIT_BUILD_TEXTS[4] in text, text
 
 
 @pytest.mark.parametrize("command", [*_KEY_REFUSING_COMMANDS, "admin-reset-totp", "rotate-key"])
@@ -1341,6 +1344,9 @@ _CLI_OPENERS = {
     # the read-only "an Administrator exists" probe before the prompt: at the refusing default it
     # would refuse an existing empty store even under the opt-out the CLI gate already accepted
     "_provision_admin.administrator_exists",
+    # vault BACKLOG #3411: the read-only "does this server database hold a store" probe, under a
+    # throwaway host blob, before a store key is minted for it
+    "_provision_admin.server_store_found",
     # vault BACKLOG #3849 B5: the reopen after the codes are shown, so the administrator_granted
     # alert's open instance lands in the store, on the write's verdict and posture. It passes no
     # create; this guard reads only the verdict, so nothing here pins that
@@ -1352,6 +1358,9 @@ _CLI_OPENERS = {
     "_backup.run",
     # BACKLOG #2337: record or withdraw the vault_transit bound attestation, with its audit row
     "_store_transit_bound.run",
+    # vault BACKLOG #2609, ADR 0207 section 6: issue a directory account's enrolment code from the
+    # host, with its audit row
+    "_issue_enrolment_code.run",
 }
 _CLI_DEFAULT = {"_rotate_key.run"}
 

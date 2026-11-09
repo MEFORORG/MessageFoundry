@@ -35,13 +35,13 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.generators.documents import oru_with_pdf, synthetic_pdf
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.transports import DeliveryError
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource, build_ack
+from messagefoundry_toolkit.generators.documents import oru_with_pdf, synthetic_pdf
 
 _RUN_SLOW = os.environ.get("MEFOR_RUN_SLOW") == "1"
 

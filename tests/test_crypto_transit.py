@@ -246,11 +246,13 @@ def test_unmarked_value_refused_unless_allowed(monkeypatch: pytest.MonkeyPatch) 
 
 def test_in_process_marker_fails_closed_in_transit_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     # An mfenc:v1/v2/v4 value is in-process AES-GCM; Transit holds no key that reads it — refuse, never
-    # mis-decrypt (a store switched to Transit must be rotated first).
+    # mis-decrypt. No command moves such a value into Transit, so the refusal must not name one
+    # (BACKLOG #2109); it used to say to rotate the store into Transit, which rotate-key refuses.
     _use_fake(monkeypatch)
     cipher = build_transit_cipher(StoreSettings())
-    with pytest.raises(CipherError, match="rotate"):
+    with pytest.raises(CipherError, match="no command moves it into Transit") as refused:
         cipher.decrypt("mfenc:v1:deadbeef:AAAA")
+    assert "rotate" not in str(refused.value)
 
 
 # --- selection seam -------------------------------------------------------------------------------
@@ -268,8 +270,12 @@ def test_default_cipher_provider_is_unchanged() -> None:
 
 
 def test_unknown_cipher_provider_fails_closed() -> None:
-    with pytest.raises(ValueError, match="not a known cipher provider"):
+    with pytest.raises(ValueError) as caught:
         build_store_cipher(StoreSettings(cipher_provider="nope"))
+    # The refusal's text is fixed and names the setting (engine PR 2818's seventh hold), and since
+    # the eighth hold it is raised after the handler exits: the build's error is on no chain link.
+    assert "check [store].cipher_provider" in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 # --- fail-closed build paths ----------------------------------------------------------------------
