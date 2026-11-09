@@ -86,9 +86,10 @@ same position. The owner named this actor in scope on 2026-10-01 (vault BACKLOG 
 A writer never needs the key to change a plaintext column. Without a seal, on a first deployment,
 one inserted row would give it an administrator session, a role or a channel scope.
 
-**Row seals** need a store key held in the engine's own memory. So the `vault_transit` key provider
-and a keyless store write and check none yet. On any other keyed store, the engine refuses at
-least these changes made outside the store:
+**Row seals** need a store key held in the engine's own memory, or, under the `vault_transit` key
+provider, Transit's own `hmac` and `verify` under the audit key (ADR 0217 slice 1b-iii). A keyless
+store writes and checks none. On a keyed store, the engine refuses at least these changes made
+outside the store:
 
 - a session row inserted or edited, in any column but `last_used_at`;
 - an account inserted or edited: its `users` row, its role rows, or its passkey set apart from
@@ -123,8 +124,8 @@ On a first deployment, a writer could still do at least these:
   sends the chain anchors off the host, where a collector could compare them.
 - **Copy sealed rows in from another store** under the same key. The row seal key carries no
   store id yet. That pin is vault BACKLOG #3411.
-- **Change authority rows and approval requests freely on a keyless store or under**
-  **`vault_transit`**, since no row seal is written there.
+- **Change authority rows and approval requests freely on a keyless store**, since no row seal
+  is written there.
 - **Move messages and re-route queue rows on a keyless store, or with `[store].aad_bind` off**,
   since no cell tag is bound there.
 - **Blank an encrypted cell.** An empty value opens on any keyed store, so a writer can erase a

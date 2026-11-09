@@ -919,17 +919,17 @@ class RowSealStartRefused(RuntimeError):
 
 
 def row_sealer_for_cipher(cipher: Cipher, *, store_id: bytes = NO_STORE_ID) -> AnyRowSealer | None:
-    """The sealer a store holds for ``cipher``, on every backend: a :class:`TransitRowSealer` over a
-    :class:`~messagefoundry.store.crypto_transit.TransitCipher` (ADR 0217 slice 1b-iii), else
+    """The sealer a store holds for ``cipher``, on every backend: a :class:`TransitRowSealer` over
+    the cipher's :meth:`~messagefoundry.store.crypto.Cipher.row_seal_backend` when it names one, as
+    a ``vault_transit`` cipher does (ADR 0217 slice 1b-iii, item 3.7), else
     :meth:`RowSealer.for_cipher`'s local sealer, or ``None`` on a keyless store.
 
     The Transit sealer is given no retired Transit key names: the ``retired_transit_audit_keys``
     setting ADR 0217 names is not built, so a seal under an earlier audit key reads as Forged. Its
     start probe is :func:`probe_row_sealer_at_start`."""
-    from messagefoundry.store.crypto_transit import TransitCipher  # it imports this module
-
-    if isinstance(cipher, TransitCipher):
-        return TransitRowSealer(cipher, store_id=store_id)
+    backend = cipher.row_seal_backend()
+    if backend is not None:
+        return TransitRowSealer(backend, store_id=store_id)
     return RowSealer.for_cipher(cipher, store_id=store_id)
 
 

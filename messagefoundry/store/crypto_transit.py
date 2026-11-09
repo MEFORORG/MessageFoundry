@@ -208,6 +208,12 @@ class TransitCipher(_UnmarkedPolicy):
         ``row_sealer_for_cipher`` builds for this cipher, not a sealer keyed from this root."""
         return None
 
+    def row_seal_backend(self) -> TransitCipher:
+        """This cipher: it makes the Transit ``hmac`` and ``verify`` calls the store's
+        :class:`~messagefoundry.store.row_seal.TransitRowSealer` seals authority rows through, under
+        the audit key (ADR 0217 slice 1b-iii, item 3.7)."""
+        return self
+
     def retired_authz_roots(self) -> Sequence[bytes]:
         """No in-heap DEK, so no retired roots either (BACKLOG #2592)."""
         return ()

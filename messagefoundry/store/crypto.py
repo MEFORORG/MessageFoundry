@@ -127,6 +127,8 @@ if TYPE_CHECKING:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.hmac import HMAC
 
+    from messagefoundry.store.row_seal import TransitSealBackend
+
 _log = logging.getLogger(__name__)
 
 # Version-agnostic marker prefix. Every encrypted value — v1, v2 or v4 — starts with this; the store's
@@ -729,6 +731,11 @@ class Cipher(Protocol):
     def authz_root(self) -> bytes | None: ...
 
     def retired_authz_roots(self) -> Sequence[bytes]: ...
+
+    def row_seal_backend(self) -> TransitSealBackend | None:
+        """The Transit backend this cipher's store seals authority rows through, or ``None`` when
+        its seals, if any, are keyed in-process from :meth:`authz_root` (ADR 0217, item 3.7)."""
+        ...
 
 
 def _fingerprint(key: bytes | bytearray) -> str:
@@ -1354,6 +1361,10 @@ class IdentityCipher:
         """No DEK, so no authorization root: a keyless store writes and checks no row seals."""
         return None
 
+    def row_seal_backend(self) -> None:
+        """No Transit backend: a keyless store writes and checks no row seals (ADR 0217)."""
+        return None
+
     def retired_authz_roots(self) -> Sequence[bytes]:
         """No DEK, so no retired roots either."""
         return ()
@@ -1601,6 +1612,10 @@ class AesGcmCipher(_UnmarkedPolicy):
         """The authorization root derived from the ACTIVE DEK (BACKLOG #2592). Row seals are keyed
         from it (:func:`derive_row_seal_key`). Held in-process like the audit key; never logged."""
         return self._authz_root
+
+    def row_seal_backend(self) -> None:
+        """No Transit backend: this cipher's row seals are keyed from :meth:`authz_root`."""
+        return None
 
     def retired_authz_roots(self) -> Sequence[bytes]:
         """The authorization roots of the retired keys (BACKLOG #2592). A session seal is never
