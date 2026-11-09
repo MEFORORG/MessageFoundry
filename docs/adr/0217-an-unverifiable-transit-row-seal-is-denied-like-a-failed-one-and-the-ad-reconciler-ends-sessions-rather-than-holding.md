@@ -620,8 +620,10 @@ account's epoch raise, and each Unverifiable answer of the kept session's re-sta
 transaction has committed writes the row through the store's own `record_audit`, softly, then
 pages: Unverifiable under `authority-seal-transit-unverifiable:<kind>:<ref>:<digest suffix>`,
 capped per store at `MAX_SUBJECT_ALERTS` distinct rows per window and then `:*`; Forged under
-`AUTHORITY_SEAL_SUBJECT`, as the table above gives it. The row names the kind, a 12-character ref,
-`during: revoke`, and for Unverifiable the two triage integers; never a whole id or a token hash.
+`AUTHORITY_SEAL_SUBJECT`, as the table above gives it. The row names the kind, `during: revoke`,
+an account by its whole stored id (`user_id`, as `main`'s own seal-failure rows name one) or a
+session by its 12-character ref (`session`), and for Unverifiable the two triage integers; never a
+token hash.
 A refused row is logged at ERROR and the page still goes. An Outage is still paged at once and is
 not audited, as the table says.
 

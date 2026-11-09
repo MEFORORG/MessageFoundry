@@ -749,3 +749,25 @@ def test_a_page_no_sink_took_spends_no_capped_slot() -> None:
     pager.arm(authority_seal_page(good))
     pager.unverifiable("user", "u-next", "synthetic")
     assert good.subjects == [unverifiable_subject("user", "u-next")]
+
+
+def test_a_surrogate_bearing_id_pages_rather_than_raising() -> None:
+    """A lone surrogate a driver let through still keys a row and pages under its own subject, so
+    a page after a committed revoke never raises; a well-formed id keys as strict UTF-8 does."""
+    import hashlib
+
+    from messagefoundry.pipeline.alerts import authority_seal_page
+    from messagefoundry.store.row_seal import SealPager, seal_row_digest, unverifiable_subject
+
+    odd = "u-\udcff"
+    sink = _DriftSink()
+    pager = SealPager()
+    pager.arm(authority_seal_page(sink))
+    pager.unverifiable("user", odd, "synthetic")
+    assert sink.subjects == [unverifiable_subject("user", odd)]
+
+    def part(value: bytes) -> bytes:
+        return len(value).to_bytes(4, "big") + value
+
+    strict = hashlib.sha256(part(b"user") + part("u-\u00e9".encode())).hexdigest()
+    assert seal_row_digest("user", "U-\u00c9") == strict

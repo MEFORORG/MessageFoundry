@@ -334,6 +334,36 @@ async def test_any_other_exception_after_the_stamp_revokes_then_reraises(
         await store.close()
 
 
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RowSealError("session", ""),
+        RowSealUnverifiableError("session", ""),
+        KeyError("synthetic code defect"),
+    ],
+    ids=["forged", "unverifiable", "code_defect"],
+)
+async def test_an_exception_at_the_lapse_check_still_revokes_the_stamped_hash(
+    monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> None:
+    """The lapse check runs before the rotation, so an exception there that the rotation's own
+    handlers do not take is still the window's: it revokes the stamped hash, then re-raises."""
+    store, service = await _service()
+    try:
+        token, secret, t1 = await _pre_mfa(service, monkeypatch)
+
+        async def raising(*_args: object, **_kwargs: object) -> bool:
+            raise exc
+
+        monkeypatch.setattr(service, "_rotation_lapsed", raising)
+        with pytest.raises(type(exc)):
+            await service.verify_mfa(token, totp.totp(secret, now=t1))
+        monkeypatch.undo()
+        await _revoked_unanswered(store, service, token)
+    finally:
+        await store.close()
+
+
 async def test_a_real_cancel_after_the_stamp_still_lands_the_revoke(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -10572,20 +10572,26 @@ class AuthService:
         ruling binds on the elevation path: the lapse check loads the session before the rotation
         does. It is NOT the only Transit call after the ceremony's stamp: at least ``verify_mfa``,
         the passkey assertion and ``reauth`` make sealed reads or writes between their stamp and
-        this method. Those are :meth:`_stamp_to_rotation`'s, which this method closes on entry, so
-        a refusal from here on is this method's (ADR 0217, decided by the Manager under the Owner's
-        standing instruction of 2026-10-22). The lapse check's reads are the session's
+        this method. Those are :meth:`_stamp_to_rotation`'s (ADR 0217, decided by the Manager under
+        the Owner's standing instruction of 2026-10-22). This method closes that window once the
+        lapse check has passed, so a refusal from the re-key on is this method's, and an exception
+        from the lapse check that this method's handlers do not take still reaches the window,
+        which revokes the stamped hash (decision d20261109T200352805-599b24, item 1). The lapse
+        check's reads are the session's
         and the account's: an Outage on the account record's check revokes the session too, though
         the session's own seal held."""
         window = _STAMP_WINDOW.get()
-        if window is not None:
-            # The rotation owns its refusals from here (:meth:`_stamp_to_rotation`).
-            window.closed = True
         rotated: str | None = None
         failure: dict[str, object] = {"reason": "session_gone"}
         try:
             if await self._rotation_lapsed(token_hash, ceremony=ceremony, client=client):
                 return Elevation(session_lost=True)
+            if window is not None:
+                # The rotation owns its refusals from here (:meth:`_stamp_to_rotation`). The lapse
+                # check is before it, so an exception there that no handler below takes (at least
+                # Forged, Unverifiable or a code defect) still reaches the window, which revokes
+                # the stamped hash and re-raises (decision d20261109T200352805-599b24, item 1).
+                window.closed = True
             rotated = await self._rotate_session_hash(token_hash)
         except _RotationStoreError as refused:
             # BACKLOG #3023: the store refused the re-key. The session was revoked, best effort,
@@ -10827,7 +10833,9 @@ class AuthService:
         reset = _STAMP_WINDOW.set(window)
         try:
             yield window
-        except BaseException as exc:
+        except (Exception, asyncio.CancelledError) as exc:
+            # Not BaseException: awaiting the revoke while a GeneratorExit closes the coroutine
+            # raises RuntimeError, and an interpreter exit is not the window's to answer.
             if window.stamped is None or window.closed:
                 raise
             stamped = window.stamped
@@ -10853,9 +10861,10 @@ class AuthService:
     async def _revoke_stamped_shielded(self, token_hash: str, cause: BaseException) -> bool:
         """:meth:`_revoke_unrotated` for a stamp window's hash, run to completion through a cancel
         the way :func:`_write_through_cancellation` runs a refused sign-in's rows; a cancel that
-        lands meanwhile is re-raised after it. ``True`` when the revoke landed. A revoke that fails
-        outside the errors :meth:`_revoke_unrotated` takes is logged and reads as not landed, so
-        the window's own exception, a cancel included, is still the one raised."""
+        lands meanwhile is re-raised after it, so that cancel then replaces the window's exception,
+        as it does for :func:`_write_through_cancellation`'s own callers. ``True`` when the revoke
+        landed. A revoke that fails outside the errors :meth:`_revoke_unrotated` takes is logged
+        and reads as not landed, so that failure never replaces the window's exception."""
         landed: list[bool] = []
 
         async def revoke() -> None:

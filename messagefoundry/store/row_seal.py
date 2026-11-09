@@ -976,8 +976,12 @@ SealPageHook = Callable[[str, str], None]
 def seal_row_digest(kind: str, ident: str) -> str:
     """The SHA-256, in hex, of ``kind`` and the WHOLE stored id, case-folded so one row has one key
     on a case-insensitive collation (ADR 0217, *A ref is for reading*). A throttle and the cap key on
-    it; only its first 16 characters ever reach a subject, and it is never logged."""
-    return hashlib.sha256(_part(kind.encode()) + _part(ident.casefold().encode())).hexdigest()
+    it; only its first 16 characters ever reach a subject, and it is never logged. The id is encoded
+    with ``surrogatepass``, as :func:`seal_bytes` encodes a driver-decoded value, so a lone surrogate
+    a driver let through keys a row rather than raising out of a page that must not raise; every
+    well-formed id encodes to the same bytes as strict UTF-8."""
+    folded = ident.casefold().encode("utf-8", "surrogatepass")
+    return hashlib.sha256(_part(kind.encode()) + _part(folded)).hexdigest()
 
 
 def unverifiable_subject(kind: str, ident: str) -> str:
