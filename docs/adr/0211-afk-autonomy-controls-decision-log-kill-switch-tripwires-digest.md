@@ -346,14 +346,14 @@ chain. A record the gate answered HALT for was deferred, not acted on, so it doe
 ### Cost rung (4.7)
 
 The gate reads `scripts/coord/usage.ps1 -Json` in a child pwsh, for the 5-hour window only: a
-weekly rung names a severity and stops nobody (korus `roles/STEWARD.md` 3a). The start-nothing
-rung is HOLD NEW WORK, STEWARD.md section 3's 20 minutes to cutoff and 80 percent, unless the
-Steward's `thresholds.json` beside its `watch.py` overrides them as `watch.py` reads it. That file
-names the window `5-hour`, not `five_hour`.
+weekly rung names a severity and stops nobody (korus `roles/retired/STEWARD.md` 3a). The
+start-nothing rung is HOLD NEW WORK, retired/STEWARD.md section 3's 20 minutes to cutoff and 80
+percent, unless the Steward's `thresholds.json` beside its `watch.py` overrides them as `watch.py`
+reads it. That file names the window `5-hour`, not `five_hour`.
 
-**The burn rate governs, which the brief for this build did not say.** STEWARD.md 9.6a records an
-owner ruling of 2026-08-14 that a level fires the protect half and does not stop new work when the
-rate says there is room. So with a rate, the rung is hit when the window is projected to run out
+**The burn rate governs, which the brief for this build did not say.** retired/STEWARD.md 9.6a records
+an owner ruling of 2026-08-14 that a level fires the protect half and does not stop new work when
+the rate says there is room. So with a rate, the rung is hit when the window is projected to run out
 within 20 minutes and before it resets. Only with no rate is 80 percent the backstop. A window at
 98 percent or more, `usage.ps1`'s own "at the ceiling" band, is hit whatever the rate: a flat rate
 there says there is no room. `usage.ps1` skips its check of the statusLine's wiring when it reads
@@ -368,8 +368,8 @@ UNKNOWN is common, because a Desktop session runs no statusLine, and halting on 
 gate for good. The Steward's `status.json` fallback, which `usage-headroom-inject.ps1` prints for
 such a session, is **not read**. Reading it would mean a third copy of `watch.py`'s pool rules. So
 a Desktop session at the rung gets REVIEW, not HALT; that gap is open. The Lander is exempt from
-HALT and from the rung entirely, as STEWARD.md 3e exempts it from all three states, and so is a
-roster alias of the Lander.
+HALT and from the rung entirely, as retired/STEWARD.md 3e exempts it from all three states, and so
+is a roster alias of the Lander.
 
 > **Amendment (2026-10-31): the rung moves to the weekly window.** Anthropic removed the five-hour
 > limit, and the owner ruled the same day that the weekly window now carries the stop. That replaces
