@@ -39,10 +39,15 @@ glyph -- an accented letter, an em dash, a CJK name -- and still escapes every o
 format controls such as U+200E/F, U+202A-202E and U+2066-2069 (``Cf``), the line and paragraph
 separators (``Zl``, ``Zp``), a lone surrogate (``Cs``), and the private-use and unassigned code
 points (``Co``, ``Cn``), which this interpreter's Unicode tables cannot vouch for and a newer
-terminal may treat as a control. Because a character it keeps can look like an ASCII one, it
+terminal may treat as a control. It also escapes a non-ASCII space separator (``Zs``), such as a
+no-break space, which prints as a blank: :data:`_SPACE_SEPARATOR`. Because a character it keeps
+can look like an ASCII one, it
 also escapes a kept character that stands directly before text reading as an escape body, and
 doubles a backslash before more text than the strict rule does; :data:`_ESCAPE_BODY_KEEP` says how
-far that goes. It is
+far that goes. Declined: a look-alike backslash before look-alike escape text, such as U+29F5,
+a Cyrillic ha, then ``1b``, still prints as itself, because closing it by position would escape
+most non-Latin text and closing it by list is what :data:`_ESCAPE_BODY_KEEP` rejects (BACKLOG
+#2891, PR 2390 note 2). It is
 for a sink whose own text is not ASCII, where the strict rule would turn the tool's own em dash
 into ``\\u2014``. Its output is not pure ASCII, so it is for a stream already hardened against an
 unencodable character (``messagefoundry.console_streams`` does that for the engine's command
@@ -120,6 +125,11 @@ _ESCAPE_LOOKALIKE_KEEP = re.compile(
     r"|U(?:[0-9A-Fa-f]|[^\x00-\x7f]){8}"
 )
 _NOT_SHOWN_RE = re.compile(_NOT_SHOWN)
+#: ``keep_printable_unicode`` escapes a non-ASCII space separator too, such as U+00A0, U+2003 or
+#: U+3000: each prints as a blank an operator reads as an ASCII space, so a name padded or split
+#: with one would read as another (BACKLOG #2891). The set is local to this rule, not part of
+#: :data:`CONTROL_CATEGORIES`, which the log escape and ``privilege_check.printable`` also read.
+_SPACE_SEPARATOR = "Zs"
 
 
 def _visible(char: str) -> str:
@@ -136,7 +146,8 @@ def _is_escaped(char: str, *, single_line: bool, keep_printable_unicode: bool) -
     if " " <= char <= "~":
         return False
     if keep_printable_unicode and not char.isascii():
-        return unicodedata.category(char) in CONTROL_CATEGORIES
+        category = unicodedata.category(char)
+        return category in CONTROL_CATEGORIES or category == _SPACE_SEPARATOR
     return True
 
 
@@ -147,8 +158,9 @@ def escape_for_terminal(
 
     By default the result is pure ASCII, so any console codec encodes it. ``single_line`` also
     escapes newline and tab; ``keep_printable_unicode`` lets a printable non-ASCII character
-    through and escapes, past ASCII, :data:`CONTROL_CATEGORIES` and a kept character standing
-    directly before an escape body (:data:`_ESCAPE_BODY_KEEP`).
+    through and escapes, past ASCII, :data:`CONTROL_CATEGORIES`, a space separator
+    (:data:`_SPACE_SEPARATOR`) and a kept character standing directly before an escape body
+    (:data:`_ESCAPE_BODY_KEEP`).
 
     A run of backslashes is doubled, all of it, only where it stands before text that reads as an
     escape or before a character about to be escaped. So an odd run before an escape marks a real
@@ -226,7 +238,8 @@ def escape_json_for_terminal(text: str) -> str:
 #: NOT covered, at least: a ``www.`` autolink; emphasis, strikethrough and emoji shortcodes, which
 #: still restyle the rendered text within its cell; a viewer that runs a MathJax-style
 #: auto-render over the rendered page, which can still find ``\(...\)``; and every invisible
-#: printable character but the four Hangul fillers at :data:`_MD_INVISIBLE`.
+#: printable character but the four Hangul fillers at :data:`_MD_INVISIBLE` and the space
+#: separators the console rule escapes (:data:`_SPACE_SEPARATOR`).
 _MD_CELL = {
     "&": "&amp;",
     "<": "&lt;",

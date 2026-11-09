@@ -3,4 +3,7 @@
   control character in the store principal or database name escaped once, not twice (the
   summary's `repr` escape was escaped again by the terminal rule); and `messagefoundry-toolkit
   adr-analyze` escapes the controls in its stderr `error:` line through the shared terminal
-  escape, printing a non-ASCII letter as itself (BACKLOG #2891).
+  escape, printing a non-ASCII letter as itself. The shared terminal escape's
+  `keep_printable_unicode` mode now prints a non-ASCII space separator, such as a no-break or
+  ideographic space, as a visible escape rather than a blank, on the console and in a Markdown
+  report cell (BACKLOG #2891).

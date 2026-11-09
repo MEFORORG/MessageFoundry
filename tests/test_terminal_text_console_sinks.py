@@ -49,7 +49,6 @@ def _keep(text: str, *, single_line: bool = False) -> str:
         "\u00e9",  # an accented letter
         "\u2014",  # the em dash the engine's own verify details use
         "\u2192",  # an arrow
-        "\u00a0",  # a no-break space (Zs) prints as a space would
         "\u4e2d",  # a CJK letter
         "\U0001f600",  # past the BMP
     ],
@@ -76,6 +75,11 @@ def test_keeping_unicode_prints_a_printable_character_as_itself(char: str) -> No
         ("\ufeff", "\\ufeff"),  # zero-width no-break space / BOM (Cf)
         ("\u2028", "\\u2028"),  # line separator (Zl)
         ("\u2029", "\\u2029"),  # paragraph separator (Zp)
+        ("\u00a0", "\\u00a0"),  # no-break space (Zs), which prints as a blank (BACKLOG #2891)
+        ("\u1680", "\\u1680"),  # Ogham space mark (Zs)
+        ("\u2003", "\\u2003"),  # em space (Zs)
+        ("\u202f", "\\u202f"),  # narrow no-break space (Zs)
+        ("\u3000", "\\u3000"),  # ideographic space (Zs)
         ("\ud800", "\\ud800"),  # a lone surrogate (Cs)
         ("\ue000", "\\ue000"),  # private use (Co)
         ("\U000e0001", "\\U000e0001"),  # language tag (Cf), past the BMP
@@ -88,11 +92,12 @@ def test_keeping_unicode_still_escapes_every_control_and_format_character(
 
 
 def test_keeping_unicode_escapes_exactly_the_named_categories_over_the_whole_bmp() -> None:
-    # The alphabet is stated once, as CONTROL_CATEGORIES; this walks every BMP code point past
-    # ASCII and holds the function to it, so the two cannot drift apart.
+    # The alphabet is stated once, as CONTROL_CATEGORIES plus the space separators (Zs, BACKLOG
+    # #2891); this walks every BMP code point past ASCII and holds the function to it, so the two
+    # cannot drift apart.
     for code in range(0x80, 0x10000):
         char = chr(code)
-        expected_escaped = unicodedata.category(char) in CONTROL_CATEGORIES
+        expected_escaped = unicodedata.category(char) in CONTROL_CATEGORIES | {"Zs"}
         assert (_keep(char) != char) is expected_escaped, f"U+{code:04X}"
 
 
@@ -291,6 +296,16 @@ def test_markdown_cell_shows_a_blank_hangul_filler_as_an_escape(filler: str) -> 
     assert _keep(f"a{filler}b") == f"a{filler}b"
     assert escape_for_markdown_cell(f"a{filler}b") == f"a{shown}b"
     assert escape_for_markdown_cell(f"\\{filler}") == "\\" * 6 + shown[1:]
+
+
+def test_a_space_separator_is_an_escape_on_the_console_and_in_a_cell() -> None:
+    """BACKLOG #2891: a no-break or ideographic space printed as a blank, so a name padded or
+    split with one read as the ASCII-spaced name. The strict rule already escaped it."""
+    assert _keep("svc\u00a0admin\u3000") == "svc\\u00a0admin\\u3000"
+    assert escape_for_terminal("svc\u00a0admin") == "svc\\u00a0admin"
+    assert escape_for_markdown_cell("svc\u00a0admin") == "svc\\u00a0admin"
+    # An ASCII space is Zs too, and still prints as itself.
+    assert _keep("svc admin") == "svc admin"
 
 
 # --- harness one-line verdicts ------------------------------------------------------------------

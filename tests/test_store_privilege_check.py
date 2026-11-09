@@ -450,6 +450,15 @@ def test_the_store_hop_prints_a_control_in_the_principal_escaped_once(over: bool
     assert "'mefor\\x1b[2Jsvc' on 'Message\\u202eFoundry'" in report.summary()
 
 
+def test_the_store_hop_prints_a_no_break_space_in_the_principal_as_an_escape() -> None:
+    """BACKLOG #2891: a no-break space in the principal printed as a blank, so the name read as
+    one spelled with an ASCII space; the shared rule now escapes a space separator."""
+    report = dataclasses.replace(_clean_report(), principal="mefor\u00a0svc")
+    shown = "\n".join(render_text([store_hop(report, _mssql())]))
+    assert "'mefor\\u00a0svc' on 'MessageFoundry'" in shown
+    assert "\u00a0" not in shown
+
+
 def test_the_store_hop_prints_a_domain_backslash_as_repr_printed_it() -> None:
     """A ``DOMAIN\\user`` principal reads as it did under ``repr``."""
     shown = "\n".join(render_text([store_hop(_clean_report(), _mssql())]))
