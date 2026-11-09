@@ -13,6 +13,7 @@ change to one is a decision, not a refactor.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -28,7 +29,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
+from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.row_seal import (
     RowSealError,
     RowSealUnverifiableError,
@@ -555,6 +556,38 @@ async def test_a_refused_retired_key_lookup_still_ends_and_reports_the_session(
         await store.close()
 
 
+async def test_an_outage_at_the_retired_key_lookup_still_ends_and_reports_the_session(
+    tmp_path: Path,
+) -> None:
+    """The Outage branch of the same ruling ("Revoke, then report"): the retired-key session's
+    check under the active key fails without a Transit call, and the retired-key lookup then
+    meets the Outage. The row is ended and reported. The control is a session sealed under the
+    active key, presented once Transit is back: it resolves and nothing more is reported."""
+    path = tmp_path / "retired-outage.db"
+    store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
+    try:
+        store._row_sealer = TransitRowSealer(FakeBackend(active=RETIRED))
+        await _user(store, "u-1")
+        retired = await _session(store, "u-1")
+        backend = FakeBackend()
+        store._row_sealer = TransitRowSealer(backend, retired_key_names=[RETIRED])
+        live = await _session(store, "u-1")
+        service = AuthService(store, AuthSettings())
+        backend.down = True
+        try:
+            assert await service.identity_for_token(retired) is None
+        finally:
+            backend.down = False
+        assert _revoked(path, retired)
+        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+        store._row_sealer = TransitRowSealer(backend, retired_key_names=[RETIRED])
+        assert await AuthService(store, AuthSettings()).identity_for_token(live) is not None
+        assert not _revoked(path, live)
+        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+    finally:
+        await store.close()
+
+
 def _revoked(path: Path, token: str) -> bool:
     (revoked_at,) = _sql(
         path, "SELECT revoked_at FROM sessions WHERE token_hash=?", (hash_token(token),)
@@ -586,18 +619,62 @@ async def test_an_outage_at_rotation_revokes_the_session(
         backend.down = False
     assert _revoked(path, at_load)
     # The re-key: the load's Holds answer is cached, and the new seal's hmac meets the Outage.
+    # "Both" is pinned here: the old hash and the new one are each revoked, and the error says so.
     at_rekey = await _session(store, "u-1")
     store._row_sealer = TransitRowSealer(backend)
     assert await service.identity_for_token(at_rekey) is not None
-    hmac_down = backend.seal_hmac
+    revoked_hashes: list[str] = []
+    revoke = store.revoke_session
 
-    def refused(digest: bytes) -> str:
-        raise CipherError("synthetic outage")
+    async def spy(token_hash: str, *, now: float | None = None) -> None:
+        revoked_hashes.append(token_hash)
+        await revoke(token_hash, now=now)
 
-    backend.seal_hmac = refused  # type: ignore[method-assign]
+    store.revoke_session = spy  # type: ignore[method-assign]
+    backend.only_hmac_refused = True
     try:
-        with pytest.raises(_RotationStoreError):
+        with pytest.raises(_RotationStoreError) as refused:
             await service._rotate_session_hash(hash_token(at_rekey))
     finally:
-        backend.seal_hmac = hmac_down  # type: ignore[method-assign]
+        backend.only_hmac_refused = False
+        store.revoke_session = revoke  # type: ignore[method-assign]
     assert _revoked(path, at_rekey)
+    assert len(revoked_hashes) == 2 and revoked_hashes[0] == hash_token(at_rekey)
+    assert revoked_hashes[1] != revoked_hashes[0]
+    assert refused.value.old_revoked is True
+    assert refused.value.reason == "transit_unavailable"
+
+
+async def test_an_outage_at_the_elevation_lapse_check_revokes_the_old_hash(
+    transit: tuple[MessageStore, FakeBackend, Path],
+) -> None:
+    """Owner ruling 2026-11-08 ("Revoke both") on the path production runs: every elevation goes
+    through ``_elevated_hash``, whose lapse check loads the session before the rotation does. An
+    Outage there must end the old hash, which carries the ceremony's stamp, and answer
+    ``session_lost`` with an audit row naming the Outage. The control is the same elevation with
+    Transit up, which hands back a new token and retires the old one."""
+    store, backend, path = transit
+    await _user(store, "u-1")
+    service = AuthService(store, AuthSettings())
+    control = await _session(store, "u-1")
+    elevated = await service._elevated_hash(hash_token(control), ceremony="mfa_verify", actor="a")
+    assert elevated.token is not None and not elevated.session_lost
+    assert await service.identity_for_token(elevated.token) is not None
+    assert _sql(path, "SELECT 1 FROM sessions WHERE token_hash=?", (hash_token(control),)) == []
+    stamped = await _session(store, "u-1")
+    store._row_sealer = TransitRowSealer(backend)  # nothing cached: the lapse load meets Transit
+    backend.down = True
+    try:
+        lost = await service._elevated_hash(hash_token(stamped), ceremony="mfa_verify", actor="a")
+    finally:
+        backend.down = False
+    assert lost.session_lost and lost.token is None
+    assert _revoked(path, stamped)
+    assert await service.identity_for_token(stamped) is None
+    failures = [
+        json.loads(str(row["detail"]))
+        for row in await store.list_audit(action="auth.session_rotation_failed")
+    ]
+    assert failures == [
+        {"ceremony": "mfa_verify", "reason": "transit_unavailable", "revokes_landed": True}
+    ]

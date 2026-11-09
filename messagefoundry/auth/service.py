@@ -261,10 +261,20 @@ _ALWAYS_REPORTED_REASONS: Final = frozenset(
 
 
 def _rotation_store_errors() -> tuple[type[Exception], ...]:
-    """What :meth:`AuthService._rotate_session_hash` treats as a refused rotation: every type
-    :func:`_session_write_errors` names, plus a Transit Outage (owner ruling 2026-11-08 on ADR
-    0217, "Revoke both")."""
+    """What a session rotation treats as refused, at the lapse check in
+    :meth:`AuthService._elevated_hash` and at the load and re-key in
+    :meth:`AuthService._rotate_session_hash`: every type :func:`_session_write_errors` names, plus a
+    Transit Outage (owner ruling 2026-11-08 on ADR 0217, "Revoke both"). Both sites need it, since
+    :meth:`AuthService._rotate_session_token` reaches the second without the first. Not cached, so a
+    test that clears :func:`_session_write_errors`' cache changes this tuple too."""
     return (*_session_write_errors(), TransitSealUnavailableError)
+
+
+def _rotation_failure_reason(exc: BaseException) -> str:
+    """The ``reason`` an ``auth.session_rotation_failed`` row names for a refused rotation:
+    ``transit_unavailable`` for a Transit Outage, which is no store refusal, else ``store_error``
+    (BACKLOG #3023)."""
+    return "transit_unavailable" if isinstance(exc, TransitSealUnavailableError) else "store_error"
 
 
 @cache
@@ -286,13 +296,16 @@ def _session_write_errors() -> tuple[type[Exception], ...]:
 
 
 class _RotationStoreError(Exception):
-    """A session rotation the store refused (BACKLOG #3023). ``old_revoked`` says whether every
-    best-effort revoke that followed it landed, under the old hash and the new one; the audit row
-    records it as ``revokes_landed``."""
+    """A session rotation the store refused (BACKLOG #3023), or a Transit Outage refused (owner
+    ruling 2026-11-08 on ADR 0217). ``old_revoked`` says whether every best-effort revoke that
+    followed it landed, under the old hash and, when a re-key was attempted, the new one; the audit
+    row records it as ``revokes_landed``. ``reason`` is the audit row's ``reason``, from
+    :func:`_rotation_failure_reason`."""
 
-    def __init__(self, old_revoked: bool) -> None:
+    def __init__(self, old_revoked: bool, *, reason: str = "store_error") -> None:
         super().__init__("session rotation refused by the store")
         self.old_revoked = old_revoked
+        self.reason = reason
 
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
@@ -10338,16 +10351,23 @@ class AuthService:
         until it lapses; the error records which. On Postgres the re-key waits out a pool shortage
         rather than raising. On SQL Server it waits up to a longer, still finite limit, and a
         ``StoreAcquireTimeout`` at that limit reaches this branch like any other refusal. So does a
-        Transit Outage (``TransitSealUnavailableError``) at the load or the re-key: both hashes are
-        revoked, as for a store refusal (owner ruling 2026-11-08 on ADR 0217, "Revoke both"). An
-        Unverifiable session seal is not covered: it still escapes, for the 1b-iv catch census.
+        Transit Outage (``TransitSealUnavailableError``), as for a store refusal (owner ruling
+        2026-11-08 on ADR 0217, "Revoke both"): at the load, the old hash is revoked, since no new
+        hash exists yet; at the re-key, both are. Each revoke is best effort, as above, and the
+        audit row names ``transit_unavailable`` rather than ``store_error``. On the elevation path
+        :meth:`_elevated_hash`'s lapse check loads the session first, takes the same Outage, and
+        usually leaves this load a cache hit. An Unverifiable session seal is not covered: it still
+        escapes, for the 1b-iv catch census.
 
         A cancellation is not an ``Exception``, so it skips this branch and propagates with the old
         hash unrotated and unrevoked. The longer post-commit wait widens the window for one."""
         try:
             session = await self._load_session(old_hash)
         except _rotation_store_errors() as exc:
-            raise _RotationStoreError(await self._revoke_unrotated(old_hash, None, exc)) from exc
+            raise _RotationStoreError(
+                await self._revoke_unrotated(old_hash, None, exc),
+                reason=_rotation_failure_reason(exc),
+            ) from exc
         if session is None:
             return None
         # Under the account's re-proof lock (BACKLOG #1138), so no rotation lands while a password
@@ -10364,7 +10384,8 @@ class AuthService:
                 return None
             except _rotation_store_errors() as exc:
                 raise _RotationStoreError(
-                    await self._revoke_unrotated(old_hash, hash_token(new_token), exc)
+                    await self._revoke_unrotated(old_hash, hash_token(new_token), exc),
+                    reason=_rotation_failure_reason(exc),
                 ) from exc
             if not rotated:
                 return None
@@ -10394,7 +10415,8 @@ class AuthService:
             f"a revoke was refused too ({', '.join(refused)})" if refused else "it was revoked"
         )
         _log.warning(
-            "auth: a session rotation was refused by the store (%s); %s",
+            "auth: a session rotation was refused by %s (%s); %s",
+            "the Transit sealer" if isinstance(cause, TransitSealUnavailableError) else "the store",
             type(cause).__name__,
             outcome,
             exc_info=cause,  # a SQL defect is caught here too, so its traceback must survive
@@ -10472,7 +10494,10 @@ class AuthService:
 
         A store refusal anywhere from the lapse check to the re-key fails closed (BACKLOG #3023):
         see :meth:`_rotate_session_hash`, which says which Transit answers that covers. The lapse
-        check's own reads take only :func:`_session_write_errors`."""
+        check's own reads take :func:`_rotation_store_errors`, so a Transit Outage there revokes the
+        old hash too (owner ruling 2026-11-08 on ADR 0217, "Revoke both"). This is the site the
+        ruling binds on the elevation path: the lapse check loads the session before the rotation
+        does, so an Outage meets this load first."""
         rotated: str | None = None
         failure: dict[str, object] = {"reason": "session_gone"}
         try:
@@ -10482,11 +10507,12 @@ class AuthService:
         except _RotationStoreError as refused:
             # BACKLOG #3023: the store refused the re-key. The session was revoked, best effort,
             # and this fails closed exactly as a session gone underneath the ceremony does.
-            failure = {"reason": "store_error", "revokes_landed": refused.old_revoked}
-        except _session_write_errors() as exc:
-            # The lapse check's own reads, refused: the ceremony's stamp is already on this hash.
+            failure = {"reason": refused.reason, "revokes_landed": refused.old_revoked}
+        except _rotation_store_errors() as exc:
+            # The lapse check's own reads, refused by the store or by a Transit Outage: the
+            # ceremony's stamp is already on this hash ("Revoke both", 2026-11-08).
             revoked = await self._revoke_unrotated(token_hash, None, exc)
-            failure = {"reason": "store_error", "revokes_landed": revoked}
+            failure = {"reason": _rotation_failure_reason(exc), "revokes_landed": revoked}
         if rotated is None:
             # Soft, so a refused audit write still answers session_lost rather than a 500: the
             # answer is the fail-closed control, and the row only records it.
