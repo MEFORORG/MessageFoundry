@@ -45,7 +45,7 @@ _ADMITTED = 405
             id="split empty then upper-case chunked, no Content-Length",
         ),
         # Controls: what the fix leaves as it was. The two non-chunked ones pin today's admission,
-        # which #5345's original finding (a body with no length and no chunked coding) may change.
+        # which the fix for #5345's open original finding may change.
         pytest.param(
             (("transfer-encoding", "chunked"),), 411, id="single chunked, no Content-Length"
         ),

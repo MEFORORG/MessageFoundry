@@ -9,4 +9,4 @@
   `chunked` line is. [SECURITY.md](../docs/SECURITY.md) now also says that under `serve`
   malformed chunked framing gets llhttp's own 400, and
   [DEPLOYMENT.md](../docs/DEPLOYMENT.md) no longer lists every repeated `Transfer-Encoding` among
-  the shapes llhttp refuses. (vault `BACKLOG #5345`)
+  the shapes llhttp refuses. (vault `BACKLOG #5345`, added items 1 and 2)

@@ -176,6 +176,10 @@ socket, and its `_REFUSED` table holds the exact bytes.
 | Head lines ended by a bare LF, or a bare CR inside a header line | Refuse it. |
 | A chunk size that is not hex digits, or chunk lines ended by a bare LF | Refuse it. |
 
+Refuse a request carrying `Transfer-Encoding` on more than one line too. llhttp frames
+`Transfer-Encoding: gzip` followed by `Transfer-Encoding: chunked` as chunked, so a proxy that reads
+only the first line would disagree with it about where the request ends.
+
 "Refuse" means answer the client with an error yourself, `400` or `501`, and close that client
 connection. A proxy that rewrites an ambiguous request into a clean one is the danger: the engine
 then reads a request the client did not send.
