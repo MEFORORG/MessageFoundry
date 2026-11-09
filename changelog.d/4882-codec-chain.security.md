@@ -63,17 +63,23 @@
   and an error of any other class passed through as it was. The store open reads the key custody
   in a step of its own under every key provider. Under `[store].key_provider = 'host'` it derives
   the store key from the host blob, and the store key resolution does not run. On the way it at
-  least checks the settings, judges the engine's account and reads the host file, and, where the
-  open may write, converts a handoff into it where only a handoff is there and settles a handoff
-  left beside a host file: it deletes one that names the host file's store id and holds the same
-  key, refuses the open on any other, on one it cannot read or on one it cannot show deleted, and
-  goes on where another start has already removed it. A handoff is read on Windows only, so a
-  POSIX host never converts or deletes one. A read-only store open leaves a handoff beside a host
-  file as it is and opens from the host file, and refuses where only a handoff is there. Outside
-  the store open, the `host` key provider converts and settles a handoff whatever the command, a
-  read-only one included. On a read that succeeds the step records what it found, before it
-  derives the store key. A blob a minting caller passes is checked against the settings, and none
-  of the rest runs. Under any other provider it looks for a
+  least checks the settings, judges the engine's account and reads the host file. Where the open
+  may write, it also converts a handoff into the host file where only a handoff is there, and
+  settles a handoff it finds beside a host file it read: it deletes one that names the host file's
+  current store id and holds the same key, refuses the open on any other, on one it cannot read
+  and on one it cannot show deleted, and goes on where the handoff is already gone, as when
+  another start removed it. A conversion that fails where a host file is there by then can go on
+  from that file and leave the handoff unsettled. A handoff is read on Windows only, so a POSIX
+  host never converts or deletes one, and outside that case a writable open there refuses on one
+  it finds. A read-only store open leaves a handoff beside a host file as it is and opens from the
+  host file, and refuses where only a handoff is there. Where the read, and any conversion or
+  settle, does not refuse, the step records what it found, before it derives the store key; a
+  refusal later in the open leaves that record in place. Where a minting caller passes a blob, the
+  step checks the settings as a read does and takes the store key and the pin from that blob; it
+  judges no account, reads neither custody file, converts and settles nothing, and records
+  nothing. Outside the store open, the `host` key provider converts and settles a handoff as a
+  writable open does, whatever the command, a read-only one included; a refusal there refuses the
+  key resolution, and the provider records nothing. Under any other provider it looks for a
   host blob or a handoff in the custody directory. Under every provider, a `KeyProviderError` the
   engine built and recorded passes through the step as it is; its text is the one the engine
   built it with, which reads no text from an error, and the engine raises each with no chain,
