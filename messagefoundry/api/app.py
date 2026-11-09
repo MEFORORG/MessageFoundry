@@ -1828,11 +1828,11 @@ def _build_approval_gate(
                 "name who ran it; it was not run",
             )
         # Vault BACKLOG #2596, step 3: the release loads only the bytes the approval named. A hold
-        # whose params carry no digest (none is filed that way now), or one not of the shape a
-        # digest has, binds to None, which matches nothing. The gate refuses such a hold before its
-        # claim (requires_fingerprint below, release_blocked 'params_no_fingerprint', vault
-        # BACKLOG #3192), so None reaches this only if that flag is dropped. It is then refused,
-        # with reason no_approved_digest where the release reaches the digest check.
+        # with no usable digest (held_fingerprint) binds to None, which matches nothing. The gate
+        # refuses such a hold before its claim (requires_fingerprint below, release_blocked
+        # 'params_no_fingerprint', vault BACKLOG #3192), so None reaches this only if that flag is
+        # dropped. It is then refused, with reason no_approved_digest where the release reaches
+        # the digest check.
         # On a store that holds a key the params are sealed with the rest of the request, so a
         # writer to pending_approvals who changes the digest leaves a request the gate refuses
         # (vault BACKLOG #2592).
@@ -2658,9 +2658,10 @@ async def _audit_refused_reload(
     filter sees both, and ``invalid_config`` otherwise. A trust-anchor check the store stopped, by
     refusing its audit read or write, writes reason ``store_unavailable`` and answers 503 (BACKLOG
     #3091); it is neither a refused anchor nor a bad graph. A released reload whose config is not the
-    one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch``, or
-    ``no_approved_digest`` when the hold took none or a value not of the digest's form, with both
-    digests, and answers 422 (vault BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
+    one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch`` and both
+    digests, or ``no_approved_digest`` and a null ``approved_fingerprint`` when the hold carries no
+    usable digest (:func:`held_fingerprint`), and answers 422 (vault BACKLOG #2596); only the
+    executor meets it. One whose digest could not be taken now writes
     reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
     request whose digest cannot be taken is refused the same way, with no hold filed. A release
     refused before its digest check (:class:`ConfigRefusedBeforeApprovalCheck`) keeps its reason
@@ -2717,8 +2718,8 @@ async def _audit_refused_reload(
         action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
     elif isinstance(exc, ConfigDigestMismatch):
-        # A hold that took no digest, or one not of the digest's form, is told apart, so nobody
-        # goes looking for an edit that never happened.
+        # A hold with no usable digest is told apart, so nobody goes looking for an edit that
+        # never happened.
         unbound = exc.approved is None
         warn(
             "config reload refused: %s",

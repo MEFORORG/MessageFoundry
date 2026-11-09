@@ -304,6 +304,72 @@ async def test_a_combined_outcome_write_whose_reply_is_lost_writes_no_second_row
     assert sink.lost == []
 
 
+async def test_an_outcome_row_moved_by_a_sibling_pages_audit_write_failed(
+    store: MessageStore,
+) -> None:
+    """The combined write fails WITHOUT committing, and a sibling sharing this claim owner moves
+    the row to 'interrupted' before the status-only write. That write then finds the row moved,
+    but the approval.approved row was never written, so the read-back must not page copy-only
+    (vault BACKLOG #3193 N1)."""
+
+    class _SiblingMoved(_StandingStore):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            audit = kw.get("audit")
+            if audit is not None and audit.action == "approval.approved":
+                assert await self._store.decide_pending_approval(
+                    approval_id,
+                    status="interrupted",
+                    approver="checker",
+                    decided_at=2.0,
+                    from_status="executing",
+                )
+                raise sqlite3.OperationalError(_FAULT)
+            return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+    sink = _Sink()
+    runs: list[str] = []
+    gate = _gate(_SiblingMoved(store), sink, runs=runs)
+    approval_id = await _request(gate)
+    await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert runs == ["ran"] and await _status(store, approval_id) == "interrupted"
+    assert await store.list_audit(action="approval.approved") == []
+    assert sink.lost == [(f"approval:{approval_id}", "approval.approved")]
+    assert sink.copy_missing == []
+
+
+async def test_an_outcome_read_back_that_fails_pages_audit_write_failed(
+    store: MessageStore,
+) -> None:
+    """The combined write commits with its reply lost, as above, but the read-back raises, so the
+    gate cannot say the row is stored and pages audit_write_failed (vault BACKLOG #3193 N1)."""
+
+    class _ReadBackFails(_StandingStore):
+        settled = False
+
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            moved = bool(await self._store.decide_pending_approval(approval_id, **kw))
+            audit = kw.get("audit")
+            if audit is not None and audit.action == "approval.approved":
+                self.settled = True
+                raise sqlite3.OperationalError("connection reset after COMMIT")
+            return moved
+
+        async def get_pending_approval(self, approval_id: str) -> Any:
+            if self.settled:
+                raise sqlite3.OperationalError(_FAULT)
+            return await self._store.get_pending_approval(approval_id)
+
+    sink = _Sink()
+    runs: list[str] = []
+    gate = _gate(_ReadBackFails(store), sink, runs=runs)
+    approval_id = await _request(gate)
+    await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert runs == ["ran"] and await _status(store, approval_id) == "approved"
+    assert len(await store.list_audit(action="approval.approved")) == 1
+    assert sink.lost == [(f"approval:{approval_id}", "approval.approved")]
+    assert sink.copy_missing == []
+
+
 async def test_an_unencodable_result_still_settles_the_release(store: MessageStore) -> None:
     """The operation ran. A result json cannot encode used to raise before the status moved,
     stranding the row 'executing' and answering 500."""

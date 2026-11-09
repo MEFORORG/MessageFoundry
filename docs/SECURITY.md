@@ -2684,8 +2684,8 @@ params carry no digest, or one not of the form the engine writes, is refused bef
 instead (vault BACKLOG #3192): the queue marks
 it `release_blocked: "params_no_fingerprint"`, the approve answers **409** and writes an
 `approval.params_no_fingerprint` row, nothing runs, and the request stays pending for a reject.
-A release that skipped the gate's check is still refused by the executor, with reason
-`no_approved_digest` where it reaches the digest check. A release that
+A hold with no usable digest whose release skipped the gate's check is still refused by the
+executor, with reason `no_approved_digest` where it reaches the digest check. A release that
 cannot take the digest now is refused with reason `digest_unavailable`, and the engine logs the
 cause at WARNING. The requester asks again, and a second approver reviews the new bytes.
 
@@ -2850,12 +2850,12 @@ cannot move a leftover `executing` row to `interrupted`. The row stays `executin
 start tries again.
 
 An outcome's combined write can fail while the status write that follows finds the row already
-moved. The combined write most likely committed, and only its reply was lost, so the gate writes
-no second row. It logs at ERROR and pages, because the store writes a row's off-box copy only
-after a commit it saw succeed (vault BACKLOG #3193). The page is `audit_offbox_copy_missing`, not
-`audit_write_failed`: the row is most likely in the local audit log, and only its off-box copy is
-known to be missing (vault BACKLOG #3193 N1). It is keyed `approval:<id>` and carries the row's
-action name.
+moved. The gate then writes no second row, and reads the row back (vault BACKLOG #3193 N1). If it
+reads at the outcome's status with this approver, the combined write committed and only its reply
+was lost, so its row is in the local audit log but not the off-box copy, which the store writes
+only after a commit it saw succeed. The gate logs at ERROR and pages `audit_offbox_copy_missing`,
+keyed `approval:<id>` with the row's action name. If the row reads otherwise, or cannot be read, it
+logs at ERROR and pages `audit_write_failed`.
 
 The `audit_write_failed` alert's reason says the row was not written or its write's outcome is
 unknown: a COMMIT can land despite the error, as stated for the claim above, and a row the step-up
@@ -2934,8 +2934,7 @@ that write never fails the call. If the move and its row cannot be written toget
 writes the status alone, so an audit outage never leaves the row at `executing`. It then writes the
 audit row alone. If that fails too, the loss is logged at ERROR and pages `audit_write_failed`.
 One case skips the row: the combined write fails, and the status write that follows finds the row
-already moved. The gate then writes no second row and pages `audit_offbox_copy_missing`, as
-above.
+already moved. The gate then writes no second row and pages, as above.
 
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
 worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`

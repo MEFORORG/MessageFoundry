@@ -391,8 +391,7 @@ class _Operation:
     #: #3217), so :meth:`ApprovalGate._release_blocked` predicts that refusal before the claim.
     requires_requester: bool = False
     #: The executor binds its release to the config digest in params ``fingerprint``, and refuses
-    #: every config when there is none or a value not of the digest's form
-    #: (:func:`held_fingerprint`; vault BACKLOG #3192), so
+    #: every config when there is no usable one (:func:`held_fingerprint`; vault BACKLOG #3192), so
     #: :meth:`ApprovalGate._release_blocked` predicts that refusal before the claim too.
     requires_fingerprint: bool = False
 
@@ -913,7 +912,7 @@ class ApprovalGate:
             else:
                 lost_id, action = approval_id, "approval.requested"
                 landed = await self._read_back_request(approval_id)
-                if landed == "held":
+                if isinstance(landed, ApprovalRow):
                     log.warning(
                         "approval %s: the write that filed this %s request by %s reported an "
                         "error, and reading it back found it held, with its approval.requested "
@@ -959,18 +958,19 @@ class ApprovalGate:
 
     async def _read_back_request(
         self, approval_id: str
-    ) -> Literal["held", "absent", "unsealed", "unknown"]:
-        """Whether a request whose write reported an error is in the store (vault BACKLOG #3193).
-        ``unsealed`` when it is there but fails its seal, which :meth:`_verified` reports: such a
-        row can never be released, so a retry cannot make a second releasable copy of it.
-        ``unknown`` when the read fails, logged here."""
+    ) -> ApprovalRow | Literal["absent", "unsealed", "unknown"]:
+        """The request a write that reported an error left in the store, its seal checked (vault
+        BACKLOG #3193). ``unsealed`` when it is there but fails its seal, which :meth:`_verified`
+        reports: such a row can never be released, so a retry cannot make a second releasable copy
+        of it. ``unknown`` when the read fails, logged here."""
         try:
             found = await self._store.get_pending_approval(approval_id)
             if found is None:
                 return "absent"
             # Inside the try: a row the checker cannot even parse must still end in the caller's
             # ERROR line and page, not escape them.
-            return "held" if await self._verified(found) is not None else "unsealed"
+            row = await self._verified(found)
+            return "unsealed" if row is None else row
         except Exception:  # noqa: BLE001 - every store backend raises its own type
             log.exception(
                 "approval %s: reading back a request whose write failed failed too", approval_id
@@ -1739,9 +1739,11 @@ class ApprovalGate:
 
         **When the combined write fails**, the status is written alone, so an audit outage never
         leaves the row ``executing``. If that status write finds the row already moved, the method
-        stops there. The combined write most likely committed. No second row is written, and it
-        pages ``audit_offbox_copy_missing``, since that row's off-box copy was never sent (vault
-        BACKLOG #3193 N1). Otherwise the audit row is written alone. If that fails as well, the loss is
+        writes no second row and reads the row back (vault BACKLOG #3193 N1). Found at ``status``
+        with this ``approver``, the combined write committed, and it pages
+        ``audit_offbox_copy_missing``, since that row's off-box copy was never sent. Found in any
+        other state, or not read, it pages ``audit_write_failed``. If the status write moves the
+        row, the audit row is written alone. If that fails as well, the loss is
         logged at ERROR with the detail and pages ``audit_write_failed``. If the status
         write fails too, the row may still read ``executing`` until this process restarts, when
         :meth:`reconcile_after_restart` moves it to ``interrupted`` (BACKLOG #2087 limb 4).
@@ -1783,21 +1785,40 @@ class ApprovalGate:
             )
             moved = await self._settle_status_only(approval_id, status=status, approver=approver)
             if moved is False:
-                # Nothing else should move a row out of 'executing' while this process runs (the
-                # restart reconcile moves only claims older than this process), so the likeliest cause:
-                # the combined write COMMITTED and only its reply was lost: its row is then already
-                # in the log, and writing another would duplicate the outcome with a false flag.
-                log.error(
-                    "approval %s: %s; the combined write most likely committed, so no second %s "
-                    "row is written. Check the audit log for it. Its off-box copy was not written",
-                    approval_id,
-                    context,
-                    action,
-                )
-                # Paged, as a request that reads back as held is (vault BACKLOG #3193): the store
-                # tees off-box only after a commit it saw succeed, so nothing else reports the gap.
-                # As there, the page says the copy is missing, not the row (N1).
-                self._alert_offbox_copy_missing(approval_id, action)
+                # The likeliest cause: the combined write COMMITTED and only its reply was lost, so
+                # its row is already in the log, and writing another would duplicate the outcome
+                # with a false flag. A sibling sharing this claim owner can move the row instead,
+                # so it is read back, as a request is (vault BACKLOG #3193 N1).
+                landed = await self._read_back_request(approval_id)
+                if (
+                    isinstance(landed, ApprovalRow)
+                    and landed.status == status
+                    and landed.approver == approver
+                ):
+                    log.error(
+                        "approval %s: %s; reading the row back found it '%s', so the combined "
+                        "write committed and no second %s row is written. Its off-box copy was "
+                        "not written",
+                        approval_id,
+                        context,
+                        status,
+                        action,
+                    )
+                    # The store tees off-box only after a commit it saw succeed, so nothing else
+                    # reports the gap, and the row is stored, so the page says only the copy is
+                    # missing.
+                    self._alert_offbox_copy_missing(approval_id, action)
+                else:
+                    log.error(
+                        "approval %s: %s; the row was no longer 'executing' and reading it back "
+                        "did not find it '%s', so the combined write's %s row may not have been "
+                        "written. No second row is written",
+                        approval_id,
+                        context,
+                        status,
+                        action,
+                    )
+                    self._alert_lost_audit(approval_id, action)
                 return
         else:
             if moved:
@@ -2087,9 +2108,9 @@ class ApprovalGate:
             log.exception("approval %s: the audit_write_failed alert failed to emit", approval_id)
 
     def _alert_offbox_copy_missing(self, approval_id: str, action: str) -> None:
-        """Page on an audit row the gate read back as stored, or infers committed, whose off-box
-        copy was never sent (vault BACKLOG #3193 N1): ``audit_offbox_copy_missing``, keyed
-        ``approval:<id>``, best effort as :meth:`_alert_lost_audit` is."""
+        """Page on an audit row the gate read back as stored, whose off-box copy was never sent
+        (vault BACKLOG #3193 N1): ``audit_offbox_copy_missing``, keyed ``approval:<id>``, best
+        effort as :meth:`_alert_lost_audit` is."""
         try:
             self._alert_sink.audit_offbox_copy_missing(f"approval:{approval_id}", action=action)
         except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract

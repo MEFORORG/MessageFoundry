@@ -684,23 +684,18 @@ class AlertSink(Protocol):
 
         **A failed write is not proof the row is missing.** A COMMIT can land with its reply lost,
         so the reason says the row was not written OR its write's outcome is unknown (vault BACKLOG
-        #3193 item 4); a row the step-up return budget sheds is never written. Where the gate read
-        a request back as held with its seal intact, or infers that an outcome's write committed,
-        it raises :meth:`audit_offbox_copy_missing` instead. A request read back with a seal that
-        fails still raises this one: the gate cannot say its own write produced that row."""
+        #3193 item 4); a row the step-up return budget sheds is never written. Where the gate reads
+        the row back as stored, it raises :meth:`audit_offbox_copy_missing` instead."""
         ...
 
     def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
-        """An audit row is in the store, or most likely is, but its off-box copy was never sent
-        (vault BACKLOG #3193 N1). The store tees a row off-box only after a COMMIT it saw succeed,
-        so when the write reported an error and its COMMIT landed anyway, the forwarded audit
-        stream lacks the row and nothing else reports the gap. Distinct from
+        """An audit row the approval gate read back as stored has no off-box copy (vault BACKLOG
+        #3193 N1). The store tees a row off-box only after a COMMIT it saw succeed, so when the
+        write reported an error and its COMMIT landed anyway, the forwarded audit stream lacks the
+        row and nothing else reports the gap. Distinct from
         :meth:`audit_write_failed`, whose row may be missing from the store too.
 
-        The approval gate raises it where it read the row back, at least for: a request whose
-        write reported an error and reads back held, with its ``approval.requested`` row in the
-        same write; and an outcome whose combined write reported an error while the row had
-        already left ``executing``, so that write most likely committed its row. ``name`` is
+        docs/SECURITY.md, in its approvals section, says which read-backs raise it. ``name`` is
         ``approval:<approval id>`` and ``action`` the row's audit action, as for
         :meth:`audit_write_failed`. Not connection-scoped, so no rule's ``control_action`` fires on
         it, and repeated raises on one key fold into one instance until an operator resolves it.
@@ -1396,8 +1391,8 @@ class LoggingAlertSink:
 
     def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
         log.warning(
-            "ALERT audit_offbox_copy_missing: the %s audit row for %r is in the store or most "
-            "likely is, but its off-box copy was not written",
+            "ALERT audit_offbox_copy_missing: the %s audit row for %r is in the store, but its "
+            "off-box copy was not written",
             action,
             name,
         )
