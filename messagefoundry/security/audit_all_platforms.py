@@ -338,9 +338,11 @@ def _pip_audit_requirement_count(text: str) -> int | None:
 #: part a ``%3B`` the parser still decodes.
 _URL_REMOVED = str.maketrans("", "", "\t\r\n")
 
-#: More decoding passes than the parser makes on any route (three at most), with a margin. A fixed
-#: number keeps the check linear in the line: a nested ``%25`` chain would otherwise take one pass
-#: per level, each over the whole line.
+#: How many decoding passes :func:`_pip_audit_may_see_marker` makes before it answers yes for a
+#: string still decoding. That answer, not this number, is what keeps the check sound; the number,
+#: above the parser's own (which that function's docstring counts), only spares a string decoded a
+#: little deeper. A fixed number keeps the check linear in the line: a nested ``%25`` chain would
+#: otherwise take one pass per level, each over the whole line.
 _DECODE_PASSES = 8
 
 
@@ -349,7 +351,8 @@ def _pip_audit_may_see_marker(requirement: str) -> bool:
 
     ``requirement`` is a requirement string as :func:`_pip_audit_requirements` gives it. pip-audit
     2.10.1 drops a pin whose ``InstallRequirement.marker`` the host does not satisfy, with no skip
-    and no error, so a marker left in the copy is a pin the count says was audited and was not.
+    and no error, so a marker left in the copy that the host fails is a pin the count says was
+    audited and was not.
 
     Every marker the parser makes comes through a ``;``. ``parse_reqparts_from_string`` splits one
     off at the first ``; `` after a URL, else at the first ``;``; and ``InstallRequirement`` takes

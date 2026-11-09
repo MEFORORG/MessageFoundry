@@ -772,6 +772,8 @@ def test_a_marker_the_strip_leaves_in_the_copy_is_refused(
     [
         pytest.param("https://h/evil-1.0.tar.gz#egg=evil==1.0", id="egg"),
         pytest.param("https://h/evil-1.0%2Blocal-py3-none-any.whl", id="percent-encoded-wheel"),
+        # No URL, so pip-audit audits it rather than failing it as a URL requirement.
+        pytest.param("./evil-1.0%2Blocal-py3-none-any.whl", id="percent-encoded-path-wheel"),
     ],
 )
 def test_a_url_pin_with_no_marker_left_in_it_is_handed_on(url: str, tmp_path: Path) -> None:
@@ -784,9 +786,28 @@ def test_a_url_pin_with_no_marker_left_in_it_is_handed_on(url: str, tmp_path: Pa
     assert (status, copies) == (0, [[f"{url} {digest}", f"bar==2 {digest}"]])
 
 
+@pytest.mark.parametrize(
+    ("private", "status"), [("evil", 0), ("bar", 2)], ids=["marked-pin-skipped", "other-skipped"]
+)
+def test_the_marker_check_reads_the_copy_left_after_skip_private(
+    private: str, status: int, tmp_path: Path
+) -> None:
+    """The check reads what pip-audit is handed: a pin ``--skip-private`` leaves out cannot be
+    skipped by pip-audit too, and leaving out another pin does not excuse it."""
+    digest = f"--hash=sha256:{_DIGEST}"
+    src = tmp_path / "x.lock"
+    src.write_text(
+        f"evil\\\n-x;sys_platform=='zz' {digest}\nbar==2 {digest}\nidna==3 {digest}\n",
+        encoding="utf-8",
+    )
+    ran, run = _recorder(0)
+    assert main(["--skip-private", private, str(src)], run=run) == status
+    assert len(ran) == (2 if status == 0 else 0)
+
+
 def test_a_requirement_still_decoding_after_the_last_pass_is_refused() -> None:
-    """The parser decodes three times at most; the model stops after a fixed number of passes,
-    which keeps it linear, and answers yes where it cannot tell."""
+    """The model stops after a fixed number of passes, which keeps it linear, and answers yes where
+    it cannot tell; a string that stops decoding sooner is judged on its last form."""
     from messagefoundry.security.audit_all_platforms import _pip_audit_may_see_marker
 
     assert _pip_audit_may_see_marker("https://h/a%2541") is False
