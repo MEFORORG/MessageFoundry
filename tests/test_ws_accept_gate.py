@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi import Depends, FastAPI, WebSocket, WebSocketException
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketException, status
 from starlette.responses import PlainTextResponse
 from starlette.websockets import WebSocketDisconnect
 
@@ -293,6 +293,25 @@ def _planted(engine: Engine, service: AuthService | None, outcome: _Outcome) -> 
         await authorize_ws(websocket, Permission.MONITORING_READ)
         await accept_then_send(websocket)
 
+    async def records_without_raising(websocket: WebSocket) -> None:
+        # A gate dependency that records its answer and returns either way.
+        await authorize_ws(websocket, Permission.MONITORING_READ)
+
+    @app.websocket(
+        "/zz/public-dependency-records",
+        dependencies=[Depends(mark_route_gate(records_without_raising))],
+    )
+    @public_route("a synthetic public socket whose gate dependency records its answer")
+    async def public_dependency_records(websocket: WebSocket) -> None:
+        await accept_then_send(websocket)
+
+    async def refuse(websocket: WebSocket) -> None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "synthetic refusal")
+
+    @app.websocket("/zz/dependency-refuses", dependencies=[Depends(mark_route_gate(refuse))])
+    async def dependency_refuses(websocket: WebSocket) -> None:
+        await accept_then_send(websocket)
+
     return app
 
 
@@ -462,18 +481,38 @@ async def test_the_refusal_gets_the_header_floors_403(engine: Engine) -> None:
     assert _ACCEPT not in peer.kinds, peer.sent
 
 
+@pytest.mark.parametrize("path", ["/zz/public-identifies", "/zz/public-dependency-records"])
 @pytest.mark.parametrize("roles", [None, (Role.OPERATOR,)], ids=["gate-refuses", "gate-admits"])
-async def test_a_refusal_does_not_refuse_a_public_socket(
-    engine: Engine, roles: tuple[Role, ...] | None
+async def test_a_recorded_refusal_stands_on_a_public_socket(
+    engine: Engine, path: str, roles: tuple[Role, ...] | None
 ) -> None:
-    """A public socket may ask a gate only to identify its caller, so the gate's refusal leaves it
-    as public as before. The in-body and dependency-gated cases above are refused by the same
-    refusal."""
+    """A recorded refusal refuses accept on every socket, a public one included, whether the gate
+    ran in the body or as a dependency that returned after recording. The admitting gate is the
+    control: the same socket is accepted when the gate admits the caller."""
     service = await _service(engine)
     token = None if roles is None else await _token(service, "caller", *roles)
-    peer = _Peer(_planted(engine, service, _Outcome()), "/zz/public-identifies", token)
+    peer = _Peer(_planted(engine, service, _Outcome()), path, token)
     await peer.run()
-    assert peer.kinds[:2] == [_ACCEPT, "websocket.send"], peer.sent
+    if roles is None:
+        _assert_refused_before_accept(peer)
+    else:
+        assert peer.kinds[:2] == [_ACCEPT, "websocket.send"], peer.sent
+
+
+async def test_a_gate_dependencys_own_denial_passes(engine: Engine) -> None:
+    """A gate dependency that refuses raises before the body runs, so the denial Starlette sends
+    for the raise is the gate's own answer: it goes out as sent, and nothing is accepted."""
+    peer = _Peer(
+        _planted(engine, None, _Outcome()), "/zz/dependency-refuses", None, denial_extension=True
+    )
+    await peer.run()
+    assert _ACCEPT not in peer.kinds, peer.sent
+    start = peer.sent[0]
+    assert start["type"] == "websocket.http.response.start" and start["status"] == 403, peer.sent
+    assert any(
+        m["type"] == "websocket.http.response.body" and b"synthetic refusal" in m.get("body", b"")
+        for m in peer.sent
+    ), peer.sent
 
 
 async def test_the_cookie_gate_leaves_a_native_clients_admission_standing(engine: Engine) -> None:
@@ -486,7 +525,7 @@ async def test_the_cookie_gate_leaves_a_native_clients_admission_standing(engine
     await peer.run()
     assert peer.kinds[:2] == [_ACCEPT, "websocket.send"], peer.sent
     refused = _Peer(_planted(engine, service, _Outcome()), "/zz/header-then-cookie", None)
-    await refused.run()  # control: with no token the header gate refuses, and the accept gate
+    await refused.run()  # control: with no token the header gate refuses, and so does accept
     _assert_refused_before_accept(refused)
 
 

@@ -965,22 +965,20 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
 # that ignored a refusal, or never reached its gate, would still accept. So every WebSocket gate
 # records on the handshake's scope whether it admitted the caller, through :func:`record_ws_gate`,
 # and :class:`WebSocketAcceptGate` refuses ``websocket.accept``, and a denial response of any
-# status, on a socket whose scope does not read admitted. A scope that records no answer still
-# passes where the route declares its authorization some other way: a gate dependency, which ran
-# and admitted the caller before the body did, or a ``public_route`` mark. A recorded refusal
-# passes only on a ``public_route`` socket with no gate dependency, which may call a gate just to
-# identify its caller. An undeclared socket the refusal reaches never gets this far, because
+# status, on a socket whose scope does not read admitted. A recorded refusal refuses accept on every
+# socket, whatever its route declares. A scope that records no answer still passes where the route
+# declares its authorization some other way: a gate dependency, which ran before the body did, or a
+# ``public_route`` mark. An undeclared socket the refusal reaches never gets this far, because
 # :func:`refuse_undeclared_route` refuses it first; one outside the refusal, such as a socket in a
 # mount, is refused here at accept instead.
 #
 # The LATEST gate's answer stands: a refusal clears an earlier admission, so a body that ignores a
 # stricter gate's refusal after a laxer gate admitted the caller is still refused, and so is one
-# whose route a gate dependency admitted first. That holds only for a gate that records: a public
-# socket passes a refusal, as above, and a gate that finds the handshake is not its own to judge
-# records nothing, as the web console's cookie gate does for a native client, which sends no
-# Origin. The record is a flag, not an identity: it does not
-# say which permission the route needed. The route walk reads which permissions the body asks for,
-# and refuses an endpoint body that calls ``record_ws_gate`` by that name.
+# whose route a gate dependency admitted first. That holds only for a gate that records: a gate
+# that finds the handshake is not its own to judge records nothing, as the web console's cookie
+# gate does for a native client, which sends no Origin. The record is a flag, not an identity: it
+# does not say which permission the route needed. The route walk reads which permissions the body
+# asks for, and refuses an endpoint body that calls ``record_ws_gate`` by that name.
 
 #: The scope key a WebSocket gate sets to record its answer: ``True`` admitted, ``False`` refused.
 _WS_GATE_ADMITTED_KEY = "mefor.ws_gate_admitted"
@@ -1003,16 +1001,18 @@ def record_ws_gate(websocket: HTTPConnection, *, admitted: bool) -> None:
 def ws_accept_allowed(scope: Mapping[str, Any]) -> bool:
     """Whether :class:`WebSocketAcceptGate` lets this WebSocket scope's ``accept`` through."""
     answer = scope.get(_WS_GATE_ADMITTED_KEY)
-    if answer is True:
-        return True
+    if answer is not None:
+        # A recorded answer stands on every socket, a public or dependency-gated one included: a
+        # refusal the body ignored is refused whatever the route declares.
+        return answer is True
     route = scope.get("route")
     if route is not None and route_has_gate(route):
-        # The gate dependency admitted the caller before the body ran, unless a gate in the body
-        # refused afterwards: that refusal stands.
-        return answer is None
-    # A public mark is the only declaration left, and a recorded refusal does not refuse it. An
-    # in-body mark is not enough. FastAPI's router sets no route for a plain Starlette WebSocket
-    # route, so the scope's own endpoint is read then.
+        # The gate dependency ran before the body. If it returned, it admitted the caller. If it
+        # refused, it raised, so the body never ran and no accept follows: the denial response
+        # Starlette sends for that raise is the gate's own refusal, and passes here.
+        return True
+    # A public mark is the only declaration left. An in-body mark is not enough. FastAPI's router
+    # sets no route for a plain Starlette WebSocket route, so the scope's own endpoint is read then.
     endpoint = scope.get("endpoint") if route is None else getattr(route, "endpoint", None)
     declared = route_declaration_of(endpoint)
     return declared is not None and declared.public
@@ -2241,8 +2241,9 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     Authorization header and the listed permissions.
 
     Returns the :class:`Identity` on success, or ``None`` if auth fails (caller should close). On
-    success it also records the handshake admitted, and on a refusal not admitted, which
-    :class:`WebSocketAcceptGate` reads before an in-body socket may be accepted.
+    success it also records the handshake admitted, and on a refusal not admitted.
+    :class:`WebSocketAcceptGate` reads that record on every socket, before it lets an accept or a
+    denial response through.
     """
     # Not admitted until this gate answers, so a raise inside it cannot leave an earlier admission.
     record_ws_gate(websocket, admitted=False)
