@@ -1573,9 +1573,11 @@ editor, which opens on the stored body, so the operator's typed edit is lost aga
 refusals, as it was before Amendment C.
 
 **The order of the checks.** Manager decision d20261109T161647779-2963e0, a class B tightening
-taken after an adversarial review, set the direct-mode order (a request that names a target `to`):
+taken after an adversarial review, set the direct-mode order (a request that names a target `to`).
+At least these checks run, in this order:
 
-1. the scoped read of the message, 404 when it is unknown or outside the caller's scope;
+1. the scoped read of the message: 404 when it is unknown or outside the caller's scope, and 423,
+   which gives the proof back, when an in-scope row's cells fail their integrity tag;
 2. the scope check on the target, 403, with its `auth.channel_denied` audit row;
 3. the engine-wide ingress guard (the NUL rule and the 16 MiB ceiling), whose refusal gives the
    proof back;

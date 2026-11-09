@@ -6,6 +6,8 @@
   ingress guard's 413, 415 or 422, still gives the proof back. In direct mode the guard now runs
   before the checks on whether the target is registered, deployed, on this engine shard and
   running, so a body built to fail it no longer tells the caller whether those checks would pass.
+  Re-route mode is unchanged: its guard still follows the origin check, so its refusal still
+  tells the caller that the origin inbound is held by this engine.
   [ADR 0197](../docs/adr/0197-cap-repeated-lock-cycles-on-one-account-without-making-malicious-lockout-cheaper.md)
   Amendment D records the owner's ruling and, under *The order of the checks*, the order in each
   mode. (vault `BACKLOG #3241`)
