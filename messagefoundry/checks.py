@@ -2078,7 +2078,7 @@ def _settings_source(
 
     ``toml`` is :func:`_resolve_service_toml`'s answer. With no file, ``env_only`` says whether the
     environment declares an instance anyway, and the explicit trigger is ``check --env`` (``env``)
-    or ``MEFOR_AI_ENVIRONMENT`` (vault BACKLOG #2355). Two things fix that choice:
+    or ``MEFOR_AI_ENVIRONMENT`` (vault BACKLOG #2355). Three things fix that choice:
 
     * ``serve`` refuses to start with no active environment, so ``MEFOR_*`` variables naming none
       describe nothing ``serve`` would run, and there is no refusal for a leg to bring forward.

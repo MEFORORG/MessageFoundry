@@ -1436,10 +1436,12 @@ def _resolve_offline_anchor(
     # defer_missing_service_config is check's: a --service-config that is no file stops serve before
     # its value-file check, and check's settings legs fail on it in serve's words. The value-file
     # check here would name a guessed directory instead, so it is left to them.
+    # exists(), not is_file(): serve's load_settings tests exists(), so it reads a device such as
+    # NUL as an empty file, and the value-file check still applies there.
     deferred = (
         defer_missing_service_config
         and service_config is not None
-        and not Path(service_config).is_file()
+        and not Path(service_config).exists()
     )
     if args.project_root is not None and args.env is not None and root is not None and not deferred:
         env_dir = _env_dir_name(service_config)
@@ -1457,8 +1459,9 @@ def _env_dir_name(service_config: str | None) -> str:
     literal. Best-effort: no/unreadable/malformed file -> the default. The full ``load_settings`` is
     deliberately avoided here (the offline gate stays settings-free, like validate/graph/dryrun).
 
-    ``MEFOR_ENVIRONMENTS_DIR`` beats the file, as it does in ``serve``'s ``load_settings``, so this
-    names the directory ``serve`` and ``check``'s build-check read (vault BACKLOG #2355)."""
+    ``MEFOR_ENVIRONMENTS_DIR`` beats the file, as it does in ``serve``'s ``load_settings`` (vault
+    BACKLOG #2355). The file read is ``service_config`` alone: under ``--project-root`` with no root
+    file, ``check``'s settings legs read the config dir's file, which this does not."""
     from messagefoundry.config.settings import environments_dir_named_by_env
 
     named = environments_dir_named_by_env()
@@ -1501,9 +1504,8 @@ def _check_env_file_present(config_dir: str, root: Path, env_name: str, env_dir:
     if not env_file.is_file():
         print(
             f"error: the graph references env() but no value file was found at {env_file} under the "
-            f"explicit --project-root {str(root)!r} for --env {env_name!r}. Create "
-            f"{env_dir}/{env_name}.toml under the project root (or drop --project-root to use the "
-            "working directory).",
+            f"explicit --project-root {str(root)!r} for --env {env_name!r}. Create that file (or drop "
+            "--project-root to use the working directory).",
             file=sys.stderr,
         )
         return 2

@@ -425,6 +425,8 @@ review. It is not an owner ruling. Vault BACKLOG #2355 is the build.
 checks read the settings from the environment instead of skipping. The `posture` check therefore
 fails a custom name with no explicit production tier, as `serve` refuses to start on it, where §3
 said the gate never enforces that refusal.
+The `dryrun` check is not a settings check: it takes only `[pipeline].snapshot_on_send` from
+those settings, and its Handlers still run with no active environment.
 
 **What does not change.**
 

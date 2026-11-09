@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -882,10 +883,12 @@ def test_messagefoundry_check_accepts_rewritten_sample(tmp_path: Path) -> None:
     adt.write_bytes(out.encode("utf-8"))
     # No --env: `check --env` now names the instance as `serve --env` does (vault BACKLOG #2355), so
     # on this bare dir it would grade stock settings, which serve refuses too. This test is about the
-    # rewrite, and the settings legs skip without it.
+    # rewrite, and the settings legs skip without it, given no MEFOR_* variable names an instance.
+    clean = {k: v for k, v in os.environ.items() if not k.upper().startswith("MEFOR_")}
     proc = subprocess.run(
         [sys.executable, "-m", "messagefoundry", "check", "--config", str(cfg)],
         capture_output=True,
+        env=clean,
     )
     assert proc.returncode == 0, proc.stdout.decode("utf-8", "replace") + proc.stderr.decode(
         "utf-8", "replace"
