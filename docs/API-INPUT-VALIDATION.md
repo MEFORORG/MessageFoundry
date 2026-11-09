@@ -396,7 +396,8 @@ operators whose attempt would not have been audited anyway.
 **Other console parameters carry a length bound, or nothing, and no rule.** The golden table lists
 every one of them, marked `-`. They include at least the uploaded-log filters and resend target, the
 dead-letter replay path segments, the layered-search preset ids, and the engine-minted ids on `/ui`
-paths. Closing those is separate work, and the table is what makes each one visible: read it rather
+paths. [INPUT-SURFACES.md](INPUT-SURFACES.md#some-web-console-parameters-carry-no-named-rule) says
+where a `-` parameter can still meet a rule, and the table is what makes each one visible: read it rather
 than this paragraph for the current set.
 
 **Several hundred response fields carry no rule, and they should not.** A response field is something
@@ -405,7 +406,8 @@ gap. Counting one as a gap manufactures a number that cannot be closed.
 
 **These other input surfaces are not covered here.** The engine's inbound HTTP listener, the command
 line, and the `connections.toml` file each accept operator input and each carry their own rules or
-their own absence of rules. Establishing what they should be is separate work.
+their own absence of rules. [INPUT-SURFACES.md](INPUT-SURFACES.md) maps them, with the other surfaces
+outside the operator API.
 
 **The config loader enforces the connection-name rule too (BACKLOG #1107).** A connection declared in
 code or in `connections.toml` under a name this page rejects now fails the load with a `WiringError`
