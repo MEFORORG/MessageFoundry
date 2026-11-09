@@ -14003,7 +14003,7 @@ class AuthService:
         finding 13); a route that asks :meth:`must_enrol_before_rotating` first opens it once more
         there, before the current password. The early refusal
         (:meth:`_refuse_rotation_without_way_past`) opens none, except on an account whose passkey
-        set did not verify: it refuses an account with no TOTP on and no passkey that counts, as
+        set did not verify or could not be read: it refuses an account with no TOTP on and no passkey that counts, as
         :meth:`_has_way_past` would, and leaves a TOTP that is on to the write's own judgement,
         which refuses a KNOWN refusal there. The cost of that: such a refusal now comes after the
         argon2 hash. Without the ``[webauthn]`` extra the write counts no passkey, as
@@ -14055,8 +14055,9 @@ class AuthService:
         passkey can count (no configured relying party, or no ``[webauthn]`` extra): the store's
         write reads it too, and would raise on a row that does not parse after the hash. A cell the
         driver cannot decode while fetching (:func:`passkey_cell_undecodable`) counts the set for
-        nothing too, as the census counts it, so such an account with no TOTP on is refused here
-        rather than raising."""
+        nothing too, as the census counts it, so such an account with no TOTP that counts gets the
+        enrolment refusal here rather than the driver's error. Where its TOTP counts, the store's
+        write still reads the set after the hash and raises that error."""
         held: list[WebAuthnCredential] | None = []
         if user.has_passkeys:
             try:
@@ -14064,10 +14065,14 @@ class AuthService:
             except (UnicodeDecodeError, sqlite3.OperationalError) as exc:
                 if not passkey_cell_undecodable(exc):
                     raise
-                # The class name only: a decode error's message quotes the cell.
-                _log.warning(
-                    "the passkeys of user %s could not be read (%s)", user.id, type(exc).__name__
-                )
+                # The class name only: a decode error's message quotes the cell. Throttled per
+                # account, as _verified_passkeys throttles a row that does not parse.
+                if self._seal_failures_reported.due(f"passkey-decode:{user.id}"):
+                    _log.warning(
+                        "the passkeys of user %s could not be read (%s)",
+                        user.id,
+                        type(exc).__name__,
+                    )
                 held = None
         if held is None:
             if not await self._totp_way_past(user):

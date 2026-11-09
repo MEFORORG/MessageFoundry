@@ -2239,7 +2239,7 @@ async def test_a_passkey_row_that_does_not_parse_names_the_account_in_the_census
 # --- the rotation's passkey half reads as its courtesy check does (BACKLOG #3948) ----------------
 
 
-async def _refused_totp_beside_a_passkey(
+async def _passkey_owner_counting_hashes(
     store: MessageStore, *, way_past_rp_id: str | None = RP, totp: str | None = _REFUSED_TOTP
 ) -> tuple[AuthService, Identity, list[int]]:
     """A covered Administrator holding a discoverable passkey and a refused-marker TOTP (none where
@@ -2279,7 +2279,7 @@ async def test_without_the_webauthn_extra_a_passkey_does_not_open_the_rotation(
 
     store = await MessageStore.open(":memory:")
     try:
-        service, identity, _ = await _refused_totp_beside_a_passkey(store)
+        service, identity, _ = await _passkey_owner_counting_hashes(store)
         monkeypatch.setattr(wa, "available", lambda: available)
         assert await service.must_enrol_before_rotating(identity) is not available
         before = await _password_hash(store, identity.user_id)
@@ -2309,7 +2309,7 @@ async def test_a_passkey_row_that_does_not_parse_refuses_the_rotation_before_the
     rotates. RED when: the set is read only in the store's write, which raises after the hash."""
     store = await MessageStore.open(":memory:")
     try:
-        service, identity, hashes = await _refused_totp_beside_a_passkey(
+        service, identity, hashes = await _passkey_owner_counting_hashes(
             store, way_past_rp_id=rp_id
         )
         if not corrupt:
@@ -2341,7 +2341,7 @@ async def test_a_passkey_cell_the_driver_cannot_decode_refuses_the_rotation_befo
     failure escape."""
     store = await MessageStore.open(":memory:")
     try:
-        service, identity, hashes = await _refused_totp_beside_a_passkey(
+        service, identity, hashes = await _passkey_owner_counting_hashes(
             store, way_past_rp_id=rp_id, totp=None
         )
         if not corrupt:
@@ -2364,6 +2364,38 @@ async def test_a_passkey_cell_the_driver_cannot_decode_refuses_the_rotation_befo
         await store.close()
 
 
+@pytest.mark.parametrize(
+    ("error", "refused"),
+    [
+        (UnicodeDecodeError("utf-16-le", b"\x00\xd8", 0, 2, "unpaired surrogate"), True),
+        (sqlite3.OperationalError("database is locked"), False),
+    ],
+    ids=["driver-decode", "control-other-error"],
+)
+async def test_the_rotation_survives_only_a_decode_failure_of_the_passkey_set(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, refused: bool
+) -> None:
+    """The rotation's early refusal counts the set for nothing only where the driver could not
+    decode a cell (pyodbc's ``UnicodeDecodeError`` here; sqlite3's is the test above): a covered
+    account with no TOTP on gets the enrolment refusal before the hash. The control: any other
+    driver error still raises, before the hash, rather than telling an account that holds a
+    passkey to enrol a factor. RED when: the catch drops ``UnicodeDecodeError``, or widens to every
+    ``OperationalError``."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, hashes = await _passkey_owner_counting_hashes(store, totp=None)
+
+        async def unreadable(user_id: str) -> Any:
+            raise error
+
+        monkeypatch.setattr(store, "list_webauthn_credentials", unreadable)
+        with pytest.raises(FactorEnrolmentRequired if refused else type(error)):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert hashes == []
+    finally:
+        await store.close()
+
+
 @pytest.mark.parametrize("tampered", [True, False], ids=["tampered", "control"])
 async def test_a_passkey_set_that_fails_its_seal_is_reported_by_the_rotation(
     tampered: bool, tmp_path: Path
@@ -2380,7 +2412,7 @@ async def test_a_passkey_set_that_fails_its_seal_is_reported_by_the_rotation(
     )
     try:
         assert store.row_sealer() is not None, "the arm needs a keyed store"
-        service, identity, _ = await _refused_totp_beside_a_passkey(store)
+        service, identity, _ = await _passkey_owner_counting_hashes(store)
         before = len(await store.list_audit(limit=500))
         if tampered:
             await store._db.execute("UPDATE webauthn_credentials SET label = 'outside-the-store'")
