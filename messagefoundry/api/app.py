@@ -2659,8 +2659,8 @@ async def _audit_refused_reload(
     refusing its audit read or write, writes reason ``store_unavailable`` and answers 503 (BACKLOG
     #3091); it is neither a refused anchor nor a bad graph. A released reload whose config is not the
     one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch``, or
-    ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
-    BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
+    ``no_approved_digest`` when the hold took none or a value not of the digest's form, with both
+    digests, and answers 422 (vault BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
     reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
     request whose digest cannot be taken is refused the same way, with no hold filed. A release
     refused before its digest check (:class:`ConfigRefusedBeforeApprovalCheck`) keeps its reason
@@ -2717,8 +2717,8 @@ async def _audit_refused_reload(
         action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
     elif isinstance(exc, ConfigDigestMismatch):
-        # A hold that took no digest is told apart, so nobody goes looking for an edit that
-        # never happened.
+        # A hold that took no digest, or one not of the digest's form, is told apart, so nobody
+        # goes looking for an edit that never happened.
         unbound = exc.approved is None
         warn(
             "config reload refused: %s",

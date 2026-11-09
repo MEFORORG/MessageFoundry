@@ -391,7 +391,8 @@ class _Operation:
     #: #3217), so :meth:`ApprovalGate._release_blocked` predicts that refusal before the claim.
     requires_requester: bool = False
     #: The executor binds its release to the config digest in params ``fingerprint``, and refuses
-    #: every config when there is none (:func:`held_fingerprint`; vault BACKLOG #3192), so
+    #: every config when there is none or a value not of the digest's form
+    #: (:func:`held_fingerprint`; vault BACKLOG #3192), so
     #: :meth:`ApprovalGate._release_blocked` predicts that refusal before the claim too.
     requires_fingerprint: bool = False
 

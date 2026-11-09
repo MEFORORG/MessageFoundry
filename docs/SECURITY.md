@@ -2684,8 +2684,8 @@ params carry no digest, or one not of the form the engine writes, is refused bef
 instead (vault BACKLOG #3192): the queue marks
 it `release_blocked: "params_no_fingerprint"`, the approve answers **409** and writes an
 `approval.params_no_fingerprint` row, nothing runs, and the request stays pending for a reject.
-The executor still refuses such a hold with reason `no_approved_digest`, but only a release that
-skipped the gate's check would reach it. A release that
+A release that skipped the gate's check is still refused by the executor, with reason
+`no_approved_digest` where it reaches the digest check. A release that
 cannot take the digest now is refused with reason `digest_unavailable`, and the engine logs the
 cause at WARNING. The requester asks again, and a second approver reviews the new bytes.
 

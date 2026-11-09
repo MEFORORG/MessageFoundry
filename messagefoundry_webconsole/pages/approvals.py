@@ -157,7 +157,9 @@ _NONE_MEANS: dict[str, str] = {
 # The note is true on a pending row and an interrupted one alike.
 _RELOAD = "config_reload"
 _CONFIG_DIGEST = re.compile(DIGEST_ID_PATTERN)
-_NO_DIGEST = "no usable config digest was recorded, and the engine loads no config without one"
+_NO_DIGEST = (
+    "no usable config digest was recorded, and the engine will not release this reload without one"
+)
 
 
 def _is_config_digest(value: object) -> bool:
