@@ -685,22 +685,21 @@ def test_a_held_reload_with_no_usable_digest_reads_as_the_engines_refusal(bad: o
     never as its raw value, which could pass for a digest; a well-formed one is shown as it is."""
     from messagefoundry_webconsole.pages import approvals as page_module
 
-    def _page(digest: object, operation: str = "config_reload") -> str:
+    def _page(digest: object, operation: str, blocked: ReleaseBlocked | None) -> str:
         row = _row(
-            "e" * 32,
-            operation=operation,
-            params={"fingerprint": digest},
-            release_blocked="params_no_fingerprint" if operation == "config_reload" else None,
+            "e" * 32, operation=operation, params={"fingerprint": digest}, release_blocked=blocked
         )
         return str(pages.approvals_page(ApprovalList(approvals=[row])))
 
-    html = _page(bad)
+    html = _page(bad, "config_reload", "params_no_fingerprint")
     assert f"fingerprint: {page_module._NO_DIGEST}" in html
     assert "will refuse this release" not in html
-    good = _page("c" * 64)
+    # The control: an unblocked reload row, as the engine lists one, shows its digest and Approve.
+    good = _page("c" * 64, "config_reload", None)
     assert f"fingerprint: {'c' * 64}" in good and page_module._NO_DIGEST not in good
+    assert 'action="/ui/approvals/' + "e" * 32 + '/approve"' in good
     # Only a held reload binds a digest; another operation's param of that name is not judged.
-    assert page_module._NO_DIGEST not in _page(bad, operation="dead_letter_replay")
+    assert page_module._NO_DIGEST not in _page(bad, "dead_letter_replay", None)
 
 
 def test_a_notice_code_selects_a_sentence_and_never_supplies_one() -> None:

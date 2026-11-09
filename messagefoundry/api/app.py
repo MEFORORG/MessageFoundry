@@ -1831,8 +1831,8 @@ def _build_approval_gate(
         # whose params carry no digest (none is filed that way now), or one not of the shape a
         # digest has, binds to None, which matches nothing. The gate refuses such a hold before its
         # claim (requires_fingerprint below, release_blocked 'params_no_fingerprint', vault
-        # BACKLOG #3192), so None reaches this only if that flag is dropped, and is then refused
-        # with reason no_approved_digest once its directory resolves.
+        # BACKLOG #3192), so None reaches this only if that flag is dropped. It is then refused,
+        # with reason no_approved_digest where the release reaches the digest check.
         # On a store that holds a key the params are sealed with the rest of the request, so a
         # writer to pending_approvals who changes the digest leaves a request the gate refuses
         # (vault BACKLOG #2592).
