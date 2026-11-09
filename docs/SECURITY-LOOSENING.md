@@ -1922,7 +1922,7 @@ count is above `0` (vault BACKLOG #2613).
 - **It is never silent:** a WARNING at every construction naming the connection, never an id, a
   `fhir-update-path-form` line in `messagefoundry check` naming the connections listed below, and
   an `update_url_form` entry in `security_loosenings()`, which `GET /security/posture` shows with
-  the same connection names (vault BACKLOG #2571). The last two apply one reader. A value of
+  the connections its own reading names (vault BACKLOG #2571). The last two apply one reader. A value of
   `update_url_form`, `interaction`, `conditional` or a Bundle entry list supplied through `env()` is
   read too. The posture route resolves it against the engine's current environment values, and
   names the connection plainly only if it resolves to the path form on an update. `check` resolves

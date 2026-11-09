@@ -2060,6 +2060,7 @@ _SECRET_SHAPED = "https://svc-user:Synth3ticPassw0rd@fhir.invalid/r?token=synthT
         ("interaction", {}, ("create", "update", "transaction", "batch")),
         ("conditional", {}, ("if-none-exist", "conditional-update", "if-match")),
         ("update_url_form", {"interaction": "update"}, ("transaction", "path")),
+        ("format", {}, ("json",)),
     ],
 )
 def test_a_refused_setting_does_not_echo_its_value(

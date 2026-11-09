@@ -1032,8 +1032,9 @@ class FhirDestination(DestinationConnector):
         self.format: str = str(s.get("format", "json"))
         if self.format != "json":
             # JSON-only MVP; FHIR-XML is deferred to a hardened-lxml path (ADR 0022 Options #5).
+            # The received value is left out, as for interaction below (#1183).
             raise ValueError(
-                f"FHIR destination format={self.format!r} is not supported (JSON only; ADR 0022)"
+                f"FHIR destination format must be one of {('json',)} (JSON only; ADR 0022)"
             )
         self.interaction: str = str(s.get("interaction", "create"))
         if self.interaction not in _INTERACTIONS:
