@@ -17652,13 +17652,21 @@ class MessageStore:
         must_change_password: bool = True,
         require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
+        totp_judged: TotpJudgement | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         conditional = conditional_way_past(require_way_past)
-        # The TOTP judged before the writer lock (judge_totp), confirmed under it by its cell.
+        # The TOTP judged before the writer lock, by the caller where it passed ``totp_judged``,
+        # else here (judge_totp), and confirmed under the lock by its cell either way.
         totp_counts = (
-            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            (
+                totp_judged
+                if totp_judged is not None
+                else await judge_totp(
+                    self.open_totp_secret, require_way_past, await self.get_user(user_id)
+                )
+            )
             if conditional
             else None
         )

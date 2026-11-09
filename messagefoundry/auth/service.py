@@ -198,6 +198,7 @@ from messagefoundry.store.store import (
     RevokeResult,
     RoleRow,
     SessionRecord,
+    TotpJudgement,
     TotpState,
     UserAuthzRecord,
     UsernameAuditAppendError,
@@ -13999,25 +14000,28 @@ class AuthService:
         between this read and the write makes the write match no row, and the change is refused
         rather than landing on an account with no way past.
 
-        This method opens the TOTP cell in the store's conditional write (BACKLOG #3948 finding
-        13), and before the argon2 hash in :meth:`_refuse_rotation_without_way_past` only where
-        that method says; a route that asks :meth:`must_enrol_before_rotating` first opens it once
-        more there, before the current password. Without the ``[webauthn]`` extra the write counts
-        no passkey, as :meth:`_has_way_past` counts none.
+        This method opens the TOTP cell once, before the argon2 hash, in
+        :meth:`_refuse_rotation_without_way_past`, and the store's conditional write takes that
+        judgement and confirms under its lock that the cell is the one judged (BACKLOG #3948); a
+        route that asks :meth:`must_enrol_before_rotating` first opens it once more there, before
+        the current password. Without the ``[webauthn]`` extra the write counts no passkey, as
+        :meth:`_has_way_past` counts none.
         """
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
             return violations
         user = await self._load_user(identity.user_id)
         covered = user is not None and self._covered_by_requirement(user, identity.roles)
+        judged = None
         if covered and user is not None:
-            await self._refuse_rotation_without_way_past(user)
+            judged = await self._refuse_rotation_without_way_past(user)
         written = await self._store.set_password(
             identity.user_id,
             password_hash=await self._argon2(hash_password, new_password),
             must_change_password=must_change,
             password_generated=False,
             require_way_past=_opened_totp_state if covered else None,
+            totp_judged=judged,
             # Without the [webauthn] extra no passkey can sign in, so the write counts none, as
             # _has_way_past counts none (BACKLOG #3948).
             passkey_counts=self._gate_counts if webauthn.available() else _passkey_counts_nothing,
@@ -14037,53 +14041,44 @@ class AuthService:
         )
         return []
 
-    async def _refuse_rotation_without_way_past(self, user: VerifiedUser) -> None:
+    async def _refuse_rotation_without_way_past(self, user: VerifiedUser) -> TotpJudgement:
         """The rotation's early refusal, before the argon2 hash: raise
-        :class:`FactorEnrolmentRequired` where ``user`` holds no factor with a way past, except that
-        a TOTP that is on beside a passkey set that verifies is left to the write's own judgement
-        (BACKLOG #3948 finding 13), which refuses a KNOWN refusal only after the hash. Where no
-        TOTP is on and no passkey can count (no configured relying party, or no ``[webauthn]``
-        extra), it refuses before reading anything, since no read could change the answer.
+        :class:`FactorEnrolmentRequired` where ``user`` holds no factor with a way past, in the
+        order :meth:`_has_way_past` asks. The TOTP is judged first, with no passkey read: one that
+        is on and not a KNOWN refusal (:meth:`_totp_way_past`, an unknown one included) is the way
+        past. Otherwise, where no passkey can count (none held, no configured relying party, or no
+        ``[webauthn]`` extra), it refuses with no read. Only where a passkey can count is the set
+        read, through :meth:`_verified_passkeys`, so a row that does not parse is no exception and a
+        set that fails its seal is reported; such a set counts for nothing, and so does one with a
+        cell the driver cannot decode while fetching (:func:`passkey_cell_undecodable`), as the
+        census counts it. Any other read error raises, before the hash.
 
-        Otherwise the passkeys are read wherever the account's sealed record names one, even where
-        a TOTP is on and no passkey can count. They are read through :meth:`_verified_passkeys`, as
-        :meth:`_has_way_past` reads them, so a row that does not parse is no exception and a set
-        that fails its seal is reported. Such a set counts for nothing, and so does one with a cell
-        the driver cannot decode while fetching (:func:`passkey_cell_undecodable`), as the census
-        counts it; then only the TOTP can pass, and it is judged here. A KNOWN-refused TOTP is
-        therefore refused before the hash. Where the TOTP counts beside a row that does not parse
-        or a cell that cannot be decoded, the store's write still reads the set after the hash and
-        raises."""
-        if not user.totp_enabled and not (
-            self.passkeys_count_as_way_past() and webauthn.available()
-        ):
+        Returns the TOTP judgement, which the store's conditional write takes in place of opening
+        the cell again (``totp_judged``), so the rotation opens it once (BACKLOG #3948)."""
+        state = await self._totp_state(user)
+        judged = TotpJudgement(
+            cell=user.totp_secret_cell if user.totp_enabled else None,
+            state="refused" if state is None else state,
+        )
+        if state in ("usable", "unknown"):
+            return judged
+        if not (user.has_passkeys and self.passkeys_count_as_way_past() and webauthn.available()):
             raise FactorEnrolmentRequired()
-        held: list[WebAuthnCredential] | None = []
-        if user.has_passkeys:
-            try:
-                held = await self._verified_passkeys(user)
-            except (UnicodeDecodeError, sqlite3.OperationalError) as exc:
-                if not passkey_cell_undecodable(exc):
-                    raise
-                # The class name only: a decode error's message quotes the cell. Throttled per
-                # account, as _verified_passkeys throttles a row that does not parse.
-                if self._seal_failures_reported.due(f"passkey-decode:{user.id}"):
-                    _log.warning(
-                        "the passkeys of user %s could not be read (%s)",
-                        user.id,
-                        type(exc).__name__,
-                    )
-                held = None
-        if held is None:
-            if not await self._totp_way_past(user):
-                raise FactorEnrolmentRequired()
-            return
-        if user.totp_enabled:
-            return
-        # The [webauthn] extra check is the guard at the top's (finding 3): it refused here where the
-        # extra is missing, so only each passkey's own count is judged below.
-        if not any(self._gate_counts(c) for c in held):
+        try:
+            held = await self._verified_passkeys(user)
+        except (UnicodeDecodeError, sqlite3.OperationalError) as exc:
+            if not passkey_cell_undecodable(exc):
+                raise
+            # The class name only: a decode error's message quotes the cell. Throttled per
+            # account, as _verified_passkeys throttles a row that does not parse.
+            if self._seal_failures_reported.due(f"passkey-decode:{user.id}"):
+                _log.warning(
+                    "the passkeys of user %s could not be read (%s)", user.id, type(exc).__name__
+                )
+            held = None
+        if not any(self._gate_counts(c) for c in held or ()):
             raise FactorEnrolmentRequired()
+        return judged
 
     # --- MFA: native TOTP second factor (every account, WP-14, ASVS 6.3.3) -----
 
@@ -14106,8 +14101,8 @@ class AuthService:
         discoverable, cannot be found by the usernameless ceremony, so it is a second factor
         everywhere else but no way past the lock (the amendment's fact 11). It answers for the
         factor-drop gates, at least the rotation's courtesy check :meth:`must_enrol_before_rotating`
-        (the rotation's own write judges the TOTP itself, BACKLOG #3948 finding 13), so a passkey
-        counts only under the configured relying party (:meth:`_gate_counts`, BACKLOG #3937)."""
+        (the rotation's early refusal asks in the same order), so a passkey counts only under the
+        configured relying party (:meth:`_gate_counts`, BACKLOG #3937)."""
         return await self._totp_way_past(user) or await self._holds_gate_passkey(user)
 
     async def _totp_way_past(self, user: VerifiedUser) -> bool:

@@ -5870,13 +5870,13 @@ nothing else. Its next sign-in was pending, with no way to prove a passkey there
 `[security].require_mfa` a covered passkey-only account rotates only once it holds a way past
 the sign-in lock. The route's courtesy check, `must_enrol_before_rotating`, asks before the
 current password: `_has_way_past` counts TOTP or a passkey recorded as discoverable under the
-configured `rp_id` (ADR 0197 Amendment A, wave 2; BACKLOG #3937). The rotation itself reads the
-passkey set through the same verified read before it hashes, and refuses an account with no TOTP
-on and no such passkey there. Otherwise the rotation leaves the TOTP to
-the store's conditional write, which judges the cell it writes against (BACKLOG #3948 finding 13).
-That write refuses a KNOWN refusal only where no passkey counts either, and without the
-`[webauthn]` extra it counts no passkey, as `_has_way_past` counts none. One whose passkeys are
-not discoverable must also enrol a factor that is
+configured `rp_id` (ADR 0197 Amendment A, wave 2; BACKLOG #3937). The rotation itself asks in
+the same order before it hashes: it judges the TOTP, and reads the passkey set, through the same
+verified read, only where the TOTP is no way past and a passkey can count, then refuses an account
+with neither. The store's conditional write takes that TOTP judgement rather than opening the cell
+again, and under its lock counts it only for the cell it judged (BACKLOG #3948). Without the
+`[webauthn]` extra the write counts no passkey, as `_has_way_past` counts none.
+One whose passkeys are not discoverable must also enrol a factor that is
 before it rotates, so after the passkey it goes to the enrolment page, and only then to the password
 page. Such an account exists only where its passkey came before the requirement covered it, or
 before wave 2: a store from before ADR 0197 Amendment A, a site that turned `require_mfa` on or

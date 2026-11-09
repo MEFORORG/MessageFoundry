@@ -1649,10 +1649,10 @@ async def test_an_unknown_totp_opens_the_rotation_gate(
 ) -> None:
     """The rotation gate during the outage, or on a keyless open: a covered account whose only
     factor is an enabled TOTP nobody can judge may rotate into a chosen password, as the plain
-    enabled-TOTP rule let it before BACKLOG #3422. Both halves ask: the service's gate
-    (``must_enrol_before_rotating``, through ``_has_way_past``) and the store's conditional write,
-    the one judgement a ``change_password`` makes (BACKLOG #3948 finding 13). Its refused-marker
-    control is
+    enabled-TOTP rule let it before BACKLOG #3422. Both ask: the service's gate
+    (``must_enrol_before_rotating``, through ``_has_way_past``) and ``change_password``, whose
+    early refusal makes the one judgement the store's conditional write then takes (BACKLOG
+    #3948). Its refused-marker control is
     :func:`test_a_refused_totp_does_not_open_the_rotation_gate`."""
     store = await MessageStore.open(":memory:")
     try:
@@ -1666,8 +1666,8 @@ async def test_an_unknown_totp_opens_the_rotation_gate(
         gate_opens = len(opened)
         assert gate_opens, "the rotation gate judged nothing, so the stub measured nothing"
         assert await service.change_password(identity, _NEW_PASSWORD) == []
-        # The password change judges it once, in the store's conditional write (BACKLOG #3948
-        # finding 13), so a write that stopped asking would show here, and so would a second open.
+        # The password change opens it once, in its early refusal, and the write takes that
+        # judgement (BACKLOG #3948), so a change that stopped judging it, or opened it twice, shows.
         assert len(opened) == gate_opens + 1, (gate_opens, len(opened))
         row = await store.get_user(identity.user_id)
         assert row is not None and row.password_hash != before.password_hash
@@ -2240,14 +2240,20 @@ async def test_a_passkey_row_that_does_not_parse_names_the_account_in_the_census
 
 
 async def _passkey_owner_counting_hashes(
-    store: MessageStore, *, way_past_rp_id: str | None = RP, totp: str | None = _REFUSED_TOTP
+    store: MessageStore,
+    *,
+    way_past_rp_id: str | None = RP,
+    totp: str | None = _REFUSED_TOTP,
+    passkey: bool = True,
 ) -> tuple[AuthService, Identity, list[int]]:
-    """A covered Administrator holding a discoverable passkey and a refused-marker TOTP (none where
-    ``totp`` is ``None``), so only the passkey can be the way past. Returns the service, the
-    identity and a list that grows by one on every argon2 hash the service runs."""
+    """A covered Administrator holding a discoverable passkey (none where ``passkey`` is false) and
+    a refused-marker TOTP (none where ``totp`` is ``None``), so only the passkey can be the way
+    past. Returns the service, the identity and a list that grows by one on every argon2 hash the
+    service runs."""
     service = _service(store, way_past_rp_id=way_past_rp_id)
     identity, token, _ = await login_admin(service)
-    await _register(service, identity, token)
+    if passkey:
+        await _register(service, identity, token)
     if totp is not None:
         await _enable_totp(store, identity.user_id, totp)
     hashes: list[int] = []
@@ -2307,8 +2313,8 @@ async def test_a_passkey_row_that_does_not_parse_refuses_the_rotation_before_the
     the enrolment refusal, before any argon2 hash, and so where no relying party is configured,
     or the ``[webauthn]`` extra is absent, and no passkey could count anyway. The control: the
     same account with its row intact rotates. RED when: the set is read only in the store's
-    write, which raises after the hash, or the early refusal skips the read for a TOTP that is
-    on."""
+    write, which raises after the hash, or the early refusal skips the read where the TOTP is
+    refused and a passkey can count."""
     from messagefoundry.auth import webauthn as wa
 
     store = await MessageStore.open(":memory:")
@@ -2393,9 +2399,9 @@ async def test_with_no_totp_on_a_store_error_cannot_turn_the_rotation_refusal_in
     or no ``[webauthn]`` extra): no passkey read could change the answer, so the rotation is the
     enrolment refusal before any read and before the hash, and a passkey read that would fail with
     ``database is locked`` never runs. The control: where a passkey can count the set is read, and
-    the error raises, before the hash. With a TOTP on the set is still read, so there the error
-    still raises; no arm here covers that. RED when: the early refusal reads the set where no TOTP
-    is on and no passkey can count."""
+    the error raises, before the hash. The arms with a TOTP on are
+    :func:`test_with_a_totp_on_the_rotation_reads_the_passkey_set_only_where_it_decides`. RED
+    when: the early refusal reads the set where no TOTP is on and no passkey can count."""
     from messagefoundry.auth import webauthn as wa
 
     store = await MessageStore.open(":memory:")
@@ -2422,6 +2428,104 @@ async def test_with_no_totp_on_a_store_error_cannot_turn_the_rotation_refusal_in
 
 
 @pytest.mark.parametrize(
+    ("passkey", "rp_id", "secret", "rotates"),
+    [
+        (False, RP, _REFUSED_TOTP, False),
+        (True, None, _REFUSED_TOTP, False),
+        (False, RP, _USABLE_TOTP, True),
+    ],
+    ids=["refused-no-passkey", "refused-passkey-cannot-count", "control-usable"],
+)
+async def test_a_known_refused_totp_is_refused_before_the_hash(
+    passkey: bool, rp_id: str | None, secret: str, rotates: bool
+) -> None:
+    """A covered account whose TOTP is on and a KNOWN refusal, where no passkey can be the way
+    past (none held, or one held with no relying party configured): the rotation is the enrolment
+    refusal before any argon2 hash, as the early refusal on main makes it. The control: a usable
+    TOTP rotates, with one hash. RED when: the early refusal leaves a TOTP that is on to the
+    store's write, which refuses only after the hash."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, hashes = await _passkey_owner_counting_hashes(
+            store, way_past_rp_id=rp_id, totp=secret, passkey=passkey
+        )
+        before = await _password_hash(store, identity.user_id)
+        if rotates:
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+            assert hashes == [1]
+            return
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert hashes == [], "the refusal came after the argon2 hash"
+        assert await _password_hash(store, identity.user_id) == before
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("rp_id", "available", "secret", "outcome"),
+    [
+        (None, True, _REFUSED_TOTP, "refused"),
+        (RP, False, _REFUSED_TOTP, "refused"),
+        (None, True, _USABLE_TOTP, "rotates"),
+        (RP, True, _USABLE_TOTP, "rotates"),
+        (RP, True, _REFUSED_TOTP, "raises"),
+    ],
+    ids=[
+        "refused-no-rp-id",
+        "refused-no-extra",
+        "usable-no-rp-id",
+        "usable-a-passkey-can-count",
+        "control-refused-a-passkey-can-count",
+    ],
+)
+async def test_with_a_totp_on_the_rotation_reads_the_passkey_set_only_where_it_decides(
+    monkeypatch: pytest.MonkeyPatch,
+    rp_id: str | None,
+    available: bool,
+    secret: str,
+    outcome: str,
+) -> None:
+    """A covered account with a TOTP on and a passkey, whose passkey read would fail with
+    ``database is locked``. The TOTP is judged first, with no read: a usable one is the way past,
+    and a refused one where no passkey can count (no configured relying party, or no
+    ``[webauthn]`` extra) is the enrolment refusal, both as on main. The set is read only where a
+    passkey can count and the TOTP is refused, and there the error raises before the hash, as on
+    main (the control, which also shows the read is measured). RED when: the early refusal reads
+    the set for a TOTP that is on wherever a passkey is held."""
+    from messagefoundry.auth import webauthn as wa
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, hashes = await _passkey_owner_counting_hashes(
+            store, way_past_rp_id=rp_id, totp=secret
+        )
+        monkeypatch.setattr(wa, "available", lambda: available)
+        reads: list[str] = []
+
+        async def locked(user_id: str) -> Any:
+            reads.append(user_id)
+            raise sqlite3.OperationalError("database is locked")
+
+        # Only the service's read: the store's write reads the rows under its own lock.
+        monkeypatch.setattr(store, "list_webauthn_credentials", locked)
+        before = await _password_hash(store, identity.user_id)
+        if outcome == "rotates":
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+            assert hashes == [1]
+            assert reads == []
+            return
+        expected = FactorEnrolmentRequired if outcome == "refused" else sqlite3.OperationalError
+        with pytest.raises(expected):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert hashes == [], "the argon2 hash ran"
+        assert reads == ([] if outcome == "refused" else [identity.user_id])
+        assert await _password_hash(store, identity.user_id) == before
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
     ("secret", "rotates"),
     [(_REFUSED_TOTP, False), (_USABLE_TOTP, True)],
     ids=["refused-totp", "usable-totp"],
@@ -2429,13 +2533,12 @@ async def test_with_no_totp_on_a_store_error_cannot_turn_the_rotation_refusal_in
 async def test_beside_an_undecodable_passkey_set_the_rotation_judges_the_totp(
     monkeypatch: pytest.MonkeyPatch, secret: str, rotates: bool
 ) -> None:
-    """A covered account with a TOTP on whose passkey set the driver cannot decode in the early
-    refusal's read: the set counts for nothing, so the TOTP alone decides, judged there. A refused
-    TOTP is the enrolment refusal before the hash. The control: a usable one lets the write run.
-    Only the service's read is made to fail here, so the write reads intact rows and the rotation
-    lands; with a real undecodable cell the write raises the driver's error after the hash, which
-    this test does not pin. RED when: an undecodable set skips the TOTP judgement, and the write
-    lets the refused TOTP through on the intact passkey it reads."""
+    """A covered account with a TOTP on and a passkey set the driver cannot decode in the early
+    refusal's read. A refused TOTP leaves the passkey to decide, so the set is read, counts for
+    nothing, and the change is the enrolment refusal before the hash. The control: a usable TOTP
+    is the way past with no read, and the write runs. Only the service's read is made to fail
+    here; the write reads the intact rows under its own lock. RED when: an undecodable set is let
+    through to the write, which passes the refused TOTP on the intact passkey it reads."""
     store = await MessageStore.open(":memory:")
     try:
         service, identity, hashes = await _passkey_owner_counting_hashes(store, totp=secret)
@@ -2471,12 +2574,12 @@ async def test_the_rotation_survives_only_a_decode_failure_of_the_passkey_set(
     monkeypatch: pytest.MonkeyPatch, error: Exception, refused: bool
 ) -> None:
     """The rotation's early refusal counts the set for nothing only where the driver could not
-    decode a cell (pyodbc's ``UnicodeDecodeError`` here; sqlite3's is the test above): a covered
-    account with no TOTP on gets the enrolment refusal before the hash. The control: any other
-    driver error raises from the read, before the hash. The service here has a relying party
-    configured and the extra installed, so a passkey can count and the early refusal reads the
-    set; where none can, it refuses without reading. RED when: the catch drops ``UnicodeDecodeError``, or widens to every
-    ``OperationalError``."""
+    decode a cell (pyodbc's ``UnicodeDecodeError`` here; sqlite3's is
+    :func:`test_a_passkey_cell_the_driver_cannot_decode_refuses_the_rotation_before_the_hash`): a
+    covered account with no TOTP on gets the enrolment refusal before the hash. The control: any
+    other driver error raises from the read, before the hash. The service here has a relying party
+    configured and the extra installed, and no TOTP is on, so the early refusal reads the set. RED
+    when: the catch drops ``UnicodeDecodeError``, or widens to every ``OperationalError``."""
     store = await MessageStore.open(":memory:")
     try:
         service, identity, hashes = await _passkey_owner_counting_hashes(store, totp=None)
@@ -2497,11 +2600,11 @@ async def test_a_passkey_set_that_fails_its_seal_is_reported_by_the_rotation(
     tampered: bool, tmp_path: Path
 ) -> None:
     """A passkey set that fails the digest its account's seal covers counts for nothing, and the
-    rotation reports it through ``_verified_passkeys``, which it reads here because a passkey can
-    count (relying party configured, extra installed): a refused TOTP beside it is the
-    enrolment refusal, with an integrity audit row naming the passkey set. The control: an intact
-    set writes no such row and the rotation lands. RED when: the set is judged only in the store's
-    write, which refuses without a report."""
+    rotation reports it through ``_verified_passkeys``, which it reads here because the TOTP is a
+    KNOWN refusal and a passkey can count (relying party configured, extra installed): the change
+    is the enrolment refusal, with an integrity audit row naming the passkey set. The control: an
+    intact set writes no such row and the rotation lands. RED when: the set is judged only in the
+    store's write, which refuses without a report."""
     from messagefoundry.store.crypto import generate_key, make_cipher
 
     store = await MessageStore.open(

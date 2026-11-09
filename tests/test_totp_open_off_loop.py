@@ -26,7 +26,7 @@ from messagefoundry.auth import totp
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, TotpJudgement, TotpState
 from tests._admin_account import ADMIN_USERNAME, login_admin
 from tests._totp_clock import pin_totp_clock
 
@@ -400,9 +400,10 @@ async def test_the_gates_and_the_store_judge_a_totp_cell_with_one_helper(
 async def test_a_password_change_opens_the_totp_cell_once(
     monkeypatch: pytest.MonkeyPatch, store: MessageStore
 ) -> None:
-    """BACKLOG #3948 finding 13: a password change by a covered account with TOTP on opens the TOTP
-    cell once, in the store's conditional write, not again in an early refusal beside it. Under a
-    Transit cipher each open is one round trip. RED when the early refusal judges the TOTP too."""
+    """BACKLOG #3948: a password change by a covered account with TOTP on opens the TOTP cell once,
+    in the early refusal before the hash, and the store's conditional write takes that judgement
+    rather than opening the cell again. Under a Transit cipher each open is one round trip. RED
+    when the write opens the cell again, or the early refusal stops judging it."""
     service, identity, _password, _steps, _codes = await _totp_admin(
         store, monkeypatch, before_confirm=lambda: None
     )
@@ -416,3 +417,52 @@ async def test_a_password_change_opens_the_totp_cell_once(
     monkeypatch.setattr(store, "open_totp_secret", counting)
     assert await service.change_password(identity, "a fresh synthetic passphrase 7341") == []
     assert opens == [identity.user_id], f"the change opened the TOTP cell {len(opens)} times"
+
+
+@pytest.mark.parametrize(
+    ("judged_cell", "state", "written"),
+    [("held", "usable", True), ("other", "usable", False), ("held", "refused", False)],
+    ids=["control-the-judged-cell", "a-cell-that-moved", "a-known-refusal"],
+)
+async def test_the_rotation_write_takes_the_callers_judgement_only_for_the_cell_it_judged(
+    monkeypatch: pytest.MonkeyPatch,
+    store: MessageStore,
+    judged_cell: str,
+    state: TotpState,
+    written: bool,
+) -> None:
+    """``set_password(totp_judged=...)`` takes the caller's judgement of the TOTP in place of
+    opening the cell, and confirms under its lock that the cell is the one judged: a usable
+    judgement of the held cell lets the conditional write land; a judgement of another cell, as
+    after a re-enrolment between the judgement and the write, counts for nothing, and so does a
+    KNOWN refusal, so an account with no passkey is refused. No arm opens the cell. RED when the
+    write ignores a moved cell, or opens the cell although it was handed a judgement."""
+    _service, identity, _password, _steps, _codes = await _totp_admin(
+        store, monkeypatch, before_confirm=lambda: None
+    )
+    record = await store.get_user(identity.user_id)
+    assert record is not None and record.row is not None and record.row.totp_secret is not None
+    cell = record.row.totp_secret if judged_cell == "held" else record.row.totp_secret + "x"
+    opens: list[str] = []
+    real_open = store.open_totp_secret
+
+    def counting(user_id: str, opened: str | None) -> str | None:
+        opens.append(user_id)
+        return real_open(user_id, opened)
+
+    monkeypatch.setattr(store, "open_totp_secret", counting)
+    before = record.row.password_hash
+    assert (
+        await store.set_password(
+            identity.user_id,
+            password_hash="$argon2id$synthetic-not-a-real-hash",
+            password_generated=False,
+            require_way_past=service_module._opened_totp_state,
+            totp_judged=TotpJudgement(cell=cell, state=state),
+        )
+        is written
+    )
+    assert opens == []
+    after = await store.get_user(identity.user_id)
+    assert after is not None and after.row is not None
+    assert (after.row.password_hash != before) is written
