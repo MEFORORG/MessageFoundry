@@ -944,8 +944,8 @@ count is above `0` (vault BACKLOG #2613).
   `ad_reconcile_outage_passes` above `3`, a longer
   `ad_session_recheck_seconds`, or an `ad_session_recheck_max_users` below `200` in an estate larger
   than the budget delays it. The `ad_reconcile_outage_passes` row of
-  [CONFIGURATION.md](CONFIGURATION.md) states when it comes, including that no account pages while
-  a lasting outage page stands.
+  [CONFIGURATION.md](CONFIGURATION.md) states when it comes, including that no account pages during
+  the run of outage passes that raised the lasting outage page.
 - **Not named:** fewer strikes, a larger budget, or a higher brake threshold. Each ends sessions
   sooner or ends more of them, and none keeps a session the directory withdrew, though a larger
   budget can stretch the outage page, as the bullet above says. Nor is a shorter
