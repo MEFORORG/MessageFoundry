@@ -194,6 +194,7 @@ from messagefoundry.store.row_seal import (
     RowSealer,
     RowSealError,
     RowSealKeyRetiredError,
+    TransitSealUnavailableError,
     report_revoke_seal_refusal,
     require_seal_for_write,
     revoke_seal_refusals,
@@ -1507,6 +1508,50 @@ async def require_session_seal_for_write(
     await require_seal_for_write(
         sealer, SESSION_KIND, record.seal_fields(), record.seal, subject=""
     )
+
+
+@dataclass
+class RevokeSealOutcome:
+    """What one revoke's sealed writes met (decision d20261109T200352805-599b24 on ADR 0217, item
+    2). ``tripped`` is set by the first Transit Outage: after it, no account's epoch raise calls
+    Transit (``skipped`` counts them), every session is still marked revoked, and the kept
+    session's re-stamp is not attempted, so it is ended with the rest. A Forged or Unverifiable
+    answer does not trip it, so the accounts after it still call Transit."""
+
+    tripped: bool = False
+    skipped: int = 0
+
+    def log_skipped(self) -> None:
+        """Log how many accounts went without their raise because of the Outage, if any."""
+        if self.skipped:
+            log.warning(
+                "a revoke met a Vault transit outage; %d further account epoch raise(s) were "
+                "skipped without calling Transit, and every session is still ended",
+                self.skipped,
+            )
+
+
+async def raise_account_epoch(
+    write: Callable[[EpochBump], Awaitable[UserAuthzRecord | None]],
+    outcome: RevokeSealOutcome,
+) -> EpochRaise | None:
+    """One account's session epoch raise for a revoke, shared by the three backends'
+    ``_bump_session_epoch``: ``write`` is the backend's ``_write_user`` for that account. Returns
+    the raise, or ``None`` where none was written. A refusal :func:`revoke_seal_refusals` names goes
+    without the raise (decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2); an
+    Outage trips ``outcome``, after which no raise is attempted (decision
+    d20261109T200352805-599b24, item 2)."""
+    if outcome.tripped:
+        outcome.skipped += 1
+        return None
+    bump = EpochBump()
+    try:
+        return bump.raised(await write(bump))
+    except revoke_seal_refusals() as exc:
+        report_revoke_seal_refusal(exc, what="an account's session epoch raise")
+        if isinstance(exc, TransitSealUnavailableError):
+            outcome.tripped = True
+        return None
 
 
 async def write_kept_session(write: Awaitable[SessionRecord | None]) -> SessionRecord | None:
@@ -18908,7 +18953,8 @@ class MessageStore:
         revokes included, rolls back."""
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
-            raised = await self._bump_session_epoch(user_id)
+            outcome = RevokeSealOutcome()
+            raised = await self._bump_session_epoch(user_id, outcome)
             if except_token_hash is None:
                 cur = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             else:
@@ -18922,13 +18968,22 @@ class MessageStore:
             else:
                 unmoved = global_epoch_unmoved(await self._global_session_epoch_value())
                 result = await self._keep_or_end_session(
-                    revoked, except_token_hash, KeptSessionRestamp(user_id, raised, unmoved), now
+                    revoked,
+                    except_token_hash,
+                    KeptSessionRestamp(user_id, raised, unmoved),
+                    now,
+                    outcome,
                 )
             await self._commit()
         return result
 
     async def _keep_or_end_session(
-        self, revoked: int, token_hash: str, restamp: KeptSessionRestamp, now: float
+        self,
+        revoked: int,
+        token_hash: str,
+        restamp: KeptSessionRestamp,
+        now: float,
+        outcome: RevokeSealOutcome | None = None,
     ) -> RevokeResult:
         """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, inside the
         revoke's writer transaction (follow-up to BACKLOG #4975). ``revoked`` is the sweep's count;
@@ -18936,8 +18991,12 @@ class MessageStore:
         its next request anyway, but meanwhile it would hold a slot under the session cap and its
         refusal would read as a seal failure, so it is ended here, as the sweep ends the rest. A
         Transit refusal of the re-stamp declines it too, so the kept session is ended
-        (:func:`write_kept_session`)."""
-        if restamp.kept(await write_kept_session(self._write_session(token_hash, restamp))):
+        (:func:`write_kept_session`). After a Transit Outage tripped ``outcome`` the re-stamp is not
+        attempted, and the session is ended (:class:`RevokeSealOutcome`)."""
+        tripped = outcome is not None and outcome.tripped
+        if not tripped and restamp.kept(
+            await write_kept_session(self._write_session(token_hash, restamp))
+        ):
             return RevokeResult(revoked, kept=True)
         cur = await self._db.execute(
             _END_DECLINED_KEPT_SESSION_SQL, (now, restamp.user_id, token_hash)
@@ -18992,9 +19051,12 @@ class MessageStore:
         if cur.rowcount != 1:
             raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
         cur = await self._db.execute("SELECT id FROM users ORDER BY id")
+        outcome = RevokeSealOutcome()
         raised = {
-            str(row[0]): await self._bump_session_epoch(str(row[0])) for row in await cur.fetchall()
+            str(row[0]): await self._bump_session_epoch(str(row[0]), outcome)
+            for row in await cur.fetchall()
         }
+        outcome.log_skipped()
         # Spelled at the call, not built from a constant, so the BEGIN guard in
         # `tests/test_writer_txn_is_the_only_begin.py` can read it.
         cur = await self._db.execute(
@@ -19018,6 +19080,7 @@ class MessageStore:
             except_token_hash,
             KeptSessionRestamp(user_id, raised.get(user_id), global_raised),
             now,
+            outcome,
         )
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
@@ -19090,21 +19153,18 @@ class MessageStore:
         row = await cur.fetchone()
         return None if row is None or row[0] is None else int(row[0])
 
-    async def _bump_session_epoch(self, user_id: str) -> EpochRaise | None:
+    async def _bump_session_epoch(
+        self, user_id: str, outcome: RevokeSealOutcome | None = None
+    ) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, inside the caller's writer
         transaction (BACKLOG #2592), and report the raise, or ``None`` where none was written
         (:meth:`EpochBump.raised`, BACKLOG #4975). An account whose record fails its seal is
         refused on every read already, so the revoke that called this goes ahead without the
         raise, and reports none: ending sessions needs no key, and refusing it would keep them
         live."""
-        bump = EpochBump()
-        try:
-            return bump.raised(await self._write_user(user_id, bump))
-        except revoke_seal_refusals() as exc:
-            # Decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2 (ADR 0217): a
-            # Transit Unverifiable or Outage answer goes without the raise too, as Forged does.
-            report_revoke_seal_refusal(exc, what="an account's session epoch raise")
-            return None
+        return await raise_account_epoch(
+            lambda bump: self._write_user(user_id, bump), outcome or RevokeSealOutcome()
+        )
 
     async def enforce_session_cap(
         self,

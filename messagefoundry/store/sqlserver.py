@@ -183,8 +183,6 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     AnyRowSealer,
     RowSealError,
-    report_revoke_seal_refusal,
-    revoke_seal_refusals,
     row_sealer_for_cipher,
 )
 from messagefoundry.store.schema_verify import IndexShape
@@ -257,7 +255,6 @@ from messagefoundry.store.store import (
     DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
-    EpochBump,
     EpochRaise,
     FailOutcome,
     FederatedUnbind,
@@ -286,6 +283,7 @@ from messagefoundry.store.store import (
     ResendSourceNotFound,
     RestoreRecord,
     RevokeResult,
+    RevokeSealOutcome,
     RoleGrant,
     RoleRow,
     SecretRotationMetaRow,
@@ -351,6 +349,7 @@ from messagefoundry.store.store import (
     owned_lane_scope,
     passkey_digest,
     password_change,
+    raise_account_epoch,
     read_newest_keyed_audit_row,
     read_transit_bound_attestation_rows,
     reauth_stamp,
@@ -14286,17 +14285,16 @@ class SqlServerStore:
         rows = await cur.fetchall()
         return None if not rows or rows[0][0] is None else int(rows[0][0])
 
-    async def _bump_session_epoch(self, cur: Any, user_id: str) -> EpochRaise | None:
+    async def _bump_session_epoch(
+        self, cur: Any, user_id: str, outcome: RevokeSealOutcome | None = None
+    ) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, on ``cur`` inside an open
         transaction (BACKLOG #2592), and report the raise (BACKLOG #4975); store.py's
         ``MessageStore._bump_session_epoch`` says why a record that fails its seal does not stop
         the revoke that called this, and reports no raise."""
-        bump = EpochBump()
-        try:
-            return bump.raised(await self._write_user(cur, user_id, bump))
-        except revoke_seal_refusals() as exc:  # store.py's twin says why
-            report_revoke_seal_refusal(exc, what="an account's session epoch raise")
-            return None
+        return await raise_account_epoch(
+            lambda bump: self._write_user(cur, user_id, bump), outcome or RevokeSealOutcome()
+        )
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
@@ -15810,7 +15808,8 @@ class SqlServerStore:
         now = time.time() if now is None else now
         async with self._acquire_after_commit() as conn, self._cursor(conn) as cur:
             try:
-                raised = await self._bump_session_epoch(cur, user_id)
+                outcome = RevokeSealOutcome()
+                raised = await self._bump_session_epoch(cur, user_id, outcome)
                 if except_token_hash is None:
                     await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
                 else:
@@ -15829,6 +15828,7 @@ class SqlServerStore:
                         except_token_hash,
                         KeptSessionRestamp(user_id, raised, unmoved),
                         now,
+                        outcome,
                     )
                 await self._commit(conn)
             except Exception:
@@ -15837,13 +15837,22 @@ class SqlServerStore:
         return result
 
     async def _keep_or_end_session(
-        self, cur: Any, revoked: int, token_hash: str, restamp: KeptSessionRestamp, now: float
+        self,
+        cur: Any,
+        revoked: int,
+        token_hash: str,
+        restamp: KeptSessionRestamp,
+        now: float,
+        outcome: RevokeSealOutcome | None = None,
     ) -> RevokeResult:
         """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, on ``cur``
         inside an open transaction (follow-up to BACKLOG #4975); store.py's
         ``MessageStore._keep_or_end_session`` states the contract. The end is counted from its
         ``OUTPUT`` rowset, as the sweep is (BACKLOG #2283)."""
-        if restamp.kept(await write_kept_session(self._write_session(cur, token_hash, restamp))):
+        tripped = outcome is not None and outcome.tripped
+        if not tripped and restamp.kept(
+            await write_kept_session(self._write_session(cur, token_hash, restamp))
+        ):
             return RevokeResult(revoked, kept=True)
         await cur.execute(_MSSQL_END_DECLINED_KEPT_SESSION_SQL, (now, restamp.user_id, token_hash))
         ended = len(await cur.fetchall()) == 1
@@ -15910,10 +15919,12 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("SELECT id FROM users ORDER BY id")
+                outcome = RevokeSealOutcome()
                 raised = {
-                    str(user_id): await self._bump_session_epoch(cur, str(user_id))
+                    str(user_id): await self._bump_session_epoch(cur, str(user_id), outcome)
                     for (user_id,) in await cur.fetchall()
                 }
+                outcome.log_skipped()
                 if except_token_hash is None:
                     await cur.execute(_MSSQL_REVOKE_ALL_SESSIONS_SQL, (now,))
                 else:
@@ -15943,6 +15954,7 @@ class SqlServerStore:
                             except_token_hash,
                             KeptSessionRestamp(owner, raised.get(owner), global_raised),
                             now,
+                            outcome,
                         )
                 await self._commit(conn)
             except Exception:

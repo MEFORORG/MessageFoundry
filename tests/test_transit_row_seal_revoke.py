@@ -252,3 +252,103 @@ async def test_a_server_forged_kept_session_still_raises_as_on_main(backend: str
         await store._keep_or_end_session(
             conn, 0, "c" * 64, KeptSessionRestamp("u", None, None), 1.0
         )
+
+
+# --- decision d20261109T200352805-599b24, item 2: stop calling Transit after the first Outage ----
+
+
+def _epoch(path: Path, user_id: str) -> int:
+    ((n,),) = _sql(path, "SELECT session_epoch FROM users WHERE id=?", (user_id,))
+    return int(str(n))
+
+
+async def test_revoke_all_stops_calling_transit_after_the_first_outage(
+    transit: tuple[MessageStore, FakeBackend, Path],
+    pages: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store, backend, path = transit
+    users = ("u-1", "u-2", "u-3")
+    for user in users:
+        await _user(store, user)
+        await _session(store, user)
+    kept = await _session(store, "u-1")
+    store._row_sealer = TransitRowSealer(backend)  # nothing cached: each raise would meet Transit
+    calls = len(backend.inputs)
+    backend.down = True
+    try:
+        result = await store.revoke_all_sessions(except_token_hash=hash_token(kept))
+    finally:
+        backend.down = False
+    assert len(backend.inputs) - calls == 1  # the first account's raise only, no kept re-stamp
+    assert result.ended_kept and all(_live(path, u) == 0 for u in users)
+    assert len(pages) == 1
+    assert any("2 further account epoch raise" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("answer", ["forged", "unverifiable"])
+async def test_a_forged_or_unverifiable_account_does_not_stop_the_raises_after_it(
+    transit: tuple[MessageStore, FakeBackend, Path], pages: list[str], answer: str
+) -> None:
+    store, _, path = transit
+    for user in ("u-1", "u-2"):
+        await _user(store, user)
+        await _session(store, user)
+    before = _epoch(path, "u-2")
+    if answer == "forged":
+        _sql(path, "UPDATE users SET display_name=? WHERE id=?", ("bent", "u-1"))
+    else:
+        _plant(path, "users", "authz_seal", "id", "u-1")
+    await store.revoke_all_sessions()
+    assert _epoch(path, "u-2") == before + 1
+    assert _live(path, "u-1") == 0 and _live(path, "u-2") == 0
+
+
+async def test_a_forged_account_still_runs_the_kept_sessions_seal_check(
+    transit: tuple[MessageStore, FakeBackend, Path],
+    pages: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _, path = transit
+    await _user(store, "u-1")
+    kept = await _session(store, "u-1")
+    _sql(path, "UPDATE users SET display_name=? WHERE id=?", ("bent", "u-1"))
+    writes: list[str] = []
+    write_session = store._write_session
+
+    async def counting(token_hash: str, change: Any) -> Any:
+        writes.append(token_hash)
+        return await write_session(token_hash, change)
+
+    monkeypatch.setattr(store, "_write_session", counting)
+    result = await store.revoke_user_sessions("u-1", except_token_hash=hash_token(kept))
+    assert writes == [hash_token(kept)] and not result.kept and _live(path, "u-1") == 0
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+async def test_a_server_outage_trips_the_revoke_and_skips_the_rest(
+    backend: str, pages: list[str]
+) -> None:
+    from messagefoundry.store.store import RevokeSealOutcome
+
+    store = _server(backend)
+    attempts: list[str] = []
+
+    async def refused(_conn: Any, user_id: str, _bump: Any) -> None:
+        attempts.append(user_id)
+        raise TransitSealUnavailableError()
+
+    async def no_session_write(*_args: Any, **_kwargs: Any) -> SessionRecord | None:
+        raise AssertionError("the kept session's re-stamp ran after the Outage")
+
+    store._write_user = refused
+    store._write_session = no_session_write
+    outcome = RevokeSealOutcome()
+    for user in ("u-1", "u-2", "u-3"):
+        assert await store._bump_session_epoch(object(), user, outcome) is None
+    assert attempts == ["u-1"] and outcome.skipped == 2 and len(pages) == 1
+    conn: Any = _PgConn() if backend == "postgres" else _MssqlCur()
+    result = await store._keep_or_end_session(
+        conn, 3, "c" * 64, KeptSessionRestamp("u-1", None, None), 1.0, outcome
+    )
+    assert not result.kept and result.ended_kept and result.count == 4

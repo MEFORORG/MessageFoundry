@@ -581,6 +581,15 @@ account whose raise went without has no raised epoch, so the residual the owed r
 restored earlier copy of a revoked session row) stays open for that account on a per-account
 revoke; `revoke_all_sessions` still raises the global session epoch first, with no seal.
 
+**After the first Outage, a revoke stops calling Transit (decision d20261109T200352805-599b24,
+item 2).** Without this, an Outage left each account in a revoke-all to wait out its own Transit
+timeout inside one writer transaction. On all three backends, the first
+`TransitSealUnavailableError` a revoke meets now trips it. Every later account goes without its
+epoch raise and makes no Transit call, every session is still marked revoked, and the count of
+skipped accounts is logged. The kept session's re-stamp is skipped on that Outage only, so the
+session is ended with the rest. A Forged or Unverifiable answer does not trip it: the accounts
+after it still call Transit, and a Forged account's kept session still runs its seal check.
+
 **Other legs that read a map** decide access and write nothing: at least the client-certificate
 identity (`identity_for_cert_user_id`), the step-up role test (`_directory_roles_lost`) and the
 enrolment and re-bind legs. On the step-up, enrolment and re-bind legs an Unverifiable map takes

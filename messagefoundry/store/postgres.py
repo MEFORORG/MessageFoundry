@@ -194,8 +194,6 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     AnyRowSealer,
     RowSealError,
-    report_revoke_seal_refusal,
-    revoke_seal_refusals,
     row_sealer_for_cipher,
 )
 from messagefoundry.store.schema_verify import IndexShape
@@ -256,7 +254,6 @@ from messagefoundry.store.store import (
     DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
-    EpochBump,
     EpochRaise,
     FailOutcome,
     FederatedUnbind,
@@ -285,6 +282,7 @@ from messagefoundry.store.store import (
     ResendSourceNotFound,
     RestoreRecord,
     RevokeResult,
+    RevokeSealOutcome,
     RoleGrant,
     RoleRow,
     SecretRotationMetaRow,
@@ -347,6 +345,7 @@ from messagefoundry.store.store import (
     owned_lane_scope,
     passkey_digest,
     password_change,
+    raise_account_epoch,
     read_newest_keyed_audit_row,
     read_transit_bound_attestation_rows,
     reauth_stamp,
@@ -9571,17 +9570,16 @@ class PostgresStore:
             await self._write_user(conn, user_id, lambda r: r.changed(cred_digest=digest))
         return count
 
-    async def _bump_session_epoch(self, conn: Any, user_id: str) -> EpochRaise | None:
+    async def _bump_session_epoch(
+        self, conn: Any, user_id: str, outcome: RevokeSealOutcome | None = None
+    ) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, inside ``conn``'s
         transaction (BACKLOG #2592), and report the raise (BACKLOG #4975); store.py's
         ``MessageStore._bump_session_epoch`` says why a record that fails its seal does not stop
         the revoke that called this, and reports no raise."""
-        bump = EpochBump()
-        try:
-            return bump.raised(await self._write_user(conn, user_id, bump))
-        except revoke_seal_refusals() as exc:  # store.py's twin says why
-            report_revoke_seal_refusal(exc, what="an account's session epoch raise")
-            return None
+        return await raise_account_epoch(
+            lambda bump: self._write_user(conn, user_id, bump), outcome or RevokeSealOutcome()
+        )
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
@@ -10905,7 +10903,8 @@ class PostgresStore:
         :meth:`_after_commit_txn`'s, for the reason it gives."""
         now = time.time() if now is None else now
         async with self._after_commit_txn() as conn:
-            raised = await self._bump_session_epoch(conn, user_id)
+            outcome = RevokeSealOutcome()
+            raised = await self._bump_session_epoch(conn, user_id, outcome)
             status = await conn.execute(
                 _PG_REVOKE_USER_SESSIONS_SQL + " AND ($3::text IS NULL OR token_hash != $3)",
                 now,
@@ -10921,15 +10920,25 @@ class PostgresStore:
                 except_token_hash,
                 KeptSessionRestamp(user_id, raised, unmoved),
                 now,
+                outcome,
             )
 
     async def _keep_or_end_session(
-        self, conn: Any, revoked: int, token_hash: str, restamp: KeptSessionRestamp, now: float
+        self,
+        conn: Any,
+        revoked: int,
+        token_hash: str,
+        restamp: KeptSessionRestamp,
+        now: float,
+        outcome: RevokeSealOutcome | None = None,
     ) -> RevokeResult:
         """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, inside
         ``conn``'s transaction (follow-up to BACKLOG #4975); store.py's
         ``MessageStore._keep_or_end_session`` states the contract."""
-        if restamp.kept(await write_kept_session(self._write_session(conn, token_hash, restamp))):
+        tripped = outcome is not None and outcome.tripped
+        if not tripped and restamp.kept(
+            await write_kept_session(self._write_session(conn, token_hash, restamp))
+        ):
             return RevokeResult(revoked, kept=True)
         status = await conn.execute(
             _PG_END_DECLINED_KEPT_SESSION_SQL, now, restamp.user_id, token_hash
@@ -10974,10 +10983,12 @@ class PostgresStore:
                     )
                 )
             )
+            outcome = RevokeSealOutcome()
             raised = {
-                str(row["id"]): await self._bump_session_epoch(conn, str(row["id"]))
+                str(row["id"]): await self._bump_session_epoch(conn, str(row["id"]), outcome)
                 for row in await conn.fetch("SELECT id FROM users ORDER BY id")
             }
+            outcome.log_skipped()
             status = await conn.execute(_PG_REVOKE_ALL_SESSIONS_SQL, now, except_token_hash)
             revoked = _rowcount(status)
             if except_token_hash is None:
@@ -10994,6 +11005,7 @@ class PostgresStore:
                 except_token_hash,
                 KeptSessionRestamp(owner, raised.get(owner), global_raised),
                 now,
+                outcome,
             )
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
