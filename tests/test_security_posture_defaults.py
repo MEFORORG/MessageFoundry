@@ -784,6 +784,22 @@ def test_a_reconciler_knob_is_named_only_in_its_looser_direction(
 
 
 @pytest.mark.parametrize(
+    ("field", "value", "words"),
+    [
+        ("ad_session_recheck_seconds", 600, "which waits for 3 of that account's own probes"),
+        ("ad_session_recheck_max_users", 6, "the page about one account the directory keeps"),
+    ],
+)
+def test_a_reconciler_loosening_names_the_delay_to_the_unreachable_account_page(
+    field: str, value: int, words: str
+) -> None:
+    """BACKLOG #3709. The page about one account the directory keeps failing for counts that
+    account's own probes, so a longer interval or a smaller per-pass budget delays it too. The
+    loosening says so, as the ``ad_reconcile_outage_passes`` one already did."""
+    assert words in dict(_pairs(auth=_ad(**{field: value})))[field]
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("ad_session_recheck_strikes", 10),

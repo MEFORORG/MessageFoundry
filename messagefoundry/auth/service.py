@@ -8552,7 +8552,8 @@ class AuthService:
         **A flapping directory must not page every account.** Where the accounts already paged
         and those entering would be more than :data:`_UNREACHED_ROLLUP_ABOVE`, as a directory that
         answers a few probes in each pass would make them, the lifespan task pages once for those
-        entering (``unreached_rollup``), and each still gets its own row.
+        entering, and each still gets its own row. :meth:`_record_unreached_accounts` decides that
+        (``unreached_rollup``) on the rows it wrote.
 
         The latch is set only at the end of the pass, for the accounts whose row was written
         (:meth:`_latch_unreached_accounts`), so a pass that raises, or whose row is refused,
@@ -8579,11 +8580,7 @@ class AuthService:
             runs[probe.user_id] = count = runs.get(probe.user_id, 0) + 1
             if count >= threshold and probe.user_id not in paged and not covered:
                 entered.append((probe.user_id, probe.username, count))
-        return replace(
-            plan,
-            unreached=tuple(entered),
-            unreached_rollup=bool(entered) and len(paged) + len(entered) > _UNREACHED_ROLLUP_ABOVE,
-        )
+        return replace(plan, unreached=tuple(entered))
 
     async def _record_unreached_accounts(
         self, plan: reconcile.ReconcilePlan
@@ -8593,20 +8590,20 @@ class AuthService:
         plan holding only those whose row was written, so no page goes out without its row.
 
         One ``auth.ad_reconcile_unreached`` row per entry, naming the account as ``actor``, so the
-        page the lifespan task raises for it matches a row (ASVS 8.3.2), and one WARNING naming it,
-        or one WARNING with the count on a rolled-up pass. Through the reconciler's soft write,
-        after the revocations, as a paging refusal's row is. A refused row leaves the account
-        unpaged and unlatched, so the next pass writes it again."""
+        page the lifespan task raises for it matches a row (ASVS 8.3.2). Through the reconciler's
+        soft write, after the revocations, as a paging refusal's row is. A refused row leaves the
+        account unpaged and unlatched, so the next pass writes it again.
+
+        Then it decides the rollup (``unreached_rollup``, BACKLOG #3709), once and on the rows
+        written: whether the accounts already paged and those just written are more than
+        :data:`_UNREACHED_ROLLUP_ABOVE`. Nothing is latched before the pass ends, so the paged set
+        holds only earlier passes' accounts. Decided on the entries instead, a pass whose refusals
+        left five or fewer standing paged its written ones under the bare source, naming none, and
+        one whose every row was refused carried a rollup with nothing in it. It logs one WARNING
+        naming each entry, or one WARNING with the count on a rolled-up pass."""
         written: list[tuple[str, str, int]] = []
         for entry in plan.unreached:
             _user_id, username, probes = entry
-            if not plan.unreached_rollup:
-                _log.warning(
-                    "directory reconcile: %d probes running of %s failed to reach the directory, "
-                    "so its sessions are not revoked while this lasts",
-                    probes,
-                    scrub_log_argument(username),
-                )
             if await self._audit_reconciler_row(
                 "auth.ad_reconcile_unreached",
                 actor=username,
@@ -8620,22 +8617,28 @@ class AuthService:
                 ),
             ):
                 written.append(entry)
-        if plan.unreached_rollup and written:
+        # A rollup only with something written: one with nothing would page nothing, and the
+        # lifespan task reads the run's length off the entries (final-round finding 1).
+        rollup = (
+            bool(written)
+            and len(self._reconcile_unreached_paged) + len(written) > _UNREACHED_ROLLUP_ABOVE
+        )
+        if rollup:
             _log.warning(
                 "directory reconcile: %d accounts entered a run of unreachable probes, so their "
                 "sessions are not revoked while this lasts; an auth.ad_reconcile_unreached row "
                 "names each",
                 len(written),
             )
-        # The rollup only for what was written: a rollup with nothing written would page nothing,
-        # and the lifespan task reads the run's length off the entries (final-round finding 1).
-        # Decided again on what was written (BACKLOG #3709): with rows refused, the accounts that
-        # stand may be five or fewer, and each of those then pages under its own source. Nothing
-        # is latched before the pass ends, so the paged set holds only earlier passes' accounts.
-        rollup = len(self._reconcile_unreached_paged) + len(written) > _UNREACHED_ROLLUP_ABOVE
-        return replace(
-            plan, unreached=tuple(written), unreached_rollup=plan.unreached_rollup and rollup
-        )
+        else:
+            for _user_id, username, probes in plan.unreached:
+                _log.warning(
+                    "directory reconcile: %d probes running of %s failed to reach the directory, "
+                    "so its sessions are not revoked while this lasts",
+                    probes,
+                    scrub_log_argument(username),
+                )
+        return replace(plan, unreached=tuple(written), unreached_rollup=rollup)
 
     def _latch_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:
         """Record that each entry's page is raised, last in the pass, as the outage's is

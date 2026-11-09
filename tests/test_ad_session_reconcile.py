@@ -2971,7 +2971,7 @@ async def test_a_later_rollup_says_it_counts_only_the_accounts_entering() -> Non
             "Accounts newly unreachable: 7",
             "Accounts newly unreachable: 1",
         ]
-        assert "each failed 3 or more directory probes running" in rollups[1]["detail"]
+        assert "each failed 3+ directory probes running" in rollups[1]["detail"]
         assert all("sessions are not revoked;" in p["detail"] for p in rollups)
     finally:
         await store.close()
@@ -2980,9 +2980,9 @@ async def test_a_later_rollup_says_it_counts_only_the_accounts_entering() -> Non
 async def test_a_rollup_left_with_five_or_fewer_written_rows_pages_each_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #3709. The rollup is decided before the rows are written. Where rows are refused
-    and five or fewer accounts stand, a rollup is not for them: each written account pages under
-    its own source, and the refused ones are left to the next pass.
+    """BACKLOG #3709. The rollup is decided on the rows written. Where rows are refused and five
+    or fewer accounts stand, a rollup is not for them: each written account pages under its own
+    source, and the refused ones are left to the next pass.
 
     RED when: one written account of seven entering still pages under the bare source, naming
     none, and gets no instance of its own."""
@@ -3012,6 +3012,45 @@ async def test_a_rollup_left_with_five_or_fewer_written_rows_pages_each_account(
             f"{_UNREACHED_PREFIX}flap0"
         ]
         assert not [e for e in sink.events if e[1] == _UNREACHED_ALERT_SOURCE]
+    finally:
+        await store.close()
+
+
+async def test_a_refused_entrant_after_a_rollup_pages_nothing_and_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3709, review round 2. With seven accounts already paged by a rollup, one more
+    account entering whose row is refused leaves nothing to page. The rollup must not be set on
+    the paged accounts alone: set with no entry, the lifespan task took the run's length from an
+    empty list and raised, which cost that pass's later pages and inverses.
+
+    RED when: such a pass carries ``unreached_rollup`` with no entry, so alerting it raises."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ["ok", "late"] + [f"flap{i}" for i in range(7)]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        sink = _InverseSink()
+        ldap.unreachable = set(names[2:])
+        for _ in range(3):
+            await _pass(service, sink)
+        assert len(service._reconcile_unreached_paged) == 7
+        real = service._audit_reconciler_row
+
+        async def refuse_late(action: str, **kwargs: Any) -> bool:
+            if action == "auth.ad_reconcile_unreached" and kwargs.get("actor") == "late":
+                return False
+            return await real(action, **kwargs)
+
+        monkeypatch.setattr(service, "_audit_reconciler_row", refuse_late)
+        ldap.unreachable = set(names[1:])
+        for _ in range(3):
+            plan = await _pass(service, sink)  # raised ValueError on the third pass before the fix
+        assert plan.unreached == () and not plan.unreached_rollup
+        assert len([e for e in sink.events if e[1] == _UNREACHED_ALERT_SOURCE]) == 1
     finally:
         await store.close()
 

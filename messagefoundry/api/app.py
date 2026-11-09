@@ -11359,8 +11359,9 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
 #: shortest run among those entering, in probes, not passes, which differ under a probe budget
 #: smaller than the estate.
 _UNREACHED_ROLLUP_TEXT: Final[str] = (
-    "Accounts newly unreachable: {entering}. Their sessions are not revoked; each failed {probes} "
-    "or more directory probes running. Check the directory and the path to it; rows name each."
+    "Accounts newly unreachable: {entering}. Their sessions are not revoked; each failed {probes}+ "
+    "directory probes running. Check the directory and the path to it. "
+    "auth.ad_reconcile_unreached rows name each."
 )
 
 

@@ -9613,7 +9613,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}. The "
                     f"interval also delays the page about a directory outage, which comes after "
                     f"{floor}, and the page about one account the directory keeps failing for, "
-                    "which waits for as many of that account's probes",
+                    f"which waits for {run} of that account's own probes running",
                 )
             )
         if run > _auth_default("ad_reconcile_outage_passes"):

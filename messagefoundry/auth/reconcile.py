@@ -354,9 +354,10 @@ class ReconcilePlan:
     #: unreachable accounts, but none on a pass that raises the lasting outage page or while that
     #: page stands (``AuthService._note_unreached_accounts``).
     unreached: tuple[tuple[str, str, int], ...] = ()
-    #: Set with ``unreached`` (BACKLOG #3100): True when the accounts already paged and those
-    #: entering are more than ``AuthService``'s fixed rollup bound, so the lifespan task pages once
-    #: for those entering rather than once per account. A directory that answers only a few probes
+    #: Set by ``AuthService._record_unreached_accounts`` (BACKLOG #3100, #3709), on the rows it
+    #: wrote: True when the accounts already paged and those entering whose row was written are
+    #: more than ``AuthService``'s fixed rollup bound, so the lifespan task pages once for those
+    #: entering rather than once per account. A directory that answers only a few probes
     #: in each pass would otherwise open an instance per signed-in account.
     unreached_rollup: bool = False
     #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3709): how many
