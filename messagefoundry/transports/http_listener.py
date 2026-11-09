@@ -841,7 +841,7 @@ class HttpSource(SourceConnector):
         self._upgrade_tls = False
         # The `_handshake_accepted` tasks still inside the loop's TLS handshake, which stop() cancels
         # so their sockets close at once rather than at the handshake bound (BACKLOG #2479).
-        self._handshakes: set[asyncio.Task[None]] = set()
+        self._handshakes: dict[asyncio.Task[None], _HandshakeProtocol] = {}
         # Intake authentication (ADR 0154 D6) — a PEER control: it authorises SUBMITTING a message on
         # this inbound, mints no identity and opens no session. Defaults to "none", which makes every
         # path below a no-op and every shipped configuration byte-identical. The env() refs are already
@@ -1031,7 +1031,7 @@ class HttpSource(SourceConnector):
             protocol = _HandshakeProtocol(reader)
             task = asyncio.current_task()
             assert task is not None  # always: `_on_tls_socket` runs this as a task
-            self._handshakes.add(task)
+            self._handshakes[task] = protocol
             # See `MLLPSource._handshake_accepted`: this runs only once the call below first
             # suspends, by when the TLS layer's transport holds the socket.
             disown = loop.call_soon(unwrapped.clear)
@@ -1047,7 +1047,7 @@ class HttpSource(SourceConnector):
             except OSError as exc:
                 # Out of `_handshakes` before the report below awaits, so a stop() that cancels the
                 # tasks still in their handshake cannot cancel a report already in flight.
-                self._handshakes.discard(task)
+                self._handshakes.pop(task, None)
                 if unwrapped:
                     # Not a handshake failure, so not counted; the done callback closes the socket.
                     logger.debug(
@@ -1065,7 +1065,7 @@ class HttpSource(SourceConnector):
                     await self._tls_failures.note(peer_host, handshake_cause(exc))
                 return
             finally:
-                self._handshakes.discard(task)
+                self._handshakes.pop(task, None)
                 disown.cancel()
             if not protocol.connected:
                 logger.debug(
@@ -1183,10 +1183,14 @@ class HttpSource(SourceConnector):
             # (BACKLOG #2479). Where it upgrades TLS itself it is in `_clients` (`_on_tls_accept`),
             # so this loop closes it and its handshake fails rather than completing mid-stop. Under
             # `_AcceptingServer` its task is in `_handshakes`, and cancelling that task makes
-            # `connect_accepted_socket` close the socket.
+            # `connect_accepted_socket` close the socket. A handshake that already completed, with
+            # its task not yet stepped, is aborted first: that close would otherwise run the TLS
+            # close exchange, which a silent peer can hold open for asyncio's 30 s default.
             for writer in list(self._clients):
                 writer.close()
-            for handshake in list(self._handshakes):
+            for handshake, protocol in list(self._handshakes.items()):
+                if protocol.tls_transport is not None:
+                    protocol.tls_transport.abort()
                 handshake.cancel()
             pending = [task for task in self._client_tasks if not task.done()]
             if pending:
@@ -1479,10 +1483,9 @@ class HttpSource(SourceConnector):
         else:
             peer_host = _peer_host(writer)
         # Register before anything else so stop() can always find + close this connection (H-2).
-        # A `_handshake_accepted` task is already registered, and `_accepted_task_done` drops it
-        # when it ends: dropped here instead, it would leave `_client_tasks` while this finally
-        # still awaits the close and emits `closed`, so stop() would not wait for it.
-        task = asyncio.current_task() if slot is None else None
+        # Dropped only as the last step of the finally below, after the close and the `closed`
+        # event, so a stop() that begins while this call is still closing waits for it.
+        task = asyncio.current_task()
         self._clients.add(writer)
         if task is not None:
             self._client_tasks.add(task)
@@ -1538,7 +1541,10 @@ class HttpSource(SourceConnector):
                 handshaking = False
                 answerable = True
                 if self._admission.stopping:
-                    return  # the handshake finished after stop() began: refuse it unread
+                    # The handshake finished after stop() began: refuse it unread, aborted rather
+                    # than closed, as the `slot` branch above says.
+                    writer.transport.abort()
+                    return
             # mTLS intake auth needs no request bytes at all, so it refuses here, before any read.
             # It needs the verified certificate, so it follows the handshake, inside the slot
             # admitted before it. Without TLS no slot is taken yet, and the refusal takes none.
@@ -1574,22 +1580,25 @@ class HttpSource(SourceConnector):
             if answerable:
                 await self._write_safely(writer, build_response(500, '{"error":"internal error"}'))
         finally:
-            if epoch is not None:
-                self._admission.release(peer_host, epoch)
-            self._clients.discard(writer)
-            if task is not None:
-                self._client_tasks.discard(task)
-            writer.close()
-            try:  # noqa: SIM105
-                # Bound the close (see stop()): an unbounded Proactor writer.wait_closed() would never
-                # let the per-client task finish, so stop()'s grace never sees it done (#55).
-                # Skipped for a socket whose TLS handshake never finished: see `handshaking`.
-                if not handshaking:
-                    await asyncio.wait_for(writer.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
-            except (TimeoutError, OSError):
-                pass
-            if established and not failed:
-                await self._emit_event("closed", peer_host=peer_host, reason="eof")
+            try:
+                if epoch is not None:
+                    self._admission.release(peer_host, epoch)
+                self._clients.discard(writer)
+                writer.close()
+                try:  # noqa: SIM105
+                    # Bound the close (see stop()): an unbounded Proactor writer.wait_closed() would
+                    # never let the per-client task finish, so stop()'s grace never sees it done
+                    # (#55). Skipped for a socket whose TLS handshake never finished: see
+                    # `handshaking`.
+                    if not handshaking:
+                        await asyncio.wait_for(writer.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
+                except (TimeoutError, OSError):
+                    pass
+                if established and not failed:
+                    await self._emit_event("closed", peer_host=peer_host, reason="eof")
+            finally:
+                if task is not None:
+                    self._client_tasks.discard(task)
 
     async def _serve_one(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, peer_host: str | None

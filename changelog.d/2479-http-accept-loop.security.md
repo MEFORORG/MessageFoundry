@@ -9,5 +9,5 @@
   client cannot read a plaintext `403` or `503`. stop() closes a socket still in its handshake at
   once, and a failed handshake is reported with its peer, including one that runs past its bound.
   A loop that subclasses a stdlib loop now takes this path too, as it does for `MLLP()`; it
-  already applied these controls before the handshake, through the listener's own upgrade. The
-  stdlib path is unchanged. See [CONNECTIONS.md](../docs/CONNECTIONS.md). (`BACKLOG #2479`)
+  already applied these controls before the handshake, through the listener's own upgrade. See
+  [CONNECTIONS.md](../docs/CONNECTIONS.md). (`BACKLOG #2479`)

@@ -1323,7 +1323,12 @@ def test_a_long_run_of_skipped_accepts_waits_and_warns(
         listening = socket.socket()
         server = mllp_module._AcceptingServer([listening], lambda _conn: None, name="IB_TEST")
         try:
-            for _ in range(20):
+            # A turn cap with an early exit once a fifth accept was tried, as in
+            # test_a_connection_the_listener_cannot_take_is_closed_and_accepting_goes_on. The cap
+            # stays far below the fake's call limit.
+            for _ in range(100):
+                if fake.calls > 4:
+                    break
                 await asyncio.sleep(0)
             assert listening.fileno() != -1
         finally:

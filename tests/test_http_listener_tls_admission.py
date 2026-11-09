@@ -26,6 +26,7 @@ import ssl
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -242,6 +243,48 @@ async def test_stop_closes_a_socket_still_in_its_handshake(
             await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
+async def test_stop_aborts_a_handshake_that_completed_before_its_task_stepped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under the accept loop, a handshake can complete in the same turn stop() runs, before its
+    task steps. Cancelling that task alone makes ``connect_accepted_socket`` close the transport
+    with the TLS close exchange, which a silent peer can hold open for asyncio's 30 s default, so
+    stop() aborts such a transport first. The handshake still in progress is the control: it has
+    no transport, so it is only cancelled. The interleaving is pinned by registering both entries
+    by hand."""
+    monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
+    ends: list[str] = []
+
+    class _Transport(asyncio.Transport):
+        def abort(self) -> None:
+            ends.append("abort")
+
+        def close(self) -> None:
+            ends.append("close")
+
+    source, _cert = _tls_source(tmp_path)
+    await source.start(receipt_handler(_Intake()))
+    gate: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    async def handshaking() -> None:
+        await asyncio.shield(gate)
+
+    tasks = [asyncio.create_task(handshaking()) for _ in range(2)]
+    try:
+        _on_path(source, "accept_loop")
+        completed = mllp_module._HandshakeProtocol(asyncio.StreamReader())
+        completed.connection_made(_Transport())
+        in_progress = mllp_module._HandshakeProtocol(asyncio.StreamReader())
+        source._handshakes[tasks[0]] = completed
+        source._handshakes[tasks[1]] = in_progress
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+        await asyncio.gather(*tasks, return_exceptions=True)
+    assert ends == ["abort"]
+    assert all(task.cancelled() for task in tasks)
+    assert not gate.cancelled()
+
+
 async def test_a_handshake_finishing_after_stop_began_is_refused_unread(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tls_path: str
 ) -> None:
@@ -253,6 +296,25 @@ async def test_a_handshake_finishing_after_stop_began_is_refused_unread(
     events = _Events()
     source.on_connection_event = events
     intake = _Intake()
+    ends: list[str] = []
+
+    def record_ends(transport: asyncio.BaseTransport) -> None:
+        if tls_path == "uvloop":
+            return  # uvloop's transport takes no attribute, so not there
+        real_abort = cast(asyncio.Transport, transport).abort
+        real_close = transport.close
+
+        def abort() -> None:
+            ends.append("abort")
+            real_abort()
+
+        def close() -> None:
+            ends.append("close")
+            real_close()
+
+        monkeypatch.setattr(transport, "abort", abort)
+        monkeypatch.setattr(transport, "close", close)
+
     if tls_path == "start_tls":
         real_start_tls = source._start_tls
 
@@ -261,6 +323,8 @@ async def test_a_handshake_finishing_after_stop_began_is_refused_unread(
         ) -> bool:
             ok = await real_start_tls(reader, writer, peer_host)
             source._admission.stopping = True
+            if ok:
+                record_ends(writer.transport)
             return ok
 
         monkeypatch.setattr(source, "_start_tls", finish_then_stop)
@@ -275,23 +339,9 @@ async def test_a_handshake_finishing_after_stop_began_is_refused_unread(
         ) -> None:
             assert slot is not None  # admitted before its handshake
             source._admission.stopping = True
-            if tls_path == "accept_loop":  # uvloop's transport takes no attribute, so not there
-                transport = writer.transport
-                real_abort, real_close = transport.abort, transport.close
-
-                def abort() -> None:
-                    ends.append("abort")
-                    real_abort()
-
-                def close() -> None:
-                    ends.append("close")
-                    real_close()
-
-                monkeypatch.setattr(transport, "abort", abort)
-                monkeypatch.setattr(transport, "close", close)
+            record_ends(writer.transport)
             await real_on_client(reader, writer, slot=slot)
 
-        ends: list[str] = []
         monkeypatch.setattr(source, "_on_client", stop_then_hand_over)
     await source.start(receipt_handler(intake))
     try:
@@ -300,24 +350,22 @@ async def test_a_handshake_finishing_after_stop_began_is_refused_unread(
         await _until(lambda: source._admission.active == 0, "the slot was not released")
         assert intake.received == []
         assert "established" not in events.kinds()
-        if tls_path == "accept_loop":
-            # Nothing was read or written, so the socket is aborted, with no close exchange a
-            # silent peer could hold open for asyncio's 30 s default (round-3 finding 2).
+        if tls_path != "uvloop":
+            # Nothing was read or written, so on both paths the socket is aborted, with no close
+            # exchange a silent peer could hold open for asyncio's 30 s default (round-3 finding 2).
             assert ends[:1] == ["abort"], ends
     finally:
         source._admission.stopping = False
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
-async def test_an_accept_loop_connection_stays_tracked_until_its_last_event(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_a_connection_stays_tracked_until_its_last_event(
+    tmp_path: Path, tls_path: str
 ) -> None:
-    """Under the accept loop, `_handshake_accepted`'s task carries the whole connection, and
-    `_accepted_task_done` drops it from ``_client_tasks`` when it ends. `_on_client` used to drop it
-    in its own ``finally``, before awaiting the close and emitting ``closed``, so a stop() in that
-    window did not wait for it and the event could land after a restart (round-3 finding 4). Here
-    the task must still be tracked when ``closed`` is emitted."""
-    monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
+    """`_on_client` used to drop its task from ``_client_tasks`` early in its ``finally``, before
+    awaiting the close and emitting ``closed``, so a stop() in that window did not wait for it and
+    the event could land after a restart (round-3 finding 4). On both paths the task must still be
+    tracked when ``closed`` is emitted, and dropped once the call has ended."""
     source, cert = _tls_source(tmp_path)
     tracked_at_close: list[bool] = []
 
@@ -328,7 +376,7 @@ async def test_an_accept_loop_connection_stays_tracked_until_its_last_event(
     source.on_connection_event = record
     await source.start(receipt_handler(_Intake()))
     try:
-        _on_path(source, "accept_loop")
+        _on_path(source, tls_path)
         assert await _https_post(source.sockport, cert) == 202
         await _until(lambda: tracked_at_close != [], "no closed event")
         assert tracked_at_close == [True]
@@ -419,7 +467,7 @@ async def test_a_socket_the_tls_layer_never_took_is_closed_and_its_slot_given_ba
             await _close_raw(writer)
         assert refused == [True]
         await _until(lambda: source._admission.active == 0, "the slot was not released")
-        assert source._client_tasks == set() and source._handshakes == set()
+        assert source._client_tasks == set() and not source._handshakes
         assert source.tls_handshake_failures == 0
         monkeypatch.setattr(loop_class, "connect_accepted_socket", real_connect_accepted)
         assert await _https_post(source.sockport, cert) == 202
