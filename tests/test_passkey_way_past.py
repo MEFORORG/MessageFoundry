@@ -2441,8 +2441,8 @@ async def test_a_known_refused_totp_is_refused_before_the_hash(
 ) -> None:
     """A covered account whose TOTP is on and a KNOWN refusal, where no passkey can be the way
     past (none held, or one held with no relying party configured): the rotation is the enrolment
-    refusal before any argon2 hash, as the early refusal on main makes it. The control: a usable
-    TOTP rotates, with one hash. RED when: the early refusal leaves a TOTP that is on to the
+    refusal before any argon2 hash, as ``must_enrol_before_rotating`` refuses it. The control: a
+    usable TOTP rotates, with one hash. RED when: the early refusal leaves a TOTP that is on to the
     store's write, which refuses only after the hash."""
     store = await MessageStore.open(":memory:")
     try:
@@ -2489,10 +2489,10 @@ async def test_with_a_totp_on_the_rotation_reads_the_passkey_set_only_where_it_d
     """A covered account with a TOTP on and a passkey, whose passkey read would fail with
     ``database is locked``. The TOTP is judged first, with no read: a usable one is the way past,
     and a refused one where no passkey can count (no configured relying party, or no
-    ``[webauthn]`` extra) is the enrolment refusal, both as on main. The set is read only where a
-    passkey can count and the TOTP is refused, and there the error raises before the hash, as on
-    main (the control, which also shows the read is measured). RED when: the early refusal reads
-    the set for a TOTP that is on wherever a passkey is held."""
+    ``[webauthn]`` extra) is the enrolment refusal, both in ``_has_way_past``'s order. The set is
+    read only where a passkey can count and the TOTP is refused, and there the error raises before
+    the hash (the control, which also shows the read is measured). RED when: the early refusal
+    reads the set for a TOTP that is on wherever a passkey is held."""
     from messagefoundry.auth import webauthn as wa
 
     store = await MessageStore.open(":memory:")
@@ -2543,7 +2543,10 @@ async def test_beside_an_undecodable_passkey_set_the_rotation_judges_the_totp(
     try:
         service, identity, hashes = await _passkey_owner_counting_hashes(store, totp=secret)
 
+        reads: list[str] = []
+
         async def undecodable(user_id: str) -> Any:
+            reads.append(user_id)
             raise UnicodeDecodeError("utf-16-le", b"\x00\xd8", 0, 2, "unpaired surrogate")
 
         # Only the service's read: the store's write reads the intact rows under its own lock.
@@ -2552,11 +2555,13 @@ async def test_beside_an_undecodable_passkey_set_the_rotation_judges_the_totp(
         if rotates:
             assert await service.change_password(identity, _NEW_PASSWORD) == []
             assert hashes == [1]
+            assert reads == [], "the set was read for a usable TOTP"
             assert await _password_hash(store, identity.user_id) != before
             return
         with pytest.raises(FactorEnrolmentRequired):
             await service.change_password(identity, _NEW_PASSWORD)
         assert hashes == [], "the refusal came after the argon2 hash"
+        assert reads == [identity.user_id]
         assert await _password_hash(store, identity.user_id) == before
     finally:
         await store.close()

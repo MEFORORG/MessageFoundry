@@ -3280,20 +3280,25 @@ async def judge_totp(
 
 
 async def rotation_totp_counts(
-    conditional: bool,
     opener: Callable[[str, str | None], str | None],
-    usable: TotpUsable | None,
-    judged: TotpJudgement | None,
     get_user: Callable[[str], Awaitable[UserRecord | None]],
     user_id: str,
+    *,
+    usable: TotpUsable | None,
+    judged: TotpJudgement | None,
 ) -> TotpJudgement | None:
     """The TOTP judgement a ``set_password`` passes to :func:`password_change`, made before the
-    write takes its lock: ``None`` where the write is not ``conditional``, else the caller's own
-    judgement where it passed one (``totp_judged``), else :func:`judge_totp` of the account read
-    now. Under the lock either counts only for the cell it judged (:meth:`TotpJudgement.moved`)."""
-    if not conditional:
+    write takes its lock: ``None`` with no ``usable`` (the write is not conditional; the caller
+    has already run :func:`conditional_way_past`), else the caller's own judgement where it passed
+    one (``totp_judged``), else :func:`judge_totp` of the account read now. Under the lock either
+    counts only for the cell it judged (:meth:`TotpJudgement.moved`). A ``judged`` that is not a
+    :class:`TotpJudgement` raises :class:`TypeError`: a bare callable would carry no cell to
+    confirm."""
+    if usable is None:
         return None
     if judged is not None:
+        if not isinstance(judged, TotpJudgement):
+            raise TypeError("totp_judged takes a TotpJudgement")
         return judged
     return await judge_totp(opener, usable, await get_user(user_id))
 
@@ -17695,12 +17700,11 @@ class MessageStore:
         conditional = conditional_way_past(require_way_past)
         # The TOTP judged before the writer lock, confirmed under it by its cell.
         totp_counts = await rotation_totp_counts(
-            conditional,
             self.open_totp_secret,
-            require_way_past,
-            totp_judged,
             self.get_user,
             user_id,
+            usable=require_way_past,
+            judged=totp_judged,
         )
         async with _writer_guard(self._db, self._lock):
             # The passkeys the condition reads are read under the same writer lock as the write.

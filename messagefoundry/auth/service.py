@@ -14001,12 +14001,12 @@ class AuthService:
         between this read and the write makes the write match no row, and the change is refused
         rather than landing on an account with no way past.
 
-        This method opens the TOTP cell once, before the argon2 hash, in
-        :meth:`_refuse_rotation_without_way_past`, and the store's conditional write takes that
-        judgement and confirms under its lock that the cell is the one judged (BACKLOG #3948); a
-        route that asks :meth:`must_enrol_before_rotating` first opens it once more there, before
-        the current password. Without the ``[webauthn]`` extra the write counts no passkey, as
-        :meth:`_has_way_past` counts none.
+        For a covered account with a TOTP on, this method opens the TOTP cell once, before the
+        argon2 hash, in :meth:`_refuse_rotation_without_way_past`, and the store's conditional
+        write takes that judgement and confirms under its lock that the cell is the one judged
+        (BACKLOG #3948); a route that asks :meth:`must_enrol_before_rotating` first opens it once
+        more there, before the current password. Without the ``[webauthn]`` extra the write counts
+        no passkey, as :meth:`_has_way_past` counts none.
         """
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:

@@ -14437,12 +14437,11 @@ class SqlServerStore:
         now = time.time() if now is None else now
         conditional = conditional_way_past(require_way_past)
         totp_counts = await rotation_totp_counts(
-            conditional,
             self.open_totp_secret,
-            require_way_past,
-            totp_judged,
             self.get_user,
             user_id,
+            usable=require_way_past,
+            judged=totp_judged,
         )
         # The write helper reads ``OUTPUT``, never ``cursor.rowcount`` (see ``_RESOLVE_OUTPUT``),
         # and a conditional rotation must know whether it matched. The passkeys the condition reads

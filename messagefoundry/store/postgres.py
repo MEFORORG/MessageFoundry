@@ -9867,12 +9867,11 @@ class PostgresStore:
         now = time.time() if now is None else now
         conditional = conditional_way_past(require_way_past)
         totp_counts = await rotation_totp_counts(
-            conditional,
             self.open_totp_secret,
-            require_way_past,
-            totp_judged,
             self.get_user,
             user_id,
+            usable=require_way_past,
+            judged=totp_judged,
         )
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             # The passkeys the condition reads are read in the write's own transaction, after the

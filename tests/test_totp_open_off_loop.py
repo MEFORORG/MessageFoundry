@@ -421,8 +421,20 @@ async def test_a_password_change_opens_the_totp_cell_once(
 
 @pytest.mark.parametrize(
     ("judged_cell", "state", "written"),
-    [("held", "usable", True), ("other", "usable", False), ("held", "refused", False)],
-    ids=["control-the-judged-cell", "a-cell-that-moved", "a-known-refusal"],
+    [
+        ("held", "usable", True),
+        ("held", "unknown", True),
+        ("other", "usable", False),
+        ("none", "usable", False),
+        ("held", "refused", False),
+    ],
+    ids=[
+        "control-the-judged-cell",
+        "an-unknown-judgement",
+        "a-cell-that-moved",
+        "judged-off-now-on",
+        "a-known-refusal",
+    ],
 )
 async def test_the_rotation_write_takes_the_callers_judgement_only_for_the_cell_it_judged(
     monkeypatch: pytest.MonkeyPatch,
@@ -433,16 +445,18 @@ async def test_the_rotation_write_takes_the_callers_judgement_only_for_the_cell_
 ) -> None:
     """``set_password(totp_judged=...)`` takes the caller's judgement of the TOTP in place of
     opening the cell, and confirms under its lock that the cell is the one judged: a usable
-    judgement of the held cell lets the conditional write land; a judgement of another cell, as
-    after a re-enrolment between the judgement and the write, counts for nothing, and so does a
-    KNOWN refusal, so an account with no passkey is refused. No arm opens the cell. RED when the
+    or unknown judgement of the held cell lets the conditional write land; a judgement of another
+    cell, as after a re-enrolment between the judgement and the write, or of no cell where a TOTP
+    is now on, counts for nothing, and so does a KNOWN refusal, so an account with no passkey is
+    refused. No arm opens the cell. RED when the
     write ignores a moved cell, or opens the cell although it was handed a judgement."""
     _service, identity, _password, _steps, _codes = await _totp_admin(
         store, monkeypatch, before_confirm=lambda: None
     )
     record = await store.get_user(identity.user_id)
     assert record is not None and record.row is not None and record.row.totp_secret is not None
-    cell = record.row.totp_secret if judged_cell == "held" else record.row.totp_secret + "x"
+    cells = {"held": record.row.totp_secret, "other": record.row.totp_secret + "x", "none": None}
+    cell = cells[judged_cell]
     opens: list[str] = []
     real_open = store.open_totp_secret
 
