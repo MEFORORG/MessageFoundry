@@ -217,16 +217,16 @@ async def test_discard_waits_through_run_to_completion_held_from_the_start(
 
     monkeypatch.setattr(store, "_discard_cancelled_sync", _slow_remove)
     discard = asyncio.create_task(store.discard(meta.file_id))
-    await asyncio.sleep(0.05)
-    assert store._stragglers, "the removal is not held while its caller waits"
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
-        discard.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(discard, 10)
     try:
+        await asyncio.sleep(0.05)
+        assert store._stragglers, "the removal is not held while its caller waits"
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+            discard.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(discard, 10)
         assert f"the removal of upload {meta.file_id} did not finish within" in caplog.text
     finally:
-        # Released whatever the assertion found, or the executor thread blocks the loop teardown.
+        # Released whatever an assertion found, or the executor thread blocks the loop teardown.
         release.set()
     for _ in range(500):
         if not store._stragglers:
@@ -236,12 +236,13 @@ async def test_discard_waits_through_run_to_completion_held_from_the_start(
     assert await store.list_files() == []
 
 
+def _refused(path: Path, **_: Any) -> Any:
+    """A pair lock refused, as a 0600 lock file another account created refuses it."""
+    raise PermissionError(13, "Permission denied", str(path))
+
+
 def _refuse_the_lock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every pair lock refused, as a 0600 lock file another account created refuses it."""
-
-    def _refused(path: Path, **_: Any) -> Any:
-        raise PermissionError(13, "Permission denied", str(path))
-
+    """Every pair lock refused (:func:`_refused`), with the once-per-lock ERROR record cleared."""
     monkeypatch.setattr(uploads_mod, "edit_lock", _refused)
     monkeypatch.setattr(uploads_mod, "_unlocked_logged", set())
 
@@ -269,7 +270,7 @@ def test_an_engine_that_cannot_take_the_lock_still_removes_and_says_so_once(
 def test_a_reseal_that_cannot_take_the_lock_writes_nothing_and_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The re-seal fails closed, once, before it reads any upload."""
+    """The re-seal fails closed: one ERROR, and no upload is decrypted or written."""
     root = tmp_path / "uploads"
     old, new = generate_key(), generate_key()
     fids = [_seed(root, old), _seed(root, old)]
@@ -297,7 +298,7 @@ def _busy_at(monkeypatch: pytest.MonkeyPatch, *, names: Callable[[str], bool]) -
 
     def _lock(path: Path, **kwargs: Any) -> Any:
         if names(path.name):
-            raise TimeoutError(f"another edit of {path} is still in progress after 2s")
+            raise kwargs["busy_error"](f"another edit of {path} is still in progress after 2s")
         return edit_lock(path, **kwargs)
 
     monkeypatch.setattr(uploads_mod, "edit_lock", _lock)
@@ -321,10 +322,6 @@ def test_a_busy_lock_is_a_warning_and_does_not_use_up_the_refusal_error(
     assert "another account owns it" not in caplog.text
     assert uploads_mod._unlocked_logged == set()
     caplog.clear()
-
-    def _refused(path: Path, **_: Any) -> Any:
-        raise PermissionError(13, "Permission denied", str(path))
-
     monkeypatch.setattr(uploads_mod, "edit_lock", _refused)
     with caplog.at_level(logging.ERROR, logger="messagefoundry.uploads"):
         assert engine._discard_cancelled_sync(second) is True
@@ -346,7 +343,7 @@ def test_a_busy_lock_at_a_reseal_write_is_a_skip_that_does_not_blame_the_account
         result = asyncio.run(_store(root, new, old).reseal_to_active())
     assert result.skipped == 1 and result.incomplete
     assert {n: (root / n).read_bytes() for n in upload_names(root)} == before
-    assert "re-run it once the engine's removals finish" in caplog.text, caplog.text
+    assert "a re-run settles" in caplog.text, caplog.text
     assert "Run rotate-key as the account" not in caplog.text
 
 
@@ -364,3 +361,30 @@ def test_a_refused_lock_over_uploads_already_current_is_no_skip(
     _refuse_the_lock(monkeypatch)
     result = asyncio.run(store.reseal_to_active())
     assert result.skipped == 0 and not result.incomplete
+
+
+def test_a_busy_lock_at_the_reseal_pre_check_still_lets_each_write_try(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Contention at the up-front probe is not a refusal, so each half's write takes the lock
+    itself, and a lock that freed meanwhile re-seals the upload."""
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    _seed(root, old)
+    _busy_at(monkeypatch, names=lambda name: name == LOCK_FILE_NAME)
+    result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert result.resealed == 2 and result.skipped == 0 and not result.incomplete
+
+
+def test_a_planted_link_at_the_lock_path_is_a_refusal_not_contention() -> None:
+    """``edit_lock`` raises ``busy_error`` for a link too, chained from the ELOOP; that one is a
+    refusal, so it gets the account ERROR rather than the re-run WARNING."""
+    try:
+        try:
+            raise OSError(40, "Too many levels of symbolic links")
+        except OSError as loop:
+            raise uploads_mod._PairLockBusy("x is a link") from loop
+    except OSError as exc:
+        assert not uploads_mod._pair_lock_busy(exc)
+    assert uploads_mod._pair_lock_busy(uploads_mod._PairLockBusy("still in progress"))
+    assert not uploads_mod._pair_lock_busy(TimeoutError(110, "Connection timed out"))
