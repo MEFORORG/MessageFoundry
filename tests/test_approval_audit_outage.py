@@ -438,7 +438,58 @@ async def test_an_interrupted_outcome_read_back_that_fails_logs_the_flag_unknown
             client=None,
         )
     [lost] = [r.getMessage() for r in caplog.records if "Lost detail" in r.getMessage()]
-    assert '"recorded": "unknown"' in lost and '"recorded": false' not in lost, lost
+    assert '"recorded": "unknown"' in lost, lost
+    # The committed write's row is the only one: "unknown" never reaches a written row.
+    [row] = await store.list_audit(action="approval.interrupted")
+    assert json.loads(str(row["detail"]))["recorded"] is True
+    assert sink.lost == [(f"approval:{approval_id}", "approval.interrupted")]
+    assert sink.copy_missing == []
+
+
+async def test_an_interrupted_outcome_resolved_before_its_read_back_logs_the_flag_unknown(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The combined 'interrupted' write commits, an operator resolves the row before the reply
+    arrives, and the reply is lost. The read-back finds 'resolved_applied', which this write's
+    own row may have led to, so the lost detail logs the flag unknown and no second row is
+    written (vault BACKLOG #3193 N1)."""
+
+    class _ResolvedFirst(_StandingStore):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            moved = bool(await self._store.decide_pending_approval(approval_id, **kw))
+            audit = kw.get("audit")
+            if audit is not None and audit.action == "approval.interrupted":
+                # Not asserted: _settle catches any exception raised here. The status check
+                # below shows the resolve landed.
+                await self._store.decide_pending_approval(
+                    approval_id,
+                    status="resolved_applied",
+                    approver="resolver",
+                    decided_at=3.0,
+                    from_status="interrupted",
+                )
+                raise sqlite3.OperationalError("connection reset after COMMIT")
+            return moved
+
+    sink = _Sink()
+    gate = _gate(_ResolvedFirst(store), sink)
+    approval_id = await _request(gate)
+    assert await store.decide_pending_approval(
+        approval_id, status="executing", approver="checker", decided_at=1.0
+    )
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        await gate._record_interrupted_execution(
+            approval_id,
+            operation="dead_letter_replay",
+            approver="checker",
+            requester="r",
+            client=None,
+        )
+    assert await _status(store, approval_id) == "resolved_applied"
+    [lost] = [r.getMessage() for r in caplog.records if "Lost detail" in r.getMessage()]
+    assert '"recorded": "unknown"' in lost, lost
+    [row] = await store.list_audit(action="approval.interrupted")
+    assert json.loads(str(row["detail"]))["recorded"] is True
     assert sink.lost == [(f"approval:{approval_id}", "approval.interrupted")]
     assert sink.copy_missing == []
 

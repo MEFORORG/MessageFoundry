@@ -1751,7 +1751,8 @@ class ApprovalGate:
 
         ``flag`` names a detail field that records whether the row moved: ``True`` when it moved
         with this row, ``False`` when another caller had already moved it, and ``None`` when the
-        status write failed."""
+        status write failed. The ERROR line of a failed read-back logs it as ``"unknown"`` where
+        the read-back cannot tell which."""
 
         def detail(moved: bool | Literal["unknown"] | None) -> str:
             # A result json cannot encode must not raise here, before the status moves, after the
@@ -1815,6 +1816,14 @@ class ApprovalGate:
                     # missing.
                     self._alert_offbox_copy_missing(approval_id, action)
                 else:
+                    # Only a row read back where this write could not have left it shows another
+                    # caller moved it. Absent, unsealed or unread does not, nor a resolved row on
+                    # the interrupted path: this write's own 'interrupted' may have committed and
+                    # been resolved since.
+                    moved_by_other = isinstance(landed, ApprovalRow) and not (
+                        status == "interrupted" and landed.status in RESOLVE_OUTCOMES.values()
+                    )
+                    lost = detail(False if moved_by_other else "unknown")
                     log.error(
                         "approval %s: %s; the row was no longer 'executing' and reading it back "
                         "did not find this write's '%s' (read back: %s), so its %s row was not "
@@ -1828,11 +1837,7 @@ class ApprovalGate:
                         else f"'{scrub_log_argument(landed.status)}' at {landed.decided_at}",
                         action,
                         scrub_log_argument(approver),
-                        # JSON, so the scrub leaves it as is. Only a row read back in another
-                        # state shows another caller moved it; absent, unsealed or unread does not.
-                        scrub_log_argument(
-                            detail(False if isinstance(landed, ApprovalRow) else "unknown")
-                        ),
+                        scrub_log_argument(lost),  # JSON, so the scrub leaves it as is
                     )
                     self._alert_lost_audit(approval_id, action)
                 return
