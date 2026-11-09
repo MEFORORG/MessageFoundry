@@ -839,8 +839,10 @@ example, and `messagefoundry.parsing.x12` for the codec a Router/Handler uses.
   *inbound* TA1/997/999 **generator** and outbound **999/997** functional-ack classification are **not**
   built (a Router can branch on `X12Peek`'s `ST01`/`GS08` today). Strict **implementation-guide**
   validation *is* built as an on-demand library — `messagefoundry.parsing.x12.validate` behind the
-  `[x12]` extra (pyx12's bundled HIPAA IG maps, BACKLOG #32) — and its walk emits a conforming **999**
+  `[x12]` extra (pyx12's bundled HIPAA IG maps, BACKLOG #32) — and its walk emits a **999**
   (005010) / **997** (004010) as a by-product a Handler may return; it is never run by the connector.
+  An ack pyx12 did not finish to its closing IEA is not returned: `ack` is then `None`. A returned
+  ack echoes sender values unescaped, so it is complete but not thereby well-formed.
 
 ### HTTP web-service listener — `Http(...)` (inbound only, ADR 0023)
 
