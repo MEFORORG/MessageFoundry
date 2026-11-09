@@ -4784,41 +4784,35 @@ def create_app(
         # Rejections are logged (ASVS 16.3.3) — these are control-bypass attempts (a pre-auth memory
         # DoS probe) and were previously dropped silently. We log to the rotating general log rather
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
-        client = client_ip(request)
-        length = request.headers.get("content-length")
-        # Every Transfer-Encoding line, not the first: llhttp frames `gzip` then `chunked` on two
-        # lines as chunked, and a first-line read would see only `gzip` and admit an unbounded body.
-        transfer_encoding = ", ".join(request.headers.getlist("transfer-encoding")).lower()
-        # A request carrying BOTH Content-Length and Transfer-Encoding is ambiguously framed (RFC 9112
-        # §6.1 — TE overrides CL) and is the classic CL.TE request-smuggling vector (ASVS 4.2.1). Under
-        # serve the pinned llhttp parser refuses the pair with its own 400 before this runs (BACKLOG
-        # #1125, protocol_headers.pinned_http_protocol_base). This check covers any other server that
-        # hosts the app: h11, for one, frames the pair by Transfer-Encoding and passes it on.
-        if length is not None and "chunked" in transfer_encoding:
-            _log.warning(
-                "rejected request with both Content-Length and Transfer-Encoding on %s from %s",
-                request.url.path,
-                client,
-            )
-            return JSONResponse(
-                {
-                    "detail": "ambiguous framing: Content-Length with Transfer-Encoding is not accepted"
-                },
-                status_code=400,
-            )
-        if length is None:
-            # No Content-Length means a chunked body (HTTP/1.1 requires one or the other), which the
-            # Content-Length cap can't bound up front — Starlette would buffer it unbounded, a pre-auth
-            # memory DoS. We only accept small JSON, so require a Content-Length (review M-19).
-            if "chunked" in transfer_encoding:
-                _log.warning(
-                    "rejected chunked request body on %s from %s", request.url.path, client
+        lengths = request.headers.getlist("content-length")
+
+        def refuse(status: int, detail: str, what: str) -> JSONResponse:
+            _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
+            return JSONResponse({"detail": detail}, status_code=status)
+
+        # The API takes only Content-Length bodies, so ANY Transfer-Encoding is refused, by presence
+        # on any line and whatever its value. Beside a Content-Length the request is ambiguously
+        # framed (RFC 9112 §6.1, the CL.TE smuggling vector, ASVS 4.2.1); without one its body has
+        # no length the cap can bound up front (review M-19).
+        if "transfer-encoding" in request.headers:
+            if lengths:
+                return refuse(
+                    400,
+                    "ambiguous framing: Content-Length with Transfer-Encoding is not accepted",
+                    "request with both Content-Length and Transfer-Encoding",
                 )
-                return JSONResponse(
-                    {"detail": "chunked request bodies are not accepted; send a Content-Length"},
-                    status_code=411,
-                )
+            return refuse(
+                411,
+                "Transfer-Encoding is not accepted; send a Content-Length",
+                "Transfer-Encoding request body",
+            )
+        if not lengths:
             return None
+        # One line holding `1*DIGIT` (RFC 9112 §6.2), the rule the inbound HTTP listener applies, not
+        # int(): int() takes `+2`, `-5` and `0_2`, and a repeated line is a second framing claim.
+        value = lengths[0].strip(" \t")
+        if len(lengths) > 1 or not (value.isascii() and value.isdigit()):
+            return refuse(400, "invalid Content-Length", "invalid Content-Length")
         # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
         upload_store = getattr(request.app.state, "upload_store", None)
         cap = (
@@ -4826,14 +4820,10 @@ def create_app(
             if upload_store is not None and request.url.path in _UPLOAD_BODY_PATHS
             else _MAX_REQUEST_BODY_BYTES
         )
-        try:
-            too_big = int(length) > cap
-        except ValueError:
-            _log.warning("rejected invalid Content-Length on %s from %s", request.url.path, client)
-            return JSONResponse({"detail": "invalid Content-Length"}, status_code=400)
-        if too_big:
-            _log.warning("rejected oversized request body on %s from %s", request.url.path, client)
-            return JSONResponse({"detail": "request body too large"}, status_code=413)
+        # Digit count first: int() raises past 4300 digits, and a longer number is over any cap.
+        digits = value.lstrip("0") or "0"
+        if len(digits) > len(str(cap)) or int(digits) > cap:
+            return refuse(413, "request body too large", "oversized request body")
         return None
 
     # add_middleware inserts at index 0, so registering in this order keeps _limit_request_body

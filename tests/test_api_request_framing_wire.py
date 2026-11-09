@@ -78,6 +78,7 @@ _REFUSED: dict[str, bytes] = {
     "whitespace before the colon": _POST + b"Content-Length : 2\r\n\r\n{}",
     "content-length with a plus sign": _POST + b"Content-Length: +2\r\n\r\n{}",
     "content-length with an underscore": _POST + b"Content-Length: 0_2\r\n\r\n{}",
+    "content-length negative": _POST + b"Content-Length: -5\r\n\r\n{}",
     "obs-folded transfer-encoding": _POST + b"Transfer-Encoding:\r\n chunked\r\n\r\n0\r\n\r\n",
     "head ended by bare LFs": b"POST /health HTTP/1.1\nHost: localhost\nContent-Length: 2\n\n{}",
     "bare CR inside a header line": _POST
@@ -96,13 +97,14 @@ _FRAMED: dict[str, tuple[bytes, list[int]]] = {
         b"GET /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello",
         [200, 200],
     ),
-    # Legal chunked framing. The app refuses chunked bodies with a 411 (review M-19); the 200 after
-    # it shows the chunked body was read to its last chunk, not to Content-Length or to EOF.
+    # Legal chunked framing, which llhttp reads. The app refuses any Transfer-Encoding with a 411
+    # (BACKLOG #5345); the 200 after it shows the chunked body was read to its last chunk, not to
+    # Content-Length or to EOF.
     "transfer-encoding gzip, chunked": (
         _POST + b"Transfer-Encoding: gzip, chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
         [411, 200],
     ),
-    # BACKLOG #5345: llhttp frames a split header as chunked, and the app reads every line of it.
+    # BACKLOG #5345: llhttp frames a split header as chunked, and the app refuses it by presence.
     "transfer-encoding gzip, then chunked on a second line": (
         _POST
         + b"Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
@@ -115,6 +117,14 @@ _FRAMED: dict[str, tuple[bytes, list[int]]] = {
     "transfer-encoding with case and whitespace": (
         _POST + b"Transfer-Encoding:  CHUNKED \r\n\r\n0\r\n\r\n",
         [411, 200],
+    ),
+    # BACKLOG #5345: an empty Transfer-Encoding passes llhttp, which frames by Content-Length or
+    # reads no body. The refusal is the app's, by the header's presence: 411 alone, 400 beside a
+    # Content-Length. The 200 after it shows the body was read to the length it declared.
+    "transfer-encoding empty": (_POST + b"Transfer-Encoding: \r\n\r\n", [411, 200]),
+    "transfer-encoding empty, with a content-length": (
+        _POST + b"Transfer-Encoding: \r\nContent-Length: 2\r\n\r\n{}",
+        [400, 200],
     ),
     # Not a framing header at all, so Content-Length frames the request.
     "transfer_encoding with an underscore": (

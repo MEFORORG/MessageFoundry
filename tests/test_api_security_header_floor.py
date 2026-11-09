@@ -75,6 +75,7 @@ async def _drive_raw(
     client: tuple[str, int] = ("127.0.0.1", 50000),
     expect_raise: bool = False,
     scope_app: Any = None,
+    body: bytes = b"",
 ) -> tuple[int, list[tuple[str, str]]]:
     """Send one request straight into the ASGI app; return (status, header fields IN ORDER).
 
@@ -104,7 +105,7 @@ async def _drive_raw(
     sent: list[Message] = []
 
     async def receive() -> Message:
-        return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.request", "body": body, "more_body": False}
 
     async def send(message: Message) -> None:
         sent.append(message)
