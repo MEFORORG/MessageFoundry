@@ -416,6 +416,11 @@ def _lines_pip_audit_reads(raw: bytes) -> list[str]:
     ``auto_decode`` (a mark, else a first-two-lines declaration, else the locale), then
     ``str.splitlines``. Written here apart from the module's own reader, so the test does not take
     the code under test as its oracle."""
+    return [ln.strip() for ln in _text_pip_audit_reads(raw).splitlines()]
+
+
+def _text_pip_audit_reads(raw: bytes) -> str:
+    """The copy's text as pip-requirements-parser 32.0.1's ``auto_decode`` gives it."""
     boms = [
         (codecs.BOM_UTF8, "utf-8"),
         (codecs.BOM_UTF16, "utf-16"),
@@ -430,7 +435,7 @@ def _lines_pip_audit_reads(raw: bytes) -> list[str]:
         cookies = [m for ln in raw.split(b"\n")[:2] if ln[:1] == b"#" and (m := _COOKIE.search(ln))]
         encoding = cookies[0][1].decode("ascii") if cookies else locale.getpreferredencoding(False)
         text = raw.decode(encoding)
-    return [ln.strip() for ln in text.splitlines()]
+    return text
 
 
 _COOKIE = re.compile(rb"coding[:=]\s*([-\w.]+)")
@@ -542,6 +547,92 @@ def test_a_copy_whose_read_back_fails_is_refused_without_the_error_text(
     err = capsys.readouterr().err
     assert _REFUSED in err, err
     assert "invalid continuation" not in err and "xe9" not in err, err
+
+
+def _requirements_pip_audit_reads(raw: bytes) -> list[str]:
+    """The requirement lines pip-requirements-parser 32.0.1 makes of the copy: ``join_lines`` joins
+    a line ending in a backslash, unless it is a comment, to the next, with its backslashes stripped;
+    ``split_comments`` drops each comment and blank line; a line left that does not start with an
+    option is a requirement. Apart from the module's own model, as the reader above is."""
+    comment = re.compile(r"(^|\s+)(#.*)$")
+    logical: list[str] = []
+    pending = ""
+    for line in _text_pip_audit_reads(raw).splitlines():
+        if line.endswith("\\") and not comment.match(line):
+            pending += line.strip("\\")
+            continue
+        logical.append(pending + (f" {line}" if comment.match(line) else line))
+        pending = ""
+    logical.append(pending)
+    texts = ([p.strip() for p in comment.split(ln) if p.strip()] for ln in logical)
+    return [t[0] for t in texts if t and t[0][:1] not in ("#", "-")]
+
+
+@pytest.mark.parametrize(
+    "pin",
+    [
+        "foo @ https://example.invalid/foo-1.0-py3-none-any.whl\\",
+        "https://example.invalid/foo-1.0-py3-none-any.whl\\",
+        "foo===1.0\\",
+    ],
+    ids=["name-at-url", "bare-url", "arbitrary-equality"],
+)
+def test_a_pin_left_ending_in_a_backslash_is_refused_before_the_count(
+    pin: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Lander hold on PR 2840 (issuecomment-6736152691): a pin that ends in a backslash once its
+    marker is removed joins the next pin onto it in the copy. The auditor printed "2 pinned
+    requirements audited" while pip-audit's parser read one. The copy is now counted as that parser
+    counts it, and refused before the count is printed unless the two agree."""
+    status, ran, printed, read, err = _counted_and_read(
+        tmp_path, capsys, f"{pin} ; sys_platform == 'zz'\n"
+    )
+    # Was exit 0, printed [2], and pip-audit's parser read one requirement with evil folded into it.
+    assert [len(reqs) for reqs in read] == printed, (printed, read)
+    assert (status, ran) == (2, [])
+    assert "its copy would not hand pip-audit's parser as many requirements as were counted" in err
+    assert "evil" not in err and "example.invalid" not in err and "foo" not in err, err
+
+
+def _counted_and_read(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], head: str
+) -> tuple[int, list[list[str]], list[int], list[list[str]], str]:
+    """Run ``main`` on ``head`` then the evil pin: its status, the commands it ran, each count it
+    printed, the requirements pip-audit's parser reads from each copy it was handed, and stderr."""
+    src = tmp_path / "x.lock"
+    src.write_text(f"{head}{_EVIL}\n", encoding="utf-8")
+    ran: list[list[str]] = []
+    read: list[list[str]] = []
+
+    def run(cmd: list[str]) -> int:
+        ran.append(cmd)
+        if "pip_audit" in cmd:
+            read.append(_requirements_pip_audit_reads(Path(cmd[cmd.index("-r") + 1]).read_bytes()))
+        return 0
+
+    status = main([str(src)], run=run)
+    out, err = capsys.readouterr()
+    printed = [int(n) for n in re.findall(r": (\d+) pinned requirements audited", out)]
+    return status, ran, printed, read, err
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        "foo @ https://example.invalid/foo-1.0-py3-none-any.whl\\ ; sys_platform == 'zz'\n# note\n",
+        "colorama==0.4.6 ; sys_platform == 'win32' \\\n    --hash=sha256:aaaa\n    # via pytest\n",
+    ],
+    ids=["backslash-then-comment", "uv-export"],
+)
+def test_a_copy_whose_parser_count_matches_is_audited(
+    head: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the refusal above: where the parser reads every counted pin from the copy,
+    as it does when a comment line takes the backslash, pip-audit gets the copy."""
+    status, _, printed, read, _ = _counted_and_read(tmp_path, capsys, head)
+    assert status == 0
+    assert printed == [2] and [len(reqs) for reqs in read] == printed, (printed, read)
+    assert _EVIL in read[0], read
 
 
 def test_utf8_failing_falls_back_to_the_locale_as_pip_does(

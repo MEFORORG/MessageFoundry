@@ -72,7 +72,9 @@ never writes and which would resolve against the temporary copy's directory, or 
 rather than audit what it names (``uv export --no-emit-project`` writes none; a lock tool can
 write at least an index URL, ``--trusted-host`` and ``--find-links`` lines unless told not to); and
 a requirement that continues onto a line other than a hash, option or comment, where a marker
-would stay in place; and a ``--skip-private`` that names the engine or another published
+would stay in place; and a copy from which pip-audit's parser would read a number of requirements
+other than the number counted, as when a pin ends in a backslash once its marker is removed and
+joins the next pin onto it; and a ``--skip-private`` that names the engine or another published
 MessageFoundry package, a package the lock does not pin, or every pin, or that comes after the lock
 as a word of its own (the ``=`` form or an abbreviation there reaches pip-audit, which fails on it
 as an unknown option). It does not judge
@@ -263,6 +265,38 @@ def _read_as_pip_audit(raw: bytes) -> str | None:
 
 #: A comment as pip finds one: at the start of a line, or after whitespace.
 _COMMENT = re.compile(r"(^|\s+)#.*$")
+
+
+def _pip_audit_requirement_count(text: str) -> int | None:
+    """How many requirements pip-audit reads from ``text``, or ``None`` where this cannot say.
+
+    pip-audit 2.10.1 reads the copy with pip-requirements-parser 32.0.1, whose ``preprocess`` splits
+    ``text`` with ``str.splitlines``, joins a line ending in a backslash to the next unless it is a
+    comment, stripping the backslashes from both ends of each joined line (``join_lines``), then
+    splits each comment off and drops blank lines (``split_comments``, whose ``COMMENT_RE`` is
+    :data:`_COMMENT` with a group around the comment). A line left is a requirement when
+    ``break_args_options`` leaves it words before the first that starts with ``-``, which is when
+    the line does not start with ``-``. A line of options alone is ``None``: optparse makes it a
+    requirement when it finds ``-e`` there, which this does not model, and a copy of a lock whose
+    option lines were refused should hold none.
+    """
+    logical: list[str] = []
+    joined = ""
+    for line in text.splitlines():
+        comment = _COMMENT.match(line)
+        if line.endswith("\\") and not comment:
+            joined += line.strip("\\")
+            continue
+        logical.append(joined + (f" {line}" if comment else line))
+        joined = ""
+    logical.append(joined)
+    count = 0
+    for line in logical:
+        code = _COMMENT.sub("", line).strip()
+        if code.startswith("-"):
+            return None
+        count += bool(code)
+    return count
 
 
 #: The schemes pip 26's ``is_url`` takes for a URL: its four, and each VCS's own and ``vcs+`` forms.
@@ -479,7 +513,8 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     if refusal:
         print(f"::error::{args.lock}: {refusal}", file=sys.stderr)
         return 2
-    # _strip rewrote lines one for one and kept each one's continuation, so their kinds stand.
+    # _strip rewrote lines one for one and kept each one's continuation, so their kinds stand,
+    # except where it left a pin ending in a backslash; the count check below refuses that copy.
     kept, skipped = _drop(stripped_lines, kinds, private)
     unmatched = private - {name for name, _ in skipped}
     if unmatched:
@@ -492,12 +527,24 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     if len(skipped) == requirements:
         print(f"::error::{args.lock}: --skip-private leaves no pin to audit", file=sys.stderr)
         return 2
+    counted = requirements - len(skipped)
+    audited = "".join(kept)
+    # The count is of the lock as committed, which _kinds reads once (L6). The strip can leave a
+    # pin ending in a backslash, as `foo @ <url>\ ; <marker>` does, and in the copy that joins the
+    # next pin onto it. So the count stands only if pip-audit's parser reads as many from the copy.
+    if _pip_audit_requirement_count(audited) != counted:
+        print(
+            f"::error::{args.lock}: its copy would not hand pip-audit's parser as many "
+            "requirements as were counted",
+            file=sys.stderr,
+        )
+        return 2
     # A skipped pin is neither counted nor listed as audited.
     stripped = [
         e for e in stripped if not (m := _NAME.match(e)) or canonical_name(m[0]) not in private
     ]
     print(
-        f"{args.lock}: {requirements - len(skipped)} pinned requirements audited, {len(stripped)} "
+        f"{args.lock}: {counted} pinned requirements audited, {len(stripped)} "
         "un-gated from a marker the host would have evaluated:"
     )
     for entry in stripped:
@@ -513,7 +560,6 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         return status
     with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP") or None) as tmp:
         copy = Path(tmp) / args.lock.name
-        audited = "".join(kept)
         try:
             # One complete encode call, not write_text: a text stream never finalizes its encoder,
             # and the idna codec holds back the last label until it is final, so a text-mode write
@@ -531,8 +577,9 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         # encode does not round-trip (unicode_escape escapes every newline, raw_unicode_escape a
         # line separator after a backslash) folds pins into a comment, and pip-audit audits fewer
         # than were counted. Comparing the whole text rules that out for every codec, with no list
-        # of them. It proves only that both read the same text: that the count reads that text's
-        # lines as pip-audit does is _kinds's job, not this check's. The line names neither the codec, which is the lock's own text of any length, nor the
+        # of them. It proves only that both read the same text: that pip-audit's parser reads as
+        # many requirements from that text as were counted is the check before the count's print,
+        # not this one. The line names neither the codec, which is the lock's own text of any length, nor the
         # error, which quotes what it failed on.
         try:
             faithful = _read_as_pip_audit(copy.read_bytes()) == audited
