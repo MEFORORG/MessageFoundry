@@ -326,12 +326,22 @@ def test_a_declaration_after_the_second_line_is_not_read(
 
 
 @pytest.mark.parametrize(
-    "raw",
-    [b"# -*- coding: no-such-codec -*-\nidna==3.20\n", b"# caf\xe9\nidna==3.20\n"],
+    ("raw", "named"),
+    [
+        (
+            b"# -*- coding: no-such-codec -*-\nidna==3.20\n",
+            "LookupError: unknown encoding: no-such-codec",
+        ),
+        (
+            b"# caf\xe9\nidna==3.20\n",
+            "UnicodeDecodeError: 'utf-8' codec cannot decode at position 5",
+        ),
+    ],
     ids=["unknown-codec", "undecodable"],
 )
 def test_a_lock_pip_cannot_decode_is_refused_with_an_error(
     raw: bytes,
+    named: str,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -343,7 +353,26 @@ def test_a_lock_pip_cannot_decode_is_refused_with_an_error(
     ran, run = _recorder(0)
     assert main([str(src)], run=run) == 2
     assert not ran
-    assert "not decodable the way pip decodes" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "not decodable the way pip decodes" in err
+    # The codec error's own text names the byte it failed on (vault BACKLOG #3033, #3185); the
+    # line names the error's type, and for a codec error its position, never the byte.
+    assert named in err, err
+    assert "\\xe9" not in err and "0xe9" not in err, err
+
+
+def test_a_copy_the_declared_codec_cannot_write_is_refused_without_its_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The idna codec decodes an empty label but cannot encode one, so the copy write fails."""
+    src = tmp_path / "x.lock"
+    src.write_bytes(b"# coding: idna\nidna==3.20 # a..b\n")
+    ran, run = _recorder(0)
+    assert main([str(src)], run=run) == 2
+    assert len(ran) == 1  # the dry-run install check ran; pip-audit did not
+    err = capsys.readouterr().err
+    assert "its copy is not writable as idna: UnicodeEncodeError: 'idna' codec cannot encode" in err
+    assert "label empty" not in err and "\\x2e" not in err, err
 
 
 def test_utf8_failing_falls_back_to_the_locale_as_pip_does(

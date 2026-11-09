@@ -86,7 +86,9 @@ first two lines, and the copy is written in that encoding too; failing that, as 
 locale's encoding when it is not UTF-8. Every other copy is written as UTF-8 with a byte-order mark,
 which every reader takes first, so pip-audit's parser, whose fallback is the locale and not UTF-8,
 reads it as it was decoded. A lock that cannot be read, or that none of those decodes, is refused
-with exit 2, as is a declaration naming no codec this Python knows.
+with exit 2, as is a declaration naming no codec this Python knows, and a copy that declared codec
+cannot write back. None of those refusals prints the codec error's own text, which quotes the byte
+or character it failed on.
 
 Both subprocesses start through ``messagefoundry.childenv.python_module_argv``, so with ``-P``
 (the checked-out tree, the current directory, is not on their ``sys.path`` and cannot shadow a
@@ -113,6 +115,7 @@ from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 
 from messagefoundry.childenv import engine_environment, non_engine_environment, python_module_argv
+from messagefoundry.redaction import safe_exc
 
 
 def is_requirement_line(line: str) -> bool:
@@ -410,8 +413,12 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     try:
         source, copy_encoding = _decode_lock(raw)
     except (UnicodeError, LookupError) as exc:
+        # A codec error's own text quotes the byte it failed on (vault BACKLOG #3033, #3185), so
+        # safe_exc names it by type, codec and position; a LookupError keeps its type and a
+        # bounded text, since the codec name it quotes is the lock's own, of any length.
         print(
-            f"::error::{args.lock}: not decodable the way pip decodes a requirements file: {exc}",
+            f"::error::{args.lock}: not decodable the way pip decodes a requirements file: "
+            f"{safe_exc(exc)}",
             file=sys.stderr,
         )
         return 2
@@ -478,7 +485,8 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
             copy.write_text("".join(kept), encoding=copy_encoding)
         except UnicodeError as exc:
             print(
-                f"::error::{args.lock}: its copy is not writable as {copy_encoding}: {exc}",
+                f"::error::{args.lock}: its copy is not writable as {copy_encoding}: "
+                f"{safe_exc(exc)}",
                 file=sys.stderr,
             )
             return 2
