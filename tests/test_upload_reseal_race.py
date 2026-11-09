@@ -19,7 +19,7 @@ import os
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 
@@ -501,7 +501,9 @@ def test_a_root_gone_at_a_half_write_does_not_blame_the_lock(
 
 def test_pair_lock_failures_are_classified_apart() -> None:
     """``edit_lock`` raises ``busy_error`` for a planted link too, chained from the ELOOP; that one
-    is a refusal. An OS ``ETIMEDOUT`` is a timeout, neither contention nor a refusal."""
+    is a refusal. An OS ``ETIMEDOUT`` is a timeout, neither contention nor a refusal. Only an errno
+    in ``atomic_edit._REFUSED`` is a refusal, which gets the account advice; a Windows sharing
+    violation that carries its ``winerror`` is not, though Python maps it to ``EACCES``."""
     try:
         try:
             raise OSError(errno.ELOOP, "Too many levels of symbolic links")
@@ -513,4 +515,50 @@ def test_pair_lock_failures_are_classified_apart() -> None:
     assert failure(uploads_mod._PairLockBusy("still in progress")) == "busy"
     assert failure(TimeoutError(errno.ETIMEDOUT, "Connection timed out")) == "timeout"
     assert failure(FileNotFoundError(errno.ENOENT, "gone")) == "gone"
-    assert failure(PermissionError(errno.EACCES, "Permission denied")) == "refused"
+    for code in (errno.EACCES, errno.EPERM, errno.EROFS):
+        assert failure(OSError(code, os.strerror(code))) == "refused", code
+    for code in (errno.EIO, errno.EINVAL, errno.ESTALE, errno.ENOTDIR):
+        assert failure(OSError(code, os.strerror(code))) == "failed", code
+    held = PermissionError(errno.EACCES, "in use")
+    held.winerror = 32  # type: ignore[attr-defined,unused-ignore]
+    assert failure(held) == "failed"
+
+
+@pytest.mark.parametrize(
+    "code", [errno.EIO, errno.EINVAL, errno.ESTALE], ids=["EIO", "EINVAL", "ESTALE"]
+)
+def test_an_os_error_that_is_no_refusal_is_failed_without_the_account_advice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, code: int
+) -> None:
+    """An error outside ``atomic_edit._REFUSED`` (an NFS soft mount's ``EIO``, Windows'
+    ``ERROR_SEM_TIMEOUT`` as ``EINVAL``, ``ESTALE``) is no account's lock file. The removal goes on,
+    a WARNING names the error, the once-per-process ERROR is not used up, and the re-seal skips
+    with the neutral cause and no account advice."""
+
+    def _fails(path: Path, **_: Any) -> Any:
+        raise OSError(code, os.strerror(code), str(path))
+
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    fid = _seed(root, old)
+    monkeypatch.setattr(uploads_mod, "edit_lock", _fails)
+    monkeypatch.setattr(uploads_mod, "_unlocked_logged", set())
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = asyncio.run(_store(root, new, old).reseal_to_active())
+        assert _store(root, old)._discard_cancelled_sync(fid) is True
+    assert result.skipped == 1 and result.incomplete and result.resealed == 0
+    assert upload_names(root) == []
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
+    assert (
+        f"uploaded file {fid} (body): skipped, nothing is written: the file system failed taking "
+        "the uploads pair lock"
+    ) in caplog.text, caplog.text
+    assert f"OSError: [Errno {code}]" in caplog.text, caplog.text
+    assert "another account" not in caplog.text and "Run rotate-key as" not in caplog.text
+    assert uploads_mod._unlocked_logged == set()
+
+
+def test_every_pair_lock_failure_has_a_reseal_cause() -> None:
+    """``blocked`` takes any failure kind, so the cause lookup cannot raise ``KeyError``."""
+    kinds = set(get_args(uploads_mod._PairLockFailure.__value__))
+    assert set(uploads_mod._RESEAL_BLOCKED) == kinds

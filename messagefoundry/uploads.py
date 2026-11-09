@@ -47,7 +47,7 @@ from pathlib import Path
 from stat import S_ISLNK, S_ISREG
 from typing import Any, Literal, NamedTuple, Protocol
 
-from messagefoundry.config.atomic_edit import LOCK_FILE_NAME, edit_lock, lock_path_for
+from messagefoundry.config.atomic_edit import _REFUSED, LOCK_FILE_NAME, edit_lock, lock_path_for
 from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
 from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws
@@ -2258,9 +2258,9 @@ class UploadStore:
         runs, and a plain replace brought the sidecar back. The replace now happens under
         :func:`_pair_lock`, only while the path is still the file this ``lstat`` saw. ``blocked``
         names why the pass's first pair-lock check failed: the lock was busy, refused or timed
-        out (a root gone at that check ends the pass first). With it, a half that needs a write is a
-        skip before it is decrypted. A write that finds the uploads root gone, or the lock not to be
-        had, is a skip too."""
+        out, or taking it failed (a root gone at that check ends the pass first). With it, a half
+        that needs a write is a skip before it is decrypted. A write that finds the uploads root
+        gone, or the lock not to be had, is a skip too."""
         try:
             info = path.lstat()
             if S_ISLNK(info.st_mode):
@@ -3258,22 +3258,31 @@ class _PairLockBusy(TimeoutError):
     """``edit_lock``'s ``busy_error`` for the pair lock: another holder kept it past the wait."""
 
 
-type _PairLockFailure = Literal["busy", "gone", "timeout", "refused"]
+type _PairLockFailure = Literal["busy", "gone", "timeout", "refused", "failed"]
+
+#: ``ERROR_SHARING_VIOLATION`` and ``ERROR_LOCK_VIOLATION``: another program holds the file open,
+#: which Python maps to ``EACCES`` although no account is refused.
+_WINDOWS_HELD = frozenset({32, 33})
 
 
 def _pair_lock_failure(exc: OSError) -> _PairLockFailure:
     """Why :func:`_pair_lock` could not take the lock. ``busy``: another holder kept it past the wait.
     ``gone``: the uploads root is not there. ``timeout``: the OS timed out (``ETIMEDOUT``), as a
-    network file system can; that is neither contention nor a refusal. ``refused``: anything else,
-    such as a lock file another account owns. ``edit_lock`` also raises ``busy_error`` for a lock
-    path planted as a link, chained from the ``ELOOP``; that one is a refusal."""
+    network file system can. ``refused``: the file system refused this account
+    (``atomic_edit._REFUSED``), such as a lock file another account owns; ``edit_lock`` also raises
+    ``busy_error`` for a lock path planted as a link, chained from the ``ELOOP``, and that is one
+    too. ``failed``: any other error, such as ``EIO`` or ``ESTALE`` from a network file system, or
+    a Windows sharing violation that carries its ``winerror``; one the open reports as bare
+    ``EACCES`` reads as ``refused``."""
     if isinstance(exc, _PairLockBusy):
         return "refused" if exc.__cause__ is not None else "busy"
     if isinstance(exc, FileNotFoundError):
         return "gone"
     if isinstance(exc, TimeoutError):
         return "timeout"
-    return "refused"
+    if exc.errno in _REFUSED and getattr(exc, "winerror", None) not in _WINDOWS_HELD:
+        return "refused"
+    return "failed"
 
 
 #: What a busy pair lock tells the ``rotate-key`` operator to do.
@@ -3284,6 +3293,8 @@ _RESEAL_BLOCKED: dict[_PairLockFailure, str] = {
     "busy": f"the uploads pair lock was still held when the wait ran out; {_RERUN_WHEN_FREE}",
     "timeout": "the file system timed out taking the uploads pair lock",
     "refused": "the uploads pair lock could not be taken",
+    "failed": "the file system failed taking the uploads pair lock",
+    "gone": "the uploads directory was gone at the pair-lock check",
 }
 
 
@@ -3317,7 +3328,8 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
     administrator. A lock whose directory is gone is not logged: there is nothing left to remove.
     A lock still held when the wait runs out is not a refusal: it is logged at WARNING each time,
     with ``edit_lock``'s own reason, and never uses up that one ERROR. Nor is an OS timeout, which
-    is logged at WARNING each time as a timeout (:func:`_pair_lock_failure`).
+    is logged at WARNING each time as a timeout, nor any other error that is not a refusal, which
+    is logged at WARNING each time naming the error (:func:`_pair_lock_failure`).
     **The re-seal fails closed (``for_reseal``):** a lock it cannot take is logged and raised. At
     the pass's first check that stops every write; at a half's write, that half is a skip."""
     with contextlib.ExitStack() as held:
@@ -3341,10 +3353,12 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
                     consequence,
                     f"; {_RERUN_WHEN_FREE}" if for_reseal else "",
                 )
-            elif failure == "timeout":
+            elif failure in ("timeout", "failed"):
                 _log.warning(
-                    "uploaded-logs pair lock %s: the file system timed out taking it (%s). %s",
+                    "uploaded-logs pair lock %s: the file system %s taking it (%s: %s). %s",
                     lock,
+                    "timed out" if failure == "timeout" else "failed",
+                    type(exc).__name__,
                     codec_safe_str(exc),
                     consequence,
                 )
