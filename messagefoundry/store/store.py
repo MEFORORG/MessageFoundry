@@ -3260,8 +3260,8 @@ async def judge_totp(
 ) -> TotpJudgement | None:
     """The :data:`TotpCounts` a backend passes to :func:`holds_way_past`,
     :func:`removal_keeps_way_past`, :func:`totp_removal`, :func:`lockout_increment` and
-    :func:`password_change`. ``AuthService._refuse_rotation_without_way_past`` also calls it, on
-    the record it loaded, and reads only the judgement's ``state``.
+    :func:`password_change`. A caller outside a backend may call it too, with no lock to confirm
+    the cell under, and then reads only the judgement's ``state``.
 
     ``user`` is the account as the caller read it, with no lock held, so the cell is opened with
     ``opener`` (the backend's ``open_totp_secret``) and judged by ``usable`` OFF THE EVENT LOOP and
