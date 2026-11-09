@@ -255,6 +255,7 @@ from messagefoundry.store.store import (
     DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
+    EnrolmentCodeOutcome,
     EpochBump,
     EpochRaise,
     FailOutcome,
@@ -321,6 +322,9 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    enrolment_code_issue,
+    enrolment_code_revoke,
+    enrolment_code_spend,
     escalation_passkeys,
     escalation_verdict,
     existing_roles_only,
@@ -367,6 +371,7 @@ from messagefoundry.store.store import (
     require_operator_audit,
     require_totp_rule,
     role_seal_ok,
+    roles_if_held,
     roll_audit_key_range,
     rotation_reseal,
     scope_if_source,
@@ -384,12 +389,14 @@ from messagefoundry.store.store import (
     should_record_event,
     tee_audits,
     totp_enable,
+    totp_enable_spending_code,
     totp_removal,
     totp_replace,
     totp_stage,
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
+    user_disabled_change,
     user_insert_params,
     user_reseal_params,
     user_seal_ok,
@@ -769,8 +776,9 @@ _MSSQL_USER_INSERT: Final = (
     " totp_enabled, totp_enrolled_at, totp_recovery_codes, last_totp_step, oidc_issuer,"
     " oidc_subject, directory_object_id, password_claimed_at, channel_scope_source, lock_cycles,"
     " second_step_failed_attempts, second_step_locked_until, second_step_lock_cycles,"
-    " password_generated, session_epoch, cred_digest, authz_seal)"
-    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    " password_generated, session_epoch, cred_digest, enrolment_code_digest,"
+    " enrolment_code_expires_at, enrolment_code_issuer, authz_seal)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 #: store.py's ``_USER_RESEAL`` reporting through ``OUTPUT`` (BACKLOG #2592), which a session-wide
 #: ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283). Used only by ``_write_user``.
@@ -782,7 +790,8 @@ _MSSQL_USER_RESEAL: Final = (
     " last_totp_step=?, oidc_issuer=?, oidc_subject=?, directory_object_id=?,"
     " password_claimed_at=?, channel_scope_source=?, lock_cycles=?,"
     " second_step_failed_attempts=?, second_step_locked_until=?, second_step_lock_cycles=?,"
-    " password_generated=?, session_epoch=?, cred_digest=?, authz_seal=?"
+    " password_generated=?, session_epoch=?, cred_digest=?, enrolment_code_digest=?,"
+    " enrolment_code_expires_at=?, enrolment_code_issuer=?, authz_seal=?"
     " OUTPUT inserted.id WHERE id=? AND authz_seal=?"
 )
 # The approval statements (BACKLOG #2592); store.py's twins state the contract. The writes are used
@@ -1976,6 +1985,30 @@ CLUSTER_SCHEMA: tuple[str, ...] = (
     " id INT NOT NULL PRIMARY KEY, config_version INT NOT NULL,"
     " updated_at FLOAT NOT NULL);",
 )
+
+
+def _trusted_user_key(table: str, name: str) -> str:
+    """The guarded DDL for foreign key ``name`` from ``table.user_id`` to ``users(id)``, trusted
+    (BACKLOG #2733): the key SQLite and Postgres already declare, so no row of ``table`` can name an
+    account that does not exist. No cascade, as on those two: ``_delete_user_rows`` deletes the
+    account's rows first, and a delete that skipped one would be refused. It runs where the key is missing, or present but untrusted or disabled, as an
+    earlier batch's ``WITH NOCHECK`` key is: it deletes the rows naming an account that does not
+    exist, then adds the key ``WITH CHECK``, dropping the untrusted one first. A trusted key skips
+    it, so a re-run is a no-op. The deleted rows belong to no account, so nothing can use them: a
+    passkey, a session or a role grant of a deleted account. ``sys.foreign_keys`` is read, since
+    ``OBJECT_ID`` alone cannot tell a trusted key from an untrusted one. EXEC keeps the two ALTERs
+    out of the batch's compile, as for the ``credential_id_hash`` rebuild."""
+    return f"""IF OBJECT_ID('{name}','F') IS NULL OR EXISTS (SELECT 1 FROM sys.foreign_keys
+        WHERE object_id = OBJECT_ID('{name}','F') AND (is_not_trusted = 1 OR is_disabled = 1))
+    BEGIN
+        DELETE FROM {table} WHERE NOT EXISTS (SELECT 1 FROM users WHERE users.id = {table}.user_id);
+        IF OBJECT_ID('{name}','F') IS NOT NULL
+            EXEC(N'ALTER TABLE {table} DROP CONSTRAINT {name}');
+        EXEC(N'ALTER TABLE {table} WITH CHECK
+               ADD CONSTRAINT {name} FOREIGN KEY (user_id) REFERENCES users(id)');
+    END"""
+
+
 _SCHEMA: list[str] = [
     # Single-row marker recording which shipped DDL batch was last applied (the sha256 of this very
     # list — see _schema_hash). Lets a re-open of a current database SKIP the whole guarded batch +
@@ -2407,6 +2440,10 @@ _SCHEMA: list[str] = [
         -- BACKLOG #2592: the digest of the account's passkeys, and the integrity seal over the
         -- account's row and role rows. Both written only by the store's user write helper.
         cred_digest NVARCHAR(64) NOT NULL DEFAULT '',
+        -- ADR 0207: the outstanding enrolment code's hash_token digest (64 hex characters), its
+        -- expiry, and the issuing Administrator's account id (NULL for a host-issued code).
+        enrolment_code_digest NVARCHAR(64) NULL, enrolment_code_expires_at FLOAT NULL,
+        enrolment_code_issuer NVARCHAR(256) NULL,
         authz_seal NVARCHAR(256) NOT NULL DEFAULT '')""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
@@ -2464,6 +2501,15 @@ _SCHEMA: list[str] = [
         ALTER TABLE users ADD cred_digest NVARCHAR(64) NOT NULL DEFAULT ''""",
     """IF COL_LENGTH('users','authz_seal') IS NULL
         ALTER TABLE users ADD authz_seal NVARCHAR(256) NOT NULL DEFAULT ''""",
+    # ADR 0207: the enrolment code's digest, expiry and issuer, for a users table created before
+    # them. NULL on an existing row is "no code outstanding", and a NULL column stays out of the user
+    # seal (store.py's USER_SEAL_WHEN_SET), so the add re-seals nobody.
+    """IF COL_LENGTH('users','enrolment_code_digest') IS NULL
+        ALTER TABLE users ADD enrolment_code_digest NVARCHAR(64) NULL""",
+    """IF COL_LENGTH('users','enrolment_code_expires_at') IS NULL
+        ALTER TABLE users ADD enrolment_code_expires_at FLOAT NULL""",
+    """IF COL_LENGTH('users','enrolment_code_issuer') IS NULL
+        ALTER TABLE users ADD enrolment_code_issuer NVARCHAR(256) NULL""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -2543,6 +2589,12 @@ _SCHEMA: list[str] = [
     # scan every account's role rows under locking reads.
     """IF INDEXPROPERTY(OBJECT_ID('user_roles'),'ix_user_roles_role','IndexID') IS NULL
         CREATE INDEX ix_user_roles_role ON user_roles(role_id)""",
+    # BACKLOG #2733: see _trusted_user_key. The primary key, which leads with user_id, serves its
+    # check on a user delete. Every role write holds the account row under
+    # UPDLOCK (_read_user_record), as the delete does, so the two never interleave. The role key
+    # above stays WITH NOCHECK: a grant row names a live account whose seal covers it, so
+    # deleting one would make that account fail its seal, and the write path drops it instead.
+    _trusted_user_key("user_roles", "fk_user_roles_user"),
     """IF OBJECT_ID('ad_group_role_map','U') IS NULL CREATE TABLE ad_group_role_map (
         -- BACKLOG #3187: 512 is the API's canonical group-DN cap. NONCLUSTERED because the key,
         -- 2 x (512 + 64) bytes, is past a clustered key's 900 and inside a nonclustered one's 1700.
@@ -2585,6 +2637,15 @@ _SCHEMA: list[str] = [
         ALTER TABLE sessions ADD global_epoch INT NOT NULL DEFAULT 0""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_user','IndexID') IS NULL
         CREATE INDEX ix_sessions_user ON sessions(user_id)""",
+    # BACKLOG #2733: see _trusted_user_key. ix_sessions_user above serves its check on a user
+    # delete. _delete_user_rows deletes the sessions first, under UPDLOCK on the account
+    # row, and create_session's HOLDLOCK read is compatible with that lock. So a sign-in that
+    # commits while a delete runs now makes the delete fail here and roll back whole, nothing
+    # deleted, where before the delete committed and left the session behind for a missing
+    # account. Taking the account row with XLOCK instead would close that, but it would deadlock
+    # remember_login_address and reset_login_addresses, which write a child row before their key
+    # check reads the account row.
+    _trusted_user_key("sessions", "fk_sessions_user"),
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_expires','IndexID') IS NULL
         CREATE INDEX ix_sessions_expires ON sessions(expires_at)""",
     # Which token hash replaced a retired one (vault BACKLOG #3028, ADR 0210). The SQLite `_SCHEMA`
@@ -2636,15 +2697,9 @@ _SCHEMA: list[str] = [
         CREATE INDEX ix_webauthn_credentials_user ON webauthn_credentials(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('webauthn_credentials'),'ux_webauthn_label','IndexID') IS NULL
         CREATE UNIQUE INDEX ux_webauthn_label ON webauthn_credentials(user_id, label)""",
-    # BACKLOG #2733: the user foreign key SQLite and Postgres already declare, so a passkey can
-    # never be written for an account that does not exist. No cascade, as on those two: at least
-    # delete_user and remove_unless_last_admin clear the account's passkeys first, through
-    # _delete_user_rows, and a delete that skipped it would be refused here. WITH NOCHECK so a
-    # store already holding an orphaned passkey row still opens; the key refuses every later one.
-    # ix_webauthn_credentials_user above serves the key's check on a user delete.
-    """IF OBJECT_ID('fk_webauthn_credentials_user','F') IS NULL
-        ALTER TABLE webauthn_credentials WITH NOCHECK
-            ADD CONSTRAINT fk_webauthn_credentials_user FOREIGN KEY (user_id) REFERENCES users(id)""",
+    # BACKLOG #2733: see _trusted_user_key. ix_webauthn_credentials_user above serves the key's
+    # check on a user delete.
+    _trusted_user_key("webauthn_credentials", "fk_webauthn_credentials_user"),
     # The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) -- mirrors the SQLite
     # `known_login_addresses` table (store/store.py), whose comment gives the reasons, the cascade's
     # among them. The primary key serves the signal's one read. `address` is BIN2 so key equality is
@@ -14451,6 +14506,54 @@ class SqlServerStore:
         change = totp_enable(recovery_code_hashes, now, expected_secret_cell=expected_secret_cell)
         return await self._write_user_txn(user_id, change) is not None
 
+    # --- ADR 0207: the directory account's enrolment code (Store protocol states the contract) ---
+    # One conditional sealed write each, through ``_write_user`` in a transaction of its own, with
+    # the account row locked; store.py's change builders hold every condition.
+
+    async def issue_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        code_digest: str,
+        expires_at: float,
+        issuer_id: str | None,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = enrolment_code_issue(
+            code_digest=code_digest, expires_at=expires_at, issuer_id=issuer_id, now=now
+        )
+        return change.outcome(await self._write_user_txn(user_id, change))
+
+    async def revoke_enrolment_code(self, user_id: str, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        return await self._write_user_txn(user_id, enrolment_code_revoke(now)) is not None
+
+    async def spend_enrolment_code(
+        self, user_id: str, *, code_digest: str, now: float | None = None
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = enrolment_code_spend(code_digest=code_digest, now=now)
+        return change.outcome(await self._write_user_txn(user_id, change))
+
+    async def enable_totp_spending_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        code_digest: str,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = totp_enable_spending_code(
+            recovery_code_hashes,
+            now,
+            expected_secret_cell=expected_secret_cell,
+            code_digest=code_digest,
+        )
+        return change.outcome(await self._write_user_txn(user_id, change))
+
     async def replace_totp_enrolment(
         self,
         user_id: str,
@@ -14745,7 +14848,7 @@ class SqlServerStore:
     ) -> None:
         now = time.time() if now is None else now
         await self._write_user_txn(
-            user_id, lambda r: r.changed(disabled=bool(disabled), updated_at=float(now))
+            user_id, lambda r: user_disabled_change(r, disabled=disabled, now=now)
         )
 
     async def update_user_profile(
@@ -14890,7 +14993,7 @@ class SqlServerStore:
                             return False
                     if change is AdminRemoval.DISABLE:
                         await self._write_user(
-                            cur, user_id, lambda r: r.changed(disabled=True, updated_at=float(now))
+                            cur, user_id, lambda r: user_disabled_change(r, disabled=True, now=now)
                         )
                     elif change is AdminRemoval.DELETE:
                         await self._delete_user_rows(cur, user_id)
@@ -14952,6 +15055,13 @@ class SqlServerStore:
                         await conn.rollback()  # nothing written; releases the applock
                         return AdminGrant.ADMIN_EXISTS
                     if await self._write_user(cur, user_id, change) is None:
+                        await conn.rollback()
+                        return AdminGrant.ACCOUNT_CHANGED
+                    # BACKLOG #3078 F2, as on SQLite. After the write, which holds the account row
+                    # under UPDLOCK as every passkey write does, so a passkey committed before it is
+                    # seen here and a later one waits for this commit.
+                    await cur.execute(_MSSQL_WEBAUTHN_ANY_FOR_USER, (user_id,))
+                    if await cur.fetchall():  # drained, as every read on this cursor is
                         await conn.rollback()
                         return AdminGrant.ACCOUNT_CHANGED
                     await self._commit(conn)
@@ -15167,6 +15277,24 @@ class SqlServerStore:
         await self._write_user_txn(
             user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
         )
+
+    async def set_user_roles_if_held(
+        self,
+        user_id: str,
+        role_ids: Sequence[str],
+        *,
+        expected_role_ids: Iterable[str],
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """The compare-and-set role write (vault BACKLOG #3085); see ``AuthStore``. The compare
+        runs on the row ``_write_user`` reads under ``UPDLOCK, ROWLOCK``, so a concurrent writer
+        waits."""
+        now = time.time() if now is None else now
+        change = roles_if_held(
+            role_ids, expected_role_ids=expected_role_ids, assigned_by=assigned_by, now=now
+        )
+        return await self._write_user_txn(user_id, change) is not None
 
     async def set_user_channel_scope(
         self,
@@ -15646,16 +15774,20 @@ class SqlServerStore:
         token_hash: str,
         change: Callable[[SessionRecord], SessionRecord],
         *,
+        first: Callable[[Any], Awaitable[None]] | None = None,
         landed: Callable[[Any], Awaitable[None]] | None = None,
         after_commit: bool = False,
     ) -> SessionRecord | None:
         """:meth:`_write_session` in a transaction of its own, committed before it returns.
+        ``first`` runs on the same cursor, in the same transaction, before the write.
         ``landed`` runs on the same cursor, in the same transaction, only when the write landed.
         ``after_commit`` borrows through :meth:`_acquire_after_commit`; only ``rotate_session``
         passes it."""
         borrow = self._acquire_after_commit() if after_commit else self._acquire()
         async with borrow as conn, self._cursor(conn) as cur:
             try:
+                if first is not None:
+                    await first(cur)
                 updated = await self._write_session(cur, token_hash, change)
                 if updated is not None and landed is not None:
                     await landed(cur)
@@ -15725,7 +15857,37 @@ class SqlServerStore:
         clustered-PK row move is width-safe. The lineage link goes in the same transaction, only
         when the re-key landed (vault BACKLOG #3028), its time read then, after any wait for the
         borrow or the row lock. The borrow is :meth:`_acquire_after_commit`'s, for the reason it
-        gives (BACKLOG #3023)."""
+        gives (BACKLOG #3023).
+
+        LOCK ORDER (BACKLOG #4974). The re-key takes its account's ``users`` row under ``UPDLOCK,
+        ROWLOCK`` before its session row, the order the bind, the unbind, the TOTP re-enrolment and
+        the per-account revoke take them in: each locks the account row first and sweeps after. The
+        unbind takes it through its own prior-pair ``UPDLOCK`` read in
+        :meth:`clear_user_federated_subject`, before its account write, and a rebind's first sweep
+        is that transaction's; the bind's own write and the TOTP re-enrolment take it through the
+        write helper, and the per-account revoke through the epoch raise. ``enforce_session_cap``'s
+        trim takes no account row. ``revoke_all_sessions`` locks only the accounts its list read
+        returns, so a session of any other account is not ordered against a re-key. The re-key
+        moves the row to a new clustered key, and a sweep that met the row locked mid-move could
+        find the old key gone and the new one out of its read, or deadlock with the re-key,
+        depending on the plan. With the account row first, a re-key either commits before a sweep of
+        its account locks that row, and the sweep reads the new key, or waits until the sweep
+        commits and then finds the session ended. The session's account is read unlocked first:
+        ``user_id`` never changes, and a session already gone locks nothing. Each path in this file
+        read for this change that locks both rows takes the account row first, so the re-key
+        closes no cycle with any of them. Read from the code; the race is replayed on the SQL
+        Server leg by ``tests/_federated_unbind_store_contract.py``, against store calls only, and
+        not against the TOTP re-enrolment's. docs/SECURITY.md, *Limits of the session sweep*, says
+        which are raced and which are not."""
+
+        async def _account_first(cur: Any) -> None:
+            await cur.execute("SELECT user_id FROM sessions WHERE token_hash=?", (token_hash,))
+            owners = await cur.fetchall()
+            if owners:
+                await cur.execute(
+                    "SELECT id FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?", (str(owners[0][0]),)
+                )
+                await cur.fetchall()
 
         async def _link(cur: Any) -> None:
             retired_at = time.time() if now is None else now
@@ -15734,6 +15896,7 @@ class SqlServerStore:
         rotated = await self._write_session_txn(
             token_hash,
             lambda s: replace(s, token_hash=new_token_hash),
+            first=_account_first,
             landed=_link,
             after_commit=True,
         )

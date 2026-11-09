@@ -19,6 +19,7 @@ from messagefoundry.api.auth_models import (
     ChannelScope,
     CustomRoleInfo,
     CustomRoleRequest,
+    EnrolmentCodeResponse,
     ExpectedFederatedPair,
     FederatedIdentityRequest,
     FederatedIdentityView,
@@ -38,6 +39,8 @@ from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
 from messagefoundry.auth.service import (
     FEDERATED_BINDING_CHANGED,
+    STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_ISSUE,
+    STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_REVOKE,
     STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
     STEP_UP_ACTION_ADMIN_RESET_MFA,
     STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
@@ -108,6 +111,20 @@ register_ui_action(
     Permission.USERS_MANAGE,
     action=STEP_UP_ACTION_ADMIN_RESET_MFA,
     label="Reset a user's second factor",
+)
+# ADR 0207 section 4: each enrolment-code lane is action-bound and TAGGED, as the resets are, so
+# /ui/reauth mints the one grant the POST that follows consumes.
+register_ui_action(
+    r"^/ui/users/[^/?#]+/enrolment-code$",
+    Permission.USERS_MANAGE,
+    action=STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_ISSUE,
+    label="Issue a directory account's enrolment code",
+)
+register_ui_action(
+    r"^/ui/users/[^/?#]+/enrolment-code/revoke$",
+    Permission.USERS_MANAGE,
+    action=STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_REVOKE,
+    label="Revoke a directory account's enrolment code",
 )
 # Two entries rather than one alternation, so each names its own action on /ui/reauth (#2764).
 register_ui_action(
@@ -637,6 +654,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return await _user_detail(
                 user_id, service, identity, error=str(exc.detail), status_code=_refusal_status(exc)
             )
+        if reset.enrolment_code is not None and reset.enrolment_code_expires_at is not None:
+            # ADR 0207 section 5: an enabled directory account's reset issued an enrolment code
+            # for its next first factor. Rendered ONCE, like the generated credential below.
+            target = await service.store.get_user(user_id)
+            return HTMLResponse(
+                pages.enrolment_code_page(
+                    target.username if target is not None else user_id,
+                    reset.enrolment_code,
+                    reset.enrolment_code_expires_at,
+                    heading="Authenticator reset",
+                )
+            )
         if reset.temp_password is None:
             return RedirectResponse(f"/ui/users/{user_id}", status_code=303)
         # ADR 0197 Amendment A, AC-A4: a local account's factor reset also issued a generated
@@ -650,6 +679,68 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 heading="Authenticator reset",
             )
         )
+
+    # --- users: a directory account's enrolment code (ADR 0207 section 4) -------------------------
+    #
+    # Both call the JSON handlers by reference, so the refusals and the self-exclusion are the API's
+    # own; each re-asserts the JSON route's action-bound gate, which a direct call skips.
+
+    @app.post("/ui/users/{user_id}/enrolment-code")
+    async def ui_user_issue_enrolment_code(
+        user_id: str,
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(
+            require_ui_step_up_action(
+                STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_ISSUE, Permission.USERS_MANAGE
+            )
+        ),
+    ) -> Response:
+        assert_same_origin(request)
+        try:
+            issued: EnrolmentCodeResponse = await admin.issue_user_enrolment_code(
+                request=request, service=service, identity=identity, user_id=user_id, via="ui"
+            )
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_404_NOT_FOUND:
+                raise
+            return await _user_detail(
+                user_id, service, identity, error=str(exc.detail), status_code=_refusal_status(exc)
+            )
+        user = await service.store.get_user(user_id)
+        # Rendered ONCE for the handover; the engine keeps only the digest.
+        return HTMLResponse(
+            pages.enrolment_code_page(
+                user.username if user is not None else user_id,
+                issued.code,
+                issued.expires_at,
+                replaced=issued.replaced,
+            )
+        )
+
+    @app.post("/ui/users/{user_id}/enrolment-code/revoke")
+    async def ui_user_revoke_enrolment_code(
+        user_id: str,
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(
+            require_ui_step_up_action(
+                STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_REVOKE, Permission.USERS_MANAGE
+            )
+        ),
+    ) -> Response:
+        assert_same_origin(request)
+        try:
+            await admin.revoke_user_enrolment_code(
+                user_id, request=request, service=service, identity=identity
+            )
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_404_NOT_FOUND:
+                raise
+            return await _user_detail(
+                user_id, service, identity, error=str(exc.detail), status_code=_refusal_status(exc)
+            )
+        return RedirectResponse(f"/ui/users/{user_id}", status_code=303)
 
     # --- users: federated identity (BACKLOG #1143 / #295, ADR 0184 slice B) -----------------------
     #

@@ -405,8 +405,18 @@ async def _writer_guard(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIt
 
 
 @asynccontextmanager
-async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIterator[None]:
+async def _writer_txn(
+    db: aiosqlite.Connection, lock: asyncio.Lock, *, immediate: bool = False
+) -> AsyncIterator[None]:
     """Run the block inside ONE writer transaction, holding ``lock``, unwinding on **BaseException**.
+
+    ``immediate`` opens it with ``BEGIN IMMEDIATE``, which takes SQLite's write lock at the
+    ``BEGIN``, waiting out another process's writer under ``busy_timeout``, so nothing another
+    process commits can land between the block's first read and its write. The deferred default
+    takes it at the first write, and a writer in another process that committed after the block's
+    read then fails that write with ``SQLITE_BUSY_SNAPSHOT`` rather than wait (BACKLOG #3078 F5).
+    The ``asyncio`` lock already serializes this process, so only a block that must decide on a
+    read across processes needs it: the first-administrator grant.
 
     **Every writer that opens an EXPLICIT transaction goes through here** — ``execute("BEGIN")``
     appears nowhere else on ``self._db``, and ``tests/test_writer_txn_is_the_only_begin.py`` keeps it
@@ -434,7 +444,10 @@ async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIter
     ``rollback()`` itself first or it leaves the transaction open for the next writer."""
     async with lock:
         try:
-            await db.execute("BEGIN")
+            if immediate:
+                await db.execute("BEGIN IMMEDIATE")
+            else:
+                await db.execute("BEGIN")
             yield
         except BaseException as exc:
             await _unwind_and_raise(db, exc, role="writer")
@@ -1895,17 +1908,17 @@ class AdminGrant(StrEnum):
     #: written. ``provision_first_administrator`` counts only one that signs in with a local
     #: password (vault BACKLOG #2711 step 1).
     ADMIN_EXISTS = "admin_exists"
-    #: The account no longer holds the credentials the caller wrote, holds a role already, or is
-    #: disabled or gone, so nothing was written.
+    #: The account no longer holds the credentials the caller wrote, holds a role or a passkey
+    #: already, or is disabled or gone, so nothing was written.
     ACCOUNT_CHANGED = "account_changed"
 
 
 #: How many times the SQLite store runs the first-administrator grant's transaction when SQLite
-#: answers busy (BACKLOG #3078). ``provision-admin`` is a process of its own, and the writer's
-#: deferred ``BEGIN`` means a writer in another process that committed after this one's read makes
-#: the write fail with ``SQLITE_BUSY_SNAPSHOT`` rather than wait. The re-run re-reads, so the
-#: committed write decides. Bounded, and a busy that outlasts it is raised, never read as a refusal:
-#: an unrelated engine write can be what was busy.
+#: answers busy (BACKLOG #3078). ``provision-admin`` is a process of its own. Its ``BEGIN IMMEDIATE``
+#: (F5) waits out another process's writer for ``busy_timeout`` before answering busy, so a re-run
+#: follows a writer that held the lock past that wait, such as a long engine transaction. The re-run
+#: re-reads, so the committed write decides. Bounded, and a busy that outlasts it is raised, never
+#: read as a refusal: an unrelated engine write can be what was busy.
 _ADMIN_GRANT_BUSY_ATTEMPTS: Final = 5
 _ADMIN_GRANT_BUSY_BACKOFF_SECONDS: Final = 0.05
 
@@ -2124,6 +2137,13 @@ class UserRecord:
     # one, and a session resolves only while its own ``user_epoch`` equals it. Both copies are
     # sealed: the session's in the session seal, this one in the account's own seal.
     session_epoch: int = 0
+    # THE DIRECTORY ACCOUNT'S ENROLMENT CODE (ADR 0207). The ``hash_token`` digest of the one code
+    # outstanding, when it expires, and the issuing Administrator's account id (``None`` for
+    # one the host command issued). All three are NULL with no code outstanding, and every write that
+    # clears the digest clears the other two (``enrolment_code_cleared``). Never the code itself.
+    enrolment_code_digest: str | None = None
+    enrolment_code_expires_at: float | None = None
+    enrolment_code_issuer: str | None = None
     # THE STORE'S GLOBAL SESSION EPOCH as this read found it (BACKLOG #5091), which a session's own
     # ``global_epoch`` must equal too. Not a column of this row and not in its seal: every user reader
     # selects it beside the row (``USER_READ_SQL``). ``GLOBAL_SESSION_EPOCH_SQL`` says why.
@@ -2197,6 +2217,11 @@ class UserRecord:
             # Hard subscript (BACKLOG #2592): a missing key would decode as epoch 0, which every
             # session minted before a revoke also carries, so it is the OPEN direction.
             session_epoch=int(d["session_epoch"]),
+            # ``.get()``s (ADR 0207): a missing key decodes as "no code outstanding", which refuses
+            # every code shown -- the closed direction.
+            enrolment_code_digest=d.get("enrolment_code_digest"),
+            enrolment_code_expires_at=_opt_float(d.get("enrolment_code_expires_at")),
+            enrolment_code_issuer=d.get("enrolment_code_issuer"),
             # Hard subscript for the same reason: every user reader is ``USER_READ_SQL``, and a
             # mapping without the global epoch fails here rather than decode one nobody read.
             global_session_epoch=global_epoch_or_refuse(d["global_session_epoch"]),
@@ -2445,6 +2470,16 @@ USER_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType(
     }
 )
 
+#: The ``users`` columns a user seal covers only while they hold a value (ADR 0207 Amendment A). A
+#: field encoded as ``None`` would still change the sealed bytes, so adding these as plain fields
+#: would break the seal of every account sealed before they existed, and rotate-key's re-seal pass
+#: refuses a record that fails. Left out while NULL, an account that never held a code keeps the
+#: seal it was sealed under; a value planted outside the store still fails the seal, as
+#: :func:`passkey_digest` treats ``discoverable``.
+USER_SEAL_WHEN_SET: Final[frozenset[str]] = frozenset(
+    {"enrolment_code_digest", "enrolment_code_expires_at", "enrolment_code_issuer"}
+)
+
 #: The ``webauthn_credentials`` columns the passkey digest leaves out, each with its reason.
 PASSKEY_DIGEST_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -2498,6 +2533,11 @@ class UserRow:
     session_epoch: int
     #: A digest of the account's passkeys (:func:`passkey_digest`), ``""`` with none.
     cred_digest: str
+    #: The enrolment code's digest, expiry and issuer (ADR 0207), each ``None`` with no code. Each
+    #: enters the seal only while it holds a value (:data:`USER_SEAL_WHEN_SET`).
+    enrolment_code_digest: str | None
+    enrolment_code_expires_at: float | None
+    enrolment_code_issuer: str | None
     #: The seal (``mfseal:v1:...``) over everything else. ``""`` on a keyless store.
     authz_seal: str
 
@@ -2540,6 +2580,9 @@ class UserRow:
             password_generated=bool(d["password_generated"]),
             session_epoch=int(d["session_epoch"]),
             cred_digest=str(d["cred_digest"] or ""),
+            enrolment_code_digest=_opt_str(d["enrolment_code_digest"]),
+            enrolment_code_expires_at=_opt_float(d["enrolment_code_expires_at"]),
+            enrolment_code_issuer=_opt_str(d["enrolment_code_issuer"]),
             authz_seal=str(d["authz_seal"] or ""),
         )
 
@@ -2607,11 +2650,13 @@ class UserAuthzRecord:
 
     def seal_fields(self) -> tuple[tuple[str, object], ...]:
         """The ``(name, value)`` pairs a user seal covers: every :class:`UserRow` field not in
-        :data:`USER_SEAL_EXCLUDED`, then the role rows, counted."""
+        :data:`USER_SEAL_EXCLUDED`, and none of :data:`USER_SEAL_WHEN_SET` while it is ``None``,
+        then the role rows, counted."""
         out: list[tuple[str, object]] = [
             (f.name, getattr(self.row, f.name))
             for f in _dc_fields(self.row)
             if f.name not in USER_SEAL_EXCLUDED
+            and not (f.name in USER_SEAL_WHEN_SET and getattr(self.row, f.name) is None)
         ]
         out.append(("roles", len(self.roles)))
         for grant in self.roles:
@@ -2775,8 +2820,9 @@ _USER_INSERT: Final = (
     " totp_enabled, totp_enrolled_at, totp_recovery_codes, last_totp_step, oidc_issuer,"
     " oidc_subject, directory_object_id, password_claimed_at, channel_scope_source, lock_cycles,"
     " second_step_failed_attempts, second_step_locked_until, second_step_lock_cycles,"
-    " password_generated, session_epoch, cred_digest, authz_seal)"
-    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    " password_generated, session_epoch, cred_digest, enrolment_code_digest,"
+    " enrolment_code_expires_at, enrolment_code_issuer, authz_seal)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 _USER_RESEAL: Final = (
     "UPDATE users SET username=?, auth_provider=?, display_name=?, email=?, notify_email=?,"
@@ -2786,7 +2832,8 @@ _USER_RESEAL: Final = (
     " last_totp_step=?, oidc_issuer=?, oidc_subject=?, directory_object_id=?,"
     " password_claimed_at=?, channel_scope_source=?, lock_cycles=?,"
     " second_step_failed_attempts=?, second_step_locked_until=?, second_step_lock_cycles=?,"
-    " password_generated=?, session_epoch=?, cred_digest=?, authz_seal=?"
+    " password_generated=?, session_epoch=?, cred_digest=?, enrolment_code_digest=?,"
+    " enrolment_code_expires_at=?, enrolment_code_issuer=?, authz_seal=?"
     " WHERE id=? AND authz_seal=?"
 )
 _USER_ROLES_CLEAR: Final = "DELETE FROM user_roles WHERE user_id=?"
@@ -2902,6 +2949,9 @@ def new_user_record(
         password_generated=bool(password_generated),
         session_epoch=0,
         cred_digest="",
+        enrolment_code_digest=None,
+        enrolment_code_expires_at=None,
+        enrolment_code_issuer=None,
         authz_seal="",
     )
     return UserAuthzRecord(row=row)
@@ -3612,6 +3662,161 @@ def totp_enable(
     return apply
 
 
+# --- ADR 0207: the directory account's single-use enrolment code ----------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class EnrolmentCodeOutcome:
+    """What one conditional enrolment-code write found in the record it replaced (ADR 0207).
+
+    :attr:`replaced` is whether an unexpired code was outstanding, which an issue reports.
+    :attr:`issuer_id` is the issuer of the code a spend cleared (Amendment A, A5), captured from
+    the record ``_write_user`` read under the account's lock, never from a separate read, so a
+    re-issue between a read and the write cannot make it name the wrong Administrator."""
+
+    replaced: bool = False
+    issuer_id: str | None = None
+
+
+def enrolment_code_outstanding(row: UserRow, now: float) -> bool:
+    """Whether ``row`` holds a code that has not expired at ``now``."""
+    return (
+        row.enrolment_code_digest is not None
+        and row.enrolment_code_expires_at is not None
+        and now < row.enrolment_code_expires_at
+    )
+
+
+def enrolment_code_cleared(r: UserAuthzRecord) -> UserAuthzRecord:
+    """``r`` with no code: the digest, the expiry and the issuer go together, so no issuer outlives
+    the code it named."""
+    return r.changed(
+        enrolment_code_digest=None, enrolment_code_expires_at=None, enrolment_code_issuer=None
+    )
+
+
+def _takes_a_first_code(row: UserRow) -> bool:
+    """Whether a code may be issued for, or spent on, ``row``: an enabled directory account holding
+    no engine factor. ``cred_digest`` is written in the same transaction as every passkey write,
+    under the account's lock, so it is the in-row answer to "holds a passkey"."""
+    return (
+        row.auth_provider == "ad"
+        and not row.disabled
+        and not row.totp_enabled
+        and row.cred_digest == ""
+    )
+
+
+def _code_matches(row: UserRow, code_digest: str, now: float) -> bool:
+    return (
+        enrolment_code_outstanding(row, now)
+        and row.enrolment_code_digest is not None
+        and hmac.compare_digest(row.enrolment_code_digest, code_digest)
+    )
+
+
+class EnrolmentCodeChange:
+    """A :data:`UserChange` for one enrolment-code write that keeps the record it was applied to,
+    as :class:`EpochBump` does, so :meth:`outcome` reports what that write replaced."""
+
+    def __init__(self, apply: UserChange, now: float) -> None:
+        self._apply = apply
+        self._now = float(now)
+        self._before: UserRow | None = None
+
+    def __call__(self, record: UserAuthzRecord) -> UserAuthzRecord | None:
+        self._before = record.row
+        return self._apply(record)
+
+    def outcome(self, updated: UserAuthzRecord | None) -> EnrolmentCodeOutcome | None:
+        """``None`` when the write wrote nothing: no row, a condition that did not hold, or a
+        compare lost to a concurrent write."""
+        before = self._before
+        if updated is None or before is None:
+            return None
+        return EnrolmentCodeOutcome(
+            replaced=enrolment_code_outstanding(before, self._now),
+            issuer_id=before.enrolment_code_issuer,
+        )
+
+
+def enrolment_code_issue(
+    *, code_digest: str, expires_at: float, issuer_id: str | None, now: float
+) -> EnrolmentCodeChange:
+    """What ``issue_enrolment_code`` writes (ADR 0207 sections 4 and 6): the digest, expiry and
+    issuer, replacing any outstanding code, only where the account is an enabled directory account
+    holding no engine factor. The conditions are judged on the record the write replaces."""
+    if not code_digest:
+        raise ValueError("an enrolment code digest is required")
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if not _takes_a_first_code(r.row):
+            return None
+        return r.changed(
+            enrolment_code_digest=code_digest,
+            enrolment_code_expires_at=float(expires_at),
+            enrolment_code_issuer=issuer_id,
+            updated_at=float(now),
+        )
+
+    return EnrolmentCodeChange(apply, now)
+
+
+def enrolment_code_revoke(now: float) -> UserChange:
+    """What ``revoke_enrolment_code`` writes: no code, only where one is held (expired or not), so a
+    revoke of nothing writes nothing and reports so."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if r.row.enrolment_code_digest is None:
+            return None
+        return enrolment_code_cleared(r).changed(updated_at=float(now))
+
+    return apply
+
+
+def enrolment_code_spend(*, code_digest: str, now: float) -> EnrolmentCodeChange:
+    """The passkey finish's spend (ADR 0207 Amendment A, A3 step 10): clear the code only where its
+    digest still matches and has not expired, the account is enabled, TOTP is still off and the
+    account holds no passkey. Only a write that changed a row spends, so two racing ceremonies
+    cannot both spend one code."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if not _takes_a_first_code(r.row) or not _code_matches(r.row, code_digest, now):
+            return None
+        return enrolment_code_cleared(r).changed(updated_at=float(now))
+
+    return EnrolmentCodeChange(apply, now)
+
+
+def totp_enable_spending_code(
+    recovery_code_hashes: Sequence[str],
+    now: float,
+    *,
+    expected_secret_cell: str | None,
+    code_digest: str,
+) -> EnrolmentCodeChange:
+    """The TOTP confirm's enable with the code's spend folded into it (ADR 0207 Amendment A, A3):
+    one write that turns TOTP on and clears the code, only where :func:`totp_enable`'s conditions
+    hold and the account is an enabled directory account with no passkey whose code still matches
+    and has not expired. A confirm whose enable matches no row therefore spends nothing."""
+    enable = totp_enable(recovery_code_hashes, now, expected_secret_cell=expected_secret_cell)
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if not _takes_a_first_code(r.row) or not _code_matches(r.row, code_digest, now):
+            return None
+        enabled = enable(r)
+        return None if enabled is None else enrolment_code_cleared(enabled)
+
+    return EnrolmentCodeChange(apply, now)
+
+
+def user_disabled_change(r: UserAuthzRecord, *, disabled: bool, now: float) -> UserAuthzRecord:
+    """What ``set_user_disabled`` writes. A disable clears an outstanding enrolment code in the same
+    write (ADR 0207 section 3), so re-enabling the account inside the code's life revives nothing."""
+    out = r.changed(disabled=bool(disabled), updated_at=float(now))
+    return enrolment_code_cleared(out) if disabled else out
+
+
 def first_admin_grant(
     admin_role_id: str,
     *,
@@ -3856,6 +4061,28 @@ def without_role(role_id: str) -> UserChange:
         if role_id not in r.role_ids:
             return None
         return replace(r, roles=tuple(g for g in r.roles if g.role_id != role_id))
+
+    return apply
+
+
+def roles_if_held(
+    role_ids: Sequence[str],
+    *,
+    expected_role_ids: Iterable[str],
+    assigned_by: str | None,
+    now: float,
+) -> UserChange:
+    """``set_user_roles_if_held``'s compare-and-set (vault BACKLOG #3085): the account's roles
+    replaced with ``role_ids``, only while the record still holds exactly ``expected_role_ids``,
+    compared as sets. Each backend runs it on the record its write read under the row's lock, so
+    a write decided from an older read of the roles writes nothing once another writer has moved
+    them."""
+    expected = frozenset(expected_role_ids)
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if frozenset(r.role_ids) != expected:
+            return None
+        return r.with_roles(role_ids, assigned_by=assigned_by, now=now)
 
     return apply
 
@@ -9082,6 +9309,9 @@ CREATE TABLE IF NOT EXISTS users (
     password_generated   INTEGER NOT NULL DEFAULT 0,  -- ADR 0197 Amendment A: 1 while the credential in force is engine-generated; wrong passwords arm no sign-in lock then. NO COMMA in this comment
     session_epoch        INTEGER NOT NULL DEFAULT 0,  -- BACKLOG #2592: raised by every whole-account session revoke; a session minted under an older epoch resolves to nothing. NO COMMA in this comment
     cred_digest          TEXT NOT NULL DEFAULT '',  -- BACKLOG #2592: digest of the account's passkeys; the user seal covers it. NO COMMA in this comment
+    enrolment_code_digest TEXT,                -- ADR 0207: hash_token digest of the outstanding enrolment code; NULL = none. NO COMMA in this comment
+    enrolment_code_expires_at REAL,            -- ADR 0207: when that code expires; NULL with no code. NO COMMA in this comment
+    enrolment_code_issuer TEXT,                -- ADR 0207 Amendment A5: the issuing Administrator's account id; NULL for a host-issued code. NO COMMA in this comment
     authz_seal           TEXT NOT NULL DEFAULT ''  -- BACKLOG #2592: integrity seal over the account's row and role rows. NO COMMA in this comment
 );
 
@@ -11030,6 +11260,12 @@ class MessageStore:
             # `report_unsealed_users` names the count at open.
             ("cred_digest", "TEXT NOT NULL DEFAULT ''"),
             ("authz_seal", "TEXT NOT NULL DEFAULT ''"),
+            # ADR 0207: the enrolment code's digest, expiry and issuer. NULL on an existing row is
+            # "no code outstanding", and a NULL column stays out of the seal
+            # (USER_SEAL_WHEN_SET), so the add re-seals nobody.
+            ("enrolment_code_digest", "TEXT"),
+            ("enrolment_code_expires_at", "REAL"),
+            ("enrolment_code_issuer", "TEXT"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -17414,7 +17650,7 @@ class MessageStore:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._write_user(
-                user_id, lambda r: r.changed(disabled=bool(disabled), updated_at=float(now))
+                user_id, lambda r: user_disabled_change(r, disabled=disabled, now=now)
             )
             await self._commit()
 
@@ -17504,6 +17740,64 @@ class MessageStore:
             written = await self._write_user(user_id, change)
             await self._commit()
         return written is not None
+
+    # --- ADR 0207: the directory account's enrolment code (Store protocol states the contract) ---
+
+    async def _write_code(
+        self, user_id: str, change: EnrolmentCodeChange
+    ) -> EnrolmentCodeOutcome | None:
+        async with _writer_guard(self._db, self._lock):
+            written = await self._write_user(user_id, change)
+            await self._commit()
+        return change.outcome(written)
+
+    async def issue_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        code_digest: str,
+        expires_at: float,
+        issuer_id: str | None,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = enrolment_code_issue(
+            code_digest=code_digest, expires_at=expires_at, issuer_id=issuer_id, now=now
+        )
+        return await self._write_code(user_id, change)
+
+    async def revoke_enrolment_code(self, user_id: str, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        async with _writer_guard(self._db, self._lock):
+            written = await self._write_user(user_id, enrolment_code_revoke(now))
+            await self._commit()
+        return written is not None
+
+    async def spend_enrolment_code(
+        self, user_id: str, *, code_digest: str, now: float | None = None
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        return await self._write_code(
+            user_id, enrolment_code_spend(code_digest=code_digest, now=now)
+        )
+
+    async def enable_totp_spending_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        code_digest: str,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = totp_enable_spending_code(
+            recovery_code_hashes,
+            now,
+            expected_secret_cell=expected_secret_cell,
+            code_digest=code_digest,
+        )
+        return await self._write_code(user_id, change)
 
     async def replace_totp_enrolment(
         self,
@@ -17856,7 +18150,7 @@ class MessageStore:
                     return False
             if change is AdminRemoval.DISABLE:
                 await self._write_user(
-                    user_id, lambda r: r.changed(disabled=True, updated_at=float(now))
+                    user_id, lambda r: user_disabled_change(r, disabled=True, now=now)
                 )
             elif change is AdminRemoval.DELETE:
                 await self._delete_user_rows(user_id)
@@ -17882,8 +18176,13 @@ class MessageStore:
     ) -> AdminGrant:
         """The first-administrator guard and its grant in one transaction (BACKLOG #3078); see
         ``AuthStore``. The writer lock serializes it in this process. Another process is serialized
-        by SQLite's single writer: a write that lost to one committed after this read fails busy,
-        and the transaction runs again so the re-read decides (:data:`_ADMIN_GRANT_BUSY_ATTEMPTS`)."""
+        by ``BEGIN IMMEDIATE`` (BACKLOG #3078 F5): the transaction takes SQLite's write lock before
+        its read, waiting out another writer under ``busy_timeout``, so no other process commits
+        between the read and the write. A busy that outlasts that wait is run again so the re-read
+        decides (:data:`_ADMIN_GRANT_BUSY_ATTEMPTS`). Before, the deferred ``BEGIN`` let an engine
+        write in another process land after the read, and then this write failed busy at once, so a
+        busy ``serve`` could exhaust the re-runs. The account write that follows the guard read
+        also checks that no passkey is on the row (F2), as the server backends do."""
         now = time.time() if now is None else now
         change = first_admin_grant(
             admin_role_id,
@@ -17894,7 +18193,7 @@ class MessageStore:
         )
         for attempt in range(1, _ADMIN_GRANT_BUSY_ATTEMPTS + 1):
             try:
-                async with _writer_txn(self._db, self._lock):
+                async with _writer_txn(self._db, self._lock, immediate=True):
                     cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
                     holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
                     _, others = await admin_guard_counts(
@@ -17908,6 +18207,13 @@ class MessageStore:
                         await self._db.rollback()
                         return AdminGrant.ADMIN_EXISTS
                     if await self._write_user(user_id, change) is None:
+                        await self._db.rollback()
+                        return AdminGrant.ACCOUNT_CHANGED
+                    # BACKLOG #3078 F2: a passkey on the row is an earlier holder's, enrolled in the
+                    # repair window, since this command enrols none. Read after the write, on this
+                    # transaction's connection, so it sees every passkey committed before it.
+                    passkey = await self._db.execute(_WEBAUTHN_ANY_FOR_USER, (user_id,))
+                    if await passkey.fetchone() is not None:
                         await self._db.rollback()
                         return AdminGrant.ACCOUNT_CHANGED
                     await self._commit()
@@ -18244,6 +18550,26 @@ class MessageStore:
                 user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
             )
             await self._commit()
+
+    async def set_user_roles_if_held(
+        self,
+        user_id: str,
+        role_ids: Sequence[str],
+        *,
+        expected_role_ids: Iterable[str],
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """The compare-and-set role write (vault BACKLOG #3085); see ``AuthStore``. Under the one
+        writer lock, so no other write to the row lands between the compare and the write."""
+        now = time.time() if now is None else now
+        change = roles_if_held(
+            role_ids, expected_role_ids=expected_role_ids, assigned_by=assigned_by, now=now
+        )
+        async with _writer_txn(self._db, self._lock):
+            written = await self._write_user(user_id, change)
+            await self._commit()
+        return written is not None
 
     async def set_user_channel_scope(
         self,

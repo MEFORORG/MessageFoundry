@@ -610,7 +610,10 @@ def test_a_key_that_does_not_resolve_exits_2(
     captured = capsys.readouterr()
     assert rc == 2, (captured.out, captured.err)
     text = _refusal_text(command, captured.out, captured.err)
-    assert "MEFOR_STORE_TRANSIT_KEY" in text, text
+    from messagefoundry.store import base as store_base
+
+    # A fixed text since the eighth hold on engine PR 2818.
+    assert store_base._TRANSIT_BUILD_TEXTS[4] in text, text
 
 
 @pytest.mark.parametrize("command", [*_KEY_REFUSING_COMMANDS, "admin-reset-totp", "rotate-key"])
@@ -1352,6 +1355,9 @@ _CLI_OPENERS = {
     "_backup.run",
     # BACKLOG #2337: record or withdraw the vault_transit bound attestation, with its audit row
     "_store_transit_bound.run",
+    # vault BACKLOG #2609, ADR 0207 section 6: issue a directory account's enrolment code from the
+    # host, with its audit row
+    "_issue_enrolment_code.run",
 }
 _CLI_DEFAULT = {"_rotate_key.run"}
 

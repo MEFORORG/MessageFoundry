@@ -670,7 +670,8 @@ account went with it, and `locked` when a second-step lock landed. A database dr
 connection or a pool acquire timeout in the passkey set read after the write, on any sign-count
 answer, is refused with `store_error` (BACKLOG #3775). At least a closed SQLite connection, the
 engine's other `RuntimeError` refusals and SQLite's `ProgrammingError` still raise there, and so
-does a store error in the session, account and lock re-read before it.
+does a store error in the session, account and lock re-read, which since 2026-11-05 follows that
+set read rather than preceding it (BACKLOG #3068).
 
 **Why a gone passkey still raises the signal.** A self-service passkey delete takes no account
 queue, and an MFA reset deletes every passkey before it revokes the sessions, so either can land
@@ -679,9 +680,15 @@ change exempted such a miss when it judged the passkey gone. Each review round f
 which that exemption alerted less than the engine had before it, so the exemption was withdrawn: a
 false clone row on a deleted passkey is preferred to a missing one. `gone` alone does not show a
 holder's delete: a passkey row removed outside the store's sealed write path, or with its account,
-answers `gone` too. Before discounting a `gone` row, read the same request's refusal: a
-`factor_unverified` refusal, with an `integrity.authority_seal_failed` row for the account's
-passkeys, means the row did not leave through the store.
+answers `gone` too. Before discounting a `gone` row, look for an `integrity.authority_seal_failed`
+row for the account's passkeys from the same request: on a sealed store it means the row did not
+leave through the store. The refusal alone does not tell this apart. A `factor_unverified` refusal
+also follows an account row that does not load, and a session, account or lock refusal is answered
+ahead of it, so it can read `session_lost` or `locked` instead. A keyless store keeps no seal, so
+there a row removed outside the store is refused `factor_removed` and nothing tells it from a
+holder's delete. (Corrected 2026-11-05, BACKLOG #3068 N1: this read "a `factor_unverified`
+refusal, with an `integrity.authority_seal_failed` row ... means the row did not leave through
+the store", which overclaimed the refusal.)
 
 A py_webauthn counter regression (the library's own rejection) is untouched: it is a clone signal
 whether or not the passkey is later deleted. AC-4 is unchanged. Section 4's text is left as
