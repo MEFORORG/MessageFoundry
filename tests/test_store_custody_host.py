@@ -467,6 +467,125 @@ def test_a_settle_refusal_holds_no_reference_to_the_master_key(
             gc.enable()
 
 
+class _TrackedKey(str):
+    """A base64 key text that can be weakly referenced, so a test can see whether anything still
+    holds it; ``str`` itself cannot be."""
+
+    __slots__ = ("__weakref__",)
+
+
+def _key_lifetime(
+    raise_under: Any, key: _TrackedKey
+) -> tuple[type[BaseException], bool, bool, bool]:
+    """``(kind, on_traceback, outlived, cycled)`` for ``key``, handed to ``raise_under`` as its
+    only reference, with the cyclic collector off: the class of the refusal ``raise_under`` raised,
+    whether a frame local on its traceback holds the key while the refusal is held, whether the key
+    is still alive once the refusal is dropped, and whether the refusal itself is, which only a
+    cycle keeps. ``key`` is passed in a one-item list that ``raise_under`` empties, so this frame
+    keeps no reference to it, and nor does the caller once this returns."""
+    import gc
+    import weakref
+
+    alive = weakref.ref(key)
+    handed = [key]
+    del key
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        try:
+            raise_under(handed)
+        except Exception as caught:  # noqa: BLE001 -- any refusal; only the key's lifetime counts
+            refusal = caught
+        else:
+            pytest.fail("no refusal was raised")
+        assert not handed, "the key was not handed over"
+        kind, refused = type(refusal), weakref.ref(refusal)
+        on_traceback = False
+        link = refusal.__traceback__
+        while link is not None:
+            on_traceback |= any(
+                value is not None and value is alive() for value in link.tb_frame.f_locals.values()
+            )
+            link = link.tb_next
+        del refusal
+        return kind, on_traceback, alive() is not None, refused() is not None
+    finally:
+        if was_enabled:
+            gc.enable()
+        gc.collect()
+
+
+def test_the_lifetime_probe_sees_a_key_a_bound_refusal_keeps() -> None:
+    """The positive control for the two key-lifetime cases below: a frame that holds the key and
+    raises a refusal it still has bound, the shape those sites had at 87381412455a, keeps the key
+    past the dropped refusal with the collector off, and the probe reports it."""
+
+    class _Refusal(ValueError):
+        """A class of its own, since a built-in exception cannot be weakly referenced."""
+
+    def _old_shape(handed: list[_TrackedKey]) -> None:
+        key = handed.pop()
+        refusal = _Refusal("a stand-in refusal")
+        assert key
+        raise refusal
+
+    _kind, on_traceback, outlived, cycled = _key_lifetime(_old_shape, _TrackedKey("a stand-in key"))
+    assert on_traceback, "the probe did not see the key on the held refusal's traceback"
+    assert outlived, "the probe did not see a key a bound refusal keeps"
+    assert cycled, "the probe did not see the cycle a bound refusal makes"
+
+
+def test_a_cipher_build_refusal_holds_no_reference_to_the_host_key(tmp_path: Path) -> None:
+    """``build_store_cipher`` refused under a ``host_key`` that is not base64 of 32 bytes: once the
+    refusal is caught and dropped, with the cyclic collector off, nothing keeps the key, so neither
+    the refusal's traceback nor a cycle through the build's frame holds the store data key (the
+    Lander's hold on PR 2804)."""
+    from messagefoundry.store.base import StoreCipherConfigError, build_store_cipher
+
+    settings = _settings(tmp_path)
+
+    def _build(handed: list[_TrackedKey]) -> None:
+        build_store_cipher(settings, host_key=handed.pop())
+
+    kind, on_traceback, outlived, cycled = _key_lifetime(_build, _TrackedKey("not a base64 key"))
+    assert kind is StoreCipherConfigError
+    assert not on_traceback, "a frame on the held refusal's traceback keeps the host key"
+    assert not outlived, "the cipher build refusal keeps the host key"
+    assert not cycled, "the cipher build refusal is kept by a cycle through its frame"
+
+
+def test_a_decrypt_keyring_refusal_holds_no_reference_to_the_active_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``resolve_decrypt_keys`` refused after its provider answered the active key, because the
+    retired keys could not be read: once the refusal is caught and dropped, with the cyclic
+    collector off, nothing keeps the active key (the Lander's hold on PR 2804)."""
+    from messagefoundry.store import base
+
+    class _Provider:
+        def __init__(self, handed: list[_TrackedKey]) -> None:
+            self._handed = handed
+
+        def active_key(self) -> str:
+            return self._handed.pop()  # handed over once, so the provider keeps no reference
+
+        def retired_keys(self) -> list[str]:
+            raise RuntimeError("a stand-in retired key read failure")
+
+    def _resolve(handed: list[_TrackedKey]) -> None:
+        monkeypatch.setattr(base, "resolve_key_provider", lambda *a, **k: _Provider(handed))
+        base.resolve_decrypt_keys(_settings(tmp_path, key_provider="env"))
+
+    # Built in the call outside any assert, whose rewrite would keep it, so this frame keeps none.
+    kind, on_traceback, outlived, cycled = _key_lifetime(
+        _resolve, _TrackedKey(base64.b64encode(bytes(32)).decode())
+    )
+    assert kind is KeyProviderError
+    assert not on_traceback, "a frame on the held refusal's traceback keeps the active key"
+    assert not outlived, "the decrypt keyring refusal keeps the active key"
+    assert not cycled, "the decrypt keyring refusal is kept by a cycle through its frame"
+
+
 def test_a_conversion_left_behind_reaches_the_open_and_every_seam_with_its_remedy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
