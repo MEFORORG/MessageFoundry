@@ -893,8 +893,9 @@ def test_a_pr_body_phrasing_the_first_detector_missed_is_flagged(sf, kind: str, 
     assert kind in _pr_kinds(sf, f"Context above.\n\n{line}\n\nContext below."), line
 
 
-#: Table cells with markup or an apostrophe inside them. Engine PR 2448's detector flags every row but
-#: the last, so a cell that lost its markup by deletion ("stayspartial", "isnt met") was a regression.
+#: Table cells with markup or an apostrophe inside them. Engine PR 2448's detector flags the first six
+#: rows, so a cell read only with its markup deleted ("stayspartial") was a regression against it; the
+#: rest are this detector's own shapes, which a cell read only one way loses.
 _PR_CELL_MARKUP_MUST_FIRE = [
     f"| ASVS {_REQ} | the outbound limb | stays`{_PARTIAL}` |",
     f"| {_REQ} | the outbound limb | stays`{_PARTIAL}` |",
@@ -903,12 +904,16 @@ _PR_CELL_MARKUP_MUST_FIRE = [
     f"| {_REQ} | the outbound limb | stays_{_PARTIAL}_ |",
     f"| {_REQ} | the outbound limb | stays*{_PARTIAL}* |",
     f"| ASVS {_REQ} | the outbound limb | isn't met |",
+    f"| ASVS {_REQ} | it's {_PARTIAL} |",
+    f"| V'{_REQ} | the outbound limb | {_PARTIAL} |",
+    f"| #1, #2 | {_REQ}, {_REQ_B} | unchanged, `{_PARTIAL}`. |",
 ]
 
 
 @pytest.mark.parametrize("row", _PR_CELL_MARKUP_MUST_FIRE)
 def test_markup_inside_a_table_cell_separates_words_and_keeps_an_apostrophe(sf, row: str) -> None:
-    """Cell markup reads as a space, as _PR_SEP reads it, and an apostrophe inside a word stays."""
+    """A cell is read with its markup trimmed from its ends, as engine PR 2448 read it, and again with
+    all of it deleted, so neither reading loses what the other catches."""
     assert "verdict" in _pr_kinds(sf, row), row
 
 

@@ -564,14 +564,10 @@ _PR_CELL_VERDICT_LEAD = re.compile(
     rf"(?i)(?:(?P<prefix>unchanged(?:[,;:]|{_PR_CELL_DASH})?|{_PR_STATE_VERB}){_PR_SEP})?"
     rf"{_PR_QUALIFIER}{_PR_VERDICT}(?:[.;,:](?:\s|$)|\s*\(|{_PR_CELL_DASH}(?:\s|$)|$)"
 )
-#: The markup a table cell wraps around a value. Between two words it is a separator, as _PR_SEP reads
-#: it, so `stays`partial`` is two words and not "stayspartial"; anywhere else it is deleted, so a
-#: verdict keeps the punctuation after it ("`partial`."). An apostrophe between letters is part of a
-#: word ("isn't met") and stays.
-_PR_CELL_MARKUP_JOIN = re.compile(
-    r"(?<=[A-Za-z0-9])(?!(?<=[A-Za-z])'[A-Za-z])[*`_\"']+(?=[A-Za-z0-9])"
-)
-_PR_CELL_MARKUP = re.compile(r"[*`_\"]|(?<![A-Za-z])'|'(?![A-Za-z])")
+#: The markup a table cell wraps around a value, and the separators of a cell that lists identifiers.
+_PR_CELL_MARKUP = re.compile(_PR_MARKUP)
+#: The same characters plus a space, as str.strip takes them, to trim only a cell's ends.
+_PR_CELL_EDGE = " " + _PR_MARKUP[1:-1].replace("\\", "")
 #: No "\s*" around a separator: on a long run of spaces it backtracks quadratically, so whitespace is a
 #: separator of its own and the empty parts are dropped.
 _PR_CELL_LIST = re.compile(r"[,;/&+]|(?i:\band\b)|\s+")
@@ -778,12 +774,16 @@ def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
     """A table row with an identifier cell and a cell that is nothing but a verdict, wherever it sits.
     The identifier cell may list several, split by a comma, semicolon, slash, "&", "+", "and" or
     whitespace, each with or without its ASVS or V lead. A cell that opens with a bare verdict and
-    goes on binds only a row whose identifier is marked (_PR_CELL_VERDICT_LEAD)."""
+    goes on binds only a row whose identifier is marked (_PR_CELL_VERDICT_LEAD).
+
+    Each cell is read twice. Trimmed at its ends only, as engine PR 2448 read it, the markup inside
+    it is a separator the cell patterns read through _PR_SEP ("stays`partial`", "isn't met"). With
+    all its markup deleted, an identifier cell's lead and list read whole ("ASVS `<id>`")."""
     if not ids:
         return False
-    cells = [
-        _PR_CELL_MARKUP.sub("", _PR_CELL_MARKUP_JOIN.sub(" ", c)).strip()
-        for c in row.strip().strip("|").split("|")
+    raw = row.strip().strip("|").split("|")
+    cells = [c.strip(_PR_CELL_EDGE) for c in raw] + [
+        _PR_CELL_MARKUP.sub("", c).strip() for c in raw
     ]
     keys = {_PR_CELL_ID_LEAD.sub("", i) for i in ids}
 
