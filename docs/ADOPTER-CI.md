@@ -223,7 +223,9 @@ that package's build code may run in CI:
     (a lock records none), a URL or path with no package name, and an editable line (`-e` or
     `--editable` in any spelling pip takes, which installs a source tree or checkout no lock pin
     holds) are only noted. A requirement it cannot parse fails, and so does a line of options with
-    no requirement that pip cannot read. The options on a line that also holds a requirement are
+    no requirement that pip cannot read. An include or constraint line (`-r`, `--requirement`, `-c`
+    or `--constraint`, in any spelling pip takes, with no editable on the line) fails too, because
+    the step reads no file a line names. The options on a line that also holds a requirement are
     not read.
   - The job takes the engine's pin out of the lock, as pip reads the lock, and installs that pin
     alone with `--no-deps --require-hashes`. The lock must pin `messagefoundry` exactly once, or the

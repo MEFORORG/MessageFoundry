@@ -352,7 +352,9 @@ jobs:
       # --editable, in any spelling pip takes) are only noted: the lock records no extras, an
       # unnamed URL has no name to look up, and an editable installs a source tree or checkout that
       # no lock pin holds. A requirement it cannot parse fails, and so does a line of options with
-      # no requirement that pip cannot read.
+      # no requirement that pip cannot read. An include or constraint line (-r, --requirement, -c or
+      # --constraint, in any spelling pip takes, with no editable on the line) fails too: this step
+      # reads no file a line names.
       - name: Check requirements.lock is not stale against requirements.txt
         if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
         run: |
@@ -505,17 +507,24 @@ def unnamed(text):
     return "/" in text or "\\" in text or text.startswith(".") or scheme.isalpha() or "+" in scheme
 
 
-def editable(options):
-    # Whether pip installs a line of options and no requirement as an editable, read by pip's own
-    # requirements-line parser as its parse_line reads it. None when pip cannot read the options:
-    # shlex's ValueError, optparse's error, or a PipError such as CommandError from an option's check.
+def option_kind(options):
+    # What pip does with a line of options and no requirement, read by pip's own requirements-line
+    # parser as its parse_line reads it: "editable", "include" or "constraint", in the order pip 26
+    # gives them (an editable is the line's requirement, so pip follows no file named beside it, and
+    # an include wins over a constraint), or "" for any other options. None when pip cannot read the
+    # options: shlex's ValueError, optparse's error, or a PipError such as CommandError from an
+    # option's check.
     parser = build_parser()
     parser.set_usage(optparse.SUPPRESS_USAGE)
     try:
         opts = parser.parse_args(shlex.split(" ".join(options)), parser.get_default_values())[0]
     except (OptionParsingError, PipError, ValueError):
         return None
-    return bool(opts.editables)
+    if opts.editables:
+        return "editable"
+    if opts.requirements:
+        return "include"
+    return "constraint" if opts.constraints else ""
 
 
 locked = {}
@@ -530,11 +539,15 @@ for group in logical_lines("requirements.txt"):
     text, options, line = split_line(group)
     req = requirement(text)
     if req is None:
-        found = editable(options)
-        if found is None:
+        kind = option_kind(options)
+        if kind is None:
             stale.append(f"{line} is not a line pip can read")
-        elif found:
+        elif kind == "editable":
             print(f"::notice::{line} is editable, so it is not checked against requirements.lock")
+        elif kind == "include":
+            stale.append(f"{line} includes another requirements file, which this check does not read")
+        elif kind == "constraint":
+            stale.append(f"{line} names a constraints file, which this check does not read")
         continue
     if isinstance(req, str):
         if unnamed(req):
