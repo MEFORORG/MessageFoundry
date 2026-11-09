@@ -188,6 +188,11 @@ class _RecordingStore:
         # store has no Transit key, so the gate does nothing here.
         return CipherInfo(encrypts=False, active_key_id=None)
 
+    def row_sealer(self) -> None:
+        # Read next by Engine.start's row-sealer start probe (ADR 0217 slice 1b-iii): a keyless
+        # store has no sealer, so the probe does nothing here.
+        return None
+
 
 async def test_engine_single_node_resets_and_spawns_no_leader_task() -> None:
     """Default-shaped (Null-like) coordinator: reclaims_inflight() False → the engine runs the

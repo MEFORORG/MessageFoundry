@@ -109,6 +109,7 @@ from messagefoundry.pipeline.wiring_runner import (
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.crypto import Cipher
+from messagefoundry.store.row_seal import probe_row_sealer_at_start
 from messagefoundry.store.store import (
     AUDIT_PREFIX_BREAK_MARKER,
     REINGRESS_TARGET_PREFIX,
@@ -1858,6 +1859,10 @@ class Engine:
             self.store.cipher_info().transit_key_name,
             enforcement=self._security_enforcement,
         )
+        # ADR 0217 slice 1b-iii (owner ruling 2026-11-07): a Transit row sealer proves it can hmac
+        # and verify under the audit key before anything reads an authority row. A failed probe
+        # refuses the start, failing closed, before recovery or any listener, on every backend.
+        await probe_row_sealer_at_start(self.store.row_sealer())
         # All-stages recovery: returns any row a crash left `inflight` — ingress rows mid-route and
         # outbound rows mid-delivery alike — to `pending` so the staged workers re-claim them
         # (staged pipeline, ADR 0001). The handoff/delivery transactions make the re-run idempotent.

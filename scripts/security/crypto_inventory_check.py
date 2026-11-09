@@ -561,9 +561,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/store/sealed_cache.py": frozenset({"messagefoundry.store.crypto"}),
     # BACKLOG #2592: row integrity seals. hmac = HMAC-SHA256 over a typed row encoding under a key
     # derived (HKDF, through the store.crypto seam) from the store key's authorization root; hashlib =
-    # the SHA-256 the HMAC runs over; compare_digest for the constant-time verify.
+    # the SHA-256 the HMAC runs over; compare_digest for the constant-time verify. ADR 0217 slice
+    # 1b-iii: crypto_transit = the TransitCipher type row_sealer_for_cipher tests for, to build the
+    # Transit row sealer (Vault hmac/verify under the audit key) on a vault_transit store.
     "messagefoundry/store/row_seal.py": frozenset(
-        {"hashlib", "hmac", "messagefoundry.store.crypto"}
+        {"hashlib", "hmac", "messagefoundry.store.crypto", "messagefoundry.store.crypto_transit"}
     ),
     # BACKLOG #2593: builds the AES-GCM associated data a queue payload cell is sealed under (the
     # row's routing fields) and opens the cell through the store cipher seam. No key of its own.

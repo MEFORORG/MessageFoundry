@@ -91,6 +91,15 @@ class _FakeTransit:
         digest = self._hmac.new(secret, base64.b64decode(hash_input), self._hashlib.sha256).digest()
         return {"data": {"hmac": "vault:v1:" + base64.b64encode(digest).decode("ascii")}}
 
+    def verify_signed_data(
+        self, *, name: str, hash_input: str, hmac: str, hash_algorithm: str = "sha2-256", **_: Any
+    ) -> dict[str, Any]:
+        # Transit `verify` of an HMAC: the row sealer's start probe and seal checks (ADR 0217).
+        secret = self._hmac_secret[name]
+        digest = self._hmac.new(secret, base64.b64decode(hash_input), self._hashlib.sha256).digest()
+        expected = "vault:v1:" + base64.b64encode(digest).decode("ascii")
+        return {"data": {"valid": self._hmac.compare_digest(expected, hmac)}}
+
     def encrypt_data(
         self, *, name: str, plaintext: str, associated_data: str | None = None, **_: Any
     ) -> dict[str, Any]:

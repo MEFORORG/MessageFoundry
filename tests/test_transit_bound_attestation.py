@@ -14,6 +14,7 @@ import base64
 import getpass
 import hashlib
 import hmac
+import hmac as _hmac_lib
 import json
 import logging
 import sqlite3
@@ -272,6 +273,16 @@ class _RotatingTransit(_FakeTransit):
         secret = self._hmac_secret[name] + version.to_bytes(4, "big")
         digest = hmac.new(secret, base64.b64decode(hash_input), hashlib.sha256).digest()
         return {"data": {"hmac": f"vault:v{version}:" + base64.b64encode(digest).decode("ascii")}}
+
+    def verify_signed_data(
+        self, *, name: str, hash_input: str, hmac: str, hash_algorithm: str = "sha2-256", **_: Any
+    ) -> dict[str, Any]:
+        # Transit `verify` at the version the MAC names, for the row sealer's start probe (ADR 0217).
+        version = int(hmac.removeprefix("vault:v").partition(":")[0])
+        secret = self._hmac_secret[name] + version.to_bytes(4, "big")
+        digest = _hmac_lib.new(secret, base64.b64decode(hash_input), hashlib.sha256).digest()
+        expected = f"vault:v{version}:" + base64.b64encode(digest).decode("ascii")
+        return {"data": {"valid": _hmac_lib.compare_digest(expected, hmac)}}
 
 
 async def test_rotating_the_transit_key_keeps_the_attestation(

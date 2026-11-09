@@ -193,8 +193,8 @@ from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
     USER_KIND,
     AnyRowSealer,
-    RowSealer,
     RowSealError,
+    row_sealer_for_cipher,
 )
 from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
@@ -1954,7 +1954,7 @@ class PostgresStore:
         self._settings = settings
         self._cipher: Cipher = cipher or IdentityCipher()
         # BACKLOG #2592: the row sealer, fixed for the handle's life; None on a keyless store.
-        self._row_sealer: AnyRowSealer | None = RowSealer.for_cipher(self._cipher)
+        self._row_sealer: AnyRowSealer | None = row_sealer_for_cipher(self._cipher)
         # A1 live cost counters (QueueStore protocol / `/stats` uniformity). Exposed at 0 on this backend:
         # counting is fully wired on SQLite + SQL Server, whose explicit ``conn.commit()`` / body-insert
         # sites funnel through single helpers; Postgres commits implicitly via ``async with

@@ -254,8 +254,9 @@ class RowSealer:
 
     @classmethod
     def for_cipher(cls, cipher: Cipher, *, store_id: bytes = NO_STORE_ID) -> RowSealer | None:
-        """The sealer for ``cipher``'s authorization root and ``store_id``, or ``None`` when the
-        cipher holds no in-process root."""
+        """The LOCAL sealer for ``cipher``'s authorization root and ``store_id``, or ``None`` when
+        the cipher holds no in-process root. A store builds its sealer with
+        :func:`row_sealer_for_cipher`, which also covers a Transit cipher."""
         root = cipher.authz_root()
         if root is None:
             return None
@@ -904,3 +905,50 @@ async def require_seal_for_write(
     if kind == SESSION_KIND and not sealer.is_active(stored):
         # Holds, but under a retired key: a session is never accepted under one.
         raise RowSealKeyRetiredError(kind, subject)
+
+
+class RowSealStartRefused(RuntimeError):
+    """The engine refused to start because its Transit row sealer's start probe failed (owner
+    ruling 2026-11-07 on ADR 0217). Its text is fixed and names no row, token or Vault reply."""
+
+    def __str__(self) -> str:
+        return (
+            "the Vault transit row sealer failed its start probe (hmac and verify under the audit"
+            " key), so the engine refuses to start"
+        )
+
+
+def row_sealer_for_cipher(cipher: Cipher, *, store_id: bytes = NO_STORE_ID) -> AnyRowSealer | None:
+    """The sealer a store holds for ``cipher``, on every backend: a :class:`TransitRowSealer` over a
+    :class:`~messagefoundry.store.crypto_transit.TransitCipher` (ADR 0217 slice 1b-iii), else
+    :meth:`RowSealer.for_cipher`'s local sealer, or ``None`` on a keyless store.
+
+    The Transit sealer is given no retired Transit key names: the ``retired_transit_audit_keys``
+    setting ADR 0217 names is not built, so a seal under an earlier audit key reads as Forged. Its
+    start probe is :func:`probe_row_sealer_at_start`."""
+    from messagefoundry.store.crypto_transit import TransitCipher  # it imports this module
+
+    if isinstance(cipher, TransitCipher):
+        return TransitRowSealer(cipher, store_id=store_id)
+    return RowSealer.for_cipher(cipher, store_id=store_id)
+
+
+async def probe_row_sealer_at_start(sealer: AnyRowSealer | None) -> None:
+    """Run a :class:`TransitRowSealer`'s start probe (:meth:`TransitRowSealer.probe_async`) and
+    refuse startup, failing closed, when it fails: a token that cannot ``hmac`` and ``verify``
+    under the audit key would otherwise start and refuse every authority row at its first request.
+    No-op for the local sealer and a keyless store. Raises :class:`RowSealStartRefused`, chained to
+    the Outage, after one ERROR line."""
+    if not isinstance(sealer, TransitRowSealer):
+        return
+    try:
+        version = await sealer.probe_async()
+    except TransitSealUnavailableError as exc:
+        log.error(
+            "startup refused: the Vault transit row sealer failed its start probe (%s); check that"
+            " the token holds transit/hmac and transit/verify on the audit key and that Vault is"
+            " reachable",
+            exc,
+        )
+        raise RowSealStartRefused() from exc
+    log.info("the Vault transit row sealer passed its start probe (key version %d)", version)

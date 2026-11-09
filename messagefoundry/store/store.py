@@ -195,6 +195,7 @@ from messagefoundry.store.row_seal import (
     RowSealError,
     RowSealKeyRetiredError,
     require_seal_for_write,
+    row_sealer_for_cipher,
     seal_bytes,
 )
 from messagefoundry.store.schema_verify import (
@@ -9558,7 +9559,7 @@ class MessageStore:
         # BACKLOG #2592: the row sealer, fixed for the handle's life like the cipher. None when the
         # cipher holds no in-process authorization root (keyless), and then no seal is written or
         # checked.
-        self._row_sealer: AnyRowSealer | None = RowSealer.for_cipher(self._cipher)
+        self._row_sealer: AnyRowSealer | None = row_sealer_for_cipher(self._cipher)
         # ADR 0196: set when this store's open failed to bind its salt into the cipher. That cipher
         # may already count for another store, so close() must not settle its reserve here.
         self._cipher_foreign = False
