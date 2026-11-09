@@ -28,7 +28,9 @@ from tests._ast_sites import package_trees
 #: caller's own keyword passed on; a literal False is a build whose line was logged before it.
 _PINNED: Counter[tuple[str, str, str]] = Counter(
     {
-        ("messagefoundry/pipeline/engine.py", "Engine.reload_detail", "False"): 1,
+        # The first load's start: Engine._first_load runs build_check_off_loop on this graph
+        # first, whose build_check logs the line (engine PR 2815 moved it out of reload_detail).
+        ("messagefoundry/pipeline/engine.py", "Engine._first_load", "False"): 1,
         (
             "messagefoundry/pipeline/wiring_runner.py",
             "RegistryRunner._build_fhir_lookup_executor.build",

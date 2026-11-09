@@ -246,6 +246,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         assert_same_origin(request)
         await core.dr_activate(engine=engine, identity=identity, body=None)
+        # The status page names the steps a degraded activation left unfinished (DrStatus.failures),
+        # so the redirect loses nothing and a refresh never re-POSTs the promotion.
         return RedirectResponse("/ui/status", status_code=303)
 
     @app.post("/ui/dr/release")

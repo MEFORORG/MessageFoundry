@@ -4189,7 +4189,9 @@ async def _run_connection_test(rr: RegistryRunner, name: str, direction: str) ->
         # vault BACKLOG #2371: the dialling CA first, as a lane build checks it.
         await rr.check_test_anchor(name)
         checked = True
-        _direction, connector = rr.build_test_connector(name)
+        # The build runs off the event loop: it can list folders and read files, such as a
+        # DATABASE connector's sslcapath entries (engine PR 2815, hold F2).
+        _direction, connector = await rr.build_test_connector_off_loop(name)
     except WiringError as exc:
         # This catch is EXHAUSTIVE only because build_test_connector normalizes every build failure to
         # WiringError; it did not always, and the escape cost more than a 500. The credential route's
@@ -10535,6 +10537,7 @@ def create_app(
             active=engine.dr_active,
             threshold=dr.priority_threshold.value,
             activation_mode=dr.activation_mode.value,
+            failures=list(engine.dr_activation_failures),
         )
 
     @app.get("/service/status", response_model=ServiceStatusInfo)
@@ -10575,7 +10578,9 @@ def create_app(
         not touched first (vault BACKLOG #2581).
         ``{"dba_attests_restored": true}`` is the operator's per-activation attestation that
         the DBA restored the server-DB ``mefor`` database (REQUIRED on postgres/sqlserver, ignored on
-        SQLite — BACKLOG #102). Aborts return a 4xx/5xx with the failing phase; the box stays passive."""
+        SQLite — BACKLOG #102). Aborts return a 4xx/5xx with the failing phase; the box stays passive.
+        A 200 with ``degraded`` true is not a clean activation: the box is active, and ``failures``
+        names each follow-on step that did not complete, such as ``outbound_close``."""
         coord = engine.dr_coordinator
         if coord is None:
             raise HTTPException(503, "this deployment is not a DR standby ([dr].enabled is false)")
@@ -10613,6 +10618,8 @@ def create_app(
             verify_status=result.verify_status,
             seed_segment=result.seed_segment,
             vip_hook_ran=result.vip_hook_ran,
+            degraded=bool(result.failures),
+            failures=list(result.failures),
         )
 
     @app.post("/dr/release", response_model=DrActionResult)
