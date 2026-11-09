@@ -30,6 +30,7 @@ import asyncio
 import base64
 import contextlib
 import contextvars
+import errno
 import functools
 import hashlib
 import json
@@ -3260,9 +3261,10 @@ class _PairLockBusy(TimeoutError):
 
 type _PairLockFailure = Literal["busy", "gone", "timeout", "refused", "failed"]
 
-#: ``ERROR_SHARING_VIOLATION`` and ``ERROR_LOCK_VIOLATION``: another program holds the file open,
-#: which Python maps to ``EACCES`` although no account is refused.
-_WINDOWS_HELD = frozenset({32, 33})
+#: What opening the lock path raises on POSIX when something planted there is not a regular file: a
+#: directory (``EISDIR``) or a socket (``ENXIO``). Like a planted link, that is a refusal, so it gets
+#: the once-per-process ERROR and the advice to remove it.
+_NOT_A_FILE = frozenset({errno.EISDIR, errno.ENXIO})
 
 
 def _pair_lock_failure(exc: OSError) -> _PairLockFailure:
@@ -3271,16 +3273,15 @@ def _pair_lock_failure(exc: OSError) -> _PairLockFailure:
     network file system can. ``refused``: the file system refused this account
     (``atomic_edit._REFUSED``), such as a lock file another account owns; ``edit_lock`` also raises
     ``busy_error`` for a lock path planted as a link, chained from the ``ELOOP``, and that is one
-    too. ``failed``: any other error, such as ``EIO`` or ``ESTALE`` from a network file system, or
-    a Windows sharing violation that carries its ``winerror``; one the open reports as bare
-    ``EACCES`` reads as ``refused``."""
+    too, as is a planted directory or socket (``_NOT_A_FILE``). ``failed``: any other error, such
+    as ``EIO`` or ``ESTALE`` from a network file system."""
     if isinstance(exc, _PairLockBusy):
         return "refused" if exc.__cause__ is not None else "busy"
     if isinstance(exc, FileNotFoundError):
         return "gone"
     if isinstance(exc, TimeoutError):
         return "timeout"
-    if exc.errno in _REFUSED and getattr(exc, "winerror", None) not in _WINDOWS_HELD:
+    if exc.errno in _REFUSED or exc.errno in _NOT_A_FILE:
         return "refused"
     return "failed"
 
@@ -3301,6 +3302,9 @@ _RESEAL_BLOCKED: dict[_PairLockFailure, str] = {
 # The lock files whose refusal an engine removal has already logged at ERROR in this process, so a
 # lock that stays refused is one ERROR, not one per pair on every prune pass.
 _unlocked_logged: set[str] = set()
+# The lock files whose ``failed`` error an engine removal has already logged at WARNING in this
+# process: such an error can last, as a stale mount does, so it is one WARNING, not one per pair.
+_failed_logged: set[str] = set()
 _unlocked_logged_lock = threading.Lock()
 
 
@@ -3329,7 +3333,8 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
     A lock still held when the wait runs out is not a refusal: it is logged at WARNING each time,
     with ``edit_lock``'s own reason, and never uses up that one ERROR. Nor is an OS timeout, which
     is logged at WARNING each time as a timeout, nor any other error that is not a refusal, which
-    is logged at WARNING each time naming the error (:func:`_pair_lock_failure`).
+    an engine removal logs at WARNING once per process per lock file, naming the error, and the
+    re-seal logs at WARNING each time (:func:`_pair_lock_failure`).
     **The re-seal fails closed (``for_reseal``):** a lock it cannot take is logged and raised. At
     the pass's first check that stops every write; at a half's write, that half is a skip."""
     with contextlib.ExitStack() as held:
@@ -3354,7 +3359,13 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
                     f"; {_RERUN_WHEN_FREE}" if for_reseal else "",
                 )
             elif failure in ("timeout", "failed"):
-                _log.warning(
+                first = True
+                if failure == "failed" and not for_reseal:
+                    with _unlocked_logged_lock:
+                        first = lock not in _failed_logged
+                        _failed_logged.add(lock)
+                _log.log(
+                    logging.WARNING if first else logging.DEBUG,
                     "uploaded-logs pair lock %s: the file system %s taking it (%s: %s). %s",
                     lock,
                     "timed out" if failure == "timeout" else "failed",

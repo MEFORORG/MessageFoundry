@@ -502,8 +502,8 @@ def test_a_root_gone_at_a_half_write_does_not_blame_the_lock(
 def test_pair_lock_failures_are_classified_apart() -> None:
     """``edit_lock`` raises ``busy_error`` for a planted link too, chained from the ELOOP; that one
     is a refusal. An OS ``ETIMEDOUT`` is a timeout, neither contention nor a refusal. Only an errno
-    in ``atomic_edit._REFUSED`` is a refusal, which gets the account advice; a Windows sharing
-    violation that carries its ``winerror`` is not, though Python maps it to ``EACCES``."""
+    in ``atomic_edit._REFUSED``, or a planted directory or socket, is a refusal, which gets the
+    account and remove-it advice."""
     try:
         try:
             raise OSError(errno.ELOOP, "Too many levels of symbolic links")
@@ -515,13 +515,10 @@ def test_pair_lock_failures_are_classified_apart() -> None:
     assert failure(uploads_mod._PairLockBusy("still in progress")) == "busy"
     assert failure(TimeoutError(errno.ETIMEDOUT, "Connection timed out")) == "timeout"
     assert failure(FileNotFoundError(errno.ENOENT, "gone")) == "gone"
-    for code in (errno.EACCES, errno.EPERM, errno.EROFS):
+    for code in (errno.EACCES, errno.EPERM, errno.EROFS, errno.EISDIR, errno.ENXIO):
         assert failure(OSError(code, os.strerror(code))) == "refused", code
     for code in (errno.EIO, errno.EINVAL, errno.ESTALE, errno.ENOTDIR):
         assert failure(OSError(code, os.strerror(code))) == "failed", code
-    held = PermissionError(errno.EACCES, "in use")
-    held.winerror = 32  # type: ignore[attr-defined,unused-ignore]
-    assert failure(held) == "failed"
 
 
 @pytest.mark.parametrize(
@@ -532,8 +529,8 @@ def test_an_os_error_that_is_no_refusal_is_failed_without_the_account_advice(
 ) -> None:
     """An error outside ``atomic_edit._REFUSED`` (an NFS soft mount's ``EIO``, Windows'
     ``ERROR_SEM_TIMEOUT`` as ``EINVAL``, ``ESTALE``) is no account's lock file. The removal goes on,
-    a WARNING names the error, the once-per-process ERROR is not used up, and the re-seal skips
-    with the neutral cause and no account advice."""
+    a WARNING names the error once per process, the once-per-process ERROR is not used up, and the
+    re-seal skips with the neutral cause and no account advice."""
 
     def _fails(path: Path, **_: Any) -> Any:
         raise OSError(code, os.strerror(code), str(path))
@@ -543,9 +540,15 @@ def test_an_os_error_that_is_no_refusal_is_failed_without_the_account_advice(
     fid = _seed(root, old)
     monkeypatch.setattr(uploads_mod, "edit_lock", _fails)
     monkeypatch.setattr(uploads_mod, "_unlocked_logged", set())
+    monkeypatch.setattr(uploads_mod, "_failed_logged", set())
     with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
         result = asyncio.run(_store(root, new, old).reseal_to_active())
         assert _store(root, old)._discard_cancelled_sync(fid) is True
+        removal = "This removal goes on without it"
+        assert caplog.text.count(removal) == 1, caplog.text
+        second = _seed(root, old)
+        assert _store(root, old)._discard_cancelled_sync(second) is True
+        assert caplog.text.count(removal) == 1, caplog.text
     assert result.skipped == 1 and result.incomplete and result.resealed == 0
     assert upload_names(root) == []
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
