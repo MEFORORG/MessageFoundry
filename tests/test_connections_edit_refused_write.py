@@ -39,6 +39,7 @@ from messagefoundry.config import (
     security_edit,
 )
 from messagefoundry.config.wiring import WiringError
+from tests._log_absence import assert_capture_sees
 
 CONNECTIONS_TOML = textwrap.dedent(
     """
@@ -1025,6 +1026,7 @@ def test_a_refusal_logs_a_listed_name_without_its_control_characters(
     with pytest.raises(WiringError):
         atomic_edit.is_file(tmp_path / name, refused_error=WiringError)
 
+    assert_capture_sees(caplog, atomic_edit.__name__)
     assert [record for record in caplog.records if "\n" in record.getMessage()] == []
 
 

@@ -40,6 +40,7 @@ from messagefoundry.auth.service import STEP_UP_ACTION_SESSION_TERMINATE, AuthSe
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
+from tests._enrolment_code import enrolment_code_for
 
 RP = "t"
 ORIGIN = "http://t"
@@ -119,6 +120,8 @@ async def _enroll_passkey(
         token=token,
         rp_id=RP,
         origin=ORIGIN,
+        # ADR 0207: a directory account's first factor binds only with an issued code.
+        enrolment_code=await enrolment_code_for(service, identity.user_id),
     )
     assert elevation.ok is True
     fresh = elevation.token

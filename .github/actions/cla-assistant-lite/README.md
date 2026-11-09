@@ -2,7 +2,7 @@
 
 This directory vendors `contributor-assistant/github-action` at commit `ca4a40a7d1004f18d9960b404b97e5f30a505a08` (tag `v2.6.1`).
 
-GitHub archived the upstream repository, and no maintained fork or successor exists. We vendor it instead, the same approach this project already takes for other unmaintained-but-needed third-party code (see `messagefoundry/anon/`, vendored to `tee/anon/`).
+GitHub archived the upstream repository, and no maintained fork or successor exists. We vendor it instead, the same approach this project already takes for other unmaintained-but-needed third-party code (see `messagefoundry_toolkit/anon/`, vendored to `tee/anon/`).
 
 The action is Apache-2.0 licensed. The license text is in `LICENSE` in this directory.
 

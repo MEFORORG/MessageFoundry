@@ -15,6 +15,7 @@ which injects into an INBOUND. Both live in test_webui_edit.py / test_uploaded_l
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
@@ -192,29 +193,27 @@ def test_the_confirm_page_post_is_body_less() -> None:
 def test_the_outcome_page_words_a_duplicate_apart_from_a_send() -> None:
     """ADR 0090 section 4's ``duplicate`` queued NOTHING. Reporting it as a send is the same lie as
     answering a refusal with the success response."""
-    sent = str(message_resend_done("m1", "OB2", "archive", duplicate=False))
-    dup = str(message_resend_done("m1", "OB2", "archive", duplicate=True))
+    sent = str(message_resend_done("m1", "OB2", duplicate=False))
+    dup = str(message_resend_done("m1", "OB2", duplicate=True))
     assert "Resend queued" in sent and "nothing new was queued" not in sent
     assert "Already resent" in dup and "nothing new was queued" in dup
     assert "Resend queued" not in dup
-    # No source names none, rather than an empty pair of quotes.
-    bare = str(message_resend_done("m1", "OB2", "", duplicate=False))
-    assert "copied from" not in bare and "“OB2”." in bare
+    # The page names the target alone; it takes no source to name (vault BACKLOG #3241 item 4).
+    assert "copied from" not in sent and "“OB2”." in sent
+    assert "source" not in inspect.signature(message_resend_done).parameters
 
 
 def test_the_outcome_page_carries_the_tail_warning_too() -> None:
     """The operator sees it when they decide AND when it lands. The confirm page's copy is read before
     the act; this one is what they still have in front of them if a delivery arrives out of order."""
-    assert str(text(RESEND_TAIL_WARNING)) in str(
-        message_resend_done("m1", "OB2", "archive", duplicate=False)
-    )
+    assert str(text(RESEND_TAIL_WARNING)) in str(message_resend_done("m1", "OB2", duplicate=False))
 
 
 def test_the_outcome_page_leaves_by_link_not_by_redirect() -> None:
     """Both ways out are anchors. A 303 to the message detail page would need ``messages:view_raw``,
     which a resend-only role does not hold -- the measured defect this page replaced. A link that
     role cannot follow is merely a link it does not click."""
-    html = str(message_resend_done("m1", "OB2", "archive", duplicate=False))
+    html = str(message_resend_done("m1", "OB2", duplicate=False))
     assert '<a href="/ui/messages/m1" class="btn-link">' in html
     assert '<a href="/ui/messages" class="btn-link">' in html
 

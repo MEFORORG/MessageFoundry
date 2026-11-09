@@ -2135,6 +2135,55 @@ def _load_check_settings(
     return load_settings(cli=cli, default_file=False)
 
 
+def _leg_settings(
+    name: str,
+    config_dir: str | Path,
+    *,
+    required: bool,
+    service_config: str | Path | None,
+    suppress_search: bool,
+    env: str | None,
+    cli: Mapping[str, Mapping[str, Any]] | None = None,
+) -> ServiceSettings | CheckResult:
+    """The prologue at least ten settings legs share: the settings a leg grades, or the line it
+    returns instead (vault BACKLOG #3145 item 3). Two readers keep their own, because their
+    no-settings arm is not a SKIP: ``static-credentials`` goes on graph-only, and
+    :func:`_resolve_snapshot_on_send` falls back to the model default.
+
+    Nothing to read (:func:`_settings_source` answers ``(None, False)``) is a SKIP, worded by
+    :func:`_no_settings_detail`. A file, or an environment declaration, the loader refuses is a
+    FAIL. **PRESENT-BUT-REFUSED IS A FAILURE, NOT A SKIP (BACKLOG #1318):** rendering both states
+    identically is what let ``messagefoundry init`` ship a config this very gate refuses -- the
+    gate LOADED it, got the refusal, printed it, and returned skip with rc 0. The refusal is
+    rendered by :func:`_settings_error`, never ``str(exc)``: a ``ValidationError`` echoes input
+    values, and the environment-sourced secrets are among them.
+
+    ``name`` and ``required`` are the leg's own, on both lines. ``env`` (``check --env``) and
+    ``cli`` are passed to :func:`_settings_source` and :func:`_load_check_settings` unchanged."""
+    from pydantic import ValidationError
+
+    toml, env_only = _settings_source(
+        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+    )
+    if toml is None and not env_only:
+        return CheckResult(
+            name,
+            ok=True,
+            required=required,
+            skipped=True,
+            detail=_no_settings_detail(service_config, suppress_search),
+        )
+    try:
+        return _load_check_settings(toml, cli=cli, env=env)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        return CheckResult(
+            name,
+            ok=False,
+            required=required,
+            detail=f"settings did not load: {_settings_error(exc)}",
+        )
+
+
 def _serve_reads_other_note(
     toml: Path | None, *, explicit: bool, suppress_search: bool
 ) -> str | None:
@@ -2232,33 +2281,16 @@ def _check_posture(
     read from the environment alone (:func:`_settings_source`, vault BACKLOG #2355).
     No active environment set → SKIP (``serve`` reports that separately; not this check's concern).
     Settings that won't load → FAIL (BACKLOG #1318)."""
-    from pydantic import ValidationError
-
-    toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+    settings = _leg_settings(
+        "posture",
+        config_dir,
+        required=True,
+        service_config=service_config,
+        suppress_search=suppress_search,
+        env=env,
     )
-    if toml is None and not env_only:
-        return CheckResult(
-            "posture",
-            ok=True,
-            required=True,
-            skipped=True,
-            detail=_no_settings_detail(service_config, suppress_search),
-        )
-    try:
-        settings = _load_check_settings(toml, env=env)
-    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        # PRESENT-BUT-REFUSED IS A FAILURE, NOT A SKIP (BACKLOG #1318). Reaching here means a file
-        # EXISTS, or the environment declared the instance (#2355), and the loader rejected it.
-        # Absent is the legitimate skip and is handled earlier; rendering both states identically
-        # is what let `messagefoundry init` ship a config this very gate refuses -- the gate LOADED
-        # it, got the refusal, printed it, and returned skip with rc 0.
-        return CheckResult(
-            "posture",
-            ok=False,
-            required=True,
-            detail=f"settings did not load: {_settings_error(exc)}",
-        )
+    if isinstance(settings, CheckResult):
+        return settings
 
     if settings.ai.environment is None:
         # No active environment is a serve-time error of its own; don't conflate it with posture.
@@ -2308,8 +2340,6 @@ def _check_build(
     alone (:func:`_settings_source`, vault BACKLOG #2355)."""
     import os
 
-    from pydantic import ValidationError
-
     from messagefoundry.config.environments import (
         load_environment_values,
         resolve_values_base_dir,
@@ -2318,21 +2348,6 @@ def _check_build(
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
     from messagefoundry.pipeline.wiring_runner import build_check_registry
 
-    toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
-    )
-    if toml is None and not env_only:
-        # No declared instance posture — a bare config dir. The posture-keyed refusal has nothing to key
-        # on, so skip (byte-identical to before this check). An instance declared through
-        # check --env or MEFOR_AI_ENVIRONMENT with no file is read from the environment instead
-        # (vault BACKLOG #2355).
-        return CheckResult(
-            "build-check",
-            ok=True,
-            required=True,
-            skipped=True,
-            detail=_no_settings_detail(service_config, suppress_search),
-        )
     # --project-root anchors the env VALUES, applied exactly as `serve` applies it (__main__.py, the
     # `cli["environments"]["base_dir"] = args.project_root` line): as a [environments].base_dir CLI
     # override, which load_settings' CLI > env > file precedence puts above a file-set base_dir.
@@ -2345,20 +2360,19 @@ def _check_build(
     cli: dict[str, dict[str, object]] | None = (
         {"environments": {"base_dir": str(project_root)}} if project_root is not None else None
     )
-    try:
-        settings = _load_check_settings(toml, cli=cli, env=env)
-    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        # PRESENT-BUT-REFUSED IS A FAILURE, NOT A SKIP (BACKLOG #1318). Reaching here means a file
-        # EXISTS, or the environment declared the instance (#2355), and the loader rejected it.
-        # Absent is the legitimate skip and is handled earlier; rendering both states identically
-        # is what let `messagefoundry init` ship a config this very gate refuses -- the gate LOADED
-        # it, got the refusal, printed it, and returned skip with rc 0.
-        return CheckResult(
-            "build-check",
-            ok=False,
-            required=True,
-            detail=f"settings did not load: {_settings_error(exc)}",
-        )
+    # A bare config dir declares no posture for the refusal to key on, so its SKIP line is
+    # byte-identical to before this check.
+    settings = _leg_settings(
+        "build-check",
+        config_dir,
+        required=True,
+        service_config=service_config,
+        suppress_search=suppress_search,
+        env=env,
+        cli=cli,
+    )
+    if isinstance(settings, CheckResult):
+        return settings
     try:
         # allow_empty: same reason as reference-backend (BACKLOG #1648) -- REQUIRED leg, and its skip
         # arm delegates to the one leg `--allow-empty-config` silences. With zero connections there
@@ -2483,33 +2497,16 @@ def _check_alert_smtp_tls(
 
     Service-toml resolution is :func:`_check_posture`'s, verbatim, environment-only declaration
     included (vault BACKLOG #2355); no ``messagefoundry.toml`` and no declaration → SKIP."""
-    from pydantic import ValidationError
-
-    toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+    settings = _leg_settings(
+        "alert-smtp-tls",
+        config_dir,
+        required=False,
+        service_config=service_config,
+        suppress_search=suppress_search,
+        env=env,
     )
-    if toml is None and not env_only:
-        return CheckResult(
-            "alert-smtp-tls",
-            ok=True,
-            required=False,
-            skipped=True,
-            detail=_no_settings_detail(service_config, suppress_search),
-        )
-    try:
-        settings = _load_check_settings(toml, env=env)
-    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        # PRESENT-BUT-REFUSED IS A FAILURE, NOT A SKIP (BACKLOG #1318). Reaching here means a file
-        # EXISTS, or the environment declared the instance (#2355), and the loader rejected it.
-        # Absent is the legitimate skip and is handled earlier; rendering both states identically
-        # is what let `messagefoundry init` ship a config this very gate refuses -- the gate LOADED
-        # it, got the refusal, printed it, and returned skip with rc 0.
-        return CheckResult(
-            "alert-smtp-tls",
-            ok=False,
-            required=False,
-            detail=f"settings did not load: {_settings_error(exc)}",
-        )
+    if isinstance(settings, CheckResult):
+        return settings
     alerts = settings.alerts
     if not (alerts.email_smtp_host and alerts.email_from):
         return CheckResult(
@@ -2810,8 +2807,11 @@ def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
     a heuristic over names. This line stays advisory on every hop. The ``build-check`` leg refuses
     one on a hop the no-escape credential rule covers, but that leg can SKIP (its own detail says
     why), so a passing ``check`` does not prove the hop was judged.
-    It reads a literal ``url`` only; an ``env()`` URL is read, resolved, by the construction
-    WARNING. SKIPs when the graph will not load, like its siblings."""
+    Unlike ``build-check``, it does not load the instance's environment values, so an ``env()`` URL
+    is read as its literal ``default=`` and one with no default is not read, which the clean
+    detail says; the construction WARNING and the posture entry read the resolved URL. SKIPs when
+    the graph
+    will not load, like its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, query_credential_hops
 
     name = "url-query-credential"
@@ -2827,7 +2827,10 @@ def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
             name,
             ok=True,
             required=False,
-            detail="no outbound or FhirLookup url carries a credential-like query parameter",
+            detail=(
+                "no outbound or FhirLookup url carries a credential-like query parameter; an "
+                "env() url is read by its default= only, so one with no default is not read here"
+            ),
         )
     listed = "; ".join(f"{conn} ({params})" for conn, params in found)
     return CheckResult(
@@ -3044,32 +3047,19 @@ def _check_vault_revocation_attested(
     Advisory (``required=False``): a reasoned attestation is the one lever these hops have. It
     reports the settings and builds no Vault client, so it does not say whether a hop would be
     refused. Service-toml resolution is :func:`_check_posture`'s, with the SKIP and FAIL arms of
-    :func:`_check_alert_smtp_tls`."""
-    from pydantic import ValidationError
-
+    :func:`_leg_settings`."""
     name = "vault-revocation-attested"
-    toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+    # A flag with no reason fails here: the settings load refuses it.
+    settings = _leg_settings(
+        name,
+        config_dir,
+        required=False,
+        service_config=service_config,
+        suppress_search=suppress_search,
+        env=env,
     )
-    if toml is None and not env_only:
-        return CheckResult(
-            name,
-            ok=True,
-            required=False,
-            skipped=True,
-            detail=_no_settings_detail(service_config, suppress_search),
-        )
-    try:
-        settings = _load_check_settings(toml, env=env)
-    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        # Present but refused is a failure, not a skip (BACKLOG #1318). A flag with no reason
-        # lands here, since the settings load refuses it.
-        return CheckResult(
-            name,
-            ok=False,
-            required=False,
-            detail=f"settings did not load: {_settings_error(exc)}",
-        )
+    if isinstance(settings, CheckResult):
+        return settings
     from messagefoundry.config.settings import vault_revocation_attestations
 
     attested = [
@@ -3494,30 +3484,16 @@ def _check_oidc_auth_params(
     verbatim: these are ``[auth]`` settings, so ``load_config`` is the wrong reader."""
     from urllib.parse import urlsplit
 
-    from pydantic import ValidationError
-
-    toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+    settings = _leg_settings(
+        "oidc-auth-params",
+        config_dir,
+        required=False,
+        service_config=service_config,
+        suppress_search=suppress_search,
+        env=env,
     )
-    if toml is None and not env_only:
-        return CheckResult(
-            "oidc-auth-params",
-            ok=True,
-            required=False,
-            skipped=True,
-            detail=_no_settings_detail(service_config, suppress_search),
-        )
-    try:
-        settings = _load_check_settings(toml, env=env)
-    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        # Present-but-refused is a failure, not a skip (BACKLOG #1318) — same reasoning as
-        # `alert-smtp-tls`: a file or an environment declaration was found, and the loader refused it.
-        return CheckResult(
-            "oidc-auth-params",
-            ok=False,
-            required=False,
-            detail=f"settings did not load: {_settings_error(exc)}",
-        )
+    if isinstance(settings, CheckResult):
+        return settings
     auth = settings.auth
     if not auth.oidc_enabled:
         return CheckResult(
@@ -3684,45 +3660,30 @@ def _check_upstream_hop_ack(
     calls in the same order, so on the same settings the two agree by construction. ``serve`` refuses this in EVERY
     enforcement mode, so this check reads no dial either.
 
-    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`: no
+    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_leg_settings`: no
     ``messagefoundry.toml`` → SKIP; present but refused by the loader → FAIL (BACKLOG #1318). A
     terminator declared through ``MEFOR_API_*`` environment variables with no file is read when
     ``check --env`` or ``MEFOR_AI_ENVIRONMENT`` also names the instance (vault BACKLOG #2355). With
     neither, this leg still SKIPs, so a site that names its environment only on ``serve --env``
     gets parity here only when ``check`` is given the same ``--env``.
     The file lookup differs from ``serve``'s in the ways :func:`_check_posture` documents."""
-    from pydantic import ValidationError
-
     from messagefoundry.api.tls import (
         api_tls_source,
         plaintext_upstream_hop_off_loopback,
         plaintext_upstream_hop_off_loopback_remedy,
         plaintext_upstream_hop_unacknowledged,
     )
-    from messagefoundry.config.settings import settings_error_detail
 
-    toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+    settings = _leg_settings(
+        "upstream-hop-ack",
+        config_dir,
+        required=True,
+        service_config=service_config,
+        suppress_search=suppress_search,
+        env=env,
     )
-    if toml is None and not env_only:
-        return CheckResult(
-            "upstream-hop-ack",
-            ok=True,
-            required=True,
-            skipped=True,
-            detail=_no_settings_detail(service_config, suppress_search),
-        )
-    try:
-        settings = _load_check_settings(toml, env=env)
-    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        # settings_error_detail, not str(exc): a ValidationError echoes input values, and the
-        # environment-sourced secrets are among them.
-        return CheckResult(
-            "upstream-hop-ack",
-            ok=False,
-            required=True,
-            detail=f"settings did not load: {settings_error_detail(exc)}",
-        )
+    if isinstance(settings, CheckResult):
+        return settings
     api = settings.api
     # Checked first, in serve's order: off loopback no acknowledgement covers the plaintext hop.
     if plaintext_upstream_hop_off_loopback(api):
@@ -3787,32 +3748,20 @@ def _check_oidc_revocation(
     FAIL or ERROR fails this leg. MANUAL passes with the row's text, because the engine starts and
     a person must confirm what crosses.
 
-    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`."""
-    from pydantic import ValidationError
-
+    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_leg_settings`."""
     from messagefoundry.verify.federation import idp_revocation_result
     from messagefoundry.verify.model import FAILING
 
-    toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+    settings = _leg_settings(
+        "oidc-revocation",
+        config_dir,
+        required=True,
+        service_config=service_config,
+        suppress_search=suppress_search,
+        env=env,
     )
-    if toml is None and not env_only:
-        return CheckResult(
-            "oidc-revocation",
-            ok=True,
-            required=True,
-            skipped=True,
-            detail=_no_settings_detail(service_config, suppress_search),
-        )
-    try:
-        settings = _load_check_settings(toml, env=env)
-    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        return CheckResult(
-            "oidc-revocation",
-            ok=False,
-            required=True,
-            detail=f"settings did not load: {_settings_error(exc)}",
-        )
+    if isinstance(settings, CheckResult):
+        return settings
     if not settings.auth.oidc_enabled:
         return CheckResult(
             "oidc-revocation",
@@ -3905,37 +3854,25 @@ def _check_retention(
     The function sets each unset auto-bounded window on the settings it is given. Those are this
     leg's own load, and nothing else reads them.
 
-    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`.
+    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_leg_settings`.
     :func:`_retention_posture` says what it does with no active environment and with an
     unresolved production tier. The settings are the ones this leg loads, so a ``serve`` whose
     own environment sets a window, or which reads another settings file, can still decide
     differently."""
-    from pydantic import ValidationError
-
     from messagefoundry.config.retention_classification import evaluate_retention_gate
     from messagefoundry.config.settings import SecurityEnforcement
 
     name = "retention"
-    toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+    settings = _leg_settings(
+        name,
+        config_dir,
+        required=True,
+        service_config=service_config,
+        suppress_search=suppress_search,
+        env=env,
     )
-    if toml is None and not env_only:
-        return CheckResult(
-            name,
-            ok=True,
-            required=True,
-            skipped=True,
-            detail=_no_settings_detail(service_config, suppress_search),
-        )
-    try:
-        settings = _load_check_settings(toml, env=env)
-    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        return CheckResult(
-            name,
-            ok=False,
-            required=True,
-            detail=f"settings did not load: {_settings_error(exc)}",
-        )
+    if isinstance(settings, CheckResult):
+        return settings
     posture = _retention_posture(settings)
     if posture is None:
         return CheckResult(name, ok=True, required=True, skipped=True, detail=_TIER_UNRESOLVED)
@@ -4000,33 +3937,21 @@ def _check_retention_overrides(
     (``validate`` reports it); settings that won't load → FAIL (BACKLOG #1318).
     :func:`_retention_posture` says what it does with no active environment and with an unresolved
     production tier."""
-    from pydantic import ValidationError
-
     from messagefoundry.config.retention_classification import judge_keep_forever_overrides
     from messagefoundry.config.settings import SecurityEnforcement
     from messagefoundry.config.wiring import WiringError, load_config
 
     name = "retention-overrides"
-    toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+    settings = _leg_settings(
+        name,
+        config_dir,
+        required=True,
+        service_config=service_config,
+        suppress_search=suppress_search,
+        env=env,
     )
-    if toml is None and not env_only:
-        return CheckResult(
-            name,
-            ok=True,
-            required=True,
-            skipped=True,
-            detail=_no_settings_detail(service_config, suppress_search),
-        )
-    try:
-        settings = _load_check_settings(toml, env=env)
-    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        return CheckResult(
-            name,
-            ok=False,
-            required=True,
-            detail=f"settings did not load: {_settings_error(exc)}",
-        )
+    if isinstance(settings, CheckResult):
+        return settings
     posture = _retention_posture(settings)
     if posture is None:
         return CheckResult(name, ok=True, required=True, skipped=True, detail=_TIER_UNRESOLVED)
@@ -4097,36 +4022,19 @@ def _check_reference_backend(
     backend, and the SQLITE default supports reference sets anyway); a config that won't load → SKIP
     (``validate`` already reports it); settings that won't load → FAIL (BACKLOG #1318). A ``serve``-time backend override can still diverge from the toml this reads — the
     engine-start gate is the backstop for that, which is why both halves exist."""
-    from pydantic import ValidationError
-
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.store.base import backend_supports_reference_sets
 
-    toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+    settings = _leg_settings(
+        "reference-backend",
+        config_dir,
+        required=True,
+        service_config=service_config,
+        suppress_search=suppress_search,
+        env=env,
     )
-    if toml is None and not env_only:
-        return CheckResult(
-            "reference-backend",
-            ok=True,
-            required=True,
-            skipped=True,
-            detail=_no_settings_detail(service_config, suppress_search),
-        )
-    try:
-        settings = _load_check_settings(toml, env=env)
-    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
-        # PRESENT-BUT-REFUSED IS A FAILURE, NOT A SKIP (BACKLOG #1318). Reaching here means a file
-        # EXISTS, or the environment declared the instance (#2355), and the loader rejected it.
-        # Absent is the legitimate skip and is handled earlier; rendering both states identically
-        # is what let `messagefoundry init` ship a config this very gate refuses -- the gate LOADED
-        # it, got the refusal, printed it, and returned skip with rc 0.
-        return CheckResult(
-            "reference-backend",
-            ok=False,
-            required=True,
-            detail=f"settings did not load: {_settings_error(exc)}",
-        )
+    if isinstance(settings, CheckResult):
+        return settings
     try:
         # allow_empty: this leg is REQUIRED and its subject is `registry.references`, which exists
         # with zero connections declared (BACKLOG #1648). Its skip arm delegates to validate -- the

@@ -357,11 +357,21 @@ class ReloadStepFailure:
     """One named step of a config reload that did not complete, with a PHI-free reason.
 
     ``step`` is a stable machine-readable label (``config_fingerprint``, ``reference_sync``,
-    ``cluster_propagate``); ``detail`` is a :func:`~messagefoundry.redaction.safe_exc` rendering, so
-    it carries the exception type and a redacted message and never a message body."""
+    ``cluster_propagate``, ``outbound_close``); ``detail`` is a
+    :func:`~messagefoundry.redaction.safe_exc` rendering, so it carries the exception type and a
+    redacted message and never a message body."""
 
     step: str
     detail: str
+
+
+def _outbound_close_failure(close_failures: Sequence[tuple[str, str]]) -> ReloadStepFailure:
+    """The ``outbound_close`` step for the connectors a reload replaced and could not close, as
+    ``(outbound name, reason)`` pairs from :meth:`RegistryRunner.reload` (engine PR 2815)."""
+    return ReloadStepFailure(
+        "outbound_close",
+        "; ".join(f"outbound {name!r}: {detail}" for name, detail in close_failures),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,7 +388,8 @@ class ReloadOutcome:
       live graph is untouched, so the operator fixes the config and retries.
     * **The reload happened cleanly.** ``applied`` is True and ``failures`` is empty.
     * **The reload happened and a follow-on step failed.** ``applied`` is True and ``failures``
-      names each step. The NEW graph is live. Reporting outright failure here would describe an
+      names each step, once each (``outbound_close`` names every lane in its ``detail``). The NEW
+      graph is live. Reporting outright failure here would describe an
       engine that does not exist, and reporting plain success would hide a step an operator has to
       go finish by hand -- so the partial outcome is its own answer (ASVS 2.3.3, BACKLOG #1111).
 
@@ -802,6 +813,13 @@ class Engine:
         # once instead of waiting out a whole poll interval. _graph_stop stays the loop-exit latch.
         self._graph_wake = asyncio.Event()
         self._graph_lock = asyncio.Lock()
+        # Serializes a reload's first load, which yields in its build check before add_registry:
+        # unserialized, two overlapping first loads both installed and started a runner, and the
+        # first was orphaned (engine PR 2815). reload_detail says what the second one does.
+        self._first_load_lock = asyncio.Lock()
+        # Set as stop() begins. A first load reads it under _first_load_lock once its build check
+        # returns, so a stop that found no runner to stop is not followed by one starting.
+        self._stopping = False
         self._graph_reconcile_interval = 1.0
         # The config writes started and not finished: today the connection flag's store write
         # (BACKLOG #2623), the one write this engine tracks. A caller that is cancelled stops
@@ -1053,6 +1071,16 @@ class Engine:
         return self._dr_active
 
     @property
+    def dr_activation_failures(self) -> tuple[str, ...]:
+        """The steps the DR activation that made this box active left unfinished, such as
+        ``outbound_close``, for ``GET /dr/status`` (engine PR 2815). Empty while the run-profile is
+        off, and when no coordinator has been built; reading it never builds one."""
+        coord = self._dr_coordinator
+        if coord is None or not self._dr_active:
+            return ()
+        return coord.activation_failures
+
+    @property
     def dr_settings(self) -> DrSettings:
         """The resolved ``[dr]`` settings (#61, ADR 0048) — read by the DR coordinator + the API."""
         return self._dr_settings
@@ -1109,7 +1137,7 @@ class Engine:
                 self._dr_run_threshold(), standby=self._dr_standby_threshold()
             )
 
-    async def _dr_activate_profile(self) -> None:
+    async def _dr_activate_profile(self) -> dict[str, str]:
         """Engine callback the DR coordinator runs to BEGIN serving under the DR run-profile (#61, ADR
         0048 step 4): latch the run-profile ON, hand the runner the threshold, and re-apply the
         running graph so the runner binds only connections at/above ``[dr].priority_threshold`` (the
@@ -1130,7 +1158,13 @@ class Engine:
         over the whole graph and before the shard filter. On an engine-shard process ``rr.registry`` is the
         filtered graph, so a guard here would judge less than that load did. A graph an embedder
         hands to :meth:`add_registry` meets neither check at load. That is a fact about embedding,
-        and an activation is not where it changes."""
+        and an activation is not where it changes.
+
+        Returns each follow-on step that did not complete, as ``{step: detail}``. The coordinator
+        puts the step labels on its result and the ``dr.activate`` row; the detail is in the server
+        log. Today the one step is ``outbound_close``, as :meth:`reload_detail` reports it: a
+        connector the reload replaced and could not close. The profile is live then, so it is
+        reported rather than raised (engine PR 2815, Lander hold 6698688363 item 3)."""
         was_active = self._dr_active
         rr = self._registry_runner
         # What an operator had bound before this call, which a failed activation does not unbind.
@@ -1150,12 +1184,13 @@ class Engine:
         # connection. rr.reload() re-applies whichever graph is current once it holds the reload
         # lock, so an operator reload that lands first is re-evaluated rather than reverted. A local
         # DR decision is never a cluster-wide config bump.
+        close_failures: tuple[tuple[str, str], ...] = ()
         try:
             if rr is not None:
                 await self._dr_preflight(rr.registry)
             self._set_dr_active(True)
             if rr is not None:
-                await rr.reload()
+                close_failures = await rr.reload()
         except BaseException:
             # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile,
             # so the latch and the runner's threshold go back too. Left set, the next operator
@@ -1189,6 +1224,10 @@ class Engine:
                         "failed too; POST /config/reload closes them"
                     )
             raise
+        if not close_failures:
+            return {}
+        failure = _outbound_close_failure(close_failures)
+        return {failure.step: failure.detail}
 
     async def _dr_preflight(self, registry: Registry) -> None:
         """The settings and registry preflights a DR activation runs before its reload, bounded by
@@ -1417,6 +1456,95 @@ class Engine:
             held += (await self.store.pending_depth(name))[0]
         return held
 
+    def _check_runner(self, registry: Registry) -> RegistryRunner:
+        """A throwaway runner for a build check of ``registry``, carrying the same bind host,
+        egress, posture and env values a real reload would, and never installed or started: a dry
+        run checks with it when no runner is live, and the first load checks with it before
+        :meth:`add_registry` installs the runner it starts."""
+        return RegistryRunner(
+            registry,
+            self.store,
+            poll_interval=self._poll_interval,
+            fifo_claim_batch=self._fifo_claim_batch,
+            inbound_bind_host=self._inbound_bind_host,
+            reserved_bindings=self._reserved_bindings,
+            # build_check now runs the inbound exposure gates (vault BACKLOG #2622 item 1), so
+            # the throwaway checker needs the engine's escape or a dry run refuses what a real
+            # reload accepts.
+            allow_insecure_bind=self._allow_insecure_bind,
+            delivery_defaults=self._delivery_defaults,
+            ordering_default=self._ordering_default,
+            internal_error_default=self._internal_error_default,
+            buildup_default=self._buildup_default,
+            stall_default=self._stall_default,
+            saturation_default=self._saturation_default,
+            ack_after_default=self._ack_after_default,
+            stream_inflight_budget_bytes=self._stream_inflight_budget_bytes,
+            priority_default=self._priority_default,
+            dr_threshold=self._dr_run_threshold(),
+            dr_standby=self._dr_standby_threshold(),
+            alert_sink=self._alert_sink,
+            egress=self._egress_settings,
+            hop_posture=self._hop_posture,
+            trust_anchor_policy=self._trust_anchor_policy,
+            simulate_all=self._shadow_settings.simulate_all_egress,
+            env_values=self._env_values,
+            coordinator=self._coordinator,
+        )
+
+    def _refuse_shard_universe_change(self, registry: Registry) -> None:
+        """Raise ``WiringError`` when ``registry``, already shard-filtered, names a different
+        engine-shard set from the running graph's. A no-op with no running graph or no filter."""
+        rr = self._registry_runner
+        if self._registry_filter is None or rr is None:
+            return
+        running = rr.registry
+        if registry.all_shard_ids != running.all_shard_ids:
+            # ADR 0073: outbound-lane ownership is a pure function of the shard universe, and a
+            # reload is a PER-PROCESS operation with no fleet coordination — accepting a changed
+            # universe here would leave this shard claiming by a NEW map while siblings claim by
+            # the OLD one: some lanes get two concurrent consumers (per-lane FIFO inversion),
+            # others get none (ACKed messages stall with no alert). Fail closed instead.
+            old, new = running.all_shard_ids, registry.all_shard_ids
+            old_ids = join_shard_names(old) if old else "<single>"
+            new_ids = join_shard_names(new) if new else "<single>"
+            raise WiringError(
+                f"reload changes the engine-shard set ({old_ids} -> {new_ids}) — outbound-lane "
+                "ownership (ADR 0073) is pinned to the shard universe, so a shard-set change "
+                "requires a coordinated full-fleet restart (stop supervise, apply the config, "
+                "start), not a per-shard reload"
+            )
+
+    async def _first_load(self, registry: Registry, env_values: dict[str, Any]) -> RegistryRunner:
+        """Install and start the runner for ``registry`` on an engine with none, for
+        :meth:`reload_detail`, which holds ``_first_load_lock`` across this call."""
+        if self._stopping:
+            raise RuntimeError("the engine is stopping, so the first load started no runner")
+        # Bad connector -> WiringError (422), before any start. The check awaits a worker thread,
+        # so it runs on a runner that is not installed yet: installed first, a concurrent reload
+        # could take it, unstarted, as the live runner in that window. Nothing yields between
+        # add_registry below and the start taking the runner's reload lock.
+        await self._check_runner(registry).build_check_off_loop(registry, env_values)
+        # A stop that began during the check found no runner to stop, so none may start now
+        # (engine PR 2815, Lander hold 6698688363 item 4). Nothing yields from here to add_registry.
+        if self._stopping:
+            raise RuntimeError("the engine is stopping, so the first load started no runner")
+        previous_env_values, self._env_values = self._env_values, env_values
+        try:
+            runner = self.add_registry(registry)
+            # That check warned for this graph, so this start does not (vault BACKLOG #2910).
+            await runner.start(warn_query_credentials=False)
+        except Exception:
+            # Don't leave a half-started runner: a later reload would take the "runner exists"
+            # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.
+            # Exception only: RegistryRunner.start() does not tear itself down on a cancellation,
+            # so clearing the reference then would orphan a running runner that engine.stop()
+            # could no longer reach.
+            self._registry_runner = None
+            self._env_values = previous_env_values
+            raise
+        return runner
+
     def add_registry(self, registry: Registry) -> RegistryRunner:
         """Run a code-first Connection/Router/Handler graph (one runner for the whole graph)."""
         # ADR 0087 (#197): render [sandbox] into the runner's policy + the (config_dir, env) source a
@@ -1610,11 +1738,20 @@ class Engine:
         graph then loaded via reload still gets a runner. ``start()`` is idempotent (a no-op when the
         loop is already up). The pre-sync runs on a reload unconditionally (so a new set resolves on the
         next message); at startup it honors ``[reference].sync_on_startup``. A sync failure is isolated
-        per-set (last-good kept) and never blocks start/reload."""
+        per-set (last-good kept) and never blocks start/reload.
+
+        No sync begins, and the loop is not started, once :meth:`stop` has begun: it stops the loop,
+        so a reload a stop overtakes must not start it again against a store being closed (engine
+        PR 2815, Lander hold 6702318430 item C). A sync already under way is not cut short; the
+        stop is read again after it, before the start."""
+        if self._stopping:
+            return
         if self._reference_runner is None:
             self._reference_runner = self._make_reference_runner()
         if not startup or (self._reference_settings or ReferenceSettings()).sync_on_startup:
             await self._reference_runner.sync_all()
+        if self._stopping:
+            return
         self._reference_runner.start()
 
     # --- lifecycle -----------------------------------------------------------
@@ -3159,7 +3296,8 @@ class Engine:
         raises there fails honestly: nothing was applied. Only two steps cannot move -- reference-set
         reconciliation reads its specs off the LIVE registry, and the cluster version bump announces
         a config this node has already taken -- so those two run after the swap and report as
-        ``failures`` rather than as a failed reload.
+        ``failures`` rather than as a failed reload. The swap itself reports one more,
+        ``outbound_close``: an outbound connector it replaced and could not close.
 
         ``dry_run`` performs the full validation **against this instance's environment** — it loads
         the graph and build-checks every connector, which resolves the graph's ``env()`` references
@@ -3350,22 +3488,7 @@ class Engine:
             # Re-apply this process's shard filter so a reload keeps owning only its shard's inbounds
             # (outbound/routers/handlers stay shared). Pure + cheap (sharding.filter_registry_for_shard).
             registry = self._registry_filter(registry)
-            running = self._registry_runner.registry if self._registry_runner is not None else None
-            if running is not None and registry.all_shard_ids != running.all_shard_ids:
-                # ADR 0073: outbound-lane ownership is a pure function of the shard universe, and a
-                # reload is a PER-PROCESS operation with no fleet coordination — accepting a changed
-                # universe here would leave this shard claiming by a NEW map while siblings claim by
-                # the OLD one: some lanes get two concurrent consumers (per-lane FIFO inversion),
-                # others get none (ACKed messages stall with no alert). Fail closed instead.
-                old, new = running.all_shard_ids, registry.all_shard_ids
-                old_ids = join_shard_names(old) if old else "<single>"
-                new_ids = join_shard_names(new) if new else "<single>"
-                raise WiringError(
-                    f"reload changes the engine-shard set ({old_ids} -> {new_ids}) — outbound-lane "
-                    "ownership (ADR 0073) is pinned to the shard universe, so a shard-set change "
-                    "requires a coordinated full-fleet restart (stop supervise, apply the config, "
-                    "start), not a per-shard reload"
-                )
+            self._refuse_shard_universe_change(registry)
         # KEPT, and NOT redundant with the load-time rule (BACKLOG #1648). `load_config` above now
         # refuses an empty graph inside `Registry.validate`, but that fires BEFORE
         # `self._registry_filter` — so on a `serve --shard X` process the filter can empty a graph the
@@ -3392,61 +3515,29 @@ class Engine:
             # resolves env() refs against this instance's values and raises on a missing key or bad
             # spec), then discard. Reuse the live runner if present; else a throwaway one carrying the
             # same bind host + env values, so the check sees exactly what a real reload would.
-            checker = runner or RegistryRunner(
-                registry,
-                self.store,
-                poll_interval=self._poll_interval,
-                fifo_claim_batch=self._fifo_claim_batch,
-                inbound_bind_host=self._inbound_bind_host,
-                reserved_bindings=self._reserved_bindings,
-                # build_check now runs the inbound exposure gates (vault BACKLOG #2622 item 1), so
-                # the throwaway checker needs the engine's escape or a dry run refuses what a real
-                # reload accepts.
-                allow_insecure_bind=self._allow_insecure_bind,
-                delivery_defaults=self._delivery_defaults,
-                ordering_default=self._ordering_default,
-                internal_error_default=self._internal_error_default,
-                buildup_default=self._buildup_default,
-                stall_default=self._stall_default,
-                saturation_default=self._saturation_default,
-                ack_after_default=self._ack_after_default,
-                stream_inflight_budget_bytes=self._stream_inflight_budget_bytes,
-                priority_default=self._priority_default,
-                dr_threshold=self._dr_run_threshold(),
-                dr_standby=self._dr_standby_threshold(),
-                alert_sink=self._alert_sink,
-                egress=self._egress_settings,
-                hop_posture=self._hop_posture,
-                trust_anchor_policy=self._trust_anchor_policy,
-                simulate_all=self._shadow_settings.simulate_all_egress,
-                env_values=self._env_values,
-                coordinator=self._coordinator,
-            )
+            checker = runner or self._check_runner(registry)
             # The values it re-read are checked, never applied: a dry run changes nothing live.
-            checker.build_check(registry, env_values)
+            await checker.build_check_off_loop(registry, env_values)
             return ReloadOutcome(registry=registry, applied=False, directory=path)
         # Every check has passed, so the values go live with the graph, and a refused swap keeps
         # the old values with the old graph (vault BACKLOG #2596).
-        if runner is None:
-            previous_env_values, self._env_values = self._env_values, env_values
-            try:
-                runner = self.add_registry(registry)
-                runner.build_check(registry)  # bad connector → WiringError (422), before any start
-                # That check warned for this graph, so this start does not (vault BACKLOG #2910).
-                await runner.start(warn_query_credentials=False)
-            except Exception:
-                # Don't leave a half-started runner: a later reload would take the "runner exists"
-                # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.
-                # Exception only: RegistryRunner.start() does not tear itself down on a
-                # cancellation, so clearing the reference then would orphan a running runner that
-                # engine.stop() could no longer reach.
-                self._registry_runner = None
-                self._env_values = previous_env_values
-                raise
-        else:
+        first_load = False
+        close_failures: tuple[tuple[str, str], ...] = ()
+        # Taken by every applied reload, and held across a first load until its runner has
+        # started or been cleared, so the runner read here is never one a first load is still
+        # starting. A first load that held it before this reload may have installed the runner
+        # this graph then applies to as a reload, so the shard set is checked against that one.
+        async with self._first_load_lock:
+            runner = self._registry_runner
+            if runner is None:
+                first_load = True
+                runner = await self._first_load(registry, env_values)
+            else:
+                self._refuse_shard_universe_change(registry)
+        if not first_load:
             try:
                 # The runner swaps the values under its reload lock and restores them on a rollback.
-                await runner.reload(registry, env_values)
+                close_failures = await runner.reload(registry, env_values)
             finally:
                 # Whatever the runner holds now, committed or rolled back, cancelled or not.
                 self._env_values = runner.env_values
@@ -3460,6 +3551,10 @@ class Engine:
         # the directory it came from. Set together and only here (vault BACKLOG #2598).
         self.loaded_config_fingerprint = fingerprint
         self.last_reload_dir = path
+        # A connector the swap replaced and could not close: the new one is live, so it is a step
+        # an operator may still have to finish, not a failed reload (engine PR 2815).
+        if close_failures:
+            failures.append(_outbound_close_failure(close_failures))
         # Reference sets (ADR 0006): re-arm + materialize after the swap, so a reference set added by
         # this reload syncs immediately (resolves on the next message, not only after the refresh
         # interval) and a 0->N change actually starts the loop. Idempotent when nothing changed.
@@ -3777,6 +3872,7 @@ class Engine:
     async def stop(self) -> None:
         """Stop the retention task + the wired graph, then close the store."""
         log.info("engine stopping")
+        self._stopping = True
         # Quiesce the active-passive graph supervisor FIRST (Workstream A1) so it can't reconcile (and
         # re-start the graph) while we tear down. A no-op single-node (never spawned). Cooperative: set
         # the stop event and let any in-flight reconcile finish under the lock (so we never abandon a

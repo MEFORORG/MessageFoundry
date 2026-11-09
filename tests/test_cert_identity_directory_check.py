@@ -444,6 +444,22 @@ def _age_last_warning(service: AuthService, user: UserRecord) -> None:
     service._cert_probe_fault_warned_at[user.id] -= service_module._CERT_OUTAGE_LOG_INTERVAL_SECONDS
 
 
+async def test_a_fault_of_no_known_type_still_warns_and_says_where_the_type_is(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3100, pass E point 6. ``kind`` is None only where ``_PROBE_FAULT_KIND`` was never
+    set. The WARNING still fires, names the refusal, and points at DEBUG for the type rather
+    than printing ``None``.
+
+    RED when: a None kind skips the WARNING or prints the literal None."""
+    service, _directory, user_id = await _directory_account(store, _VIEWERS)
+    caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
+    service._note_cert_probe_fault(user_id, 1, None)
+    [warning] = _fault_warnings(caplog)
+    assert "the probe raised an exception whose type is logged at DEBUG" in warning
+    assert "None" not in warning
+
+
 async def test_a_fault_returning_after_the_account_went_unprobed_warns(
     store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

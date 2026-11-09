@@ -34,11 +34,24 @@ def test_sqlserver_passkeys_carry_the_user_foreign_key() -> None:
     def first(fragment: str) -> int:
         return next(i for i, stmt in enumerate(schema) if fragment in stmt)
 
-    fk = first("fk_webauthn_credentials_user")
-    assert "IF OBJECT_ID('fk_webauthn_credentials_user','F') IS NULL" in schema[fk]
-    assert "FOREIGN KEY (user_id) REFERENCES users(id)" in schema[fk]
-    assert "CASCADE" not in schema[fk]
-    assert fk > first("CREATE TABLE users (") and fk > first("CREATE TABLE webauthn_credentials (")
+    for table, name in (
+        ("webauthn_credentials", "fk_webauthn_credentials_user"),
+        ("sessions", "fk_sessions_user"),  # BACKLOG #2733, pass F: the two keys it found missing
+        ("user_roles", "fk_user_roles_user"),
+    ):
+        fk = first(name)
+        assert f"IF OBJECT_ID('{name}','F') IS NULL" in schema[fk]
+        # Trusted (pass F finding 2): the orphan delete runs before the key, which is added WITH
+        # CHECK, and an untrusted key from an earlier batch is rebuilt rather than kept.
+        assert "is_not_trusted = 1" in schema[fk]
+        assert schema[fk].index(f"DELETE FROM {table} WHERE NOT EXISTS") < schema[fk].index(
+            "WITH CHECK"
+        )
+        assert f"DROP CONSTRAINT {name}" in schema[fk]
+        assert "NOCHECK" not in schema[fk]
+        assert f"ADD CONSTRAINT {name} FOREIGN KEY (user_id) REFERENCES users(id)" in schema[fk]
+        assert "CASCADE" not in schema[fk]
+        assert fk > first("CREATE TABLE users (") and fk > first(f"CREATE TABLE {table} (")
 
 
 def test_postgres_schema_hash_tracks_ddl(monkeypatch: pytest.MonkeyPatch) -> None:
