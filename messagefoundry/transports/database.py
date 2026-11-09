@@ -4812,7 +4812,7 @@ def classify_login_roles(row: Sequence[Any]) -> LoginRoleReading:
     ``db_denydatawriter`` takes a finding away.
     ``IS_SRVROLEMEMBER`` and ``IS_ROLEMEMBER`` answer NULL for a name that does not resolve for this
     login, and a NULL folded to "not a member" would be a false clean. A role read as held is still
-    reported when another read NULL. An unread role can hide an over-grant, and an unread
+    reported when another is not read. An unread role can hide an over-grant, and an unread
     ``db_denydatawriter`` beside a held ``db_datawriter`` reports that writer as an over-grant
     rather than clearing it, though the deny may have taken it back.
 

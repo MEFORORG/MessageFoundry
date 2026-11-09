@@ -139,7 +139,7 @@ def test_a_value_other_than_an_int_0_or_1_cannot_judge_and_is_never_clean(value:
 
 
 @pytest.mark.parametrize("value", [None, 1.0, Decimal(1), "1"])
-def test_an_odd_typed_deny_does_not_take_a_writer_finding_away(value: object) -> None:
+def test_an_unread_deny_does_not_take_a_writer_finding_away(value: object) -> None:
     """A ``db_denydatawriter`` read as held clears ``db_datawriter``, so an unread one, NULL or
     answered in another type, must not: the writer stays a finding."""
     row = tuple(
