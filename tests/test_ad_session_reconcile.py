@@ -3106,9 +3106,8 @@ async def test_refused_unreached_rows_log_no_per_account_warning(
 async def test_an_unreached_row_write_that_raises_keeps_the_earlier_warnings(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #3709, review round 3. Where the entries cannot roll up, each account's WARNING
-    follows its own row, so a later write that raises, ending the pass, still leaves the WARNING
-    for every account whose row was written before it.
+    """BACKLOG #3709, review round 3. A later write that raises ends the pass with no page, so
+    every account whose row was written before it still gets its WARNING.
 
     RED when: the WARNINGs wait for the whole write loop, so a raise leaves none."""
     store = await MessageStore.open(":memory:")

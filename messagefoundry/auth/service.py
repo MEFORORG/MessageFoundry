@@ -667,18 +667,6 @@ _FORFEIT_NOBODY_ELSE: Final[str] = (
 #: `AuthService._record_unreached_accounts`). A fixed number, not a setting, so tuning the
 #: mass-revoke breaker does not change how these page.
 _UNREACHED_ROLLUP_ABOVE: Final[int] = 5
-
-
-def _log_unreached_account(username: str, probes: int) -> None:
-    """The WARNING for one account entering the lasting unreachable state (BACKLOG #3100)."""
-    _log.warning(
-        "directory reconcile: %d probes running of %s failed to reach the directory, so its "
-        "sessions are not revoked while this lasts",
-        probes,
-        scrub_log_argument(username),
-    )
-
-
 #: What a forfeited standing logs when a new condition of its kind opens (BACKLOG #3083).
 _FORFEITED_EPISODE_WARNINGS: Final[dict[_EpisodeKind, str]] = {
     "breaker": (
@@ -8615,42 +8603,49 @@ class AuthService:
         one whose every row was refused carried a rollup with nothing in it.
 
         It logs one WARNING naming each account whose row was written, or one WARNING with the
-        count on a rolled-up pass; a refused row has the soft write's ERROR instead. Where the
-        entries cannot make a rollup, each account's WARNING follows its own row, so a write that
-        raises leaves one for every account written before it."""
-        paged = self._reconcile_unreached_paged
-        may_roll_up = len(paged) + len(plan.unreached) > _UNREACHED_ROLLUP_ABOVE
+        count on a rolled-up pass; a refused row has the soft write's ERROR instead. A write that
+        raises ends the pass with no page, so each account written before it gets its own
+        WARNING."""
         written: list[tuple[str, str, int]] = []
-        for entry in plan.unreached:
-            _user_id, username, probes = entry
-            if await self._audit_reconciler_row(
-                "auth.ad_reconcile_unreached",
-                actor=username,
-                detail=_json(
-                    {
-                        "reason": reconcile.UNREACHED_ACCOUNT,
-                        "probes": probes,
-                        "asked": plan.asked,
-                        "aborted": plan.aborted,
-                    }
-                ),
-            ):
-                written.append(entry)
-                if not may_roll_up:
-                    _log_unreached_account(username, probes)
-        # A rollup only with something written: one with nothing would page nothing, and the
-        # lifespan task reads the run's length off the entries (final-round finding 1).
-        rollup = bool(written) and len(paged) + len(written) > _UNREACHED_ROLLUP_ABOVE
-        if rollup:
-            _log.warning(
-                "directory reconcile: %d accounts entered a run of unreachable probes, so their "
-                "sessions are not revoked while this lasts; an auth.ad_reconcile_unreached row "
-                "names each",
-                len(written),
+        rollup = False
+        try:
+            for entry in plan.unreached:
+                _user_id, username, probes = entry
+                if await self._audit_reconciler_row(
+                    "auth.ad_reconcile_unreached",
+                    actor=username,
+                    detail=_json(
+                        {
+                            "reason": reconcile.UNREACHED_ACCOUNT,
+                            "probes": probes,
+                            "asked": plan.asked,
+                            "aborted": plan.aborted,
+                        }
+                    ),
+                ):
+                    written.append(entry)
+            # A rollup only with something written: one with nothing would page nothing, and the
+            # lifespan task reads the run's length off the entries (final-round finding 1).
+            rollup = (
+                bool(written)
+                and len(self._reconcile_unreached_paged) + len(written) > _UNREACHED_ROLLUP_ABOVE
             )
-        elif may_roll_up:
-            for _user_id, username, probes in written:
-                _log_unreached_account(username, probes)
+        finally:
+            if rollup:
+                _log.warning(
+                    "directory reconcile: %d accounts entered a run of unreachable probes, so "
+                    "their sessions are not revoked while this lasts; an "
+                    "auth.ad_reconcile_unreached row names each",
+                    len(written),
+                )
+            else:
+                for _user_id, username, probes in written:
+                    _log.warning(
+                        "directory reconcile: %d probes running of %s failed to reach the "
+                        "directory, so its sessions are not revoked while this lasts",
+                        probes,
+                        scrub_log_argument(username),
+                    )
         return replace(plan, unreached=tuple(written), unreached_rollup=rollup)
 
     def _latch_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:
