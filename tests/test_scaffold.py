@@ -743,6 +743,18 @@ _STALE_CASES = [
         None,
         "--editable ./acme is editable, so it is not checked",
     ),
+    # pip's own parser reads the options: a cut long name and a tab, and no other option is one.
+    ("messagefoundry==0.5.1\n--ed\t./acme\n", None, "--ed\t./acme is editable"),
+    ("messagefoundry==0.5.1\n--extra-index-url https://host.invalid/simple\n", None, None),
+    # A line is printed as written, before ${VAR} expansion, and in any script the runner's
+    # console cannot encode.
+    (
+        "messagefoundry==0.5.1\n-e git+https://${MF_SET_8171}@host.invalid/acme.git#egg=acme\n",
+        None,
+        "-e git+https://${MF_SET_8171}@host.invalid/acme.git#egg=acme is editable",
+    ),
+    ("messagefoundry==0.5.1\n-e ./caf中\n", None, "-e ./caf"),
+    ("messagefoundry==0.5.1\n-acme==1.0\n", "-acme==1.0 is not a line pip can read", None),
 ]
 
 
@@ -757,8 +769,9 @@ def test_a_stale_lock_fails_its_own_step_and_hides_no_audit(
     """Vault BACKLOG #3786 (R2-1): with a lock, nothing resolves requirements.txt, so a lock left
     behind by a change to it audited the old closure and nothing said so."""
     calls, audited, output, failed = _run_audit_job(
-        scaffolded_ci, tmp_path, _STALE_LOCK, requirements=requirements
+        scaffolded_ci, tmp_path, _STALE_LOCK, {"MF_SET_8171": "s3cr3t-8171"}, requirements
     )
+    assert "s3cr3t-8171" not in output
     assert failed == ([_STALE] if error else []), output
     if error:
         assert f"::error::{error}" in output and "; regenerate requirements.lock" in output
