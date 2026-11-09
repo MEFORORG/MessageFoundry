@@ -355,10 +355,10 @@ async def test_a_custody_step_outside_the_reads_reaches_the_open_with_a_fixed_te
     caplog: pytest.LogCaptureFixture,
     step: str,
 ) -> None:
-    """An error from a step on the open's custody path that the custody reads do not wrap, at
-    least the custody directory's ``Path.resolve``, the minted blob's settings check and key, and
-    the observation, reaches ``open_store``'s caller as a refusal with a fixed text and no chain,
-    never with the error's own text (BACKLOG #4882; the Lander's hold on PR 2804)."""
+    """An error from a step on the open's custody path that the custody reads do not wrap (the
+    steps ``base._host_custody_for_open`` names) reaches ``open_store``'s caller as a refusal with
+    a fixed text and no chain, never with the error's own text (BACKLOG #4882; the Lander's hold
+    on PR 2804)."""
     import traceback
 
     sentinel = "SENTINEL-not-an-engine-text-open-path"
@@ -397,6 +397,26 @@ async def test_a_custody_step_outside_the_reads_reaches_the_open_with_a_fixed_te
     assert sentinel not in "".join(traceback.format_exception(refusal))
     assert "a host custody error was replaced (OSError)" in caplog.text
     assert sentinel not in caplog.text
+
+
+async def test_a_recorded_error_that_is_no_custody_refusal_is_still_replaced_at_the_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a custody refusal the engine built passes through the open. A recorded error of
+    another class, such as a ``CustodyError``, is replaced by a ``HostCustodyRefused`` that keeps
+    its recorded text and has no chain, so every custody refusal stays a ``KeyProviderError``
+    (BACKLOG #4882)."""
+
+    def _raise(*args: object, **kwargs: object) -> Any:
+        raise custody_host._recorded_as(custody.CustodyError, "RECORDED-custody-text")
+
+    monkeypatch.setattr(custody_host, "check_host_custody_settings", _raise)
+    with pytest.raises(HostCustodyRefused) as excinfo:
+        await open_store(_settings(tmp_path), create=True, custody=_proved_blob())
+    refusal = excinfo.value
+    assert type(refusal) is HostCustodyRefused
+    assert "RECORDED-custody-text" in str(refusal)
+    assert refusal.__cause__ is None and refusal.__context__ is None
 
 
 @pytest.mark.parametrize("raised", ["left behind", "refused"])

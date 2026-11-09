@@ -363,11 +363,10 @@ def _read_refusal(what: str, exc: BaseException) -> HostCustodyRefused:
 
 
 def custody_refusal_at_open(exc: BaseException) -> HostCustodyRefused:
-    """The refusal ``open_store`` raises in place of an error on its custody path that the engine
-    did not build, at least one from the custody directory's resolve, the minted blob's checks and
-    key, or the observation, which the custody reads do not wrap: :func:`_read_refusal`'s fixed
-    text, reading nothing from ``exc``. The caller raises it with no chain and then flushes the
-    replaced class's log line (BACKLOG #4882)."""
+    """The refusal :func:`~messagefoundry.store.base._host_custody_for_open` raises in place of an
+    error on the open's custody path that is not a custody refusal the engine built:
+    :func:`_read_refusal`'s fixed text, reading nothing from ``exc``. The caller raises it with no
+    chain and then flushes the replaced class's log line (BACKLOG #4882)."""
     return _read_refusal(
         "the store's key custody could not be read or checked at the open: check "
         f"[store].key_provider, the custody directory ({SECRETS_DIRECTORY_VARIABLE}, or else a "
@@ -384,11 +383,26 @@ def _custody_errors() -> tuple[type[BaseException], ...]:
     return (CustodyError, DpapiError, DpapiUnavailable, OSError)
 
 
-def _settle_left_handoff(handoff: Path, blob: HostBlob) -> HostCustodyRefused | None:
+def _settle_left_handoff(handoff: Path, blob: HostBlob) -> None:
     """The crash rule (draft rule 3 step 3): a handoff found beside a host file that opens is
     deleted when it names the host file's store id, through the handle that read it, and refused
-    when it names another. Returns the refusal, or ``None`` when the handoff is settled or another
-    start settled it first; the caller raises it once it has dropped the blob (BACKLOG #4882)."""
+    when it names another. The refusal is raised with the blob dropped from this frame, which its
+    traceback keeps, and with no cycle through it, so it never holds the master key; a caller that
+    holds the blob drops it too before the refusal leaves (BACKLOG #4882)."""
+    refusal = _left_handoff_refusal(handoff, blob)
+    if refusal is None:
+        return
+    del blob
+    try:
+        raise refusal  # outside any handler, so it has no context (BACKLOG #4882)
+    finally:
+        del refusal
+
+
+def _left_handoff_refusal(handoff: Path, blob: HostBlob) -> HostCustodyRefused | None:
+    """:func:`_settle_left_handoff`'s judgement: its refusal, or ``None`` when the handoff is
+    settled or another start settled it first. It returns rather than raises, so the frame that
+    holds the blob, here and in its ``same_store`` closure, is gone before the refusal is raised."""
     from messagefoundry.store.custody import CustodyError, HandoffLeftBehind, consume_handoff_file
 
     def same_store(left: HostBlob) -> None:
@@ -498,17 +512,13 @@ def _read_or_convert(host: Path, handoff: Path, *, convert: bool) -> HostBlob:
     if blob is not None:
         # A read that may not convert leaves a handoff beside the host file as it is.
         if convert and os.path.lexists(handoff):
-            left = _settle_left_handoff(handoff, blob)
-            if left is not None:
-                # The master key is dropped from this frame, which the refusal's traceback keeps,
-                # and the refusal from it, so the refusal never holds the key and leaves no
-                # cycle. The frame that judged the handoff has returned, so the traceback does not
-                # hold it either.
+            try:
+                _settle_left_handoff(handoff, blob)
+            except BaseException:
+                # This frame is on the refusal's traceback too, so it drops the master key before
+                # the refusal leaves; the bare raise adds no context (BACKLOG #4882).
                 del blob
-                try:
-                    raise left  # outside any handler, so it has no context (BACKLOG #4882)
-                finally:
-                    del left
+                raise
         return blob
     if not os.path.lexists(handoff):
         # An engine shard may have converted it between the two looks.

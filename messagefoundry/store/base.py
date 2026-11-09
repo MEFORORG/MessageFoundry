@@ -4577,11 +4577,9 @@ async def open_store(
     place and before its first write (``store.store.check_open_store_pin``), so a store that is not
     the blob's is refused before anything is written to it, its salt bind and at-rest sweep
     included.
-    Every custody refusal is a :class:`~messagefoundry.store.keyprovider.KeyProviderError`. One
-    the engine built passes through as it is; any other ``Exception`` from the custody path, at
-    least an ``OSError`` from a step the custody reads do not wrap, is replaced by a
-    :class:`~messagefoundry.store.custody_host.HostCustodyRefused` with a fixed text and no cause
-    or context (BACKLOG #4882, :func:`_host_custody_for_open`).
+    Every custody refusal is a :class:`~messagefoundry.store.keyprovider.KeyProviderError`, with a
+    fixed text and no cause or context; :func:`_host_custody_for_open` says which errors on the
+    custody path are replaced (BACKLOG #4882).
     """
     if create and read_only:
         raise ValueError("open_store: create and read_only exclude each other")
@@ -4657,11 +4655,15 @@ def _host_custody_for_open(
     provider once no host blob or handoff is found beside it (vault BACKLOG #3411). See
     :func:`open_store`.
 
-    A refusal the engine built passes through as it is. Any other ``Exception`` from the custody
-    path, at least an ``OSError`` from a step the custody reads do not wrap (the custody
-    directory's resolve, the minted blob's checks and key, the observation), is replaced by a
-    refusal with a fixed text that reads nothing from it, raised outside the handler, so it has no
-    cause and no context (BACKLOG #4882)."""
+    A caller passing ``custody`` or ``recovery_wrap`` under another provider gets a
+    ``ValueError`` first. After that, a custody refusal the engine built (a ``KeyProviderError``
+    recorded as built, :func:`_recorded`) passes through as it is. Any other ``Exception`` from
+    the custody steps is replaced by
+    :func:`~messagefoundry.store.custody_host.custody_refusal_at_open`'s refusal, which keeps a
+    recorded error's own text and reads nothing from any other, raised outside the handler, so it
+    has no cause and no context (BACKLOG #4882). At least an ``OSError`` from a step the custody
+    reads do not wrap is one: the custody directory's resolve, the minted blob's settings check,
+    pin and key, and the observation."""
     from messagefoundry.store.custody_host import custody_refusal_at_open
 
     if settings.key_provider != HOST_KEY_PROVIDER and (custody is not None or recovery_wrap):
@@ -4672,7 +4674,8 @@ def _host_custody_for_open(
                 settings, custody, posture=posture, read_only=read_only, recovery_wrap=recovery_wrap
             )
         except Exception as exc:
-            if isinstance(exc, KeyProviderError) and _recorded_text(exc) is not None:
+            # Judged by identity and by type(), so none of the error's own code runs.
+            if _recorded_text(exc) is not None and issubclass(type(exc), KeyProviderError):
                 raise  # a custody refusal the engine built, already with no chain
             caught = exc
         # Built and raised outside the handler, never bound here, and the replaced error dropped,
