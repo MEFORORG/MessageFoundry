@@ -8605,24 +8605,38 @@ class AuthService:
         It logs one WARNING naming each account whose row was written, or one WARNING with the
         count on a rolled-up pass; a refused row has the soft write's ERROR instead. A write that
         raises ends the pass with no page, so the accounts written before it are logged the same
-        way, decided on them."""
+        way, decided on them. The account whose own write raised gets its WARNING too, whatever
+        the rollup: it has neither row nor page, so that line is its only record."""
+
+        def warn(username: str, probes: int) -> None:
+            _log.warning(
+                "directory reconcile: %d probes running of %s failed to reach the directory, so "
+                "its sessions are not revoked while this lasts",
+                probes,
+                scrub_log_argument(username),
+            )
+
         written: list[tuple[str, str, int]] = []
         try:
             for entry in plan.unreached:
                 _user_id, username, probes = entry
-                if await self._audit_reconciler_row(
-                    "auth.ad_reconcile_unreached",
-                    actor=username,
-                    detail=_json(
-                        {
-                            "reason": reconcile.UNREACHED_ACCOUNT,
-                            "probes": probes,
-                            "asked": plan.asked,
-                            "aborted": plan.aborted,
-                        }
-                    ),
-                ):
-                    written.append(entry)
+                try:
+                    if await self._audit_reconciler_row(
+                        "auth.ad_reconcile_unreached",
+                        actor=username,
+                        detail=_json(
+                            {
+                                "reason": reconcile.UNREACHED_ACCOUNT,
+                                "probes": probes,
+                                "asked": plan.asked,
+                                "aborted": plan.aborted,
+                            }
+                        ),
+                    ):
+                        written.append(entry)
+                except BaseException:
+                    warn(username, probes)
+                    raise
         finally:
             # A rollup only with something written: one with nothing would page nothing, and the
             # lifespan task reads the run's length off the entries (final-round finding 1).
@@ -8639,12 +8653,7 @@ class AuthService:
                 )
             else:
                 for _user_id, username, probes in written:
-                    _log.warning(
-                        "directory reconcile: %d probes running of %s failed to reach the "
-                        "directory, so its sessions are not revoked while this lasts",
-                        probes,
-                        scrub_log_argument(username),
-                    )
+                    warn(username, probes)
         return replace(plan, unreached=tuple(written), unreached_rollup=rollup)
 
     def _latch_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:

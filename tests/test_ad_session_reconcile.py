@@ -3069,9 +3069,10 @@ async def test_refused_unreached_rows_log_no_per_account_warning(
 ) -> None:
     """BACKLOG #3709, review round 3. Seven accounts entering would roll up, but six rows are
     refused, so the pass does not roll up. Only the written account gets its WARNING; a refused
-    one is left to the soft write's own ERROR line.
+    one is left to the soft write's own ERROR line. The refusal is raised by the store write
+    beneath the soft write, so that ERROR line is the real one.
 
-    RED when: a refused account still gets the per-account WARNING."""
+    RED when: a refused account still gets the per-account WARNING, or has no ERROR line."""
     store = await MessageStore.open(":memory:")
     try:
         names = ["ok"] + [f"flap{i}" for i in range(7)]
@@ -3080,14 +3081,14 @@ async def test_refused_unreached_rows_log_no_per_account_warning(
         await service.initialize()
         for n in names:
             assert await _signed_in_ad_user(service, store, n) is not None
-        real = service._audit_reconciler_row
+        real = service._audit
 
-        async def only_flap0(action: str, **kwargs: Any) -> bool:
+        async def only_flap0(action: str, **kwargs: Any) -> None:
             if action == "auth.ad_reconcile_unreached" and kwargs.get("actor") != "flap0":
-                return False
-            return await real(action, **kwargs)
+                raise OSError("store refused")
+            await real(action, **kwargs)
 
-        monkeypatch.setattr(service, "_audit_reconciler_row", only_flap0)
+        monkeypatch.setattr(service, "_audit", only_flap0)
         sink = _InverseSink()
         ldap.unreachable = set(names[1:])
         for _ in range(2):
@@ -3098,6 +3099,14 @@ async def test_refused_unreached_rows_log_no_per_account_warning(
         assert len(plan.unreached) == 1 and not plan.unreached_rollup
         warned = _unreached_warnings(caplog)
         assert len(warned) == 1 and "flap0" in warned[0]
+        refused = sorted(
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.ERROR and "could not be written" in r.getMessage()
+        )
+        assert len(refused) == 6
+        assert all("auth.ad_reconcile_unreached" in m for m in refused)
+        assert [f"flap{i}" in m for i, m in enumerate(refused, start=1)] == [True] * 6
     finally:
         await store.close()
 
@@ -3106,9 +3115,10 @@ async def test_an_unreached_row_write_that_raises_keeps_the_earlier_warnings(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #3709, review round 3. A later write that raises ends the pass with no page, so
-    every account whose row was written before it still gets its WARNING.
+    every account whose row was written before it still gets its WARNING, and so does the account
+    whose own write raised.
 
-    RED when: a raise leaves no WARNING for an account written before it."""
+    RED when: a raise leaves no WARNING for an account written before it, or for its own."""
     store = await MessageStore.open(":memory:")
     try:
         names = ["ok", "flapA", "flapB"]
@@ -3139,8 +3149,51 @@ async def test_an_unreached_row_write_that_raises_keeps_the_earlier_warnings(
         ):
             await _pass(service, sink)
         assert len(written) == 1
+        (raised,) = {"flapA", "flapB"} - set(written)
         warned = _unreached_warnings(caplog)
-        assert len(warned) == 1 and written[0] in warned[0]
+        assert len(warned) == 2
+        assert sum(written[0] in w for w in warned) == 1 and sum(raised in w for w in warned) == 1
+    finally:
+        await store.close()
+
+
+async def test_the_account_whose_own_unreached_row_raises_still_gets_its_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3709, final repair. Before the rollup was decided on the rows written, each
+    account's WARNING was logged before its write, so an account whose own write raised still had
+    one. It has neither row nor page, so that line is its only record, and it keeps it.
+
+    RED when: the account whose own write raised gets no per-account WARNING."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ["ok", "flapA"]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        real = service._audit_reconciler_row
+
+        async def raise_on_unreached(action: str, **kwargs: Any) -> bool:
+            if action == "auth.ad_reconcile_unreached":
+                raise RuntimeError("store gone")
+            return await real(action, **kwargs)
+
+        monkeypatch.setattr(service, "_audit_reconciler_row", raise_on_unreached)
+        sink = _InverseSink()
+        ldap.unreachable = {"flapA"}
+        for _ in range(2):
+            await _pass(service, sink)
+        caplog.clear()
+        with (
+            caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"),
+            pytest.raises(RuntimeError, match="store gone"),
+        ):
+            await _pass(service, sink)
+        warned = _unreached_warnings(caplog)
+        assert len(warned) == 1 and "flapA" in warned[0]
+        assert not _unreached_events(sink)
     finally:
         await store.close()
 
@@ -3151,6 +3204,7 @@ async def test_a_raise_after_more_than_five_written_rows_logs_one_count_line(
     """BACKLOG #3709, review round 3. Where the rows written before a raising write are more than
     the rollup bound, they are logged as the rollup's one count line, not one WARNING each, so a
     raise that recurs every pass does not bring back the per-account flood the rollup prevents.
+    Only the account whose own write raised has a WARNING of its own: it has no row.
 
     RED when: a raise after six written rows logs a WARNING per account."""
     store = await MessageStore.open(":memory:")
@@ -3183,7 +3237,9 @@ async def test_a_raise_after_more_than_five_written_rows_logs_one_count_line(
         ):
             await _pass(service, sink)
         assert len(written) == 6
-        assert _unreached_warnings(caplog) == []
+        (raised,) = set(names[1:]) - set(written)
+        warned = _unreached_warnings(caplog)
+        assert len(warned) == 1 and raised in warned[0]
         counted = [r.getMessage() for r in caplog.records if "6 accounts entered" in r.getMessage()]
         assert len(counted) == 1
     finally:
