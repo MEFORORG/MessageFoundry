@@ -2162,15 +2162,17 @@ class UploadStore:
                 exc.strerror or type(exc).__name__,
             )
             return ResealResult(root_missing=True)
+        writable = True
         if pairs:
             try:
                 # Once, before any file is read: a lock this account cannot take refuses every
                 # write, and finding that out per half would decrypt and re-encrypt each upload
-                # first. Every pair is then a skip, so the run fails and nothing is written.
+                # first. Then every half that needs a write is a skip, so the run fails and nothing
+                # is written; a half already under the active key needs none, and is not one.
                 with _pair_lock(self._root / LOCK_FILE_NAME, for_reseal=True):
                     pass
             except OSError:
-                return ResealResult(skipped=len(pairs))
+                writable = False
         resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = 0
         for fid, _sidecar in pairs:
             try:
@@ -2186,8 +2188,10 @@ class UploadStore:
             # _encrypt_blob). Body FIRST, as save() writes it: the sidecar is the listing key, and a
             # keyed store refuses a plaintext value (BACKLOG #1169). Sealing the sidecar first would
             # let an interrupted pass list an upload whose body is still refused.
-            body = self._reseal_half(cipher, fid, blob_path, "body")
-            meta = self._reseal_half(cipher, fid, meta_path, "meta", over=(body, blob_path))
+            body = self._reseal_half(cipher, fid, blob_path, "body", writable=writable)
+            meta = self._reseal_half(
+                cipher, fid, meta_path, "meta", over=(body, blob_path), writable=writable
+            )
             resealed += (body in _WRITTEN) + (meta in _WRITTEN)
             # Once per pair, whichever half failed. A skipped pair counts in sealed_plaintext too
             # when it had a plaintext half sealed (BACKLOG #3240): its sidecar may be sealed
@@ -2232,6 +2236,7 @@ class UploadStore:
         kind: Literal["body", "meta"],
         *,
         over: tuple[_Half, Path] | None = None,
+        writable: bool = True,
     ) -> _Half:
         """Re-seal one half of upload ``fid`` and say what became of it. A sidecar passes ``over``,
         the body half's result and its path, because a plaintext sidecar is sealed only over a body
@@ -2247,7 +2252,9 @@ class UploadStore:
         **The write never re-creates a removed file (BACKLOG #3181 item 5).** ``rotate-key`` refuses
         a held store only on SQLite, so an engine on a server store can delete an upload while this
         runs, and a plain replace brought the sidecar back. The replace now happens under
-        :func:`_pair_lock`, only while the path is still the file this ``lstat`` saw."""
+        :func:`_pair_lock`, only while the path is still the file this ``lstat`` saw. Without
+        ``writable`` (the pair lock was refused), a half that needs a write is a skip before it is
+        decrypted."""
         try:
             info = path.lstat()
             if S_ISLNK(info.st_mode):
@@ -2326,6 +2333,14 @@ class UploadStore:
             if body is _Half.SKIPPED:
                 _log.warning("uploaded file %s (meta): left unsealed, its body was not", fid)
                 return _Half.SKIPPED
+        if not writable:
+            _log.warning(
+                "uploaded file %s (%s): skipped, the uploads pair lock could not be taken, so "
+                "nothing is written",
+                fid,
+                kind,
+            )
+            return _Half.SKIPPED
         try:
             sealed = _reencrypt_value(cipher, stored, cell_aad("uploaded_file", kind, fid))
         except _UnopenableValueError:
@@ -3250,24 +3265,40 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
     on unlocked. It is logged at ERROR once per process per lock file, naming it and the likely
     cause: a lock file another account created, as when ``rotate-key`` ran as root or as an
     administrator. A lock whose directory is gone is not logged: there is nothing left to remove.
-    **The re-seal fails closed (``for_reseal``):** a lock it cannot take is logged at ERROR and
-    raised, so that half is a skip and nothing is written."""
+    A lock still held when the wait runs out is not a refusal: it is logged at WARNING each time,
+    with ``edit_lock``'s own reason, and never uses up that one ERROR.
+    **The re-seal fails closed (``for_reseal``):** a lock it cannot take is logged and raised, so
+    that half is a skip and nothing is written."""
     with contextlib.ExitStack() as held:
         try:
             held.enter_context(edit_lock(path, timeout=_PAIR_LOCK_TIMEOUT_SECONDS))
         except OSError as exc:
             lock = scrub_log_argument(str(lock_path_for(path)))
-            if for_reseal:
+            # edit_lock raises TimeoutError, with no cause, when another holder kept the lock past
+            # the wait; with a cause it is a lock path planted as a link, which is a refusal.
+            if isinstance(exc, TimeoutError) and exc.__cause__ is None:
+                _log.warning(
+                    "uploaded-logs pair lock: %s. %s",
+                    codec_safe_str(exc),
+                    "rotate-key writes nothing in its place; re-run it once the engine's removals "
+                    "finish"
+                    if for_reseal
+                    else "This removal goes on without it, so a rotate-key run meanwhile could "
+                    "re-create the removed upload",
+                )
+                if for_reseal:
+                    raise
+            elif for_reseal:
                 _log.error(
-                    "rotate-key could not take the uploads pair lock %s (%s), so it re-seals no "
-                    "upload. Run rotate-key as the account the engine runs as. If another account "
-                    "owns the lock file, or it is not a regular file, delete it while neither the "
-                    "engine nor rotate-key runs",
+                    "rotate-key could not take the uploads pair lock %s (%s), so it writes no "
+                    "uploaded file while it cannot. Run rotate-key as the account the engine runs "
+                    "as. If another account owns the lock file, or it is not a regular file, "
+                    "delete it while neither the engine nor rotate-key runs",
                     lock,
                     codec_safe_str(exc),
                 )
                 raise
-            if not isinstance(exc, FileNotFoundError):
+            elif not isinstance(exc, FileNotFoundError):
                 with _unlocked_logged_lock:
                     first = lock not in _unlocked_logged
                     _unlocked_logged.add(lock)
@@ -3297,7 +3328,7 @@ def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
     """Whether two ``lstat`` results are one unchanged file. The engine never writes a pair in place,
     only by temp-and-replace, so a rewrite gives a new file id, and the size and times catch most of
     what a file system that reports none would hide. The change time is a creation time on Windows,
-    so a replacement's is new there; a false "changed" is only a skip."""
+    so a replacement's is new there; a false "changed" makes that half a skip."""
     return os.path.samestat(a, b) and (a.st_size, a.st_mtime_ns, a.st_ctime_ns) == (
         b.st_size,
         b.st_mtime_ns,

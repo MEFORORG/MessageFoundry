@@ -223,8 +223,11 @@ async def test_discard_waits_through_run_to_completion_held_from_the_start(
         discard.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(discard, 10)
-    assert f"the removal of upload {meta.file_id} did not finish within" in caplog.text
-    release.set()
+    try:
+        assert f"the removal of upload {meta.file_id} did not finish within" in caplog.text
+    finally:
+        # Released whatever the assertion found, or the executor thread blocks the loop teardown.
+        release.set()
     for _ in range(500):
         if not store._stragglers:
             break
@@ -286,3 +289,78 @@ def test_a_reseal_that_cannot_take_the_lock_writes_nothing_and_fails(
     assert reads == []
     assert {n: (root / n).read_bytes() for n in upload_names(root)} == before
     assert "Run rotate-key as the account the engine runs as" in caplog.text, caplog.text
+
+
+def _busy_at(monkeypatch: pytest.MonkeyPatch, *, names: Callable[[str], bool]) -> None:
+    """The pair lock still held past the wait, as ``edit_lock`` reports it, for the lock taken on a
+    path whose name ``names`` selects; the real lock for every other path."""
+
+    def _lock(path: Path, **kwargs: Any) -> Any:
+        if names(path.name):
+            raise TimeoutError(f"another edit of {path} is still in progress after 2s")
+        return edit_lock(path, **kwargs)
+
+    monkeypatch.setattr(uploads_mod, "edit_lock", _lock)
+    monkeypatch.setattr(uploads_mod, "_unlocked_logged", set())
+
+
+def test_a_busy_lock_is_a_warning_and_does_not_use_up_the_refusal_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lock held past the wait is contention, not a refused lock file, so the removal says so at
+    WARNING and a later refusal still gets its one ERROR."""
+    root = tmp_path / "uploads"
+    key = generate_key()
+    first, second = _seed(root, key), _seed(root, key)
+    engine = _store(root, key)
+    _busy_at(monkeypatch, names=lambda _name: True)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert engine._discard_cancelled_sync(first) is True
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
+    assert "still in progress" in caplog.text
+    assert "another account owns it" not in caplog.text
+    assert uploads_mod._unlocked_logged == set()
+    caplog.clear()
+
+    def _refused(path: Path, **_: Any) -> Any:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(uploads_mod, "edit_lock", _refused)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.uploads"):
+        assert engine._discard_cancelled_sync(second) is True
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "another account owns it" in errors[0].getMessage(), caplog.text
+
+
+def test_a_busy_lock_at_a_reseal_write_is_a_skip_that_does_not_blame_the_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The pre-check takes the lock; a half's write then finds it held past the wait. That half is
+    a skip, nothing is written over it, and the log says to re-run, not to change accounts."""
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    _seed(root, old)
+    before = {n: (root / n).read_bytes() for n in upload_names(root)}
+    _busy_at(monkeypatch, names=lambda name: name != LOCK_FILE_NAME)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert result.skipped == 1 and result.incomplete
+    assert {n: (root / n).read_bytes() for n in upload_names(root)} == before
+    assert "re-run it once the engine's removals finish" in caplog.text, caplog.text
+    assert "Run rotate-key as the account" not in caplog.text
+
+
+def test_a_refused_lock_over_uploads_already_current_is_no_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A half already under the active key needs no write, so a lock the re-run cannot take does
+    not count it as one that may still be under the prior key."""
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    _seed(root, old)
+    store = _store(root, new, old)
+    # The first pass, unrefused, puts both halves under this store's active marker.
+    assert asyncio.run(store.reseal_to_active()).resealed == 2
+    _refuse_the_lock(monkeypatch)
+    result = asyncio.run(store.reseal_to_active())
+    assert result.skipped == 0 and not result.incomplete
