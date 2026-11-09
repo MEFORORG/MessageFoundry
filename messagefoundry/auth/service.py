@@ -8604,7 +8604,7 @@ class AuthService:
         count on a rolled-up pass; a refused row has the soft write's ERROR instead. A write that
         raises ends the pass with no page, so the accounts written before it are logged the same
         way, decided on them. The account whose own write raised gets its WARNING too, whatever
-        the rollup: it has neither row nor page, so that line is its only record."""
+        the rollup: it is neither paged nor latched."""
 
         def warn(username: str, probes: int) -> None:
             _log.warning(

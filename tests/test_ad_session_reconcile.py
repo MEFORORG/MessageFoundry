@@ -3069,8 +3069,8 @@ async def test_refused_unreached_rows_log_no_per_account_warning(
 ) -> None:
     """BACKLOG #3709, review round 3. Seven accounts entering would roll up, but six rows are
     refused, so the pass does not roll up. Only the written account gets its WARNING; a refused
-    one is left to the soft write's own ERROR line. The refusal is raised by the store write
-    beneath the soft write, so that ERROR line is the real one.
+    one is left to the soft write's own ERROR line. The refusal is raised beneath the soft write,
+    by a stand-in for ``_audit``, so that ERROR line is the soft write's own.
 
     RED when: a refused account still gets the per-account WARNING, or has no ERROR line."""
     store = await MessageStore.open(":memory:")
