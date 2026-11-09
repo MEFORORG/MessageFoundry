@@ -39,19 +39,17 @@ glyph -- an accented letter, an em dash, a CJK name -- and still escapes every o
 format controls such as U+200E/F, U+202A-202E and U+2066-2069 (``Cf``), the line and paragraph
 separators (``Zl``, ``Zp``), a lone surrogate (``Cs``), and the private-use and unassigned code
 points (``Co``, ``Cn``), which this interpreter's Unicode tables cannot vouch for and a newer
-terminal may treat as a control. It also escapes a non-ASCII space separator (``Zs``), such as a
-no-break space, which prints as a blank: :data:`_SPACE_SEPARATOR`. Because a character it keeps
-can look like an ASCII one, it
-also escapes a kept character that stands directly before text reading as an escape body, and
-doubles a backslash before more text than the strict rule does; :data:`_ESCAPE_BODY_KEEP` says how
-far that goes. Declined: a look-alike backslash before look-alike escape text, such as U+29F5,
-a Cyrillic ha, then ``1b``, still prints as itself, because closing it by position would escape
+terminal may treat as a control. It also escapes a non-ASCII space separator (``Zs``, see
+:data:`_SPACE_SEPARATOR`). Because a character it keeps can look like an ASCII one, it also
+escapes a kept character that stands directly before text reading as an escape body, and doubles
+a backslash before more text than the strict rule does; :data:`_ESCAPE_BODY_KEEP` says how far
+that goes. Declined: a look-alike backslash before look-alike escape text, such as U+29F5, a
+Cyrillic ha, then ``1b``, still prints as itself, because closing it by position would escape
 most non-Latin text and closing it by list is what :data:`_ESCAPE_BODY_KEEP` rejects (BACKLOG
-#2891, PR 2390 note 2). It is
-for a sink whose own text is not ASCII, where the strict rule would turn the tool's own em dash
-into ``\\u2014``. Its output is not pure ASCII, so it is for a stream already hardened against an
-unencodable character (``messagefoundry.console_streams`` does that for the engine's command
-line).
+#2891, PR 2390 note 2). It is for a sink whose own text is not ASCII, where the strict rule would
+turn the tool's own em dash into ``\\u2014``. Its output is not pure ASCII, so it is for a stream
+already hardened against an unencodable character (``messagefoundry.console_streams`` does that
+for the engine's command line).
 
 A MARKDOWN TABLE CELL. :func:`escape_for_markdown_cell` is the console rule above with
 ``single_line`` and ``keep_printable_unicode``, then the escapes a GFM table cell needs. It is
@@ -65,7 +63,8 @@ because their sinks are byte-oriented (a request line, a header, a file name). T
 different alphabet -- an allowlist of printable ASCII, not a denylist of C0 -- with a
 disambiguation step that one does not need. The two share one thing: :data:`CONTROL_CATEGORIES`,
 which is defined in ``controlchars`` and imported here. The log escape there uses the same set,
-because a log is read back as text much as a terminal is (vault BACKLOG #2815).
+because a log is read back as text much as a terminal is (vault BACKLOG #2815). Keep mode adds the
+space separators (:data:`_SPACE_SEPARATOR`) on top of that set; the log escape does not.
 
 **This module imports only the standard library and ``controlchars``**, a leaf that itself imports
 only the standard library, so a client tree (``harness/``, ``samples/``) may import it under
