@@ -1928,9 +1928,10 @@ count is above `0` (vault BACKLOG #2613).
   names the connection plainly only if it resolves to the path form on an update. `check` resolves
   none, so the two can name different sets. A connection with a value the reading cannot resolve is
   named and marked possibly. At least two kinds are left off instead. One is a connection whose
-  known values rule the path form out, because the build refuses the path form there: a form other
-  than `"path"`, a `transaction` or `batch` interaction, a conditional other than `if-match`, an
-  interaction other than `update` with no conditional, or Bundle entry lists that are set. The
+  known values rule the path form out: a form other than `"path"`, which puts no path form in
+  force, or one of these, beside which the build refuses the path form: a `transaction` or `batch`
+  interaction, a conditional other than `if-match`, an interaction other than `update` with no
+  conditional, or Bundle entry lists that are set. The
   other is a `deployed=False` connection whose `update_url_form` is an `env()` value, because it is
   never built and that value is never read. A `deployed=False` connection with a literal `"path"`
   is named, marked possibly where its interaction, conditional or an entry list is an `env()`

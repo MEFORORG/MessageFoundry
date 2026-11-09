@@ -1037,15 +1037,14 @@ class FhirDestination(DestinationConnector):
             )
         self.interaction: str = str(s.get("interaction", "create"))
         if self.interaction not in _INTERACTIONS:
-            raise ValueError(
-                f"FHIR destination interaction must be one of {_INTERACTIONS}, got {self.interaction!r}"
-            )
+            # The received value is left out: an env() value reaches this check at build, and a
+            # wrongly bound key can hold a credential (#1183, as resolve_env_settings does).
+            raise ValueError(f"FHIR destination interaction must be one of {_INTERACTIONS}")
         conditional = s.get("conditional")
         self.conditional: str | None = str(conditional) if conditional else None
         if self.conditional is not None and self.conditional not in _CONDITIONALS:
             raise ValueError(
-                f"FHIR destination conditional must be one of {_CONDITIONALS} or unset, "
-                f"got {self.conditional!r}"
+                f"FHIR destination conditional must be one of {_CONDITIONALS} or unset"
             )
         # Screened HERE rather than on the send path: it reaches an unencoded URL interpolation AND
         # the If-None-Exist HEADER value, and the header sink has none of the URL limb's incidental
@@ -1081,10 +1080,7 @@ class FhirDestination(DestinationConnector):
         self._is_update = takes_update(self.interaction, self.conditional)
         self.update_url_form: str = str(s.get("update_url_form") or "transaction")
         if self.update_url_form not in _UPDATE_URL_FORMS:
-            raise ValueError(
-                f"FHIR destination update_url_form must be one of {_UPDATE_URL_FORMS}, "
-                f"got {self.update_url_form!r}"
-            )
+            raise ValueError(f"FHIR destination update_url_form must be one of {_UPDATE_URL_FORMS}")
         self._path_form = self.update_url_form == "path"
         if self._path_form and not self._is_update:
             # Nothing else carries an id in the URL, so the setting would do nothing. Refused

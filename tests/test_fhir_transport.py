@@ -2049,6 +2049,34 @@ def test_unknown_update_url_form_is_refused() -> None:
         _dest(interaction="update", update_url_form="query")
 
 
+# Synthetic only: a URL carrying a password and a token= pair, the shape a wrongly bound env() key
+# can hold when it reaches these build-time refusals.
+_SECRET_SHAPED = "https://svc-user:Synth3ticPassw0rd@fhir.invalid/r?token=synthTok-0000"
+
+
+@pytest.mark.parametrize(
+    ("setting", "extra", "allowed"),
+    [
+        ("interaction", {}, ("create", "update", "transaction", "batch")),
+        ("conditional", {}, ("if-none-exist", "conditional-update", "if-match")),
+        ("update_url_form", {"interaction": "update"}, ("transaction", "path")),
+    ],
+)
+def test_a_refused_setting_does_not_echo_its_value(
+    setting: str, extra: dict[str, str], allowed: tuple[str, ...]
+) -> None:
+    """The refusal names the setting and its allowed values, never the received value (#1183)."""
+    settings = {**FHIR(url=BASE).settings, **extra, setting: _SECRET_SHAPED}
+    with pytest.raises(ValueError) as exc:
+        FhirDestination(Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=settings))
+    text = str(exc.value)
+    for part in ("Synth3ticPassw0rd", "synthTok-0000", "svc-user", "fhir.invalid"):
+        assert part not in text
+    assert f"{setting} must be one of" in text
+    for value in allowed:
+        assert repr(value) in text
+
+
 def _write_feed(tmp_path: Any, body: str) -> Any:
     cfg = tmp_path / "config"
     cfg.mkdir()

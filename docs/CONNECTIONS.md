@@ -3354,7 +3354,7 @@ With `update_url_form="path"`, an `update` or `if-match` is sent as `PUT {base}/
 logs. That relaxes owner ruling R3 (ASVS 14.2.1), so it is a listed loosening in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#update_url_form--path-on-a-fhir-connection--the-resource-id-in-the-request-url).
 The engine logs a WARNING naming the connection at every construction, and `messagefoundry check` and
-`GET /security/posture` name it. Set it only on the connection that needs it. FHIR is not a
+`GET /security/posture` name it, except in the cases its SECURITY-LOOSENING.md entry lists as left off. Set it only on the connection that needs it. FHIR is not a
 `connections.toml` transport, so the setting is a `FHIR()` keyword only. This is vault BACKLOG #2550.
 
 **OperationOutcome & delivery semantics.** A 2xx is **delivered** (a returned `OperationOutcome` is captured,
