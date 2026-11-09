@@ -2308,11 +2308,11 @@ async def test_without_the_webauthn_extra_a_passkey_does_not_open_the_rotation(
 async def test_a_passkey_row_that_does_not_parse_refuses_the_rotation_before_the_hash(
     corrupt: bool, rp_id: str | None, available: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The rotation reads the passkey set through the service's verified read, so a row that does
-    not parse counts for nothing and is never an exception: beside a refused TOTP the change is
-    the enrolment refusal, before any argon2 hash, and so where no relying party is configured,
-    or the ``[webauthn]`` extra is absent, and no passkey could count anyway. The control: the
-    same account with its row intact rotates. RED when: the set is read only in the store's
+    """A passkey row that does not parse, beside a refused TOTP: the change is the enrolment
+    refusal before any argon2 hash, never an exception. Where a passkey can count (the malformed
+    arm) the rotation reads the set through the service's verified read, and the row counts for
+    nothing; where none can (no configured relying party, or no ``[webauthn]`` extra) it refuses
+    on the TOTP with no read. The control: the same account with its row intact rotates. RED when: the set is read only in the store's
     write, which raises after the hash, or the early refusal skips the read where the TOTP is
     refused and a passkey can count."""
     from messagefoundry.auth import webauthn as wa

@@ -480,3 +480,25 @@ async def test_the_rotation_write_takes_the_callers_judgement_only_for_the_cell_
     after = await store.get_user(identity.user_id)
     assert after is not None and after.row is not None
     assert (after.row.password_hash != before) is written
+
+
+@pytest.mark.parametrize("shape", ["no-rule", "not-a-judgement"])
+async def test_the_rotation_write_refuses_a_misshaped_judgement(
+    store: MessageStore, shape: str
+) -> None:
+    """A ``totp_judged`` with no ``require_way_past``, which would leave the write unconditional,
+    or one that is not a :class:`TotpJudgement`, which carries no cell to confirm, raises
+    :class:`TypeError` before anything is written. RED when either is accepted."""
+    identity, _token, _password = await login_admin(AuthService(store, AuthSettings()))
+    judged: Any = (
+        TotpJudgement(cell=None, state="usable") if shape == "no-rule" else (lambda _r: True)
+    )
+    rule = None if shape == "no-rule" else service_module._opened_totp_state
+    with pytest.raises(TypeError):
+        await store.set_password(
+            identity.user_id,
+            password_hash="$argon2id$synthetic-not-a-real-hash",
+            password_generated=False,
+            require_way_past=rule,
+            totp_judged=judged,
+        )

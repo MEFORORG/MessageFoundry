@@ -14053,7 +14053,9 @@ class AuthService:
         not parse is no exception and a set that fails its seal is reported. Such a set counts for
         nothing, and so does one with a cell the driver cannot decode while fetching
         (:func:`passkey_cell_undecodable`), as the census counts it. Any other read error raises,
-        before the hash.
+        before the hash. Where the TOTP counts, the store's write still reads the set under its
+        lock, after the hash, so a row that does not parse or a cell that cannot be decoded raises
+        there.
 
         Returns the TOTP judgement, which the store's conditional write takes in place of opening
         the cell again (``totp_judged``), so the rotation opens it once (BACKLOG #3948)."""
@@ -14166,7 +14168,7 @@ class AuthService:
         only where the configuration names a relying party (:meth:`_gate_counts`, BACKLOG #3937).
         It does not ask whether the ``[webauthn]`` extra is present. Its askers include at least
         the console's enrol-first notice, the first-factor refusal of a passkey that is not
-        discoverable, the lock escalation and the rotation's early refusal."""
+        discoverable and the lock escalation."""
         return self._way_past_rp_id is not None
 
     async def _holds_gate_passkey(self, user: VerifiedUser) -> bool:

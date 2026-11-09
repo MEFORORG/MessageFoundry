@@ -3292,9 +3292,13 @@ async def rotation_totp_counts(
     has already run :func:`conditional_way_past`), else the caller's own judgement where it passed
     one (``totp_judged``), else :func:`judge_totp` of the account read now. Under the lock either
     counts only for the cell it judged (:meth:`TotpJudgement.moved`). A ``judged`` that is not a
-    :class:`TotpJudgement` raises :class:`TypeError`: a bare callable would carry no cell to
-    confirm."""
+    :class:`TotpJudgement`, or one with no ``usable``, raises :class:`TypeError`: a bare callable
+    carries no cell to confirm, and a judgement alone would leave the write unconditional."""
     if usable is None:
+        if judged is not None:
+            raise TypeError(
+                "totp_judged needs require_way_past: a judgement makes no write conditional"
+            )
         return None
     if judged is not None:
         if not isinstance(judged, TotpJudgement):
