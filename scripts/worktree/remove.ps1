@@ -269,12 +269,10 @@ $transientRefExcludes = @('--exclude=refs/stash', '--exclude=refs/prefetch/*', '
 # checkout. prune-merged.ps1 and the worktree gate exclude this population too, for the same reason,
 # but count a segment anywhere, so for a clone below one they exclude more than this does.
 # A segment above the primary does not count (vault BACKLOG #2985, item 3): a clone made inside
-# another checkout's .claude/worktrees would otherwise have every one of its trees refused. No harness
-# tree of THIS clone can sit in such a segment. The harness puts its trees under a checkout of this
-# clone (the "WHICH MECHANISM MADE THIS WORKTREE" block of scripts/hooks/worktree_gate.ps1 says which
-# one), and a checkout of this clone holding the primary would have to be added into a directory that
-# already holds it, which `git worktree add` refuses. Every other segment counts, including one under
-# a directory git does not list, so this fails closed.
+# another checkout's .claude/worktrees would otherwise have every one of its trees refused. At least
+# the harness and new.ps1 -Nested put their trees under the MAIN worktree's .claude/worktrees (the
+# "WHICH MECHANISM MADE THIS WORKTREE" block of scripts/hooks/worktree_gate.ps1). Every other segment
+# counts, including one under a directory git does not list, so this fails closed.
 # ORDINAL, because the exemption ALLOWS: the culture comparison ignores a zero-width character or a
 # soft hyphen, so a primary differing by one from the segment's spelling would read as below it. The
 # path is normalised here, so a caller's spelling and case cannot skip the match.
@@ -547,19 +545,18 @@ if ($byPath) {
     # USERPROFILE. So that root joins both reads. A session on some OTHER root outside USERPROFILE is
     # still not seen: nothing on this machine lists the roots in use.
     #
-    # A RUNNING PROCESS THAT STARTED BEFORE ITS SESSION REGISTERED IS THAT SESSION (item 9). The
-    # registry's default reads such a record as STALE, which vetoes nothing. A recycled pid belongs to
-    # a process started AFTER the session registered (the record's startedAt), since one pid is never
-    # held by two processes at once, so only the start-AFTER test can tell reuse. The skew is therefore unbounded here. The
+    # A RECORD WHOSE RUNNING PROCESS STARTED BEFORE ITS startedAt READS AS LIVE HERE (item 9). The
+    # registry's default reads such a record as STALE, which vetoes nothing. The skew is unbounded
+    # here, so only a process started AFTER the record's startedAt reads as a reused pid. The
     # receipt also matches sessions against the worktree list read above, not a second read (item 5).
     $pinRoot = ''
     if ($env:CLAUDE_CONFIG_DIR) {
         if (-not [System.IO.Path]::IsPathFullyQualified($env:CLAUDE_CONFIG_DIR)) {
             throw "CLAUDE_CONFIG_DIR is the relative path '$env:CLAUDE_CONFIG_DIR', so its session registry cannot be placed. Occupancy unknown. Nothing was removed."
         }
-        # The registry's own reads take a root as a wildcard path, so [ or ] could read another
-        # directory, or none, while the literal second listing counts the same root.
-        if ($env:CLAUDE_CONFIG_DIR -match '[\[\]*?]') {
+        # The registry's own reads take a root as a wildcard path, so [, ] or the backtick escape
+        # could read another directory, or none, while the literal second listing counts the same root.
+        if ($env:CLAUDE_CONFIG_DIR -match '[\[\]*?`]') {
             throw "CLAUDE_CONFIG_DIR '$env:CLAUDE_CONFIG_DIR' holds a wildcard character, which the session registry reads as a pattern. Occupancy unknown. Nothing was removed."
         }
         # TrimEndingDirectorySeparator keeps a drive root whole: `D:` alone would name D:'s cwd.

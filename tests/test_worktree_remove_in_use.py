@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -688,7 +689,8 @@ def test_a_shared_root_that_cannot_be_resolved_refuses_both_registries(
     proc = rig.run(*_target(route, wt), "-Force", extra={"MEFOR_COORD_ROOT": value})
     assert proc.returncode != 0, _out(proc)
     # pwsh wraps a long error at the console width, behind a "| " margin, so the words are rejoined.
-    said = " ".join(_out(proc).replace("|", " ").split())
+    # It can also colour each wrapped line, so the colour codes go first.
+    said = " ".join(re.sub(r"\x1b\[[0-9;]*m", "", _out(proc)).replace("|", " ").split())
     assert "could not be resolved" in said and "claims and allocations are unknown" in said, said
     assert wt.exists() and rig.is_registered(wt)
 

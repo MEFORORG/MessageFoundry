@@ -792,6 +792,8 @@ def test_a_session_on_the_callers_config_root_outside_userprofile_occupies_the_t
     # directory, refuse rather than be read.
     for value, needle in (
         (str(rig.root / "cfg[1]"), "wildcard character"),
+        # The backtick is the wildcard escape. Six characters, as cfg[1], so pwsh wraps it the same.
+        (str(rig.root / "cfg`10"), "wildcard character"),
         ("cfg", "relative path"),
     ):
         proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": value})
