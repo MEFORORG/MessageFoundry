@@ -337,6 +337,54 @@ def test_a_handoff_left_behind_names_the_handoff_to_delete_and_reads_no_text(
     assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
 
 
+def test_a_conversion_left_behind_reaches_the_open_and_every_seam_with_its_remedy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The conversion's left-behind refusal names the handoff to delete at the open and through
+    the key seams, with no text from the custody primitive and no chain (BACKLOG #4882)."""
+    from messagefoundry.store.base import resolve_active_key
+
+    def _left(host: Path, handoff: Path) -> HostBlob:
+        raise custody.HandoffLeftBehind("SENTINEL-left-behind")
+
+    def _no_host(path: Path) -> HostBlob:
+        raise FileNotFoundError(path)
+
+    handoff = tmp_path / "handoff.key"
+    handoff.write_bytes(b"not read")
+    monkeypatch.setattr(custody, "read_host_file", _no_host)
+    monkeypatch.setattr(custody_host, "_convert_handoff", _left)
+    settings = _settings(tmp_path)
+    for seam in (
+        functools.partial(load_host_custody, settings, enforcing=True, environ={}),
+        functools.partial(resolve_active_key, settings),
+    ):
+        with pytest.raises(KeyProviderError) as excinfo:
+            seam()
+        text = str(excinfo.value)
+        assert f"Check that {handoff} is gone" in text and "keep the host file" in text
+        assert "SENTINEL" not in text
+        assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
+
+
+def test_an_account_read_that_fails_is_named_as_the_account_and_reads_no_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed account read at open is named as the account's, not the files', and reads no
+    text from the error (BACKLOG #4882)."""
+
+    def _unread(*, enforcing: bool) -> str | None:
+        raise OSError(5, "SENTINEL-account")
+
+    (tmp_path / "master.key").write_bytes(b"not read")
+    monkeypatch.setattr(custody_host, "non_local_account_reading", _unread)
+    with pytest.raises(HostCustodyRefused) as excinfo:
+        load_host_custody(_settings(tmp_path), enforcing=True, environ={})
+    text = str(excinfo.value)
+    assert "the engine's account could not be judged" in text and "SENTINEL" not in text
+    assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
+
+
 # --- the mint -------------------------------------------------------------------------------------
 
 
@@ -2562,7 +2610,7 @@ def test_end_of_input_at_the_recovery_prompt_is_a_refusal(
 
 
 @windows_only
-def test_a_cleanup_that_cannot_remove_the_host_file_keeps_the_original_reason(
+def test_a_cleanup_that_cannot_remove_the_host_file_keeps_the_read_back_reason_class(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Item 10: the unlink in the conversion's cleanup replaced the read-back's own error. The

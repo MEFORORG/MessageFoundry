@@ -34,7 +34,9 @@ command run by an account that cannot open the host blob refuses rather than ask
 recovery key. Nothing here writes the keyring table.
 
 **No key material reaches a log, an exception message, argv or the environment.** This module
-logs nothing at all. The recovery key's text goes only to the terminal callable the caller passes,
+logs at least a custody directory it could not check before a mint, and, through the store's held
+log lines, the class name of an error a refusal at open replaced; never an error's text. The
+recovery key's text goes only to the terminal callable the caller passes,
 which writes the console device, and an entry read back is dropped once it is parsed.
 """
 
@@ -335,9 +337,15 @@ def _read_reason(exc: BaseException) -> str:
     kind = type(exc)
     _log_unjudged("a host custody error was replaced", kind)
     if issubclass(kind, DpapiUnavailable):
-        return "DPAPI, which a handoff and a Windows host file need, is not available on this host"
+        return (
+            "DPAPI, which a handoff and a Windows host file need, is not available on this host; "
+            "a POSIX host uses no handoff"
+        )
     if issubclass(kind, DpapiError):
-        return "a DPAPI call refused it"
+        return (
+            "a DPAPI call refused it; a host file opens only for the account that wrote it, and "
+            "a handoff only on the machine it was written on"
+        )
     if issubclass(kind, CustodyError):
         return (
             "a custody check refused it; those checks read at least the engine's account, the "
@@ -415,9 +423,12 @@ def _convert_handoff(host: Path, handoff: Path) -> HostBlob:
 
     def remove_written() -> bool:
         """Remove the host file this conversion wrote; whether it is gone."""
+        from messagefoundry.store.base import _log_unjudged
+
         try:
             host.unlink(missing_ok=True)
-        except OSError:
+        except OSError as exc:
+            _log_unjudged("the host file a conversion wrote could not be removed", type(exc))
             return False
         return True
 
@@ -503,6 +514,10 @@ def _read_or_convert(host: Path, handoff: Path, *, convert: bool) -> HostBlob:
         # the host file it leaves is read below. With none there, the start refuses.
         if not os.path.lexists(host):
             refusal = _read_refusal(unconverted, exc)
+        else:
+            from messagefoundry.store.base import _log_unjudged
+
+            _log_unjudged("a handoff conversion failed beside a host file", type(exc))
     if refusal is not None:
         raise refusal  # outside the handler, so it has no context (BACKLOG #4882)
     blob = _read_host(host)
@@ -587,12 +602,14 @@ def load_host_custody(
         raise _missing(host, handoff)
     try:
         try:
+            stage = f"the engine's account could not be judged for the host custody of {host}"
             account = non_local_account_reading(enforcing=enforcing)
+            stage = f"the host custody read of {host} and {handoff} failed"
             blob = _read_or_convert(host, handoff, convert=convert)
         except Exception as exc:
             if _recorded_text(exc) is not None:
                 raise  # one this module built, already with no chain
-            refusal = _read_refusal(f"the host custody read of {host} and {handoff} failed", exc)
+            caught = exc
         else:
             if observe:
                 record_key_custody(
@@ -602,7 +619,13 @@ def load_host_custody(
                     )
                 )
             return blob
-        raise refusal  # outside the handler, so it has no context
+        # Built and raised outside the handler, so neither the refusal nor anything its build
+        # raises has the caught error as its context.
+        try:
+            refusal = _read_refusal(stage, caught)
+        finally:
+            del caught
+        raise refusal
     finally:
         _flush_unjudged()  # the replaced classes, logged once no handler is running
 
