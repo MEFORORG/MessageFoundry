@@ -2688,12 +2688,10 @@ class LockableAccountCensus:
     #: from the set its seal covers: ``reset-mfa`` would also remove that passkey. Any account the
     #: requirement does not cover included, since the reset removes every passkey whatever the
     #: scope (BACKLOG #3948 finding 11). A local account counts a passkey its combined passkey
-    #: sign-in accepts (discoverable, under the configured relying party, today's hash scheme), so
-    #: a non-discoverable one it uses as the second factor after its password is not counted. A
-    #: directory account counts a passkey its second factor accepts: under the configured relying
-    #: party and today's hash scheme, discoverable or not. The cure is the store key for a cell
-    #: that does not open, and removing and enrolling the app again for an enrolment this release
-    #: refuses.
+    #: sign-in accepts, so a non-discoverable one it uses as the second factor after its password
+    #: is not counted. A directory account counts a passkey its second factor accepts,
+    #: discoverable or not. The cure is the store key for a cell that does not open, and removing
+    #: and enrolling the app again for an enrolment this release refuses.
     reset_would_remove_a_passkey: tuple[str, ...] = ()
 
     @property
