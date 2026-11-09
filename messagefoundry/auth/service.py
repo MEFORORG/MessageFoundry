@@ -14053,8 +14053,22 @@ class AuthService:
 
         The set is read wherever the account's sealed record names a passkey, even where no
         passkey can count (no configured relying party, or no ``[webauthn]`` extra): the store's
-        write reads it too, and would raise on a row that does not parse after the hash."""
-        held = await self._verified_passkeys(user) if user.has_passkeys else []
+        write reads it too, and would raise on a row that does not parse after the hash. A cell the
+        driver cannot decode while fetching (:func:`passkey_cell_undecodable`) counts the set for
+        nothing too, as the census counts it, so such an account with no TOTP on is refused here
+        rather than raising."""
+        held: list[WebAuthnCredential] | None = []
+        if user.has_passkeys:
+            try:
+                held = await self._verified_passkeys(user)
+            except (UnicodeDecodeError, sqlite3.OperationalError) as exc:
+                if not passkey_cell_undecodable(exc):
+                    raise
+                # The class name only: a decode error's message quotes the cell.
+                _log.warning(
+                    "the passkeys of user %s could not be read (%s)", user.id, type(exc).__name__
+                )
+                held = None
         if held is None:
             if not await self._totp_way_past(user):
                 raise FactorEnrolmentRequired()

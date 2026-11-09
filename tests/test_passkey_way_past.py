@@ -2240,15 +2240,16 @@ async def test_a_passkey_row_that_does_not_parse_names_the_account_in_the_census
 
 
 async def _refused_totp_beside_a_passkey(
-    store: MessageStore, *, way_past_rp_id: str | None = RP
+    store: MessageStore, *, way_past_rp_id: str | None = RP, totp: str | None = _REFUSED_TOTP
 ) -> tuple[AuthService, Identity, list[int]]:
-    """A covered Administrator holding a discoverable passkey and a refused-marker TOTP, so only
-    the passkey can be the way past. Returns the service, the identity and a list that grows by
-    one on every argon2 hash the service runs."""
+    """A covered Administrator holding a discoverable passkey and a refused-marker TOTP (none where
+    ``totp`` is ``None``), so only the passkey can be the way past. Returns the service, the
+    identity and a list that grows by one on every argon2 hash the service runs."""
     service = _service(store, way_past_rp_id=way_past_rp_id)
     identity, token, _ = await login_admin(service)
     await _register(service, identity, token)
-    await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
+    if totp is not None:
+        await _enable_totp(store, identity.user_id, totp)
     hashes: list[int] = []
     argon2 = service._argon2
 
@@ -2316,6 +2317,36 @@ async def test_a_passkey_row_that_does_not_parse_refuses_the_rotation_before_the
             assert hashes == [1]
             return
         await _corrupt_passkey_rows(store, identity.user_id, "not json")
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert hashes == [], "the refusal came after the argon2 hash"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("corrupt", "rp_id"),
+    [(True, None), (True, RP), (False, RP)],
+    ids=["undecodable-no-rp-id", "undecodable", "control"],
+)
+async def test_a_passkey_cell_the_driver_cannot_decode_refuses_the_rotation_before_the_hash(
+    corrupt: bool, rp_id: str | None
+) -> None:
+    """A covered account with no TOTP on whose passkey cell sqlite3 cannot decode while fetching:
+    the set counts for nothing, so the change is the enrolment refusal before any argon2 hash,
+    never an exception, and so where no relying party is configured. The control: the same account
+    with its cell intact rotates on its passkey. RED when: the rotation's read lets the driver's
+    decode failure escape (a 500 where the route had a clean refusal)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, hashes = await _refused_totp_beside_a_passkey(
+            store, way_past_rp_id=rp_id, totp=None
+        )
+        if not corrupt:
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+            assert hashes == [1]
+            return
+        await _corrupt_passkey_rows(store, identity.user_id, b"\xff")
         with pytest.raises(FactorEnrolmentRequired):
             await service.change_password(identity, _NEW_PASSWORD)
         assert hashes == [], "the refusal came after the argon2 hash"
