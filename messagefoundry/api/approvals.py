@@ -1753,9 +1753,10 @@ class ApprovalGate:
         with this row, ``False`` when another caller had already moved it, and ``None`` when the
         status write failed."""
 
-        def detail(moved: bool | None) -> str:
+        def detail(moved: bool | Literal["unknown"] | None) -> str:
             # A result json cannot encode must not raise here, before the status moves, after the
-            # operation ran. That would strand the row 'executing'.
+            # operation ran. That would strand the row 'executing'. "unknown" is for a log line
+            # only, never a written row.
             return _audit_detail(fields if flag is None else {**fields, flag: moved})
 
         combined = AuditAppend(action, actor=approver, detail=detail(True), client=client)
@@ -1827,7 +1828,11 @@ class ApprovalGate:
                         else f"'{scrub_log_argument(landed.status)}' at {landed.decided_at}",
                         action,
                         scrub_log_argument(approver),
-                        scrub_log_argument(detail(False)),  # JSON, so the scrub leaves it as is
+                        # JSON, so the scrub leaves it as is. Only a row read back in another
+                        # state shows another caller moved it; absent, unsealed or unread does not.
+                        scrub_log_argument(
+                            detail(False if isinstance(landed, ApprovalRow) else "unknown")
+                        ),
                     )
                     self._alert_lost_audit(approval_id, action)
                 return

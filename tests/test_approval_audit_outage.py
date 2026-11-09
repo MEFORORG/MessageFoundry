@@ -330,6 +330,29 @@ class _SiblingMoved(_StandingStore):
         return bool(await self._store.decide_pending_approval(approval_id, **kw))
 
 
+class _ReadBackFails(_StandingStore):
+    """The gate's combined ``outcome`` write COMMITS and then raises, as a lost reply does, and
+    every read of the row after it raises too."""
+
+    def __init__(self, store: Any, *, outcome: str) -> None:
+        super().__init__(store)
+        self.outcome = outcome
+        self.settled = False
+
+    async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+        moved = bool(await self._store.decide_pending_approval(approval_id, **kw))
+        audit = kw.get("audit")
+        if audit is not None and audit.action == self.outcome:
+            self.settled = True
+            raise sqlite3.OperationalError("connection reset after COMMIT")
+        return moved
+
+    async def get_pending_approval(self, approval_id: str) -> Any:
+        if self.settled:
+            raise sqlite3.OperationalError(_FAULT)
+        return await self._store.get_pending_approval(approval_id)
+
+
 async def test_an_outcome_row_moved_by_a_sibling_pages_audit_write_failed(
     store: MessageStore,
 ) -> None:
@@ -349,7 +372,7 @@ async def test_an_outcome_row_moved_by_a_sibling_pages_audit_write_failed(
 
 
 async def test_an_interrupted_outcome_moved_by_a_sibling_pages_audit_write_failed(
-    store: MessageStore,
+    store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The sibling leaves the row at the very status and approver this write would have, so only
     the write's own decision time tells the two apart (vault BACKLOG #3193 N1)."""
@@ -360,9 +383,17 @@ async def test_an_interrupted_outcome_moved_by_a_sibling_pages_audit_write_faile
     assert await store.decide_pending_approval(
         approval_id, status="executing", approver="checker", decided_at=1.0
     )
-    await gate._record_interrupted_execution(
-        approval_id, operation="dead_letter_replay", approver="checker", requester="r", client=None
-    )
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        await gate._record_interrupted_execution(
+            approval_id,
+            operation="dead_letter_replay",
+            approver="checker",
+            requester="r",
+            client=None,
+        )
+    # The read-back found the row moved by another caller, so the lost detail says so.
+    [lost] = [r.getMessage() for r in caplog.records if "Lost detail" in r.getMessage()]
+    assert '"recorded": false' in lost, lost
     assert sibling.sibling_moved
     assert await _status(store, approval_id) == "interrupted"
     rows = await store.list_audit(action="approval.interrupted")
@@ -376,31 +407,39 @@ async def test_an_outcome_read_back_that_fails_pages_audit_write_failed(
 ) -> None:
     """The combined write commits with its reply lost, as above, but the read-back raises, so the
     gate cannot say the row is stored and pages audit_write_failed (vault BACKLOG #3193 N1)."""
-
-    class _ReadBackFails(_StandingStore):
-        settled = False
-
-        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
-            moved = bool(await self._store.decide_pending_approval(approval_id, **kw))
-            audit = kw.get("audit")
-            if audit is not None and audit.action == "approval.approved":
-                self.settled = True
-                raise sqlite3.OperationalError("connection reset after COMMIT")
-            return moved
-
-        async def get_pending_approval(self, approval_id: str) -> Any:
-            if self.settled:
-                raise sqlite3.OperationalError(_FAULT)
-            return await self._store.get_pending_approval(approval_id)
-
     sink = _Sink()
     runs: list[str] = []
-    gate = _gate(_ReadBackFails(store), sink, runs=runs)
+    gate = _gate(_ReadBackFails(store, outcome="approval.approved"), sink, runs=runs)
     approval_id = await _request(gate)
     await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
     assert runs == ["ran"] and await _status(store, approval_id) == "approved"
     assert len(await store.list_audit(action="approval.approved")) == 1
     assert sink.lost == [(f"approval:{approval_id}", "approval.approved")]
+    assert sink.copy_missing == []
+
+
+async def test_an_interrupted_outcome_read_back_that_fails_logs_the_flag_unknown(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A read-back that raises cannot say whether another caller moved the row, so the lost
+    detail logs the ``recorded`` flag as unknown rather than false (vault BACKLOG #3193 N1)."""
+    sink = _Sink()
+    gate = _gate(_ReadBackFails(store, outcome="approval.interrupted"), sink)
+    approval_id = await _request(gate)
+    assert await store.decide_pending_approval(
+        approval_id, status="executing", approver="checker", decided_at=1.0
+    )
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        await gate._record_interrupted_execution(
+            approval_id,
+            operation="dead_letter_replay",
+            approver="checker",
+            requester="r",
+            client=None,
+        )
+    [lost] = [r.getMessage() for r in caplog.records if "Lost detail" in r.getMessage()]
+    assert '"recorded": "unknown"' in lost and '"recorded": false' not in lost, lost
+    assert sink.lost == [(f"approval:{approval_id}", "approval.interrupted")]
     assert sink.copy_missing == []
 
 

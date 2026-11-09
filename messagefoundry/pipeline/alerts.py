@@ -686,7 +686,9 @@ class AlertSink(Protocol):
         so the reason says the row was not written OR its write's outcome is unknown (vault BACKLOG
         #3193 item 4); a row the step-up return budget sheds is never written. Where the gate reads
         back that its own write committed, it raises :meth:`audit_offbox_copy_missing` instead. A
-        request read back with a seal that fails still raises this one."""
+        request read back with a seal that fails still raises this one, and so does an outcome
+        whose read-back does not find its own write's status and decision time, or cannot read
+        the row."""
         ...
 
     def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
