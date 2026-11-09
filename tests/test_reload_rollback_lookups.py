@@ -244,9 +244,9 @@ async def test_a_committed_reload_closes_the_old_executor_once_the_swap_holds(
         real_reconcile = runner._reconcile_outbounds
         open_during_step_3: list[bool] = []
 
-        async def observing_reconcile(*args: Any, **kwargs: Any) -> None:
+        async def observing_reconcile(*args: Any, **kwargs: Any) -> list[tuple[str, str]]:
             open_during_step_3.append(old_db not in closed)
-            await real_reconcile(*args, **kwargs)
+            return await real_reconcile(*args, **kwargs)
 
         monkeypatch.setattr(runner, "_reconcile_outbounds", observing_reconcile)
         await runner.reload(_registry(tmp_path, with_lookups=True))

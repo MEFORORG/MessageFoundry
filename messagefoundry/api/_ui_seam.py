@@ -827,12 +827,17 @@ from typing import Any
 #: Re-derived with ``--write`` over both, from ``ce424894d11883ec`` and ``348fe2ce7f78d903``
 #: to ``bfae7aa7c6c809e6``.
 #:
+#: Engine PR 2815 (BACKLOG #5197): ``DrStatus`` gained ``failures``, the steps a degraded DR
+#: activation left unfinished, which the console's status page renders. The digest moved from
+#: ``348fe2ce7f78d903`` (to ``4b8f0c19e6301e96`` on its own branch). Merged with main's ``bfae7aa7c6c809e6`` and re-derived with ``--write`` over
+#: both, to ``2a4589213e5e782c``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "bfae7aa7c6c809e6"
+ENGINE_UI_SEAM: str = "2a4589213e5e782c"
 
 
 @dataclass(frozen=True, slots=True)
