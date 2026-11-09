@@ -415,9 +415,11 @@ given** — which is exactly AC-6.
 
 ## Amendment A: `check --env` matches `serve` (2026-11-09)
 
-**Decided under the owner's delegation of 2026-11-09 (d20261109T161629902-42e4ec).** The owner
-answered the question with `/driver`, and the deciding seat decided it after an adversarial
-review. It is not an owner ruling. Vault BACKLOG #2355 is the build.
+**Decided by the QUIET supermanager under the owner's delegation of 2026-11-09 (decision
+d20261109T161629902-42e4ec):** the owner quoted the Manager's list headed 'Owner questions to
+bundle (asked once all Builders are idle, so it can't stall PRs again)', whose line read '#2355:
+should check match serve?', and answered '/driver'. Under CLAUDE.md section 5 that record counts as
+the owner's ruling for this question. Vault BACKLOG #2355 is the build.
 
 **What changes.** When `check` is given `--env`, every settings check reads the name as `serve
 --env` reads it: a CLI override of `[ai].environment`, above the settings file and
@@ -438,6 +440,6 @@ those settings, and its Handlers still run with no active environment.
 **What "matches `serve`" covers.** The settings checks read the environment name `serve --env`
 reads. Value-file location is shared too: the offline `<env>.toml` check under `--project-root` now
 reads `MEFOR_ENVIRONMENTS_DIR` above the file's `[environments].dir`, as `serve`'s settings load
-does, so `check` looks in the directory `serve` reads. It does not cover a `[environments].base_dir`
+does. It does not cover a `[environments].base_dir`
 set in the file or the environment without `--project-root`: `serve` fails loud on a missing value
 file under that root, and the offline check fires only under an explicit `--project-root`.
