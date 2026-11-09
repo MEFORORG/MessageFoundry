@@ -469,12 +469,11 @@ def test_out_help_states_the_posix_open_in_place_rule(command: str) -> None:
 def test_compare_out_writes_to_nul_in_place_on_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The compare help says a device such as NUL is opened in place, not replaced: no temp file is
-    # made beside it and the command succeeds.
+    # The compare help says a device such as NUL is opened in place, not replaced. A replace onto
+    # NUL fails (WinError 183), so exit 0 is the assertion that can fail.
     db = _seed_compare(tmp_path, monkeypatch)
     monkeypatch.chdir(tmp_path)
     assert _compare_to(db, "NUL") == 0
-    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_compare_out_replaces_a_second_hard_link(

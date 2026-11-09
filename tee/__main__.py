@@ -536,10 +536,9 @@ def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> Non
     ``compare``. False keeps ``compare``'s writer on main, unchanged on every OS: newlines are the
     platform's (CRLF on Windows), a target :func:`_is_named_stream` accepts is opened for writing
     in place, and anything else goes to a ``mkstemp`` file and ``os.replace``, which replaces an
-    existing file or link on Windows too and refuses a directory. There the report takes the
-    folder's access list, whatever list the old file had, even one that denied this account
-    writing; a link is replaced rather than followed unless it resolves to a target
-    :func:`_is_named_stream` accepts; and the write is atomic.
+    existing regular file on Windows too. There the report takes the folder's access list,
+    whatever list the old file had, even one that denied this account writing; a link to a
+    regular file is replaced rather than followed; and the write is atomic.
     A folder's list can itself let another account read the report, and the replace does not stop
     that. The POSIX paragraph below applies to both values; the paragraphs on Windows describe
     True.

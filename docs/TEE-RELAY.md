@@ -155,16 +155,15 @@ consequences follow from it:
   vault BACKLOG #3166 a Windows `export` file ended its lines in CRLF.
 * **On Windows, `export` and `anonymize-captures` write an existing file in place**, as `write_text`
   did before #3166. It keeps its access list and owner, whatever they hold, so a file another
-  account created there first stays that account's. A link at the path is followed and the file it
-  names is written in place, and a dangling one creates that file. The write is not atomic, so a failure part way leaves the
+  account created there first stays that account's. A link to a file at the path is followed and
+  the file it names is written in place. The write is not atomic, so a failure part way leaves the
   file truncated or partly written. A file the open refuses is an error and exit 1, never replaced:
   at least one this account may not write, a read-only, Hidden or System one, a directory, and one
   another process holds open without write sharing. A new file takes its folder's access list.
 * **compare replaces an existing regular file; the replace can be refused, for example for a
   read-only file on Windows.** On Windows the report takes its folder's access list, whatever list
-  the old file had, so an access list hardened on the old file is not kept. A link at the path, a
-  dangling one included, is replaced rather than followed, unless it resolves to a target compare
-  opens in place. On Windows compare opens a target that resolves, through any link, to anything
+  the old file had, so an access list hardened on the old file is not kept, and a link to a regular
+  file is replaced. On Windows compare opens a target that resolves, through any link, to anything
   that is neither a regular file nor a directory, such as NUL or CON, for writing in place instead
   of replacing it; the open can be refused, for example for a named pipe, and that is an error and
   exit 1. It writes the platform's line endings.
