@@ -8601,10 +8601,11 @@ class AuthService:
         one whose every row was refused carried a rollup with nothing in it.
 
         It logs one WARNING naming each account whose row was written, or one WARNING with the
-        count on a rolled-up pass; a refused row has the soft write's ERROR instead. A write that
-        raises ends the pass with no page, so the accounts written before it are logged the same
-        way, decided on them. The account whose own write raised gets its WARNING too, whatever
-        the rollup: it is neither paged nor latched."""
+        count on a rolled-up pass; a refused row has the soft write's ERROR instead. A raise ends
+        the pass with no page, so the accounts written before it are logged the same way, decided
+        on them. Where the raise came out of an account's own write, that account gets its WARNING
+        too, whatever the rollup: it is neither paged nor latched. A raise anywhere else in the
+        loop gets no WARNING of its own."""
 
         def warn(username: str, probes: int) -> None:
             _log.warning(

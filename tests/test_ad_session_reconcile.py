@@ -3175,7 +3175,7 @@ class _RaisingEntries:
 
 
 @pytest.mark.parametrize("where", ["first-entry", "second-detail", "second-unpack"])
-async def test_a_raise_outside_an_unreached_row_write_warns_only_accounts_attempted(
+async def test_a_raise_outside_an_unreached_row_write_warns_only_the_accounts_written(
     where: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #3709, review round 55a1f0b8. A raise that does not come out of a row write is
@@ -3212,10 +3212,16 @@ async def test_a_raise_outside_an_unreached_row_write_warns_only_accounts_attemp
 
             monkeypatch.setattr(service_module, "_json", raise_second)
         plan = replace(reconcile.ReconcilePlan(), unreached=entries)
+        raises: dict[str, tuple[type[Exception], str]] = {
+            "first-entry": (RuntimeError, "entries gone"),
+            "second-detail": (RuntimeError, "detail gone"),
+            "second-unpack": (ValueError, "not enough values to unpack"),
+        }
+        kind, text = raises[where]
         caplog.clear()
         with (
             caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"),
-            pytest.raises(ValueError if where == "second-unpack" else RuntimeError),
+            pytest.raises(kind, match=text),
         ):
             await service._record_unreached_accounts(plan)
         expected = [] if where == "first-entry" else ["flapA"]
