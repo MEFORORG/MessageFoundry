@@ -100,6 +100,12 @@ _FRAMED: dict[str, tuple[bytes, list[int]]] = {
         _POST + b"Transfer-Encoding: gzip, chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
         [411, 200],
     ),
+    # BACKLOG #5345: llhttp frames a split header as chunked, and the app reads every line of it.
+    "transfer-encoding gzip, then chunked on a second line": (
+        _POST
+        + b"Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+        [411, 200],
+    ),
     "transfer-encoding with case and whitespace": (
         _POST + b"Transfer-Encoding:  CHUNKED \r\n\r\n0\r\n\r\n",
         [411, 200],

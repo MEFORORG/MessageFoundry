@@ -4786,7 +4786,9 @@ def create_app(
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
         client = client_ip(request)
         length = request.headers.get("content-length")
-        transfer_encoding = request.headers.get("transfer-encoding", "").lower()
+        # Every Transfer-Encoding line, not the first: llhttp frames `gzip` then `chunked` on two
+        # lines as chunked, and a first-line read would see only `gzip` and admit an unbounded body.
+        transfer_encoding = ", ".join(request.headers.getlist("transfer-encoding")).lower()
         # A request carrying BOTH Content-Length and Transfer-Encoding is ambiguously framed (RFC 9112
         # §6.1 — TE overrides CL) and is the classic CL.TE request-smuggling vector (ASVS 4.2.1). Under
         # serve the pinned llhttp parser refuses the pair with its own 400 before this runs (BACKLOG
