@@ -456,16 +456,12 @@ _PR_BIND = r"[:=|\-\u2013\u2014\u2192"
 #: The tree scan's verdict words plus the spellings prose uses for them, so a word added to the record
 #: vocabulary reaches both surfaces. "fail closed" and its kin name a control's failure MODE, which is
 #: what a security pull request describes; they are not a verdict.
-_PR_VERDICT = (
-    rf"(?:{_RECORD_VERDICT}|passes|fails|passing|failing|na|needs review|not met|unmet|met)"
-    r"(?![A-Za-z0-9/-])(?!\s+(?:closed|open|safe|fast|through|over)\b)"
-)
+_PR_VERDICT_WORDS = rf"{_RECORD_VERDICT}|na|needs review|not met|unmet|met"
+_PR_VERDICT_TAIL = r"(?![A-Za-z0-9/-])(?!\s+(?:closed|open|safe|fast|through|over)\b)"
+_PR_VERDICT = rf"(?:{_PR_VERDICT_WORDS}|passes|fails|passing|failing){_PR_VERDICT_TAIL}"
 #: The verdict words that name a STATE, without "passing"/"failing"/"passes"/"fails": a test "kept
 #: failing" or "keeps passing", and that is CI prose, not a requirement held at a verdict.
-_PR_VERDICT_STATE = (
-    rf"(?:{_RECORD_VERDICT}|na|needs review|not met|unmet|met)"
-    r"(?![A-Za-z0-9/-])(?!\s+(?:closed|open|safe|fast|through|over)\b)"
-)
+_PR_VERDICT_STATE = rf"(?:{_PR_VERDICT_WORDS}){_PR_VERDICT_TAIL}"
 #: The record's verbs for keeping a requirement at a verdict ("held at", "capped at", "held partial").
 _PR_HOLD_VERB = r"(?:held|holds?|holding|kept|keeps?|capped|pinned)"
 #: Verbs that only a record uses of a verdict. A version does not "stay partial", so these bind even an
@@ -522,16 +518,15 @@ _PR_VERB_BEFORE = re.compile(
 )
 #: "to <verdict>" with no move verb is ordinary English ("requires <version> to pass"), so a bare "to"
 #: binds only when the text before the identifier says the identifier is what moves.
+_PR_MOVE_OBJECT = rf"{_PR_SEP}(?:(?:the|vault|cells?|ASVS){_PR_SEP})*$"
 _PR_MOVE_LEAD = re.compile(
     r"(?i)\b(?:move[sd]?|moving|takes?|took|brings?|brought|re-?grade[sd]?|re-?score[sd]?|of"
     r"|upgrade[sd]?|downgrade[sd]?|sets?|flip(?:s|ped)?|raise[sd]?|lower(?:s|ed)?|drops?|dropped)"
-    rf"{_PR_SEP}(?:(?:the|vault|cells?|ASVS){_PR_SEP})*$"
+    + _PR_MOVE_OBJECT
 )
 #: Move verbs that are also ordinary English ("updates <version> to pass Z-segments through"), so they
 #: bind only an identifier the text marks as a requirement ("update the <id> row to na").
-_PR_MARKED_MOVE_LEAD = re.compile(
-    rf"(?i)\b(?:update[sd]?|updating|mark(?:s|ed)?){_PR_SEP}(?:(?:the|vault|cells?|ASVS){_PR_SEP})*$"
-)
+_PR_MARKED_MOVE_LEAD = re.compile(r"(?i)\b(?:update[sd]?|updating|mark(?:s|ed)?)" + _PR_MOVE_OBJECT)
 #: Read up to the start of the identifier: "partial: <id>", "| fail | <id>".
 _PR_VERDICT_BEFORE = re.compile(rf"(?i)\b{_PR_VERDICT}{_PR_FMT}\s*{_PR_BIND}<\[(]+\s*{_PR_FMT}$")
 #: A table cell that is nothing but a verdict, optionally after a state verb ("Stay partial").
@@ -542,7 +537,9 @@ _PR_CELL_VERDICT_LEAD = re.compile(
 )
 #: The markup a table cell wraps around a value, and the separators of a cell that lists identifiers.
 _PR_CELL_MARKUP = re.compile(_PR_MARKUP)
-_PR_CELL_LIST = re.compile(r"\s*(?:,|;|/|\band\b)\s*")
+#: No "\s*" around the separator: on a long run of spaces it backtracks quadratically, so the parts are
+#: stripped instead.
+_PR_CELL_LIST = re.compile(r"[,;/]|\band\b")
 #: The record's own nouns carrying the verdict when the identifier is a clause away: "held the cell at
 #: partial", "the cell stays partial", "its re-score to pass". Read inside _PR_WINDOW like a gap word,
 #: because "cell" or "re-score" beside a verdict is record vocabulary, not ordinary English.
@@ -719,10 +716,12 @@ def _pr_verdict_bound(text: str, m: re.Match[str], version: bool) -> bool:
 def _pr_table_verdict(row: str, ids: set[str]) -> bool:
     """A table row with an identifier cell and a cell that is nothing but a verdict, wherever it sits.
     The identifier cell may list several, with any list punctuation between them."""
+    if not ids:
+        return False
     cells = [_PR_CELL_MARKUP.sub("", c).strip() for c in row.strip().strip("|").split("|")]
 
     def lists_ids(cell: str) -> bool:
-        parts = [p for p in _PR_CELL_LIST.split(cell) if p]
+        parts = [s for p in _PR_CELL_LIST.split(cell) if (s := p.strip())]
         return bool(parts) and all(p in ids for p in parts)
 
     return any(lists_ids(c) for c in cells) and any(
@@ -762,7 +761,7 @@ def scan_pr_body(body: str) -> list[str]:
             ids = _pr_requirement_ids(sentence)
             # A table pairs an identifier cell with any other cell, so a row is one whole window, and
             # its searches run once rather than once per identifier: a row is unbounded in length.
-            row_evidence: _PrEvidence | None = None
+            evidence: _PrEvidence | None = None
             for m, version in ids:
                 window = (
                     sentence
@@ -776,9 +775,9 @@ def scan_pr_body(body: str) -> list[str]:
                     found["verdict"] = m.start()
                 if version or ("gap" in found and "map" in found):
                     continue
-                if is_row:
-                    row_evidence = row_evidence or _pr_evidence(sentence)
-                gap, marked_gap, code, symbol = row_evidence or _pr_evidence(window)
+                if evidence is None or not is_row:
+                    evidence = _pr_evidence(window)
+                gap, marked_gap, code, symbol = evidence
                 marked = (marked_gap or symbol) and _pr_marked(sentence, m)
                 if "gap" not in found and (gap or (marked_gap and marked)):
                     found["gap"] = m.start()

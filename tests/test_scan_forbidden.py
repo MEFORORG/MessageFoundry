@@ -843,6 +843,9 @@ def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str)
         "| " + ", ".join([_REQ] * 8000) + " | the outbound limb |",
         # An argument list that could overlap the "->" tail of a code symbol backtracks on this.
         f"| {_REQ} | `a(" + ")->" * 21000 + " |",
+        # A list separator pattern with "\s*" around it backtracks on a long run of spaces in a cell
+        # read before the identifier cell: about 3.5 seconds at 20000 spaces, so about 55 at 80000.
+        "| x" + " " * 80000 + f"y | {_REQ} |",
     ],
 )
 def test_a_long_table_row_scans_in_linear_time(sf, row: str) -> None:
