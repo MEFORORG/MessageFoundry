@@ -3187,6 +3187,23 @@ class _StampOutcome:
     refused: bool = False
 
 
+@dataclass
+class _StampWindow:
+    """One ceremony's window from its first session stamp to its rotation (decided by the Manager
+    under the Owner's standing instruction of 2026-10-22, ADR 0217, widening "Revoke both"). See
+    :meth:`AuthService._stamp_to_rotation`. ``stamped`` is the hash the first stamp that landed
+    wrote to, which arms the window; ``closed`` is set once the rotation begins, which owns its
+    own refusals; ``lost`` says the window caught a refusal and answered for the ceremony."""
+
+    stamped: str | None = None
+    closed: bool = False
+    lost: bool = False
+
+
+#: The open stamp window of the running ceremony, if any (:meth:`AuthService._stamp_to_rotation`).
+_STAMP_WINDOW: ContextVar[_StampWindow | None] = ContextVar("_STAMP_WINDOW", default=None)
+
+
 class AuthService:
     """Authentication + RBAC orchestration over an :class:`AuthStore` and the configured directory.
 
@@ -6811,18 +6828,24 @@ class AuthService:
         # (1) Every stamp against the OLD hash, re-anchoring the session to this client address.
         # The accepted auth_time is written in the same statement (BACKLOG #2143), so the next
         # step-up must show a later one: this answer replayed by the IdP is then refused.
-        async with self._sealed_stamp(token_hash):
-            await self._store.mark_session_reauthed(
-                token_hash, client=client, idp_auth_time=principal_claims.auth_time
+        # The stamp-to-rotation window, as in reauth (_stamp_to_rotation).
+        elevation = Elevation(session_lost=True)
+        grant_refused = False
+        async with self._stamp_to_rotation(
+            ceremony="reauth_oidc", actor=user.username, client=client
+        ):
+            async with self._sealed_stamp(token_hash):
+                await self._store.mark_session_reauthed(
+                    token_hash, client=client, idp_auth_time=principal_claims.auth_time
+                )
+            self._restart_new_ip_dedupe(token_hash)
+            grant_refused = purpose is not None and await self._factor_binding_is_blocked_hash(
+                token_hash, purpose
             )
-        self._restart_new_ip_dedupe(token_hash)
-        grant_refused = purpose is not None and await self._factor_binding_is_blocked_hash(
-            token_hash, purpose
-        )
-        # (2) Rotate. Past this line the staged hash no longer resolves.
-        elevation = await self._elevated_hash(
-            token_hash, ceremony="reauth_oidc", actor=user.username, client=client
-        )
+            # (2) Rotate. Past this line the staged hash no longer resolves.
+            elevation = await self._elevated_hash(
+                token_hash, ceremony="reauth_oidc", actor=user.username, client=client
+            )
         if elevation.ok:
             # vault BACKLOG #2145, as in reauth.
             await self._mark_login_address_known(user.id, client, step_up=True)
@@ -10501,10 +10524,15 @@ class AuthService:
         ruling binds on the elevation path: the lapse check loads the session before the rotation
         does. It is NOT the only Transit call after the ceremony's stamp: at least ``verify_mfa``,
         the passkey assertion and ``reauth`` make sealed reads or writes between their stamp and
-        this method, and an Outage there escapes with the stamped hash live (ADR 0217, the second
-        2026-11-09 correction; an open owner question). The lapse check's reads are the session's
+        this method. Those are :meth:`_stamp_to_rotation`'s, which this method closes on entry, so
+        a refusal from here on is this method's (ADR 0217, decided by the Manager under the Owner's
+        standing instruction of 2026-10-22). The lapse check's reads are the session's
         and the account's: an Outage on the account record's check revokes the session too, though
         the session's own seal held."""
+        window = _STAMP_WINDOW.get()
+        if window is not None:
+            # The rotation owns its refusals from here (:meth:`_stamp_to_rotation`).
+            window.closed = True
         rotated: str | None = None
         failure: dict[str, object] = {"reason": "session_gone"}
         try:
@@ -10521,21 +10549,8 @@ class AuthService:
             revoked = await self._revoke_unrotated(token_hash, None, exc)
             failure = {"reason": _rotation_failure_reason(exc), "revokes_landed": revoked}
         if rotated is None:
-            # Soft, so a refused audit write still answers session_lost rather than a 500: the
-            # answer is the fail-closed control, and the row only records it. The audit set, not
-            # the session set: on a vault_transit store a Transit Outage that refused the rotation
-            # also refuses the audit-chain MAC, as CipherError (ADR 0217).
-            await write_audit_soft(
-                lambda: self._audit(
-                    "auth.session_rotation_failed",
-                    actor=actor,
-                    detail=_json({"ceremony": ceremony, **failure}),
-                    client=client,
-                ),
-                log=_log,
-                message="the auth.session_rotation_failed audit row could not be written",
-                errors=audit_write_errors(),
-                defects=AUDIT_WRITE_DEFECTS,
+            await self._audit_rotation_failed(
+                ceremony=ceremony, actor=actor, client=client, failure=failure
             )
             return Elevation(session_lost=True)
         await self._audit(
@@ -10722,13 +10737,79 @@ class AuthService:
         The store refuses the write, writing nothing, when the row it read does not verify. That is
         handled here like a refused read, and the yielded outcome's ``refused`` is set. A caller
         whose next steps record a success must check it and end closed; the others reach a rotation
-        that fails closed on the same row."""
+        that fails closed on the same row.
+
+        A stamp that lands arms the ceremony's open :class:`_StampWindow`, if it has one and the
+        rotation has not begun (:meth:`_stamp_to_rotation`)."""
         outcome = _StampOutcome()
         try:
             yield outcome
         except RowSealError:
             outcome.refused = True
             await self._session_seal_failed(token_hash)
+        else:
+            window = _STAMP_WINDOW.get()
+            if window is not None and not window.closed and window.stamped is None:
+                window.stamped = token_hash
+
+    @asynccontextmanager
+    async def _stamp_to_rotation(
+        self, *, ceremony: str, actor: str | None, client: str | None
+    ) -> AsyncIterator[_StampWindow]:
+        """Guard a ceremony's window from its session stamp to its rotation (decided by the Manager
+        under the Owner's standing instruction of 2026-10-22, ADR 0217, widening "Revoke both").
+
+        Between the stamp and the rotation a ceremony makes more store calls, sealed under Transit,
+        at least a second stamp, ``record_login_success``, a factor-binding check and an audit row.
+        One that raises :func:`_rotation_store_errors` once a stamp has landed would otherwise
+        escape with the stamped hash live. Here the stamped hash is revoked, best effort, the
+        ``auth.session_rotation_failed`` row is written as :meth:`_elevated_hash` writes it, and the
+        refusal is suppressed with ``lost`` set, so the ceremony answers ``session_lost``. A refusal
+        before any stamp landed, after the rotation began, or of any other type propagates as
+        before. A Transit Outage on an audit row raises ``CipherError``, which that tuple does not
+        take."""
+        window = _StampWindow()
+        reset = _STAMP_WINDOW.set(window)
+        try:
+            yield window
+        except _rotation_store_errors() as exc:
+            if window.stamped is None or window.closed:
+                raise
+            window.lost = True
+            revoked = await self._revoke_unrotated(window.stamped, None, exc)
+            await self._audit_rotation_failed(
+                ceremony=ceremony,
+                actor=actor,
+                client=client,
+                failure={"reason": _rotation_failure_reason(exc), "revokes_landed": revoked},
+            )
+        finally:
+            _STAMP_WINDOW.reset(reset)
+
+    async def _audit_rotation_failed(
+        self,
+        *,
+        ceremony: str,
+        actor: str | None,
+        client: str | None,
+        failure: dict[str, object],
+    ) -> None:
+        """Write ``auth.session_rotation_failed``, soft, so a refused audit write still answers
+        ``session_lost`` rather than a 500: the answer is the fail-closed control, and the row only
+        records it. The audit set, not the session set: on a vault_transit store a Transit Outage
+        that refused the rotation also refuses the audit-chain MAC, as CipherError (ADR 0217)."""
+        await write_audit_soft(
+            lambda: self._audit(
+                "auth.session_rotation_failed",
+                actor=actor,
+                detail=_json({"ceremony": ceremony, **failure}),
+                client=client,
+            ),
+            log=_log,
+            message="the auth.session_rotation_failed audit row could not be written",
+            errors=audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
 
     # --- the user loader (BACKLOG #2592) -----------------------------------------------------------
 
@@ -12420,20 +12501,27 @@ class AuthService:
             # columns forward; a stamp issued after it would silently write nothing.
             # Re-anchor the session to the address it re-verified from, so a forced step-up triggered
             # by a roamed/new client IP (WP-L3-13) clears once the caller re-proves from there.
-            async with self._sealed_stamp(hash_token(token)):
-                await self._store.mark_session_reauthed(hash_token(token), client=client)
-            self._restart_new_ip_dedupe(hash_token(token))
-            # `_factor_binding_is_blocked` resolves the session BY THE OLD TOKEN and fails closed when
-            # it cannot find it, so it is decided here, BEFORE the rotation retires that token --
-            # asking after would refuse every such grant on a session that is perfectly fine. It
-            # covers every action in _PENDING_REFUSED_ACTIONS, session_terminate too (#1951).
-            grant_refused = purpose is not None and await self._factor_binding_is_blocked(
-                token, purpose
-            )
-            # (2) Rotate. Past this line `token` no longer authenticates.
-            elevation = await self._elevated(
-                token, ceremony="reauth", actor=identity.username, client=client
-            )
+            # The stamp-to-rotation window (_stamp_to_rotation): a refusal in it, at least
+            # the factor-binding check, revokes the stamped hash and answers session_lost.
+            async with self._stamp_to_rotation(
+                ceremony="reauth", actor=identity.username, client=client
+            ) as window:
+                async with self._sealed_stamp(hash_token(token)):
+                    await self._store.mark_session_reauthed(hash_token(token), client=client)
+                self._restart_new_ip_dedupe(hash_token(token))
+                # `_factor_binding_is_blocked` resolves the session BY THE OLD TOKEN and fails closed when
+                # it cannot find it, so it is decided here, BEFORE the rotation retires that token --
+                # asking after would refuse every such grant on a session that is perfectly fine. It
+                # covers every action in _PENDING_REFUSED_ACTIONS, session_terminate too (#1951).
+                grant_refused = purpose is not None and await self._factor_binding_is_blocked(
+                    token, purpose
+                )
+                # (2) Rotate. Past this line `token` no longer authenticates.
+                elevation = await self._elevated(
+                    token, ceremony="reauth", actor=identity.username, client=client
+                )
+            if window.lost:
+                elevation = Elevation(session_lost=True)
             if elevation.ok:
                 # vault BACKLOG #2145: a step-up on an account that owes no factor is how a
                 # first-seen address passes its challenge, so it becomes known.
@@ -14123,32 +14211,41 @@ class AuthService:
                 # an OIDC one also seed the step-up window (the session has completed password +
                 # MFA). (Initial enrollment has no factor to verify, so this never fires there —
                 # keeping the enrollment step-up gate honest, WP-14.)
-                async with self._sealed_stamp(hash_token(token)) as factor_stamp:
-                    await self._store.mark_session_mfa_verified(hash_token(token))
-                if factor_stamp.refused:
-                    # BACKLOG #2592: the session failed its seal and has been ended. Nothing below
-                    # may record a success for it.
-                    return Elevation(session_lost=True)
-                # BACKLOG #2142 (see the docstring): an OIDC session's window and anchor move only
-                # at the IdP. Seat decision under owner delegation 2026-10-08, not an owner ruling.
-                # Do NOT move the stamp out of this branch: tests/test_oidc_step_up.py pins the
-                # behaviour, and tests/test_docs_security_pathways.py pins the branch itself.
-                if session.auth_mechanism != SessionMechanism.OIDC.value:
-                    # Re-anchor the session to the address that completed the second factor (parity
-                    # with reauth), so an MFA-required admin who roamed clears the WP-L3-13
-                    # new-client-IP signal with one credential proof rather than being forced into a
-                    # separate password step-up.
-                    async with self._sealed_stamp(hash_token(token)) as reauth_stamp:
-                        await self._store.mark_session_reauthed(hash_token(token), client=client)
-                    if reauth_stamp.refused:
-                        # BACKLOG #2592: as above, the session has been ended.
+                # The window from this stamp to the rotation (_stamp_to_rotation): a refusal in it,
+                # at least the second stamp, record_login_success or the audit row, revokes the
+                # stamped hash and answers session_lost.
+                elevation = Elevation(session_lost=True)
+                async with self._stamp_to_rotation(
+                    ceremony="mfa_verify", actor=user.username, client=client
+                ):
+                    async with self._sealed_stamp(hash_token(token)) as factor_stamp:
+                        await self._store.mark_session_mfa_verified(hash_token(token))
+                    if factor_stamp.refused:
+                        # BACKLOG #2592: the session failed its seal and has been ended. Nothing below
+                        # may record a success for it.
                         return Elevation(session_lost=True)
-                    self._restart_new_ip_dedupe(hash_token(token))
-                await self._store.record_login_success(user.id, now=now)
-                await self._audit("auth.mfa_verified", actor=user.username, client=client)
-                elevation = await self._elevated(
-                    token, ceremony="mfa_verify", actor=user.username, client=client
-                )
+                    # BACKLOG #2142 (see the docstring): an OIDC session's window and anchor move only
+                    # at the IdP. Seat decision under owner delegation 2026-10-08, not an owner ruling.
+                    # Do NOT move the stamp out of this branch: tests/test_oidc_step_up.py pins the
+                    # behaviour, and tests/test_docs_security_pathways.py pins the branch itself.
+                    if session.auth_mechanism != SessionMechanism.OIDC.value:
+                        # Re-anchor the session to the address that completed the second factor (parity
+                        # with reauth), so an MFA-required admin who roamed clears the WP-L3-13
+                        # new-client-IP signal with one credential proof rather than being forced into a
+                        # separate password step-up.
+                        async with self._sealed_stamp(hash_token(token)) as reauth_stamp:
+                            await self._store.mark_session_reauthed(
+                                hash_token(token), client=client
+                            )
+                        if reauth_stamp.refused:
+                            # BACKLOG #2592: as above, the session has been ended.
+                            return Elevation(session_lost=True)
+                        self._restart_new_ip_dedupe(hash_token(token))
+                    await self._store.record_login_success(user.id, now=now)
+                    await self._audit("auth.mfa_verified", actor=user.username, client=client)
+                    elevation = await self._elevated(
+                        token, ceremony="mfa_verify", actor=user.username, client=client
+                    )
                 if elevation.ok:
                     # vault BACKLOG #2145: the factor is proved from this address. Recorded INSIDE
                     # the account's queue: a local ``login`` classifies under the same queue, so a
@@ -15491,25 +15588,30 @@ class AuthService:
             token, user, client=client, factor_checked=True, at="webauthn_assert"
         ):
             return Elevation(session_lost=True)
-        async with self._sealed_stamp(hash_token(token)) as stamp:
-            await self._store.mark_session_mfa_verified(hash_token(token))
-        if stamp.refused:  # BACKLOG #2592: the session failed its seal and has been ended
-            return Elevation(session_lost=True)
-        # BACKLOG #1638. A SUCCESSFUL ASSERTION CLEARS THE FAILURE COUNTER, and that is NOT a reversal
-        # of the ADR 0068 divergence recorded above. That divergence is about not FEEDING
-        # ``_register_failure`` on assertion failure, and it stands. It says nothing about success,
-        # and the counter has to be cleared by whichever leg completes the authentication: since
-        # #1638 the password step no longer clears it, so without this line a passkey-only account's
-        # password failures would shed only by waiting the lockout window out.
-        #
-        # Sited before ``_elevated`` rotates the session for the same reason the group in
-        # ``verify_mfa`` is -- though this write targets the USER row, not the session, so it is
-        # ordering by parity rather than by necessity.
-        await self._store.record_login_success(user.id, now=now)
-        await self._audit("auth.webauthn_verified", actor=user.username, client=client)
-        elevation = await self._elevated(
-            token, ceremony="webauthn_assert", actor=user.username, client=client
-        )
+        # The stamp-to-rotation window, as in verify_mfa (_stamp_to_rotation).
+        elevation = Elevation(session_lost=True)
+        async with self._stamp_to_rotation(
+            ceremony="webauthn_assert", actor=user.username, client=client
+        ):
+            async with self._sealed_stamp(hash_token(token)) as stamp:
+                await self._store.mark_session_mfa_verified(hash_token(token))
+            if stamp.refused:  # BACKLOG #2592: the session failed its seal and has been ended
+                return Elevation(session_lost=True)
+            # BACKLOG #1638. A SUCCESSFUL ASSERTION CLEARS THE FAILURE COUNTER, and that is NOT a reversal
+            # of the ADR 0068 divergence recorded above. That divergence is about not FEEDING
+            # ``_register_failure`` on assertion failure, and it stands. It says nothing about success,
+            # and the counter has to be cleared by whichever leg completes the authentication: since
+            # #1638 the password step no longer clears it, so without this line a passkey-only account's
+            # password failures would shed only by waiting the lockout window out.
+            #
+            # Sited before ``_elevated`` rotates the session for the same reason the group in
+            # ``verify_mfa`` is -- though this write targets the USER row, not the session, so it is
+            # ordering by parity rather than by necessity.
+            await self._store.record_login_success(user.id, now=now)
+            await self._audit("auth.webauthn_verified", actor=user.username, client=client)
+            elevation = await self._elevated(
+                token, ceremony="webauthn_assert", actor=user.username, client=client
+            )
         if elevation.ok:
             # vault BACKLOG #2145, as in verify_mfa.
             await self._mark_login_address_known(user.id, client)

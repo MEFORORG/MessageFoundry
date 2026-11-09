@@ -190,6 +190,25 @@ owner. Separately, the sentence above that says "the SQLite session writer turns
 into `RowSealError`" is out of date: since slice 1b-ii every backend's session writer does, through
 `session_writer_seal_check`.
 
+**The stamp-to-rotation window, decided 2026-11-09 (decisions d20261109T165402853-83b348 and
+d20261109T165406730-2505f2).** The open question above is answered by the Manager under the
+Owner's standing instruction of 2026-10-22, widening "Revoke both" (Q1) to the whole window from
+the stamp to the rotation. The adversarial review split only on whose call it was, and the guard
+is strictly safer. This supersedes the Outage row's "end nothing" in *The four answers, defined
+once* for this window only; that row's text is unchanged. It is the **Owner's open reversal
+point**: the Owner may reverse it, and until then it stands. One guard,
+`AuthService._stamp_to_rotation`, is armed when a `_sealed_stamp` lands and closed when
+`_elevated_hash` begins. On a refusal `_rotation_store_errors()` names, raised between the two, it
+revokes the stamped old hash, best effort, writes `auth.session_rotation_failed` with Q1's
+`reason` and `revokes_landed`, and the ceremony answers `session_lost`. It covers at least the
+second stamp and `record_login_success` in `verify_mfa`, the passkey assertion, the factor-binding
+check in `reauth` and in the federated re-auth callback, and the audit row written after the
+stamp. The `_load_user` arm before the federated callback's stamp is unchanged. A refusal before
+any stamp lands still refuses the request with nothing elevated. **Limit:** on a `vault_transit`
+store a Transit Outage at that audit row raises `CipherError` from the audit-chain MAC, which
+`_rotation_store_errors()` does not take, so there the guard fires only on a store refusal of the
+audit write.
+
 ## Context
 
 Engine `main` seals identity and authorization rows (sessions, users with their role grants, custom
