@@ -962,8 +962,9 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
 # --- An in-body WebSocket is accepted only after a gate admitted it (vault BACKLOG #2955) -----------
 # ``authorizes_in_body`` says a WebSocket endpoint runs its own gate before ``accept()``, and the
 # route walk reads that gate as a call in the body. A call is not proof the body acts on it: a body
-# that ignored a refusal, or never reached its gate, would still accept. So every WebSocket gate
-# records on the handshake's scope whether it admitted the caller, through :func:`record_ws_gate`,
+# that ignored a refusal, or never reached its gate, would still accept. So :func:`authorize_ws`,
+# and the web console's ``authorize_ui_ws`` on a browser handshake, record on the handshake's scope
+# whether they admitted the caller, through :func:`record_ws_gate`,
 # and :class:`WebSocketAcceptGate` refuses ``websocket.accept``, and a denial response of any
 # status, on a socket whose scope does not read admitted. When the latest recorded answer is a
 # refusal, it refuses accept on every socket, whatever its route declares. A scope that records no
@@ -1010,9 +1011,8 @@ def ws_accept_allowed(scope: Mapping[str, Any]) -> bool:
     if route is not None:
         # As the HTTP rule reads it: a gate dependency or a public mark; an in-body mark is not
         # enough. A gate dependency that recorded nothing is trusted to have admitted the caller
-        # once it returned. If any dependency raised instead, the body never ran and no accept
-        # follows, and the denial response Starlette sends for that raise passes here, whichever
-        # dependency raised.
+        # once it returned. On such a route, a denial response sent for any dependency's raise
+        # passes here too.
         return route_is_declared(route, websocket=False)
     # FastAPI's router sets no route for a plain Starlette WebSocket route: the endpoint's own public
     # mark, when the scope names one, is the only declaration left to read.
