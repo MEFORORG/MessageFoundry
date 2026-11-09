@@ -2330,13 +2330,15 @@ async def test_a_passkey_row_that_does_not_parse_refuses_the_rotation_before_the
     ids=["undecodable-no-rp-id", "undecodable", "control"],
 )
 async def test_a_passkey_cell_the_driver_cannot_decode_refuses_the_rotation_before_the_hash(
-    corrupt: bool, rp_id: str | None
+    corrupt: bool, rp_id: str | None, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A covered account with no TOTP on whose passkey cell sqlite3 cannot decode while fetching:
-    the set counts for nothing, so the change is the enrolment refusal before any argon2 hash,
-    never an exception, and so where no relying party is configured. The control: the same account
-    with its cell intact rotates on its passkey. RED when: the rotation's read lets the driver's
-    decode failure escape (a 500 where the route had a clean refusal)."""
+    in ``change_password`` the set counts for nothing, so the change is the enrolment refusal
+    before any argon2 hash, never an exception, both with and without a configured relying party.
+    Only the arm without one is a regression from main, whose rotation read no set there. The
+    warning names the account and none of the cell. The control: the same account with its cell
+    intact rotates on its passkey. RED when: the rotation's early refusal lets the driver's decode
+    failure escape."""
     store = await MessageStore.open(":memory:")
     try:
         service, identity, hashes = await _refused_totp_beside_a_passkey(
@@ -2347,9 +2349,17 @@ async def test_a_passkey_cell_the_driver_cannot_decode_refuses_the_rotation_befo
             assert hashes == [1]
             return
         await _corrupt_passkey_rows(store, identity.user_id, b"\xff")
-        with pytest.raises(FactorEnrolmentRequired):
+        with (
+            caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"),
+            pytest.raises(FactorEnrolmentRequired),
+        ):
             await service.change_password(identity, _NEW_PASSWORD)
         assert hashes == [], "the refusal came after the argon2 hash"
+        warned = [r.getMessage() for r in caplog.records if "could not be read" in r.getMessage()]
+        # The whole message, so any trace of the cell fails it.
+        assert warned == [
+            f"the passkeys of user {identity.user_id} could not be read (OperationalError)"
+        ], warned
     finally:
         await store.close()
 
