@@ -697,16 +697,39 @@ def test_a_missing_named_service_config_never_falls_through_to_the_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:
     # serve refuses a --service-config that does not exist. Reading defaults plus the environment
-    # in its place would pass a config serve will not start, so the leg keeps its old answer.
+    # in its place would pass a config serve will not start, and a SKIP would pass the gate.
     cfg = _bare_config(tmp_path, monkeypatch)
     monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
-    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "typo.toml")
+    typo = tmp_path / "typo.toml"
+    report = run_checks(cfg, run_lint=False, service_config=typo)
     result = next(r for r in report.results if r.name == name)
     assert _ENV_ONLY_NOTE not in result.detail, f"{name}: {result.detail}"
-    if name == "static-credentials":
-        assert "graph only" in result.detail
-    else:
-        assert result.skipped, f"{name}: {result.detail}"
+    assert not result.ok and not result.skipped, f"{name}: {result.detail}"
+    assert "service config not found" in result.detail and str(typo) in result.detail
+    if result.required:
+        assert not report.ok
+    # Control: the same run with the file present loads it.
+    typo.write_text('[ai]\nenvironment = "dev"\n', encoding="utf-8")
+    present = run_checks(cfg, run_lint=False, service_config=typo)
+    control = next(r for r in present.results if r.name == name)
+    assert "service config not found" not in control.detail, f"{name}: {control.detail}"
+
+
+@pytest.mark.parametrize("env", [None, "dev"])
+def test_the_check_command_fails_a_service_config_that_names_no_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    env: str | None,
+) -> None:
+    # serve exits 2 on this flag; the gate used to SKIP every settings leg and print PASS.
+    cfg = _bare_config(tmp_path, monkeypatch)
+    flags = ("--env", env) if env is not None else ()
+    rc, legs = _cli_check(
+        capsys, "--config", str(cfg), "--service-config", str(tmp_path / "typo.toml"), *flags
+    )
+    assert rc == 1, legs
+    assert not legs["posture"]["ok"] and not legs["posture"]["skipped"], legs["posture"]
 
 
 def test_a_graph_skip_is_not_tagged_as_an_environment_read(

@@ -1992,9 +1992,13 @@ def _resolve_service_toml(
     """The ``messagefoundry.toml`` a check reads, by the ADR 0050 rules the other checks spell inline:
     an explicit ``--service-config`` wins, ``--project-root`` confines the look to the config dir, and
     otherwise the legacy upward walk runs. ``None`` when there is none. Every settings-reading leg
-    calls this, through :func:`_settings_source`."""
+    calls this, through :func:`_settings_source`.
+
+    An explicit ``--service-config`` is returned whether or not it exists. ``serve`` exits 2 on one
+    that names no file (``load_settings`` raises ``FileNotFoundError``), so the load below raises
+    the same refusal and each settings leg FAILS rather than SKIPs."""
     if service_config is not None:
-        return Path(service_config) if Path(service_config).is_file() else None
+        return Path(service_config)
     if suppress_search:
         candidate = Path(config_dir) / "messagefoundry.toml"
         return candidate if candidate.is_file() else None
@@ -2084,7 +2088,8 @@ def _settings_source(
 
     An explicit ``--service-config`` naming a file that does not exist never falls through to the
     environment. ``serve`` refuses that file outright, so reading defaults plus the environment in its
-    place would pass a config ``serve`` will not start. It keeps the SKIP it always had.
+    place would pass a config ``serve`` will not start. It is returned as ``toml``, and its load
+    fails the leg (:func:`_resolve_service_toml`).
 
     Under ``--project-root``, a ``./messagefoundry.toml`` in the working directory also keeps the
     SKIP, named in its text (:func:`_unread_working_dir_toml`).
@@ -2095,7 +2100,7 @@ def _settings_source(
     toml = _resolve_service_toml(
         config_dir, service_config=service_config, suppress_search=suppress_search
     )
-    if toml is not None or service_config is not None:
+    if toml is not None:
         return toml, False
     if _unread_working_dir_toml(service_config, suppress_search) is not None:
         # serve started here would read that file as well as the environment, so an
