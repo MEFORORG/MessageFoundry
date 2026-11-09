@@ -9612,7 +9612,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"the directory reconciler runs every {interval} s, less often than the "
                     f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}. The "
                     f"interval also delays the page about a directory outage, which comes after "
-                    f"{floor}",
+                    f"{floor}, and the page about one account the directory keeps failing for, "
+                    f"which comes after at least {run} of that account's own probes running "
+                    f"fail, at least {(run - 1) * interval} s after its first such probe",
                 )
             )
         if run > _auth_default("ad_reconcile_outage_passes"):
@@ -9625,7 +9627,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "configured interval. Until it does, a directory account disabled or deleted "
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
                     "per pass to show for it. The same count bounds one account the directory "
-                    "keeps failing for while it answers others, so that page waits longer too",
+                    "keeps failing for, so that page waits longer too",
                 )
             )
         strikes = auth.ad_session_recheck_strikes
@@ -9647,7 +9649,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "a reconciler pass probes fewer accounts than the default of "
                     f"{_auth_default('ad_session_recheck_max_users')}, so a larger estate takes "
                     f"more passes to cover, and {late}. The smaller sample is also the breaker's "
-                    "denominator, so a smaller wave of revocations aborts the pass",
+                    "denominator, so a smaller wave of revocations aborts the pass. In an estate "
+                    "larger than the sample each account is probed less often, so the page about "
+                    "one account the directory keeps failing for, which counts that account's "
+                    "probes, comes more passes later too",
                 )
             )
         brake = (

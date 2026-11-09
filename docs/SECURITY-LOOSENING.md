@@ -938,6 +938,13 @@ count is above `0` (vault BACKLOG #2613).
   `ad_connect_timeout` stretches it too. Each outage pass still logs a WARNING and writes an
   `auth.ad_reconcile_skipped` audit row; only the page waits. The table row above gives the load's
   bound.
+- **What you lose, the unreachable-account page:** the page about one account the directory keeps
+  failing for (vault BACKLOG #3100) counts that account's own probes, not outage passes, so its
+  least delay runs from that account's first failing probe, not from the first outage pass. An
+  `ad_reconcile_outage_passes` above `3`, a longer
+  `ad_session_recheck_seconds`, or an `ad_session_recheck_max_users` below `200` in an estate larger
+  than the budget delays it. The `ad_reconcile_outage_passes` row of
+  [CONFIGURATION.md](CONFIGURATION.md) states when it comes.
 - **Not named:** fewer strikes, a larger budget, or a higher brake threshold. Each ends sessions
   sooner or ends more of them, and none keeps a session the directory withdrew, though a larger
   budget can stretch the outage page, as the bullet above says. Nor is a shorter

@@ -662,8 +662,10 @@ _FORFEIT_NOBODY_ELSE: Final[str] = (
     ", because a restarted process does not resolve one it finds open, and a [cluster] node or "
     "an engine of more than one engine shard resolves none itself"
 )
-#: More accounts than this standing unreachable at once page as one (BACKLOG #3100 closing step
-#: 2; `AuthService._note_unreached_accounts`). A fixed number, not a setting, so tuning the
+#: Where those whose row this pass wrote, plus the accounts latched as paged unreachable that still
+#: hold a live session and a directory key and were not since answered for, are more than this,
+#: those entering page as one (BACKLOG #3100 closing step 2, #3709;
+#: `AuthService._record_unreached_accounts`). A fixed number, not a setting, so tuning the
 #: mass-revoke breaker does not change how these page.
 _UNREACHED_ROLLUP_ABOVE: Final[int] = 5
 #: What a forfeited standing logs when a new condition of its kind opens (BACKLOG #3083).
@@ -8409,8 +8411,8 @@ class AuthService:
             # code that is not an answer is also reported at WARNING by ldap.py itself, once per
             # operation and code (BACKLOG #3010), in engine text that never quotes the directory's
             # diagnostic message. An undecodable response does not reach here (the arm above).
-            # An account this arm reads on every probe while the directory answers others is
-            # bounded by a page, not a strike (`_note_unreached_accounts`, BACKLOG #3100 step 2).
+            # An account this arm reads on every probe is bounded by a page, not a strike
+            # (`_note_unreached_accounts`, BACKLOG #3100 step 2).
             _log.debug("directory probe failed for %s: %s", user.username, exc)
             # Vault BACKLOG #3696. A group search past its deadline or its entry cap is still
             # unjudged, so still UNAVAILABLE, but it says which bound refused it, so it pages.
@@ -8549,10 +8551,11 @@ class AuthService:
         search refused for its bound is an answer: the user search answered, and it pages on its
         own (vault BACKLOG #3696). An account the pass did not probe keeps its count.
 
-        **A flapping directory must not page every account.** Where the accounts already paged
-        and those entering would be more than :data:`_UNREACHED_ROLLUP_ABOVE`, as a directory that
-        answers a few probes in each pass would make them, the lifespan task pages once for those
-        entering (``unreached_rollup``), and each still gets its own row.
+        **A flapping directory must not page every account.** Whether the lifespan task pages
+        once for those entering (``unreached_rollup``) is decided by
+        :meth:`_record_unreached_accounts`, on the rows it wrote; each account whose row was
+        written has that row, and one whose row was refused gets no row, page or latch on that
+        pass.
 
         The latch is set only at the end of the pass, for the accounts whose row was written
         (:meth:`_latch_unreached_accounts`), so a pass that raises, or whose row is refused,
@@ -8579,11 +8582,7 @@ class AuthService:
             runs[probe.user_id] = count = runs.get(probe.user_id, 0) + 1
             if count >= threshold and probe.user_id not in paged and not covered:
                 entered.append((probe.user_id, probe.username, count))
-        return replace(
-            plan,
-            unreached=tuple(entered),
-            unreached_rollup=bool(entered) and len(paged) + len(entered) > _UNREACHED_ROLLUP_ABOVE,
-        )
+        return replace(plan, unreached=tuple(entered))
 
     async def _record_unreached_accounts(
         self, plan: reconcile.ReconcilePlan
@@ -8593,45 +8592,75 @@ class AuthService:
         plan holding only those whose row was written, so no page goes out without its row.
 
         One ``auth.ad_reconcile_unreached`` row per entry, naming the account as ``actor``, so the
-        page the lifespan task raises for it matches a row (ASVS 8.3.2), and one WARNING naming it,
-        or one WARNING with the count on a rolled-up pass. Through the reconciler's soft write,
-        after the revocations, as a paging refusal's row is. A refused row leaves the account
-        unpaged and unlatched, so the next pass writes it again."""
+        page the lifespan task raises for it matches a row (ASVS 8.3.2). Through the reconciler's
+        soft write, after the revocations, as a paging refusal's row is. A refused row leaves the
+        account unpaged and unlatched, so the next pass writes it again.
+
+        Then it decides the rollup (``unreached_rollup``, BACKLOG #3709), once and on the rows
+        written: whether the accounts already paged and those just written are more than
+        :data:`_UNREACHED_ROLLUP_ABOVE`. Nothing is latched before the pass ends, so the paged set
+        holds only earlier passes' accounts. Decided on the entries instead, a pass whose refusals
+        left five or fewer standing paged its written ones under the bare source, naming none, and
+        one whose every row was refused carried a rollup with nothing in it.
+
+        It logs one WARNING naming each account whose row was written, or one WARNING with the
+        count on a rolled-up pass; a refused row has the soft write's ERROR instead. A raise ends
+        the pass with no page, so the accounts written before it are logged the same way, decided
+        on them. Where the raise came out of an account's own write, that account gets its WARNING
+        too, whatever the rollup: it is neither paged nor latched. A raise anywhere else in the
+        loop gets no WARNING of its own."""
+
+        def warn(username: str, probes: int) -> None:
+            _log.warning(
+                "directory reconcile: %d probes running of %s failed to reach the directory, so "
+                "its sessions are not revoked while this lasts",
+                probes,
+                scrub_log_argument(username),
+            )
+
         written: list[tuple[str, str, int]] = []
-        for entry in plan.unreached:
-            _user_id, username, probes = entry
-            if not plan.unreached_rollup:
-                _log.warning(
-                    "directory reconcile: %d probes running of %s failed to reach the directory, "
-                    "so its sessions are not revoked while this lasts",
-                    probes,
-                    scrub_log_argument(username),
-                )
-            if await self._audit_reconciler_row(
-                "auth.ad_reconcile_unreached",
-                actor=username,
-                detail=_json(
+        # The entry whose row write is in flight, so a raise out of that write, a cancellation
+        # included, is pinned to the one account it ended; None outside the write, so the detail
+        # is built before it is set and a raise there is pinned to no account.
+        pending: tuple[str, str, int] | None = None
+        try:
+            for entry in plan.unreached:
+                _user_id, username, probes = entry
+                detail = _json(
                     {
                         "reason": reconcile.UNREACHED_ACCOUNT,
                         "probes": probes,
                         "asked": plan.asked,
                         "aborted": plan.aborted,
                     }
-                ),
-            ):
-                written.append(entry)
-        if plan.unreached_rollup and written:
-            _log.warning(
-                "directory reconcile: %d accounts entered a run of unreachable probes, so their "
-                "sessions are not revoked while this lasts; an auth.ad_reconcile_unreached row "
-                "names each",
-                len(written),
+                )
+                pending = entry
+                stored = await self._audit_reconciler_row(
+                    "auth.ad_reconcile_unreached", actor=username, detail=detail
+                )
+                pending = None
+                if stored:
+                    written.append(entry)
+        finally:
+            if pending is not None:
+                warn(pending[1], pending[2])
+            # A rollup only with something written: one with nothing would page nothing, and the
+            # lifespan task reads the run's length off the entries (final-round finding 1).
+            rollup = (
+                bool(written)
+                and len(self._reconcile_unreached_paged) + len(written) > _UNREACHED_ROLLUP_ABOVE
             )
-        # The rollup only for what was written: a rollup with nothing written would page nothing,
-        # and the lifespan task reads the run's length off the entries (final-round finding 1).
-        return replace(
-            plan, unreached=tuple(written), unreached_rollup=plan.unreached_rollup and bool(written)
-        )
+            if rollup:
+                _log.warning(
+                    "directory reconcile: %d accounts entered a run of unreachable probes, so "
+                    "their sessions are not revoked while this lasts; an "
+                    "auth.ad_reconcile_unreached row names each",
+                    len(written),
+                )
+            else:
+                for _user_id, username, probes in written:
+                    warn(username, probes)
+        return replace(plan, unreached=tuple(written), unreached_rollup=rollup)
 
     def _latch_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:
         """Record that each entry's page is raised, last in the pass, as the outage's is
@@ -8732,8 +8761,9 @@ class AuthService:
           every other account is still judged (BACKLOG #2538). So does a probe the directory
           refused for its configuration, such as a deleted search base (BACKLOG #3010), and a
           probe that raised something the engine could not read, a probe fault (BACKLOG #3100);
-        * an account whose probe keeps failing to reach the directory while it answers others
-          pages once that lasts (BACKLOG #3100), and so does a whole-directory outage (#3709);
+        * an account whose probe keeps failing to reach the directory pages once that lasts
+          (BACKLOG #3100; :meth:`_note_unreached_accounts` says when), and so does a
+          whole-directory outage (#3709);
         * a principal must come back absent, disabled, undetermined or unkeyed
           ``ad_session_recheck_strikes`` passes running;
         * a PRESENT principal whose directory groups would change its roles, or withdraw or narrow
