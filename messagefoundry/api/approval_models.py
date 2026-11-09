@@ -31,6 +31,10 @@ OwnerLiveness = Literal[
     "attestation_required",
 ]
 
+#: What an interrupt would answer now, read from :data:`OwnerLiveness`. One type for the gate and
+#: the wire, as above.
+InterruptVerdict = Literal["refused", "needs_attestation", "allowed"]
+
 
 class ExecutingApprovalInfo(BaseModel):
     """One release still claimed as ``executing``. ``claimed_at`` is when it was claimed;
@@ -47,7 +51,7 @@ class ExecutingApprovalInfo(BaseModel):
     claim_owner: str | None = None
     this_process: bool
     liveness: OwnerLiveness
-    interrupt: Literal["refused", "needs_attestation", "allowed"]
+    interrupt: InterruptVerdict
 
 
 class ExecutingApprovalList(BaseModel):

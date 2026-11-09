@@ -61,7 +61,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, NoReturn
 from uuid import uuid4
 
-from messagefoundry.api.approval_models import OwnerLiveness
+from messagefoundry.api.approval_models import InterruptVerdict, OwnerLiveness
 from messagefoundry.api.models import ReleaseBlocked
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth.identity import Identity
@@ -347,7 +347,7 @@ def _stranded_fields(row: ApprovalRow, reason: str, **extra: Any) -> dict[str, A
 
 def _interrupt_verdict(
     liveness: OwnerLiveness,
-) -> Literal["refused", "needs_attestation", "allowed"]:
+) -> InterruptVerdict:
     """What :meth:`ApprovalGate.interrupt_stranded` does on ``liveness``: the one rule the listing
     and the route both read (BACKLOG #1562)."""
     if liveness in _INTERRUPT_REFUSED:
@@ -832,7 +832,9 @@ class ApprovalGate:
                     )
                     return None
                 for entry in entries:
-                    if _audited_id(entry["detail"]) == row.id:
+                    # The substring test only skips parsing rows that cannot name this request.
+                    detail = str(entry["detail"])
+                    if row.id in detail and _audited_id(detail) == row.id:
                         found.setdefault(status, int(entry["id"]))
         except Exception:  # noqa: BLE001 - an unread trail leaves the outcome unknown, not an error
             log.exception(
