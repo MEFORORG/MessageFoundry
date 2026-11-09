@@ -558,9 +558,8 @@ _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 # ``MEFOR_X=<redacted> ww}`` with its letters masked, and the label is hidden with the value, as it was
 # before. The tail it takes holds only lower case letters and spaces, as the conditions below
 # require, so :func:`_braced_tail` writes each letter as "x" and keeps every space and the closer:
-# the tail's word lengths still print, and nothing else of it. It masks every word, because no later
-# pass can read a word of such a tail: each reader needs a boundary, a digit or punctuation the tail
-# cannot hold. The connection-string member mask kept whole a word ending in ``mrn`` or a scheme word
+# the tail's word lengths still print, and nothing else of it. It masks every word. The
+# connection-string member mask kept whole a word ending in ``mrn`` or a scheme word
 # before a space, which printed a password word such as ``hunterbasic`` in full.
 #
 # A FIRST FORM MASKED EVERY LETTER AND DIGIT TO "x" and printed values the old class hid: in
