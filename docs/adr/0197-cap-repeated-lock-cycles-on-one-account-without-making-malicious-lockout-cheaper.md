@@ -1581,8 +1581,10 @@ At least these checks run, in this order:
 2. the scope check on the target, 403, with its `auth.channel_denied` audit row;
 3. the engine-wide ingress guard for a direct target, which here refuses a body holding a NUL
    byte, and whose refusal gives the proof back. Its 16 MiB ceiling is not reached on this route,
-   because `_limit_request_body` refuses any request body over 1 MiB with a 413 before the
-   handler runs;
+   because `_limit_request_body` refuses, before the handler runs, a body over 1 MiB that
+   declares a Content-Length with a 413, a chunked body with no Content-Length, of any size,
+   with a 411, and a request carrying both a Content-Length and a chunked Transfer-Encoding with
+   a 400 (under `serve` the pinned llhttp parser refuses that pair with its own 400 first);
 4. the registry checks on the target: 404 when it is not registered, 409 when it is not deployed,
    is owned by another engine shard or is not running;
 5. the 409 for a refused body stored only as its head, the last check before the store write.
