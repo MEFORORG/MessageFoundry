@@ -2858,7 +2858,9 @@ def _check_fhir_update_path_form(config_dir: str | Path) -> CheckResult:
     is in the request URL, which owner ruling R3 (ASVS 14.2.1) keeps out of it by default. A site
     takes it for a server with no ``transaction`` interaction. Advisory (``required=False``) on the
     precedent of ``tls_allow_expired``: an interoperability relaxation is reported, not refused, under
-    any ``[security].enforcement``. The construction WARNING is its other record.
+    any ``[security].enforcement``. The construction WARNING is its other record. An ``env()`` value
+    is not resolved here, so a connection that takes the form from one is named as possibly; the set
+    is :func:`~messagefoundry.config.wiring.path_form_fhir_updates`.
 
     SKIPs when the graph will not load, the same convention as its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, path_form_fhir_updates
@@ -2876,16 +2878,17 @@ def _check_fhir_update_path_form(config_dir: str | Path) -> CheckResult:
             name,
             ok=True,
             required=False,
-            detail="no FHIR connection sets update_url_form='path'",
+            detail="no FHIR connection sends updates in the path form (update_url_form='path'), or may",
         )
+    listed = ", ".join(f"{conn} ({note})" if note else conn for conn, note in path_form)
     return CheckResult(
         name,
         ok=True,
         required=False,
         detail=(
-            f"{len(path_form)} FHIR connection(s) send updates in the path form, so each message's "
-            f"resource id is in the request URL — {', '.join(path_form)} (a listed loosening of "
-            "owner ruling R3, ASVS 14.2.1)"
+            f"{len(path_form)} FHIR connection(s) send updates in the path form, or may where "
+            f"marked possibly, so each message's resource id is in the request URL — {listed} (a "
+            "listed loosening of owner ruling R3, ASVS 14.2.1)"
         ),
     )
 
@@ -2924,7 +2927,8 @@ def _check_fhir_update_if_match(config_dir: str | Path) -> CheckResult:
         clean = (
             "every path-form FHIR update declares an If-Match that check can read"
             if path_form_fhir_updates(registry)
-            else "no FHIR connection sets update_url_form='path', so there is no update to read"
+            else "no FHIR connection sends updates in the path form, or may, so there is no update "
+            "to read"
         )
         return CheckResult(name, ok=True, required=False, detail=clean)
     listed = "; ".join(f"{conn} ({note})" for conn, note in plain)
