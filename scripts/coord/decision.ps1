@@ -26,7 +26,7 @@
     failed or skipped record exits 4; a held one does not, since its holder is still at work.
     _decisionlog.ps1 says how the spool's lock and posted mark work (The spool).
 
-    -Gate -Item <item> [-Seat <seat>] [-BuildsOn <id>] (-Touches <path> | -TouchesNothing) answers
+    -Gate -Item <item> -Touches <path> [-Seat <seat>] [-BuildsOn <id>] answers
     which path a Class B act may take: the T1 fast path or review (docs/AUTONOMY-PLAN.md R4, 4.5-4.7
     and section 12, the owner ruling of 2026-11-09). It prints one word as its only stdout line, the
     reasons on stderr, or an object under -Json:
@@ -37,13 +37,15 @@
                             without review.
         REVIEW     exit 11  take the adversarial-review path first.
         HALT       exit 12  do not act; defer. The cost rung is hit.
-    NO-REVIEW needs all of: the act names what it touches, -Touches with every repository path it
-    changes (relative, split at newlines like -Predicate) or -TouchesNothing for an act that changes
-    no file, and no path is one _decisionlog.ps1 Get-DecisionClassCPath names; the kill switch reads
-    exactly OFF (afk-kill.ps1 -Status); the seat's Class B is calibrated, by the digest's own
-    arithmetic (_decisionlog.ps1 Get-DecisionCalibration: the automated signals, the reversal rate
-    and the rates of reds after merge and Lander holds over 14 days, each at 5 percent or less, plus
-    any blind-sample breach; 60 owner ratings are no longer needed); no decision on the item was
+    NO-REVIEW needs all of: the act names, with -Touches, every repository path it changes
+    (relative, one per line: pwsh -File passes one string, so lines are how to give several), and no
+    path is one _decisionlog.ps1 Get-DecisionClassCPath names or cannot classify. An act that changes
+    no file has no git undo, so it has no fast path. The seat is one docs/roles/seats.json resolves,
+    so an alias shares its seat's calibration and budget. The kill switch reads exactly OFF
+    (afk-kill.ps1 -Status); the seat's Class B is calibrated, by the digest's own arithmetic
+    (_decisionlog.ps1 Get-DecisionCalibration: the reversal rate and the rates of reds after merge
+    and Lander holds over 14 days, each at 5 percent or less, plus any blind-sample breach; 60 owner
+    ratings are no longer needed, and every input is an `outcome` record a seat logs by hand); no decision on the item was
     reversed in the 60 days read; the reversal budget is open (plan 4.5: 3 reversals fleet-wide or 2
     of the seat's own decisions inside 24 hours close it for 24 hours); the chain is no deeper than
     two (plan 4.6, below); and the cost rung is not hit (plan 4.7). The paths are the session's own
@@ -111,10 +113,9 @@ param(
     [switch]$Flush,
     [switch]$Gate,
     [string[]]$BuildsOn = @(),
-    # What the act changes, for the T1 fast path (plan section 12): every repository path, or
-    # -TouchesNothing for an act that changes no file. Neither given is REVIEW.
+    # What the act changes, for the T1 fast path (plan section 12): every repository path. None
+    # given is REVIEW.
     [string[]]$Touches = @(),
-    [switch]$TouchesNothing,
     # The usage reader and the Steward's thresholds file the cost rung reads. Defaulted in the body
     # (usage.ps1 beside this script; <home>\.claude\mefor-usage\thresholds.json); tests name fixtures.
     [string]$UsageScript = '',
@@ -339,7 +340,7 @@ function Invoke-DecisionGate {
       count against itself.
     #>
     param([string]$Item, [string]$Seat, [string[]]$BuildsOn, [string]$UsageScript, [string]$ThresholdsFile, [switch]$Offline,
-        [string]$ExcludeId = '', [string[]]$Touches = @(), [switch]$TouchesNothing)
+        [string]$ExcludeId = '', [string[]]$Touches = @())
     $why = [System.Collections.Generic.List[string]]::new()
     try {
         if (Test-DecisionLanderSeat $Seat) {
@@ -364,13 +365,18 @@ function Invoke-DecisionGate {
             return (New-GateAnswer 'REVIEW' $why)
         }
         # T1's no-Class-C-path condition, the one the gate can partly see (plan section 12).
-        if (-not $TouchesNothing -and -not $Touches.Count) {
-            $why.Add('touches: neither -Touches nor -TouchesNothing was given, so the gate cannot show the act touches no Class C path')
+        if (-not $Touches.Count) {
+            $why.Add('touches: no -Touches path was given, so the gate cannot show the act touches no Class C path, or that a git revert undoes it')
             return (New-GateAnswer 'REVIEW' $why)
         }
         $classC = @($Touches | ForEach-Object { Get-DecisionClassCPath $_ } | Where-Object { $_ })
         if ($classC.Count) {
             foreach ($c in $classC) { $why.Add("touches: $c, so the T1 fast path does not apply") }
+            return (New-GateAnswer 'REVIEW' $why)
+        }
+        $canon = Get-DecisionSeatKey $Seat
+        if (-not $canon) {
+            $why.Add("seat: '$Seat' is not a live seat or alias in docs/roles/seats.json, so it cannot be held to a seat's calibration and budget")
             return (New-GateAnswer 'REVIEW' $why)
         }
         $kill = Get-DecisionKillSwitch
@@ -401,7 +407,7 @@ function Invoke-DecisionGate {
 
         # Calibration reads the window alone, so it is the digest's whatever else was read for joins.
         $cal = Get-DecisionCalibration -Ratings $ratings -Outcomes $outcomes -Signals $signals -RecentDays @(Get-DecisionDayRange $today 14) -Decisions @($all | Where-Object {
-                $_.kind -eq 'decision' -and [string]$_.seat -eq $Seat -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id))
+                $_.kind -eq 'decision' -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id)) -and (Get-DecisionSeatKey ([string]$_.seat)) -eq $canon
             })
         if (-not $cal.Calibrated) {
             $why.Add("calibration: $Seat's Class B is not calibrated (blind sample $($cal.Blind); over 14 days, reversal rate $($cal.RateText), red after merge $($cal.RedText), Lander holds $($cal.HeldText))")
@@ -421,7 +427,7 @@ function Invoke-DecisionGate {
             $why.Add("reversal budget: three reversals fleet-wide inside 24 hours close the no-review path for everyone until $(Format-DecisionInstant $fleet.ClosedUntil)")
             $closed = $true
         }
-        $own = Get-DecisionBudget -Reversals $reversals -Now $now -Seat $Seat
+        $own = Get-DecisionBudget -Reversals $reversals -Now $now -Seat $canon
         if ($own.ClosedUntil) {
             $why.Add("reversal budget: two reversals of $Seat's decisions inside 24 hours close its no-review path until $(Format-DecisionInstant $own.ClosedUntil)")
             $closed = $true
@@ -453,24 +459,17 @@ foreach ($b in $BuildsOn) {
     }
 }
 $Touches = @($Touches | ForEach-Object { $_ -split '\r?\n' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)
-if ($TouchesNothing -and $Touches.Count) {
-    [Console]::Error.WriteLine('decision.ps1: give -Touches or -TouchesNothing, not both. Nothing was written.')
-    exit 2
-}
-# As the record and -Json carry it: the paths, 'nothing' under -TouchesNothing, or empty when the
-# session stated neither, which the gate reads as REVIEW.
-$TouchesStated = @(if ($TouchesNothing) { 'nothing' } else { $Touches })
 
 if ($Gate) {
     if (-not $Item) { [Console]::Error.WriteLine('decision.ps1: -Gate needs -Item, the item the act is on.'); exit 2 }
     if (-not $Session) { $Session = [string]$env:CLAUDE_CODE_SESSION_ID }
     if (-not $Seat) { $Seat = Resolve-SeatFromRegistry $Session }
     $g = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript -ThresholdsFile $ThresholdsFile `
-        -Touches $Touches -TouchesNothing:$TouchesNothing
+        -Touches $Touches
     if ($Json) {
         Write-Output (ConvertTo-Json -Depth 4 -InputObject ([ordered]@{
                     result = $g.Result; exit = $GateCodes[$g.Result]; item = $Item; seat = $Seat; buildsOn = @($BuildsOn)
-                    touches = @($TouchesStated); reasons = @($g.Reasons)
+                    touches = @($Touches); reasons = @($g.Reasons)
                 }))
     } else {
         foreach ($r in $g.Reasons) { [Console]::Error.WriteLine("decision.ps1: gate: $r") }
@@ -568,7 +567,7 @@ $record = [ordered]@{
     rating         = $Rating
     note           = $Note
     buildsOn       = @($BuildsOn)
-    touches        = @($TouchesStated)
+    touches        = @($Touches)
     # PENDING until the gate answers, below. A record left PENDING (the gate crashed or hung, or a
     # flusher posted it first) counts toward the chain floor like any unsampled Class B decision.
     gate           = $(if ($gated) { 'PENDING' } else { '' })
@@ -597,7 +596,7 @@ if ($gated) {
     try {
         Write-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record)
         $gateAnswer = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript `
-            -ThresholdsFile $ThresholdsFile -Offline:$NoPost -ExcludeId $record.id -Touches $Touches -TouchesNothing:$TouchesNothing
+            -ThresholdsFile $ThresholdsFile -Offline:$NoPost -ExcludeId $record.id -Touches $Touches
         $record.gate = $gateAnswer.Result
         # The gate has answered, so a failure to write the answer down must not hide it: the record
         # keeps PENDING, which counts toward the chain floor, and -Log still reports the answer.

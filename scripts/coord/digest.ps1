@@ -287,7 +287,10 @@ $md.Add('|---|---|---|---|---|---|---|---|---|---|')
 $recent = @(Get-DecisionDayRange $Day 14)
 # Kept by "seat|class", so the gate-state table below reads each seat's Class B row from here.
 $calibration = @{}
-foreach ($g in @($decisions | Group-Object { "$($_.seat)|$($_.class)" } | Sort-Object Name)) {
+# Grouped by the seat the roster resolves a label to, as the gate reads it, so an alias such as
+# manager2 is manager's row; a label the roster does not resolve keeps its own row.
+function Get-DigestSeat([string]$Seat) { $k = Get-DecisionSeatKey $Seat; if ($k) { $k } else { $Seat } }
+foreach ($g in @($decisions | Group-Object { "$(Get-DigestSeat ([string]$_.seat))|$($_.class)" } | Sort-Object Name)) {
     $seat, $class = $g.Name -split '\|', 2
     $c = Get-DecisionCalibration -Decisions $g.Group -Ratings $ratings -Outcomes $outcomes -Signals $signals -RecentDays $recent
     $calibration[$g.Name] = $c
@@ -322,9 +325,11 @@ if ($dayEnd -gt $now) {
 $md.Add('')
 $md.Add('| Seat | Seat reversal budget | Class B calibrated |')
 $md.Add('|---|---|---|')
-foreach ($s in @($decisions | ForEach-Object { [string]$_.seat } | Where-Object { $_ } | Sort-Object -Unique)) {
+foreach ($s in @($decisions | ForEach-Object { Get-DigestSeat ([string]$_.seat) } | Where-Object { $_ } | Sort-Object -Unique)) {
+    # A seat with no Class B decisions has nothing against it, which the gate reads as calibrated.
     $cal = $calibration["$s|B"]
-    $md.Add("| $s | $(Format-Budget (Get-DecisionBudget -Reversals $reversals -Now $asOf -Seat $s)) | $(if ($cal -and $cal.Calibrated) { 'yes' } else { 'no' }) |")
+    if (-not $cal) { $cal = Get-DecisionCalibration -Decisions @() -Ratings $ratings -Outcomes $outcomes -Signals $signals -RecentDays $recent }
+    $md.Add("| $s | $(Format-Budget (Get-DecisionBudget -Reversals $reversals -Now $asOf -Seat $s)) | $(if (-not (Get-DecisionSeatKey $s)) { 'no, not a roster seat' } elseif ($cal.Calibrated) { 'yes' } else { 'no' }) |")
 }
 $md.Add('')
 $md.Add('Chain limit: each item where a further Class B decision would build on more than two unsampled ones, by the 24-hour floor. A decision''s own buildsOn links can only raise its depth.')

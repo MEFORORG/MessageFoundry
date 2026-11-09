@@ -581,9 +581,12 @@ function Get-DecisionKillSwitch {
 function Get-DecisionLatest($Records, [string]$Kind) {
     # The latest record of a kind per decision it refers to. Ordered by id, which is the UTC write
     # time to the millisecond with a random tail: `ts` reads back as a DateTime, whose string form
-    # sorts month first and drops the milliseconds.
+    # sorts month first and drops the milliseconds. A signal outcome (Test-DecisionSignalOutcome) is
+    # never the latest outcome: it is read by Get-DecisionSignals, and a hold or red logged after a
+    # reversal must not hide the reversal from the gate.
     $map = @{}
-    foreach ($r in @($Records | Where-Object { $_.kind -eq $Kind -and $_.ref } | Sort-Object { [string]$_.id })) { $map[[string]$r.ref] = $r }
+    foreach ($r in @($Records | Where-Object { $_.kind -eq $Kind -and $_.ref -and -not ($Kind -eq 'outcome' -and (Test-DecisionSignalOutcome $_.outcome)) } |
+                Sort-Object { [string]$_.id })) { $map[[string]$r.ref] = $r }
     return $map
 }
 
@@ -598,19 +601,58 @@ function Get-DecisionOutcome($Record, [hashtable]$Outcomes) {
 # act merged, and a Lander hold on the act's pull request.
 $script:DecisionSignalOutcomes = @('red-after-merge', 'held')
 
+function Test-DecisionSignalOutcome($Outcome) {
+    # Case and surrounding space ignored, so a hand-logged `Held` counts as `held`.
+    return ($script:DecisionSignalOutcomes -contains ([string]$Outcome).Trim().ToLowerInvariant())
+}
+
 function Get-DecisionSignals($Records) {
     <#
-      Every signal outcome ever recorded per decision, as ref -> list of values. Unlike `reversed`,
-      which reads the LATEST outcome so a mistaken one can be corrected, a signal counts once any
-      `outcome` record carries it: a hold that was later cleared was still a hold.
+      Every signal outcome ever recorded per decision, as ref -> list of lower-case values. Unlike
+      `reversed`, which reads the LATEST outcome so a mistaken one can be corrected, a signal counts
+      once any `outcome` record carries it: a hold that was later cleared was still a hold.
     #>
     $map = @{}
-    foreach ($o in @($Records | Where-Object { $_.kind -eq 'outcome' -and $_.ref -and $script:DecisionSignalOutcomes -contains [string]$_.outcome })) {
+    foreach ($o in @($Records | Where-Object { $_.kind -eq 'outcome' -and $_.ref -and (Test-DecisionSignalOutcome $_.outcome) })) {
         $ref = [string]$o.ref
+        $v = ([string]$o.outcome).Trim().ToLowerInvariant()
         if (-not $map.ContainsKey($ref)) { $map[$ref] = [System.Collections.Generic.List[string]]::new() }
-        if (-not $map[$ref].Contains([string]$o.outcome)) { $map[$ref].Add([string]$o.outcome) }
+        if (-not $map[$ref].Contains($v)) { $map[$ref].Add($v) }
     }
     return $map
+}
+
+$script:DecisionRoster = $null
+
+function Get-DecisionSeatKey([string]$Seat) {
+    <#
+      The canonical seat a label names, through docs/roles/seats.json's live seats and aliases, so
+      `manager2` is `manager` and cannot start a fresh calibration. '' for an empty, unknown or
+      retired label, or when the roster cannot be read.
+    #>
+    if (-not $Seat) { return '' }
+    $s = $Seat.Trim().ToLowerInvariant()
+    try {
+        if ($null -eq $script:DecisionRoster) {
+            $file = Join-Path (Split-Path -Parent (Split-Path -Parent $script:DecisionHere)) 'docs/roles/seats.json'
+            $script:DecisionRoster = [System.IO.File]::ReadAllText($file) | ConvertFrom-Json -ErrorAction Stop
+        }
+        if (@($script:DecisionRoster.live) -contains $s) { return $s }
+        $alias = $script:DecisionRoster.aliases.PSObject.Properties[$s]
+        if ($alias -and @($script:DecisionRoster.live) -contains [string]$alias.Value) { return [string]$alias.Value }
+    } catch {
+        return ''
+    }
+    return ''
+}
+
+function Test-DecisionSameSeat([string]$A, [string]$B) {
+    # Two labels name one seat: the same canonical seat, or, for a label the roster does not
+    # resolve, the same label.
+    $ka = Get-DecisionSeatKey $A
+    $kb = Get-DecisionSeatKey $B
+    if ($ka -or $kb) { return ($ka -eq $kb) }
+    return ([string]$A).Trim().ToLowerInvariant() -eq ([string]$B).Trim().ToLowerInvariant()
 }
 
 function Format-DecisionRate([int]$Count, [int]$Of) {
@@ -623,9 +665,11 @@ function Format-DecisionRate([int]$Count, [int]$Of) {
 function Get-DecisionCalibration {
     <#
       One seat and class's calibration. Since the owner ruling of 2026-11-09 (tier T1; plan section
-      12) it is the automated signals over the decisions logged on -RecentDays: the reversal rate,
-      the rate of decisions with a red after merge, and the rate with a Lander hold, each a breach
-      above 5 percent. No decisions in the window is no breach.
+      12) it is the signals over the decisions logged on -RecentDays and not answered HALT (a
+      halted decision was deferred, so it can collect no signal): the reversal rate, the rate of
+      decisions with a red after merge, and the rate with a Lander hold, each a breach above 5
+      percent. No decisions in the window is no breach. The arithmetic is automatic; its inputs
+      are `outcome` records a seat logs, and nothing writes one for it.
 
       The owner's blind sample is optional now, so fewer than 60 ratings no longer holds a class on
       the review path. A rating the owner did give still counts: any trailing window of up to 60
@@ -649,7 +693,7 @@ function Get-DecisionCalibration {
     $blind = if ($lastBreach -ge 0 -and $since -lt 60) { "BREACH: review path, $since/60 fresh samples" }
     elseif ($n -lt 60) { $blindOk = $true; "optional, $n/60 samples" }
     else { $blindOk = $true; 'calibrated' }
-    $recent = @($Decisions | Where-Object { $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) })
+    $recent = @($Decisions | Where-Object { [string]$_.gate -ne 'HALT' -and $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) })
     $revd = @($recent | Where-Object { (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed' }).Count
     $red = @($recent | Where-Object { $Signals.ContainsKey([string]$_.id) -and $Signals[[string]$_.id].Contains('red-after-merge') }).Count
     $held = @($recent | Where-Object { $Signals.ContainsKey([string]$_.id) -and $Signals[[string]$_.id].Contains('held') }).Count
@@ -665,34 +709,49 @@ function Get-DecisionCalibration {
 function Get-DecisionClassCPath([string]$Path) {
     <#
       Why a path the act touches keeps it off the T1 fast path, or '' when this list does not name
-      it. AT LEAST these: the rules that bind the fleet (plan R3's Class C list), the coordination
-      and gate scripts this check lives in, the security, PHI and de-identification code, and the
-      dependency manifests. A path that cannot be classified (empty, absolute, or climbing out with
-      `..`) is refused too. It is a denylist, so a path it does not name is not thereby safe: the
-      session still judges that the act is not a security control.
+      it. It names at least these: the rule files plan R3 lists, the coordination, hook and gate
+      scripts and their tests, the security, PHI, de-identification and API code, the scan and lint
+      configuration, the ADRs (T4 reads their direction), and dependency manifests and locks. It is
+      a denylist and does not name every security path, so a path it does not name is not thereby
+      safe: the session still judges that the act is not a security control.
+
+      IT FAILS CLOSED on a path it cannot classify: empty, absolute, climbing out with `..`, the
+      tree itself (`.`), or carrying a glob, a list separator or whitespace. A directory matches
+      with or without its trailing slash, a doubled slash or a `.` segment is folded away, and a
+      trailing dot is dropped as Windows drops it.
     #>
     $p = ([string]$Path).Trim() -replace '\\', '/'
-    while ($p.StartsWith('./')) { $p = $p.Substring(2) }
     if (-not $p) { return 'an empty path cannot be classified' }
+    if ($p -match '[\s,;*?\[\]{}|<>"]') { return "'$Path' carries a glob, a list separator or whitespace, so it cannot be classified; name each path on its own line" }
     if ($p -match '^(/|~|[A-Za-z]:)') { return "'$Path' is not a path relative to the repository, so it cannot be classified" }
-    if (@($p -split '/') -contains '..') { return "'$Path' climbs out with '..', so it cannot be classified" }
-    $l = $p.ToLowerInvariant()
-    $leaf = ($l -split '/')[-1]
+    $segs = @($p -split '/' | Where-Object { $_ -and $_ -ne '.' } | ForEach-Object { $_.TrimEnd('.') })
+    if ($segs -contains '' -or $segs -contains '..') { return "'$Path' climbs out with '..' or names a dot-only segment, so it cannot be classified" }
+    if (-not $segs.Count) { return "'$Path' names the whole tree, so it cannot be classified" }
+    $l = ($segs -join '/').ToLowerInvariant()
+    $leaf = $segs[-1].ToLowerInvariant()
     if ($leaf -in @('claude.md', 'agents.md')) { return "'$Path' is a CLAUDE.md or AGENTS.md, a rule file (Class C)" }
     if ($leaf -like '.env*') { return "'$Path' is an environment file, which holds secrets (Class C)" }
-    $prefixes = @(
-        '.claude/', '.github/', 'scripts/hooks/', 'scripts/coord/', 'scripts/worktree/', 'scripts/security/', 'scripts/asvs/',
-        'docs/roles/', 'docs/security/', 'roles/', 'skills/', 'messagefoundry/auth/', 'messagefoundry/security/',
-        'messagefoundry_toolkit/anon/', 'tee/anon/'
+    if ($leaf -in @('pyproject.toml', 'package.json', 'package-lock.json') -or $leaf -like '*.lock') {
+        return "'$Path' is a dependency manifest or lock (Class C)"
+    }
+    $dirs = @(
+        '.agents', '.claude', '.codex', '.github', '.mefor-hooks', '.semgrep', 'docker/locks', 'docs/adr', 'docs/roles',
+        'docs/security', 'messagefoundry/api', 'messagefoundry/auth', 'messagefoundry/security', 'messagefoundry/support',
+        'messagefoundry_toolkit/anon', 'roles', 'scripts/asvs', 'scripts/ci', 'scripts/coord', 'scripts/hooks', 'scripts/quality',
+        'scripts/security', 'scripts/worktree', 'security', 'skills', 'tee/anon'
     )
-    foreach ($x in $prefixes) { if ($l.StartsWith($x)) { return "'$Path' is under $x, a rule, gate or security path (Class C)" } }
-    $exact = @(
-        '.pre-commit-config.yaml', 'docs/autonomy-plan.md', 'docs/secure_ai_development_standards.md',
-        'docs/secure_development_standards.md', 'docs/security.md', 'docs/phi.md', 'docs/method.md', 'docs/review-standards.md',
-        'docs/ledger-gate.md', 'docs/worktrees.md', 'messagefoundry/api/security.py', 'messagefoundry/api/auth_routes.py',
-        'messagefoundry/support/redact.py', 'pyproject.toml', 'requirements.lock', 'uv.lock'
+    foreach ($d in $dirs) {
+        if ($l -eq $d -or $l.StartsWith("$d/")) { return "'$Path' is under $d/, a rule, gate or security path (Class C)" }
+    }
+    $files = @(
+        '.gitleaks.toml', '.pre-commit-config.yaml', 'docs/autonomy-plan.md', 'docs/ledger-gate.md', 'docs/method.md', 'docs/phi.md',
+        'docs/review-standards.md', 'docs/secure_ai_development_standards.md', 'docs/secure_development_standards.md',
+        'docs/security.md', 'docs/worktrees.md', 'messagefoundry/secretscrub.py'
     )
-    if ($exact -contains $l) { return "'$Path' is a rule, security or dependency file (Class C)" }
+    if ($files -contains $l) { return "'$Path' is a rule, scan or security file (Class C)" }
+    if ($l -like 'tests/test_afk_*' -or $l -like 'tests/test_coord_*' -or $l -like 'tests/test_worktree_*' -or $l -like 'tests/test_role_cards*') {
+        return "'$Path' is a test that pins a gate or a rule (Class C)"
+    }
     return ''
 }
 
@@ -755,7 +814,7 @@ function Get-DecisionBudget {
     $Limit = 3
     if ($Seat) {
         $Limit = 2
-        $Reversals = @($Reversals | Where-Object { $_.Seat -eq $Seat -or $null -eq $_.Seat })
+        $Reversals = @($Reversals | Where-Object { $null -eq $_.Seat -or (Test-DecisionSameSeat $_.Seat $Seat) })
     }
     $day = [TimeSpan]::FromHours(24)
     # A reversal that could still close the scope at $Now happened in the last 24 hours, and the 24
@@ -827,15 +886,8 @@ function Test-DecisionLanderSeat([string]$Seat) {
     # The Lander, or a roster alias of it (docs/roles/seats.json). An unreadable roster is no
     # exemption: this only ever relaxes the cost rung, so a fault must not grant it.
     if (-not $Seat) { return $false }
-    $s = $Seat.Trim().ToLowerInvariant()
-    if ($s -eq 'lander') { return $true }
-    try {
-        $roster = Join-Path (Split-Path -Parent (Split-Path -Parent $script:DecisionHere)) 'docs/roles/seats.json'
-        $alias = ([System.IO.File]::ReadAllText($roster) | ConvertFrom-Json -ErrorAction Stop).aliases.PSObject.Properties[$s]
-        return [bool]($alias -and [string]$alias.Value -eq 'lander')
-    } catch {
-        return $false
-    }
+    if ($Seat.Trim().ToLowerInvariant() -eq 'lander') { return $true }
+    return ((Get-DecisionSeatKey $Seat) -eq 'lander')
 }
 
 function Get-DecisionJsonValue($Object, [string]$Name) {

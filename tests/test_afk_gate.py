@@ -120,6 +120,10 @@ def sb(tmp_path: Path) -> Sandbox:
     s = make_sandbox(tmp_path)
     s.set_state(variables={"MEFOR_AFK_KILL": "off"})
     write_fake_usage(tmp_path / "usage.ps1", usage())
+    # The gate resolves a seat through the roster, as a checkout has it.
+    roster = s.repo / "docs" / "roles"
+    roster.mkdir(parents=True)
+    shutil.copy2(ROOT / "docs" / "roles" / "seats.json", roster / "seats.json")
     return s
 
 
@@ -191,24 +195,25 @@ def test_the_plain_answer_is_one_word_with_the_reasons_on_stderr(sb: Sandbox) ->
 
 
 def test_an_act_that_names_nothing_it_touches_reviews(sb: Sandbox) -> None:
+    """An act that changes no file has no git undo, so it has no fast path."""
     seed_vault(sb, calibrated("manager"))
     code, doc = gate_touching(sb, ())
-    assert code == REVIEW and "neither -Touches nor -TouchesNothing" in why(doc)
+    assert code == REVIEW and "no -Touches path was given" in why(doc)
 
 
-def test_an_act_that_touches_no_file_may_act_without_review(sb: Sandbox) -> None:
-    seed_vault(sb, calibrated("manager"))
-    code, doc = gate_touching(sb, ("-TouchesNothing",))
-    assert code == NO_REVIEW, why(doc)
-    assert doc["touches"] == ["nothing"]
+def test_a_seat_the_roster_does_not_resolve_reviews(sb: Sandbox) -> None:
+    """A new or mistyped label would otherwise start a clean calibration and an empty budget."""
+    code, doc = gate(sb, seat="manger")
+    assert code == REVIEW and "not a live seat or alias" in why(doc), why(doc)
 
 
-def test_touches_and_touches_nothing_together_are_refused(sb: Sandbox) -> None:
-    proc = sb.run(
-        DECISION,
-        *no_host_usage(sb, ("-Gate", "-Item", "1", "-Seat", "manager", *PLAIN, "-TouchesNothing")),
-    )
-    assert proc.returncode == 2 and "not both" in proc.stderr
+def test_an_alias_shares_its_seats_calibration(sb: Sandbox) -> None:
+    """manager2 is manager in the roster, so manager's breach closes manager2's path too."""
+    recent = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(10)]
+    held = [_signal(d, "held") for d in recent[:2]]
+    seed_vault(sb, recent + held)
+    code, doc = gate(sb, seat="manager2")
+    assert code == REVIEW and "Lander holds 20.0% BREACH" in why(doc), why(doc)
 
 
 @pytest.mark.parametrize(
@@ -248,6 +253,30 @@ def test_touches_and_touches_nothing_together_are_refused(sb: Sandbox) -> None:
         "D:/Code/x.py",
         "../korus/roles/COMMON.md",
         "docs/../CLAUDE.md",
+        ".agents/skills/driver/SKILL.md",
+        ".codex/config.toml",
+        ".semgrep/messagefoundry.yml",
+        ".gitleaks.toml",
+        ".mefor-hooks/pre-commit",
+        "scripts/hooks",
+        ".github",
+        "scripts//hooks/claim_check.py",
+        "scripts/./hooks/claim_check.py",
+        ".",
+        "*",
+        "CLAUDE.md.",
+        "a.py,CLAUDE.md",
+        "a.py CLAUDE.md",
+        "scripts/quality/new_glyph_check.py",
+        "scripts/ci/required_contexts.py",
+        "docs/adr/0211-afk.md",
+        "packaging/messagefoundry-webconsole/pyproject.toml",
+        "constraints.lock",
+        "ide/package.json",
+        "tests/test_afk_gate.py",
+        "messagefoundry/api/phi_gate.py",
+        "messagefoundry/secretscrub.py",
+        "security/locks/x.lock",
     ],
 )
 def test_a_class_c_or_unclassifiable_path_reviews(sb: Sandbox, path: str) -> None:
@@ -298,6 +327,32 @@ def test_a_signal_above_five_percent_in_14_days_reviews(
     code, doc = gate(sb)
     assert code == REVIEW, why(doc)
     assert f"{label} 20.0% BREACH" in why(doc), why(doc)
+
+
+def test_a_signal_logged_after_a_reversal_does_not_hide_it(sb: Sandbox) -> None:
+    """A signal is not the decision's latest outcome, so the item check still sees the reversal."""
+    seed_vault(sb, calibrated("manager"))
+    theirs = rec(at=ago(days=6), seat="builder", item="4242")
+    undone = rec("outcome", at=ago(days=5), seat="lander", ref=theirs["id"], outcome="reversed")
+    seed_vault(sb, [theirs, undone, _signal(theirs, "red-after-merge")])
+    code, doc = gate(sb)
+    assert code == REVIEW and f"decision {theirs['id']} on item 4242 was reversed" in why(doc)
+
+
+def test_a_signal_is_read_whatever_its_case(sb: Sandbox) -> None:
+    recent = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(10)]
+    seed_vault(sb, recent + [_signal(d, " Held") for d in recent[:2]])
+    code, doc = gate(sb)
+    assert code == REVIEW and "Lander holds 20.0% BREACH" in why(doc), why(doc)
+
+
+def test_a_halted_decision_is_not_in_the_signal_denominator(sb: Sandbox) -> None:
+    """Deferred decisions can collect no signal, so they cannot dilute a breach."""
+    acted = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(10)]
+    halted = [rec(at=ago(days=4, minutes=i), item=f"h{i}", gate="HALT") for i in range(40)]
+    seed_vault(sb, acted + halted + [_signal(d, "held") for d in acted[:2]])
+    code, doc = gate(sb)
+    assert code == REVIEW and "Lander holds 20.0% BREACH" in why(doc), why(doc)
 
 
 def test_a_hold_later_cleared_still_counts(sb: Sandbox) -> None:
@@ -560,10 +615,7 @@ def test_a_hit_stands_when_usage_reads_unknown_overall(sb: Sandbox) -> None:
 
 @pytest.mark.parametrize("seat", ["lander", "land"])
 def test_the_lander_is_exempt_from_the_halt(sb: Sandbox, seat: str) -> None:
-    """The roster's aliases count too; the sandbox gets the real roster, as a checkout has it."""
-    roster = sb.repo / "docs" / "roles"
-    roster.mkdir(parents=True)
-    shutil.copy2(ROOT / "docs" / "roles" / "seats.json", roster / "seats.json")
+    """The roster's aliases count too; the sb fixture gives the sandbox the real roster."""
     seed_vault(sb, calibrated(seat))
     write_fake_usage(_usage_path(sb), usage(99.0, state="CRITICAL"))
     code, doc = gate(sb, seat=seat)
