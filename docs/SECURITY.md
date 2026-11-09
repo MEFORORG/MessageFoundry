@@ -2844,8 +2844,10 @@ than to one request.
   the actor and the operation;
 - a claim, a rejection or a resolution that answers 503, and a claim whose approve was cancelled.
   The log line carries the exception, not the row's detail;
-- an outcome read back after its status write found the row moved, as below. The log line carries
-  the row's detail, its move flag `false` or `unknown`.
+- an outcome whose status write found the row moved, where the read-back does not find this
+  write's row at its status and decision time, as below. The log line carries the row's detail;
+  on an interrupted or failed outcome its `recorded` or `compensated` field reads `false` where
+  another caller moved the row, and `unknown` where the read-back cannot tell.
 
 For some failed writes the gate logs at ERROR and pages nothing. At least this one: a restart
 cannot move a leftover `executing` row to `interrupted`. The row stays `executing`, and the next

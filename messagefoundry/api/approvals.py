@@ -1751,8 +1751,8 @@ class ApprovalGate:
 
         ``flag`` names a detail field that records whether the row moved: ``True`` when it moved
         with this row, ``False`` when another caller had already moved it, and ``None`` when the
-        status write failed. The ERROR line of a failed read-back logs it as ``"unknown"`` where
-        the read-back cannot tell which."""
+        status write failed. The ERROR line logs it as ``"unknown"`` where the read-back cannot tell
+        which: a row absent, unsealed or unreadable, or resolved on the interrupted path."""
 
         def detail(moved: bool | Literal["unknown"] | None) -> str:
             # A result json cannot encode must not raise here, before the status moves, after the
