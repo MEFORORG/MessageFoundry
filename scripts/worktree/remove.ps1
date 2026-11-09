@@ -554,12 +554,12 @@ if ($byPath) {
         if (-not [System.IO.Path]::IsPathFullyQualified($env:CLAUDE_CONFIG_DIR)) {
             throw "CLAUDE_CONFIG_DIR is the relative path '$env:CLAUDE_CONFIG_DIR', so its session registry cannot be placed. Occupancy unknown. Nothing was removed."
         }
-        # The registry's own reads take a root as a wildcard path, so a wildcard character in it ([, ],
-        # * or ?) could read another directory, or none, while the literal second listing counts the
-        # same root. A backtick is not refused: on pwsh 7.6.9 WildcardPattern.ContainsWildcardCharacters
-        # is False for it, and Test-Path and Get-ChildItem read such a root literally.
-        if ($env:CLAUDE_CONFIG_DIR -match '[\[\]*?]') {
-            throw "CLAUDE_CONFIG_DIR '$env:CLAUDE_CONFIG_DIR' holds a wildcard character, which the session registry reads as a pattern. Occupancy unknown. Nothing was removed."
+        # The registry's own reads treat a root as a wildcard pattern, while the second listing reads it
+        # literally. A pattern read unescapes backtick escapes, so a doubled backtick reads as one, and
+        # a root holding a backtick can be read as a different directory. [, ], * and ? can do the same.
+        # So at least these refuse, and any backtick does, including a lone one that reads as itself.
+        if ($env:CLAUDE_CONFIG_DIR -match '[\[\]*?`]') {
+            throw "CLAUDE_CONFIG_DIR '$env:CLAUDE_CONFIG_DIR' holds a wildcard character or a backtick, which the session registry reads as a pattern. Occupancy unknown. Nothing was removed."
         }
         # TrimEndingDirectorySeparator keeps a drive root whole: `D:` alone would name D:'s cwd.
         $pin = [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($env:CLAUDE_CONFIG_DIR))
@@ -592,9 +592,15 @@ if ($byPath) {
     }
     # Never empty, so an exception with no message cannot read as a clean listing.
     catch { $listingError = "the second listing failed: $($_.Exception.Message)" }
-    if ($listingError -or ($listedRoots -ne $occ.RootsExamined)) {
-        $why = if ($listingError) { $listingError } else {
-            "the receipt examined $($occ.RootsExamined) registry root(s) and a second listing found $listedRoots" }
+    # A record count that differs means the receipt read a different set of records, for example
+    # skipping a hidden file the second listing counts, so a receipt that is available cannot clear.
+    # An unavailable receipt clears only as readable-empty below, which needs both counts at zero.
+    $why = if ($listingError) { $listingError }
+    elseif ($listedRoots -ne $occ.RootsExamined) {
+        "the receipt examined $($occ.RootsExamined) registry root(s) and a second listing found $listedRoots" }
+    elseif ($occ.Available -and ($listedRecords -ne $occ.RecordsExamined)) {
+        "the receipt examined $($occ.RecordsExamined) session record(s) and a second listing found $listedRecords" }
+    if ($why) {
         Write-Host "REFUSED: the session registry could not be listed consistently: $why." -ForegroundColor Red
         throw "Occupancy unknown. Nothing was removed."
     }

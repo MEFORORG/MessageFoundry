@@ -788,33 +788,90 @@ def test_a_session_on_the_callers_config_root_outside_userprofile_occupies_the_t
     assert "Target is occupied" in _out(proc), _out(proc)
     assert wt.exists() and rig.is_registered(wt)
 
-    # A backtick is not a wildcard character (WildcardPattern.ContainsWildcardCharacters is False for
-    # it), so a root holding one is read literally and its session still occupies the target.
+    # A lone backtick refuses too, though the registry reads this root as itself: any backtick is
+    # refused (the doubled-backtick test below says why), so a root such as o`brien is not read.
     ticked = rig.root / "o`brien"
     (ticked / "sessions").mkdir(parents=True)
-    (ticked / "sessions" / "8.json").write_text(
-        json.dumps({"cwd": str(wt), "sessionId": "on-a-backtick-root"}), encoding="utf-8"
-    )
     proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(ticked)})
     assert proc.returncode != 0, _out(proc)
-    assert "Target is occupied" in _out(proc), _out(proc)
-    assert "wildcard character" not in _out(proc), _out(proc)
+    assert "wildcard character" in _out(proc), _out(proc)
     assert wt.exists() and rig.is_registered(wt)
 
-    # A root the registry's wildcard reads could misread, and a relative root that names no fixed
-    # directory, refuse rather than be read.
-    for value, needle in (
-        (str(rig.root / "cfg[1]"), "wildcard character"),
-        ("cfg", "relative path"),
-    ):
-        proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": value})
-        assert proc.returncode != 0, _out(proc)
-        assert needle in _out(proc), _out(proc)
-        assert wt.exists()
+    # A relative root names no fixed directory, so it refuses rather than be read.
+    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": "cfg"})
+    assert proc.returncode != 0, _out(proc)
+    assert "relative path" in _out(proc), _out(proc)
+    assert wt.exists()
 
     # Control: a CLAUDE_CONFIG_DIR that IS one of the USERPROFILE roots, whose registry clears the
     # target, removes the tree. It does not tell a single read of that root from a double one.
     proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(rig.home / ".claude")})
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_doubled_backtick_config_root_refuses_rather_than_read_its_sibling(rig: Rig) -> None:
+    """Vault BACKLOG #2985, item 6. The registry's reads take a root as a wildcard pattern, which reads
+    a doubled backtick as one, so CLAUDE_CONFIG_DIR=<root>\\o``brien was read as its sibling
+    <root>\\o`brien. Each holds one record, so the root and record counts of the two reads agreed,
+    the session recorded in the target went unseen, and the tree went with exit 0. Red at 93139cf657,
+    which stopped refusing a backtick."""
+    wt = rig.add(rig.scratch("ticked-twice"))
+    doubled = rig.root / "o``brien"
+    (doubled / "sessions").mkdir(parents=True)
+    (doubled / "sessions" / "9.json").write_text(
+        json.dumps({"cwd": str(wt), "sessionId": "in-the-target"}), encoding="utf-8"
+    )
+    sibling = rig.root / "o`brien"
+    (sibling / "sessions").mkdir(parents=True)
+    (sibling / "sessions" / "9.json").write_text(
+        json.dumps(
+            {"cwd": str(rig.root / "elsewhere"), "pid": 1, "sessionId": "clear", "startedAt": 0}
+        ),
+        encoding="utf-8",
+    )
+
+    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(doubled)})
+    assert proc.returncode != 0, _out(proc)
+    assert "wildcard character" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: with no CLAUDE_CONFIG_DIR, the USERPROFILE registry clears the target and it goes.
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+@pytest.mark.parametrize("char", ["[", "]", "*", "?"])
+def test_a_wildcard_character_in_the_config_root_refuses(rig: Rig, char: str) -> None:
+    """Vault BACKLOG #2985, item 6. The registry's reads take a root as a wildcard pattern, so a root
+    holding one of these could read another directory, or none. It refuses before anything is read,
+    so the root need not exist (``*`` and ``?`` cannot be in a Windows file name at all)."""
+    wt = rig.add(rig.scratch("wild"))
+    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(rig.root / f"cfg{char}1")})
+    assert proc.returncode != 0, _out(proc)
+    assert "wildcard character" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+
+def test_a_record_the_registry_did_not_read_refuses_on_the_record_count(rig: Rig) -> None:
+    """Vault BACKLOG #2985. The registry lists records without -Force, so it skips a hidden one, and a
+    session recorded there in the target went unseen while the visible record kept the fence
+    available. The second listing counts every record, and a different record count now refuses.
+    Red before the guard: the tree went."""
+    wt = rig.add(rig.scratch("hidden-record"))
+    hidden = rig.registry(wt) / ".claude" / "sessions" / "2.json"
+    subprocess.run(["attrib", "+h", str(hidden)], check=True, capture_output=True)
+
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode != 0, _out(proc)
+    assert "session record(s) and a second listing found" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: without the hidden record the two reads agree and the target is cleared.
+    subprocess.run(["attrib", "-h", str(hidden)], check=True, capture_output=True)
+    rig.registry()
+    proc = rig.run("-Path", str(wt))
     assert proc.returncode == 0, _out(proc)
     assert not wt.exists()
 
