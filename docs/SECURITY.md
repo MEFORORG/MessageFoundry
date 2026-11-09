@@ -225,14 +225,14 @@ body, the early sign-in check above still answers before it. A route passes in o
   On an HTTP route with no gate, that mark does not count, so the route is refused. The mark is
   not trusted on its own (vault BACKLOG #2955): the in-body WebSocket gates, at least `authorize_ws`
   and the web console's `authorize_ui_ws`, record on the handshake whether they admitted the caller,
-  the latest answer standing. `WebSocketAcceptGate` refuses the accept of a socket whose handshake
-  reads refused, unless the route is a `public_route` with no gate dependency, and of an in-body
-  socket whose handshake records no answer. On such a socket it refuses a denial response the body
-  sends the same way, whatever its status, so none of its status, headers or body goes out. The
-  refusal is a close before accept: under uvicorn, which offers the denial-response extension, the
-  client gets a bodyless HTTP 403, and only a server without that extension sends a 1008 close. The
-  gate also writes an ERROR line, `refused accept on WebSocket route`, at most once a minute for
-  each route the handshake names.
+  the latest answer standing. `WebSocketAcceptGate` refuses the accept of every socket whose
+  handshake does not read admitted, except where the route declares its authorization another way:
+  with no recorded answer, a gate dependency or a `public_route` mark; with a recorded refusal, only
+  a `public_route` mark on a route with no gate dependency. On a socket it refuses, it refuses a
+  denial response the body sends the same way, whatever its status, so none of its status, headers
+  or body goes out. The refusal is a close before accept, which the client gets as a bodyless HTTP
+  403. An accept it refuses, or a denial response no gate answered for, is also an ERROR line,
+  `refused accept on WebSocket route`, at most once a minute for each route the handshake names.
   Refusals on handshakes that name no route share one count and one line. That count is in
   memory only; `GET /security/posture` does not report it.
 

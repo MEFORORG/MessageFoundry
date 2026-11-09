@@ -98,7 +98,9 @@ def test_the_stats_socket_follows_the_same_opt_in(tmp_path: Path) -> None:
     ):
         pass
     assert denied.value.status_code == 403
-    assert denied.value.json() == {"detail": "not authenticated or not permitted"}
+    # Vault BACKLOG #2955: no gate admitted the caller, so the accept gate refuses the route's own
+    # denial response, and the header floor's bodyless 403 is the answer.
+    assert denied.value.content == b""
 
     opened = create_managed_app(
         db_path=tmp_path / "ws-open.db",

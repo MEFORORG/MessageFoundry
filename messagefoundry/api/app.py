@@ -10693,7 +10693,9 @@ def create_app(
             identity = await authorize_ws(websocket, Permission.MONITORING_READ)
             token = ws_token(websocket)
         # The three refusals below happen BEFORE accept, so each is the handshake's HTTP answer
-        # (BACKLOG #1120; see header_floor.refuse_websocket).
+        # (BACKLOG #1120; see header_floor.refuse_websocket). The first runs with no gate admitted,
+        # so WebSocketAcceptGate refuses its denial response and the client gets a bodyless 403
+        # (vault BACKLOG #2955); the two 503s run after a gate admitted the caller.
         if identity is None:
             await refuse_websocket(
                 websocket,

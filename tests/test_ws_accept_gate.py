@@ -4,14 +4,15 @@
 
 Engine PR 2390 note 1: the route walk reads an ``authorizes_in_body`` socket's gate as a CALL in its
 body, which is not proof the body acts on it. ``WebSocketAcceptGate`` closes that gap at run time:
-``authorize_ws`` and the web console's ``authorize_ui_ws`` mark the handshake admitted when they admit
-the caller, and the gate refuses ``websocket.accept`` on a socket that carries no mark, unless the
-route declares its authorization by a gate dependency or a ``public_route`` mark.
+``authorize_ws`` and the web console's ``authorize_ui_ws`` record on the handshake whether they
+admitted the caller, and the gate refuses ``websocket.accept``, and a denial response of any status,
+on a socket that does not read admitted, as ``ws_accept_allowed`` defines it.
 
 Each socket here is driven through the whole app, middleware included, by an in-memory ASGI peer on
-the test's own loop, which records every message the app sends. The harness offers no denial-response
-extension, so a refusal before accept is a bare 1008 close, and an accept is the
-``websocket.accept`` message itself."""
+the test's own loop, which records every message the app sends. By default the peer offers no
+denial-response extension, so a refusal before accept is a bare 1008 close; a test that passes
+``denial_extension=True`` sees the header floor's 403 instead. An accept is the ``websocket.accept``
+message itself."""
 
 from __future__ import annotations
 
@@ -44,7 +45,6 @@ from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry_webconsole._auth import authorize_ui_ws
 from tests._admin_account import create_local_user_chosen
 
 PW = "Sup3rSecret!!"
@@ -237,6 +237,12 @@ def _planted(engine: Engine, service: AuthService | None, outcome: _Outcome) -> 
         await authorize_ws(websocket)
         await websocket.send_denial_response(PlainTextResponse("synthetic-body", status_code=404))
 
+    @app.websocket("/zz/refuses-then-denial")
+    @authorizes_in_body("a synthetic socket whose gate refuses, then answers with a denial")
+    async def refuses_then_denial(websocket: WebSocket) -> None:
+        if await authorize_ws(websocket, Permission.MONITORING_READ) is None:
+            await websocket.send_denial_response(PlainTextResponse("refused", status_code=403))
+
     @app.websocket("/zz/public-identifies")
     @public_route("a synthetic public socket that asks a gate only to identify its caller")
     async def public_identifies(websocket: WebSocket) -> None:
@@ -246,11 +252,12 @@ def _planted(engine: Engine, service: AuthService | None, outcome: _Outcome) -> 
     @app.websocket("/zz/header-then-cookie")
     @authorizes_in_body("a synthetic socket: the header gate, then the web console's cookie gate")
     async def header_then_cookie(websocket: WebSocket) -> None:
-        identity = await authorize_ws(websocket, Permission.MONITORING_READ)
-        cookie_identity, _ = await authorize_ui_ws(websocket, Permission.MONITORING_READ)
-        if identity is None and cookie_identity is None:
-            await websocket.close(code=1008)
-            return
+        # Imported here, so the rest of this module runs without the console installed.
+        from messagefoundry_webconsole._auth import authorize_ui_ws
+
+        # Both answers are ignored: whether the accept goes through is the accept gate's alone.
+        await authorize_ws(websocket, Permission.MONITORING_READ)
+        await authorize_ui_ws(websocket, Permission.MONITORING_READ)
         await accept_then_send(websocket)
 
     @app.websocket("/zz/lax-then-strict")
@@ -340,6 +347,26 @@ async def test_every_denial_response_needs_an_admitted_caller(engine: Engine, pa
     start, body = _denial_start_and_body(peer)
     assert start["status"] == 403 and body == b"", peer.sent
     assert _ACCEPT not in peer.kinds, peer.sent
+
+
+@pytest.mark.parametrize(
+    ("path", "logged"),
+    [("/zz/refuses-then-denial", False), ("/zz/denial-404", True)],
+    ids=["gate-refused", "no-gate-answered"],
+)
+async def test_only_a_denial_no_gate_answered_for_is_logged_as_a_defect(
+    engine: Engine, caplog: pytest.LogCaptureFixture, path: str, logged: bool
+) -> None:
+    """A gate refusing with a denial response is the gate working, not a body that skipped it, so
+    it gets the bodyless 403 with no ERROR line. A denial no gate answered for is a defect."""
+    service = await _service(engine)
+    peer = _Peer(_planted(engine, service, _Outcome()), path, None, denial_extension=True)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.security"):
+        await peer.run()
+    start, body = _denial_start_and_body(peer)
+    assert start["status"] == 403 and body == b"", peer.sent
+    lines = [r.getMessage() for r in caplog.records if "refused accept" in r.getMessage()]
+    assert bool(lines) is logged, lines
 
 
 async def test_a_denial_response_on_an_admitted_socket_goes_out_as_sent(engine: Engine) -> None:
@@ -441,13 +468,14 @@ async def test_a_refusal_does_not_refuse_a_public_socket(
 async def test_the_cookie_gate_leaves_a_native_clients_admission_standing(engine: Engine) -> None:
     """A native client sends no Origin, so the web console's cookie gate answers "not mine" and
     must not clear the admission the header gate recorded first."""
+    pytest.importorskip("messagefoundry_webconsole")
     service = await _service(engine)
     token = await _token(service, "caller", Role.OPERATOR)
     peer = _Peer(_planted(engine, service, _Outcome()), "/zz/header-then-cookie", token)
     await peer.run()
     assert peer.kinds[:2] == [_ACCEPT, "websocket.send"], peer.sent
     refused = _Peer(_planted(engine, service, _Outcome()), "/zz/header-then-cookie", None)
-    await refused.run()  # control: with no token, neither gate admits
+    await refused.run()  # control: with no token the header gate refuses, and the accept gate
     _assert_refused_before_accept(refused)
 
 

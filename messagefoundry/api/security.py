@@ -975,7 +975,10 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
 #
 # The LATEST gate's answer stands: a refusal clears an earlier admission, so a body that ignores a
 # stricter gate's refusal after a laxer gate admitted the caller is still refused, and so is one
-# whose route a gate dependency admitted first. The record is a flag, not an identity: it does not
+# whose route a gate dependency admitted first. That holds only for a gate that records: a public
+# socket passes a refusal, as above, and a gate that finds the handshake is not its own to judge
+# records nothing, as the web console's cookie gate does for a native client, which sends no
+# Origin. The record is a flag, not an identity: it does not
 # say which permission the route needed. The route walk reads which permissions the body asks for,
 # and refuses an endpoint body that calls ``record_ws_gate`` by that name.
 
@@ -1008,10 +1011,9 @@ def ws_accept_allowed(scope: Mapping[str, Any]) -> bool:
         # refused afterwards: that refusal stands.
         return answer is None
     # A public mark is the only declaration left, and a recorded refusal does not refuse it. An
-    # in-body mark is not enough. FastAPI's router sets no route for a plain Starlette WebSocket
-    # route, so the scope's own endpoint is read then.
-    endpoint = scope.get("endpoint") if route is None else getattr(route, "endpoint", None)
-    declared = route_declaration_of(endpoint)
+    # in-body mark is not enough. The route's match puts its endpoint in the scope, and so does a
+    # plain Starlette WebSocket route, for which FastAPI's router sets no route.
+    declared = route_declaration_of(scope.get("endpoint"))
     return declared is not None and declared.public
 
 
@@ -1065,7 +1067,10 @@ class WebSocketAcceptGate:
             if kind in ("websocket.accept", "websocket.http.response.start"):
                 if not ws_accept_allowed(scope):
                     refused = True
-                    _record_refused_accept(scope)
+                    # A denial after a gate's recorded refusal is that gate refusing, as it should,
+                    # so only an accept, or a denial no gate answered for, is counted as a defect.
+                    if kind == "websocket.accept" or _WS_GATE_ADMITTED_KEY not in scope:
+                        _record_refused_accept(scope)
                     await send({"type": "websocket.close", "code": status.WS_1008_POLICY_VIOLATION})
                     if kind == "websocket.accept":
                         raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
