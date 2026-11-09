@@ -132,6 +132,12 @@ async def test_ws_cookie_auth_requires_cookie_and_origin(engine: Engine) -> None
     assert (await authorize_ui_ws(bad, Permission.MONITORING_READ))[0] is None  # type: ignore[arg-type]
     # A refused handshake is never marked admitted (vault BACKLOG #2955).
     assert not any(ws_accept_allowed(w.scope) for w in (no_cookie, no_origin, bad))
+    # A native client's handshake is not this gate's to judge, so the header gate's admission
+    # recorded before it stands (vault BACKLOG #2955).
+    header_admitted = _FakeWS(origin=None, host="t", cookie=token, app=app)
+    record_ws_gate(header_admitted, admitted=True)  # type: ignore[arg-type]
+    assert (await authorize_ui_ws(header_admitted, Permission.MONITORING_READ))[0] is None  # type: ignore[arg-type]
+    assert ws_accept_allowed(header_admitted.scope)
 
 
 async def test_ws_cookie_auth_permission_denial_is_audited(engine: Engine) -> None:

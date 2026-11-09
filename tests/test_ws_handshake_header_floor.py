@@ -144,7 +144,9 @@ async def test_an_unauthenticated_handshake_is_a_403_carrying_the_floor(engine: 
     assert start["status"] == 403
     headers = _assert_floor(start)
     assert HSTS_HEADER.lower() not in headers  # ws:// is cleartext; HSTS is never set over it
-    assert "detail" in json.loads(body)
+    # Vault BACKLOG #2955: no gate admitted the caller, so the accept gate refuses the route's own
+    # denial response, and the floor's bodyless 403 is the answer.
+    assert body == b""
 
 
 async def test_an_absent_engine_is_a_503_carrying_the_floor(engine: Engine) -> None:

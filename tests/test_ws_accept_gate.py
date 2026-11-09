@@ -44,6 +44,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole._auth import authorize_ui_ws
 from tests._admin_account import create_local_user_chosen
 
 PW = "Sup3rSecret!!"
@@ -225,6 +226,33 @@ def _planted(engine: Engine, service: AuthService | None, outcome: _Outcome) -> 
     async def denial_403(websocket: WebSocket) -> None:
         await websocket.send_denial_response(PlainTextResponse("refused", status_code=403))
 
+    @app.websocket("/zz/denial-404")
+    @authorizes_in_body("a synthetic socket that answers 404 with a body and no gate")
+    async def denial_404(websocket: WebSocket) -> None:
+        await websocket.send_denial_response(PlainTextResponse("synthetic-body", status_code=404))
+
+    @app.websocket("/zz/admitted-denial-404")
+    @authorizes_in_body("the control: a gate admitted the caller, then a 404 with a body")
+    async def admitted_denial_404(websocket: WebSocket) -> None:
+        await authorize_ws(websocket)
+        await websocket.send_denial_response(PlainTextResponse("synthetic-body", status_code=404))
+
+    @app.websocket("/zz/public-identifies")
+    @public_route("a synthetic public socket that asks a gate only to identify its caller")
+    async def public_identifies(websocket: WebSocket) -> None:
+        await authorize_ws(websocket, Permission.MONITORING_READ)
+        await accept_then_send(websocket)
+
+    @app.websocket("/zz/header-then-cookie")
+    @authorizes_in_body("a synthetic socket: the header gate, then the web console's cookie gate")
+    async def header_then_cookie(websocket: WebSocket) -> None:
+        identity = await authorize_ws(websocket, Permission.MONITORING_READ)
+        cookie_identity, _ = await authorize_ui_ws(websocket, Permission.MONITORING_READ)
+        if identity is None and cookie_identity is None:
+            await websocket.close(code=1008)
+            return
+        await accept_then_send(websocket)
+
     @app.websocket("/zz/lax-then-strict")
     @authorizes_in_body("a synthetic socket whose stricter gate's refusal is ignored")
     async def lax_then_strict(websocket: WebSocket) -> None:
@@ -294,23 +322,35 @@ async def test_an_in_body_socket_that_ignores_its_gate_is_accepted_only_when_the
         _assert_refused_before_accept(peer)
 
 
-async def test_a_non_refusal_denial_response_needs_an_admitted_caller(engine: Engine) -> None:
-    """A denial response is an HTTP answer the body chooses, so one below 400 would hand a caller no
-    gate admitted whatever the body sends. A 403 is how a gate refuses, and still goes out."""
-    refused = _Peer(
-        _planted(engine, None, _Outcome()), "/zz/denial-200", None, denial_extension=True
+def _denial_start_and_body(peer: _Peer) -> tuple[dict[str, Any], bytes]:
+    starts = [m for m in peer.sent if m["type"] == "websocket.http.response.start"]
+    assert len(starts) == 1 and peer.sent[0] is starts[0], peer.sent
+    body = b"".join(
+        bytes(m.get("body", b"")) for m in peer.sent if m["type"] == "websocket.http.response.body"
     )
-    await refused.run()
-    assert refused.sent and refused.sent[0]["type"] == "websocket.http.response.start", refused.sent
-    assert [m for m in refused.sent if m["type"] == "websocket.http.response.start"] == [
-        m for m in refused.sent[:1] if m.get("status") == 403
-    ], refused.sent
-    assert not any(b"synthetic-body" in m.get("body", b"") for m in refused.sent), refused.sent
-    allowed = _Peer(
-        _planted(engine, None, _Outcome()), "/zz/denial-403", None, denial_extension=True
+    return starts[0], body
+
+
+@pytest.mark.parametrize("path", ["/zz/denial-200", "/zz/denial-403", "/zz/denial-404"])
+async def test_every_denial_response_needs_an_admitted_caller(engine: Engine, path: str) -> None:
+    """A denial response is an HTTP answer the body chooses, whatever its status, so a caller no
+    gate admitted gets the bodyless 403 of a refused accept instead, from the floor outside."""
+    peer = _Peer(_planted(engine, None, _Outcome()), path, None, denial_extension=True)
+    await peer.run()
+    start, body = _denial_start_and_body(peer)
+    assert start["status"] == 403 and body == b"", peer.sent
+    assert _ACCEPT not in peer.kinds, peer.sent
+
+
+async def test_a_denial_response_on_an_admitted_socket_goes_out_as_sent(engine: Engine) -> None:
+    """The control for the test above: once a gate admitted the caller, the body's own denial
+    response, status and body, is the handshake's answer."""
+    peer = _Peer(
+        _planted(engine, None, _Outcome()), "/zz/admitted-denial-404", None, denial_extension=True
     )
-    await allowed.run()
-    assert any(b"refused" in m.get("body", b"") for m in allowed.sent), allowed.sent
+    await peer.run()
+    start, body = _denial_start_and_body(peer)
+    assert start["status"] == 404 and body == b"synthetic-body", peer.sent
 
 
 async def test_a_later_refusal_clears_an_earlier_admission(engine: Engine) -> None:
@@ -382,6 +422,33 @@ async def test_the_refusal_gets_the_header_floors_403(engine: Engine) -> None:
     names = {bytes(n).lower() for n, _ in start.get("headers", [])}
     assert b"x-content-type-options" in names, start
     assert _ACCEPT not in peer.kinds, peer.sent
+
+
+@pytest.mark.parametrize("roles", [None, (Role.OPERATOR,)], ids=["gate-refuses", "gate-admits"])
+async def test_a_refusal_does_not_refuse_a_public_socket(
+    engine: Engine, roles: tuple[Role, ...] | None
+) -> None:
+    """A public socket may ask a gate only to identify its caller, so the gate's refusal leaves it
+    as public as before. The in-body and dependency-gated cases above are refused by the same
+    refusal."""
+    service = await _service(engine)
+    token = None if roles is None else await _token(service, "caller", *roles)
+    peer = _Peer(_planted(engine, service, _Outcome()), "/zz/public-identifies", token)
+    await peer.run()
+    assert peer.kinds[:2] == [_ACCEPT, "websocket.send"], peer.sent
+
+
+async def test_the_cookie_gate_leaves_a_native_clients_admission_standing(engine: Engine) -> None:
+    """A native client sends no Origin, so the web console's cookie gate answers "not mine" and
+    must not clear the admission the header gate recorded first."""
+    service = await _service(engine)
+    token = await _token(service, "caller", Role.OPERATOR)
+    peer = _Peer(_planted(engine, service, _Outcome()), "/zz/header-then-cookie", token)
+    await peer.run()
+    assert peer.kinds[:2] == [_ACCEPT, "websocket.send"], peer.sent
+    refused = _Peer(_planted(engine, service, _Outcome()), "/zz/header-then-cookie", None)
+    await refused.run()  # control: with no token, neither gate admits
+    _assert_refused_before_accept(refused)
 
 
 @pytest.mark.parametrize("path", ["/zz/public", "/zz/dependency-gated"])
