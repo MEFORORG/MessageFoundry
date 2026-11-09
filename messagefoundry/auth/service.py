@@ -24,6 +24,7 @@ import os
 import re
 import secrets
 import socket
+import sqlite3
 import time
 import unicodedata
 import urllib.error
@@ -131,6 +132,7 @@ from messagefoundry.auth.policy import (
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import (
     CREDENTIAL_ID_HASH_SCHEME,
+    credential_id_hash_is_current,
     credential_id_hash_scheme,
     enrolment_code_digest,
     enrolment_code_matches,
@@ -204,7 +206,9 @@ from messagefoundry.store.store import (
     VerifiedUser,
     WebAuthnCredential,
     ad_map_seal_ok,
-    log_unopened_totp,
+    judge_totp,
+    judge_totp_cell,
+    passkey_cell_undecodable,
     passkey_digest,
     passkey_is_way_past,
     passkey_is_way_past_under,
@@ -2377,6 +2381,9 @@ class _Reproof:
     just_locked: bool = False
     #: The sign-in lock's cycle count after this attempt (ADR 0197), carried to the lock notice.
     cycles: int = 0
+    #: The TOTP verdict that attempt's escalation used (:class:`LockoutIncrement`), carried to the
+    #: lock notice too (BACKLOG #3948 finding 16).
+    totp_state: TotpState | None = None
     cleared: bool = False
     #: A closed-set slug for an uncounted directory refusal: at least one that judged no password
     #: (BACKLOG #2027), a row with no id or any :class:`_DirectoryRebind` reason, and one that judged
@@ -2664,8 +2671,10 @@ class LockableAccountCensus:
     TOTP could not be judged is named in ``unknown_beside_a_passkey`` instead. The record
     is what the client reported, or the requirement the registration sent when it reported nothing,
     so on a client that does not conform it can overstate, and ADR 0197 Amendment A (N-G) has the
-    census name these accounts for that reason. An account in both lists keeps a working passkey that
-    an administrator's factor reset would remove: :attr:`reset_would_remove_a_passkey`."""
+    census name these accounts for that reason. :attr:`reset_would_remove_a_passkey` names the
+    accounts in ``undecryptable_totp`` that keep a passkey the census counts as working, which an
+    administrator's factor reset would remove, whatever the requirement covers. It does not name
+    every such account: a local account's non-discoverable second-factor passkey is not counted."""
 
     no_way_past: tuple[str, ...] = ()
     undecryptable_totp: tuple[str, ...] = ()
@@ -2678,19 +2687,19 @@ class LockableAccountCensus:
     #: factor reset would remove. Kept apart from ``passkey_only``, which reads as "the TOTP is no
     #: way past", a thing nobody knows of an unknown TOTP.
     unknown_beside_a_passkey: tuple[str, ...] = ()
+    #: Every account in ``undecryptable_totp`` that holds a passkey it may still sign in with, read
+    #: from the set its seal covers: ``reset-mfa`` would also remove that passkey. Any account the
+    #: requirement does not cover included, since the reset removes every passkey whatever the
+    #: scope (BACKLOG #3948 finding 11). A local account counts a passkey its combined passkey
+    #: sign-in accepts, so a non-discoverable one it uses as the second factor after its password
+    #: is not counted. A directory account counts a passkey its second factor accepts,
+    #: discoverable or not. The cure is the store key for a cell that does not open, and removing
+    #: and enrolling the app again for an enrolment this release refuses.
+    reset_would_remove_a_passkey: tuple[str, ...] = ()
 
     @property
     def clean(self) -> bool:
         return not self.no_way_past and not self.undecryptable_totp
-
-    @property
-    def reset_would_remove_a_passkey(self) -> tuple[str, ...]:
-        """The accounts with an unusable TOTP whose working way past is a discoverable passkey, among
-        the population ``passkey_only`` covers: ``reset-mfa`` would also remove that passkey. The cure
-        is the store key for a cell that does not open, and removing and enrolling the app again for
-        an enrolment this release refuses."""
-        named = set(self.undecryptable_totp) & set(self.passkey_only)
-        return tuple(sorted(named | set(self.unknown_beside_a_passkey)))
 
 
 @dataclass(frozen=True)
@@ -2864,7 +2873,7 @@ def _opened_totp_state(secret: str | None) -> TotpState:
     codes with it (:func:`_totp_unusable_reason`), ``"refused"`` when it KNOWS it cannot (an
     enrolment marker this release refuses, or no secret at all), and ``"unknown"`` when it cannot
     tell (ciphertext a keyless open passed through, or a value that will not compute). The service's
-    gates ask it, and pass it to the store's writes as ``totp_usable``. Only ``"refused"`` moves any
+    gates ask it, and pass it to the store's writes as their TOTP rule. Only ``"refused"`` moves any
     decision away from the plain ``totp_enabled`` rule."""
     if not secret:
         return "refused"
@@ -2874,6 +2883,12 @@ def _opened_totp_state(secret: str | None) -> TotpState:
     if reason == "refused":
         return "refused"
     return "usable" if reason is None else "unknown"
+
+
+def _passkey_counts_nothing(cred: WebAuthnCredential) -> bool:
+    """A :data:`PasskeyCounts` that counts no passkey: a conditional write's rule where no passkey
+    can sign in, at least without the ``[webauthn]`` extra."""
+    return False
 
 
 async def lockable_account_census(
@@ -2891,11 +2906,12 @@ async def lockable_account_census(
 
     Read-only, and it needs no :class:`AuthService`, so ``messagefoundry verify`` runs it without the
     trust-anchor preflights or a directory client. Disabled accounts are read too: one cannot sign in
-    now, but it is lockable the moment it is re-enabled. A local row with no password hash is
-    skipped: nobody can sign into it, so there is nothing to lock (an interrupted
-    ``provision-admin`` leaves one). Raises :class:`CensusNeedsTheStoreKey` when a TOTP cell is
-    still ciphertext, which means this shell lacks the store key. Usernames only; each secret is
-    dropped at once. :meth:`AuthService.report_lockable_account_census` warns and audits;
+    now, but it is lockable the moment it is re-enabled. A local row with no password hash is in no
+    lockable list and not in the reset list: nobody can sign into it, so there is nothing to lock
+    and no passkey a reset would cost (an interrupted ``provision-admin`` leaves one). An enabled
+    TOTP on it that is not usable is still named in ``undecryptable_totp``. Raises :class:`CensusNeedsTheStoreKey` when a
+    TOTP cell is still ciphertext, which means this shell lacks the store key. Usernames only; each
+    secret is dropped at once. :meth:`AuthService.report_lockable_account_census` warns and audits;
     ``verify`` reports. Neither refuses to start, since refusing would hand an account-level fact a
     site-wide veto.
 
@@ -2908,6 +2924,7 @@ async def lockable_account_census(
     unknown: list[str] = []
     unknown_beside_a_passkey: list[str] = []
     passkey_only: list[str] = []
+    reset_removes: list[str] = []
     sealed = store.row_sealer() is not None
     # One probe, so a site with no passkey anywhere reads no account's set below. Without the
     # [webauthn] extra no passkey can sign in, so none is a way past and none is read.
@@ -2919,6 +2936,15 @@ async def lockable_account_census(
     # Which passkey may sign the owner in: under the configured rp_id where there is one, any
     # discoverable one where there is none (the sign-in then takes the request's rp_id).
     sign_in_counts = passkey_is_way_past if way_past_rp_id is None else gate_counts
+
+    def second_factor_counts(cred: WebAuthnCredential) -> bool:
+        # A directory account's passkey second factor: offered only under the request's rp_id,
+        # and found at the finish only by a credential-id hash in today's scheme. The rp_id rule
+        # is ``sign_in_counts``'s; the discoverable record is not asked, since the second-factor
+        # ceremony names the credential itself.
+        return (
+            way_past_rp_id is None or cred.rp_id == way_past_rp_id
+        ) and credential_id_hash_is_current(cred.credential_id_hash)
 
     for user in await store.list_users():
         # Disabled accounts are read too: one re-enabled later is lockable at once, and the census
@@ -2934,21 +2960,24 @@ async def lockable_account_census(
                 unknown.append(user.username)
             # Either way the account falls through, since a discoverable passkey may be its working
             # way past, which reset-mfa would remove.
-        if (
-            user.password_generated
-            or user.password_hash is None
+        lockable = (
+            not user.password_generated
+            and user.password_hash is not None
             # Only a LOCAL row can sign in by password, so only it can be locked (#3117).
-            or user.auth_provider != AuthProvider.LOCAL.value
-            or not settings.require_mfa
-        ):
-            continue
-        # The role read only where the scope depends on it.
-        roles = (
-            frozenset()
-            if settings.require_mfa_scope == "every_local_account"
-            else _roles_from_ids(await store.get_user_role_ids(user.id))
+            and user.auth_provider == AuthProvider.LOCAL.value
+            and settings.require_mfa
         )
-        if not _requirement_covers(settings, user, roles):
+        if lockable:
+            # The role read only where the scope depends on it.
+            roles = (
+                frozenset()
+                if settings.require_mfa_scope == "every_local_account"
+                else _roles_from_ids(await store.get_user_role_ids(user.id))
+            )
+            lockable = _requirement_covers(settings, user, roles)
+        # An account that is not lockable is read on only for the reset list: an unusable TOTP
+        # beside a passkey that reset-mfa would remove (BACKLOG #3948 finding 11).
+        if not lockable and state is None:
             continue
         # Wave 2: a passkey recorded as discoverable is a way past, read from the set the account's
         # seal covers. A set that fails its digest counts for nothing, so the account is named.
@@ -2959,12 +2988,47 @@ async def lockable_account_census(
         except PasskeyRowMalformed as exc:
             _log.warning("a passkey row of user %s did not parse (%s)", user.id, exc)
             creds = []
+        except UnicodeDecodeError:
+            # A cell the driver cannot decode while fetching (escalation_passkeys names both), on
+            # an account this census may now read for the reset list alone: counted for nothing,
+            # as a row that does not parse is, rather than losing every other account's finding.
+            # The arm binds no name: a decode error's message quotes the cell, so none is rendered.
+            _log.warning(
+                "the passkeys of user %s could not be read (%s)", user.id, "UnicodeDecodeError"
+            )
+            creds = []
+        except sqlite3.OperationalError as exc:
+            # The same cell, as sqlite3 reports it (told apart only by its message).
+            if not passkey_cell_undecodable(exc):
+                raise
+            _log.warning(
+                "the passkeys of user %s could not be read (%s)", user.id, type(exc).__name__
+            )
+            creds = []
         digest = user.row.cred_digest if user.row is not None else ""
-        # Two questions, two rules (BACKLOG #3937). Whether a reset would remove a passkey that
-        # may still sign the holder in asks ``sign_in_counts``. Whether the account holds a way
-        # past the GATES count asks the configured rp_id, as the gates do. One digest check.
+        # Two questions, two rules (BACKLOG #3937). Whether the account may still sign in with a
+        # passkey asks ``sign_in_counts`` (a local account) or ``second_factor_counts`` (a
+        # directory account), and that answer feeds ``passkey_only``, ``unknown_beside_a_passkey``
+        # and the reset list. Whether the account holds a way past the GATES count asks the
+        # configured rp_id, as the gates do. One digest check.
         trusted = not sealed or constant_time_equal(passkey_digest(creds), digest)
-        if trusted and any(sign_in_counts(c) for c in creds):
+        signs_in = trusted and any(sign_in_counts(c) for c in creds)
+        # The reset list asks how THIS account can still sign in with a passkey (BACKLOG #3948
+        # finding 11). A local row with a password: the combined passkey sign-in, so the same
+        # rule; a non-discoverable passkey it uses as the second factor after its password is not
+        # counted here. A directory account: its sign-in, then a passkey as the second factor,
+        # which needs no discoverable record but does need the relying party and the hash scheme
+        # the ceremony finds it by. A local row with no password hash signs nobody in, so a reset
+        # costs it nothing.
+        if _is_directory_account(user):
+            reset_signs_in = trusted and any(second_factor_counts(c) for c in creds)
+        else:
+            reset_signs_in = signs_in and user.password_hash is not None
+        if reset_signs_in and state is not None:
+            reset_removes.append(user.username)
+        if not lockable:
+            continue
+        if signs_in:
             if state == "unknown":
                 unknown_beside_a_passkey.append(user.username)
             else:
@@ -2977,6 +3041,7 @@ async def lockable_account_census(
         unknown_totp=tuple(sorted(unknown)),
         passkey_only=tuple(sorted(passkey_only)),
         unknown_beside_a_passkey=tuple(sorted(unknown_beside_a_passkey)),
+        reset_would_remove_a_passkey=tuple(sorted(reset_removes)),
     )
 
 
@@ -5710,7 +5775,7 @@ class AuthService:
     async def _register_failure(
         self, user: UserRecord, now: float, *, counter: LockoutCounter
     ) -> LockoutIncrement:
-        """Record a failed attempt on ``counter``; return ``(attempts, just_locked, cycles)``.
+        """Record a failed attempt on ``counter``; return its :class:`LockoutIncrement`.
         ``just_locked`` is True only on the attempt that sets that counter's lock, so it fires exactly
         one lockout notification per lock.
 
@@ -5992,7 +6057,9 @@ class AuthService:
         passkey and no usable TOTP tells it the combined passkey sign-in does. A TOTP nobody could
         judge (a cell that did not open) is offered as the plain rule offers it and reported as
         unknown, beside the passkey when there is one. A record nobody checked against its seal
-        claims neither (BACKLOG #3422)."""
+        claims neither (BACKLOG #3422). Where the lock's escalation judged the TOTP, the notice
+        reads that verdict (``failure.totp_state``) and judges nothing itself, so it cannot report
+        a TOTP the escalation read differently (BACKLOG #3948 finding 16)."""
         if not failure.just_locked:
             return
         notice: dict[str, Any] = {
@@ -6006,7 +6073,9 @@ class AuthService:
             first = "first_step" if user.auth_provider == AuthProvider.LOCAL.value else "directory"
             notice["factor_right"] = factor if factor in ("password", "code", "passkey") else first
         elif user.auth_provider == AuthProvider.LOCAL.value and isinstance(user, VerifiedUser):
-            totp_state = await self._totp_state(user)
+            # The verdict the escalation used, where it used one, so the notice cannot tell the
+            # owner something the lock's length was not decided on (BACKLOG #3948 finding 16).
+            totp_state = failure.totp_state or await self._totp_state(user)
             if totp_state in ("usable", "unknown"):
                 notice["combined_sign_in"] = True
             if totp_state == "unknown":
@@ -11477,9 +11546,11 @@ class AuthService:
 
     async def _open_totp_cell(self, user: VerifiedUser) -> str | None:
         """``user``'s TOTP cell, the one the checked record's seal covered (BACKLOG #3510), opened
-        OFF THE EVENT LOOP (BACKLOG #3929). The service's one way to open it: under a Transit cipher
-        the open is a blocking ``decrypt_data`` HTTP call (CLAUDE.md section 6), and the combined
-        sign-in reaches it with a username alone. Raises what the store's opener raises."""
+        OFF THE EVENT LOOP (BACKLOG #3929). The service's way to open it for a code: under a Transit
+        cipher the open is a blocking ``decrypt_data`` HTTP call (CLAUDE.md section 6), and the
+        combined sign-in reaches it with a username alone. The way-past gates judge the cell through
+        the store's :func:`judge_totp_cell` instead (:meth:`_totp_state`), which opens it off the
+        loop too. Raises what the store's opener raises."""
         return await asyncio.to_thread(self._store.open_totp_secret, user.id, user.totp_secret_cell)
 
     async def _totp_secret(self, user: VerifiedUser) -> str | None:
@@ -12999,12 +13070,11 @@ class AuthService:
         current = await self._load_user(user.id)
         locked = current is not None and _live_lock(current, now)
         if not verdict:
-            attempts, just_locked, cycles = 0, False, 0
+            failure = LockoutIncrement(0, False, 0)
             if current is not None and not locked:
                 # The SIGN-IN counter, per R4 of 2026-09-23 and ADR 0197 Decision item 1.
-                attempts, just_locked, cycles = await self._register_failure(
-                    user, now, counter="sign_in"
-                )
+                failure = await self._register_failure(user, now, counter="sign_in")
+            attempts, just_locked, cycles = failure.attempts, failure.just_locked, failure.cycles
             if charged >= threshold:
                 # The caller audits this attempt, records any lockout, and only then revokes, so a
                 # failed revoke cannot lose those rows. Until the revoke lands the count stays at the
@@ -13016,9 +13086,15 @@ class AuthService:
                     attempts=attempts,
                     just_locked=just_locked,
                     cycles=cycles,
+                    totp_state=failure.totp_state,
                 )
             return _Reproof(
-                ok=False, user=user, attempts=attempts, just_locked=just_locked, cycles=cycles
+                ok=False,
+                user=user,
+                attempts=attempts,
+                just_locked=just_locked,
+                cycles=cycles,
+                totp_state=failure.totp_state,
             )
         if current is None:
             return _Reproof(ok=False, user=user)
@@ -13068,7 +13144,7 @@ class AuthService:
             await self._record_lock(
                 proof.user,
                 "sign_in",
-                LockoutIncrement(proof.attempts, proof.just_locked, proof.cycles),
+                LockoutIncrement(proof.attempts, proof.just_locked, proof.cycles, proof.totp_state),
                 client=client,
                 audit_detail=audit_detail,
             )
@@ -13959,22 +14035,30 @@ class AuthService:
         so an ``admin_reset_mfa`` that clears TOTP, or a removal of the last discoverable passkey,
         between this read and the write makes the write match no row, and the change is refused
         rather than landing on an account with no way past.
+
+        For a covered account with a TOTP on, :meth:`_refuse_rotation_without_way_past` opens the
+        TOTP cell before the argon2 hash, and the store's conditional write opens it again before
+        its lock and, under the lock, counts that judgement only for the cell it judged (BACKLOG
+        #3948); a route that asks :meth:`must_enrol_before_rotating` first opens it there too,
+        before the current password. Without the ``[webauthn]`` extra the write counts no passkey,
+        as :meth:`_has_way_past` counts none.
         """
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
             return violations
         user = await self._load_user(identity.user_id)
         covered = user is not None and self._covered_by_requirement(user, identity.roles)
-        if covered and user is not None and not await self._has_way_past(user):
-            raise FactorEnrolmentRequired()
+        if covered and user is not None:
+            await self._refuse_rotation_without_way_past(user)
         written = await self._store.set_password(
             identity.user_id,
             password_hash=await self._argon2(hash_password, new_password),
             must_change_password=must_change,
             password_generated=False,
-            require_way_past=covered,
-            totp_usable=_opened_totp_state,
-            passkey_counts=self._gate_counts,
+            require_way_past=_opened_totp_state if covered else None,
+            # Without the [webauthn] extra no passkey can sign in, so the write counts none, as
+            # _has_way_past counts none (BACKLOG #3948).
+            passkey_counts=self._gate_counts if webauthn.available() else _passkey_counts_nothing,
         )
         if not written and covered:
             raise FactorEnrolmentRequired()
@@ -13990,6 +14074,43 @@ class AuthService:
             client=client,
         )
         return []
+
+    async def _refuse_rotation_without_way_past(self, user: VerifiedUser) -> None:
+        """The rotation's early refusal, before the argon2 hash: raise
+        :class:`FactorEnrolmentRequired` where ``user`` holds no factor with a way past, in the
+        order :meth:`_has_way_past` asks. The TOTP is judged first, with no passkey read: one that
+        is on and not a KNOWN refusal (:func:`judge_totp`, an unknown one included) is the way past.
+        Otherwise the passkey half is :meth:`_holds_gate_passkey`'s: where no passkey can count
+        (none held, no configured relying party, or no ``[webauthn]`` extra) it refuses with no
+        read, and elsewhere it reads the set through :meth:`_verified_passkeys`, so a row that does
+        not parse is no exception and a set that fails its seal is reported. Such a set counts for
+        nothing, and so does one with a cell the driver cannot decode while fetching
+        (:func:`passkey_cell_undecodable`), as the census counts it. Any other read error raises,
+        before the hash. Where the TOTP counts, the store's write still reads the set under its
+        lock, after the hash, so a row that does not parse or a cell that cannot be decoded raises
+        there."""
+        judged = await judge_totp(self._store.open_totp_secret, _opened_totp_state, user)
+        if judged.state != "refused":
+            return
+        try:
+            if await self._holds_gate_passkey(user):
+                return
+        except UnicodeDecodeError:
+            # The class name only: a decode error's message quotes the cell, so the arm binds no
+            # name. Throttled per account, as _verified_passkeys throttles a row that does not parse.
+            if self._seal_failures_reported.due(f"passkey-decode:{user.id}"):
+                _log.warning(
+                    "the passkeys of user %s could not be read (%s)", user.id, "UnicodeDecodeError"
+                )
+        except sqlite3.OperationalError as exc:
+            # The same cell, as sqlite3 reports it (told apart only by its message).
+            if not passkey_cell_undecodable(exc):
+                raise
+            if self._seal_failures_reported.due(f"passkey-decode:{user.id}"):
+                _log.warning(
+                    "the passkeys of user %s could not be read (%s)", user.id, type(exc).__name__
+                )
+        raise FactorEnrolmentRequired()
 
     # --- MFA: native TOTP second factor (every account, WP-14, ASVS 6.3.3) -----
 
@@ -14011,9 +14132,9 @@ class AuthService:
         A passkey registered before wave 2, or one whose client reported it was not made
         discoverable, cannot be found by the usernameless ceremony, so it is a second factor
         everywhere else but no way past the lock (the amendment's fact 11). It answers for the
-        factor-drop gates, at least the rotation gate and its courtesy twin
-        :meth:`must_enrol_before_rotating`, so a passkey counts only under the configured relying
-        party (:meth:`_gate_counts`, BACKLOG #3937)."""
+        factor-drop gates, at least the rotation's courtesy check :meth:`must_enrol_before_rotating`
+        (the rotation's early refusal asks in the same order), so a passkey counts only under the
+        configured relying party (:meth:`_gate_counts`, BACKLOG #3937)."""
         return await self._totp_way_past(user) or await self._holds_gate_passkey(user)
 
     async def _totp_way_past(self, user: VerifiedUser) -> bool:
@@ -14027,21 +14148,19 @@ class AuthService:
         """What ``user``'s TOTP is (:func:`_opened_totp_state`, the census rule), or ``None`` when
         it is not enabled. The engine judges it ``"usable"`` when it can compute codes with it. An
         enrolment whose marker this release refuses matches no code, so its combined sign-in can
-        never pass a lock, and it is no way past (BACKLOG #3422). The cell is opened by
-        :meth:`_open_totp_cell`, off the event loop. The service's way-past
-        decisions ask this: the rotation and removal gates, the last-factor rule and the lock
-        notice; the store's conditional writes and the lock escalation ask the same rule
-        (``totp_usable``) on the cell they lock."""
+        never pass a lock, and it is no way past (BACKLOG #3422). The cell is the one the checked
+        record's seal covered, judged by the store's :func:`judge_totp_cell`, off the event loop:
+        the same judgement the store's conditional writes and the lock escalation make on the cell
+        they lock (BACKLOG #3948 finding 17). The service's way-past decisions ask this: at least
+        the rotation's courtesy check, the removal gates, the last-factor rule, and the lock notice
+        where the escalation judged nothing."""
         if not user.totp_enabled:
             return None
         if user.totp_secret_cell is None:
             return "refused"
-        try:
-            secret = await self._open_totp_cell(user)
-        except CipherError:
-            log_unopened_totp(user.id)
-            return "unknown"
-        return _opened_totp_state(secret)
+        return await judge_totp_cell(
+            self._store.open_totp_secret, _opened_totp_state, user.id, user.totp_secret_cell
+        )
 
     async def _holds_discoverable_passkey(
         self,
@@ -14083,9 +14202,9 @@ class AuthService:
     def passkeys_count_as_way_past(self) -> bool:
         """Whether any passkey can count as a way past the sign-in lock at the factor-drop gates:
         only where the configuration names a relying party (:meth:`_gate_counts`, BACKLOG #3937).
-        The console's enrol-first notice asks it, so it offers a passkey only where one would
-        discharge the requirement, and the first-factor refusal of a passkey that is not
-        discoverable asks it too."""
+        It does not ask whether the ``[webauthn]`` extra is present. Its askers include at least
+        the console's enrol-first notice, the first-factor refusal of a passkey that is not
+        discoverable and the lock escalation."""
         return self._way_past_rp_id is not None
 
     async def _holds_gate_passkey(self, user: VerifiedUser) -> bool:
@@ -14108,10 +14227,13 @@ class AuthService:
         return passkey_is_way_past_under(cred, self._way_past_rp_id)
 
     async def must_enrol_before_rotating(self, identity: Identity) -> bool:
-        """Whether a password change by ``identity`` would be refused with
-        :class:`FactorEnrolmentRequired` right now. The route and the console ask it FIRST, so they
-        send the holder to enrolment before asking for a password the service would then refuse.
-        The service still refuses on its own; this is a courtesy, not the control."""
+        """Whether ``identity``'s account is covered by the requirement and holds no way past the
+        sign-in lock (:meth:`_has_way_past`): no TOTP that is on and not a KNOWN refusal, and no
+        passkey the gates count. That is the predicate :meth:`change_password` applies, its write
+        on the row it locks, so the two can differ when a factor changes between them. The route
+        and the console ask it FIRST, so they send the holder to enrolment before asking for a
+        password the service would then refuse. The service still refuses on its own; this is a
+        courtesy, not the control."""
         user = await self._load_user(identity.user_id)
         return (
             user is not None
@@ -14244,10 +14366,11 @@ class AuthService:
         keep_passkey = census.reset_would_remove_a_passkey
         if keep_passkey:
             _log.warning(
-                "ADR 0197: %d of those also hold a discoverable passkey that still gets them past a "
-                "lock: %s. A factor reset (POST /users/{id}/reset-mfa) would also remove that "
-                "passkey. For a cell that does not open, fix the store key; for an enrolment this "
-                "release refuses, ask the holder to remove the authenticator app and enrol it again.",
+                "ADR 0197: %d account(s) with a TOTP that is unusable or could not be checked also "
+                "hold a passkey they may still sign in with: %s. A factor reset "
+                "(POST /users/{id}/reset-mfa) would also remove that passkey. For a cell that does "
+                "not open, fix the store key; for an enrolment this release refuses, ask the "
+                "holder to remove the authenticator app and enrol it again.",
                 len(keep_passkey),
                 ", ".join(keep_passkey),
             )
@@ -15648,8 +15771,7 @@ class AuthService:
         if (
             not await self._store.disable_totp(
                 identity.user_id,
-                require_way_past=covered,
-                totp_usable=_opened_totp_state,
+                require_way_past=_opened_totp_state if covered else None,
                 passkey_counts=self._gate_counts,
             )
             and covered
@@ -16891,8 +17013,7 @@ class AuthService:
         if not await self._store.delete_webauthn_credential(
             identity.user_id,
             credential_id_hash,
-            require_way_past=keep_way_past,
-            totp_usable=_opened_totp_state,
+            require_way_past=_opened_totp_state if keep_way_past else None,
             passkey_counts=self._gate_counts,
         ):
             if keep_way_past and await self._passkey_still_held(identity.user_id, target):
