@@ -6833,10 +6833,11 @@ class AuthService:
         # step-up must show a later one: this answer replayed by the IdP is then refused.
         # The stamp-to-rotation window, as in reauth (_stamp_to_rotation).
         elevation = Elevation(session_lost=True)
-        grant_refused = False
+        grant_refused: bool | None = False
+        grant_checked = False
         async with self._stamp_to_rotation(
             ceremony="reauth_oidc", actor=user.username, client=client
-        ):
+        ) as window:
             async with self._sealed_stamp(token_hash):
                 await self._store.mark_session_reauthed(
                     token_hash, client=client, idp_auth_time=principal_claims.auth_time
@@ -6845,10 +6846,14 @@ class AuthService:
             grant_refused = purpose is not None and await self._factor_binding_is_blocked_hash(
                 token_hash, purpose
             )
+            grant_checked = True
             # (2) Rotate. Past this line the staged hash no longer resolves.
             elevation = await self._elevated_hash(
                 token_hash, ceremony="reauth_oidc", actor=user.username, client=client
             )
+        if window.lost and not grant_checked:
+            # Decision d20261109T200352805-599b24, item 3: the check never ran, so the row says so.
+            grant_refused = None
         if elevation.ok:
             # vault BACKLOG #2145, as in reauth.
             await self._mark_login_address_known(user.id, client, step_up=True)
@@ -6873,8 +6878,33 @@ class AuthService:
             "session_revoked": False,
             **self._step_up_address_fields(flow, client),
         }
-        await self._audit("auth.reauth", actor=user.username, detail=_json(detail), client=client)
+        await self._write_reauth_row(
+            lost=window.lost, actor=user.username, detail=_json(detail), client=client
+        )
         return OidcStepUp(elevation=elevation, return_to=return_to)
+
+    async def _write_reauth_row(
+        self, *, lost: bool, actor: str | None, detail: str, client: str | None
+    ) -> None:
+        """Write a step-up's ``auth.reauth`` row. Hard, as before, except when its stamp window
+        answered ``session_lost`` (decision d20261109T200352805-599b24 on ADR 0217, item 3): then
+        softly, through the audit set, since the Transit Outage that ended the session on a
+        ``vault_transit`` store also refuses this row's audit-chain MAC, and the answer is the
+        fail-closed control while the row only records it."""
+
+        async def row() -> None:
+            await self._audit("auth.reauth", actor=actor, detail=detail, client=client)
+
+        if not lost:
+            await row()
+            return
+        await write_audit_soft(
+            row,
+            log=_log,
+            message="the auth.reauth row of a step-up that lost its session could not be written",
+            errors=audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
 
     async def _step_up_actor(self, flow: PendingFlow) -> str:
         """The account a step-up refusal is filed under: the staged session's user, else ``<oidc>``.
@@ -12537,7 +12567,9 @@ class AuthService:
             if proof.directory_unconfirmed
             else None,
         )
-        grant_refused = False
+        grant_refused: bool | None = False
+        grant_checked = False
+        lost = False
         if ok:
             # (1) Every stamp for this elevation, against the OLD hash. The rotation carries these
             # columns forward; a stamp issued after it would silently write nothing.
@@ -12558,12 +12590,17 @@ class AuthService:
                 grant_refused = purpose is not None and await self._factor_binding_is_blocked(
                     token, purpose
                 )
+                grant_checked = True
                 # (2) Rotate. Past this line `token` no longer authenticates.
                 elevation = await self._elevated(
                     token, ceremony="reauth", actor=identity.username, client=client
                 )
             if window.lost:
                 elevation = Elevation(session_lost=True)
+                lost = True
+                if not grant_checked:
+                    # Decision d20261109T200352805-599b24, item 3: the check never ran.
+                    grant_refused = None
             if elevation.ok:
                 # vault BACKLOG #2145: a step-up on an account that owes no factor is how a
                 # first-seen address passes its challenge, so it becomes known.
@@ -12574,8 +12611,8 @@ class AuthService:
                 # Bind THIS fresh proof to the single action named by `purpose` (single-use), so a broad
                 # login-seeded window can never authorize a factor-binding action (ASVS 7.5.1 / 8.2.4).
                 self._grant_action_step_up(hash_token(elevation.token), purpose)
-        await self._audit(
-            "auth.reauth",
+        await self._write_reauth_row(
+            lost=lost,
             actor=identity.username,
             detail=_json(
                 {
@@ -12587,6 +12624,7 @@ class AuthService:
                     "session_lost": elevation.session_lost,
                     # A good password whose purpose grant was refused (a pending session on an
                     # account with a factor). Without it the row reads as a granted re-proof.
+                    # Null when the session was lost before the check ran.
                     "grant_refused": grant_refused,
                     # This failure spent the session's re-proof budget, so it is revoked
                     # (BACKLOG #1138). A session already gone reads session_lost alone.

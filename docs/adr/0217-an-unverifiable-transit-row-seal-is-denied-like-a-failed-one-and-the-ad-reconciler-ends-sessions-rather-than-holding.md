@@ -218,6 +218,13 @@ and the `CipherError` of the window's own success audit row (`auth.mfa_verified`
 `session_lost` and the exception is suppressed. Every other exception is re-raised after the
 revoke, at least Forged, Unverifiable, any other `CipherError`, a cancel and a code defect.
 
+**A lost step-up's `auth.reauth` row (decision d20261109T200352805-599b24, item 3).** In `reauth`
+and the federated re-auth callback, the ceremony writes its `auth.reauth` row softly, through
+`audit_write_errors()`, only when the window answered `session_lost`. The outage that ended the
+session would otherwise refuse that row's audit MAC and turn the answer into a 500. Every other
+`auth.reauth` row is written as before. When the factor-binding check never ran, the row's
+`grant_refused` is null.
+
 ## Context
 
 Engine `main` seals identity and authorization rows (sessions, users with their role grants, custom

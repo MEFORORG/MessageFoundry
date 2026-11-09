@@ -227,6 +227,72 @@ async def test_the_federated_callback_after_its_stamp_answers_session_lost(
         await store.close()
 
 
+# --- decision d20261109T200352805-599b24, item 3: the lost step-up's auth.reauth row ---------------
+
+
+def _refuse_audit(monkeypatch: pytest.MonkeyPatch, store: MessageStore, action: str) -> None:
+    record_audit = store.record_audit
+
+    async def refused(name: str, **kwargs: Any) -> Any:
+        if name == action:
+            raise CipherError("synthetic audit MAC outage")
+        return await record_audit(name, **kwargs)
+
+    monkeypatch.setattr(store, "record_audit", refused)
+
+
+@pytest.mark.parametrize("audit_up", [True, False], ids=["audit_up", "audit_refused"])
+async def test_a_lost_reauth_writes_its_row_softly_with_no_grant_verdict(
+    monkeypatch: pytest.MonkeyPatch, audit_up: bool
+) -> None:
+    store, service = await _service()
+    try:
+        identity, token, password = await login_admin(service)
+        monkeypatch.setattr(
+            service, "_factor_binding_is_blocked", _raising(TransitSealUnavailableError())
+        )
+        if not audit_up:
+            _refuse_audit(monkeypatch, store, "auth.reauth")
+        lost = await service.reauth(
+            identity, password, token=token, purpose=STEP_UP_ACTION_SESSION_TERMINATE
+        )
+        assert lost.session_lost and lost.token is None
+        rows = [json.loads(str(r["detail"])) for r in await store.list_audit(action="auth.reauth")]
+        if audit_up:
+            assert rows[-1]["session_lost"] is True and rows[-1]["grant_refused"] is None
+        else:
+            assert rows == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("audit_up", [True, False], ids=["audit_up", "audit_refused"])
+async def test_a_lost_federated_step_up_writes_its_row_softly_with_no_grant_verdict(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, audit_up: bool
+) -> None:
+    from tests.test_auth_oidc_service import _service as _oidc_service
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _oidc_service(store, rsa_key)
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        flow_id, _url = await _begin(service, token, purpose=STEP_UP_ACTION_SESSION_TERMINATE)
+        monkeypatch.setattr(
+            service, "_factor_binding_is_blocked_hash", _raising(TransitSealUnavailableError())
+        )
+        if not audit_up:
+            _refuse_audit(monkeypatch, store, "auth.reauth")
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, auth_time=time.time())
+        assert out.elevation.session_lost and out.elevation.token is None
+        rows = [json.loads(str(r["detail"])) for r in await store.list_audit(action="auth.reauth")]
+        if audit_up:
+            assert rows[-1]["session_lost"] is True and rows[-1]["grant_refused"] is None
+        else:
+            assert rows == []
+    finally:
+        await store.close()
+
+
 # --- decision d20261109T200352805-599b24, item 1: any exception revokes once armed -----------------
 
 
