@@ -728,18 +728,57 @@ def test_closing_step_4_a_folder_on_an_unreached_share_is_refused(
     the value was cleared with no entry judged. Red: it was left to the driver."""
     folder = _capath(tmp_path, "a.0")
     _entry_verdicts(monkeypatch, {})
+    _not_found_at_open(monkeypatch, folder, 53)
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
+        database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
+
+
+def _not_found_at_open(monkeypatch: pytest.MonkeyPatch, folder: Path, winerror: int | None) -> None:
+    """Make the open of ``folder`` raise ``FileNotFoundError`` with ``winerror``, none if ``None``."""
     real = os.scandir
 
-    def unreached(path: str) -> Any:
+    def not_found(path: str) -> Any:
         if os.fspath(path) == str(folder):
-            exc = FileNotFoundError(2, "not reached")
-            exc.winerror = 53  # type: ignore[attr-defined]
+            exc = FileNotFoundError(2, "not found at open")
+            if winerror is not None:
+                exc.winerror = winerror  # type: ignore[attr-defined]
             raise exc
         return real(path)
 
-    monkeypatch.setattr(os, "scandir", unreached)
+    monkeypatch.setattr(os, "scandir", not_found)
+
+
+@pytest.mark.parametrize("winerror", [161, 206])
+def test_hold_6730243614_item_2_another_not_found_code_at_open_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    winerror: int,
+) -> None:
+    """CPython raises 161 ERROR_BAD_PATHNAME and 206 ERROR_FILENAME_EXCED_RANGE as not found, where
+    a folder may be there, so nothing in it was judged. Refused as an unlistable folder is. Red
+    (Lander hold 6730243614, item 2): it was left to the driver, with no entry judged."""
+    folder = _capath(tmp_path, "a.0")
+    _entry_verdicts(monkeypatch, {})
+    _not_found_at_open(monkeypatch, folder, winerror)
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
     with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
         database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("an sslcapath folder could not be listed" in m for m in warned)
+    assert all("phi-capath" not in m for m in warned)
+
+
+@pytest.mark.parametrize("winerror", [2, 3, None])
+def test_hold_6730243614_item_2_a_missing_folder_code_is_still_left_to_the_driver(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, winerror: int | None
+) -> None:
+    """Control: 2 and 3, and a not-found with no ``winerror`` (ENOENT off Windows), mean no folder
+    is there, so the value is still left to the driver. Green before and after the fix."""
+    folder = _capath(tmp_path, "a.0")
+    _entry_verdicts(monkeypatch, {})
+    _not_found_at_open(monkeypatch, folder, winerror)
+    database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
 
 
 def test_closing_step_4_the_refusal_fits_a_stored_failure() -> None:

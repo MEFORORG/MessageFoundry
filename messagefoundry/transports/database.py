@@ -1223,10 +1223,17 @@ def _capath_folder_clear(folder: str) -> bool:
         try:
             listing = os.scandir(folder)
         except (FileNotFoundError, NotADirectoryError) as exc:
-            if getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
+            winerror = getattr(exc, "winerror", None)
+            if winerror in _WINDOWS_UNREACHABLE:
                 # A share Windows could not reach, which CPython raises as not found, read as the
                 # walk's own probe reads it (_windows_path_verdict): the folder leads off the host.
                 _not_cleared("an sslcapath folder is on a share Windows could not reach", exc)
+                return False
+            if isinstance(exc, FileNotFoundError) and winerror not in _CAPATH_MISSING_WINERRORS:
+                # CPython raises other Windows codes as not found too, at least 161
+                # ERROR_BAD_PATHNAME and 206 ERROR_FILENAME_EXCED_RANGE, where a folder may be
+                # there. Nothing in it was judged, so it is refused as an unlistable folder is.
+                _not_cleared(f"an sslcapath folder could not be listed: {_why(exc)}", exc)
                 return False
             # No folder at this spelling: left to the driver, as a missing file is. The reason
             # only, since the exception's text names the path.
@@ -1373,6 +1380,10 @@ _WINDOWS_INVALID_NAME = 123
 #: ``ERROR_BAD_NETPATH`` and ``ERROR_BAD_NET_NAME``: a share Windows could not reach, which
 #: CPython raises as ``FileNotFoundError`` though a file may be there.
 _WINDOWS_UNREACHABLE = frozenset({53, 67})
+#: The not-found answers at an ``sslcapath`` folder's open that mean no folder is there
+#: (:func:`_capath_folder_clear`): 2 ``ERROR_FILE_NOT_FOUND`` and 3 ``ERROR_PATH_NOT_FOUND``, and
+#: ``None``, a ``FileNotFoundError`` with no ``winerror``, as ENOENT is off Windows.
+_CAPATH_MISSING_WINERRORS = frozenset({None, 2, 3})
 #: The ``stat`` failures of libpq's root certificate that leave it to libpq, by ``errno`` off
 #: Windows: no file is there, or libpq, running as the same identity, cannot ``stat`` it either and
 #: so loads nothing. ENOENT and ENOTDIR: no such file. ENAMETOOLONG: a name the filesystem cannot
