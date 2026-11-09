@@ -54,7 +54,6 @@ import contextlib
 import errno
 import json
 import logging
-import numbers
 import os
 import re
 import sys
@@ -4795,8 +4794,8 @@ _LOGIN_ROLE_PROBE_PARAMS: tuple[str, ...] = tuple(role for _, role in _LOGIN_ROL
 class LoginRoleReading:
     """One role probe's result. ``held`` names each role read as held that a read-only login does
     not need, as ``server role <name>`` or ``database role <name>``. ``unread`` names each role that
-    read NULL, or a value that is neither a 1 nor an integer 0. ``cause`` says why a probe did not run. No field holds a DSN, a credential, a
-    server's error text or a row."""
+    read NULL, or a value that is neither a 1 nor an integer 0. ``cause`` says why a probe did not
+    run. No field holds a DSN, a credential, a server's error text or a row."""
 
     verdict: LoginRoleVerdict
     held: tuple[str, ...] = ()
@@ -4808,12 +4807,13 @@ def classify_login_roles(row: Sequence[Any]) -> LoginRoleReading:
     """Judge one row of the role probe (BACKLOG #2617). Pure, so every verdict is unit-testable.
 
     Read three ways, as ``store/sqlserver.py`` ``_probed_grant`` reads the store login: ``1`` held,
-    ``0`` not held, NULL **not read**. A ``1`` in any numeric type, such as ``1.0``, is held, but
+    ``0`` not held, NULL **not read**. A ``1`` as an int, a bool, a float or a Decimal is held, but
     only an integer or a bool ``0`` is not held. Any other value, such as the text ``"1"``, ``0.0``
-    or ``2``, is not read either, where ``_probed_grant`` reads it as not held. ``IS_SRVROLEMEMBER`` and ``IS_ROLEMEMBER`` answer NULL for a
-    name that does not resolve for this login, and a NULL folded to "not a member" would be a false
-    clean. A role read as held is still reported when another read NULL, because a partial read can
-    only understate an over-grant, never invent one.
+    or ``2``, is not read either, where ``_probed_grant`` reads it as not held.
+    ``IS_SRVROLEMEMBER`` and ``IS_ROLEMEMBER`` answer NULL for a name that does not resolve for this
+    login, and a NULL folded to "not a member" would be a false clean. A role read as held is still
+    reported when another read NULL, because a partial read can only understate an over-grant, never
+    invent one.
 
     "Clean" means **no database-wide write role**: none of the classic fixed server roles, and no
     fixed database role but ``db_datareader`` and the two ``db_deny*`` roles. It reads role
@@ -4830,12 +4830,12 @@ def classify_login_roles(row: Sequence[Any]) -> LoginRoleReading:
     held: list[tuple[str, str]] = []
     unread: list[str] = []
     for (kind, role), value in zip(_LOGIN_ROLE_PROBE_ROLES, row, strict=True):
-        # A number equal to 1, in any numeric type, is held: it can only add a finding. "Not held"
-        # needs an integer or bool 0. Anything else, such as a driver's text "1", a 0.0 or a 2, is
-        # not an answer these functions give, so it fails closed as unread, never as "not held".
-        if isinstance(value, numbers.Number) and value == 1:
+        # A 1 as an int, a bool, a float or a Decimal is held: it can only add a finding. "Not
+        # held" needs an int or bool 0. Anything else, such as a driver's text "1", a 0.0 or a 2,
+        # is not an answer these functions give, so it fails closed as unread, never "not held".
+        if isinstance(value, (int, float, Decimal)) and value == 1:
             held.append((kind, role))
-        elif not (isinstance(value, numbers.Integral) and value == 0):
+        elif not (isinstance(value, int) and value == 0):
             unread.append(f"{kind} role {role}")
     allowed = set(LOOKUP_LOGIN_READ_ROLES)
     if ("database", "db_denydatawriter") in held:
@@ -4881,8 +4881,8 @@ def _log_login_role_reading(reading: LoginRoleReading, label: str) -> None:
     elif reading.verdict is LoginRoleVerdict.CANNOT_JUDGE:
         logger.warning(
             "%r: login role probe cannot judge this login: %s read NULL, or a value that is "
-            "neither a 1 nor an integer 0. A NULL means the name did not resolve for it, not that it is not a member. "
-            "No write role read as held",
+            "neither a 1 nor an integer 0. A NULL means the name did not resolve for it, not that "
+            "it is not a member. No write role read as held",
             label,
             ", ".join(reading.unread),
         )

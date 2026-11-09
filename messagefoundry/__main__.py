@@ -12692,8 +12692,8 @@ def _security(args: argparse.Namespace) -> int:
         idle-limit entry, says when one is named and how it is labelled.
 
         ``degraded`` is why ``sec`` is not the [security] the caller meant to report, as when `set`
-        could not re-read the [security] it saved (vault BACKLOG #8171, item 38). It marks the report
-        partial, and is the reason given."""
+        could not re-read the [security] it saved (vault BACKLOG #8171, item 38). It marks the
+        report partial, and is the reason given."""
         full: ServiceSettings | None = saved
         partial_reason: str | None = None
         # An ABSENT file is not a degraded read -- the shipped defaults ARE the effective posture
@@ -12794,9 +12794,9 @@ def _security(args: argparse.Namespace) -> int:
                 loosenings.append({"switch": s, "risk": f"{source}: {r}"})
         # Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
         # degraded or settings-only report for a complete one. `partial` means the sections outside
-        # [security] could not be read at all (the file did not load), so they report shipped defaults,
-        # or that `set` could not re-read the [security] it saved (``degraded``); the scope string is
-        # the standing limitation above. It names
+        # [security] could not be read at all (the file did not load), so they report shipped
+        # defaults, or that `set` could not re-read the [security] it saved (``degraded``); the
+        # scope string is the standing limitation above. It names
         # ALL the connection-scoped deviations (#333, ADR 0173) — naming only cleartext_accepted made the DECLARED
         # scope itself incomplete, which is the same defect one level up.
         #
