@@ -499,16 +499,20 @@ NUL_BODY = ADT + "NTE|1||x\x00\r"
 
 
 @pytest.mark.parametrize(
-    ("case", "to", "status"),
+    ("to", "status", "patch"),
     [
-        pytest.param("unknown", "OB_NOPE", 404, id="unknown"),
-        pytest.param("not-deployed", "OB_UNDEPLOYED", 409, id="not-deployed"),
-        pytest.param("another-engine-shard", "OB2", 409, id="another-engine-shard"),
-        pytest.param("stopped", "OB2", 409, id="stopped"),
+        pytest.param("OB_NOPE", 404, None, id="unknown"),
+        pytest.param("OB_UNDEPLOYED", 409, None, id="not-deployed"),
+        pytest.param("OB2", 409, ("destination_owner", "other-shard"), id="another-engine-shard"),
+        pytest.param("OB2", 409, ("outbound_running", False), id="stopped"),
     ],
 )
 async def test_a_direct_edit_resend_with_a_bad_body_does_not_reveal_its_target(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str, to: str, status: int
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    to: str,
+    status: int,
+    patch: tuple[str, object] | None,
 ) -> None:
     """A body the guard refuses gets the guard's 422 and its proof back, whatever state the target
     is in, so a run of such bodies cannot map which outbounds are registered, deployed, on this
@@ -519,10 +523,9 @@ async def test_a_direct_edit_resend_with_a_bad_body_does_not_reveal_its_target(
     try:
         rr = engine.registry_runner
         assert rr is not None
-        if case == "another-engine-shard":
-            monkeypatch.setattr(rr, "destination_owner", lambda _name: "other-shard")
-        elif case == "stopped":
-            monkeypatch.setattr(rr, "outbound_running", lambda _name: False)
+        if patch is not None:
+            method, answer = patch
+            monkeypatch.setattr(rr, method, lambda _name: answer)
         service = await _service(engine)
         await _add(service, "adm", [Role.ADMINISTRATOR.value])
         mid = await engine.store.enqueue_message(
