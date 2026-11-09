@@ -172,6 +172,12 @@ refuses is logged and leaves the row live until it lapses, so "never left live" 
 the revoke lands. A rotation refused by an Outage is audited as `auth.session_rotation_failed`
 with reason `transit_unavailable`, not `store_error`.
 
+A correction to that note, added 2026-11-09: "the first load is the lapse check" means the first
+load after the ceremony's stamp. The route's own session check, and the stamp write's check, run
+through Transit before `_elevated_hash` does; an Outage there refuses the request and writes no
+stamp, so nothing is left elevated. The lapse check also reads the account record, and an Outage
+on that check revokes the session too, though the session's own seal held.
+
 ## Context
 
 Engine `main` seals identity and authorization rows (sessions, users with their role grants, custom

@@ -613,11 +613,13 @@ async def test_an_outage_at_rotation_revokes_the_session(
     store._row_sealer = TransitRowSealer(backend)
     backend.down = True
     try:
-        with pytest.raises(_RotationStoreError):
+        with pytest.raises(_RotationStoreError) as at_load_refused:
             await service._rotate_session_hash(hash_token(at_load))
     finally:
         backend.down = False
     assert _revoked(path, at_load)
+    assert at_load_refused.value.reason == "transit_unavailable"
+    assert at_load_refused.value.old_revoked is True
     # The re-key: the load's Holds answer is cached, and the new seal's hmac meets the Outage.
     # "Both" is pinned here: the old hash and the new one are each revoked, and the error says so.
     at_rekey = await _session(store, "u-1")

@@ -1497,11 +1497,38 @@ async def require_session_seal_for_write(
     for a Forged seal, :class:`~messagefoundry.store.row_seal.RowSealUnverifiableError` for an
     Unverifiable one, :class:`~messagefoundry.store.row_seal.TransitSealUnavailableError` for an
     Outage, and :class:`~messagefoundry.store.row_seal.RowSealKeyRetiredError` for a genuine seal
-    under a retired key. The SQLite writer turns that last one back into ``RowSealError`` until
-    the ruled quiet end at the callers is built (ADR 0217, *Build rulings*)."""
+    under a retired key. Every backend's session writer calls :func:`session_writer_seal_check`,
+    which turns that last one back into ``RowSealError`` until the ruled quiet end at the callers
+    is built (ADR 0217, *Build rulings*)."""
     await require_seal_for_write(
         sealer, SESSION_KIND, record.seal_fields(), record.seal, subject=""
     )
+
+
+async def session_writer_seal_check(sealer: AnyRowSealer | None, record: SessionRecord) -> None:
+    """:func:`require_session_seal_for_write` as every backend's session writer runs it: a session
+    under a retired key raises ``RowSealError(SESSION_KIND)``, as on ``main``, and every other
+    answer raises as that function says.
+
+    The helper names a retired-key session as its own type (owner ruling 2026-11-07), but ending
+    it in the writer would hide the end from every caller: ``revoke_user_sessions`` would miscount
+    its kept session and the stamp legs would record a success for a session just ended. So the
+    write declines it as before, and the reader's quiet end (``AuthService``, ``key_changed``)
+    stays the one end, until each caller of the writer names the new type (the catch census)."""
+    retired = False
+    try:
+        await require_session_seal_for_write(sealer, record)
+    except RowSealKeyRetiredError:
+        retired = True
+    if retired:
+        raise RowSealError(SESSION_KIND)
+
+
+async def require_role_seal_for_write(sealer: AnyRowSealer | None, row: RoleRow) -> None:
+    """Refuse a write over ``row`` unless its seal holds under a held key: the write path's form
+    of :func:`role_seal_ok` (ADR 0217 (c) step 1), raising as
+    :func:`~messagefoundry.store.row_seal.require_seal_for_write` says."""
+    await require_seal_for_write(sealer, ROLE_KIND, row.seal_fields(), row.seal, subject="")
 
 
 def session_seal_ok(sealer: RowSealer | None, record: SessionRecord) -> bool:
@@ -18610,9 +18637,7 @@ class MessageStore:
                 # The write path's own refusal (ADR 0217 (c) step 1), as the map half below meets
                 # it through _write_ad_map: a Forged row is counted refused, as on main.
                 try:
-                    await require_seal_for_write(
-                        sealer, ROLE_KIND, row.seal_fields(), row.seal, subject=""
-                    )
+                    await require_role_seal_for_write(sealer, row)
                 except RowSealError:
                     refused += 1
                     continue
@@ -18719,19 +18744,7 @@ class MessageStore:
         current = SessionRecord.from_mapping(dict(row))
         if current.revoked_at is not None:
             return None
-        retired = False
-        try:
-            await require_session_seal_for_write(self._row_sealer, current)
-        except RowSealKeyRetiredError:
-            retired = True
-        if retired:
-            # Raised as main raises it, on every backend alike. The helper names a retired-key
-            # session as its own type (owner ruling 2026-11-07), but ending it HERE would hide the
-            # end from every caller: revoke_user_sessions would miscount its kept session and the
-            # stamp legs would record a success for a session just ended. So the write declines it
-            # as before, and the reader's quiet end (AuthService, key_changed) stays the one end,
-            # until each caller of this writer names the new type (the catch census).
-            raise RowSealError(SESSION_KIND)
+        await session_writer_seal_check(self._row_sealer, current)
         updated = await seal_session_async(self._row_sealer, change(current))
         cur = await self._db.execute(_SESSION_RESEAL, session_reseal_params(updated, current))
         return updated if cur.rowcount == 1 else None

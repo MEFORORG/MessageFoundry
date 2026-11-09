@@ -190,15 +190,11 @@ from messagefoundry.store.queue_tag import (
     report_queue_tag_failure,
 )
 from messagefoundry.store.row_seal import (
-    ROLE_KIND,
     SEAL_PREFIX,
-    SESSION_KIND,
     USER_KIND,
     AnyRowSealer,
     RowSealer,
     RowSealError,
-    RowSealKeyRetiredError,
-    require_seal_for_write,
 )
 from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
@@ -365,7 +361,7 @@ from messagefoundry.store.store import (
     require_ingress_audit,
     require_notify_email,
     require_operator_audit,
-    require_session_seal_for_write,
+    require_role_seal_for_write,
     require_totp_rule,
     require_user_seal_for_write,
     roll_audit_key_range,
@@ -379,6 +375,7 @@ from messagefoundry.store.store import (
     session_insert_params,
     session_owes_unproven_factor_async,
     session_reseal_params,
+    session_writer_seal_check,
     settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
@@ -10652,9 +10649,7 @@ class PostgresStore:
                 # The write path's own refusal (ADR 0217 (c) step 1), as store.py's twin: a Forged
                 # row is counted refused, as on main.
                 try:
-                    await require_seal_for_write(
-                        sealer, ROLE_KIND, role.seal_fields(), role.seal, subject=""
-                    )
+                    await require_role_seal_for_write(sealer, role)
                 except RowSealError:
                     refused += 1
                     continue
@@ -10764,14 +10759,7 @@ class PostgresStore:
         current = SessionRecord.from_mapping(dict(row))
         if current.revoked_at is not None:
             return None
-        retired = False
-        try:
-            await require_session_seal_for_write(self._row_sealer, current)
-        except RowSealKeyRetiredError:
-            retired = True
-        if retired:
-            # Raised as main raises it, on every backend alike; store.py's twin says why.
-            raise RowSealError(SESSION_KIND)
+        await session_writer_seal_check(self._row_sealer, current)
         updated = await seal_session_async(self._row_sealer, change(current))
         status = await conn.execute(_PG_SESSION_RESEAL, *session_reseal_params(updated, current))
         return updated if _rowcount(status) > 0 else None

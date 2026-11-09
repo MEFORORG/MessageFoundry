@@ -8,8 +8,9 @@ borrow is replaced by a fake connection that answers the session read with one r
 an in-memory Transit stand-in and records every statement. The writer must check and re-seal
 through the awaitable seam on both backends, as SQLite's does: a Holds row is re-sealed under the
 active key, an Outage or a Forged row writes nothing, and a session under a retired key is declined
-as ``RowSealError``, as on ``main``. The rest of each backend's sealed paths need a live server and
-run on the hosted Postgres and SQL Server legs.
+as ``RowSealError``, as on ``main``. Only the session writer is covered here. No test yet runs the
+rest of either server backend's sealed paths under the Transit sealer: the hosted Postgres and SQL
+Server legs run them under the local sealer only.
 """
 
 from __future__ import annotations
@@ -25,12 +26,15 @@ from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.row_seal import (
     RowSealError,
+    RowSealKeyRetiredError,
     TransitRowSealer,
     TransitSealUnavailableError,
 )
 from messagefoundry.store.store import (
     GLOBAL_SESSION_EPOCH_SQL,
+    SessionRecord,
     new_session_record,
+    require_session_seal_for_write,
     seal_session_async,
 )
 from tests._transit_seal_fake import RETIRED, FakeBackend
@@ -165,11 +169,16 @@ async def test_a_session_write_checks_and_reseals_through_transit(backend: str) 
     seen: Seen = []
     store = _STORES[backend](row, seen)
     store._row_sealer = TransitRowSealer(fake)  # nothing cached, so the check meets Transit
+    fake.inputs.clear()
+    fake.verify_calls = 0
     await store.mark_session_mfa_verified(_HASH, now=_NOW)
     (write,) = _writes(seen)
-    new_seals = [p for p in write[1] if isinstance(p, str) and sealer.is_active(p)]
-    assert new_seals and row["seal"] in write[1]  # the new seal, and the compare on the old one
-    assert fake.inputs, "no Transit call was made"
+    new_seals = [
+        p for p in write[1] if isinstance(p, str) and sealer.is_active(p) and p != row["seal"]
+    ]
+    assert len(new_seals) == 1 and row["seal"] in write[1]  # a new seal, and the old one compared
+    assert fake.verify_calls == 1, "the stored seal was not checked through Transit"
+    assert len(fake.inputs) == 2, "the check and the re-seal are each one Transit call"
 
 
 @pytest.mark.parametrize("backend", sorted(_STORES))
@@ -206,6 +215,9 @@ async def test_a_session_under_a_retired_key_is_declined_as_on_main(backend: str
     seen: Seen = []
     store = _STORES[backend](row, seen)
     store._row_sealer = TransitRowSealer(FakeBackend(), retired_key_names=[RETIRED])
+    # The row is a retired-key session, not a Forged one: the check itself names it so.
+    with pytest.raises(RowSealKeyRetiredError):
+        await require_session_seal_for_write(store._row_sealer, SessionRecord(**row))
     with pytest.raises(RowSealError) as refused:
         await store.mark_session_mfa_verified(_HASH, now=_NOW)
     assert type(refused.value) is RowSealError

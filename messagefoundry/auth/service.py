@@ -289,9 +289,10 @@ def _session_write_errors() -> tuple[type[Exception], ...]:
     engine ``RuntimeError`` other than the acquire timeout still reads as a defect. Under the
     Transit sealer (ADR 0217) that premise is FALSE: an Outage or an Unverifiable seal raises a
     type this tuple does not take, so it escapes at least every site that catches only this tuple.
-    :meth:`AuthService._rotate_session_hash` adds the Outage type itself (owner ruling 2026-11-08,
-    "Revoke both"); every other such site, and the Unverifiable type, is the catch census of
-    slice 1b-iv (vault #4739 step 6)."""
+    A session rotation adds the Outage type through :func:`_rotation_store_errors`, at the lapse
+    check in :meth:`AuthService._elevated_hash` and at the load and re-key in
+    :meth:`AuthService._rotate_session_hash` (owner ruling 2026-11-08, "Revoke both"); every other
+    such site, and the Unverifiable type, is the catch census of slice 1b-iv (vault #4739 step 6)."""
     return store_open_errors()
 
 
@@ -10395,8 +10396,9 @@ class AuthService:
     async def _revoke_unrotated(
         self, old_hash: str, new_hash: str | None, cause: Exception
     ) -> bool:
-        """Revoke a session whose rotation the store refused, under ``old_hash`` and, when a re-key
-        was attempted, ``new_hash``; ``True`` when every revoke landed (BACKLOG #3023). Best effort: a
+        """Revoke a session whose rotation the store refused, or a Transit Outage refused (owner
+        ruling 2026-11-08), under ``old_hash`` and, when a re-key was attempted, ``new_hash``;
+        ``True`` when every revoke landed (BACKLOG #3023). Best effort: a
         second refusal is logged, never raised, so the caller still fails closed. The log names the
         error classes only, never a hash.
 
@@ -10497,7 +10499,9 @@ class AuthService:
         check's own reads take :func:`_rotation_store_errors`, so a Transit Outage there revokes the
         old hash too (owner ruling 2026-11-08 on ADR 0217, "Revoke both"). This is the site the
         ruling binds on the elevation path: the lapse check loads the session before the rotation
-        does, so an Outage meets this load first."""
+        does, so an Outage after the ceremony's stamp meets this load first. Those reads are the
+        session's and the account's: an Outage on the account record's check revokes the session
+        too, though the session's own seal held."""
         rotated: str | None = None
         failure: dict[str, object] = {"reason": "session_gone"}
         try:
