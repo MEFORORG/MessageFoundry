@@ -63,15 +63,17 @@
   and an error of any other class passed through as it was. The store open reads the key custody
   in a step of its own under every key provider. Under `[store].key_provider = 'host'` it derives
   the store key from the host blob, and the store key resolution does not run. On the way it at
-  least checks the settings, judges the engine's account, reads the host file, converts a handoff
-  into it where only a handoff is there and the open may write, and, where the open may write,
-  settles a handoff left beside a host file: it deletes one that names the host file's store id
-  and holds the same key, refuses the open on any other, or where the handoff cannot be read, as
-  on a POSIX host it never can, or cannot be shown deleted, and goes on where another start has
-  already removed it. A read-only open leaves a handoff beside a host file as it is and opens from
-  the host file, and refuses where only a handoff is there. On a read that succeeds it records
-  what it found; a blob a minting caller passes is checked against the settings and not read.
-  Under any other provider it looks for a
+  least checks the settings, judges the engine's account and reads the host file, and, where the
+  open may write, converts a handoff into it where only a handoff is there and settles a handoff
+  left beside a host file: it deletes one that names the host file's store id and holds the same
+  key, refuses the open on any other, on one it cannot read or on one it cannot show deleted, and
+  goes on where another start has already removed it. A handoff is read on Windows only, so a
+  POSIX host never converts or deletes one. A read-only store open leaves a handoff beside a host
+  file as it is and opens from the host file, and refuses where only a handoff is there. Outside
+  the store open, the `host` key provider converts and settles a handoff whatever the command, a
+  read-only one included. On a read that succeeds the step records what it found, before it
+  derives the store key. A blob a minting caller passes is checked against the settings, and none
+  of the rest runs. Under any other provider it looks for a
   host blob or a handoff in the custody directory. Under every provider, a `KeyProviderError` the
   engine built and recorded passes through the step as it is; its text is the one the engine
   built it with, which reads no text from an error, and the engine raises each with no chain,
