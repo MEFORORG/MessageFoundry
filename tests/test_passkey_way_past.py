@@ -1710,7 +1710,7 @@ async def test_an_unknown_totp_opens_the_rotation_gate(
         assert await service.change_password(identity, _NEW_PASSWORD) == []
         # The password change opens it twice more: in its early refusal and in the store's
         # conditional write (BACKLOG #3948). The count alone does not say which site opened it;
-        # test_a_password_change_opens_the_totp_cell_in_the_early_refusal_and_in_the_write does.
+        # test_a_password_change_currently_opens_the_totp_cell_twice does.
         assert len(opened) == gate_opens + 2, (gate_opens, len(opened))
         row = await store.get_user(identity.user_id)
         assert row is not None and row.password_hash != before.password_hash
