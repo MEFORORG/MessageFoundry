@@ -788,11 +788,9 @@ def test_a_session_on_the_callers_config_root_outside_userprofile_occupies_the_t
     assert "Target is occupied" in _out(proc), _out(proc)
     assert wt.exists() and rig.is_registered(wt)
 
-    # A lone backtick refuses too, though the registry reads this root as itself: any backtick is
-    # refused (the doubled-backtick test below says why), so a root such as o`brien is not read.
-    ticked = rig.root / "o`brien"
-    (ticked / "sessions").mkdir(parents=True)
-    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(ticked)})
+    # A lone backtick refuses too: any backtick is refused (the doubled-backtick test below says
+    # why), so a root such as o`brien is not read. The refusal fires before any read.
+    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(rig.root / "o`brien")})
     assert proc.returncode != 0, _out(proc)
     assert "wildcard character" in _out(proc), _out(proc)
     assert wt.exists() and rig.is_registered(wt)
@@ -853,6 +851,11 @@ def test_a_wildcard_character_in_the_config_root_refuses(rig: Rig, char: str) ->
     assert "wildcard character" in _out(proc), _out(proc)
     assert wt.exists() and rig.is_registered(wt)
 
+    # Control: with no CLAUDE_CONFIG_DIR, the same call removes the tree.
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
 
 def test_a_record_the_registry_did_not_read_refuses_on_the_record_count(rig: Rig) -> None:
     """Vault BACKLOG #2985. The registry lists records without -Force, so it skips a hidden one, and a
@@ -868,8 +871,14 @@ def test_a_record_the_registry_did_not_read_refuses_on_the_record_count(rig: Rig
     assert "session record(s) and a second listing found" in _out(proc), _out(proc)
     assert wt.exists() and rig.is_registered(wt)
 
-    # Control: without the hidden record the two reads agree and the target is cleared.
+    # Unhidden, both reads count the record, and it is placed in the target.
     subprocess.run(["attrib", "-h", str(hidden)], check=True, capture_output=True)
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode != 0, _out(proc)
+    assert "Target is occupied" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: without that record, the target is cleared.
     rig.registry()
     proc = rig.run("-Path", str(wt))
     assert proc.returncode == 0, _out(proc)

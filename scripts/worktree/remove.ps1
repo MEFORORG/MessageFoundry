@@ -45,8 +45,10 @@
         cannot be read (scripts/coord/occupancy.ps1 says why an unreadable fence must refuse). A
         registry that was read and holds no record at all clears the target. The registry is every
         %USERPROFILE%\.claude* config root, and the caller's CLAUDE_CONFIG_DIR when it names another;
-        a session on any other root is not seen. A record whose process still runs counts unless
-        that process started more than a minute after the record's startedAt. This fence sees only
+        a session on any other root is not seen. A CLAUDE_CONFIG_DIR holding a backtick, [, ], * or
+        ? refuses, and so does a second listing of the registry that counts a different number of
+        roots than the registry's own read, or, when that read found records, of records. A record
+        whose process still runs counts unless that process started more than a minute after the record's startedAt. This fence sees only
         the directory a session was launched in, never where it writes, so on its own it is blind
         to a subagent's tree. The refusals in the next list are the signals that are not;
       * every refusal in the next list, which -Name shares.
@@ -559,7 +561,7 @@ if ($byPath) {
         # a root holding a backtick can be read as a different directory. [, ], * and ? can do the same.
         # So at least these refuse, and any backtick does, including a lone one that reads as itself.
         if ($env:CLAUDE_CONFIG_DIR -match '[\[\]*?`]') {
-            throw "CLAUDE_CONFIG_DIR '$env:CLAUDE_CONFIG_DIR' holds a wildcard character or a backtick, which the session registry reads as a pattern. Occupancy unknown. Nothing was removed."
+            throw "CLAUDE_CONFIG_DIR '$env:CLAUDE_CONFIG_DIR' holds a wildcard character or a backtick, and the session registry reads a root as a pattern, so this one is not read. Occupancy unknown. Nothing was removed."
         }
         # TrimEndingDirectorySeparator keeps a drive root whole: `D:` alone would name D:'s cwd.
         $pin = [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($env:CLAUDE_CONFIG_DIR))
