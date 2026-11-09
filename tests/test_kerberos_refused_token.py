@@ -44,7 +44,12 @@ from spnego._negotiate import NegotiateProxy
 from spnego._spnego import NegTokenInit, NegTokenResp
 
 from messagefoundry.api import create_app
-from messagefoundry.auth.ldap import KerberosTokenRefused, LdapError, kerberos_principal
+from messagefoundry.auth.ldap import (
+    KerberosTokenRefused,
+    LdapError,
+    LdapReferralError,
+    kerberos_principal,
+)
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
@@ -360,10 +365,64 @@ async def test_a_failed_principal_read_is_audited_as_an_outage_not_a_500(
     assert not outcome.ok and outcome.error == "directory unavailable"
     rows = await _rows(engine, "auth.login_error")
     assert len(rows) == 1, rows
+    # A closed reason and the type (BACKLOG #3196); the status code is in the WARNING the read
+    # logs, which the test above pins.
     assert json.loads(rows[0]["detail"]) == {
         "provider": "ad",
         "mech": "kerberos",
-        "error": "Kerberos principal read failed: _SspiError winerror=-2146893048",
+        "reason": "directory_error",
+        "error": "LdapError",
     }
     assert _LEAK not in json.dumps(rows[0])
     assert await _rows(engine, "auth.login_failed") == []
+
+
+#: Planted in a directory error's text after the step accepted the token. It stands for what the
+#: caller or the directory chose, and must reach neither the row nor any log line (BACKLOG #3196).
+_PLANTED = "CN=planted-3196,DC=attacker.invalid"
+
+
+class _FailingDirectory:
+    """A directory that answers every lookup with ``error``."""
+
+    def __init__(self, error: LdapError) -> None:
+        self._error = error
+
+    def resolve_principal(self, username: str, **_: object) -> Any:
+        raise self._error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(LdapError(f"AD directory call failed near {_PLANTED}"), id="LdapError"),
+        pytest.param(LdapReferralError(f"referral to ldaps://{_PLANTED}"), id="LdapReferralError"),
+    ],
+)
+async def test_a_directory_error_after_an_accepted_token_stores_no_text(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: LdapError,
+) -> None:
+    """BACKLOG #3196. The ``LdapError`` arm stored ``str(exc)``. Now the row holds a closed reason
+    and the error's type, and the planted text reaches neither the row nor the log, the audit
+    tee's INFO line included. RED on the old arm, which stored the text."""
+    service = await _service(engine, monkeypatch)
+    monkeypatch.setattr("messagefoundry.auth.service.kerberos_principal", lambda _t, _s: "alice")
+    service._ldap = _FailingDirectory(error)  # type: ignore[assignment]
+    with caplog.at_level(logging.DEBUG):
+        outcome = await service.authenticate_kerberos(b"token", client="192.0.2.7")
+    assert not outcome.ok and outcome.error == "directory unavailable"
+    rows = await _rows(engine, "auth.login_error")
+    assert len(rows) == 1, rows
+    assert json.loads(rows[0]["detail"]) == {
+        "provider": "ad",
+        "mech": "kerberos",
+        "reason": "directory_error",
+        "error": type(error).__name__,
+    }
+    assert _PLANTED not in json.dumps(rows[0])
+    logged = [r.getMessage() for r in caplog.records]
+    assert any("auth.login_error" in m for m in logged), "the audit tee's line is the control"
+    assert not [m for m in logged if _PLANTED in m], logged

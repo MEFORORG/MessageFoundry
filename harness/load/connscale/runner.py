@@ -75,6 +75,7 @@ from harness.load.connscale.stepconfig import STEP_CONFIG_DIR_PREFIX, write_step
 from harness.load.corpus import Corpus, build_corpus
 from harness.load.correlator import Correlator
 from harness.load.enginepoll import (
+    RIG_SESSION_CAP,
     SIGN_IN_ERRORS,
     EnginePoller,
     EngineSample,
@@ -93,6 +94,8 @@ from messagefoundry.config.tls_policy import HopPosture
 # Hard-coded here (a plain env-var name) so the harness sets it in the engine SUBPROCESS env without
 # importing the engine's pipeline package into the driver process.
 SHIM_ENV = "MEFOR_CONNSCALE_EXECUTOR_SHIM"
+#: The env name a node's engine reads its ``[auth].max_sessions_per_user`` from.
+_SESSION_CAP_ENV = "MEFOR_AUTH_MAX_SESSIONS_PER_USER"
 
 log = logging.getLogger(__name__)
 
@@ -563,7 +566,13 @@ async def _run_started_step(
     # instant each was taken, and those instants must sit on the SAME clock as `EngineSample.elapsed_s`
     # or nothing downstream can put a probe reading beside the engine sample it belongs next to.
     origin = time.perf_counter()
-    poller = EnginePoller(node.url, token=RIG_SESSION, origin=origin)
+    # The cap the node's engine runs, so the reload probe keeps a session of headroom under it and
+    # never evicts the sampler's session (vault BACKLOG #3241, added item 5).
+    try:
+        session_cap = int(node_env.get(_SESSION_CAP_ENV, RIG_SESSION_CAP))
+    except ValueError:
+        session_cap = RIG_SESSION_CAP  # the engine refuses such a value at start anyway
+    poller = EnginePoller(node.url, token=RIG_SESSION, origin=origin, session_cap=session_cap)
     # BACKLOG #1292: the per-message send ledger the intake audit reads. None disables the audit
     # wholesale (the sender's write path is then byte-identical to pre-#1292).
     ledger = IntakeLedger() if profile.intake_audit else None

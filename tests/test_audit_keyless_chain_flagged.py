@@ -50,6 +50,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
     security_loosenings,
 )
+from messagefoundry.store import base as store_base
 from messagefoundry.store.base import open_store, resolve_active_key
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.keyprovider import (
@@ -473,8 +474,9 @@ def test_provision_admin_with_a_vault_provider_is_not_refused_as_keyless(
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc != 0, error
     assert "no store key is set in this shell" not in error, "a Vault key is a configured key"
-    # The refusal is the Vault one -- not some unrelated failure that also leaves no store.
-    assert "MEFOR_STORE_VAULT_TRANSIT_KEY" in error, error
+    # The refusal is the store key resolution's -- not some unrelated failure that also leaves no
+    # store. Its text is fixed since the eighth hold on engine PR 2818, so it names no variable.
+    assert store_base._KEY_SEAM_TEXTS[4] in error, error
     assert not db.exists(), "a refused open must not leave a store behind"
 
 
@@ -487,8 +489,12 @@ async def test_an_external_provider_that_cannot_resolve_fails_closed_at_open(
     for name in _VAULT_ENV:
         monkeypatch.delenv(name, raising=False)
     db = shell / f"{provider}.db"
-    with pytest.raises(KeyProviderError, match=provider):
+    with pytest.raises(KeyProviderError) as caught:
         await open_store(StoreSettings(key_provider=provider, path=str(db)), create=True)
+    assert (
+        str(caught.value) == store_base._KEY_SEAM_TEXTS[4]
+        # A fixed text since the eighth hold on engine PR 2818.
+    )
     assert not db.exists(), "a refused open must not leave a store behind"
 
 

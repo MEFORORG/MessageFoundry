@@ -839,6 +839,22 @@ async def test_concurrent_admin_removals_leave_one(store) -> None:
     await assert_concurrent_removals_leave_one(store)
 
 
+async def test_role_write_if_held_contract(store) -> None:
+    """Vault BACKLOG #3085 on SQL Server: the reconciler's compare-and-set role write writes only
+    while the record holds the set the caller read."""
+    from tests._role_write_if_held_contract import assert_role_write_if_held_contract
+
+    await assert_role_write_if_held_contract(store)
+
+
+async def test_concurrent_role_writes_from_one_read_write_once(store) -> None:
+    """Vault BACKLOG #3085 on SQL Server: two writes from one read on two pooled connections, at
+    once. The ``UPDLOCK, ROWLOCK`` read serializes them; one writes."""
+    from tests._role_write_if_held_contract import assert_concurrent_role_writes_write_once
+
+    await assert_concurrent_role_writes_write_once(store)
+
+
 async def test_first_admin_grant_contract(store) -> None:
     """BACKLOG #3078 on SQL Server: the first-administrator grant refuses while another enabled
     administrator exists, and over credentials the caller did not write."""
@@ -855,6 +871,15 @@ async def test_first_admin_grant_counts_only_a_local_administrator_that_signs_in
     )
 
     await assert_grant_counts_only_a_local_administrator_that_signs_in(store)
+
+
+async def test_first_admin_grant_refuses_a_row_holding_a_passkey(store) -> None:
+    """BACKLOG #3078 F2 on SQL Server: the grant's refusal rolls its role write back."""
+    from tests._first_admin_grant_store_contract import (
+        assert_grant_refuses_a_row_holding_a_passkey,
+    )
+
+    await assert_grant_refuses_a_row_holding_a_passkey(store)
 
 
 async def test_concurrent_first_admin_grants_leave_one(store) -> None:
@@ -1207,6 +1232,112 @@ async def test_rotation_racing_a_sweep_is_swept(store) -> None:
 
     await _assert_rotation_racing_a_sweep_is_swept(store, **_lock_wait_probes(store))
     await _assert_rotation_waits_for_a_bind(store, **_lock_wait_probes(store))
+
+
+async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(store) -> None:
+    """BACKLOG #2733 on the real SQL Server backend: the three ``users(id)`` keys are trusted, and a
+    store an earlier batch left with untrusted keys over orphaned rows is repaired by the next full
+    run. The plant is what that batch could leave: each key dropped and re-added ``WITH NOCHECK``,
+    and one row per table naming an account that does not exist, beside one that does."""
+    from messagefoundry.auth.service import _is_integrity_refusal
+
+    keys = {
+        "webauthn_credentials": "fk_webauthn_credentials_user",
+        "sessions": "fk_sessions_user",
+        "user_roles": "fk_user_roles_user",
+    }
+
+    async def _untrusted() -> dict[str, bool]:
+        rows = await store._fetchall(
+            "SELECT name, is_not_trusted FROM sys.foreign_keys WHERE name IN (?, ?, ?)",
+            tuple(keys.values()),
+        )
+        return {str(r["name"]): bool(r["is_not_trusted"]) for r in rows}
+
+    async def _rows(table: str) -> set[str]:
+        rows = await store._fetchall(f"SELECT user_id FROM {table}")  # table is a constant
+        return {str(r["user_id"]) for r in rows}
+
+    assert await _untrusted() == dict.fromkeys(keys.values(), False)
+    await store.upsert_role(role_id="viewer", display_name="Viewer", description=None, builtin=True)
+    await store.create_user(
+        user_id="kept",
+        username="kept",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        for table, name in keys.items():
+            await cur.execute(f"ALTER TABLE {table} DROP CONSTRAINT {name}")
+        for user_id in ("kept", "ghost"):
+            await cur.execute(
+                "INSERT INTO user_roles (user_id, role_id, assigned_at) VALUES (?, 'viewer', 1.0)",
+                (user_id,),
+            )
+            await cur.execute(
+                "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at)"
+                " VALUES (?, ?, 1.0, 9e9, 1.0)",
+                (f"{user_id:x<64}", user_id),
+            )
+            await cur.execute(
+                "INSERT INTO webauthn_credentials (credential_id_hash, credential_id, user_id, rp_id,"
+                " public_key, sign_count, device_type, label, created_at)"
+                " VALUES (?, 'c', ?, 't', 'k', 0, 'single_device', 'l', 1.0)",
+                (f"h-{user_id}", user_id),
+            )
+        for table, name in keys.items():
+            await cur.execute(
+                f"ALTER TABLE {table} WITH NOCHECK ADD CONSTRAINT {name}"
+                " FOREIGN KEY (user_id) REFERENCES users(id)"
+            )
+        await cur.execute("DELETE FROM schema_meta")
+        await conn.commit()
+        await cur.close()
+    # Positive controls: the plant took, so the run below has something to repair.
+    assert await _untrusted() == dict.fromkeys(keys.values(), True)
+    # Awaited one by one: an await inside a generator expression makes an async generator,
+    # which all() cannot iterate.
+    for table in keys:
+        assert await _rows(table) == {"kept", "ghost"}, table
+
+    assert await store._ensure_schema() is True  # pre-marker DB: the full batch really ran
+    assert await _untrusted() == dict.fromkeys(keys.values(), False)
+    for table in keys:
+        assert await _rows(table) == {"kept"}, table
+    # Trusted keys refuse every later orphan, here a session and a role grant.
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        for sql in (
+            "INSERT INTO user_roles (user_id, role_id, assigned_at) VALUES ('ghost', 'viewer', 1.0)",
+            "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at)"
+            f" VALUES ('{'g' * 64}', 'ghost', 1.0, 9e9, 1.0)",
+        ):
+            with pytest.raises(Exception, match="FOREIGN KEY") as refused:  # noqa: PT011
+                await cur.execute(sql)
+            assert _is_integrity_refusal(refused.value), refused.value
+            await conn.rollback()
+        await cur.close()
+    # A second full run finds the keys trusted and leaves the kept rows alone.
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        await cur.execute("DELETE FROM schema_meta")
+        await conn.commit()
+        await cur.close()
+    assert await store._ensure_schema() is True
+    for table in keys:
+        assert await _rows(table) == {"kept"}, table
+
+
+async def test_a_session_for_a_missing_account_is_refused(store) -> None:
+    """BACKLOG #2733: SQL Server's sign-in wrote an orphaned session for an account that does not
+    exist, where SQLite and Postgres refused it on their key. The shared body is the one they run."""
+    from tests._webauthn_store_contract import assert_a_session_for_a_missing_account_is_refused
+
+    await assert_a_session_for_a_missing_account_is_refused(store)
 
 
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:

@@ -225,7 +225,9 @@ class LdapReferralError(LdapError):
 
 
 class LdapUnansweredError(LdapError):
-    """The directory ended an operation with a result code that is not an answer (BACKLOG #3010).
+    """The directory ended an operation with a result code that is not an answer the operation can
+    use (BACKLOG #3010): a search it did not finish, or a service-account bind it refused or did
+    not judge (:func:`_unanswered` words the two apart, BACKLOG #3017 L3).
 
     A subclass, so every ``except LdapError`` handles it as before; :func:`_refuse_unanswered` says
     what that means for each of its callers. A user bind raises it too, through
@@ -233,17 +235,25 @@ class LdapUnansweredError(LdapError):
     (``AuthService._reauth_ad``) reads it as ``directory_unavailable``, not counted. ``code`` is
     the result code, or ``None`` when the result held none that is an integer or a paged search was
     refused for its paging (:func:`_search_paged`); ``code_name`` is ldap3's name for the code, or
-    the engine's for the case, never text the directory sent.
-    Both default, so the exception survives a copy or a pickle, which rebuild it from its message
-    and then restore both from its ``__dict__``.
+    the engine's for the case, never text the directory sent. ``operation`` is the engine's own
+    name for what was refused, such as ``service-account bind`` or ``user search``, or empty when
+    the raiser named none, so a refused bind DN and a refused search base read apart.
+    All three default, so the exception survives a copy or a pickle, which rebuild it from its
+    message and then restore them from its ``__dict__``.
     """
 
     def __init__(
-        self, message: str, *, code: int | None = None, code_name: str = "no code"
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        code_name: str = "no code",
+        operation: str = "",
     ) -> None:
         super().__init__(message)
         self.code = code
         self.code_name = code_name
+        self.operation = operation
 
     @property
     def configuration(self) -> bool:
@@ -923,7 +933,9 @@ _UNANSWERED_HINTS: dict[int, str] = {
 _CONFIGURATION_CODES = frozenset({32, 34, 50})
 
 
-def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | None = None) -> None:
+def _refuse_unanswered(
+    conn: Any, operation: str, *, answers: frozenset[int] | None = None, bind: bool = False
+) -> None:
     """Raise :class:`LdapReferralError` for a referral, and otherwise :class:`LdapUnansweredError`
     unless ``conn``'s last operation ended with a result code in ``answers``, which is success alone
     unless the caller names another set.
@@ -964,7 +976,8 @@ def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | N
     without one. Only a test double can.
 
     ``answers`` is a parameter so an operation whose answers differ, such as a bind, can reuse this
-    with its own set. A referral is refused first, as a referral, whatever ``answers`` holds, so
+    with its own set; ``bind`` names the operation a bind, for the refusal's wording
+    (:func:`_unanswered`). A referral is refused first, as a referral, whatever ``answers`` holds, so
     the reconciler still reads it as referred (BACKLOG #2538).
     """
     from ldap3.core.results import RESULT_SUCCESS  # lazy, like every ldap3 import here
@@ -975,13 +988,22 @@ def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | N
         return
     code = result.get("result")
     if type(code) is not int:  # not isinstance: a bool is an int, and is no result code
-        raise _unanswered(operation, None)
+        raise _unanswered(operation, None, bind=bind)
     if code not in (answers if answers is not None else (RESULT_SUCCESS,)):
-        raise _unanswered(operation, code)
+        raise _unanswered(operation, code, bind=bind)
 
 
-def _unanswered(operation: str, code: int | None) -> LdapUnansweredError:
+#: The result codes with which a bind judges what it was asked and refuses it (BACKLOG #3017 L3):
+#: invalidCredentials (49) on the password, and noSuchObject (32), invalidDNSyntax (34) and
+#: insufficientAccessRights (50) on the DN. Any other code, such as an outage code or
+#: strongerAuthRequired (8), judged nothing, so it is not called a refusal.
+_REFUSING_BIND_CODES = frozenset({49}) | _CONFIGURATION_CODES
+
+
+def _unanswered(operation: str, code: int | None, *, bind: bool = False) -> LdapUnansweredError:
     """The refusal for ``operation`` ending with ``code``, warned once per operation and code name.
+    ``bind`` says the operation was a bind, whose refusing codes (:data:`_REFUSING_BIND_CODES`)
+    are named as a refusal rather than as no answer.
 
     The text carries the code, ldap3's name for it and the operation, never directory text.
     """
@@ -994,19 +1016,21 @@ def _unanswered(operation: str, code: int | None) -> LdapUnansweredError:
         shown, hint = f"result code {code} ({name})", _UNANSWERED_HINTS.get(code, "")
     # A configuration code is not read as the directory not answering: the session reconciler
     # reads it as a configuration refusal, which alerts (LdapUnansweredError.configuration).
-    reading = (
-        "a fault in the configuration"
-        if code in _CONFIGURATION_CODES
-        else "the directory not answering"
-    )
-    message = (
-        f"AD ended the {operation} with {shown}, which is not an answer; the engine reads it as "
-        f"{reading} (BACKLOG #3010).{hint}"
-    )
+    # A bind the directory refused, such as with invalidCredentials, is an answer, so it is
+    # called a refusal, not "not an answer" (BACKLOG #3017 L3).
+    refused = bind and code in _REFUSING_BIND_CODES
+    if code in _CONFIGURATION_CODES:
+        reading = "the engine reads it as a fault in the configuration"
+    elif refused:
+        reading = "the engine reads the directory as unavailable until it is fixed"
+    else:
+        reading = "the engine reads it as the directory not answering"
+    verdict = "which refused the bind" if refused else "which is not an answer"
+    message = f"AD ended the {operation} with {shown}, {verdict}; {reading} (BACKLOG #3010).{hint}"
     # Keyed on ldap3's name, not the raw code: a directory chooses the code, and ldap3's table is
     # finite, so the set of warnings stays bounded.
     _warn_once(f"unanswered: {operation}: {name}", "%s Reported once per code.", message)
-    return LdapUnansweredError(message, code=code, code_name=name)
+    return LdapUnansweredError(message, code=code, code_name=name, operation=operation)
 
 
 #: The result codes that end a user bind without judging its password (BACKLOG #3169): busy (51),
@@ -1110,21 +1134,62 @@ def _reading_connection(exc: BaseException) -> Any:
 
 def _close_without_sending(conn: Any, why: str) -> None:
     """Shut ``conn``'s socket with ldap3's ``BaseStrategy.close``, which sends nothing on a stream
-    that may be out of step or already failed. Best effort: an error is logged at DEBUG, by type
-    only, because the caller's answer stands either way."""
+    that may be out of step or already failed. Best effort: an ldap3 or socket error is logged at
+    DEBUG, by type only, because the caller's answer stands either way. Any other error is an
+    engine defect, such as an ldap3 upgrade that renamed the close, which would leave every such
+    socket open: it is logged at ERROR, by type only, and still not raised, because raised in
+    place of the caller's answer it would replace a refusal every caller reads as an
+    ``LdapError`` with an unhandled one (BACKLOG #3017).
+
+    **The rule, stated here once (BACKLOG #3017): when the service-account bind's open fails, its
+    socket is closed at once, by the engine or by ``ssl``, not by the collector, at least in the
+    cases below.** ldap3 2.9.1's ``close`` shuts the socket only once an open has completed, and a
+    failed open leaves ``conn.closed`` true. It does not yet hold for a user or decoy bind, which
+    ``_released`` ends with an ``unbind`` that does nothing on a closed connection.
+
+    * Before ``ssl`` takes the socket over, it is the last connected socket on ``conn.socket``, and
+      it is closed here directly, whatever ``close`` did. Read from the ldap3 and ``ssl`` source,
+      that covers at least a TLS context ``NarrowedTls`` could not build, and a receive timeout
+      ``settimeout`` or ``setsockopt`` could not set.
+    * Once ``ssl`` has taken it over, ``conn.socket`` holds only the detached socket. A failed
+      handshake is closed by ``ssl`` itself. A host name refusal after a completed handshake is
+      closed by ``NarrowedTls.wrap_socket`` before it re-raises, for every LDAPS bind.
+      Through ldap3's ``open`` that socket was already freed promptly, because ``open`` re-raises a
+      copy of the error without its traceback; the close removes the reliance on that."""
     import ldap3
 
     try:
         conn.strategy.close()
     except (ldap3.core.exceptions.LDAPException, OSError) as failed:
         logger.debug("AD socket close %s: %s", why, _type_name(failed))
+    except Exception as failed:  # noqa: BLE001 -- logged loud; the caller's error is the answer
+        logger.error(
+            "AD socket close %s raised %s, an engine defect; the socket may be left open",
+            why,
+            _type_name(failed),
+        )
+    leftover = getattr(conn, "socket", None)
+    if leftover is None:
+        return
+    try:
+        leftover.close()
+    except OSError as failed:
+        logger.debug("AD socket close %s, of a socket left open: %s", why, _type_name(failed))
+    except Exception as failed:  # noqa: BLE001 -- logged loud; the caller's error is the answer
+        logger.error(
+            "AD socket close %s raised %s on a socket left open, an engine defect; the socket "
+            "may be left open",
+            why,
+            _type_name(failed),
+        )
+    conn.socket = None
 
 
 @contextlib.contextmanager
-def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
+def _ldap3_call(operation: str) -> Iterator[None]:
     """The boundary every ldap3 call that reads a response runs inside: each search and each page
-    of one, every bind including the service account's ``auto_bind``, and the Who am I extended
-    operation. A static test pins that. An unbind reads no response, so it runs outside.
+    of one, every bind including the service account's, and the Who am I extended operation. A
+    static test pins that. An unbind reads no response, so it runs outside.
 
     BACKLOG #3010. A :data:`_DECODE_FAULTS` exception that ldap3 raised while reading the
     directory's response becomes :class:`LdapUndecodableError` (its docstring says who reads it
@@ -1140,11 +1205,9 @@ def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
     so the session reconciler reads it as referred and alerts (BACKLOG #2538).
     :func:`_is_bind_referral` says how it is told apart, again by origin.
 
-    ``close`` closes the socket the failed read was on, where nothing else will. Only the service
-    account's bind passes it: its ``auto_bind`` runs inside ldap3's ``Connection`` constructor, so
-    when it raises no caller holds the connection to unbind. A search does not need it (BACKLOG
-    #3010): every caller holding a searched connection unbinds it when its block ends, through
-    ``_service_session`` (BACKLOG #3017).
+    It closes no socket. Every caller holds the connection it called on and closes it when its
+    block ends: the service bind's caller on any failure (``_service_conn``), and every other
+    through :func:`_released` (BACKLOG #3010, #3017).
     """
     import ldap3
 
@@ -1153,12 +1216,8 @@ def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
     except ldap3.core.exceptions.LDAPException:
         raise
     except _DECODE_FAULTS as exc:
-        connection = _reading_connection(exc)
-        if connection is None:
+        if _reading_connection(exc) is None:
             raise
-        if close:
-            # The refusal below is the answer either way.
-            _close_without_sending(connection, "after an undecodable response")
         if _is_bind_referral(exc):
             raise _referred_bind(operation) from exc
         raise _undecodable(operation, exc) from exc
@@ -1452,7 +1511,7 @@ def _paging_refused(
         f"({item})."
     )
     _warn_once(f"unanswered: {operation}: {case}", "%s Reported once.", message)
-    return LdapUnansweredError(message, code_name=case)
+    return LdapUnansweredError(message, code_name=case, operation=operation)
 
 
 #: What opening an ldap3 socket can raise that is not an ldap3 error (BACKLOG #2566). ldap3's
@@ -1477,20 +1536,19 @@ def _socket_faults_as_ldap_error() -> Iterator[None]:
     Every caller maps ``LdapError`` to a directory failure, and the sign-in callers write
     ``auth.login_error``, so an unmapped fault would skip both and surface as an unhandled error.
 
-    **It wraps only the ldap3 calls that OPEN a socket**: the service account's ``auto_bind``
-    construction and the explicit binds. An operation on an open socket needs none, because ldap3
-    already re-raises a ``socket.error`` there as its own ``LDAPSocket*Error``. A wider wrap would
-    catch the engine's own defects, such as a ``TypeError`` from a bad keyword or from parsing an
-    answer. Mapped, that reads as a directory outage, which the session reconciler holds on and logs
-    at debug level, so the defect would hide.
+    **It wraps only the ldap3 calls that OPEN a socket**: the binds, the service account's
+    included. An operation on an open socket needs none, because ldap3 already re-raises a
+    ``socket.error`` there as its own ``LDAPSocket*Error``. A wider wrap would catch the engine's
+    own defects, such as a ``TypeError`` from a bad keyword or from parsing an answer. Mapped, that
+    reads as a directory outage, which the session reconciler holds on and logs at debug level, so
+    the defect would hide.
 
-    Two wraps are wider than the open, and each says why. The ``auto_bind`` construction checks its
-    keywords and opens in one call, so a renamed ldap3 keyword there would map; the real-ldap3 arms
-    of ``tests/test_ldap_referrals.py`` build that connection, so one would fail there first. And
-    ``authenticate`` wraps the whole decoy bind, which must neither map nor swallow by itself.
-    Its release is inside that wrap and the real bind's is not, so an unbind fault of one of these
-    types that is not an ldap3 error still maps on the decoy branch alone (#3830 item 9); an ldap3
-    one :func:`_released` logs on both.
+    One wrap is wider than the open, and says why: ``authenticate`` wraps the whole decoy bind,
+    which must neither map nor swallow by itself. Its release is inside that wrap and the real
+    bind's is not, so an unbind fault of one of these types that is not an ldap3 error still maps
+    on the decoy branch alone (#3830 item 9); an ldap3 one :func:`_released` logs on both. The
+    service connection is built outside its wrap, so a renamed ldap3 keyword there stays an
+    engine defect (BACKLOG #3017 L5).
 
     A response ldap3 could not decode is not a socket fault: each bind also runs inside
     :func:`_ldap3_call`, nested inside this wrap, which refuses it first.
@@ -1518,19 +1576,31 @@ def _ldap3_failed(exc: BaseException) -> LdapError:
 
     BACKLOG #3017. The text is fixed and names ldap3's error type, never its text. That text can
     carry each address the engine tried and the error at each (``LDAPSocketOpenError``), or the
-    directory's diagnostic message, and the sign-in callers write this text into
-    ``auth.login_error``. ``check-privileges`` prints the same text. It differs from
+    directory's diagnostic message. ``check-privileges`` prints this text; the sign-in callers'
+    ``auth.login_error`` row holds no text (``AuthService``'s
+    ``_directory_error_detail``, BACKLOG #3196). It differs from
     :func:`_socket_faults_as_ldap_error`'s text, so a reader can tell an ldap3 error from a bare
     socket fault.
 
-    **The cause's type is named too.** ldap3 builds a socket error as a class that also
-    subclasses the error the interpreter raised (``communication_exception_factory``), such as
-    ``SSLCertVerificationError`` or ``ConnectionRefusedError``. Its name tells a pinned-CA mismatch
-    from a refused port without quoting anything. The full text goes to a DEBUG traceback only.
+    **The cause's type is named too** (:func:`interpreter_error`). The full text goes to a DEBUG
+    traceback only.
     """
     logger.debug("AD directory call failed", exc_info=exc)
-    name = type(exc).__name__
-    cause = next(
+    cause = interpreter_error(exc)
+    return LdapError(
+        f"AD directory call failed: ldap3 raised {type(exc).__name__}"
+        + (f" ({cause})" if cause else "")
+    )
+
+
+def interpreter_error(exc: BaseException) -> str | None:
+    """The name of the interpreter error an ldap3 error merges in, or ``None``.
+
+    ldap3 builds a socket error as a class that also subclasses the error the interpreter raised
+    (``communication_exception_factory``), such as ``SSLCertVerificationError`` or
+    ``ConnectionRefusedError``. Its name tells a pinned-CA mismatch from a refused port without
+    quoting anything."""
+    return next(
         (
             kind.__name__
             for kind in type(exc).__mro__
@@ -1539,13 +1609,6 @@ def _ldap3_failed(exc: BaseException) -> LdapError:
         ),
         None,
     )
-    return LdapError(
-        f"AD directory call failed: ldap3 raised {name}" + (f" ({cause})" if cause else "")
-    )
-
-
-#: The ldap3 module and method whose frame raises ``LDAPBindError`` for a refused ``auto_bind``.
-_AUTO_BIND_FRAME = ("ldap3.core.connection", "_do_auto_bind")
 
 
 def _innermost_frame(exc: BaseException) -> FrameType | None:
@@ -1558,36 +1621,21 @@ def _innermost_frame(exc: BaseException) -> FrameType | None:
     return tb.tb_frame
 
 
-def _auto_binding_connection(exc: BaseException) -> Any:
-    """The connection whose ``auto_bind`` raised ``exc``, or ``None``.
+def _refuse_service_bind(conn: Any) -> NoReturn:
+    """Raise the refusal of a service-account bind that ``conn.bind()`` answered ``False``.
 
-    ldap3 raises a refused ``auto_bind`` from inside the ``Connection`` constructor, so no caller
-    holds the connection whose result says why. Decided by ORIGIN, as :func:`_reading_connection`
-    is: the innermost frame is ldap3's ``_do_auto_bind``, whose ``self`` is that connection. A test
-    pins the ldap3 names this reads.
+    BACKLOG #3017. Read on as ldap3's own refusal, a referral was a directory failure, which the
+    session reconciler reads as an outage. The refused connection's result goes through
+    :func:`_refuse_unanswered`, as a search's does: a referral is refused by name, so the
+    reconciler reads it as referred and alerts (BACKLOG #2538), and any other code is named with
+    ldap3's name for it and the hint for it, never the directory's diagnostic message, so an
+    operator still sees ``invalidCredentials`` for a wrong service password. A bind response
+    carrying the referral's hosts never reaches here: ldap3 cannot decode one, and
+    :func:`_ldap3_call` refuses it first. A result that is not a dict, or one that reads success
+    although the bind did not bind, still refuses, naming no code.
     """
-    frame = _innermost_frame(exc)
-    if frame is None or (frame.f_globals.get("__name__"), frame.f_code.co_name) != _AUTO_BIND_FRAME:
-        return None
-    return frame.f_locals.get("self")
-
-
-def _refuse_service_bind(exc: BaseException) -> NoReturn:
-    """Raise the refusal of a service-account ``auto_bind`` that ldap3 raised ``exc`` for.
-
-    BACKLOG #3017. ldap3 raises a plain ``LDAPBindError`` for every refused ``auto_bind``, so a
-    referral read as a directory failure, which the session reconciler reads as an outage. The
-    refused connection's result goes through :func:`_refuse_unanswered`, as a search's does: a
-    referral is refused by name, so the reconciler reads it as referred and alerts (BACKLOG
-    #2538), and any other code is named with ldap3's name for it and the hint for it, never the
-    directory's diagnostic message, so an operator still sees ``invalidCredentials`` for a wrong
-    service password. A bind response carrying the referral's hosts never reaches here: ldap3
-    cannot decode one, and :func:`_ldap3_call` refuses it first.
-    """
-    conn = _auto_binding_connection(exc)
-    if conn is not None:
-        _refuse_unanswered(conn, "service-account bind")
-    raise LdapError("AD refused the service-account bind; ldap3 raised LDAPBindError") from exc
+    _refuse_unanswered(conn, "service-account bind", bind=True)
+    raise LdapError("AD refused the service-account bind, with no refusing result code to name")
 
 
 @dataclass(slots=True)
@@ -1760,34 +1808,41 @@ class LdapAuthenticator:
         # ASVS 13.1.3: receive_timeout bounds every LDAP RESPONSE read on this connection (the bind and
         # each search). ldap3's default is None — an unresponsive DC would otherwise pin the thread-pool
         # worker AuthService dispatches this call on, since that dispatch has no asyncio.wait_for.
-        # auto_bind opens the socket here, so a socket fault surfaces here (BACKLOG #2566). The
-        # Server is built outside the wrap to keep engine code out of it. The timeout conversion
-        # stays inline, because tests/test_ldap_timeouts.py checks for that call at this site.
-        server = self._server()
+        # The bind opens the socket, so a socket fault surfaces there (BACKLOG #2566). The timeout
+        # conversion stays inline, because tests/test_ldap_timeouts.py checks for that call at
+        # this site.
+        #
+        # BACKLOG #3017 (L4, L5): built unbound and bound explicitly, not with auto_bind. ldap3
+        # binds an auto_bind connection inside its constructor, so when that bind raised after the
+        # socket opened, such as on a password SASLprep refuses, no caller held the connection to
+        # close, and the socket stayed open until the object was collected. Here the engine holds
+        # the connection before any socket opens, and closes it on every way out but a bound one.
+        conn = ldap3.Connection(
+            self._server(),
+            user=self._s.ad_bind_dn,
+            password=self._bind_password,  # resolved once in __init__ (env or a provider)
+            authentication=ldap3.SIMPLE,
+            receive_timeout=_ldap3_receive_timeout(self._s.ad_receive_timeout),
+            auto_referrals=False,  # BACKLOG #2530: see _refuse_referral
+        )
         try:
-            with (
-                _socket_faults_as_ldap_error(),
-                _ldap3_call("service-account bind", close=True),
-            ):
-                return ldap3.Connection(
-                    server,
-                    user=self._s.ad_bind_dn,
-                    password=self._bind_password,  # resolved once in __init__ (env or a provider)
-                    authentication=ldap3.SIMPLE,
-                    auto_bind=True,
-                    receive_timeout=_ldap3_receive_timeout(self._s.ad_receive_timeout),
-                    auto_referrals=False,  # BACKLOG #2530: see _refuse_referral
-                )
-        except ldap3.core.exceptions.LDAPBindError as exc:
-            # ldap3 unbound the refused connection before raising, so nothing is left open.
-            _refuse_service_bind(exc)
+            with _socket_faults_as_ldap_error(), _ldap3_call("service-account bind"):
+                bound = conn.bind()
+            if not bound:
+                _refuse_service_bind(conn)
+        except BaseException:
+            # The error raised is the answer either way, and the stream may be out of step.
+            _close_without_sending(conn, "after a failed service-account bind")
+            raise
+        return conn
 
     @contextlib.contextmanager
     def _service_session(self) -> Iterator[Any]:
         """The service-account connection, unbound when the block ends, however it ends.
 
         BACKLOG #3017. Not ldap3's own ``with``: its ``Connection.__exit__`` (ldap3 2.9.1) unbinds
-        only a connection that was not bound on entry, and ``auto_bind`` binds every one here, so
+        only a connection that was not bound on entry, and :meth:`_service_conn` binds every one
+        before the block, so
         the session stayed open and bound until the object was collected, after an undecodable
         response on a stream that may be out of step too. It also reopens a connection that was
         open on entry and closed on exit, so an unbind inside it would cost one more connect.

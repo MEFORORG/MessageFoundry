@@ -1459,7 +1459,7 @@ requires-dist = [
     { name = "pytest-rerunfailures", marker = "extra == 'dev'", specifier = ">=16.0" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.3.1" },
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.6.1" },
-    { name = "pyx12", marker = "extra == 'x12'", specifier = ">=4.0.0" },
+    { name = "pyx12", marker = "extra == 'x12'", specifier = ">=4.0.1" },
     { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0.3" },
     { name = "requests", marker = "extra == 'vault'", specifier = ">=2.32.2" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4,<0.16" },
@@ -2264,14 +2264,14 @@ wheels = [
 
 [[package]]
 name = "pytest-asyncio"
-version = "1.4.1"
+version = "1.4.1.post1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pytest" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f8/9a/887535e477847f5159377ab35303923644840b13c0ca03c0a467f84d4680/pytest_asyncio-1.4.1.tar.gz", hash = "sha256:e8266eb094e5ee9ffdb2068c9836f33e209ea77a970eb846933d416b5602669b", size = 145237, upload-time = "2026-10-25T21:05:37.135Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/73/7f/c60a4338420b33453d4f814ac0c930abd399f162b9bdd21af4b9e363037f/pytest_asyncio-1.4.1.post1.tar.gz", hash = "sha256:f582d9ea4a1c082195abe8bd29a1fe106aeb1cd435e3dad2d3bc2749935c36a2", size = 145360, upload-time = "2026-11-01T18:26:03.732Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/46/d7/cd9e2708afdbf059658adaf08bdb0792ca52489871051d6ce7d498b51277/pytest_asyncio-1.4.1-py3-none-any.whl", hash = "sha256:507afa78ec77c6661164ef1a2368bc7820383fd1a14b2a7f813de8b5a92949cc", size = 17061, upload-time = "2026-10-25T21:05:35.473Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/de/adbc7578959cfab07e5e7c05cf6d54224a51e7667ea2c07458b6bc571e75/pytest_asyncio-1.4.1.post1-py3-none-any.whl", hash = "sha256:0755e488cc0a2b9bd2eab7292cc6390d4cbb8390f1020745647bae5a708e0165", size = 17140, upload-time = "2026-11-01T18:26:02.168Z" },
 ]
 
 [[package]]
@@ -2340,14 +2340,14 @@ wheels = [
 
 [[package]]
 name = "pyx12"
-version = "4.0.0"
+version = "4.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "defusedxml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1b/7f/5faae65f7b41a1ab1d26fc8753a24635f0961609eb48ac1eab9d9a169497/pyx12-4.0.0.tar.gz", hash = "sha256:d45c572e19971f7f67d65227bc7da158b01179ece2947a7038412dd935c59660", size = 540895, upload-time = "2026-05-05T22:34:08.73Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/dc/d5/f6c55537f397bb721d0da5a8eba6fb68e27f42dba8afd640a68282cd9789/pyx12-4.0.1.tar.gz", hash = "sha256:d7fbe4e367be6405c724f7109306bf46f319557406035ea2cac2c403cc4f6296", size = 551910, upload-time = "2026-10-31T21:24:44.039Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/84/6a/f8c18811c912f2a287f684f731a1031a24490f6d780e95ee17e5d601baf7/pyx12-4.0.0-py3-none-any.whl", hash = "sha256:8e983b5a3a76a307bea3be9203fb32f0ea1580e13cb66ed60d8b028dc015d1cc", size = 633962, upload-time = "2026-05-05T22:34:06.808Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/d2/1dd9b5071cfc11bcabb9de8de3504e9303afe0c4538fef61a05ac3a93b56/pyx12-4.0.1-py3-none-any.whl", hash = "sha256:30241f4427f0db03675df55edba5b02cc38998114b34c03bf9bbe1bd92ec3314", size = 644538, upload-time = "2026-10-31T21:24:42.42Z" },
 ]
 
 [[package]]

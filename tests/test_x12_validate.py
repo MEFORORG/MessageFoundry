@@ -25,6 +25,7 @@ from messagefoundry.parsing.x12 import (  # noqa: E402 - after importorskip
     X12ValidationResult,
     validate,
 )
+from messagefoundry.parsing.x12._deps import load_x12_code_resolver  # noqa: E402
 
 _ISA = (
     "ISA*00*          *00*          *ZZ*SENDER         *ZZ*RECEIVER       "
@@ -49,10 +50,9 @@ _ISA_270 = (
 _GS_270 = "GS*HS*SENDERAPP*RECVAPP*20060501*1200*1*X*004010X092A1~"
 
 
-def test_valid_conformant_interchange_validates_true() -> None:
-    # A conformant 270 must validate with valid=True and zero surfaced errors (the positive case the
-    # existing suite lacked). The negative-ack side is exercised by the conformance-error test above.
-    msg = (
+def _conformant_270(*, dob: str = "19430519", iea: str = "IEA*1*000000001~") -> str:
+    """The conformant 004010 270 eligibility inquiry, with slots left open to break exactly one thing."""
+    return (
         _ISA_270 + _GS_270 + "ST*270*0001~"
         "BHT*0022*13*10001234*20060501*1319~"
         "HL*1**20*1~"
@@ -62,17 +62,39 @@ def test_valid_conformant_interchange_validates_true() -> None:
         "HL*3*2*22*0~"
         "TRN*1*93175-012547*9877281234~"
         "NM1*IL*1*SMITH*ROBERT****MI*11122333301~"
-        "DMG*D8*19430519*M~"
+        f"DMG*D8*{dob}*M~"
         "DTP*307*D8*20060101~"
         "EQ*30~"
-        "SE*13*0001~"
-        "GE*1*1~"
-        "IEA*1*000000001~"
+        "SE*13*0001~GE*1*1~" + iea
     )
-    result = validate(msg)
+
+
+def test_valid_conformant_interchange_validates_true() -> None:
+    # A conformant 270 must validate with valid=True and zero surfaced errors (the positive case the
+    # existing suite lacked). The negative-ack side is exercised by the conformance-error test above.
+    result = validate(_conformant_270())
     assert isinstance(result, X12ValidationResult)
     assert result.valid is True
     assert result.errors == ()
+
+
+def test_element_error_code_is_the_x12_number() -> None:
+    # pyx12 4.0.1 moved the X12 number from err_cde (now a pyx12 name such as
+    # "ELE_8_invalid_date_range") to x12_code; ``code`` must stay the X12 number (data element error 8,
+    # "Invalid Date").
+    result = validate(_conformant_270(dob="19431399"))
+    assert result.valid is False
+    element = [e for e in result.errors if e.element_position is not None]
+    assert [(e.segment_id, e.element_position, e.code) for e in element] == [("DMG", 2, "8")]
+    assert all(e.code.isdigit() for e in result.errors)
+
+
+def test_envelope_error_code_is_the_x12_number() -> None:
+    # IEA01 counts two groups but the interchange holds one: TA1 note code 021 ("Invalid Number of
+    # Included Groups Value"), not pyx12's "ISA_021_invalid_group_count".
+    result = validate(_conformant_270(iea="IEA*2*000000001~"))
+    assert result.valid is False
+    assert [(e.message, e.code) for e in result.errors] == [("interchange error", "021")]
 
 
 def test_validate_reports_conformance_errors_and_emits_999() -> None:
@@ -284,3 +306,152 @@ def test_segment_error_is_frozen_dataclass() -> None:
     err = X12SegmentError(code="3", message="segment NM1: error 3", segment_id="NM1")
     with pytest.raises(Exception):  # noqa: B017
         err.code = "9"  # type: ignore[misc]
+
+
+def test_codes_follow_the_ack_version_and_fall_back_to_the_pyx12_name() -> None:
+    # pyx12's own x12_code field is 999-first whatever the version; a pass that generated a 997 (a
+    # 004010 GS08) reports a not-used segment as AK304 "2", not the 999's IK304 "I4". A raw X12 number
+    # passes through, and a name pyx12 maps to no X12 code (an HL count mismatch) stands in as itself.
+    def report(vriic: str) -> dict[str, object]:
+        seg = {"seg_id": "REF", "errors": [{"err_cde": "SEG_2_segment_not_used"}], "elements": []}
+        hl = {"seg_id": "HL", "errors": [{"err_cde": "SEG_8_hl_count_mismatch"}], "elements": []}
+        txn = {"errors": [], "segments": [seg, hl]}
+        group = {"vriic": vriic, "errors": [{"err_cde": "5"}], "transactions": [txn]}
+        return {"interchanges": [{"errors": [], "groups": [group]}]}
+
+    resolve = load_x12_code_resolver()
+    flatten = _X12_VALIDATE._flatten_errors
+    codes_4010 = [e.code for e in flatten(report("004010X092A1"), resolve, prefer_5010=False)]
+    codes_5010 = [e.code for e in flatten(report("005010X222A1"), resolve, prefer_5010=True)]
+    assert codes_4010 == ["5", "2", "SEG_8_hl_count_mismatch"]
+    assert codes_5010 == ["5", "I4", "SEG_8_hl_count_mismatch"]
+
+
+def test_validate_resolves_codes_against_the_ack_it_generated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The 004010 270 is acked with a 997, so its codes resolve AK-first; the 005010 837 gets a 999.
+    real = load_x12_code_resolver()
+    seen: list[bool] = []
+
+    def recording(err_cde: str, prefer_5010: bool = True) -> str | None:
+        seen.append(prefer_5010)
+        return real(err_cde, prefer_5010=prefer_5010)
+
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_code_resolver", lambda: recording)
+    result = validate(_conformant_270(dob="19431399"))
+    assert result.ack_transaction == "997" and seen and not any(seen)
+    seen.clear()
+    result = validate(_interchange("ST*837*0001*005010X222A1~", "SE*2*0001~"))
+    assert result.ack_transaction == "999" and seen and all(seen)
+
+
+def test_a_997_whose_sender_text_holds_999_is_still_a_997(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The 997 echoes GS03 "TEST" then GS02 "999APP", so its GS line holds the text "ST*999"; only the ST
+    # segment's own ST01 names the ack.
+    msg = _conformant_270(dob="19431399").replace("GS*HS*SENDERAPP*RECVAPP*", "GS*HS*999APP*TEST*")
+    real = load_x12_code_resolver()
+    seen: list[bool] = []
+
+    def recording(err_cde: str, prefer_5010: bool = True) -> str | None:
+        seen.append(prefer_5010)
+        return real(err_cde, prefer_5010=prefer_5010)
+
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_code_resolver", lambda: recording)
+    result = validate(msg)
+    assert result.ack is not None and "ST*999" in result.ack
+    assert result.ack_transaction == "997"
+    assert seen and not any(seen)
+
+
+def test_a_4010_pass_with_no_ack_reports_the_4010_codes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An inbound 004010 997 (GS01 FA) gets no ack, so the code list comes from the group's GS08. A
+    # not-used segment is spliced into pyx12's real report: 004010 says "2", only the 999 says "I4".
+    isa = _ISA_270
+    gs = "GS*FA*SENDERAPP*RECVAPP*20060501*1200*1*X*004010~"
+    msg = isa + gs + "ST*997*0001~AK1*HS*1~AK9*A*1*1*1~SE*4*0001~GE*1*1~IEA*1*000000001~"
+    real_loads = _X12_VALIDATE.json_loads_or_refusal
+
+    def splice(raw: str) -> tuple[object, object]:
+        report, refused = real_loads(raw)
+        txn = report["interchanges"][0]["groups"][0]["transactions"][0]
+        bad = {"seg_id": "REF", "errors": [{"err_cde": "SEG_2_segment_not_used"}], "elements": []}
+        txn["segments"].append(bad)
+        return report, refused
+
+    monkeypatch.setattr(_X12_VALIDATE, "json_loads_or_refusal", splice)
+    result = validate(msg)
+    assert result.ack is None and result.ack_transaction is None
+    assert [e.code for e in result.errors if e.segment_id == "REF"] == ["2"]
+
+
+def test_sender_separators_cannot_forge_the_acks_st_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With "|" and newline as the sender's separators, a GS03 of "X~ST" and a GS02 of "999" put a
+    # whole "~ST*999" segment boundary into the 997's GS line, ahead of its real ST*997.
+    msg = _conformant_270(dob="19431399").replace("GS*HS*SENDERAPP*RECVAPP*", "GS*HS*999*X#ST*")
+    msg = msg.replace("*", "|").replace("~", chr(10)).replace("#", "~")
+    real = load_x12_code_resolver()
+    seen: list[bool] = []
+
+    def recording(err_cde: str, prefer_5010: bool = True) -> str | None:
+        seen.append(prefer_5010)
+        return real(err_cde, prefer_5010=prefer_5010)
+
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_code_resolver", lambda: recording)
+    result = validate(msg)
+    assert result.ack is not None and "~ST*999" in result.ack and "ST*997" in result.ack
+    assert result.ack_transaction == "997"
+    assert seen and not any(seen)
+
+
+def test_a_997_pass_never_reports_a_999_only_code() -> None:
+    # NM110 is not used in this 004010 270. pyx12 maps that error to the 999's I10 alone, with no 997
+    # AK code, so on a 997 pass the code is pyx12's own name rather than a code no 997 carries.
+    result = validate(_conformant_270().replace("MI*11122333301~", "MI*11122333301*X~"))
+    assert result.ack_transaction == "997"
+    element = [
+        (e.segment_id, e.element_position, e.code) for e in result.errors if e.element_position
+    ]
+    assert element == [("NM1", 10, "ELE_I10_NOT_USED")]
+    import pyx12.error_codes
+
+    ik_only = {s.ik_code for s in pyx12.error_codes.ERROR_CODES.values() if s.ak_code is None}
+    assert not [e.code for e in result.errors if e.code in ik_only]
+
+
+def test_a_fragment_from_an_ack_writer_that_failed_is_not_returned(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # An ST with no ST02 makes pyx12's 997 writer raise after its AK1, and pyx12 swallows the error;
+    # the fragment it leaves has no closing IEA, so it is no 997 and is not returned to send.
+    with caplog.at_level(logging.WARNING, logger=_X12_VALIDATE.__name__):
+        result = validate(_conformant_270().replace("ST*270*0001~", "ST*270~"))
+    assert result.ack is None
+    assert result.ack_transaction is None
+    assert "before the closing IEA" in caplog.text
+
+
+def test_sender_text_cannot_forge_the_closing_iea_of_a_fragment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With "|" and newline as the sender's separators, a GS06 of "1~IEA*1*000000001" is echoed into
+    # the fragment's AK102, so the fragment's text ends in an IEA segment pyx12 never wrote.
+    pipes = _conformant_270().replace("ST*270*0001~", "ST*270~").replace("*", "|")
+    pipes = pipes.replace("|1200|1|X|", "|1200|1#IEA*1*000000001|X|")
+    pipes = pipes.replace("GE|1|1~", "GE|1|1#IEA*1*000000001~")
+    msg = pipes.replace("~", chr(10)).replace("#", "~")
+    buffers: list[io.StringIO] = []
+    real_buffer = _X12_VALIDATE._AckBuffer
+
+    def keep() -> io.StringIO:
+        buffers.append(real_buffer())
+        return buffers[-1]
+
+    monkeypatch.setattr(_X12_VALIDATE, "_AckBuffer", keep)
+    result = validate(msg)
+    # Positive control: the fragment's text really does end in the forged IEA.
+    assert buffers[0].getvalue().rstrip().endswith("AK1*HS*1~IEA*1*000000001~")
+    assert result.ack is None
+    assert result.ack_transaction is None
