@@ -2943,7 +2943,8 @@ async def test_an_executor_fault_in_a_reload_build_is_never_an_invalid_config(
     engine: Engine, tmp_path: Path, cause: str
 ) -> None:
     """A reload whose connector builds the executor fails, by a broken pool, builds them on the
-    loop instead, since the pool never began them, and succeeds with no failed row: nothing is
+    loop instead, since the pool never began them, and succeeds with no failed row (the fake
+    leaves the build check's own hop to the real pool, which has no such fallback): nothing is
     wrong with the config. The build that meets it first is the restart of the running inbound,
     which every reload makes through _build_off_loop before it rebuilds an outbound. Red (Lander
     hold 6703767989): _build_off_loop raised a plain WiringError, which the route answered 422
@@ -3006,11 +3007,12 @@ async def test_a_convergence_reload_records_an_executor_fault_as_a_reload_error(
 async def test_a_reload_executor_fault_leaves_the_previous_inbounds_running(
     engine: Engine,
 ) -> None:
-    """The pool stays broken for the whole reload. Every build the pool never began runs on the
-    loop, so the reload goes through and intake is up. Red (Lander hold 6704342060, item 1): the
-    rollback built through the same pool, so IB_T_ADT failed to start and intake was left down;
-    then (Lander hold 6730392844, item 3) the reload failed where main, building on the loop,
-    succeeded."""
+    """The pool fails every connector build for the whole reload, rollback included; the fake
+    leaves the build check's own hop to the real pool. Every connector build the pool never began
+    runs on the loop, so the reload goes through and intake is up. Red (Lander hold 6704342060,
+    item 1): the rollback built through the same pool, so IB_T_ADT failed to start and intake was
+    left down; then (Lander hold 6730392844, item 3) the reload failed where main, building on the
+    loop, succeeded."""
     from concurrent.futures.thread import BrokenThreadPool
 
     service = await _service(engine)

@@ -12595,10 +12595,11 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
     pool, or no thread it could start) or cancelled or failed it while queued, runs on the loop
     instead, as every build did before builds left the loop, with a WARNING naming the cause. So
     an executor fault at this hop never leaves a connector unbuilt (Lander hold 6730392844, item
-    3); another worker-thread hop, such as a lane's anchor check, has no such fallback. ``run()`` never began there, so nothing is built twice. A build the pool
-    queued before it failed to start a thread is cancelled first, or, if a worker already took it,
-    awaited, and its own result or refusal is the answer. A build that began and then failed
-    raises its own error."""
+    3). ``run()`` never began in those cases, so nothing is built twice. Another worker-thread
+    hop, at least a reload's build check and a lane's anchor check, has no such fallback. A build
+    the pool queued before it failed to start a thread is cancelled first, or, if a worker already
+    took it, awaited, and its own result or refusal is the answer. A build that began and then
+    failed raises its own error."""
 
     def stamped() -> T:
         with active_hop_posture(posture):

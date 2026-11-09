@@ -734,7 +734,8 @@ def test_closing_step_4_a_folder_on_an_unreached_share_is_refused(
 
 
 def _not_found_at_open(monkeypatch: pytest.MonkeyPatch, folder: Path, winerror: int | None) -> None:
-    """Make the open of ``folder`` raise ``FileNotFoundError`` with ``winerror``, none if ``None``."""
+    """Make the open of ``folder`` raise ``FileNotFoundError`` with ``winerror`` (none if
+    ``None``)."""
     real = os.scandir
 
     def not_found(path: str) -> Any:

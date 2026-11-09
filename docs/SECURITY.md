@@ -2578,13 +2578,14 @@ written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mi
 reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline, a dry run
 included, and released, any error the reload raises that none of the other reasons names is
 `reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
-raised by a runner start or swap. An executor fault is named by its own type, for example
-`BrokenThreadPool`, also when it reaches the reload wrapped as `WiringBuildFault`, which is then
-not the type named. Either way the row never carries the error's text. A connector build the
-executor never began is built on the event loop instead, with a WARNING in the engine log, so it
-writes no such row. A `FileNotFoundError` there is never `not_found`. That reason is
+raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`. That reason is
 for the config directory itself: at least one that is missing, and one moved away between the
-reload's target check and its read of the directory. The row does not claim the old graph is still serving: at least a
+reload's target check and its read of the directory. An executor fault is named by its own type,
+for example `BrokenThreadPool`, at least when the reload's build check meets it, and so is one
+wrapped as `WiringBuildFault`, which names its cause's type. Either way the row never carries the
+error's text. A connector build itself that the executor never began is built on the event loop
+instead, with a WARNING in the engine log, and fails nothing; the build check has no such
+fallback. The row does not claim the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
 fails, which is logged. A cluster convergence reload records such a fault with reason
