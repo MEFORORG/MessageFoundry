@@ -329,8 +329,9 @@ async def test_an_in_body_socket_that_never_calls_its_gate_is_refused_at_accept(
     assert outcome.send_error is not None, "a frame after the refused accept was not refused"
     lines = [r.getMessage() for r in caplog.records if "refused accept" in r.getMessage()]
     assert lines == [
-        "refused accept on WebSocket route /zz/no-gate: no gate admitted the caller before accept() "
-        "(1 refusals since the last log line, 1 in all)"
+        "refused accept on WebSocket route /zz/no-gate: the latest recorded gate answer was a"
+        " refusal, or none was recorded and the route has no gate dependency or public_route mark"
+        " (1 refusals since the last log line, 1 in all)"
     ], lines
 
 
@@ -486,8 +487,8 @@ async def test_the_refusal_gets_the_header_floors_403(engine: Engine) -> None:
 async def test_a_recorded_refusal_stands_on_a_public_socket(
     engine: Engine, path: str, roles: tuple[Role, ...] | None
 ) -> None:
-    """A recorded refusal refuses accept on every socket, a public one included, whether the gate
-    ran in the body or as a dependency that returned after recording. The admitting gate is the
+    """The latest recorded refusal refuses accept on a public socket too, whether the gate ran in
+    the body or as a dependency that returned after recording. The admitting gate is the
     control: the same socket is accepted when the gate admits the caller."""
     service = await _service(engine)
     token = None if roles is None else await _token(service, "caller", *roles)

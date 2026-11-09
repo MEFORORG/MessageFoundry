@@ -1003,8 +1003,8 @@ def ws_accept_allowed(scope: Mapping[str, Any]) -> bool:
     """Whether :class:`WebSocketAcceptGate` lets this WebSocket scope's ``accept`` through."""
     answer = scope.get(_WS_GATE_ADMITTED_KEY)
     if answer is not None:
-        # A recorded answer stands on every socket, a public or dependency-gated one included: a
-        # refusal the body ignored is refused whatever the route declares.
+        # The latest recorded answer decides on every socket, a public or dependency-gated one
+        # included.
         return answer is True
     route = scope.get("route")
     if route is not None:
@@ -1027,13 +1027,15 @@ def _record_refused_accept(scope: Scope) -> None:
     routes = getattr(scope.get("app"), "routes", None) or ()
     _count_and_log(
         _tally_on(route, _ACCEPT_REFUSALS_ATTR, _UNKNOWN_ROUTE_ACCEPT_REFUSALS),
-        "refused accept on WebSocket route %s: no gate admitted the caller before accept()",
+        "refused accept on WebSocket route %s: the latest recorded gate answer was a refusal, or"
+        " none was recorded and the route has no gate dependency or public_route mark",
         lambda: _logged_key(route, routes),
     )
 
 
 class WebSocketAcceptGate:
-    """Refuse ``websocket.accept`` on a WebSocket no gate admitted, as the note above defines it.
+    """Refuse ``websocket.accept`` on a WebSocket whose latest recorded gate answer is a refusal, or
+    with none and neither a gate dependency nor a ``public_route`` mark, as the note above says.
 
     Pure ASGI, wrapping ``send`` only. The refusal is a policy-violation close sent in place of the
     accept, or of a denial response of any status, so the handshake fails exactly as a gate's own
