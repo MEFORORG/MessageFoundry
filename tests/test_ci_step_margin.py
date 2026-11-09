@@ -914,38 +914,48 @@ def bash(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return Path(require_bash(tmp_path_factory.mktemp("resolve-bash")))
 
 
+#: Every event the engine margin check can run under. The softening branched on two of them; the
+#: other three are here so a branch added on any event reds, not only on those two.
+_MARGIN_EVENTS = ("pull_request", "merge_group", "push", "schedule", "workflow_dispatch")
+
+
 @pytest.mark.parametrize(
-    ("event", "script_rcs", "step_rc", "warns"),
+    ("script_rcs", "step_rc"),
     [
-        ("pull_request", "0", 0, False),
-        ("pull_request", "1 0", 0, True),  # under 1.30x, at or over 1.20x: a warning
-        ("pull_request", "1 1", 1, False),  # under 1.20x blocks before enqueue
-        ("pull_request", "1 2", 2, False),  # the second call could not measure: never a pass
-        ("pull_request", "2", 2, False),  # the first could not, so there is no second opinion
-        ("merge_group", "1", 0, True),  # a warning in the queue, with no second floor
-        ("merge_group", "2", 2, False),  # a gate that could not measure still fails, queue or not
-        ("merge_group", "0", 0, False),
-        ("push", "1", 1, False),  # 1.30x still blocks, and nothing asks about 1.20x
-        ("push", "2", 2, False),
-        ("schedule", "1", 1, False),
-        ("workflow_dispatch", "1", 1, False),
+        ("0", 0),
+        # LOW against 1.30x and OK against the retired 1.20x pull_request floor: the band the
+        # softening passed. A second call, if one were made, would answer 0.
+        ("1 0", 1),
+        ("2", 2),  # the script could not measure: never a pass
     ],
 )
-def test_the_engine_margin_check_softens_a_low_margin_only_by_event(
-    bash: Path, tmp_path: Path, event: str, script_rcs: str, step_rc: int, warns: bool
+@pytest.mark.parametrize("event", _MARGIN_EVENTS)
+def test_the_engine_margin_check_reds_a_low_margin_on_every_event(
+    bash: Path,
+    tmp_path: Path,
+    event: str,
+    script_rcs: str,
+    step_rc: int,
 ) -> None:
-    """The owner ruling of 2026-10-29 and the 1.20x floor decided under the delegation of 2026-10-30
-    (both beside the step in ci.yml), pinned until #3515's re-measure reverts them. Runs the step's
-    REAL run body under the runner's own `bash -eo pipefail`, with `python` stubbed to one exit code
-    per call, so the pin is on behaviour rather than on a spelling.
+    """BACKLOG #5247 item 9: the 1.30x floor blocks on every event again.
 
-    Falsified by widening the merge_group branch to `"$rc" -ne 0`, by deleting the `::warning` line,
-    by widening the pull_request branch to every event, by passing a second-call exit 2, and by
-    dropping `--min-margin 1.20`: RED each time. Restored.
+    The owner ruling of 2026-10-29 made a LOW margin a warning in merge_group, and the decision of
+    2026-10-30 made pull_request warn down to 1.20x, both until the cap was re-measured. The shard
+    re-measure recorded in scripts/ci/step_margin_baseline.toml put every leg far over 1.30x, and
+    the revert landed with it. This runs the `test` job's REAL run body under the runner's own
+    `bash -eo pipefail`, with `python` stubbed to one exit code per call, so the pin is on behaviour
+    rather than on a spelling: the step exits with the script's own answer, makes exactly one call,
+    passes no second floor, and raises no warning of its own. The event is set both as the step's
+    old `EVENT_NAME` and as the runner's own `GITHUB_EVENT_NAME`, so a branch on either differs by
+    event. `test-shard2` is not run separately: tests/test_ci_engine_suite_shards.py holds its body
+    identical to this one.
+
+    Red first, against the softened body: merge_group with the script at 1 exited 0, pull_request
+    with the script at 1 then 0 (a margin between 1.20x and 1.30x) exited 0 after a second call at
+    --min-margin 1.20. The push, schedule and workflow_dispatch cases passed before and after.
     """
     check = _margin_check("test")
-    assert "continue-on-error" not in check, "continue-on-error would also pass exit 2 in the queue"
-    assert (check.get("env") or {}).get("EVENT_NAME") == "${{ github.event_name }}"
+    assert "continue-on-error" not in check, "continue-on-error would pass a LOW margin"
     summary = tmp_path / "summary.md"
     summary.write_text("", encoding="utf-8")
     calls = tmp_path / "calls.txt"
@@ -954,6 +964,7 @@ def test_the_engine_margin_check_softens_a_low_margin_only_by_event(
         dict(
             os.environ,
             EVENT_NAME=event,
+            GITHUB_EVENT_NAME=event,
             LEG="ubuntu-latest",
             STEP_CAP="46",
             TESTS_OUTCOME="success",
@@ -980,41 +991,23 @@ def test_the_engine_margin_check_softens_a_low_margin_only_by_event(
         f"[step-margin] {event} rcs {script_rcs}: step {done.returncode}; {done.stdout.strip()!r}"
     )
     assert done.returncode == step_rc, done.stdout + done.stderr
-    assert ("::warning" in done.stdout) is warns, done.stdout
-    assert ("WARNING" in summary.read_text(encoding="utf-8")) is warns
-    if warns:
-        assert f"title=Step margin advisory ({event})::" in done.stdout, done.stdout
+    assert "::warning" not in done.stdout, done.stdout
+    assert "WARNING" not in summary.read_text(encoding="utf-8")
     argv = calls.read_text(encoding="utf-8").splitlines()
-    # push and merge_group never make a second call
-    assert len(argv) == len(script_rcs.split()), argv
+    assert len(argv) == 1, f"the step made {len(argv)} calls, not one: {argv}"
     assert "--min-margin" not in argv[0], argv[0]
-    assert all("--step Tests (pytest) --leg ubuntu-latest" in line for line in argv), argv
-    if len(argv) == 2:
-        assert argv[1].endswith(f"--min-margin {_pull_request_floor()}"), argv[1]
+    assert "--step Tests (pytest) --leg ubuntu-latest" in argv[0], argv[0]
 
 
-def _pull_request_floor() -> str:
-    """The floor the engine step's run body passes, read from the step rather than restated."""
-    found = re.search(r"^\s*pr_floor=(\S+)$", str(_margin_check("test")["run"]), re.MULTILINE)
-    assert found, "the engine margin step no longer names pr_floor"
-    return found.group(1)
-
-
-@pytest.mark.parametrize(
-    ("margin", "second_rc"),
-    [(1.25, 0), (1.15, 1)],
-)
-def test_the_real_script_answers_both_calls_of_the_pull_request_path(
-    tmp_path: Path, margin: float, second_rc: int
+@pytest.mark.parametrize("margin", [1.25, 1.15])
+def test_the_real_script_reds_the_band_the_pull_request_floor_used_to_pass(
+    tmp_path: Path, margin: float
 ) -> None:
-    """The stubbed test above proves the step's branches, and this one proves the two calls they
-    make. The second only runs after a slow step, so nothing else would exercise it: if the self-check
-    stopped holding at this floor, or a call consumed the mark or truncated the summary, the first
-    slow PR would get exit 2 or lose a block rather than a warning.
-
-    Falsified by setting pr_floor to 1.10 in ci.yml: RED, the second call exits 2. Restored.
+    """The stubbed test above proves the step's branch; this one proves the call it makes. At 1.25x
+    the retired pull_request floor passed a step with a warning, and at 1.15x it blocked. With one call
+    at the default floor, the real script reds both; the test below pins that no step passes a
+    second floor.
     """
-    assert _pull_request_floor() == "1.20"
     cap_minutes = 46
     baseline = tmp_path / "baseline.toml"
     baseline.write_text(_FIXTURE_ROW, encoding="utf-8")
@@ -1040,23 +1033,30 @@ def test_the_real_script_answers_both_calls_of_the_pull_request_path(
         "--summary-file",
         str(summary),
     ]
-    first = main(call)
-    second = main([*call, "--min-margin", _pull_request_floor()])
-    print(f"[step-margin] margin {margin}x: first exit {first}, second exit {second}")
-    assert (first, second) == (1, second_rc)
-    text = summary.read_text(encoding="utf-8")
-    assert "floor 1.30x" in text and "floor 1.20x" in text, text
+    rc = main(call)
+    print(f"[step-margin] margin {margin}x: exit {rc}")
+    assert rc == 1
+    assert f"floor {DEFAULT_MIN_MARGIN:.2f}x" in summary.read_text(encoding="utf-8")
 
 
-def test_the_web_console_margin_check_stays_blocking_on_every_event() -> None:
-    """The ruling and the 1.20x floor name the engine suite's check only. Falsified by adding a
-    merge_group branch, a pull_request branch or a `continue-on-error` to this step: RED. Restored."""
-    check = _margin_check("webconsole")
+@pytest.mark.parametrize("job_name", sorted(_GATED))
+def test_every_margin_check_stays_blocking_on_every_event(job_name: str) -> None:
+    """No margin check may branch on the event, carry a second floor, or `continue-on-error`.
+
+    This was the web console check's test alone while the engine checks carried the softening; since
+    BACKLOG #5247 item 9 reverted it, it covers every gated job. Falsified by adding a merge_group
+    branch, a pull_request branch, a `--min-margin` or a `continue-on-error` to any of the three
+    checks: RED. Red first, against the softened body: RED on `test` and `test-shard2`.
+    """
+    check = _margin_check(job_name)
     assert "continue-on-error" not in check, check.get("continue-on-error")
     run = str(check.get("run", ""))
     assert "merge_group" not in run
     assert "pull_request" not in run
+    assert "EVENT_NAME" not in run
+    assert "EVENT_NAME" not in (check.get("env") or {})
     assert "--min-margin" not in run
+    assert "pr_floor" not in run
 
 
 def test_the_web_console_suite_shares_neither_budget_nor_job_with_the_engine_suite() -> None:

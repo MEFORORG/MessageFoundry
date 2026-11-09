@@ -48,6 +48,35 @@
 # Splitting the engine pair the way the web console pair is now split is a separate change nobody has
 # made.
 
+# THE ENGINE SHARD POOLS WERE MEASURED 2026-11-09 UTC (BACKLOG #5247 items 8 and 9), AND NO ROW BELOW
+# MOVED WITH THEM. One key per (step, leg): both shards' `Tests (pytest)` steps pooled, one row per
+# run, the worse of its success rows across the two shard jobs and their attempts. Pool: every ci.yml
+# run with event merge_group, pull_request, push or workflow_dispatch created
+# 2026-11-06T16:29:06Z..2026-11-09T00:17:02Z UTC, opening at the second after engine PR 2812 merged
+# and closing at the second before the one run still in progress when listed (no run was created on
+# 2026-11-08). Jobs fetched with ?filter=all, read 2026-11-09 about 00:40Z UTC; a row is a step that
+# concluded success, executions under 60s dropped, re-run copies with identical stamps dropped. Every
+# run in it has a `test-shard2` job. 220 runs gave an engine step.
+#
+#   leg             n     merge_group  pull_request  push   median   p95     max     worst run      max at cap
+#   ubuntu-latest   157   36           94            27     21:56    23:32   24:21   42326526726    46:00 / 24:21 = 1.889x
+#   windows-2022    152   36           89            27     27:48    29:13   32:13   42361254132    71:00 / 32:13 = 2.204x
+#   windows-2025    148   36           85            27     27:25    29:18   31:25   42370426615    71:00 / 31:25 = 2.260x
+#
+# The worst runs are pull_request runs of 2026-11-07, each shard 1. Evidence the pool is uncensored:
+# no execution on any leg came within 10 minutes of its cap; the longest step failures stopped at
+# 23:39 (ubuntu), 29:06 (windows-2022) and 29:35 (windows-2025), and the longest cancellations at
+# 21:59, 26:12 and 26:12. Shard balance, shard 1 over shard 2 per run: median 1.04 / 1.02 / 1.01.
+# The same reading from the split's own merge (engine PR 2721, 2026-11-03T20:30:24Z) to the same close,
+# 638 runs, straddles PR 2812: maxima 24:43 / 32:13 / 31:25. It leaves out six pull_request runs of
+# 2026-11-03 and 2026-11-04 whose trees predate the split, one of them a 38:00 whole-suite ubuntu step.
+#
+# WHY NO ROW MOVED. The ubuntu row would move its cap: tests/test_ci_step_margin.py holds ubuntu's
+# `step_timeout` equal to ceil_minute(1.35x its row), and 24:21 sizes 33:00, not the 46:00 in force.
+# The windows-2025 row is the one the 71:00 Windows cap is sized from (owner ruling of 2026-11-02).
+# Re-sizing a cap is its own change. Until then the rows stay whole-suite maxima, an upper bound on a
+# shard, and the RE-DERIVE and RE-SIZE warning stays inert on the shards.
+
 # THE UBUNTU ENGINE ROW WAS RE-MEASURED 2026-10-18 UTC (BACKLOG #3456), after the gate reddened this
 # leg with every test passing on PR 2409's pull-request run 39110039682 at 29:15 and on merge-group
 # run 39131597083 (PR 2416) at 30:14, which the queue ejected. ci.yml's "THE UBUNTU ROW WAS
