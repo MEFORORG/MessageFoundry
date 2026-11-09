@@ -2581,7 +2581,7 @@ included, and released, any error the reload raises that none of the other reaso
 raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`. That reason is
 for the config directory itself: at least one that is missing, and one moved away between the
 reload's target check and its read of the directory. An executor fault is named by its own type,
-for example `BrokenThreadPool`, at least when a lane's anchor check meets it. The row never
+at least when a lane's anchor check meets it. The row never
 carries the error's text. A connector build or build check that the executor refused at submit,
 before a worker took it, or cancelled or failed before it began, runs on the event loop instead,
 with a WARNING in the engine log, so that hop does not fail; a bad config is still refused. Work
