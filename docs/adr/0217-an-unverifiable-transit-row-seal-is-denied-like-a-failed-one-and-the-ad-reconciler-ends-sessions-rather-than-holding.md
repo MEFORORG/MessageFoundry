@@ -597,6 +597,19 @@ skipped accounts is logged. The kept session's re-stamp is skipped on that Outag
 session is ended with the rest. A Forged or Unverifiable answer does not trip it: the accounts
 after it still call Transit, and a Forged account's kept session still runs its seal check.
 
+**Each store pages through its own hook (decision d20261109T200352805-599b24, item 5).** The
+decision reads: *"Replace the process-global page with a per-store hook that follows the
+`set_refusal_hook` plumbing and never raises. Register it before `_record_a_restore`. Make sure
+the admin-revoke-sessions CLI and a bare Engine page too. One lifespan's teardown must not silence
+another's page."* Each of the three backends holds a `SealPager` (`store/row_seal.py`), reached
+through `seal_pager()`. Its `arm` registers a hook and returns a disarm that removes that
+registration only, and the newest live registration takes each page, so neither an engine's stop
+nor a lifespan's teardown clears a hook another armed, in either order. The serve lifespan arms it
+on the authority-seal sink before the start probe and `_record_a_restore`; `Engine.start` arms its
+own on the engine's sink, or the logging sink, so an engine started without that lifespan pages,
+and `Engine.stop` removes it; `admin-revoke-sessions` arms the logging sink, `serve`'s fallback,
+since the CLI holds no notifier. A hook that raises is logged at WARNING and the revoke goes on.
+
 **Other legs that read a map** decide access and write nothing: at least the client-certificate
 identity (`identity_for_cert_user_id`), the step-up role test (`_directory_roles_lost`) and the
 enrolment and re-bind legs. On the step-up, enrolment and re-bind legs an Unverifiable map takes

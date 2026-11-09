@@ -458,6 +458,7 @@ from messagefoundry.pipeline.alerts import (
     LoggingAlertSink,
     administrator_granted_alert,
     authority_seal_alert,
+    authority_seal_page,
     no_enabled_administrator_alert,
     step_up_return_audit_alert,
     store_cipher_refusal_forwarder,
@@ -530,11 +531,7 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.crypto import audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
-from messagefoundry.store.row_seal import (
-    TRANSIT_OUTAGE_SUBJECT,
-    probe_row_sealer_at_start,
-    set_transit_outage_alert,
-)
+from messagefoundry.store.row_seal import probe_row_sealer_at_start
 from messagefoundry.store.store import (
     VIEWED_EVENT,
     AuditAppend,
@@ -12486,14 +12483,18 @@ def create_managed_app(
         # abandoned in place on a startup failure. engine.stop() ends in store.close(), and
         # aiosqlite's connection worker is NON-DAEMON, so skipping it left the process unable to
         # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
+        disarm_seal_page: Callable[[], None] | None = None
         try:
             # Decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2 (ADR 0217): a
             # revoke that goes without an account's epoch raise, or ends its kept session, on a
-            # Vault transit outage pages authority-seal-transit on the authority-seal sink. First,
-            # so the restore's revoke below pages too; cleared in the teardown below.
-            set_transit_outage_alert(
-                authority_seal_alert(notifier or LoggingAlertSink(), subject=TRANSIT_OUTAGE_SUBJECT)
-            )
+            # Vault transit outage pages authority-seal-transit on the authority-seal sink. Armed
+            # on this store's own pager (decision d20261109T200352805-599b24, item 5), first, so
+            # the restore's revoke below pages too; the teardown removes only this registration.
+            seal_pager = getattr(store, "seal_pager", None)
+            if callable(seal_pager):
+                disarm_seal_page = seal_pager().arm(
+                    authority_seal_page(notifier or LoggingAlertSink())
+                )
             # ADR 0217 slice 1b-iii: the Transit row sealer's start probe, before the restore and
             # the auth service read or write any authority row. A failed probe refuses the start.
             # Engine.start runs it again, for an engine started without this lifespan.
@@ -12800,9 +12801,10 @@ def create_managed_app(
                     )
             yield
         finally:
-            # This lifespan's authority-seal-transit page, so a later app in the process does not
-            # page through this one's sink (ADR 0217).
-            set_transit_outage_alert(None)
+            # This lifespan's own seal page registration, and no other (ADR 0217, decision
+            # d20261109T200352805-599b24 item 5).
+            if disarm_seal_page is not None:
+                disarm_seal_page()
             # BACKLOG #2087, #3191: every step after the yield runs whatever the steps before it
             # did. A step that raises, overruns its bound or is cut by a cancel is logged and the
             # next one runs, so a cancel delivered mid-teardown still drains, stops the engine and

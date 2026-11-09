@@ -955,29 +955,108 @@ async def probe_row_sealer_at_start(sealer: AnyRowSealer | None) -> None:
 
 
 #: The page an Outage on an authority row raises (ADR 0217, *The four answers*).
-TRANSIT_OUTAGE_SUBJECT = "authority-seal-transit"
+TRANSIT_OUTAGE_SUBJECT: Final = "authority-seal-transit"
+#: The page a Forged authority row raises: ``AUTHORITY_SEAL_SUBJECT`` in ``pipeline/alerts.py``,
+#: which the store may not import, so a test pins the two equal (ADR 0217, *The four answers*).
+AUTHORITY_SEAL_FAILED_SUBJECT: Final = "authority-seal"
+#: The prefix of an Unverifiable row's capped subject (ADR 0217, *The four answers*).
+UNVERIFIABLE_SUBJECT_PREFIX: Final = "authority-seal-transit-unverifiable"
+#: Distinct Unverifiable subjects one store pages under their own name per window, then the shared
+#: ``<prefix>:*``: ``MAX_SUBJECT_ALERTS`` in ``pipeline/security_signals.py``, pinned equal by a test.
+UNVERIFIABLE_SUBJECT_CAP: Final = 5
+#: The readable part of a subject's ref, as a session's 12-character ref (*A ref is for reading*).
+_SUBJECT_REF_LEN: Final = 12
 
-_transit_outage_alert: Callable[[str], None] | None = None
+#: A store's seal page: called with an ``integrity_drift`` subject and a reason naming no row value,
+#: token or Vault reply.
+SealPageHook = Callable[[str, str], None]
 
 
-def set_transit_outage_alert(alert: Callable[[str], None] | None) -> None:
-    """Register the process's ``authority-seal-transit`` page, or clear it with ``None``. The API
-    registers it at startup on the alert sink the authority-seal page uses; a store reports through
-    :func:`report_transit_outage`, so no backend needs a sink of its own."""
-    global _transit_outage_alert
-    _transit_outage_alert = alert
+def seal_row_digest(kind: str, ident: str) -> str:
+    """The SHA-256, in hex, of ``kind`` and the WHOLE stored id, case-folded so one row has one key
+    on a case-insensitive collation (ADR 0217, *A ref is for reading*). A throttle and the cap key on
+    it; only its first 16 characters ever reach a subject, and it is never logged."""
+    return hashlib.sha256(_part(kind.encode()) + _part(ident.casefold().encode())).hexdigest()
 
 
-def report_transit_outage(reason: str) -> None:
-    """Page ``authority-seal-transit`` with ``reason``, which names no row value, token or Vault
-    reply. Never raises: a page that fails must not change what a revoke does."""
-    alert = _transit_outage_alert
-    if alert is None:
-        return
-    try:
-        alert(reason)
-    except Exception:  # noqa: BLE001 -- an alert failure must never break a revoke
-        log.warning("the authority-seal-transit page could not be delivered")
+def unverifiable_subject(kind: str, ident: str) -> str:
+    """``<prefix>:<kind>:<readable ref>:<digest suffix>`` for an Unverifiable row (ADR 0217, *A ref
+    is for reading*): the ref is the id's first 12 characters, the suffix the first 16 hex
+    characters of :func:`seal_row_digest`, so a planted row copying a genuine ref pages apart."""
+    ref = ident.casefold()[:_SUBJECT_REF_LEN]
+    return f"{UNVERIFIABLE_SUBJECT_PREFIX}:{kind}:{ref}:{seal_row_digest(kind, ident)[:16]}"
+
+
+class SealPager:
+    """One store's seal page (decision d20261109T200352805-599b24 on ADR 0217, item 5), replacing
+    the process-global page: each store holds one, so two engines or two lifespans in one process
+    page through their own sinks.
+
+    :meth:`arm` registers a hook and returns its own disarm, which removes only that registration,
+    so one lifespan's teardown, or an engine's stop, never silences a page another armed. The newest
+    live registration takes each page. No page method raises: a page that fails must not change
+    what a revoke does. An Unverifiable row's subject is capped (:meth:`unverifiable`)."""
+
+    __slots__ = ("_hooks", "_named")
+
+    def __init__(self) -> None:
+        self._hooks: list[tuple[object, SealPageHook]] = []
+        self._named: dict[str, float] = {}
+
+    def arm(self, hook: SealPageHook) -> Callable[[], None]:
+        """Register ``hook``; the returned callable removes this registration only."""
+        token = object()
+        self._hooks.append((token, hook))
+
+        def disarm() -> None:
+            self._hooks[:] = [entry for entry in self._hooks if entry[0] is not token]
+
+        return disarm
+
+    @property
+    def armed(self) -> bool:
+        """Whether a hook is registered, so a page reaches a sink."""
+        return bool(self._hooks)
+
+    def page(self, subject: str, reason: str) -> bool:
+        """Page ``subject`` with ``reason`` through the newest hook. Returns whether a hook took
+        it; never raises."""
+        if not self._hooks:
+            return False
+        hook = self._hooks[-1][1]
+        try:
+            hook(subject, reason)
+        except Exception:  # noqa: BLE001 -- an alert failure must never break a revoke
+            log.warning("the %s page could not be delivered", subject.split(":", 1)[0])
+            return False
+        return True
+
+    def outage(self, reason: str) -> None:
+        """Page the shared ``authority-seal-transit`` subject."""
+        self.page(TRANSIT_OUTAGE_SUBJECT, reason)
+
+    def forged(self, reason: str) -> None:
+        """Page a Forged row under ``AUTHORITY_SEAL_SUBJECT``, as ``main`` pages one."""
+        self.page(AUTHORITY_SEAL_FAILED_SUBJECT, reason)
+
+    def unverifiable(self, kind: str, ident: str, reason: str) -> None:
+        """Page an Unverifiable row under its own subject while fewer than
+        :data:`UNVERIFIABLE_SUBJECT_CAP` distinct rows have this window
+        (:data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`), else under the shared ``<prefix>:*``. A
+        slot is spent only on a page a hook took, keyed by the whole digest."""
+        if not self._hooks:
+            return
+        now = time.monotonic()
+        cutoff = now - SEAL_FAILURE_REPORT_INTERVAL_SECONDS
+        for key, at in list(self._named.items()):
+            if at <= cutoff:
+                del self._named[key]
+        key = seal_row_digest(kind, ident)
+        if key in self._named or len(self._named) < UNVERIFIABLE_SUBJECT_CAP:
+            if self.page(unverifiable_subject(kind, ident), reason):
+                self._named[key] = now
+            return
+        self.page(f"{UNVERIFIABLE_SUBJECT_PREFIX}:*", reason)
 
 
 def transit_seal_refusals() -> tuple[type[Exception], ...]:
@@ -997,15 +1076,3 @@ def revoke_seal_refusals() -> tuple[type[Exception], ...]:
     """What a revoke's account-epoch raise takes as a refusal and goes ahead without: Forged
     (``RowSealError``) and every :func:`transit_seal_refusals` type."""
     return (RowSealError, *transit_seal_refusals())
-
-
-def report_revoke_seal_refusal(exc: Exception, *, what: str) -> None:
-    """Log a refusal :func:`revoke_seal_refusals` took, naming its class only, and page
-    ``authority-seal-transit`` when it is an Outage. ``what`` says which write went without."""
-    log.warning(
-        "%s was refused (%s); the revoke ends the sessions anyway", what, type(exc).__name__
-    )
-    if isinstance(exc, TransitSealUnavailableError):
-        report_transit_outage(
-            f"{what} met a Vault transit outage; the revoke went ahead without it"
-        )

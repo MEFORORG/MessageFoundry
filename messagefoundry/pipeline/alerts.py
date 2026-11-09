@@ -1614,6 +1614,24 @@ def authority_seal_alert(
     return _raise
 
 
+def authority_seal_page(sink: AlertSink) -> Callable[[str, str], None]:
+    """A store's seal page hook, armed on its
+    :class:`~messagefoundry.store.row_seal.SealPager` (decision d20261109T200352805-599b24 on ADR
+    0217, item 5): each call, with a subject and a reason, raises ``integrity_drift`` on ``sink``.
+    The store builds the subject, at least ``authority-seal-transit`` for an Outage, and the reason
+    names no row value, token or Vault reply.
+
+    Never raises: an alert failure must not change what a revoke does."""
+
+    def _raise(subject: str, reason: str) -> None:
+        try:
+            sink.integrity_drift(subject, reason=reason, drift_count=1)
+        except Exception:  # noqa: BLE001 — an alert-sink failure must never break a revoke
+            log.warning("a store seal page could not be delivered")
+
+    return _raise
+
+
 def no_enabled_administrator_alert(sink: AlertSink) -> Callable[[str, str], None]:
     """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call, with a
     username and a ``via``, raises :meth:`AlertSink.no_enabled_administrator` keyed

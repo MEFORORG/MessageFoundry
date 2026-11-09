@@ -78,16 +78,26 @@ async def test_the_managed_lifespan_probes_before_the_restore_and_clears_its_pag
     """The managed lifespan registers the authority-seal-transit page, probes, and only then runs
     the restore record, so a failed probe refuses the start with no authority row touched, and the
     teardown clears the page. Control: a passing probe reaches the restore, and the page is
-    registered while the app serves."""
+    registered while the app serves. The page is the store's own (decision
+    d20261109T200352805-599b24, item 5), so the test reads that store's pager."""
     import messagefoundry.api.app as appmod
-    import messagefoundry.store.row_seal as row_seal_mod
     from messagefoundry.api import create_managed_app
     from messagefoundry.config.settings import AlertsSettings, AuthSettings
+    from messagefoundry.store.row_seal import SealPager
 
     calls: list[str] = []
+    pagers: list[SealPager] = []
+    arm = SealPager.arm
 
-    async def _restore(store: object, sink: object) -> None:
+    def _arm(self: SealPager, hook: Any) -> Any:
+        pagers.append(self)
+        return arm(self, hook)
+
+    monkeypatch.setattr(SealPager, "arm", _arm)
+
+    async def _restore(store: Any, sink: object) -> None:
         calls.append("restore")
+        assert store.seal_pager().armed  # registered before the restore's revoke
 
     async def _probe(sealer: object) -> None:
         calls.append("probe")
@@ -112,14 +122,15 @@ async def test_the_managed_lifespan_probes_before_the_restore_and_clears_its_pag
         async with app.router.lifespan_context(app):
             pytest.fail("the lifespan served after its probe refused")
     assert calls == ["probe"]
-    assert row_seal_mod._transit_outage_alert is None
+    assert pagers and not any(pager.armed for pager in pagers)
     refuse = False
     calls.clear()
+    pagers.clear()
     app = _app()
     async with app.router.lifespan_context(app):
         assert calls == ["probe", "restore"]
-        assert row_seal_mod._transit_outage_alert is not None
-    assert row_seal_mod._transit_outage_alert is None
+        assert pagers and all(pager.armed for pager in pagers)
+    assert not any(pager.armed for pager in pagers)
 
 
 async def test_the_engine_refuses_to_start_when_the_probe_fails(tmp_path: Path) -> None:

@@ -64,6 +64,7 @@ from messagefoundry.engine_secrets import SecretsDirectoryError
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
+    authority_seal_page,
     cell_tag_failure_forwarder,
     store_cipher_refusal_forwarder,
 )
@@ -671,6 +672,7 @@ class Engine:
         # The store cipher whose unmarked-value refusals this engine forwards as an alert (BACKLOG
         # #1169); None until start() arms it, and again after stop() disarms it.
         self._cipher_refusal_armed: Any = None
+        self._seal_page_disarm: Callable[[], None] | None = None
         # [secret_rotation] secret-rotation reminder (#195b, ADR 0019 §5) — the secret-side twin of
         # cert_monitor. None (embedding/tests) → no reminder task; a no-op when warn_days=0 or nothing is
         # tracked. The tracked-secret set is derived at scan time from [secret_rotation] so a reload is
@@ -1843,12 +1845,31 @@ class Engine:
         if callable(tag_setter):
             tag_setter(None)
 
+    def _arm_seal_page(self) -> None:
+        """Arm the store's seal page on the AlertSink, or the logging sink with none configured
+        (decision d20261109T200352805-599b24 on ADR 0217, item 5), so a revoke an engine runs pages
+        whether or not the serve lifespan armed one too. Tolerant of a store without
+        ``seal_pager()`` (a test double). :meth:`_disarm_seal_page` removes only this registration,
+        so the lifespan's own stays armed."""
+        getter = getattr(self.store, "seal_pager", None)
+        pager = getter() if callable(getter) else None
+        if pager is None or self._seal_page_disarm is not None:
+            return
+        sink = self._alert_sink if self._alert_sink is not None else LoggingAlertSink()
+        self._seal_page_disarm = pager.arm(authority_seal_page(sink))
+
+    def _disarm_seal_page(self) -> None:
+        disarm, self._seal_page_disarm = self._seal_page_disarm, None
+        if disarm is not None:
+            disarm()
+
     async def start(self) -> None:
         """Recover crashed in-flight rows (every stage), dead-letter outbound rows for removed
         outbounds, then start the wired graph."""
         self.started_at = time.time()
         # Before anything reads the store, so a refusal during recovery alerts too (BACKLOG #1169).
         self._arm_cipher_refusal_alert()
+        self._arm_seal_page()
         # BACKLOG #2337 (owner rulings 2026-10-07): on `vault_transit` the engine counts no AES-GCM
         # invocations, so a recorded, audited operator attestation must name the configured Transit
         # data key. It refuses under enforce and warns otherwise. First, before recovery or any
@@ -3862,6 +3883,7 @@ class Engine:
             await self._gcm_invocation_runner.stop()
             self._gcm_invocation_runner = None
         self._disarm_cipher_refusal_alert()
+        self._disarm_seal_page()
         # Deregister cluster membership after the runner has quiesced but before the store closes (the
         # coordinator marks its node left over the same pool). stop() is idempotent and safe even if
         # start() raised (then there's just nothing to cancel). NullCoordinator is a no-op.

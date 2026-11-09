@@ -194,6 +194,7 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     AnyRowSealer,
     RowSealError,
+    SealPager,
     row_sealer_for_cipher,
 )
 from messagefoundry.store.schema_verify import IndexShape
@@ -1957,6 +1958,7 @@ class PostgresStore:
         self._cipher: Cipher = cipher or IdentityCipher()
         # BACKLOG #2592: the row sealer, fixed for the handle's life; None on a keyless store.
         self._row_sealer: AnyRowSealer | None = row_sealer_for_cipher(self._cipher)
+        self._seal_pager = SealPager()
         # A1 live cost counters (QueueStore protocol / `/stats` uniformity). Exposed at 0 on this backend:
         # counting is fully wired on SQLite + SQL Server, whose explicit ``conn.commit()`` / body-insert
         # sites funnel through single helpers; Postgres commits implicitly via ``async with
@@ -9571,14 +9573,14 @@ class PostgresStore:
         return count
 
     async def _bump_session_epoch(
-        self, conn: Any, user_id: str, outcome: RevokeSealOutcome | None = None
+        self, conn: Any, user_id: str, outcome: RevokeSealOutcome
     ) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, inside ``conn``'s
         transaction (BACKLOG #2592), and report the raise (BACKLOG #4975); store.py's
         ``MessageStore._bump_session_epoch`` says why a record that fails its seal does not stop
         the revoke that called this, and reports no raise."""
         return await raise_account_epoch(
-            lambda bump: self._write_user(conn, user_id, bump), outcome or RevokeSealOutcome()
+            lambda bump: self._write_user(conn, user_id, bump), outcome, user_id
         )
 
     async def reseal_user_records(self) -> tuple[int, int]:
@@ -10780,6 +10782,12 @@ class PostgresStore:
         :meth:`messagefoundry.store.base.AuthStore.row_sealer`."""
         return self._row_sealer
 
+    def seal_pager(self) -> SealPager:
+        """This store's seal page (decision d20261109T200352805-599b24 on ADR 0217, item 5). The
+        engine, the serve lifespan and ``admin-revoke-sessions`` arm it on their alert sink; each
+        disarms only its own registration."""
+        return self._seal_pager
+
     async def get_session(self, token_hash: str) -> SessionRecord | None:
         d = await self._fetchone("SELECT * FROM sessions WHERE token_hash=$1", token_hash)
         return SessionRecord.from_mapping(dict(d)) if d else None
@@ -10903,7 +10911,7 @@ class PostgresStore:
         :meth:`_after_commit_txn`'s, for the reason it gives."""
         now = time.time() if now is None else now
         async with self._after_commit_txn() as conn:
-            outcome = RevokeSealOutcome()
+            outcome = RevokeSealOutcome(self._seal_pager)
             raised = await self._bump_session_epoch(conn, user_id, outcome)
             status = await conn.execute(
                 _PG_REVOKE_USER_SESSIONS_SQL + " AND ($3::text IS NULL OR token_hash != $3)",
@@ -10930,14 +10938,15 @@ class PostgresStore:
         token_hash: str,
         restamp: KeptSessionRestamp,
         now: float,
-        outcome: RevokeSealOutcome | None = None,
+        outcome: RevokeSealOutcome,
     ) -> RevokeResult:
         """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, inside
         ``conn``'s transaction (follow-up to BACKLOG #4975); store.py's
         ``MessageStore._keep_or_end_session`` states the contract."""
-        tripped = outcome is not None and outcome.tripped
-        if not tripped and restamp.kept(
-            await write_kept_session(self._write_session(conn, token_hash, restamp))
+        if not outcome.tripped and restamp.kept(
+            await write_kept_session(
+                self._write_session(conn, token_hash, restamp), outcome, token_hash
+            )
         ):
             return RevokeResult(revoked, kept=True)
         status = await conn.execute(
@@ -10983,7 +10992,7 @@ class PostgresStore:
                     )
                 )
             )
-            outcome = RevokeSealOutcome()
+            outcome = RevokeSealOutcome(self._seal_pager)
             raised = {
                 str(row["id"]): await self._bump_session_epoch(conn, str(row["id"]), outcome)
                 for row in await conn.fetch("SELECT id FROM users ORDER BY id")

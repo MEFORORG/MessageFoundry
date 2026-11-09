@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from messagefoundry.auth.tokens import hash_token, mint_token
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.row_seal import (
     RowSealError,
@@ -29,28 +30,36 @@ from messagefoundry.store.row_seal import (
     TransitRowSealer,
     TransitSealUnavailableError,
     TransitSealUnverifiableError,
-    set_transit_outage_alert,
 )
-from messagefoundry.store.store import KeptSessionRestamp, MessageStore, SessionRecord
+from messagefoundry.store.store import (
+    KeptSessionRestamp,
+    MessageStore,
+    RevokeSealOutcome,
+    SessionRecord,
+)
 from tests._transit_seal_fake import FakeBackend, with_version
 
 
 @pytest.fixture
-def pages() -> Iterator[list[str]]:
-    seen: list[str] = []
-    set_transit_outage_alert(seen.append)
-    try:
-        yield seen
-    finally:
-        set_transit_outage_alert(None)
+def pages() -> list[str]:
+    """Each page a store armed on it took, as ``<subject>|<reason>``."""
+    return []
+
+
+def _arm(store: Any, pages: list[str]) -> None:
+    """Arm ``store``'s own seal pager on ``pages`` (decision d20261109T200352805-599b24, item 5)."""
+    store.seal_pager().arm(lambda subject, reason: pages.append(f"{subject}|{reason}"))
 
 
 @pytest.fixture
-async def transit(tmp_path: Path) -> AsyncIterator[tuple[MessageStore, FakeBackend, Path]]:
+async def transit(
+    tmp_path: Path, pages: list[str]
+) -> AsyncIterator[tuple[MessageStore, FakeBackend, Path]]:
     path = tmp_path / "revoke.db"
     store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
     backend = FakeBackend()
     store._row_sealer = TransitRowSealer(backend)
+    _arm(store, pages)
     try:
         yield store, backend, path
     finally:
@@ -166,12 +175,18 @@ async def test_an_unverifiable_kept_session_is_ended_too(
 # --- Postgres and SQL Server twins ----------------------------------------------------------------
 
 
-def _server(backend: str) -> Any:
+def _server(backend: str, pages: list[str] | None = None) -> Any:
     import importlib
+
+    from messagefoundry.store.row_seal import SealPager
 
     module = importlib.import_module(f"messagefoundry.store.{backend}")
     cls = getattr(module, "PostgresStore" if backend == "postgres" else "SqlServerStore")
-    return cls.__new__(cls)
+    store = cls.__new__(cls)
+    store._seal_pager = SealPager()
+    if pages is not None:
+        _arm(store, pages)
+    return store
 
 
 _REFUSALS: list[type[Exception]] = [
@@ -195,13 +210,14 @@ def _raise(kind: type[Exception]) -> Exception:
 async def test_a_server_epoch_raise_goes_without_on_every_refusal(
     backend: str, kind: type[Exception], pages: list[str]
 ) -> None:
-    store = _server(backend)
+    store = _server(backend, pages)
 
     async def refused(*_args: Any, **_kwargs: Any) -> None:
         raise _raise(kind)
 
     store._write_user = refused
-    assert await store._bump_session_epoch(object(), "u-1") is None
+    outcome = RevokeSealOutcome(store.seal_pager())
+    assert await store._bump_session_epoch(object(), "u-1", outcome) is None
     assert len(pages) == (1 if kind is TransitSealUnavailableError else 0)
 
 
@@ -227,7 +243,7 @@ class _MssqlCur:
 async def test_a_server_kept_session_refused_by_transit_is_ended(
     backend: str, kind: type[Exception], pages: list[str]
 ) -> None:
-    store = _server(backend)
+    store = _server(backend, pages)
 
     async def refused(*_args: Any, **_kwargs: Any) -> SessionRecord | None:
         raise _raise(kind)
@@ -235,7 +251,8 @@ async def test_a_server_kept_session_refused_by_transit_is_ended(
     store._write_session = refused
     conn: Any = _PgConn() if backend == "postgres" else _MssqlCur()
     restamp = KeptSessionRestamp("u-1", None, None)
-    result = await store._keep_or_end_session(conn, 3, "c" * 64, restamp, 1.0)
+    outcome = RevokeSealOutcome(store.seal_pager())
+    result = await store._keep_or_end_session(conn, 3, "c" * 64, restamp, 1.0, outcome)
     assert not result.kept and result.ended_kept and result.count == 4
 
 
@@ -250,7 +267,7 @@ async def test_a_server_forged_kept_session_still_raises_as_on_main(backend: str
     conn: Any = _PgConn() if backend == "postgres" else _MssqlCur()
     with pytest.raises(RowSealError):
         await store._keep_or_end_session(
-            conn, 0, "c" * 64, KeptSessionRestamp("u", None, None), 1.0
+            conn, 0, "c" * 64, KeptSessionRestamp("u", None, None), 1.0, RevokeSealOutcome()
         )
 
 
@@ -329,9 +346,7 @@ async def test_a_forged_account_still_runs_the_kept_sessions_seal_check(
 async def test_a_server_outage_trips_the_revoke_and_skips_the_rest(
     backend: str, pages: list[str]
 ) -> None:
-    from messagefoundry.store.store import RevokeSealOutcome
-
-    store = _server(backend)
+    store = _server(backend, pages)
     attempts: list[str] = []
 
     async def refused(_conn: Any, user_id: str, _bump: Any) -> None:
@@ -343,7 +358,7 @@ async def test_a_server_outage_trips_the_revoke_and_skips_the_rest(
 
     store._write_user = refused
     store._write_session = no_session_write
-    outcome = RevokeSealOutcome()
+    outcome = RevokeSealOutcome(store.seal_pager())
     for user in ("u-1", "u-2", "u-3"):
         assert await store._bump_session_epoch(object(), user, outcome) is None
     assert attempts == ["u-1"] and outcome.skipped == 2 and len(pages) == 1
@@ -352,3 +367,156 @@ async def test_a_server_outage_trips_the_revoke_and_skips_the_rest(
         conn, 3, "c" * 64, KeptSessionRestamp("u-1", None, None), 1.0, outcome
     )
     assert not result.kept and result.ended_kept and result.count == 4
+
+
+# --- decision d20261109T200352805-599b24, item 5: each store pages through its own hook ----------
+
+
+async def _outage_revoke(store: MessageStore, backend: FakeBackend, user_id: str) -> None:
+    store._row_sealer = TransitRowSealer(backend)  # nothing cached: the raise meets Transit
+    backend.down = True
+    try:
+        await store.revoke_user_sessions(user_id)
+    finally:
+        backend.down = False
+
+
+async def test_each_store_pages_through_its_own_hook(tmp_path: Path) -> None:
+    """Two stores in one process: an Outage on one pages that store's hook only. Control: the
+    other store's revoke pages its own."""
+    stores: list[MessageStore] = []
+    backends = [FakeBackend(), FakeBackend()]
+    seen: list[list[str]] = [[], []]
+    try:
+        for n in range(2):
+            store = await MessageStore.open(
+                tmp_path / f"own-{n}.db", cipher=make_cipher(generate_key(), write_v2=True)
+            )
+            stores.append(store)
+            store._row_sealer = TransitRowSealer(backends[n])
+            _arm(store, seen[n])
+            await _user(store, "u-1")
+            await _session(store, "u-1")
+        await _outage_revoke(stores[0], backends[0], "u-1")
+        assert len(seen[0]) == 1 and seen[1] == []
+        await _outage_revoke(stores[1], backends[1], "u-1")
+        assert len(seen[0]) == 1 and len(seen[1]) == 1
+    finally:
+        for store in stores:
+            await store.close()
+
+
+@pytest.mark.parametrize("order", ["newest_first", "oldest_first"])
+def test_a_disarm_removes_only_its_own_registration(order: str) -> None:
+    """One teardown never silences a page another registration armed, in either order."""
+    from messagefoundry.store.row_seal import SealPager
+
+    pager = SealPager()
+    first: list[str] = []
+    second: list[str] = []
+    disarm_first = pager.arm(lambda subject, reason: first.append(reason))
+    disarm_second = pager.arm(lambda subject, reason: second.append(reason))
+    pager.outage("a")
+    assert first == [] and second == ["a"]  # the newest registration takes the page
+    if order == "newest_first":
+        disarm_second()
+        pager.outage("b")
+        assert first == ["b"]
+        disarm_first()
+    else:
+        disarm_first()
+        pager.outage("b")
+        assert second == ["a", "b"]
+        disarm_second()
+    assert not pager.armed
+    pager.outage("c")  # no hook: nothing pages, nothing raises
+    assert "c" not in first + second
+
+
+async def test_a_page_that_raises_never_breaks_the_revoke(
+    transit: tuple[MessageStore, FakeBackend, Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    store, backend, path = transit
+
+    def broken(subject: str, reason: str) -> None:
+        raise RuntimeError("synthetic sink failure")
+
+    store.seal_pager().arm(broken)
+    await _user(store, "u-1")
+    for _ in range(2):
+        await _session(store, "u-1")
+    await _outage_revoke(store, backend, "u-1")
+    assert _live(path, "u-1") == 0
+    assert any("page could not be delivered" in r.getMessage() for r in caplog.records)
+
+
+class _DriftSink(LoggingAlertSink):
+    def __init__(self) -> None:
+        self.subjects: list[str] = []
+
+    def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
+        self.subjects.append(name)
+
+
+async def test_a_bare_engine_pages_and_its_stop_keeps_an_earlier_registration(
+    tmp_path: Path,
+) -> None:
+    """An engine started without the serve lifespan arms its store's pager on its own sink; its
+    stop removes only that registration, so one armed before it, as the lifespan's is, still
+    pages. Control: before the engine starts, the earlier registration takes the page."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.engine import Engine
+    from messagefoundry.store.row_seal import TRANSIT_OUTAGE_SUBJECT
+
+    store = await MessageStore.open(tmp_path / "engine.db", cipher=make_cipher(generate_key()))
+    try:
+        earlier: list[str] = []
+        _arm(store, earlier)
+        store.seal_pager().outage("before")
+        assert len(earlier) == 1
+        sink = _DriftSink()
+        engine = Engine(
+            store, alert_sink=sink, egress_settings=EgressSettings(deny_by_default=False)
+        )
+        try:
+            await engine.start()
+            store.seal_pager().outage("during")
+            assert sink.subjects == [TRANSIT_OUTAGE_SUBJECT] and len(earlier) == 1
+        finally:
+            await engine.stop()
+        assert store.seal_pager().armed
+        store.seal_pager().outage("after")
+        assert len(earlier) == 2 and len(sink.subjects) == 1
+    finally:
+        await store.close()
+
+
+def test_the_cli_revoke_pages_through_the_logging_sink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``admin-revoke-sessions`` arms the store's pager on the logging sink before its revoke, so
+    an Outage there pages. The revoke is wrapped to page as an Outage would; the store is keyless,
+    as the CLI's other tests open it."""
+    import asyncio
+
+    from messagefoundry.__main__ import main
+    from tests._phi_gate_provisions import setenv_at_rest_opt_out
+    from tests.test_b2614_revoke_all_route_cli import _seed
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    asyncio.run(_seed(db))
+    revoke = MessageStore.revoke_all_sessions
+    armed: list[bool] = []
+
+    async def paging(self: MessageStore, **kwargs: Any) -> Any:
+        armed.append(self.seal_pager().armed)
+        self.seal_pager().outage("a synthetic outage during the CLI revoke")
+        return await revoke(self, **kwargs)
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", paging)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 0
+    assert armed == [True]
+    # The CLI configures its own logging, which writes to stderr.
+    assert "ALERT integrity_drift: 'authority-seal-transit'" in capsys.readouterr().err
