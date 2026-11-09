@@ -14002,12 +14002,12 @@ class AuthService:
         This method opens the TOTP cell ONCE, in the store's conditional write (BACKLOG #3948
         finding 13); a route that asks :meth:`must_enrol_before_rotating` first opens it once more
         there, before the current password. The early refusal
-        (:meth:`_refuse_rotation_without_way_past`) opens none, except on an account whose passkey
-        set did not verify or could not be read: it refuses an account with no TOTP on and no passkey that counts, as
-        :meth:`_has_way_past` would, and leaves a TOTP that is on to the write's own judgement,
-        which refuses a KNOWN refusal there. The cost of that: such a refusal now comes after the
-        argon2 hash. Without the ``[webauthn]`` extra the write counts no passkey, as
-        :meth:`_has_way_past` counts none.
+        (:meth:`_refuse_rotation_without_way_past`) refuses, before the argon2 hash, an account
+        with no TOTP on and no passkey that counts. It opens the cell only where the passkey set
+        reads as nothing (it failed its seal, a row did not parse, or the driver could not decode
+        a cell); otherwise it leaves a TOTP that is on to the write's own judgement, which refuses
+        a KNOWN refusal there, after the hash. Without the ``[webauthn]`` extra the write counts no
+        passkey, as :meth:`_has_way_past` counts none.
         """
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
@@ -14044,20 +14044,27 @@ class AuthService:
     async def _refuse_rotation_without_way_past(self, user: VerifiedUser) -> None:
         """The rotation's early refusal, before the argon2 hash: raise
         :class:`FactorEnrolmentRequired` where ``user`` holds no factor with a way past that can be
-        told without opening the TOTP cell. The passkeys are read through
+        told without opening the TOTP cell. Where no TOTP is on and no passkey can count (no
+        configured relying party, or no ``[webauthn]`` extra), it refuses before reading anything,
+        since no read could change the answer.
+
+        Otherwise the passkeys are read wherever the account's sealed record names one, even where
+        a TOTP is on and no passkey can count: the store's write reads them too, and would raise on
+        a row that does not parse after the hash. They are read through
         :meth:`_verified_passkeys`, as :meth:`_has_way_past` reads them, so a row that does not
         parse is no exception and a set that fails its seal is reported. Such a set counts for
-        nothing, so only the TOTP can pass, and it is judged here, a second open of the cell, but
-        only on an account whose passkey set did not verify. Otherwise a TOTP that is on is left
-        to the write's own judgement (BACKLOG #3948 finding 13).
-
-        The set is read wherever the account's sealed record names a passkey, even where no
-        passkey can count (no configured relying party, or no ``[webauthn]`` extra): the store's
-        write reads it too, and would raise on a row that does not parse after the hash. A cell the
-        driver cannot decode while fetching (:func:`passkey_cell_undecodable`) counts the set for
-        nothing too, as the census counts it, so such an account with no TOTP that counts gets the
-        enrolment refusal here rather than the driver's error. Where its TOTP counts, the store's
-        write still reads the set after the hash and raises that error."""
+        nothing, and so does one with a cell the driver cannot decode while fetching
+        (:func:`passkey_cell_undecodable`), as the census counts it; then only the TOTP can pass,
+        and it is judged here, a second open of the cell. Where its TOTP counts beside an
+        undecodable cell, the store's write still reads the set after the hash and raises the
+        driver's error. Where the set reads, a TOTP that is on is left to the write's own judgement
+        (BACKLOG #3948 finding 13)."""
+        if not user.totp_enabled and not (
+            webauthn.available() and self._way_past_rp_id is not None
+        ):
+            # No factor here can be a way past, so no read can change the answer: refuse before
+            # one, so a store error on that read cannot turn the refusal into a 500.
+            raise FactorEnrolmentRequired()
         held: list[WebAuthnCredential] | None = []
         if user.has_passkeys:
             try:
@@ -14080,7 +14087,7 @@ class AuthService:
             return
         if user.totp_enabled:
             return
-        if not (webauthn.available() and any(self._gate_counts(c) for c in held)):
+        if not any(self._gate_counts(c) for c in held):
             raise FactorEnrolmentRequired()
 
     # --- MFA: native TOTP second factor (every account, WP-14, ASVS 6.3.3) -----

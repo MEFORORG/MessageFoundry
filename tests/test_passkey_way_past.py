@@ -2325,25 +2325,32 @@ async def test_a_passkey_row_that_does_not_parse_refuses_the_rotation_before_the
 
 
 @pytest.mark.parametrize(
-    ("corrupt", "rp_id"),
-    [(True, None), (True, RP), (False, RP)],
-    ids=["undecodable-no-rp-id", "undecodable", "control"],
+    ("corrupt", "rp_id", "available"),
+    [(True, None, True), (True, RP, False), (True, RP, True), (False, RP, True)],
+    ids=["undecodable-no-rp-id", "undecodable-no-extra", "undecodable", "control"],
 )
 async def test_a_passkey_cell_the_driver_cannot_decode_refuses_the_rotation_before_the_hash(
-    corrupt: bool, rp_id: str | None, caplog: pytest.LogCaptureFixture
+    corrupt: bool,
+    rp_id: str | None,
+    available: bool,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A covered account with no TOTP on whose passkey cell sqlite3 cannot decode while fetching:
-    in ``change_password`` the set counts for nothing, so the change is the enrolment refusal
-    before any argon2 hash, never an exception, both with and without a configured relying party.
-    Only the arm without one is a regression from main, whose rotation read no set there. The
-    warning names the account and none of the cell. The control: the same account with its cell
-    intact rotates on its passkey. RED when: the rotation's early refusal lets the driver's decode
-    failure escape."""
+    in ``change_password`` the change is the enrolment refusal before any argon2 hash, never an
+    exception. Where a passkey can count, the set is read and counts for nothing, and the warning
+    names the account and none of the cell. Where none can (no configured relying party, or no
+    ``[webauthn]`` extra), the refusal comes before any read, so nothing is warned. The control:
+    the same account with its cell intact rotates on its passkey. RED when: the rotation's early
+    refusal lets the driver's decode failure escape."""
+    from messagefoundry.auth import webauthn as wa
+
     store = await MessageStore.open(":memory:")
     try:
         service, identity, hashes = await _passkey_owner_counting_hashes(
             store, way_past_rp_id=rp_id, totp=None
         )
+        monkeypatch.setattr(wa, "available", lambda: available)
         if not corrupt:
             assert await service.change_password(identity, _NEW_PASSWORD) == []
             assert hashes == [1]
@@ -2357,9 +2364,87 @@ async def test_a_passkey_cell_the_driver_cannot_decode_refuses_the_rotation_befo
         assert hashes == [], "the refusal came after the argon2 hash"
         warned = [r.getMessage() for r in caplog.records if "could not be read" in r.getMessage()]
         # The whole message, so any trace of the cell fails it.
-        assert warned == [
-            f"the passkeys of user {identity.user_id} could not be read (OperationalError)"
-        ], warned
+        expected = (
+            [f"the passkeys of user {identity.user_id} could not be read (OperationalError)"]
+            if rp_id is not None and available
+            else []
+        )
+        assert warned == expected, warned
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("rp_id", "available", "refused"),
+    [(None, True, True), (RP, False, True), (RP, True, False)],
+    ids=["no-rp-id", "no-extra", "control-a-passkey-can-count"],
+)
+async def test_a_store_error_cannot_turn_the_rotation_refusal_into_an_exception(
+    monkeypatch: pytest.MonkeyPatch, rp_id: str | None, available: bool, refused: bool
+) -> None:
+    """A covered account with no TOTP on, where no passkey can count (no configured relying party,
+    or no ``[webauthn]`` extra): no passkey read could change the answer, so the rotation is the
+    enrolment refusal before any read and before the hash, and a passkey read that would fail with
+    ``database is locked`` never runs. The control: where a passkey can count the set is read, and
+    the error raises, before the hash. RED when: the early refusal reads the set where nothing it
+    holds can count."""
+    from messagefoundry.auth import webauthn as wa
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, hashes = await _passkey_owner_counting_hashes(
+            store, way_past_rp_id=rp_id, totp=None
+        )
+        monkeypatch.setattr(wa, "available", lambda: available)
+        reads: list[str] = []
+
+        async def locked(user_id: str) -> Any:
+            reads.append(user_id)
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(store, "list_webauthn_credentials", locked)
+        before = await _password_hash(store, identity.user_id)
+        with pytest.raises(FactorEnrolmentRequired if refused else sqlite3.OperationalError):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert hashes == [], "the refusal came after the argon2 hash"
+        assert reads == ([] if refused else [identity.user_id])
+        assert await _password_hash(store, identity.user_id) == before
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("secret", "rotates"),
+    [(_REFUSED_TOTP, False), (_USABLE_TOTP, True)],
+    ids=["refused-totp", "usable-totp"],
+)
+async def test_beside_an_undecodable_passkey_set_the_rotation_judges_the_totp(
+    monkeypatch: pytest.MonkeyPatch, secret: str, rotates: bool
+) -> None:
+    """A covered account with a TOTP on whose passkey set the driver cannot decode in the early
+    refusal's read: the set counts for nothing, so the TOTP alone decides, judged there. A refused
+    TOTP is the enrolment refusal before the hash. The control: a usable one lets the write run
+    and the rotation lands. RED when: an undecodable set skips the TOTP judgement, and the write
+    lets the refused TOTP through on the intact passkey it reads."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, hashes = await _passkey_owner_counting_hashes(store, totp=secret)
+
+        async def undecodable(user_id: str) -> Any:
+            raise UnicodeDecodeError("utf-16-le", b"\x00\xd8", 0, 2, "unpaired surrogate")
+
+        # Only the service's read: the store's write reads the intact rows under its own lock.
+        monkeypatch.setattr(store, "list_webauthn_credentials", undecodable)
+        before = await _password_hash(store, identity.user_id)
+        if rotates:
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+            assert hashes == [1]
+            assert await _password_hash(store, identity.user_id) != before
+            return
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert hashes == [], "the refusal came after the argon2 hash"
+        assert await _password_hash(store, identity.user_id) == before
     finally:
         await store.close()
 
