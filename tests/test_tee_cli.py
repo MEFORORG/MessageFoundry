@@ -433,7 +433,7 @@ def test_out_help_states_what_the_writer_does_to_the_file(command: str) -> None:
         "a symbolic link at FILE is replaced",
         "On Windows an existing FILE is written in place",
         "keeps its access list and owner",
-        "On POSIX, a target that resolves, through any link, to a character device, or to a pipe or socket this account owns, is written through instead of replaced.",
+        "On POSIX, a target that resolves, through any link, to a character device, or to anything else that is neither a regular file nor a directory and that this account owns, such as a pipe, is opened for writing in place instead of replaced.",
     ):
         assert consequence in text, f"{command} --out help lacks {consequence!r}: {text}"
 
@@ -449,6 +449,14 @@ def test_compare_out_help_states_that_an_existing_file_is_replaced() -> None:
     # Windows, met only when the help says the old file's hardened access list is lost.
     assert (
         "On Windows the replaced report takes its folder's access list, so an access list hardened on the old file is not kept."
+        in text
+    )
+    assert (
+        "On POSIX, a target that resolves, through any link, to a character device, or to anything else that is neither a regular file nor a directory and that this account owns, such as a pipe, is opened for writing in place instead of replaced."
+        in text
+    )
+    assert (
+        "On Windows compare opens a target that resolves, through any link, to anything that is neither a regular file nor a directory, such as NUL or CON, for writing in place instead of replacing it."
         in text
     )
 

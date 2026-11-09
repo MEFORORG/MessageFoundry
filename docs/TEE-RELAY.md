@@ -147,8 +147,9 @@ consequences follow from it:
 * **On POSIX an existing file is replaced, not written into.** A read-only (`0444`) file is
   overwritten, a hard link at the path is broken (the other name keeps the old contents), and a
   symbolic link at the path is replaced. On POSIX, a target that resolves, through any link, to a
-  character device, or to a pipe or socket this account owns, is written through instead of
-  replaced. These hold for all three commands.
+  character device, or to anything else that is neither a regular file nor a directory and that
+  this account owns, such as a pipe, is opened for writing in place instead of replaced. These hold
+  for all three commands.
 * **`export` and `anonymize-captures` write LF line endings on every OS**, Windows included. Before
   vault BACKLOG #3166 a Windows `export` file ended its lines in CRLF.
 * **On Windows, `export` and `anonymize-captures` write an existing file in place**, as `write_text`
@@ -160,8 +161,10 @@ consequences follow from it:
   another process holds open without write sharing. A new file takes its folder's access list.
 * **compare replaces an existing regular file; the replace can be refused, for example for a
   read-only file on Windows.** On Windows the report takes its folder's access list, whatever list
-  the old file had, and a link at the path is replaced. On Windows compare also writes through a
-  named stream, for example NUL, CON or a named pipe. It writes the platform's line endings.
+  the old file had, so an access list hardened on the old file is not kept, and a link to a regular
+  file is replaced. On Windows compare opens a target that resolves, through any link, to anything
+  that is neither a regular file nor a directory, such as NUL or CON, for writing in place instead
+  of replacing it. It writes the platform's line endings.
 
 ### Purge
 
