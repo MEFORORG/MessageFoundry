@@ -685,14 +685,14 @@ class AlertSink(Protocol):
         **A failed write is not proof the row is missing.** A COMMIT can land with its reply lost,
         so the reason says the row was not written OR its write's outcome is unknown (vault BACKLOG
         #3193 item 4); a row the step-up return budget sheds is never written. Where the gate reads
-        the row back as stored, it raises :meth:`audit_offbox_copy_missing` instead."""
+        back that its own write committed, it raises :meth:`audit_offbox_copy_missing` instead."""
         ...
 
     def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
-        """An audit row the approval gate read back as stored has no off-box copy (vault BACKLOG
-        #3193 N1). The store tees a row off-box only after a COMMIT it saw succeed, so when the
-        write reported an error and its COMMIT landed anyway, the forwarded audit stream lacks the
-        row and nothing else reports the gap. Distinct from
+        """An audit row whose write the approval gate read back as committed has no off-box copy
+        (vault BACKLOG #3193 N1). The store tees a row off-box only after a COMMIT it saw succeed,
+        so when the write reported an error and its COMMIT landed anyway, the forwarded audit
+        stream lacks the row and nothing else reports the gap. Distinct from
         :meth:`audit_write_failed`, whose row may be missing from the store too.
 
         docs/SECURITY.md, in its approvals section, says which read-backs raise it. ``name`` is

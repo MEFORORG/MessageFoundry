@@ -36,7 +36,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import AuditAppend, MessageStore
 from tests._pending_approval_store_contract import (
     _REQUESTER_ID,
     _request,
@@ -304,36 +304,64 @@ async def test_a_combined_outcome_write_whose_reply_is_lost_writes_no_second_row
     assert sink.lost == []
 
 
+class _SiblingMoved(_StandingStore):
+    """The gate's combined ``outcome`` write fails WITHOUT committing, after a sibling sharing its
+    claim owner moved the row to 'interrupted' with that sibling's own row, as its restart
+    reconcile does, keeping the approver the claim wrote."""
+
+    def __init__(self, store: Any, *, outcome: str) -> None:
+        super().__init__(store)
+        self.outcome = outcome
+
+    async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+        audit = kw.get("audit")
+        if audit is not None and audit.action == self.outcome:
+            assert await self._store.decide_pending_approval(
+                approval_id,
+                status="interrupted",
+                approver=kw["approver"],
+                decided_at=2.0,
+                from_status="executing",
+                audit=AuditAppend("approval.interrupted", actor="system", detail="{}"),
+            )
+            raise sqlite3.OperationalError(_FAULT)
+        return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+
 async def test_an_outcome_row_moved_by_a_sibling_pages_audit_write_failed(
     store: MessageStore,
 ) -> None:
-    """The combined write fails WITHOUT committing, and a sibling sharing this claim owner moves
-    the row to 'interrupted' before the status-only write. That write then finds the row moved,
-    but the approval.approved row was never written, so the read-back must not page copy-only
-    (vault BACKLOG #3193 N1)."""
-
-    class _SiblingMoved(_StandingStore):
-        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
-            audit = kw.get("audit")
-            if audit is not None and audit.action == "approval.approved":
-                assert await self._store.decide_pending_approval(
-                    approval_id,
-                    status="interrupted",
-                    approver="checker",
-                    decided_at=2.0,
-                    from_status="executing",
-                )
-                raise sqlite3.OperationalError(_FAULT)
-            return bool(await self._store.decide_pending_approval(approval_id, **kw))
-
+    """The status-only write finds the row moved, but by the sibling, so the approval.approved
+    row was never written and the read-back must not page copy-only (vault BACKLOG #3193 N1)."""
     sink = _Sink()
     runs: list[str] = []
-    gate = _gate(_SiblingMoved(store), sink, runs=runs)
+    gate = _gate(_SiblingMoved(store, outcome="approval.approved"), sink, runs=runs)
     approval_id = await _request(gate)
     await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
     assert runs == ["ran"] and await _status(store, approval_id) == "interrupted"
     assert await store.list_audit(action="approval.approved") == []
     assert sink.lost == [(f"approval:{approval_id}", "approval.approved")]
+    assert sink.copy_missing == []
+
+
+async def test_an_interrupted_outcome_moved_by_a_sibling_pages_audit_write_failed(
+    store: MessageStore,
+) -> None:
+    """The sibling leaves the row at the very status and approver this write would have, so only
+    the write's own decision time tells the two apart (vault BACKLOG #3193 N1)."""
+    sink = _Sink()
+    gate = _gate(_SiblingMoved(store, outcome="approval.interrupted"), sink)
+    approval_id = await _request(gate)
+    assert await store.decide_pending_approval(
+        approval_id, status="executing", approver="checker", decided_at=1.0
+    )
+    await gate._record_interrupted_execution(
+        approval_id, operation="dead_letter_replay", approver="checker", requester="r", client=None
+    )
+    assert await _status(store, approval_id) == "interrupted"
+    rows = await store.list_audit(action="approval.interrupted")
+    assert [r["actor"] for r in rows] == ["system"]  # only the sibling's row
+    assert sink.lost == [(f"approval:{approval_id}", "approval.interrupted")]
     assert sink.copy_missing == []
 
 

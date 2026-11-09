@@ -207,10 +207,10 @@ class ConfigDigestMismatch(Exception):
     """A released reload's config is not the config its approval named (vault BACKLOG #2596).
 
     :meth:`Engine.reload_detail` raises it before anything is swapped. ``approved`` is the digest
-    the hold captured, or ``None``, which no config matches; ``current`` is the digest of the
-    directory now, or ``None`` when it could not be read. Both are content digests, never file content.
-    ``value_file`` is True when the two digests match and the environment value file is not the
-    one the approval bound, which neither digest covers."""
+    the release is bound to, or ``None``, which no config matches; ``current`` is the digest of
+    the directory now, or ``None`` when it could not be read. Both are content digests, never file
+    content. ``value_file`` is True when the two digests match and the environment value file is
+    not the one the approval bound, which neither digest covers."""
 
     def __init__(
         self, approved: str | None, current: str | None, *, value_file: bool = False
@@ -279,8 +279,8 @@ def _log_abandoned_config_write(task: asyncio.Task[None]) -> None:
 @dataclass(frozen=True, slots=True)
 class ApprovedConfig:
     """The config a dual-control approval released, which :meth:`Engine.reload_detail` binds a
-    reload to (vault BACKLOG #2596, step 3). ``fingerprint`` is the digest the hold captured at
-    request time; a reload bound to ``None`` refuses every config.
+    reload to (vault BACKLOG #2596, step 3). ``fingerprint`` is the digest the release is bound
+    to; a reload bound to ``None`` refuses every config.
 
     ``value_file`` binds the environment value file the engine reads from outside the config
     directory, which ``fingerprint`` leaves out because that digest is published unkeyed: the

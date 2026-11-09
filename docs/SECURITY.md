@@ -2850,8 +2850,8 @@ cannot move a leftover `executing` row to `interrupted`. The row stays `executin
 start tries again.
 
 An outcome's combined write can fail while the status write that follows finds the row already
-moved. The gate then writes no second row, and reads the row back (vault BACKLOG #3193 N1). If it
-reads at the outcome's status with this approver, the combined write committed and only its reply
+moved. The gate then writes no row alone, and reads the row back (vault BACKLOG #3193 N1). If it
+reads at the outcome's status with that write's decision time, the combined write committed and only its reply
 was lost, so its row is in the local audit log but not the off-box copy, which the store writes
 only after a commit it saw succeed. The gate logs at ERROR and pages `audit_offbox_copy_missing`,
 keyed `approval:<id>` with the row's action name. If the row reads otherwise, or cannot be read, it
@@ -2934,7 +2934,7 @@ that write never fails the call. If the move and its row cannot be written toget
 writes the status alone, so an audit outage never leaves the row at `executing`. It then writes the
 audit row alone. If that fails too, the loss is logged at ERROR and pages `audit_write_failed`.
 One case skips the row: the combined write fails, and the status write that follows finds the row
-already moved. The gate then writes no second row and pages, as above.
+already moved. The gate then writes no row alone and pages, as above.
 
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
 worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`

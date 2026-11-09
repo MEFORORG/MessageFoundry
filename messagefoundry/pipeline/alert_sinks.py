@@ -1494,9 +1494,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         )
 
     def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
-        # vault BACKLOG #3193 N1: the gate read the row back as stored, and only its off-box copy
-        # is missing (AlertSink.audit_offbox_copy_missing says why). Keyed `approval:<id>`,
-        # as audit_write_failed is, and its own instance. No PHI.
+        # vault BACKLOG #3193 N1: the gate read the row's write back as committed, and only its
+        # off-box copy is missing (AlertSink.audit_offbox_copy_missing says why). Keyed
+        # `approval:<id>`, as audit_write_failed is, and its own instance. No PHI.
         self._emit(
             {
                 "type": "audit_offbox_copy_missing",

@@ -959,10 +959,11 @@ class ApprovalGate:
     async def _read_back_request(
         self, approval_id: str
     ) -> ApprovalRow | Literal["absent", "unsealed", "unknown"]:
-        """The request a write that reported an error left in the store, its seal checked (vault
-        BACKLOG #3193). ``unsealed`` when it is there but fails its seal, which :meth:`_verified`
-        reports: such a row can never be released, so a retry cannot make a second releasable copy
-        of it. ``unknown`` when the read fails, logged here."""
+        """The approval row a write that reported an error left in the store, its seal checked
+        (vault BACKLOG #3193): a request's, or an outcome's in :meth:`_settle`. ``unsealed`` when
+        it is there but fails its seal, which :meth:`_verified` reports: such a row can never be
+        released, so a retry cannot make a second releasable copy of it. ``unknown`` when the read
+        fails, logged here."""
         try:
             found = await self._store.get_pending_approval(approval_id)
             if found is None:
@@ -973,7 +974,7 @@ class ApprovalGate:
             return "unsealed" if row is None else row
         except Exception:  # noqa: BLE001 - every store backend raises its own type
             log.exception(
-                "approval %s: reading back a request whose write failed failed too", approval_id
+                "approval %s: reading back its row after a write failed failed too", approval_id
             )
             return "unknown"
 
@@ -1739,8 +1740,8 @@ class ApprovalGate:
 
         **When the combined write fails**, the status is written alone, so an audit outage never
         leaves the row ``executing``. If that status write finds the row already moved, the method
-        writes no second row and reads the row back (vault BACKLOG #3193 N1). Found at ``status``
-        with this ``approver``, the combined write committed, and it pages
+        writes no row alone and reads the row back (vault BACKLOG #3193 N1). Found at ``status``
+        with this write's ``decided_at``, the combined write committed, and it pages
         ``audit_offbox_copy_missing``, since that row's off-box copy was never sent. Found in any
         other state, or not read, it pages ``audit_write_failed``. If the status write moves the
         row, the audit row is written alone. If that fails as well, the loss is
@@ -1758,13 +1759,15 @@ class ApprovalGate:
             return _audit_detail(fields if flag is None else {**fields, flag: moved})
 
         combined = AuditAppend(action, actor=approver, detail=detail(True), client=client)
+        # Kept to recognise this write on a read-back: every other move stamps its own clock.
+        decided_at = self._clock()
         moved: bool | None
         try:
             moved = await self._store.decide_pending_approval(
                 approval_id,
                 status=status,
                 approver=approver,
-                decided_at=self._clock(),
+                decided_at=decided_at,
                 from_status="executing",
                 audit=combined,
             )
@@ -1793,7 +1796,7 @@ class ApprovalGate:
                 if (
                     isinstance(landed, ApprovalRow)
                     and landed.status == status
-                    and landed.approver == approver
+                    and landed.decided_at == decided_at
                 ):
                     log.error(
                         "approval %s: %s; reading the row back found it '%s', so the combined "
@@ -1811,8 +1814,8 @@ class ApprovalGate:
                 else:
                     log.error(
                         "approval %s: %s; the row was no longer 'executing' and reading it back "
-                        "did not find it '%s', so the combined write's %s row may not have been "
-                        "written. No second row is written",
+                        "did not find this write's '%s', so its %s row was not written or its "
+                        "outcome is unknown. No row is written alone",
                         approval_id,
                         context,
                         status,
@@ -2108,9 +2111,9 @@ class ApprovalGate:
             log.exception("approval %s: the audit_write_failed alert failed to emit", approval_id)
 
     def _alert_offbox_copy_missing(self, approval_id: str, action: str) -> None:
-        """Page on an audit row the gate read back as stored, whose off-box copy was never sent
-        (vault BACKLOG #3193 N1): ``audit_offbox_copy_missing``, keyed ``approval:<id>``, best
-        effort as :meth:`_alert_lost_audit` is."""
+        """Page on an audit row whose write the gate read back as committed, whose off-box copy
+        was never sent (vault BACKLOG #3193 N1): ``audit_offbox_copy_missing``, keyed
+        ``approval:<id>``, best effort as :meth:`_alert_lost_audit` is."""
         try:
             self._alert_sink.audit_offbox_copy_missing(f"approval:{approval_id}", action=action)
         except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
