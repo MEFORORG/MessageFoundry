@@ -8,12 +8,17 @@ before the rotation begins, revokes the stamped hash and answers ``session_lost`
 ``auth.session_rotation_failed`` row, as a refused rotation does. One test per site the decision
 names. Each injects the refusal at that one call: a Transit Outage
 (``TransitSealUnavailableError``) where the call is sealed, and a store refusal (``OSError``, a
-connection lost at the socket) at the audit row, whose Transit form is ``CipherError`` and is not
-in the tuple. The control is a refusal before any stamp landed, which propagates as before.
+connection lost at the socket) at the audit row. The control is a refusal before any stamp landed,
+which propagates as before.
+
+Decision d20261109T200352805-599b24 (item 1) widens it: once armed, ANY exception revokes the
+stamped hash, shielded from a cancel. The success audit row's ``CipherError`` is answered too; every
+other exception (Forged, Unverifiable, any other ``CipherError``, a cancel, a defect) is re-raised.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any
@@ -27,7 +32,12 @@ from messagefoundry.auth import totp
 from messagefoundry.auth.service import STEP_UP_ACTION_SESSION_TERMINATE, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.row_seal import TransitSealUnavailableError
+from messagefoundry.store.crypto import CipherError
+from messagefoundry.store.row_seal import (
+    RowSealError,
+    RowSealUnverifiableError,
+    TransitSealUnavailableError,
+)
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
 from tests.test_oidc_step_up import _begin, _oidc_session, _return_from_idp
@@ -212,6 +222,123 @@ async def test_the_federated_callback_after_its_stamp_answers_session_lost(
         assert out.elevation.session_lost and out.elevation.token is None
         await _assert_lost(
             store, service, token, ceremony="reauth_oidc", reason="transit_unavailable"
+        )
+    finally:
+        await store.close()
+
+
+# --- decision d20261109T200352805-599b24, item 1: any exception revokes once armed -----------------
+
+
+async def _revoked_unanswered(store: MessageStore, service: AuthService, token: str) -> None:
+    """The stamped hash is revoked, and no refused-rotation row answers for it."""
+    session = await store.get_session(hash_token(token))
+    assert session is not None and session.revoked_at is not None
+    assert await service.identity_for_token(token) is None
+    assert await store.list_audit(action="auth.session_rotation_failed") == []
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RowSealError("user", ""),
+        RowSealUnverifiableError("user", ""),
+        CipherError("synthetic: not the audit row"),
+        KeyError("synthetic code defect"),
+        asyncio.CancelledError(),
+    ],
+    ids=["forged", "unverifiable", "cipher_error_elsewhere", "code_defect", "cancelled"],
+)
+async def test_any_other_exception_after_the_stamp_revokes_then_reraises(
+    monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> None:
+    store, service = await _service()
+    try:
+        token, secret, t1 = await _pre_mfa(service, monkeypatch)
+
+        async def raising(*_args: object, **_kwargs: object) -> None:
+            raise exc
+
+        monkeypatch.setattr(store, "record_login_success", raising)
+        with pytest.raises(type(exc)):
+            await service.verify_mfa(token, totp.totp(secret, now=t1))
+        monkeypatch.undo()
+        await _revoked_unanswered(store, service, token)
+    finally:
+        await store.close()
+
+
+async def test_a_real_cancel_after_the_stamp_still_lands_the_revoke(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The task is cancelled while it waits after the stamp; the revoke is shielded."""
+    store, service = await _service()
+    try:
+        token, secret, t1 = await _pre_mfa(service, monkeypatch)
+        entered = asyncio.Event()
+
+        async def hang(*_args: object, **_kwargs: object) -> None:
+            entered.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(store, "record_login_success", hang)
+        task = asyncio.ensure_future(service.verify_mfa(token, totp.totp(secret, now=t1)))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        monkeypatch.undo()
+        await _revoked_unanswered(store, service, token)
+    finally:
+        await store.close()
+
+
+async def test_verify_mfa_answers_a_refused_success_audit_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The audit set's CipherError at ``auth.mfa_verified`` (on vault_transit, the audit MAC under
+    a Transit Outage) answers session_lost."""
+    store, service = await _service()
+    try:
+        token, secret, t1 = await _pre_mfa(service, monkeypatch)
+        record_audit = store.record_audit
+
+        async def refused(action: str, **kwargs: Any) -> Any:
+            if action == "auth.mfa_verified":
+                raise CipherError("synthetic audit MAC outage")
+            return await record_audit(action, **kwargs)
+
+        monkeypatch.setattr(store, "record_audit", refused)
+        lost = await service.verify_mfa(token, totp.totp(secret, now=t1))
+        assert lost.session_lost and lost.token is None
+        await _assert_lost(store, service, token, ceremony="mfa_verify", reason="audit_refused")
+    finally:
+        await store.close()
+
+
+@requires_webauthn
+async def test_the_passkey_assertion_answers_a_refused_success_audit_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, service = await _service()
+    try:
+        identity, enrolling, password = await login_admin(service)
+        _, enrolled = await _enroll_totp(service, identity, enrolling)
+        soft, _ = await _enroll_passkey(service, identity, enrolled)
+        out = await service.login(ADMIN_USERNAME, password)
+        assert out.ok and out.token is not None
+        record_audit = store.record_audit
+
+        async def refused(action: str, **kwargs: Any) -> Any:
+            if action == "auth.webauthn_verified":
+                raise CipherError("synthetic audit MAC outage")
+            return await record_audit(action, **kwargs)
+
+        monkeypatch.setattr(store, "record_audit", refused)
+        ok, after = await _assert_passkey(service, out.token, soft)
+        assert not ok and after == out.token
+        await _assert_lost(
+            store, service, out.token, ceremony="webauthn_assert", reason="audit_refused"
         )
     finally:
         await store.close()

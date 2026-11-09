@@ -3193,11 +3193,14 @@ class _StampWindow:
     under the Owner's standing instruction of 2026-10-22, ADR 0217, widening "Revoke both"). See
     :meth:`AuthService._stamp_to_rotation`. ``stamped`` is the hash the first stamp that landed
     wrote to, which arms the window; ``closed`` is set once the rotation begins, which owns its
-    own refusals; ``lost`` says the window caught a refusal and answered for the ceremony."""
+    own refusals; ``lost`` says the window caught a refusal and answered for the ceremony.
+    ``audit_refused`` is the ``CipherError`` the window's own success audit row raised
+    (:meth:`AuthService._window_audit`), the one ``CipherError`` it answers for."""
 
     stamped: str | None = None
     closed: bool = False
     lost: bool = False
+    audit_refused: BaseException | None = None
 
 
 #: The open stamp window of the running ceremony, if any (:meth:`AuthService._stamp_to_rotation`).
@@ -10417,7 +10420,7 @@ class AuthService:
             return new_token
 
     async def _revoke_unrotated(
-        self, old_hash: str, new_hash: str | None, cause: Exception
+        self, old_hash: str, new_hash: str | None, cause: BaseException
     ) -> bool:
         """Revoke a session whose rotation the store refused, or a Transit Outage refused (owner
         ruling 2026-11-08), under ``old_hash`` and, when a re-key was attempted, ``new_hash``;
@@ -10440,8 +10443,12 @@ class AuthService:
             f"a revoke was refused too ({', '.join(refused)})" if refused else "it was revoked"
         )
         _log.warning(
-            "auth: a session rotation, or the check before it, was refused by %s (%s); %s",
-            "the Transit sealer" if isinstance(cause, TransitSealUnavailableError) else "the store",
+            "auth: a session rotation, or a step before it, was refused by %s (%s); %s",
+            "the Transit sealer"
+            if isinstance(cause, TransitSealUnavailableError)
+            else "the store"
+            if isinstance(cause, _session_write_errors())
+            else "an error",
             type(cause).__name__,
             outcome,
             exc_info=cause,  # a SQL defect is caught here too, so its traceback must survive
@@ -10761,30 +10768,65 @@ class AuthService:
 
         Between the stamp and the rotation a ceremony makes more store calls, sealed under Transit,
         at least a second stamp, ``record_login_success``, a factor-binding check and an audit row.
-        One that raises :func:`_rotation_store_errors` once a stamp has landed would otherwise
-        escape with the stamped hash live. Here the stamped hash is revoked, best effort, the
-        ``auth.session_rotation_failed`` row is written as :meth:`_elevated_hash` writes it, and the
-        refusal is suppressed with ``lost`` set, so the ceremony answers ``session_lost``. A refusal
-        before any stamp landed, after the rotation began, or of any other type propagates as
-        before. A Transit Outage on an audit row raises ``CipherError``, which that tuple does not
-        take."""
+        Once a stamp has landed, ANY exception before the rotation revokes the stamped hash, best
+        effort and shielded from a cancel (decision d20261109T200352805-599b24 on ADR 0217, item
+        1). Two kinds are then answered: a refusal :func:`_rotation_store_errors` names, and the
+        ``CipherError`` of the window's own success audit row (:meth:`_window_audit`). For those the
+        ``auth.session_rotation_failed`` row is written as :meth:`_elevated_hash` writes it and the
+        exception is suppressed with ``lost`` set, so the ceremony answers ``session_lost``. Every
+        other exception, at least Forged, Unverifiable, a cancel and a code defect, is re-raised
+        after the revoke. Before any stamp landed, or once the rotation began, nothing is revoked
+        here and the exception propagates as before."""
         window = _StampWindow()
         reset = _STAMP_WINDOW.set(window)
         try:
             yield window
-        except _rotation_store_errors() as exc:
+        except BaseException as exc:
             if window.stamped is None or window.closed:
                 raise
+            stamped = window.stamped
+            answered = isinstance(exc, _rotation_store_errors()) or (
+                exc is window.audit_refused and isinstance(exc, CipherError)
+            )
+            revoked = await self._revoke_stamped_shielded(stamped, exc)
+            if not answered:
+                raise
             window.lost = True
-            revoked = await self._revoke_unrotated(window.stamped, None, exc)
+            reason = (
+                "audit_refused" if exc is window.audit_refused else _rotation_failure_reason(exc)
+            )
             await self._audit_rotation_failed(
                 ceremony=ceremony,
                 actor=actor,
                 client=client,
-                failure={"reason": _rotation_failure_reason(exc), "revokes_landed": revoked},
+                failure={"reason": reason, "revokes_landed": revoked},
             )
         finally:
             _STAMP_WINDOW.reset(reset)
+
+    async def _revoke_stamped_shielded(self, token_hash: str, cause: BaseException) -> bool:
+        """:meth:`_revoke_unrotated` for a stamp window's hash, run to completion through a cancel
+        the way :func:`_write_through_cancellation` runs a refused sign-in's rows; a cancel that
+        lands meanwhile is re-raised after it. ``True`` when the revoke landed."""
+        landed: list[bool] = []
+
+        async def revoke() -> None:
+            landed.append(await self._revoke_unrotated(token_hash, None, cause))
+
+        await _write_through_cancellation([revoke])
+        return bool(landed and landed[0])
+
+    async def _window_audit(
+        self, window: _StampWindow, action: str, *, actor: str | None, client: str | None
+    ) -> None:
+        """Write a ceremony's success audit row inside its stamp window, marking a ``CipherError``
+        it raises as the window's to answer (:meth:`_stamp_to_rotation`): on a ``vault_transit``
+        store that is the audit-chain MAC refused by a Transit Outage."""
+        try:
+            await self._audit(action, actor=actor, client=client)
+        except CipherError as exc:
+            window.audit_refused = exc
+            raise
 
     async def _audit_rotation_failed(
         self,
@@ -14211,14 +14253,12 @@ class AuthService:
                 # an OIDC one also seed the step-up window (the session has completed password +
                 # MFA). (Initial enrollment has no factor to verify, so this never fires there —
                 # keeping the enrollment step-up gate honest, WP-14.)
-                # The window from this stamp to the rotation (_stamp_to_rotation): a refusal in it,
-                # at least the second stamp or record_login_success, or a store refusal of the audit
-                # row, revokes the stamped hash and answers session_lost. A Transit Outage at the
-                # audit row raises CipherError, which the window does not take.
+                # The window from this stamp to the rotation (_stamp_to_rotation) says what an
+                # exception in it does to the stamped hash and to the answer.
                 elevation = Elevation(session_lost=True)
                 async with self._stamp_to_rotation(
                     ceremony="mfa_verify", actor=user.username, client=client
-                ):
+                ) as window:
                     async with self._sealed_stamp(hash_token(token)) as factor_stamp:
                         await self._store.mark_session_mfa_verified(hash_token(token))
                     if factor_stamp.refused:
@@ -14243,7 +14283,9 @@ class AuthService:
                             return Elevation(session_lost=True)
                         self._restart_new_ip_dedupe(hash_token(token))
                     await self._store.record_login_success(user.id, now=now)
-                    await self._audit("auth.mfa_verified", actor=user.username, client=client)
+                    await self._window_audit(
+                        window, "auth.mfa_verified", actor=user.username, client=client
+                    )
                     elevation = await self._elevated(
                         token, ceremony="mfa_verify", actor=user.username, client=client
                     )
@@ -15593,7 +15635,7 @@ class AuthService:
         elevation = Elevation(session_lost=True)
         async with self._stamp_to_rotation(
             ceremony="webauthn_assert", actor=user.username, client=client
-        ):
+        ) as window:
             async with self._sealed_stamp(hash_token(token)) as stamp:
                 await self._store.mark_session_mfa_verified(hash_token(token))
             if stamp.refused:  # BACKLOG #2592: the session failed its seal and has been ended
@@ -15609,7 +15651,9 @@ class AuthService:
             # ``verify_mfa`` is -- though this write targets the USER row, not the session, so it is
             # ordering by parity rather than by necessity.
             await self._store.record_login_success(user.id, now=now)
-            await self._audit("auth.webauthn_verified", actor=user.username, client=client)
+            await self._window_audit(
+                window, "auth.webauthn_verified", actor=user.username, client=client
+            )
             elevation = await self._elevated(
                 token, ceremony="webauthn_assert", actor=user.username, client=client
             )

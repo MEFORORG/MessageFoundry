@@ -209,6 +209,15 @@ store a Transit Outage at that audit row raises `CipherError` from the audit-cha
 `_rotation_store_errors()` does not take, so there the guard fires only on a store refusal of the
 audit write.
 
+**The window takes any exception, decided 2026-11-09 (decision d20261109T200352805-599b24, item
+1).** This closes the Limit above. Once the guard is armed, any exception before the rotation
+revokes the stamped hash, run to completion through a cancel as `_write_through_cancellation`
+runs a refused sign-in's rows. Two kinds are answered: a refusal `_rotation_store_errors()` names,
+and the `CipherError` of the window's own success audit row (`auth.mfa_verified`,
+`auth.webauthn_verified`), recorded with reason `audit_refused`. For those the ceremony answers
+`session_lost` and the exception is suppressed. Every other exception is re-raised after the
+revoke, at least Forged, Unverifiable, any other `CipherError`, a cancel and a code defect.
+
 ## Context
 
 Engine `main` seals identity and authorization rows (sessions, users with their role grants, custom
