@@ -578,9 +578,15 @@ def _engine_requirement(dependencies: list[str]) -> Requirement | None:
     Returns the REQUIREMENT rather than just its version so the extras check below reads off the same
     parse instead of re-finding it; the two asked the same question twice and could disagree.
     """
+    return _requirement(dependencies, "messagefoundry")
+
+
+def _requirement(dependencies: list[str], name: str) -> Requirement | None:
+    """The first parsed requirement on distribution ``name``, or ``None``. One lookup for the engine
+    and toolkit pin checks, so the two cannot match names differently."""
     for raw in dependencies:
         req = Requirement(raw)
-        if _normalise(req.name) == "messagefoundry":
+        if _normalise(req.name) == name:
             return req
     return None
 
@@ -603,7 +609,12 @@ def _engine_pin(dependencies: list[str]) -> str | None:
     anywhere else, so it passes on the ubuntu runner that grades it and fails on the Windows host the
     harness is for. A requirement that holds only somewhere is not a lockstep pin.
     """
-    req = _engine_requirement(dependencies)
+    return _exact_pin(_engine_requirement(dependencies))
+
+
+def _exact_pin(req: Requirement | None) -> str | None:
+    """The one exact version ``req`` pins, or ``None`` for a missing requirement, a marker, or any
+    specifier but a single wildcard-free ``==``. Shared by the engine and toolkit pin checks."""
     if req is None or req.marker is not None:
         return None
     specs = list(req.specifier)
@@ -800,6 +811,30 @@ def test_the_install_resolution_check_names_an_unstubbed_dependency(tmp_path: Pa
     assert len(failures) == 1 and "httpx" in failures[0] and "besides" in failures[0], failures
 
 
+def test_the_install_resolution_check_names_a_drifted_toolkit_pin(tmp_path: Path) -> None:
+    """Every arm stubs the toolkit at the harness's own version (ADR 0201 slice 7), so a toolkit
+    pin that drifted would refuse the matched arm and blame the engine. It is named instead, before
+    any arm runs, and a correct toolkit pin beside the engine is not refused for it."""
+    (tmp_path / "drifted").mkdir()
+    drifted = _synthetic_harness_wheel(
+        tmp_path / "drifted",
+        "0.3.2",
+        ["messagefoundry[harness]==0.3.2", "messagefoundry-toolkit==0.3.1"],
+    )
+    failures = _resolution_module().check(drifted)
+    assert len(failures) == 1 and "messagefoundry-toolkit==0.3.1" in failures[0], failures
+    assert "AC-7" in failures[0] and "arm" not in failures[0], failures
+
+    (tmp_path / "clean").mkdir()
+    clean = _synthetic_harness_wheel(
+        tmp_path / "clean",
+        "0.3.2",
+        ["messagefoundry[harness]==0.3.2", "messagefoundry-toolkit==0.3.2"],
+    )
+    _require_pip()
+    assert _resolution_module().check(clean, arms={"matched"}) == []
+
+
 def test_the_install_resolution_check_counts_a_dependency_marked_for_another_platform() -> None:
     """A base dependency gated to Windows is still a base dependency on the ubuntu runner.
 
@@ -904,13 +939,16 @@ def test_the_harness_names_the_engine_once_in_the_table_the_release_counts() -> 
     _extra_gates). Counting them here would forbid a table the sibling console already ships.
     """
     deps = tomllib.loads(_HARNESS_PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
-    named = [raw for raw in deps if _normalise(Requirement(raw).name) == "messagefoundry"]
-    assert len(named) == 1, (
-        f"the harness base dependency table names the engine {len(named)} times: {named}. The "
-        f"release smoke counts them on the built wheel and accepts only one, so this fails at the "
-        f"tag rather than here. Keep one line in "
-        f"{_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()}."
-    )
+    # The toolkit too (ADR 0201 slice 7): the smoke counts its lines the same way, and
+    # ``_toolkit_pin`` reads only the first.
+    for name, what in (("messagefoundry", "the engine"), ("messagefoundry-toolkit", "the toolkit")):
+        named = [raw for raw in deps if _normalise(Requirement(raw).name) == name]
+        assert len(named) == 1, (
+            f"the harness base dependency table names {what} {len(named)} times: {named}. The "
+            f"release smoke counts them on the built wheel and accepts only one, so this fails at "
+            f"the tag rather than here. Keep one line in "
+            f"{_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()}."
+        )
 
 
 # --- the toolkit pins the engine it ships with (ADR 0201 AC-7, BACKLOG #1192) ---------------------
@@ -955,6 +993,54 @@ def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
         f"the toolkit's engine pin names an extra: {deps}"
     )
     assert len(deps) == 1, f"the toolkit declares more than the engine pin: {deps}"
+
+
+def _toolkit_pin(dependencies: list[str]) -> str | None:
+    """The exact version a requirement on ``messagefoundry-toolkit`` pins, or ``None``.
+
+    ``None`` for every shape ``_engine_pin`` refuses (``_exact_pin`` is the one rule both use),
+    and for an extra too, since the toolkit declares none.
+    """
+    req = _requirement(dependencies, "messagefoundry-toolkit")
+    return None if req is not None and req.extras else _exact_pin(req)
+
+
+def test_the_toolkit_pin_check_refuses_the_shapes_it_exists_to_refuse() -> None:
+    """The control for the harness's toolkit pin below: a check never seen firing proves
+    nothing."""
+    for loose in (
+        "messagefoundry-toolkit",
+        "messagefoundry-toolkit>=0.3.2",
+        "messagefoundry-toolkit~=0.3.2",
+        "messagefoundry-toolkit==0.3.*",
+        "messagefoundry-toolkit>=0.3.2,<0.4",
+        'messagefoundry-toolkit==0.3.2; sys_platform == "linux"',
+        "messagefoundry-toolkit[dev]==0.3.2",
+    ):
+        assert _toolkit_pin([loose]) is None, loose
+    assert _toolkit_pin(["messagefoundry[harness]==0.3.2", "messagefoundry_toolkit==0.3.2"]) == (
+        "0.3.2"
+    )
+    assert _toolkit_pin(["messagefoundry[harness]==0.3.2"]) is None
+
+
+def test_the_harness_pins_the_toolkit_at_the_version_it_ships_with() -> None:
+    """ADR 0201 AC-7, slice 7: the harness imports ``messagefoundry_toolkit.generators``, so it
+    depends on the toolkit, and pins it the way it pins the engine: at its own lockstep version.
+
+    A loose toolkit requirement would let a resolver pair this harness with a toolkit whose
+    generators it was never run against, and a missing one installs a harness whose GUI and load
+    profiles die on ImportError at the first generator call.
+    """
+    deps: list[str] = _project(_HARNESS_PYPROJECT.parent.name)["dependencies"]
+    shipped = _version_literal(version_path(_HARNESS_PYPROJECT))
+    pinned = _toolkit_pin(deps)
+    assert pinned == shipped, (
+        f"the harness must pin the toolkit at the version it ships with (ADR 0201 AC-7).\n"
+        f"  the harness ships at: {shipped}\n"
+        f"  {_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()} pins the toolkit at: {pinned}\n"
+        f"A VERSION BUMP MOVES THIS PIN WITH THE OTHERS; {_BUMP_LIST} lists the others."
+    )
 
 
 #: Every separate distribution under packaging/, derived so a new one is covered on arrival.

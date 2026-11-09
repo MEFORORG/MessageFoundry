@@ -9,6 +9,7 @@ in-flight outbox deliveries, and rejecting a bad/empty config without disturbing
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -504,6 +505,173 @@ async def test_engine_reload_starts_graph_when_none_loaded(tmp_path: Path) -> No
     finally:
         await eng.stop()
     assert (outdir / "MSG1.hl7").exists()
+
+
+async def test_engine_two_overlapping_first_loads_start_one_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two reloads on an engine with no graph overlap in the first load's build check, which awaits
+    a worker thread. Exactly one runner starts and the engine holds it; the second reload applies to
+    that runner. Red (engine PR 2815): both passed the check and both called add_registry, so the
+    first runner started and was orphaned, out of engine.stop()'s reach."""
+    good = tmp_path / "good"
+    _write_valid_config(good, tmp_path / "in", tmp_path / "out")
+    started: list[RegistryRunner] = []
+    real_start = RegistryRunner.start
+    real_check = RegistryRunner.build_check_off_loop
+
+    async def recording_start(self: RegistryRunner, *args: Any, **kwargs: Any) -> None:
+        started.append(self)
+        await real_start(self, *args, **kwargs)
+
+    entered: list[RegistryRunner] = []
+    both_in = asyncio.Event()
+
+    async def slow_check(self: RegistryRunner, *args: Any, **kwargs: Any) -> None:
+        # Holds each check open until the other reload has reached its own, so on the unfixed
+        # engine the two overlap every time. Bounded, because the fix keeps the second out.
+        entered.append(self)
+        if len(entered) >= 2:
+            both_in.set()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(both_in.wait(), timeout=1.0)
+        await real_check(self, *args, **kwargs)
+
+    monkeypatch.setattr(RegistryRunner, "start", recording_start)
+    monkeypatch.setattr(RegistryRunner, "build_check_off_loop", slow_check)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
+    await eng.start()
+    assert eng.registry_runner is None
+    try:
+        results = await asyncio.gather(eng.reload(good), eng.reload(good), return_exceptions=True)
+        assert not [r for r in results if isinstance(r, BaseException)], results
+        assert len(started) == 1, started
+        assert eng.registry_runner is started[0] and started[0].running
+    finally:
+        await eng.stop()
+        for orphan in started:
+            if orphan is not eng.registry_runner:
+                await orphan.stop()
+
+
+async def test_engine_first_load_does_not_start_a_runner_after_a_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop that lands while a first load awaits its threaded build check finds no runner to
+    stop. The load then installs nothing and starts nothing. Red (engine PR 2815, Lander hold
+    6698688363 item 4): the load went on to add_registry and started a runner after the stop."""
+    good = tmp_path / "good"
+    _write_valid_config(good, tmp_path / "in", tmp_path / "out")
+    started: list[RegistryRunner] = []
+    real_start = RegistryRunner.start
+    real_check = RegistryRunner.build_check_off_loop
+    in_check = asyncio.Event()
+    release = asyncio.Event()
+
+    async def recording_start(self: RegistryRunner, *args: Any, **kwargs: Any) -> None:
+        started.append(self)
+        await real_start(self, *args, **kwargs)
+
+    async def held_check(self: RegistryRunner, *args: Any, **kwargs: Any) -> None:
+        in_check.set()
+        await release.wait()
+        await real_check(self, *args, **kwargs)
+
+    monkeypatch.setattr(RegistryRunner, "start", recording_start)
+    monkeypatch.setattr(RegistryRunner, "build_check_off_loop", held_check)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
+    await eng.start()
+    load = asyncio.create_task(eng.reload(good))
+    stopped = False
+    try:
+        await asyncio.wait_for(in_check.wait(), timeout=5)
+        stopped = True
+        await eng.stop()
+        release.set()
+        with pytest.raises(RuntimeError, match="stopping"):
+            await asyncio.wait_for(load, timeout=5)
+        assert started == []
+        assert eng.registry_runner is None
+    finally:
+        release.set()
+        if not load.done():
+            load.cancel()
+        await asyncio.gather(load, return_exceptions=True)
+        for orphan in started:
+            await orphan.stop()
+        if not stopped:
+            await eng.stop()
+
+
+async def test_a_reload_a_stop_overtakes_does_not_restart_reference_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop that lands while a reload's runner swap is finishing stops the reference sync loop.
+    The reload then goes on, and must not start that loop again on a stopped engine. Red (Lander
+    hold 6702318430, item C): _reconcile_reference_sync started ReferenceSyncRunner after the
+    stop had stopped it, against the closed store."""
+    from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
+
+    good = tmp_path / "good"
+    _write_valid_config(good, tmp_path / "in", tmp_path / "out")
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
+    await eng.start()
+    await eng.reload(good)  # the first load: the runner is installed and started
+    starts_after_stop: list[ReferenceSyncRunner] = []
+    stopping = False
+    real_start = ReferenceSyncRunner.start
+
+    def recording_start(self: ReferenceSyncRunner) -> None:
+        if stopping:
+            starts_after_stop.append(self)
+        real_start(self)
+
+    runner = eng.registry_runner
+    assert runner is not None
+    real_reload = runner.reload
+    swapped = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held_reload(*args: Any, **kwargs: Any) -> tuple[tuple[str, str], ...]:
+        result = await real_reload(*args, **kwargs)
+        swapped.set()
+        await release.wait()
+        return result
+
+    reconciled_after_stop: list[bool] = []
+    real_reconcile = Engine._reconcile_reference_sync
+
+    async def recording_reconcile(self: Engine, *, startup: bool) -> None:
+        if stopping:
+            reconciled_after_stop.append(startup)
+        await real_reconcile(self, startup=startup)
+
+    monkeypatch.setattr(ReferenceSyncRunner, "start", recording_start)
+    monkeypatch.setattr(Engine, "_reconcile_reference_sync", recording_reconcile)
+    monkeypatch.setattr(runner, "reload", held_reload)
+    load = asyncio.create_task(eng.reload(good))
+    stopped = False
+    try:
+        await asyncio.wait_for(swapped.wait(), timeout=5)
+        stopping = stopped = True
+        await eng.stop()
+        release.set()
+        await asyncio.gather(load, return_exceptions=True)
+        assert reconciled_after_stop == [False]  # the control: the reload reached the reconcile
+        assert starts_after_stop == []
+    finally:
+        release.set()
+        await asyncio.gather(load, return_exceptions=True)
+        for ref in starts_after_stop:
+            await ref.stop()
+        if not stopped:
+            await eng.stop()
 
 
 def _write_env_config(cfg: Path, inbox: Path) -> None:

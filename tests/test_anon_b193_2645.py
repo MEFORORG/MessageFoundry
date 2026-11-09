@@ -16,9 +16,9 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.anon import SurrogateKind
-from messagefoundry.anon import anonymize as engine_anonymize
-from messagefoundry.anon import rules as engine_rules
+from messagefoundry_toolkit.anon import SurrogateKind
+from messagefoundry_toolkit.anon import anonymize as engine_anonymize
+from messagefoundry_toolkit.anon import rules as engine_rules
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import rules as tee_rules
 

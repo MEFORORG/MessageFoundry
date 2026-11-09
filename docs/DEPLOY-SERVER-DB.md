@@ -216,6 +216,20 @@ Vault and LDAP*.
 > | Runtime (the gMSA) | `db_datareader` + `db_datawriter`, with `UPDATE` and `DELETE` denied on `audit_log` | every start, all day |
 > | Provisioning (a DBA login) | `db_ddladmin` + `db_datareader` + `db_datawriter`, plus `ALTER` on the database for the two options | step 4 only |
 >
+> **Under `[store].key_provider = "host"`, the login `provision-admin` connects as also needs
+> `VIEW DEFINITION` on the store's schema.** Before it mints a store key, `provision-admin` reads the
+> catalog to show that the database holds no store yet, and SQL Server lists a table in `sys.tables`
+> and `sys.objects` only to a login that may see its metadata. On a database with no store yet it
+> asks this of the login's default schema and of `dbo`, the schemas a store's tables resolve
+> through, so grant it on both where they differ. `SELECT`, which `db_datareader` grants on the database,
+> is not enough: under it alone a table-level `DENY` of `SELECT` hides that table. Without the grant
+> the mint is refused and the refusal names it. Grant it on the schema that holds `schema_meta` to
+> the login that runs `provision-admin`, for example
+> `GRANT VIEW DEFINITION ON SCHEMA::[dbo] TO [CORP\some-operator];` when that schema is `dbo`.
+> Under `auth = "integrated"` that login is the Windows account that runs the command, which is
+> not the gMSA unless the command runs as it. The startup probe (§1.3) does not report it as excess,
+> so where that login is the runtime login (`auth = "sql"`), revoke the grant once the mint is done.
+>
 > **`[store].schema_management = "auto"` puts the DDL back on the runtime login.** The engine then
 > builds and upgrades its own schema at open, and the gMSA also needs `db_ddladmin` as a standing
 > grant. That is the one supported reason to grant it to the runtime login. The startup probe (§1.3)

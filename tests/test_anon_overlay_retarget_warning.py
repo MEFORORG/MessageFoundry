@@ -31,7 +31,7 @@ from types import ModuleType
 
 import pytest
 
-import messagefoundry.anon as engine_anon
+import messagefoundry_toolkit.anon as engine_anon
 import tee.anon as tee_anon
 from tests.test_anon_core import _field_of
 

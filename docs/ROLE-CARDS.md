@@ -140,8 +140,10 @@ worktree -- see section 6, where that turns out to be the whole problem.
 
 ### 2.2 The cards: `docs/roles/<seat>.card.md`
 
-One tracked file per live seat. Six of them: Manager, Builder, Watchdog, Steward,
-Lander, Special. (At the time of writing the first name was Console; the owner retired that seat on
+One tracked file per live seat. Five of them: Manager, Builder, Watchdog, Lander, Special. The
+Steward's card made a sixth until the owner said on 2026-11-05 that the seat was retired months
+earlier; the card is removed, and when the seat went is not recorded. (At the time of writing the
+first name was Console; the owner retired that seat on
 2026-09-10 and the Manager replaced it, BACKLOG #1529. The third name was Regulator until
 2026-09-19, when the owner retired it and added the Watchdog; the Watchdog is an addition and
 **not** its successor. One further seat was retired on 2026-09-05 and is deliberately not named,
@@ -307,10 +309,12 @@ Set-Content .claude/seat.local.txt 'builder'
 
 ## 4. The roster, and which document governs it
 
-Six seats: **Manager, Builder, Watchdog, Steward, Lander, Special.** That list comes from
-section 5 of `CLAUDE.md`. The **Special** seat joined 2026-09-16 by owner decision, for work
-outside the other five; it is an addition, and nothing retired to make room for it. A different
-sixth seat existed until 2026-09-05, when the owner retired it along with the `reviewed` label and
+Five seats: **Manager, Builder, Watchdog, Lander, Special.** That list comes from
+section 5 of `CLAUDE.md`. The **Steward** left it when the owner said on 2026-11-05 that the seat
+had been retired months earlier; the date is not recorded, and `seats.json` resolves the name to a
+retirement notice. The **Special** seat joined 2026-09-16 by owner decision, for work
+outside the other standing seats; it is an addition, and nothing retired to make room for it. A
+different seat existed until 2026-09-05, when the owner retired it along with the `reviewed` label and
 the review gate; it is deliberately unnamed. The **Console** held the Manager's place until 2026-09-10,
 when the owner retired it; the Manager is its replacement and **not a rename of it**, so a Console
 rule does not carry across (BACKLOG #1529).
@@ -334,10 +338,12 @@ improvement as live seats, and it says of itself that it is a partial list. Sect
 settles this directly: a document naming a retired seat is stale, and section 5 wins.
 
 **korus `roles/README.md` names the seven seats retired on 2026-09-01 in prose, and its live table
-is current.** That table runs six seats: the five here plus a **Special** seat the owner added on
-2026-09-16 as an addition, not a replacement. Section 5 still settles the roster for this
+was current when this section was written.** That table then ran six seats, among them a
+**Special** seat the owner added on 2026-09-16 as an addition, not a replacement. At korus
+`origin/main` on 2026-11-05 it still listed the Steward, which this repository retired that day;
+korus records that retirement in its own change, not here. Section 5 still settles the roster for this
 repository: it is the **naming** of a retired seat that goes stale, not the whole document that
-names one on purpose, so the cards follow section 5's six.
+names one on purpose, so the cards follow section 5's roster.
 
 *The 2026-09-18 pass claimed that README "opens with a STOP banner", puts the seven in "one row
 marked RETIRED", and that "the whole table is superseded". All three were false. Checked with the
@@ -352,7 +358,7 @@ also added `roles/README.md`; korus itself was initialised 35 minutes earlier). 
 separate, later owner ruling that they are READ at `origin/main` -- conflating the two dates the
 move two days late, which this document and a test docstring both did.
 
-**Every live seat has a korus playbook, and all six cards cite one.** Measured at korus
+**Every live seat had a korus playbook, and all six cards then cited one.** Measured at korus
 `origin/main`, tip `efd7b42`, 2026-09-19: `roles/SPECIAL.md` 248 lines, `roles/WATCHDOG.md` 398,
 `roles/MANAGER.md` 459, `roles/BUILDER.md` 1,077, `roles/LANDER.md` 1,500, `roles/STEWARD.md`
 1,545. Control, run the same way so it can fail on its own: `roles/NOTASEAT.md` returns 404.
@@ -558,7 +564,7 @@ Test-driven: the tests were written first and watched fail before any of the cod
 | A sixth role card | For the seat the owner retired the same day (`12063c91e`), deliberately unnamed here per owner instruction 2026-09-16. |
 | `docs/roles/builder.card.md` | Role card |
 | `docs/roles/regulator.card.md` | Role card. Its playbook is korus `roles/REGULATOR.md`, which existed on 2026-09-02 and which the card cites. |
-| `docs/roles/steward.card.md` | Role card |
+| `docs/roles/steward.card.md` | Role card. Removed on 2026-11-05, when the owner said the Steward seat had been retired. |
 | `docs/roles/lander.card.md` | Role card |
 | `scripts/hooks/role-card-inject.ps1` | The SessionStart hook |
 | `tests/test_role_cards.py` | The suite |
@@ -569,8 +575,8 @@ from #970 as `1584742b2` on 2026-09-08. So no single commit matches this table, 
 heading names the branch commit rather than the merge.
 
 `seats.json` has since gained a fourth map, `elsewhere`, and its roster key was renamed from `seats`
-to `live`. The shipped card set today is `builder`, `lander`, `manager`, `special`, `steward` and
-`watchdog`.
+to `live`. The shipped card set today is `builder`, `lander`, `manager`, `special` and `watchdog`,
+`steward.card.md` having been removed when the owner said on 2026-11-05 that the Steward was retired.
 
 **That last sentence read "`manager`, `builder`, `regulator`, `steward`, `lander`" until 2026-09-20,
 and it was wrong at both ends.** It named a card that does not exist and omitted two that do.

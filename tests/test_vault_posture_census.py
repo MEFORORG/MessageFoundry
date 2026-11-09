@@ -285,6 +285,8 @@ _CENSUS: list[Row] = sorted(
         ("__main__.py", "_backup.run", "open_store", "posture"),
         ("__main__.py", "_build_provision_auth_service", "resolve_secret_provider", "posture"),
         ("__main__.py", "_check_privileges", "probe_vault", "posture"),
+        # vault BACKLOG #2609: issue-enrolment-code opens the store on the command's posture.
+        ("__main__.py", "_issue_enrolment_code.run", "open_store", "posture"),
         ("__main__.py", "_admin_reset_totp.notice", "_offline_security_notifier", "posture"),
         ("__main__.py", "_offline_security_notifier", "resolve_secret_provider", "posture"),
         ("__main__.py", "_provision_admin.run", "_offline_security_notifier", "posture"),
@@ -308,6 +310,7 @@ _CENSUS: list[Row] = sorted(
         ("__main__.py", "_provision_admin", "build_store_cipher", "posture"),
         ("__main__.py", "_provision_admin.administrator_exists", "open_store", "posture"),
         ("__main__.py", "_provision_admin.run", "open_store", "posture"),
+        ("__main__.py", "_provision_admin.server_store_found", "open_store", "posture"),
         ("__main__.py", "_renew_api_tls_before_spawning._audit", "open_store", "posture"),
         ("__main__.py", "_rotate_key", "resolve_active_key", "posture"),
         ("__main__.py", "_rotate_key.run", "open_store", "posture"),

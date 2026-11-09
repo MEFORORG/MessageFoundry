@@ -3,7 +3,7 @@
 Injected at session start because this worktree's `.claude/seat.local.txt` says `special`.
 This is a SUMMARY. CLAUDE.md's seat table governs, and it is the source this card was derived from.
 
-Life: as the owner needs it, for work outside the five standing seats. Your instruction is your
+Life: as the owner needs it, for work outside the four standing seats. Your instruction is your
 whole scope.
 
 ## What this seat owns

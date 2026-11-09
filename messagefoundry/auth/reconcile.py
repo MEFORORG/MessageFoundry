@@ -232,6 +232,14 @@ MISCONFIGURED_ABORT = "directory_misconfigured"
 PAGING_DEADLINE = "group_search_deadline"
 PAGING_CAP = "group_search_cap"
 
+#: The reason slug of an account whose own probe failed to reach the directory, read
+#: :attr:`ProbeOutcome.UNAVAILABLE` with no paging cause, on ``[auth].ad_reconcile_outage_passes``
+#: of its probes running (BACKLOG #3100 closing step 2). The whole-directory outage has its own
+#: page (:data:`OUTAGE_ABORT`); this is the bound on one account the directory keeps failing to
+#: answer for, which is never struck or revoked while that lasts. It pages once per account as it
+#: enters that state (``AuthService._note_unreached_accounts``).
+UNREACHED_ACCOUNT = "account_unreachable"
+
 #: The outcomes that judge nothing about the account: no strike, no recorded outcome (rule item 4).
 _UNJUDGED = frozenset(
     {
@@ -338,6 +346,19 @@ class ReconcilePlan:
     #: :data:`PAGING_DEADLINE` or :data:`PAGING_CAP`. An account already in that state is not
     #: here, so each pages once per state change. Set on every pass, an outage-shaped one included.
     paging_refused: tuple[tuple[str, str, str], ...] = ()
+    #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3100 closing
+    #: step 2): ``(user_id, username, probes)`` of each account that has just ENTERED the state
+    #: :data:`UNREACHED_ACCOUNT` names, ``probes`` being how many of its probes running read it
+    #: unreachable. An account already in that state is not here, so each pages once per state
+    #: change. An outage-shaped pass can carry entries, where its probe sample held only
+    #: unreachable accounts, but none on a pass that raises the lasting outage page or while that
+    #: page stands (``AuthService._note_unreached_accounts``).
+    unreached: tuple[tuple[str, str, int], ...] = ()
+    #: Set with ``unreached`` (BACKLOG #3100): True when the accounts already paged and those
+    #: entering are more than ``AuthService``'s fixed rollup bound, so the lifespan task pages once
+    #: for those entering rather than once per account. A directory that answers only a few probes
+    #: in each pass would otherwise open an instance per signed-in account.
+    unreached_rollup: bool = False
     #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3709): how many
     #: passes running, this one included, have read the directory unreachable
     #: (:attr:`directory_outage`), in this process. 0 on a pass that reached it. A pass whose
@@ -403,13 +424,25 @@ class ReconcilePlan:
         )
 
     @property
+    def reached_directory(self) -> bool:
+        """True when the pass shows the directory was reached: it asked something, not every probe
+        failed (:attr:`directory_outage`), and not every probe failed or faulted
+        (:attr:`probe_fault`), since a fault says nothing about reach. A pass of referrals or
+        configuration refusals only reached it. The outage run reads it (BACKLOG #3709). An
+        account's unreached run does not: it counts on every pass that probes the account, an
+        outage pass included (BACKLOG #3100, ``AuthService._note_unreached_accounts``)."""
+        return self.asked > 0 and not self.directory_outage and not self.probe_fault
+
+    @property
     def judged(self) -> int:
         """The mass-revoke breaker's denominator: every probe of the pass. The breaker's decision and
         the ceiling an operator is told both use this, so a change to the rule lands here once.
 
         Held probes stay in (ADR 0195 amendment 2026-10-11, BACKLOG #2138, a seat decision under
         owner delegation 2026-10-08, not an owner ruling), and so do referred ones (BACKLOG #2538).
-        The amendment says why, and what the dilution costs."""
+        The amendment says why, and what the dilution costs. So does every other unjudged probe,
+        at least a faulted, a misconfigured and an unavailable one (BACKLOG #3100, #3010): the
+        denominator is every candidate the pass took, whatever it read."""
         return self.probed
 
 
