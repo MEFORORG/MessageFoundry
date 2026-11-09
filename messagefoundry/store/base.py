@@ -3581,21 +3581,20 @@ def resolve_decrypt_keys(
             # Copied here, so a provider whose sequence reads as it is iterated is refused here too.
             retired_keys = list(provider.retired_keys())
         except Exception as exc:
+            # The traceback of whatever leaves keeps this frame, the judgement's own escape
+            # included, so the key the provider answered is dropped first; assigned rather than
+            # deleted, since the call that raised may have left it unbound.
+            active = None
             caught, refusal = exc, _codec_safe_refusal(exc)
         else:
             return _keyring(active, retired_keys)
-        # The refusal's traceback keeps this frame, so the active key is dropped from it first;
-        # assigned rather than deleted, since the call that raised may have left it unbound.
-        active = None
-        # As at :func:`resolve_active_key`.
+        # As at :func:`resolve_active_key`, and with neither the caught error nor the refusal left
+        # bound, even where the call raises, so no cycle through this frame keeps either.
         try:
             refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
-        finally:
-            del caught  # dropped even where the call raises, at the recursion limit included
-        try:
             raise refusal from None
         finally:
-            del refusal  # no cycle through this frame keeps it once a caller drops it
+            del caught, refusal
     finally:
         _flush_unjudged()
 
@@ -3658,19 +3657,15 @@ def build_store_cipher(
         try:
             return _build_store_cipher(settings, posture, host_key)
         except Exception as exc:
+            del host_key  # the store data key, dropped first, as at resolve_decrypt_keys
             caught, refusal = exc, _codec_safe_refusal(exc)
-        # The refusal's traceback keeps this frame, so the store data key is dropped from it first.
-        del host_key
-        # As at :func:`resolve_active_key`. A hop refusal is a ``StoreCipherConfigError`` here, as
-        # every ``ValueError`` from the build is, so each command's key arm still reports it.
+        # As at :func:`resolve_decrypt_keys`. A hop refusal is a ``StoreCipherConfigError`` here,
+        # as every ``ValueError`` from the build is, so each command's key arm still reports it.
         try:
             refusal = _in_place_of(caught, refusal, texts, StoreCipherConfigError)
-        finally:
-            del caught  # as at resolve_active_key
-        try:
             raise refusal from None
         finally:
-            del refusal  # as at resolve_decrypt_keys
+            del caught, refusal
     finally:
         _flush_unjudged()
 
@@ -4614,7 +4609,12 @@ async def open_store(
         read_only=read_only,
         recovery_wrap=recovery_wrap,
     )
-    cipher = build_store_cipher(settings, posture=posture, host_key=host_key)
+    try:
+        cipher = build_store_cipher(settings, posture=posture, host_key=host_key)
+    finally:
+        # The store data key, dropped whether the build refused or not, so no traceback through
+        # this frame, the build's refusal or a later open error, holds it.
+        del host_key
     setter = getattr(cipher, "set_refusal_hook", None)
     if refusal_hook is not None and callable(setter):
         setter(refusal_hook)
