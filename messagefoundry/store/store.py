@@ -19274,10 +19274,18 @@ class MessageStore:
     ) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, inside the caller's writer
         transaction (BACKLOG #2592), and report the raise, or ``None`` where none was written
-        (:meth:`EpochBump.raised`, BACKLOG #4975). An account whose record fails its seal is
-        refused on every read already, so the revoke that called this goes ahead without the
-        raise, and reports none: ending sessions needs no key, and refusing it would keep them
-        live."""
+        (:meth:`EpochBump.raised`, BACKLOG #4975). On every refusal :func:`revoke_seal_refusals`
+        names, the revoke that called this goes ahead without the raise and reports none: ending
+        sessions needs no key, and refusing the revoke would keep them live.
+
+        Not every such account is refused on every read (SDS-3.7, decision
+        d20261109T200352805-599b24 item 6). A Forged or Unverifiable record is. An Outage is not:
+        a read whose Holds answer the Transit sealer cached within
+        :data:`~messagefoundry.store.row_seal.TRANSIT_SEAL_CACHE_TTL_SECONDS` is served without
+        calling Transit, and a read after Transit recovers is served as usual. So after an Outage
+        the account may still be read, its sessions are ended here, and the epoch raise that
+        would stop an older copy of a session row resolving is missing until the owed raise is
+        built (ADR 0217 (b))."""
         return await raise_account_epoch(
             lambda bump: self._write_user(user_id, bump), outcome, user_id
         )
