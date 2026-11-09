@@ -5872,8 +5872,7 @@ the sign-in lock. The route's courtesy check, `must_enrol_before_rotating`, asks
 current password: `_has_way_past` counts TOTP or a passkey recorded as discoverable under the
 configured `rp_id` (ADR 0197 Amendment A, wave 2; BACKLOG #3937). The rotation itself reads the
 passkey set through the same verified read before it hashes, and refuses an account with no TOTP
-on and no such passkey there. A set that does not parse or fails its seal counts for nothing, the
-seal failure reported, and the TOTP is judged there too. Otherwise the rotation leaves the TOTP to
+on and no such passkey there. Otherwise the rotation leaves the TOTP to
 the store's conditional write, which judges the cell it writes against (BACKLOG #3948 finding 13).
 That write refuses a KNOWN refusal only where no passkey counts either, and without the
 `[webauthn]` extra it counts no passkey, as `_has_way_past` counts none. One whose passkeys are
