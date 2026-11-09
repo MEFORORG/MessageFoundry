@@ -1816,5 +1816,9 @@ def test_the_refusal_traceback_holds_no_frame_local_of_the_error(
     rendered = "".join(
         traceback.TracebackException.from_exception(escaped, capture_locals=True).format()
     )
-    assert "refusal =" in rendered  # the control: the site's own frame locals were rendered
+    # The control: the site's own frame locals were rendered. ``posture`` is the site's parameter,
+    # and no other frame on the traceback has one; ``build_store_cipher`` and
+    # ``resolve_decrypt_keys`` no longer keep ``refusal`` there to read (the Lander's hold on PR
+    # 2804).
+    assert "posture =" in rendered
     _assert_no_key_byte(rendered)

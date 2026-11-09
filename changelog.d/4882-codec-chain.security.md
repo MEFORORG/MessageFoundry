@@ -30,8 +30,12 @@
   are cleared through `BaseException`'s own descriptors, so an interrupt class's own `__setattr__`
   does not run. (`BACKLOG #4882`, `BACKLOG #3471`)
 - **Every other error from the store cipher build or the store key resolution is replaced by a new
-  refusal with a fixed text the site chooses, raised after the handler has exited, and nothing is
-  passed through.** The class of every refusal at these sites, the previous bullet's included,
+  refusal with a fixed text the site chooses, raised after the handler has exited, and nothing
+  from the provider or the build is passed through at either site. What runs once the provider
+  has answered is not judged: the key check at `resolve_active_key`, whose refusals the engine
+  built and raises as built, and the keyring's assembly at `resolve_decrypt_keys`. The store
+  open's own key custody step differs, as the end of this bullet says.** The class of every
+  refusal at these sites, the previous bullet's included,
   depends on the codec judgement. An error the judgement refuses, one with a codec error on it, one
   whose chain cannot be read whole or one whose judgement raised, takes the previous bullet's two
   classes, so a hop refusal holding a codec error is a `StoreCipherConfigError` and a `DpapiError`
@@ -56,7 +60,16 @@
   own text, and the site drops the error, so no frame local of the refusal's traceback holds the
   error itself. The class of a replaced error the engine did not build, and of its cause, is logged
   as a WARNING by name alone. Before, a `ValueError` from the build was refused with its own text,
-  and an error of any other class passed through as it was. (`BACKLOG #4882`)
+  and an error of any other class passed through as it was. At the open, under every key provider,
+  the key custody step runs inside one guard: a `KeyProviderError` the engine built and recorded is
+  re-raised as it is, and any other `Exception` from the step, a `ValueError` included, is replaced
+  by a `HostCustodyRefused`, raised with no cause or context, unless building that refusal raises,
+  which then leaves in its place. Of the replaced error, the guard logs at most its class name. A
+  `BaseException` that is not an `Exception` is not caught there, and a check before the guard
+  raises a `ValueError` with a fixed text where a caller passes a host blob or a recovery wrap
+  under any key provider but `host`. What the step itself reads, converts, settles and refuses is
+  defined by `load_host_custody` and `_host_custody_steps` (`messagefoundry/store/custody_host.py`,
+  `messagefoundry/store/base.py`); this entry does not restate it. (`BACKLOG #4882`)
 - **The PostgreSQL store's TLS context refusal at the open, `StoreTlsRefused`, carries a fixed text
   that names `[store].ssl_root_cert`, `[store].ssl_crl_file` and the hop's suites, and reads
   nothing from the context builder's `ValueError`.** Before, it carried that error's text, which

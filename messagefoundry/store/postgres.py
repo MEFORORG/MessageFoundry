@@ -54,6 +54,7 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import ssl
 import time
@@ -115,6 +116,7 @@ from messagefoundry.store.base import (
     _flush_unjudged,
     acquire_pooled,
     driver_sqlstate,
+    seed_filter_clause,
     warm_pool_connections,
     warm_pool_target,
     warn_stale_schema_read_only,
@@ -317,7 +319,9 @@ from messagefoundry.store.store import (
     birth_notify_email,
     build_audit_mac_keys,
     check_caller_event_kind,
+    check_open_store_pin,
     check_password_generated,
+    create_batch_failure,
     delivery_key,
     enrolment_code_issue,
     enrolment_code_revoke,
@@ -1456,6 +1460,37 @@ def _relkind_label(kind: str | None, wanted: tuple[str, ...], label: str) -> str
     return label if kind in wanted else _RELKINDS.get(kind, f"relation of kind {kind!r}")
 
 
+#: A search_path element that names one schema: an unquoted simple name, or a quoted one.
+_SIMPLE_SCHEMA_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+_QUOTED_SCHEMA_NAME = re.compile(r'"((?:[^"]|"")+)"')
+
+
+def _search_path_schemas(path: str, role: str) -> list[str] | None:
+    """The schemas a ``search_path`` setting names, read as Postgres reads them: ``$user`` as
+    ``role``, an unquoted simple name folded to lower case, a quoted one as written. ``None`` for
+    any other element, such as a hyphenated or dotted name or a quoted name a comma split, so a
+    caller reads a path it cannot parse as "cannot show" (PR 2804 fifteenth hold)."""
+    schemas: list[str] = []
+    for element in path.split(","):
+        # Postgres skips ASCII whitespace alone (PR 2804 sixteenth hold); any other space stays in
+        # the element, so it fails the name patterns and reads as "cannot show". A vertical tab,
+        # which PostgreSQL 16 and later also skip, reads as "cannot show" too: closed, not open.
+        item = element.strip(" \t\n\r\f")
+        if not item:
+            continue
+        if item in ("$user", '"$user"'):
+            schemas.append(role)
+            continue
+        quoted = _QUOTED_SCHEMA_NAME.fullmatch(item)
+        if quoted is not None:
+            schemas.append(quoted.group(1).replace('""', '"'))
+            continue
+        if _SIMPLE_SCHEMA_NAME.fullmatch(item) is None:
+            return None
+        schemas.append(item.lower())
+    return schemas
+
+
 def _declared_schema() -> ServerSchemaShape:
     """What the live-schema check expects: the batch, then every index the migration builds or drops,
     with each column's type and nullability as PostgreSQL's catalog spells them."""
@@ -2152,6 +2187,7 @@ class PostgresStore:
         try:
             await store._ensure_schema(create=create, read_only=read_only)
             if not read_only:
+                await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
@@ -2266,6 +2302,53 @@ class PostgresStore:
             yield store
         finally:
             await store.close()
+
+    @classmethod
+    async def schema_meta_anywhere(
+        cls, settings: StoreSettings, *, posture: HopPosture | None = None
+    ) -> bool | None:
+        """Whether a schema this connection's search_path names holds a relation or type under
+        a table or index name :func:`_declared_schema` declares (PR 2804 fourteenth to sixteenth holds), or ``None`` when
+        that cannot be shown. The path is ``db_schema`` when it is set, else the role's own path, read
+        by :func:`_search_path_schemas`; an element it cannot read as one schema name, or a path
+        that names none, is ``None``. Names are bound as ``text[]`` and cast to ``name[]`` in SQL,
+        which truncates as Postgres does, where a bound ``name`` too long is refused.
+        Read from ``pg_catalog.pg_class``, which lists every relation to every role whatever its
+        schema privileges, where ``to_regclass`` skips a schema the role has no USAGE on. A schema
+        the path does not name, such as another install's ``db_schema``, is not asked. A missing
+        row is ``None``. Reads only."""
+        async with (
+            cls._one_connection_store(settings, posture=posture) as store,
+            store._timed_acquire() as conn,
+        ):
+            setting = await conn.fetchrow(
+                "SELECT current_setting('search_path') AS path, current_user::text AS who"
+            )
+            if setting is None:
+                return None
+            schemas = _search_path_schemas(str(setting["path"]), str(setting["who"]))
+            # An index shares the relation namespace, so its name collides as a table's does.
+            declared = _declared_schema()
+            tables = sorted({*declared.columns, *declared.named_indexes})
+            if not schemas or not tables:
+                return None
+            # Any relation or type under a store table's name, a view, sequence or enum
+            # included: each breaks the create as a table does (PR 2804 sixteenth hold).
+            row = await conn.fetchrow(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c"
+                " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+                " WHERE n.nspname = ANY($1::text[]::name[])"
+                " AND c.relname = ANY($2::text[]::name[]))"
+                " OR EXISTS (SELECT 1 FROM pg_catalog.pg_type t"
+                " JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace"
+                " WHERE n.nspname = ANY($1::text[]::name[])"
+                " AND t.typname = ANY($2::text[]::name[])) AS found",
+                schemas,
+                tables,
+            )
+        if row is None or row["found"] is None:
+            return None
+        return bool(row["found"])
 
     @classmethod
     async def probe_privileges(
@@ -2405,9 +2488,15 @@ class PostgresStore:
                 except Exception as exc:
                     # 55P03 is lock_not_available (asyncpg's LockNotAvailableError), read off the
                     # error rather than by importing the lazy driver.
+                    translated = None
                     if driver_sqlstate(exc) == _LOCK_NOT_AVAILABLE:
-                        raise SchemaDdlLockTimeout(self.backend, lock, wait) from exc
-                    raise
+                        translated = SchemaDdlLockTimeout(self.backend, lock, wait)
+                    # Raised inside the transaction, before its commit, so the batch rolls back
+                    # and nothing was sealed under a minted key (PR 2804 hold 17).
+                    failure = create_batch_failure(exc, translated)
+                    if failure is exc:
+                        raise
+                    raise failure from failure.__cause__
         log.info("postgres: schema DDL batch applied (%s…)", expected[:12])
         return True
 
@@ -11638,6 +11727,34 @@ class PostgresStore:
             audit=await self._count("audit_log"),
             synchronous=None,  # SQLite-only knob; Postgres WAL durability is not a per-store PRAGMA
         )
+
+    async def table_occupancy(self) -> dict[str, bool]:
+        """See :meth:`Store.table_occupancy`: the ordinary and partitioned tables in the schema
+        that holds the store's own ``schema_meta`` (``pg_catalog.to_regclass`` resolves the
+        unqualified name through the pool's ``search_path``), less the tables an extension owns
+        (a ``pg_depend`` row of type ``e``). A table of another owner there still counts: a later
+        ``provision-schema`` run under another role may have made a store table. Read from
+        ``pg_catalog`` by the stored name; each probe names the schema too, because an
+        unqualified name would resolve through ``pg_catalog`` first."""
+        rows = await self._fetchall(
+            "SELECT n.nspname AS s, c.relname AS t FROM pg_catalog.pg_class c"
+            " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+            " JOIN pg_catalog.pg_class m ON m.oid = pg_catalog.to_regclass('schema_meta')"
+            " WHERE c.relkind IN ('r', 'p') AND c.relnamespace = m.relnamespace"
+            " AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d"
+            " WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = c.oid"
+            " AND d.deptype = 'e')"
+        )
+        occupancy: dict[str, bool] = {}
+        for row in rows:
+            schema, table = str(row["s"]), str(row["t"])
+            qualified = ".".join('"' + name.replace('"', '""') + '"' for name in (schema, table))
+            occupancy[table] = bool(
+                await self._fetchval(
+                    f"SELECT EXISTS (SELECT 1 FROM {qualified}{seed_filter_clause(table)})"
+                )
+            )
+        return occupancy
 
     async def integrity_check(self) -> tuple[bool, str]:
         # A connectivity probe; deep checks (amcheck / pg_amcheck) are an out-of-band DBA task.

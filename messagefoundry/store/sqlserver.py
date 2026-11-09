@@ -37,6 +37,7 @@ import json
 import logging
 import math
 import queue
+import re
 import time
 from collections.abc import (
     AsyncIterator,
@@ -100,8 +101,10 @@ from messagefoundry.store.base import (
     SchemaNotProvisionedError,
     SchemaProvisionResult,
     StoreNotFoundError,
+    TableCensusIncomplete,
     acquire_pooled,
     driver_sqlstate,
+    seed_filter_clause,
     warm_pool_connections,
     warm_pool_target,
     warn_stale_schema_read_only,
@@ -320,7 +323,9 @@ from messagefoundry.store.store import (
     birth_notify_email,
     build_audit_mac_keys,
     check_caller_event_kind,
+    check_open_store_pin,
     check_password_generated,
+    create_batch_failure,
     delivery_key,
     enrolment_code_issue,
     enrolment_code_revoke,
@@ -2881,6 +2886,10 @@ def _schema_hash() -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+#: A constraint the batch names, as ``CONSTRAINT pk_state`` (PR 2804 sixteenth hold).
+_NAMED_CONSTRAINT = re.compile(r"\bCONSTRAINT\s+\[?(\w+)", re.IGNORECASE)
+
+
 def _declared_schema() -> ServerSchemaShape:
     """What the live-schema check expects: every object the batch declares (BACKLOG #1720), with
     each column's type, nullability, numbering and declared collation (BACKLOG #5085)."""
@@ -4010,6 +4019,7 @@ class SqlServerStore:
                 # proc gate (it reads that outcome). A miss logs and no-ops — never an outage.
                 await store._gate_claim_prepared()
             if not read_only:
+                await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
@@ -4951,9 +4961,16 @@ class SqlServerStore:
                         )
                         await cur.execute(_LOCK_TIMEOUT_RESET)
                     except Exception as exc:
+                        translated = None
                         if _is_lock_timeout(exc):
-                            raise SchemaDdlLockTimeout(self.backend, _SCHEMA_LOCK, wait) from exc
-                        raise
+                            translated = SchemaDdlLockTimeout(self.backend, _SCHEMA_LOCK, wait)
+                        # Before the commit: the rollback below undoes the batch, and nothing was
+                        # sealed under a minted key (PR 2804 hold 17). A rollback that fails
+                        # raises its own error instead, and the key is kept.
+                        failure = create_batch_failure(exc, translated)
+                        if failure is exc:
+                            raise
+                        raise failure from failure.__cause__
                     await self._commit(conn)
                     log.info("sqlserver: schema DDL batch applied (%s…)", expected[:12])
                     return True
@@ -5244,6 +5261,55 @@ class SqlServerStore:
             yield store
         finally:
             await store.close()
+
+    @classmethod
+    async def schema_meta_anywhere(
+        cls, settings: StoreSettings, *, posture: HopPosture | None = None
+    ) -> bool | None:
+        """Whether the schemas ``OBJECT_ID`` resolves through, the login's default schema and
+        ``dbo``, hold an object under a table name :func:`_declared_schema` declares or a
+        constraint name the batch gives (PR 2804
+        fourteenth to sixteenth holds), or ``None`` when this login cannot show that. A missing
+        row is ``None``. ``sys.objects`` lists only what the login may see, so its answer counts
+        only where ``HAS_PERMS_BY_NAME`` shows ``VIEW DEFINITION`` held on both schemas; a NULL,
+        an answer that could not be given, counts as not shown. Even then, at least a table-level
+        ``DENY`` of ``VIEW DEFINITION`` on such a table itself can still hide one. Reads
+        only."""
+        found: bool | None = None
+        # A named constraint is a schema-wide object, so its name collides as a table's does.
+        constraints = {name for each in _SCHEMA for name in _NAMED_CONSTRAINT.findall(each)}
+        tables = tuple(sorted({*_declared_schema().columns, *constraints}))
+        if not tables:
+            return None
+        async with (
+            cls._one_connection_store(settings, posture=posture) as probe,
+            probe._acquire() as conn,
+            probe._cursor(conn) as cur,
+        ):
+            try:
+                await cur.execute(
+                    "SELECT HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), N'SCHEMA',"
+                    " N'VIEW DEFINITION'),"
+                    " HAS_PERMS_BY_NAME(N'[dbo]', N'SCHEMA', N'VIEW DEFINITION')"
+                )
+                row = await cur.fetchone()
+                if row is not None and row[0] == 1 and row[1] == 1:
+                    marks = ", ".join("?" for _ in tables)
+                    # Any object under a store table's name, a view or synonym included:
+                    # each breaks the create as a table does (PR 2804 sixteenth hold).
+                    await cur.execute(
+                        "SELECT COUNT(*) FROM sys.objects"
+                        f" WHERE name IN ({marks})"
+                        " AND schema_id IN (SCHEMA_ID(), SCHEMA_ID(N'dbo'))",
+                        tables,
+                    )
+                    counted = await cur.fetchone()
+                    found = None if counted is None else bool(counted[0])
+                await probe._commit_read(conn)  # a read snapshot: not a counted write txn
+            except Exception:
+                await conn.rollback()
+                raise
+        return found
 
     @classmethod
     async def probe_privileges(
@@ -16231,6 +16297,58 @@ class SqlServerStore:
             audit=await self._count("audit_log"),
             synchronous=None,  # SQLite-only knob; SQL Server durability rides journal_mode (recovery model)
         )
+
+    async def table_occupancy(self) -> dict[str, bool]:
+        """See :meth:`Store.table_occupancy`: the tables in the schema that holds the store's own
+        ``schema_meta``, as ``OBJECT_ID`` resolves the unqualified name (the login's default
+        schema, then ``dbo``, as the store's DDL resolved it), read from ``sys.tables`` less the
+        tables SQL Server ships (``is_ms_shipped``) and external ones (``is_external``: a probe
+        of one would run a remote query), each probed for one row through its bracket-quoted,
+        schema-qualified name.
+
+        ``sys.tables`` lists only the tables the login may see the metadata of. Without
+        ``VIEW DEFINITION`` on that schema (held directly, through a role or from the database) it
+        raises :class:`TableCensusIncomplete` rather than report a census a gap may have cut
+        short. ``SELECT``, which ``db_datareader`` grants on the database, does not stand in for
+        it: under it alone a table-level ``DENY`` of ``SELECT`` hides that table from
+        ``sys.tables``. What
+        the check does not show is stated on :meth:`Store.table_occupancy`."""
+        anchor = await self._fetchone(
+            "SELECT a.s, HAS_PERMS_BY_NAME(QUOTENAME(a.s), N'SCHEMA', N'VIEW DEFINITION') AS vd"
+            " FROM (SELECT OBJECT_SCHEMA_NAME(OBJECT_ID(N'schema_meta', N'U')) AS s) AS a"
+        )
+        if anchor is None or anchor["s"] is None:
+            return {}
+        store_schema = str(anchor["s"])
+        if anchor["vd"] is None:
+            raise TableCensusIncomplete(
+                f"SQL Server did not answer whether this login may view schema {store_schema!r},"
+                " so whether the store holds data cannot be read"
+            )
+        if anchor["vd"] != 1:
+            raise TableCensusIncomplete(
+                f"this login does not hold the view definition permission on schema"
+                f" {store_schema!r}, so SQL Server may hide a table there that holds rows, and"
+                " whether the store holds data cannot be read. Grant this login view definition"
+                " on that schema (select, which the db_datareader role grants on the database, is"
+                " not enough)"
+            )
+        rows = await self._fetchall(
+            "SELECT t.name AS t FROM sys.tables t"
+            " WHERE t.is_ms_shipped = 0 AND t.is_external = 0 AND t.schema_id = SCHEMA_ID(?)",
+            (store_schema,),
+        )
+        occupancy: dict[str, bool] = {}
+        for row in rows:
+            table = str(row["t"])
+            qualified = ".".join(
+                "[" + name.replace("]", "]]") + "]" for name in (store_schema, table)
+            )
+            held = await self._fetchone(
+                f"SELECT TOP (1) 1 AS held FROM {qualified}{seed_filter_clause(table)}"
+            )
+            occupancy[table] = held is not None
+        return occupancy
 
     async def integrity_check(self) -> tuple[bool, str]:
         # A connectivity/consistency probe; deep checks (DBCC CHECKDB) are an out-of-band DBA task.
