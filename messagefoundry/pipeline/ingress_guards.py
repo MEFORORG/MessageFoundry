@@ -585,8 +585,9 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
     inbound to guard for; a re-route whose origin inbound is not registered is refused with a 409
     before this runs. Only the engine-wide rules apply then, the NUL rule and the engine ceiling, and
     ``raw`` is returned as is. Strict validation is an inbound's setting, so it never applies there
-    either. ``EditResendRequest.raw``'s ``max_length`` already bounds that body below the ceiling, so
-    the ceiling there is a backstop.
+    either. The API's 1 MiB request cap already bounds that body below the ceiling, since the API
+    refuses any body that does not declare one plain ``Content-Length``, so the ceiling there is a
+    backstop.
 
     **Not mirrored, and a resubmission can therefore still differ from a sender's body:** document
     detach. A streaming inbound raises ``max_message_bytes`` to pay for a detach this path does not do,

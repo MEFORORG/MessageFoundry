@@ -1,12 +1,13 @@
-- **The API's request body limit reads every `Transfer-Encoding` line, not only the first.** A
+- **The API's request body limit refuses any `Transfer-Encoding`, and a `Content-Length` that is not
+  one plain number.** The limit matched `chunked` in the first `Transfer-Encoding` line only. A
   request carrying `Transfer-Encoding: gzip` and then a second `Transfer-Encoding: chunked` line is
-  framed as chunked by the llhttp parser `serve` pins, but the limit read only the first line and
-  saw `gzip`. With no `Content-Length` it admitted the chunked body at any size, so a public route
-  that reads a body, such as `POST /auth/login`, would read it unbounded before any
-  authentication; a gated route refuses a caller with no identity before reading the body. With a
-  `Content-Length`, the limit skipped its ambiguous-framing 400 on a server other than llhttp. Such
-  a request is now refused **411** without a `Content-Length`, and **400** with one, as a single
-  `chunked` line is. [SECURITY.md](../docs/SECURITY.md) now also says that under `serve`
-  malformed chunked framing gets llhttp's own 400, and
-  [DEPLOYMENT.md](../docs/DEPLOYMENT.md) no longer lists every repeated `Transfer-Encoding` among
-  the shapes llhttp refuses. (vault `BACKLOG #5345`, added items 1 and 2)
+  framed as chunked by the llhttp parser `serve` pins, so with no `Content-Length` the limit admitted
+  the chunked body at any size: a public route that reads a body, such as `POST /auth/login`, would
+  read it unbounded before any authentication; a gated route refuses a caller with no identity
+  before reading the body. Under `serve`, an empty `Transfer-Encoding` beside a `Content-Length`
+  also reached a route. The limit also read the length with `int()`, which takes `+2`, `-5` and
+  `0_2`, and read only the first of several `Content-Length` lines. Now any `Transfer-Encoding`
+  line, whatever its value, is refused **411**, or **400** beside a `Content-Length`; a
+  `Content-Length` must be one line of plain decimal digits or the request is refused **400**; and
+  the 1 MiB cap on the declared length is unchanged. [SECURITY.md](../docs/SECURITY.md) control 5
+  states the rule. (vault `BACKLOG #5345`)

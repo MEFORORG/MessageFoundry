@@ -156,8 +156,9 @@ connection. For most shapes llhttp refuses the request head before any engine co
 `400` is the only response.
 
 The two chunk shapes in the last row fail in the body instead. The engine starts handling a request
-once its head is read, and it answers any chunked body with `411` from the head alone. When the bad
-body arrives in the same read as the head, the engine writes only the `400`, and nothing after it.
+once its head is read, and it answers any request carrying `Transfer-Encoding` with `411` from the
+head alone. When the bad body arrives in the same read as the head, the engine writes only the
+`400`, and nothing after it.
 When the head arrives first and the bad body later, the engine can send its `411` and then the
 `400`: two responses to one request. Rule 1 below keeps a proxy clear of this, because a proxy that
 sends one `Content-Length` never forwards a chunked body.
@@ -168,7 +169,7 @@ socket, and its `_REFUSED` table holds the exact bytes.
 
 | A request that carries | What your proxy must do |
 |---|---|
-| Both `Content-Length` and `Transfer-Encoding` | Refuse it. Do not forward it with either header removed. |
+| Both `Content-Length` and `Transfer-Encoding` | Refuse it. Do not forward it with either header removed. llhttp passes an empty `Transfer-Encoding` beside a `Content-Length`; the engine then answers `400` itself. |
 | `Transfer-Encoding: chunked` on two lines, or `Transfer-Encoding` as a list whose last coding is not `chunked`, or `identity`, or a list ending in an empty element | Refuse it. |
 | `Content-Length` twice, even with equal values, or as a list such as `2, 2`, or holding anything but digits, such as `+2` or `0_2` | Refuse it. |
 | Whitespace between a field name and its colon, such as `Content-Length : 2` | Refuse it. |
@@ -187,7 +188,7 @@ then reads a request the client did not send.
 Your proxy must also meet at least these four rules.
 
 1. **Send each request body to the engine with one `Content-Length`.** Buffer the body first. The
-   engine answers a chunked request body with `411`. nginx buffers by default
+   engine answers any request carrying `Transfer-Encoding` with `411`. nginx buffers by default
    (`proxy_request_buffering on`).
 2. **Do not reuse a connection to the engine after an error.** After an engine `400`, or a response
    the proxy could not read to its framed end, drop that connection. The engine closes it too. One
