@@ -296,15 +296,15 @@ def _is_revoke_defect(exc: BaseException) -> bool:
 @cache
 def _passkey_read_errors() -> tuple[type[Exception], ...]:
     """The classes the passkey set read after the sign-count write catches to refuse (BACKLOG
-    #3775; vault BACKLOG #4728 finding 3 decided it):
+    #3775; vault BACKLOG #4728 finding 3):
     :func:`~messagefoundry.store.base.store_call_errors` and
     :func:`~messagefoundry.store.base.store_connect_errors`. Wider than
     :func:`_session_write_errors` by ``ValueError`` and ``RuntimeError``; of the two sets, only the
     connect set takes pyodbc's ``Error`` root, which pyodbc raises for a deadlock victim. The caller
-    re-raises ``AUDIT_WRITE_DEFECTS`` first, so ``NotImplementedError``, ``RecursionError`` and
-    ``sqlite3.ProgrammingError`` raise although these sets take them, and so does every class
-    outside both sets, ``sqlite3.InterfaceError`` among them. Cached, as ``store_call_errors`` is,
-    so a refusal does not run the driver import on the event loop."""
+    re-raises ``AUDIT_WRITE_DEFECTS`` first, so those classes raise although these sets take them,
+    and so does every class outside both sets, ``sqlite3.InterfaceError`` among them. These classes
+    do not tell a store fault from a bug, so a bug that raises one of them refuses too. Cached, as
+    ``store_call_errors`` is, so a refusal does not run the driver import on the event loop."""
     return (*store_call_errors(), *store_connect_errors())
 
 
@@ -16565,9 +16565,10 @@ class AuthService:
         verifies once the directory confirms the account. After the sign-count write the passkey set is
         read, then the session, the account and the lock, so the last read before the factor write
         is the holder re-read, with no other await between it and the write (BACKLOG #3068). An
-        exception in the passkey re-read that :func:`_passkey_read_errors` takes refuses, audited
-        with ``reason=store_error``, unless it is one of ``AUDIT_WRITE_DEFECTS``; every other
-        exception raises (BACKLOG #3775)."""
+        exception in the passkey re-read that :func:`_passkey_read_errors` takes refuses, unless
+        it is one of ``AUDIT_WRITE_DEFECTS``, and the refusal is audited with
+        ``reason=store_error`` unless the store refuses that row too; every other exception raises
+        (BACKLOG #3775)."""
         if not token:
             return Elevation()
         session = await self._load_session(hash_token(token))
@@ -16731,20 +16732,27 @@ class AuthService:
         self, user: VerifiedUser, cred: WebAuthnCredential, client: str | None
     ) -> _PasskeyHeld | None:
         """:meth:`_passkey_held`, as :meth:`finish_webauthn_assertion` asks it after the sign-count
-        write, or ``None`` when a store fault refused the read and the refusal is audited."""
+        write, or ``None`` when it raised one of :func:`_passkey_read_errors` that is not one of
+        ``AUDIT_WRITE_DEFECTS``. The refusal is then logged by exception type, and audited unless
+        the store refuses that row too."""
         try:
             return await self._passkey_held(user, cred)
         except AUDIT_WRITE_DEFECTS:
             # SQLite's bad statement or bind is a defect, not a store refusal. On PostgreSQL and
             # SQL Server a bad statement is a driver DatabaseError, so it is refused below.
             raise
-        except _passkey_read_errors():
+        except _passkey_read_errors() as exc:
             # BACKLOG #3775: after the sign-count write, an exception the set takes refuses with an
             # audit row rather than raising past the ceremony with none; the set's docstring says
             # what it takes and what still raises. Soft, so a store that refuses that row too still
             # gets the refusal back: the refusal is the fail-closed control, and the row only
             # records it.
-            _log.exception("finish_webauthn_assertion: the passkey re-read raised")
+            # The type only at ERROR: a ValueError's message can quote a row's value, as the
+            # directory probe's log line avoids. The traceback, with the message, goes to DEBUG.
+            _log.error(
+                "finish_webauthn_assertion: the passkey re-read raised %s", type(exc).__name__
+            )
+            _log.debug("finish_webauthn_assertion: the passkey re-read raised", exc_info=exc)
             await write_audit_soft(
                 lambda: self._assertion_refused(user, client, "store_error"),
                 log=_log,

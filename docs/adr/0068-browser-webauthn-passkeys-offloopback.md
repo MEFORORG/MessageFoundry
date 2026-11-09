@@ -668,22 +668,23 @@ with, audited `auth.webauthn_failed`, include at least `factor_removed`, `factor
 the passkey set read after the write fails its seal, `session_lost` when the session or the
 account went with it, and `locked` when a second-step lock landed.
 
-What an exception in the passkey set read after the write does, on any sign-count answer, is
-decided by class (BACKLOG #3775; `AuthService._passkey_standing` in
-`messagefoundry/auth/service.py`). That read, and the account-row check it makes when the set does
-not hold the passkey, run under one catch. It first re-raises the classes in `AUDIT_WRITE_DEFECTS`
+What an exception in the passkey set read after the write does, on any sign-count answer, is decided
+by class (BACKLOG #3775; `AuthService._passkey_standing` in `messagefoundry/auth/service.py`).
+Everything `_passkey_held` awaits runs under one catch: at least the set read with the account
+re-load and seal-failure report it can make, and the account-row check made when the set does not
+hold the passkey. The catch first re-raises the classes in `AUDIT_WRITE_DEFECTS`
 (`messagefoundry/audit_write.py`), at least `NotImplementedError`, `RecursionError` and
-`sqlite3.ProgrammingError`. It then refuses with `store_error`, logged and audited, every exception
-in `store_call_errors()` or `store_connect_errors()` (`messagefoundry/store/base.py`). Those take at
+`sqlite3.ProgrammingError`. It then refuses with `store_error` every exception in
+`store_call_errors()` or `store_connect_errors()` (`messagefoundry/store/base.py`), logs the
+exception's type, and audits the refusal unless the store refuses that row too. Those sets take at
 least every other `RuntimeError`, `OSError` and `ValueError`, SQLite's `DatabaseError`, asyncpg's
-roots and pyodbc's `Error` root where those drivers are installed, and `StoreAcquireTimeout`. The
-`RuntimeError` and `ValueError` halves date from 2026-11-06 (vault BACKLOG #4728 finding 3); a
-closed SQLite connection raises `ValueError`. These classes do not tell a store fault from a bug,
-so a bug that raises one of them is refused as `store_error` too. Every exception outside both
-sets raises out of the ceremony, `sqlite3.InterfaceError` among them: it is a `sqlite3.Error` but
-not a `DatabaseError`. The session, account and lock re-read, which since 2026-11-05 follows that
-set read rather than preceding it (BACKLOG #3068), is outside this catch, so an exception there
-raises.
+roots and pyodbc's `Error` root where those drivers are installed, and `StoreAcquireTimeout`; the
+`RuntimeError` and `ValueError` halves are vault BACKLOG #4728 finding 3, and a closed SQLite
+connection raises `ValueError`. These classes do not tell a store fault from a bug, so a bug that
+raises one of them is refused as `store_error` too. Every exception outside both sets raises out of
+the ceremony, `sqlite3.InterfaceError` among them: it is a `sqlite3.Error` but not a
+`DatabaseError`. The session, account and lock re-read, which since 2026-11-05 follows that set read
+rather than preceding it (BACKLOG #3068), is outside this catch, so an exception there raises.
 
 **Why a gone passkey still raises the signal.** A self-service passkey delete takes no account
 queue, and an MFA reset deletes every passkey before it revokes the sessions, so either can land

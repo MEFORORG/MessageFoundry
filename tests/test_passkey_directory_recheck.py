@@ -1075,13 +1075,15 @@ async def test_a_passkey_set_failing_its_seal_after_the_write_is_unverified() ->
 #: Each case: how the passkey goes before the write (``"held"``: it does not, and the store is made
 #: to answer ``gone`` anyway; ``"sealed"``: through the store's sealed delete; ``"unsealed"``:
 #: outside it, so the set fails its seal), and what the request answers (a refusal reason,
-#: ``"raises"`` or ``"cancelled"``). A set read's store fault refuses as ``store_error`` (BACKLOG
-#: #3775); the holder re-read's still raises (vault BACKLOG #4728 finding 2).
+#: ``"raises"`` or ``"cancelled"``). A ``RuntimeError`` in the set read refuses as ``store_error``
+#: and a ``sqlite3.InterfaceError`` there raises (BACKLOG #3775); the holder re-read's still raises
+#: (vault BACKLOG #4728 finding 2).
 _GONE_CASES: dict[str, tuple[str, str]] = {
     "set-held": ("held", "factor_removed"),
     "set-removed": ("sealed", "factor_removed"),
     "set-unverified": ("unsealed", "factor_unverified"),
     "set-read-raises": ("sealed", "store_error"),
+    "set-read-propagates": ("sealed", "raises"),
     "set-read-cancelled": ("sealed", "cancelled"),
     "account-unloadable": ("sealed", "session_lost"),
     "account-deleted-after-load": ("sealed", "session_lost"),
@@ -1097,11 +1099,12 @@ async def test_every_gone_answer_writes_one_clone_row_whatever_follows(case: str
     """BACKLOG #3774, the Manager's ruling on PR 2392 at 38b26723. Engine main writes the clone row
     on every compare-and-set miss, so a ``gone`` answer writes it too, once, before any other read,
     naming ``gone``. RED when: a gone answer whose set still holds the passkey, loses it through
-    the sealed delete, fails its seal, or whose set read raises or is cancelled; whose account does
-    not load or is deleted after it loads; or whose holder re-read refuses (revoked, disabled,
-    locked) or raises, leaves other than one ``auth.webauthn_clone_suspected`` row naming ``gone``,
-    or a set that fails its seal is refused as ``factor_removed``. A cancel after the store answers
-    (``set-read-cancelled``) leaves the row. Keyed, so the seal can fail."""
+    the sealed delete, fails its seal, or whose set read refuses, raises or is cancelled; whose
+    account does not load or is deleted after it loads; or whose holder re-read refuses
+    (revoked, disabled, locked) or raises, leaves other than one
+    ``auth.webauthn_clone_suspected`` row naming ``gone``, or a set that fails its seal is
+    refused as ``factor_removed``. A cancel after the store answers (``set-read-cancelled``)
+    leaves the row. Keyed, so the seal can fail."""
     gone_by, outcome = _GONE_CASES[case]
     store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
     try:
@@ -1115,6 +1118,8 @@ async def test_every_gone_answer_writes_one_clone_row_whatever_follows(case: str
         async def _set_read_fails(*_args: Any) -> list[object]:
             if case == "set-read-cancelled":
                 raise asyncio.CancelledError
+            if case == "set-read-propagates":
+                raise sqlite3.InterfaceError("synthetic: the store read failed")
             raise RuntimeError("synthetic: the store read failed")
 
         async def _holder_reread_fails(*_args: Any, **_kwargs: Any) -> Any:
@@ -1141,7 +1146,7 @@ async def test_every_gone_answer_writes_one_clone_row_whatever_follows(case: str
                     await store._db.commit()
                 answer = await real_update(*args, **kwargs)
                 assert answer == "gone"
-            if case in ("set-read-raises", "set-read-cancelled"):
+            if case in ("set-read-raises", "set-read-propagates", "set-read-cancelled"):
                 store.list_webauthn_credentials = _set_read_fails  # type: ignore[method-assign,assignment]
             state["written"] = True
             return answer
@@ -1161,7 +1166,7 @@ async def test_every_gone_answer_writes_one_clone_row_whatever_follows(case: str
             service._factor_holder_current = _holder_reread_fails  # type: ignore[method-assign]
 
         if outcome == "raises":
-            with pytest.raises(RuntimeError, match="synthetic"):
+            with pytest.raises((RuntimeError, sqlite3.InterfaceError), match="synthetic"):
                 await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
         elif outcome == "cancelled":
             with pytest.raises(asyncio.CancelledError):
@@ -1386,14 +1391,14 @@ async def test_a_store_call_read_fault_takes_the_refusal_path(
     catches ``store_call_errors()`` and ``store_connect_errors()``, so each of these faults takes
     one path: a ``store_error`` refusal with its audit row, no clone row, the factor unmarked. All
     of these are in ``store_call_errors()``; the pyodbc test below covers what the connect half
-    adds. RED when: any of them raises past ``finish_webauthn_assertion`` (the ``RuntimeError`` and
-    ``ValueError`` cases did, under the narrower session-write catch), marks the factor, or writes
-    no ``store_error`` row."""
+    adds. RED when: any of them raises past ``finish_webauthn_assertion``, marks the factor, or
+    writes no ``store_error`` row. Under the narrower session-write catch the ``call-runtime`` and
+    ``call-closed`` cases raised; the other two were already refused."""
     await _assert_the_read_fault_refuses(_READ_FAULTS[case](), monkeypatch, caplog)
 
 
 @pytest.mark.usefixtures("fake_pyodbc")
-async def test_a_pyodbc_root_read_fault_takes_the_call_class_path(
+async def test_a_pyodbc_root_read_fault_takes_the_connect_class_path(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #3775. pyodbc's ``Error`` root, which it raises for a deadlock victim, is in the
@@ -1412,5 +1417,5 @@ async def test_a_sqlite_interface_error_in_the_passkey_re_read_still_raises(
     a wider catch answers it as a ``store_error`` refusal while the ADR still says otherwise."""
     with pytest.raises(sqlite3.InterfaceError, match="synthetic"):
         await _assert_with_the_set_read_failing(
-            monkeypatch, sqlite3.InterfaceError("synthetic: an unsupported bind type")
+            monkeypatch, sqlite3.InterfaceError("synthetic: SQLITE_MISUSE")
         )
