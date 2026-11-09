@@ -221,8 +221,10 @@ that package's build code may run in CI:
     carries, so versions compare as pip compares them, and reads a line of options with no
     requirement with pip's own parser. A requirement whose marker is false on the runner, an extra
     (a lock records none), a URL or path with no package name, and an editable line (`-e` or
-    `--editable`, which installs a source tree or checkout no lock pin holds) are only noted; any
-    other line it cannot parse fails, a line of options pip cannot read included.
+    `--editable` in any spelling pip takes, which installs a source tree or checkout no lock pin
+    holds) are only noted. A requirement it cannot parse fails, and so does a line of options with
+    no requirement that pip cannot read. The options on a line that also holds a requirement are
+    not read.
   - The job takes the engine's pin out of the lock, as pip reads the lock, and installs that pin
     alone with `--no-deps --require-hashes`. The lock must pin `messagefoundry` exactly once, or the
     job says so and fails; pip refuses the pin if it carries no hash. No other locked package is

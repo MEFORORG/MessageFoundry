@@ -753,8 +753,21 @@ _STALE_CASES = [
         None,
         "-e git+https://${MF_SET_8171}@host.invalid/acme.git#egg=acme is editable",
     ),
+    (
+        "messagefoundry==0.5.1\nhttps://${MF_SET_8171}@host.invalid/acme-1.0-py3-none-any.whl\n",
+        None,
+        "https://${MF_SET_8171}@host.invalid/acme-1.0-py3-none-any.whl names no package",
+    ),
     ("messagefoundry==0.5.1\n-e ./caf中\n", None, "-e ./caf"),
     ("messagefoundry==0.5.1\n-acme==1.0\n", "-acme==1.0 is not a line pip can read", None),
+    # pip's own option checks raise their own error, which reads the same.
+    ("messagefoundry==0.5.1\n--no-binary -x\n", "--no-binary -x is not a line pip can read", None),
+    # pip leaves an empty variable as written.
+    (
+        "messagefoundry==${MF_EMPTY_8171}0.5.1\n",
+        "messagefoundry==${MF_EMPTY_8171}0.5.1 is not a requirement",
+        None,
+    ),
 ]
 
 
@@ -769,7 +782,11 @@ def test_a_stale_lock_fails_its_own_step_and_hides_no_audit(
     """Vault BACKLOG #3786 (R2-1): with a lock, nothing resolves requirements.txt, so a lock left
     behind by a change to it audited the old closure and nothing said so."""
     calls, audited, output, failed = _run_audit_job(
-        scaffolded_ci, tmp_path, _STALE_LOCK, {"MF_SET_8171": "s3cr3t-8171"}, requirements
+        scaffolded_ci,
+        tmp_path,
+        _STALE_LOCK,
+        {"MF_SET_8171": "s3cr3t-8171", "MF_EMPTY_8171": ""},
+        requirements,
     )
     assert "s3cr3t-8171" not in output
     assert failed == ([_STALE] if error else []), output

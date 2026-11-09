@@ -349,9 +349,10 @@ jobs:
       # compares versions. The packaging copy pip carries parses each requirement, after a copy of
       # pip's line handling, and pip's own parser reads a line of options with no requirement. A
       # marker false here, an extra, a URL or path with no name, and an editable line (-e or
-      # --editable) are only noted: the lock records no extras, an unnamed URL has no name to look
-      # up, and an editable installs a source tree or checkout that no lock pin holds. Any other
-      # line it cannot parse fails, a line of options pip cannot read included.
+      # --editable, in any spelling pip takes) are only noted: the lock records no extras, an
+      # unnamed URL has no name to look up, and an editable installs a source tree or checkout that
+      # no lock pin holds. A requirement it cannot parse fails, and so does a line of options with
+      # no requirement that pip cannot read.
       - name: Check requirements.lock is not stale against requirements.txt
         if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
         run: |
@@ -449,12 +450,13 @@ def split_line(group):
     # handling: join_lines (a continued line loses its backslashes and joins with nothing, a file's
     # last line included, and a comment joins after a space), the comment strip, ${VAR} expansion
     # and break_args_options (options start at the first word beginning with "-"). Then the line
-    # before expansion, for a message, so a value kept out of the file stays out of the log.
+    # before expansion, for a message that echoes it, so a value kept out of the file, such as a
+    # token in a URL, stays out of the log. pip leaves an unset or empty variable as written.
     joined = "".join(
         ln.strip("\\") if continued(ln) else f" {ln}" if comment(ln) else ln for ln in group
     )
     code = COMMENT_RE.sub("", joined).strip()
-    words = re.sub(r"\$\{([A-Z0-9_]+)\}", lambda m: os.environ.get(m[1], m[0]), code).split(" ")
+    words = re.sub(r"\$\{([A-Z0-9_]+)\}", lambda m: os.environ.get(m[1]) or m[0], code).split(" ")
     first = next((n for n, word in enumerate(words) if word.startswith("-")), len(words))
     return " ".join(words[:first]).strip(), words[first:], code
 
@@ -482,6 +484,7 @@ def named(group, name):
 _CHECK_STALE = r"""
 import optparse, shlex
 
+from pip._internal.exceptions import PipError
 from pip._internal.req.req_file import OptionParsingError, build_parser
 from pip._vendor.packaging.version import InvalidVersion, Version
 
@@ -504,12 +507,13 @@ def unnamed(text):
 
 def editable(options):
     # Whether pip installs a line of options and no requirement as an editable, read by pip's own
-    # requirements-line parser as its parse_line reads it. None when pip cannot read the options.
+    # requirements-line parser as its parse_line reads it. None when pip cannot read the options:
+    # shlex's ValueError, optparse's error, or a PipError such as CommandError from an option's check.
     parser = build_parser()
     parser.set_usage(optparse.SUPPRESS_USAGE)
     try:
         opts = parser.parse_args(shlex.split(" ".join(options)), parser.get_default_values())[0]
-    except (OptionParsingError, ValueError):
+    except (OptionParsingError, PipError, ValueError):
         return None
     return bool(opts.editables)
 
@@ -534,9 +538,9 @@ for group in logical_lines("requirements.txt"):
         continue
     if isinstance(req, str):
         if unnamed(req):
-            print(f"::notice::{req} names no package, so it is not checked against requirements.lock")
+            print(f"::notice::{line} names no package, so it is not checked against requirements.lock")
         else:
-            stale.append(f"{req} is not a requirement this check can read")
+            stale.append(f"{line} is not a requirement this check can read")
         continue
     name = canonicalize_name(req.name)
     if req.marker is not None and not req.marker.evaluate():
