@@ -788,12 +788,23 @@ def test_a_session_on_the_callers_config_root_outside_userprofile_occupies_the_t
     assert "Target is occupied" in _out(proc), _out(proc)
     assert wt.exists() and rig.is_registered(wt)
 
+    # A backtick is not a wildcard character (WildcardPattern.ContainsWildcardCharacters is False for
+    # it), so a root holding one is read literally and its session still occupies the target.
+    ticked = rig.root / "o`brien"
+    (ticked / "sessions").mkdir(parents=True)
+    (ticked / "sessions" / "8.json").write_text(
+        json.dumps({"cwd": str(wt), "sessionId": "on-a-backtick-root"}), encoding="utf-8"
+    )
+    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(ticked)})
+    assert proc.returncode != 0, _out(proc)
+    assert "Target is occupied" in _out(proc), _out(proc)
+    assert "wildcard character" not in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
     # A root the registry's wildcard reads could misread, and a relative root that names no fixed
     # directory, refuse rather than be read.
     for value, needle in (
         (str(rig.root / "cfg[1]"), "wildcard character"),
-        # The backtick is the wildcard escape. Six characters, as cfg[1], so pwsh wraps it the same.
-        (str(rig.root / "cfg`10"), "wildcard character"),
         ("cfg", "relative path"),
     ):
         proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": value})

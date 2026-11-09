@@ -554,9 +554,11 @@ if ($byPath) {
         if (-not [System.IO.Path]::IsPathFullyQualified($env:CLAUDE_CONFIG_DIR)) {
             throw "CLAUDE_CONFIG_DIR is the relative path '$env:CLAUDE_CONFIG_DIR', so its session registry cannot be placed. Occupancy unknown. Nothing was removed."
         }
-        # The registry's own reads take a root as a wildcard path, so [, ] or the backtick escape
-        # could read another directory, or none, while the literal second listing counts the same root.
-        if ($env:CLAUDE_CONFIG_DIR -match '[\[\]*?`]') {
+        # The registry's own reads take a root as a wildcard path, so a wildcard character in it ([, ],
+        # * or ?) could read another directory, or none, while the literal second listing counts the
+        # same root. A backtick is not refused: on pwsh 7.6.9 WildcardPattern.ContainsWildcardCharacters
+        # is False for it, and Test-Path and Get-ChildItem read such a root literally.
+        if ($env:CLAUDE_CONFIG_DIR -match '[\[\]*?]') {
             throw "CLAUDE_CONFIG_DIR '$env:CLAUDE_CONFIG_DIR' holds a wildcard character, which the session registry reads as a pattern. Occupancy unknown. Nothing was removed."
         }
         # TrimEndingDirectorySeparator keeps a drive root whole: `D:` alone would name D:'s cwd.
