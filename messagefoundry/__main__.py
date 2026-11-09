@@ -12679,7 +12679,8 @@ def _security(args: argparse.Namespace) -> int:
         The [auth] copies of the [security] switches are taken from ``sec`` (vault BACKLOG #2600).
         The registry reads the two session limits off those copies, and the load fills them from
         the file AND the environment, while ``sec`` is an authored [security] with no environment
-        layer: the file's for `show`, the saved candidate's for `set`. Unmatched, a shell variable
+        layer: the file's for `show`, the saved candidate's for `set` (or, when ``degraded`` is
+        set, the [security] checked before the edit). Unmatched, a shell variable
         named a limit `values` did not show with nothing saying where it came from, a shell variable
         or the shipped-default fallback hid one `values` did show, and
         a `set` preview paired with the pre-edit load missed a new loosening. A switch ``sec``
@@ -12692,10 +12693,10 @@ def _security(args: argparse.Namespace) -> int:
         idle-limit entry, says when one is named and how it is labelled.
 
         ``degraded`` is why ``sec`` is not the [security] the caller meant to report, as when `set`
-        could not re-read the [security] it saved (vault BACKLOG #8171, item 38). It marks the
-        report partial, and is the reason given."""
+        could not re-read the [security] it saved. It marks the report partial, and is the reason
+        given; `set` passes ``saved`` with it, so the load below does not run."""
         full: ServiceSettings | None = saved
-        partial_reason: str | None = None
+        partial_reason: str | None = degraded
         # An ABSENT file is not a degraded read -- the shipped defaults ARE the effective posture
         # there, and `security show` is expected to work offline before any config exists.
         if full is None and Path(path).exists():
@@ -12810,9 +12811,6 @@ def _security(args: argparse.Namespace) -> int:
         # Vault BACKLOG #2599 added a FIFTH, named for the same reason: the config-source escape is an
         # environment variable, and security_loosenings() reads it from the process that calls it. Here
         # that is the operator's shell, not the service.
-        # `set` passes ``saved`` whenever it passes ``degraded``, so the load above did not run.
-        if degraded is not None:
-            partial_reason = degraded
         return {
             "loosenings": loosenings,
             "loosenings_partial": partial_reason is not None,
@@ -12880,6 +12878,9 @@ def _security(args: argparse.Namespace) -> int:
     check_candidate = _post_write_settings_check(security_edit.SecurityEditError, keep=saved)
 
     def validate(candidate: Path) -> None:
+        # Only the last run counts, so a second run cannot pair a stale outcome with a fresh one.
+        saved_sec.clear()
+        reread_failed.clear()
         check_candidate(candidate)
         # The [security] of the very text that was validated, read under the edit lock, so a
         # concurrent edit between the pre-check read below and the lock cannot pair a stale
@@ -12920,7 +12921,6 @@ def _security(args: argparse.Namespace) -> int:
             return _emit_error(f"invalid [security] value: {exc}", as_json=args.json)
         result = security_edit.set_security(path, updates, validate=validate)
         # The candidate the write validated, so the preview reports the posture the edit left.
-        # set_security runs validate once, so at most one of the two lists holds an entry.
         view = saved_sec[-1] if saved_sec else sec
         degraded = reread_failed[-1] if reread_failed else None
         result.update(_posture(view, saved[-1] if saved else None, degraded=degraded))

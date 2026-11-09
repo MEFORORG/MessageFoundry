@@ -297,7 +297,7 @@ def test_set_preview_does_not_refuse_an_edit_whose_candidate_read_raises(
 
     The fallback logs a WARNING naming the exception's type and nothing of its text, which can
     quote the file's values, and the report says it is partial and why, so the pre-check view
-    never reads as complete (vault BACKLOG #8171, item 38). The control is an edit whose candidate
+    never reads as complete. The control is an edit whose candidate
     reads: it logs no such line, and its report is not partial. The handler sits on the module's
     logger, since `--json` replaces the root's handlers."""
     import logging
