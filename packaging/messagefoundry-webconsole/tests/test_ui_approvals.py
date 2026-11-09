@@ -675,6 +675,27 @@ def test_params_that_did_not_parse_or_are_empty_say_so() -> None:
     assert "requester: other" in differs
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [None, "", " ", "7", 7, "a" * 63, "A" * 64, "g" * 64, "a" * 64 + "\n", ["a" * 64]],
+    ids=["none", "empty", "space", "int-text", "int", "short", "upper", "not-hex", "nl", "list"],
+)
+def test_a_held_reload_with_no_usable_digest_reads_as_the_engines_refusal(bad: object) -> None:
+    """Vault BACKLOG #3192: every digest the engine refuses to approve on reads as that refusal,
+    never as its raw value, which could pass for a digest; a well-formed one is shown as it is."""
+    from messagefoundry_webconsole.pages import approvals as page_module
+
+    def _page(digest: object) -> str:
+        row = _row("e" * 32, params={"fingerprint": digest}, release_blocked=None)
+        return str(pages.approvals_page(ApprovalList(approvals=[row])))
+
+    html = _page(bad)
+    assert f"fingerprint: {page_module._NO_DIGEST}" in html
+    assert "will refuse this release" not in html
+    good = _page("c" * 64)
+    assert f"fingerprint: {'c' * 64}" in good and page_module._NO_DIGEST not in good
+
+
 def test_a_notice_code_selects_a_sentence_and_never_supplies_one() -> None:
     empty = ApprovalList(approvals=[])
     assert "Request rejected" in str(pages.approvals_page(empty, notice="rejected"))

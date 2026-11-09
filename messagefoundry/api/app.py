@@ -1828,9 +1828,10 @@ def _build_approval_gate(
                 "name who ran it; it was not run",
             )
         # Vault BACKLOG #2596, step 3: the release loads only the bytes the approval named. A hold
-        # whose params carry no digest (none is filed that way now) binds to None, which matches
-        # nothing. The gate refuses such a hold before its claim (requires_fingerprint below,
-        # release_blocked 'params_no_fingerprint', vault BACKLOG #3192), so None reaches this only
+        # whose params carry no digest (none is filed that way now), or one not of the shape a
+        # digest has, binds to None, which matches nothing. The gate refuses such a hold before its
+        # claim (requires_fingerprint below, release_blocked 'params_no_fingerprint', vault
+        # BACKLOG #3192), so None reaches this only
         # if that flag is dropped, and is then refused as a mismatch once its directory resolves.
         # On a store that holds a key the params are sealed with the rest of the request, so a
         # writer to pending_approvals who changes the digest leaves a request the gate refuses

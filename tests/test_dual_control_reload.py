@@ -1426,8 +1426,8 @@ async def test_a_hold_that_captured_no_digest_is_refused_at_release(
     assert r.status_code == 409, r.text
     assert "no config digest" in r.json()["detail"]
     held = await engine.store.get_pending_approval(approval_id)
-    assert _held_params(held)["fingerprint"] is None
     assert held is not None and str(held["status"]) == "pending"
+    assert _held_params(held)["fingerprint"] is None
     [row] = [
         json.loads(r["detail"])
         for r in await engine.store.list_audit(action="approval.params_no_fingerprint")

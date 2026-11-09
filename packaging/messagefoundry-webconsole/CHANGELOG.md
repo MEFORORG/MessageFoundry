@@ -237,9 +237,10 @@ this line.**
   carries `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
 - **The Approvals page offers no Approve on a held reload that names no config digest.** The
   engine marks it `release_blocked: "params_no_fingerprint"`, and the page offers Reject, or
-  Withdraw on the requester's own row, with a note saying why. Needs the engine seam that carries
-  that value; the same seam drops `PendingApprovalInfo.gated`, which the page never read. (vault
-  `BACKLOG #3192`, `#3193`)
+  Withdraw on the requester's own row, with a note saying why. A held reload's digest that is
+  missing or not of the form the engine writes is shown as that refusal, never as its raw value.
+  Needs the engine seam that carries that value; the same seam drops `PendingApprovalInfo.gated`,
+  which the page never read. (vault `BACKLOG #3192`, `#3193`)
 
 ## [0.5.0] — 2026-10-20 — Early Access
 

@@ -61,6 +61,7 @@ from typing import Any, Literal, NoReturn
 from uuid import uuid4
 
 from messagefoundry.api.models import ReleaseBlocked
+from messagefoundry.api.validation import is_config_digest
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
@@ -142,10 +143,13 @@ def named_requester(params: Mapping[str, Any]) -> str | None:
 
 
 def held_fingerprint(params: Mapping[str, Any]) -> str | None:
-    """The config digest a held reload's params carry, or ``None`` when it is missing or not a
-    non-empty string (vault BACKLOG #3192). A release bound to ``None`` refuses every config, so
-    the reload executor and the queue's ``params_no_fingerprint`` prediction read this one test."""
-    return _param_text(params, "fingerprint")
+    """The config digest a held reload's params carry, or ``None`` when it is missing or is not of
+    the shape a release compares (:func:`~messagefoundry.api.validation.is_config_digest`; vault
+    BACKLOG #3192). A release bound to
+    ``None`` refuses every config, and so would one bound to a value of another shape, so the
+    reload executor and the queue's ``params_no_fingerprint`` prediction read this one test."""
+    value = params.get("fingerprint")
+    return value if is_config_digest(value) else None
 
 
 #: The audit action and the 409 text :meth:`ApprovalGate.approve` writes and answers for each
@@ -162,8 +166,9 @@ _PARAMS_REFUSALS: Mapping[ReleaseBlocked, tuple[str, str]] = {
     ),
     "params_no_fingerprint": (
         "approval.params_no_fingerprint",
-        "this request's parameters record no config digest, so its release could not be bound to "
-        "the config it names; reject it and request the operation again",
+        "this request's parameters record no config digest, or one not of the form the engine "
+        "writes, so its release could not be bound to the config it names; reject it and request "
+        "the operation again",
     ),
 }
 

@@ -46,6 +46,7 @@ from messagefoundry.api.models import (
     ReleaseBlocked,
     ResolveOutcome,
 )
+from messagefoundry.api.validation import is_config_digest
 
 from .._html import Markup, el, page, register_nav, rows_table
 from ._common import _reload_shortfall, _seg
@@ -119,8 +120,9 @@ _BLOCKED: dict[ReleaseBlocked, str] = {
         "cannot be approved. {verb} it; if it is still needed, request it again."
     ),
     "params_no_fingerprint": (
-        "Its parameters record no config digest, so the release could not be bound to the config "
-        "it names, and it cannot be approved. {verb} it; if it is still needed, request it again."
+        "Its parameters record no config digest, or one not of the form the engine writes, so "
+        "the release could not be bound to the config it names, and it cannot be approved. {verb} "
+        "it; if it is still needed, request it again."
     ),
     "requester_not_authorized": (
         "The requester no longer holds the authority this operation requires, so it cannot be "
@@ -145,9 +147,14 @@ _NONE_MEANS: dict[str, str] = {
     "channel_id": "any inbound connection",
     "destination_name": "any destination",
     "config_dir": "the engine's startup config directory",
-    # A held reload's digest (vault BACKLOG #2596): with none, the engine refuses the release.
-    "fingerprint": "no config digest was taken, so the engine will refuse this release",
 }
+
+# A held reload's digest (vault BACKLOG #2596). The engine refuses to approve a hold whose digest
+# is missing or not 64 lowercase hex characters, the form it writes, before anything is claimed or
+# runs, and marks the row params_no_fingerprint (vault BACKLOG #3192). Any such value, None, empty,
+# not a string or malformed, reads as this note, never raw, so it does not pass for a digest.
+# The engine's test is this one (is_config_digest).
+_NO_DIGEST = "no usable config digest was recorded, so the engine refuses to approve this request"
 
 # Guidance for a refusal, keyed by the status the engine raised. The engine's own message follows it
 # verbatim, because one status covers several causes (a 409 is at least already decided, expired,
@@ -214,6 +221,8 @@ def _when(value: float | None) -> str:
 
 
 def _param_value(key: str, value: object) -> str:
+    if key == "fingerprint" and not is_config_digest(value):
+        return _NO_DIGEST
     if value is None:
         return _NONE_MEANS.get(key, "not set")
     return value if isinstance(value, str) else json.dumps(value)

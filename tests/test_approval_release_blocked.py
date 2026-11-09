@@ -35,9 +35,10 @@ from uuid import uuid4
 
 import pytest
 
-from messagefoundry.api.approvals import ApprovalError, ApprovalGate
+from messagefoundry.api.approvals import ApprovalError, ApprovalGate, held_fingerprint
 from messagefoundry.api.models import ReleaseBlocked
 from messagefoundry.auth.permissions import Permission
+from messagefoundry.config.fingerprint import config_fingerprint
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.store.store import MessageStore
 from tests._pending_approval_store_contract import _REQUESTER_ID, _resolve, _StandingStore
@@ -86,6 +87,20 @@ def _gate(store: Any, runs: list[str], sink: _Sink | None = None) -> ApprovalGat
 _DIGEST = "a" * 64
 _NAMED = json.dumps({"requester": "maker", "fingerprint": _DIGEST})
 
+#: Digests a release can never match, since the engine writes 64 lowercase hex characters (vault
+#: BACKLOG #3192): each one, offered Approve, was claimed and then compensated to ``failed``.
+_MALFORMED_DIGESTS: Mapping[str, object] = {
+    "whitespace": " ",
+    "padded": f" {_DIGEST}",
+    "trailing-newline": f"{_DIGEST}\n",
+    "truncated": _DIGEST[:-1],
+    "too-long": _DIGEST + "a",
+    "uppercase": _DIGEST.upper(),
+    "not-hex": "g" * 64,
+    "int-as-text": "7",
+    "list": [_DIGEST],
+}
+
 
 async def _row(
     store: MessageStore,
@@ -133,6 +148,12 @@ async def _rows(store: MessageStore) -> dict[str, ReleaseBlocked | None]:
         await _row(
             store, params=json.dumps({"requester": "maker", "fingerprint": 7})
         ): "params_no_fingerprint",
+        **{
+            await _row(
+                store, params=json.dumps({"requester": "maker", "fingerprint": bad})
+            ): "params_no_fingerprint"
+            for bad in _MALFORMED_DIGESTS.values()
+        },
         # Both reasons hold again; the digest test comes first, as the requester's name did.
         await _row(
             store, params=json.dumps({"out_of_scope": True, "requester": "maker"})
@@ -259,6 +280,23 @@ async def test_a_no_fingerprint_refusal_writes_its_audit_row(store: MessageStore
     detail = json.loads(str(row["detail"]))
     assert detail == {"approval_id": approval_id, "operation": _REPLAY, "requester": "maker"}
     assert await store.list_audit(action="approval.release_attempted") == []
+
+
+@pytest.mark.parametrize("bad", list(_MALFORMED_DIGESTS.values()), ids=list(_MALFORMED_DIGESTS))
+def test_a_digest_of_the_wrong_shape_is_no_digest(bad: object) -> None:
+    """Vault BACKLOG #3192: only the shape a release compares counts as a held digest."""
+    assert held_fingerprint({"fingerprint": bad}) is None
+
+
+def test_the_digest_the_engine_writes_is_one_the_queue_accepts(tmp_path: Path) -> None:
+    """The shape test against its producer: a digest a hold records is
+    :func:`~messagefoundry.config.fingerprint.snapshot_fingerprint`'s, so a change to that shape
+    that ``held_fingerprint`` did not follow would mark every held reload unapprovable."""
+    assert held_fingerprint({"fingerprint": _DIGEST}) == _DIGEST  # the control
+    (tmp_path / "route.py").write_text("X = 1\n", encoding="utf-8")
+    for directory in (tmp_path, tmp_path / "absent"):
+        digest = config_fingerprint(directory)
+        assert held_fingerprint({"fingerprint": digest}) == digest
 
 
 @pytest.mark.parametrize("resolver", ["none-bound", "resolves-nobody"])
