@@ -917,8 +917,10 @@ count is above `0` (vault BACKLOG #2613).
 - **What you lose:** a revocation the directory calls for arrives later when
   `ad_session_recheck_seconds` is above `300` s, when `ad_session_recheck_strikes` is above `2` (a pass
   revokes only after that many in a row find the account absent or disabled), or when
-  `ad_session_recheck_max_users` is below `200` (a larger estate takes more passes to cover). A
-  longer interval also delays the outage page, in the next bullet. The strike count delays at least an account found absent or disabled, or one whose account control
+  `ad_session_recheck_max_users` is below `200` (a larger estate takes more passes to cover, and
+  the page about one account the directory keeps failing for, which counts that account's probes,
+  comes more passes later too). A longer interval also delays the outage page and that
+  per-account page, in the next bullet. The strike count delays at least an account found absent or disabled, or one whose account control
   cannot be read; a role or scope change revokes on the first pass. The mass-revoke circuit breaker
   aborts a pass that would revoke more than **both** `ad_session_revoke_max` accounts and
   `ad_session_revoke_max_fraction` of the accounts it probed, and an aborted pass revokes nothing.
@@ -931,7 +933,9 @@ count is above `0` (vault BACKLOG #2613).
   so while an outage lasts no directory disable or deletion reaches a signed-in session. The engine
   pages on the pass that brings the count of such passes to `ad_reconcile_outage_passes` (vault
   BACKLOG #3709); a pass that asks nothing, or whose every probe failed or faulted with one fault at
-  least, neither counts nor ends the run. A value above `3` delays that page. One less than the
+  least, neither counts nor ends the run. A value above `3` delays that page, and the page about one
+  account the directory keeps failing for while it answers others (vault BACKLOG #3100), which waits
+  for as many of that account's probes. One less than the
   value, times `ad_session_recheck_seconds`, after the first outage pass is only the least delay:
   the passes are an interval apart plus each pass's own run, and an outage pass waits out a directory
   timeout for each account it probes, so a larger estate, a larger per-pass budget or a longer
