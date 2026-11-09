@@ -76,6 +76,8 @@ _EXPECTED = frozenset(
         # ADR 0197 Amendment A: account creation and the factor reset issue a generated credential.
         ("POST", "/users"),
         ("POST", "/users/{user_id}/reset-mfa"),
+        # ADR 0207: a directory account's enrolment code, returned once.
+        ("POST", "/users/{user_id}/enrolment-code"),
     }
 )
 
@@ -308,6 +310,19 @@ async def test_every_credential_reply_is_no_store_on_the_wire(
         reset_mfa = await c.post(f"/users/{target.id}/reset-mfa", headers=_auth(tok))
         note(("POST", "/users/{user_id}/reset-mfa"), reset_mfa)
         assert reset_mfa.json()["temp_password"], "a local account's factor reset issues one"
+
+        # ADR 0207: an Administrator issues a directory account's enrolment code, once.
+        await service.store.create_user(
+            user_id="ad" * 16,
+            username="dirholder",
+            auth_provider="ad",
+            password_generated=False,
+            audits=(),
+        )
+        r, tok = await _reauth(c, tok, purpose="admin_enrolment_code_issue")
+        code = await c.post(f"/users/{'ad' * 16}/enrolment-code", headers=_auth(tok))
+        note(("POST", "/users/{user_id}/enrolment-code"), code)
+        assert code.json()["code"]
 
         created = await c.post(
             "/users",

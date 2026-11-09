@@ -72,7 +72,9 @@ from messagefoundry.store.store import (
     VerifiedUser,
     audit_row_hash,
 )
+from tests import test_ad_user_account_control as uac
 from tests._admin_account import create_local_user_chosen
+from tests._log_absence import assert_capture_sees
 from tests.test_ad_user_account_control import _InverseSink
 from tests.test_approval_requester_recheck import _Sink
 from tests.test_user_seal import _raw_for
@@ -1067,9 +1069,9 @@ async def test_a_referring_user_search_base_judges_nothing_and_pages_every_pass(
         assert "ad_user_search_base" in alert[:200] and "ad_group_search_base" in alert[:200]
         assert "revoked nothing" in alert and "circuit breaker" not in alert
         # BACKLOG #3100 items 4 and 6. The detail says what a referral costs: a disabled account
-        # behind the base is not revoked while it lasts. That sentence falls past the 200
-        # characters the alert instance keeps; the notifier's detail carries it. No account named.
-        assert "never revoked while it is referred" in alert
+        # behind the base is not revoked while it lasts. Inside the 200 characters the alert
+        # instance keeps, beside the settings (BACKLOG #3100 P5). No account named.
+        assert "never revoked while it is referred" in alert[:200]
         assert "jdoe" not in alert and "asmith" not in alert
         audit = await store.list_audit()
         referred = _referred_rows(audit)
@@ -1529,6 +1531,7 @@ async def test_when_every_probe_raises_the_operator_sees_a_probe_fault_not_an_ou
         assert "session_absolute_hours" in alert
         # The store keeps 200 characters of the alert's reason: the pointer must fit in them.
         assert "names the account" in alert[:200]
+        assert "never revoked while its probe faults" in alert[:200]  # and so must the cost (P5)
         audit = await store.list_audit()
         expected = {
             "reason": "probe_fault",
@@ -2136,6 +2139,7 @@ async def test_a_deleted_search_base_aborts_alerts_and_never_revokes(
         message = service.directory_reconcile_misconfigured
         assert message is not None and "revoked nothing" in message
         assert "ad_user_search_base" in message[:200]
+        assert "never revoked while the refusal lasts" in message[:200]  # BACKLOG #3100 P5
         audit = await store.list_audit()
         rows = [
             json.loads(a["detail"])
@@ -2716,6 +2720,434 @@ async def test_a_threshold_pass_that_raises_pages_on_the_next_pass(
         assert len(_outage_events(sink)) == 1
     finally:
         await store.close()
+
+
+# --- BACKLOG #3100 closing step 2: one account the directory keeps failing for pages ------------
+
+_UNREACHED_PREFIX = "directory-reconciler-unreached:"
+
+
+def _unreached_events(sink: _InverseSink) -> list[tuple[str, str, dict[str, Any]]]:
+    return [e for e in sink.events if e[1].startswith(_UNREACHED_PREFIX)]
+
+
+async def _unreached_rows(store: MessageStore) -> list[tuple[str, int]]:
+    """``(actor, probes)`` of each lasting unreachable account's audit row."""
+    rows = [dict(r) for r in await store.list_audit(action="auth.ad_reconcile_unreached")]
+    return [(str(r["actor"]), json.loads(str(r["detail"]))["probes"]) for r in rows]
+
+
+@pytest.mark.parametrize("threshold", [2, 3])
+async def test_an_account_the_directory_keeps_failing_for_pages_once_naming_it(
+    threshold: int,
+) -> None:
+    """BACKLOG #3100 closing step 2. An ``LdapError`` on one account's probe, while the directory
+    answers the other, reads UNAVAILABLE: no strike, no revocation. Without a bound the account's
+    sessions would run to the absolute cap and nobody would be told. So
+    ``ad_reconcile_outage_passes`` of its probes running page once, naming the account in the
+    source, with one audit row. The next failing pass pages nothing more; an answer ends the run
+    and re-arms the page. It is still fail-open throughout, and the whole-directory outage page
+    never fires.
+
+    RED when: the arm pages nobody, pages on every pass, or never re-arms."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=threshold)
+        alice = await store.get_user_by_username("alice")
+        assert alice is not None
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        for n in range(1, threshold):
+            plan = await _pass(service, sink)
+            assert not plan.directory_outage and plan.unavailable == 1 and plan.unreached == ()
+            assert service._reconcile_unreached_runs == {alice.id: n}
+        assert _unreached_events(sink) == []  # the N-1 control
+        plan = await _pass(service, sink)
+        assert plan.unreached == ((alice.id, "alice", threshold),)
+        [(kind, source, payload)] = _unreached_events(sink)
+        assert (kind, source) == ("ad_reconcile_aborted", f"{_UNREACHED_PREFIX}alice")
+        assert payload["reason"] == reconcile.UNREACHED_ACCOUNT and payload["probed"] == 2
+        assert f"{threshold} of its directory probes running failed" in payload["detail"]
+        assert "sessions are not revoked" in payload["detail"][:200]
+        assert len(payload["detail"]) <= 200 and "alice" not in payload["detail"]
+        assert await _unreached_rows(store) == [("alice", threshold)]
+
+        assert (await _pass(service, sink)).unreached == ()  # latched: no second page
+        assert len(_unreached_events(sink)) == 1 and len(await _unreached_rows(store)) == 1
+
+        ldap.unreachable = set()  # the account answers once
+        assert (await _pass(service, sink)).unreached == ()
+        assert service._reconcile_unreached_runs == {}
+        ldap.unreachable = {"alice"}
+        for _ in range(threshold):
+            plan = await _pass(service, sink)
+        assert plan.unreached == ((alice.id, "alice", threshold),), "the page did not re-arm"
+        assert len(_unreached_events(sink)) == 2
+        assert _outage_events(sink) == []
+        assert await store.list_sessions(alice.id), "the account's sessions were revoked"
+    finally:
+        await store.close()
+
+
+async def test_a_whole_directory_outage_pages_once_and_no_account_pages_beside_it() -> None:
+    """BACKLOG #3100 closing step 2, round-two review. Every pass that probes an account counts,
+    an outage pass too, but the lasting outage page covers a whole-directory outage: no account
+    enters on the pass that raises it or while it stands. Once a pass reaches the directory, an
+    account still unreachable enters at once.
+
+    RED when: a whole-directory outage also pages each account, or the account stays unpaged
+    after the directory comes back for the others."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store)  # the default threshold, 3
+        alice = await store.get_user_by_username("alice")
+        assert alice is not None
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        for n in range(1, 5):
+            plan = await _pass(service, sink)
+            assert plan.directory_outage and plan.unreached == (), f"outage pass {n}"
+        assert len(_outage_events(sink)) == 1 and _unreached_events(sink) == []
+        ldap.unreachable = {"alice"}  # the directory answers bob again
+        back = await _pass(service, sink)
+        assert back.outage_clear and back.unreached == ((alice.id, "alice", 5),)
+        assert len(_unreached_events(sink)) == 1
+    finally:
+        await store.close()
+
+
+async def test_an_account_alone_in_its_probe_sample_still_pages(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3100 closing step 2, round-two review. At a budget of one, every pass that probes
+    the unreachable account reads as an outage, and the next pass, which reaches the other
+    account, ends that outage run. Neither page came. The account's own run counts its outage
+    passes, so it pages after its third probe.
+
+    RED when: an account whose sample holds only unreachable accounts is never paged."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_session_recheck_max_users=1)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        for _ in range(8):
+            await _pass(service, sink)
+        assert [source for _k, source, _p in _unreached_events(sink)] == [
+            f"{_UNREACHED_PREFIX}alice"
+        ]
+        assert _outage_events(sink) == []
+    finally:
+        await store.close()
+
+
+async def test_an_unreached_page_is_latched_only_once_its_row_is_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3100 closing step 2. As a paging refusal's, the page is latched only once its row
+    is recorded, so a pass whose own row write raises leaves the next pass to page.
+
+    RED when: the latch is set before the row is written, so the account never pages."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        await _pass(service, sink)
+        real = service._audit_reconciler_row
+
+        async def boom(action: str, **kwargs: Any) -> bool:
+            if action == "auth.ad_reconcile_unreached":
+                raise RuntimeError("synthetic: a defect in the row write")
+            return await real(action, **kwargs)
+
+        monkeypatch.setattr(service, "_audit_reconciler_row", boom)
+        with pytest.raises(RuntimeError):
+            await service.reconcile_directory_sessions()
+        assert service._reconcile_unreached_paged == set()
+        monkeypatch.setattr(service, "_audit_reconciler_row", real)
+        plan = await _pass(service, sink)
+        assert [name for _uid, name, _n in plan.unreached] == ["alice"]
+        assert len(_unreached_events(sink)) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_pass_that_raises_after_the_unreached_row_leaves_the_next_pass_to_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3100 closing step 2, round-two review. The latch is set last in the pass, as the
+    outage's is, so a pass that writes the row and then raises, and so returns no plan to page
+    from, leaves the next pass to page.
+
+    RED when: the latch is set as the row is written, so the account is latched and never paged."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        await _pass(service, sink)
+        real = service._record_reconcile_hold
+
+        async def boom(plan: reconcile.ReconcilePlan) -> None:
+            raise RuntimeError("synthetic: a store read failed after the rows")
+
+        monkeypatch.setattr(service, "_record_reconcile_hold", boom)
+        with pytest.raises(RuntimeError):
+            await service.reconcile_directory_sessions()
+        assert len(await _unreached_rows(store)) == 1
+        assert service._reconcile_unreached_paged == set()
+        monkeypatch.setattr(service, "_record_reconcile_hold", real)
+        plan = await _pass(service, sink)
+        assert [name for _uid, name, _n in plan.unreached] == ["alice"]
+        assert len(_unreached_events(sink)) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_flapping_directory_pages_once_for_many_unreached_accounts() -> None:
+    """BACKLOG #3100 closing step 2, round-one review. A directory that answers only a few probes
+    in each pass is not an outage, so each failing account would enter its own run. Past
+    ``ad_session_revoke_max`` of them on one pass, one page under the bare source covers them,
+    naming none, and each account still has its own row.
+
+    RED when: such a pass opens one instance per account."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ["ok"] + [f"flap{i}" for i in range(7)]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        sink = _InverseSink()
+        ldap.unreachable = set(names[1:])
+        for _ in range(3):
+            plan = await _pass(service, sink)
+        assert plan.unreached_rollup and len(plan.unreached) == 7
+        [(kind, source, payload)] = _unreached_events(sink) + [
+            e for e in sink.events if e[1] == "directory-reconciler-unreached"
+        ]
+        assert (kind, source) == ("ad_reconcile_aborted", "directory-reconciler-unreached")
+        assert payload["reason"] == reconcile.UNREACHED_ACCOUNT and payload["probed"] == 8
+        assert "7 accounts' sessions are not revoked" in payload["detail"]
+        assert len(payload["detail"]) <= 200 and "flap" not in payload["detail"]
+        assert sorted(a for a, _n in await _unreached_rows(store)) == sorted(names[1:])
+        assert (await _pass(service, sink)).unreached == ()
+    finally:
+        await store.close()
+
+
+async def test_a_rollup_whose_rows_are_all_refused_pages_nothing_and_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3100 closing step 2, final-round finding 1. When every row of a rolled-up pass is
+    refused, no entry is left to page, so the rollup flag must go too. Left set, the lifespan task
+    took the run's length from an empty list and raised, which cost that pass's later pages and
+    inverses.
+
+    RED when: such a pass keeps ``unreached_rollup`` set, so alerting it raises ValueError."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ["ok"] + [f"flap{i}" for i in range(7)]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        real = service._audit_reconciler_row
+
+        async def refusing(action: str, **kwargs: Any) -> bool:
+            if action == "auth.ad_reconcile_unreached":
+                return False
+            return await real(action, **kwargs)
+
+        monkeypatch.setattr(service, "_audit_reconciler_row", refusing)
+        sink = _InverseSink()
+        ldap.unreachable = set(names[1:])
+        for _ in range(3):
+            plan = await _pass(service, sink)  # raised ValueError on the third pass before the fix
+        assert plan.unreached == () and not plan.unreached_rollup
+        assert _unreached_events(sink) == []
+        assert not [e for e in sink.events if e[1] == "directory-reconciler-unreached"]
+    finally:
+        await store.close()
+
+
+async def test_a_refused_unreached_row_leaves_the_account_to_page_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3100 closing step 2, round-one review. The soft write logs a refused row and
+    returns False. The latch must wait for a written row, so the next pass writes it and pages
+    again, rather than leaving a page with no row that is never retried.
+
+    RED when: a refused row still latches the account."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        real = service._audit_reconciler_row
+
+        async def refusing(action: str, **kwargs: Any) -> bool:
+            if action == "auth.ad_reconcile_unreached":
+                return False
+            return await real(action, **kwargs)
+
+        monkeypatch.setattr(service, "_audit_reconciler_row", refusing)
+        for _ in range(2):
+            await _pass(service, sink)
+        assert service._reconcile_unreached_paged == set()
+        monkeypatch.setattr(service, "_audit_reconciler_row", real)
+        plan = await _pass(service, sink)
+        assert [name for _uid, name, _n in plan.unreached] == ["alice"]
+        assert await _unreached_rows(store) == [("alice", 3)]
+        assert (await _pass(service, sink)).unreached == ()
+    finally:
+        await store.close()
+
+
+async def test_a_fault_neither_counts_nor_ends_a_run_and_an_answer_says_so(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3100 closing step 2, round-one review. A probe fault says nothing about whether
+    the directory was reached, on any pass, so it leaves the account's run as it stands. An
+    answer for a paged account ends its run with a WARNING, so an operator can tell when to
+    resolve the instance.
+
+    RED when: a fault resets the run on a pass that reached the directory, or the end is silent."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store)  # the default threshold, 3
+        alice = await store.get_user_by_username("alice")
+        assert alice is not None
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        for _ in range(2):
+            await _pass(service, sink)
+        ldap.unreachable = set()
+        ldap.broken = {"alice": ValueError("synthetic: unreadable entry")}
+        assert (await _pass(service, sink)).faulted == (alice.id,)  # bob answered
+        assert service._reconcile_unreached_runs == {alice.id: 2}
+        ldap.broken = {}
+        ldap.unreachable = {"alice"}
+        assert (await _pass(service, sink)).unreached == ((alice.id, "alice", 3),)
+        ldap.unreachable = set()
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            await _pass(service, sink)
+        said = [r.getMessage() for r in caplog.records if "answered for again" in r.getMessage()]
+        assert len(said) == 1 and "after 3 unreachable probes" in said[0]
+    finally:
+        await store.close()
+
+
+# --- ADR 0195, "What a restart does to the hold", direction 1 (BACKLOG #3057, #3689) -------------
+#
+# The latch and the outcome record are process memory, so a fresh process on the same store holds
+# what the ADR note says it holds, and no more. Each test first shows the process that saw the wave
+# keeping it held, so the revocations after the restart are the restart's doing.
+
+
+def _unreachable_for(monkeypatch: pytest.MonkeyPatch, service: AuthService, name: str) -> None:
+    """``name``'s probe raises :class:`LdapError` on ``service``, so it reads UNAVAILABLE, while
+    every other account is still answered by the real authenticator."""
+    auth = service._ldap
+    assert auth is not None
+    real = auth.probe_principal
+
+    def probe(username: str, *, object_id: str | None = None) -> DirectoryProbe:
+        if username == name:
+            raise LdapError("synthetic: LDAP socket closed")
+        return real(username, object_id=object_id)
+
+    monkeypatch.setattr(auth, "probe_principal", probe)
+
+
+async def test_a_restart_at_one_strike_revokes_a_held_wave_one_account_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #3057 closing step 3, and #3689 closing step 3's strike-1 test. ADR 0195,
+    *What a restart does to the hold*, direction 1: at ``ad_session_recheck_strikes = 1`` with an
+    ``ad_session_recheck_max_users`` below the signed-in count, a fresh process could revoke an
+    earlier run's held wave one account at a time.
+
+    Four accounts and a budget of two, so the id order fixes the samples. The two undetermined
+    accounts sort first and third. The readable ones sign in only after the wave is seen, so the
+    process that saw it probes the two together and latches. The control: that process holds them
+    through two full rotations and revokes nothing. A fresh process on the same store, with the
+    same settings and the same directory, samples each undetermined account beside a readable one,
+    holds neither, and revokes one per pass.
+
+    RED when: a held account is revoked before the restart, or the restart keeps the hold, which
+    would contradict the ADR note and owe it an edit."""
+    names = ["n1", "n2", "n3", "n4"]
+    settings: dict[str, Any] = {"ad_session_recheck_strikes": 1, "ad_session_recheck_max_users": 2}
+    async with uac._signed_in_estate(monkeypatch, names, **settings) as estate:
+        directory, service, store, tokens = estate
+        listed = sorted((u.id, u.username) for u in await store.list_users())
+        order = [name for _id, name in listed if name in names]
+        held, readable = [order[0], order[2]], [order[1], order[3]]
+        held_ids = {await uac._id(store, n) for n in held}
+        directory.uac.update(dict.fromkeys(held, uac.ABSENT))
+        await uac._expire(store, readable)
+
+        first = await uac._pass(service)
+        assert first.hold and first.latched and set(first.held) == held_ids
+        await uac._sign_in(service, readable)
+        for n in range(4):  # two full rotations of the budget
+            plan = await uac._pass(service)
+            assert plan.hold and plan.revocations == (), f"pass {n + 2} of the process that held"
+        assert await uac._alive(service, {n: tokens[n] for n in held}) == set(held)
+
+        fresh = uac._fresh_process(store, **settings)
+        await fresh.initialize()
+        revoked: list[list[tuple[str, str]]] = []
+        for _ in range(2):
+            plan = await uac._pass(fresh)
+            assert not plan.hold and not plan.latched
+            revoked.append([(r.username, r.reason) for r in plan.revocations])
+        assert revoked == [
+            [(held[0], "directory_undetermined")],
+            [(held[1], "directory_undetermined")],
+        ]
+        assert await uac._alive(fresh, {n: tokens[n] for n in held}) == set()
+
+
+async def test_a_restart_at_default_settings_revokes_a_held_account_beside_an_unreachable_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #3689 closing step 3's second test. ADR 0195, *What a restart does to the
+    hold*, direction 1 at default settings: the empty outcome record loses rule item 4's
+    protection, so on a pass where one held account's probe is UNAVAILABLE a fresh process counts
+    only the other, and strikes and revokes a held account that is not the last.
+
+    The control: the process that held the wave keeps both held while one of them is unreachable,
+    because its record still reads that one undetermined. The fresh process, on the same store
+    and directory, revokes the reachable one at the default two strikes and leaves the unreachable
+    one, which is never judged, signed in.
+
+    RED when: the process that held revokes either account, or the fresh one revokes none, which
+    would contradict the ADR note and owe it an edit."""
+    names = ["u1", "u2", "ok1"]
+    async with uac._signed_in_estate(monkeypatch, names) as estate:
+        directory, service, store, tokens = estate
+        directory.uac.update({"u1": uac.ABSENT, "u2": uac.ABSENT})
+        assert (await uac._pass(service)).hold
+        _unreachable_for(monkeypatch, service, "u1")
+        for n in range(3):
+            plan = await uac._pass(service)
+            assert plan.hold and plan.undetermined == 2 and plan.unavailable == 1, f"pass {n + 2}"
+            assert plan.revocations == ()
+
+        fresh = uac._fresh_process(store)
+        await fresh.initialize()
+        _unreachable_for(monkeypatch, fresh, "u1")
+        struck = await uac._pass(fresh)
+        assert not struck.hold and struck.undetermined == 1 and struck.revocations == ()
+        revoked = await uac._pass(fresh)
+        assert [(r.username, r.reason) for r in revoked.revocations] == [
+            ("u2", "directory_undetermined")
+        ]
+        assert await uac._alive(fresh, tokens) == {"u1", "ok1"}
 
 
 async def test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id() -> None:
@@ -3787,6 +4219,7 @@ async def test_a_rename_already_applied_by_another_caller_is_not_told_twice(
             new_username="jdoe-married",
             held=held,
             from_plan=True,
+            audit_soft=True,
         )
 
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
@@ -3881,6 +4314,7 @@ async def test_a_sign_in_rename_is_not_skipped_when_a_pass_wrote_an_older_name_f
             new_username="jdoe-remarried",
             held=None,
             from_plan=False,
+            audit_soft=False,
         )
 
         after = await store.get_user(user_id)
@@ -3929,12 +4363,14 @@ async def test_a_stale_plan_is_skipped_not_filed_as_a_conflict_when_another_row_
             new_username="jdoe-married",
             held=held,
             from_plan=True,
+            audit_soft=True,
         )
 
         after = await store.get_user(user_id)
         assert after is not None and after.username == "jdoe-remarried"
         assert not await _rename_audits(store), "a stale plan was audited"
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert_capture_sees(caplog, "messagefoundry.auth.service")
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
             "a stale plan warned of a lockout"
         )
@@ -3963,6 +4399,7 @@ async def test_a_row_deleted_before_the_apply_is_refused_without_a_write_or_a_no
             new_username="jdoe-married",
             held=None,
             from_plan=True,
+            audit_soft=True,
         )
 
         assert writes == [], "the refresh wrote to a row it had just read as gone"
@@ -4051,6 +4488,7 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
             new_username="jdoe-married",
             held=held,
             from_plan=False,
+            audit_soft=False,
         )
 
         [conflict] = [
@@ -4092,6 +4530,7 @@ async def test_a_stale_held_row_is_not_a_conflict_when_this_row_already_has_the_
             new_username="jdoe-married",
             held=stale_held,
             from_plan=True,
+            audit_soft=True,
         )
 
         assert not [
@@ -4100,6 +4539,7 @@ async def test_a_stale_held_row_is_not_a_conflict_when_this_row_already_has_the_
             if a["action"] == "auth.ad_username_refresh_conflict"
         ], "a stale held row filed a conflict for a rename already in place"
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert_capture_sees(caplog, "messagefoundry.auth.service")
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     finally:
         await store.close()
@@ -4139,6 +4579,7 @@ async def test_a_stale_held_row_that_let_the_name_go_files_no_conflict(
         assert [a["action"] for a in await _rename_audits(store)] == [
             "auth.ad_username_refreshed"
         ], "a stale held row filed a conflict for a name nobody holds"
+        assert_capture_sees(caplog, "messagefoundry.auth.service")
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
             "a stale held row warned of a lockout nobody faces"
         )
@@ -4231,6 +4672,7 @@ async def test_a_pass_whose_holder_read_went_stale_writes_the_rename(
         assert [a["action"] for a in await _rename_audits(store)] == [
             "auth.ad_username_refreshed"
         ], "a stale held read in the pass filed a conflict"
+        assert_capture_sees(caplog, "messagefoundry.auth.service")
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
             "a stale held read in the pass warned"
         )
@@ -4270,6 +4712,7 @@ async def test_a_stale_held_row_is_no_conflict_when_this_row_took_the_name_since
         assert after is not None and after.username == "jdoe-married"
         assert not await _rename_audits(store), "this row filed a conflict against itself"
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert_capture_sees(caplog, "messagefoundry.auth.service")
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert any("BACKLOG #2290" in r.getMessage() for r in caplog.records)
     finally:
@@ -4323,6 +4766,95 @@ async def test_a_holder_that_fails_its_seal_by_the_re_read_is_refused_with_the_l
             "a seal-failed holder at the re-read lost the lockout warning"
         )
         assert not [m for m in messages if "retries it" in m]
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("shape", ["write_noop", "write_race"])
+async def test_a_holder_that_fails_its_seal_on_the_write_path_is_refused_with_the_lockout_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, shape: str
+) -> None:
+    """Vault BACKLOG #3069 note T3, on a keyed store. No ``held`` is passed, so the pre-check is
+    skipped and the write finds the new name taken by a row whose record was then changed outside
+    the store. That row still holds the name, so the refusal is the lockout one, with no verified
+    id to name and ``held_by_refused`` on the audit row. RED when the write path reads the holder
+    as absent: the warning then says no row holds the name and a later pass retries it, which is
+    false while that holder fails its seal."""
+    path = tmp_path / "sealed.db"
+    store, _ldap, service, notifier, user_id = await _renamed_service(path)
+    try:
+
+        async def _taken(*a: object, **kw: object) -> bool:
+            await store.create_user(
+                user_id="squatter",
+                username="jdoe-married",
+                auth_provider="ad",
+                password_generated=False,
+                audits=(),
+            )
+            await _raw_for(path)("UPDATE users SET display_name=? WHERE id=?", ("bent", "squatter"))
+            if shape == "write_race":
+                raise sqlite3.IntegrityError("UNIQUE constraint failed: users.username")
+            return False
+
+        store.set_user_username = _taken  # type: ignore[method-assign]
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        caplog.clear()
+
+        await service._refresh_cached_username(
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-married",
+            held=None,
+            from_plan=True,
+            audit_soft=True,
+        )
+
+        [conflict] = await _rename_audits(store)
+        detail = json.loads(conflict["detail"])
+        assert detail["detected"] == shape
+        assert detail["held_by_user_id"] is None and detail["held_by_refused"] is True
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert [m for m in messages if "refused at its next sign-in" in m], (
+            f"a seal-failed holder on the {shape} path lost the lockout warning"
+        )
+        assert not [m for m in messages if "no row holds the new name" in m]
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+    finally:
+        await store.close()
+
+
+async def test_a_row_that_fails_its_seal_is_not_refused_as_gone(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3069 note T3, the renamed row itself. Its record is changed outside the store
+    after the plan, so the refresh's pre-read refuses it. The row is still there, so the refresh
+    files no ``row_gone`` conflict saying it was removed, writes nothing and tells nobody; the
+    loader has already reported the seal failure. RED when a seal failure reads as a gone row."""
+    path = tmp_path / "sealed.db"
+    store, _ldap, service, notifier, user_id = await _renamed_service(path)
+    try:
+        await _raw_for(path)("UPDATE users SET display_name=? WHERE id=?", ("bent", user_id))
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        caplog.clear()
+
+        await service._refresh_cached_username(
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-married",
+            held=None,
+            from_plan=True,
+            audit_soft=True,
+        )
+
+        assert not await _rename_audits(store), "a seal-failed row was filed as a rename refusal"
+        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+        raw = await store.get_user(user_id)
+        assert raw is not None and raw.username == "jdoe"
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert [m for m in messages if "fails its integrity check" in m and "BACKLOG #3069" in m]
+        assert not [m for m in messages if "removed" in m]
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
     finally:
         await store.close()
@@ -4412,6 +4944,7 @@ async def test_a_store_fault_on_the_holder_re_read_still_raises_off_the_reconcil
                 new_username="jdoe-married",
                 held=replace(row, id="gone-holder", username="jdoe-married"),
                 from_plan=False,
+                audit_soft=False,
             )
         after = await store.get_user(user_id)
         assert after is not None and after.username == "jdoe"
@@ -4436,6 +4969,7 @@ async def test_a_row_gone_refusal_does_not_warn_of_a_lockout(
             new_username="jdoe-married",
             held=None,
             from_plan=False,
+            audit_soft=False,
         )
         [warning] = [r for r in caplog.records if r.name == "messagefoundry.auth.service"]
         assert "removed" in warning.getMessage()
@@ -4475,6 +5009,7 @@ async def test_a_lost_write_with_no_holder_left_does_not_warn_of_a_lockout(
             new_username="jdoe-married",
             held=None,
             from_plan=False,
+            audit_soft=False,
         )
         [warning] = [r for r in caplog.records if r.name == "messagefoundry.auth.service"]
         assert "no row holds the new name" in warning.getMessage()
@@ -4543,6 +5078,7 @@ async def test_two_refreshes_of_one_rename_at_once_write_audit_and_notify_once(
                         new_username="jdoe-married",
                         held=None,
                         from_plan=from_plan,
+                        audit_soft=from_plan,
                     )
                 )
 
@@ -5482,6 +6018,7 @@ async def test_the_login_path_rename_still_fails_on_a_refused_audit_write(
                 new_username="jdoe-new",
                 held=None,
                 from_plan=False,
+                audit_soft=False,
             )
         assert refused == ["jdoe-new"]
         after = await store.get_user(jdoe.id)
@@ -6025,6 +6562,105 @@ async def test_a_role_revocation_another_reconciler_applied_first_is_quiet() -> 
         )
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
         assert len(_revoked_rows(await store.list_audit())) == 2
+    finally:
+        await store.close()
+
+
+async def test_two_reconcilers_that_both_read_the_old_roles_report_the_change_once() -> None:
+    """Vault BACKLOG #3085, the role-half race. Two applies of one role revocation both read the
+    old roles before either writes. Only the first write counts the change: one apply reports and
+    tells the user, the other is quiet, and both still write their row ("audit always").
+
+    **The barrier is what makes this the race.** Without it ``asyncio.gather`` can run one apply
+    to its write before the other reads, and the second would read the new roles and skip, which
+    passed before the compare-and-set too. Neither apply may go past its first read of the account
+    until both have made it. The sessions are ended first, so neither apply's session count can
+    decide its report: only the role write can."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        await store.revoke_user_sessions(user.id)
+        target = () if await store.get_user_role_ids(user.id) else (Role.OPERATOR.value,)
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=target
+        )
+        barrier = asyncio.Barrier(2)
+        reads = 0
+        load_user = service._load_user
+
+        async def _read_then_wait(user_id: str) -> VerifiedUser | None:
+            nonlocal reads
+            row = await load_user(user_id)
+            reads += 1
+            if reads <= 2:
+                await barrier.wait()
+            return row
+
+        service._load_user = _read_then_wait  # type: ignore[method-assign]
+        writes: list[bool] = []
+        write = store.set_user_roles_if_held
+
+        async def _count_write(*a: Any, **kw: Any) -> bool:
+            wrote = await write(*a, **kw)
+            writes.append(wrote)
+            return wrote
+
+        store.set_user_roles_if_held = _count_write  # type: ignore[method-assign]
+        watermark = await service._audit_watermark()
+        async with asyncio.timeout(10):
+            outcomes = await asyncio.gather(
+                service._apply_reconcile_revocation(revocation, watermark=watermark),
+                service._apply_reconcile_revocation(revocation, watermark=watermark),
+            )
+
+        assert sorted(writes) == [False, True], "both applies must reach the write"
+        assert sorted(outcomes) == ["quiet", "reported"], outcomes
+        assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
+        assert [r["sessions"] for r in _revoked_rows(await store.list_audit())] == [0, 0]
+        assert sorted(await store.get_user_role_ids(user.id)) == sorted(target)
+    finally:
+        await store.close()
+
+
+async def test_a_stale_role_plan_does_not_overwrite_a_newer_role_write() -> None:
+    """Vault BACKLOG #3085, the compare-and-set's other half. Between the apply's read of the roles
+    and its write, another writer (a directory sign-in, here a bare store write standing in for
+    one) moves the roles to a third set. The apply writes nothing over it, counts no role change,
+    and, ending no session, is quiet. RED when the write compares on the plan's target rather
+    than on what the apply read: it would then write the stale set and report it."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        await store.revoke_user_sessions(user.id)
+        await store.set_user_roles(user.id, [Role.VIEWER.value])
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=(Role.OPERATOR.value,)
+        )
+        load_user = service._load_user
+
+        async def _read_then_sign_in(user_id: str) -> VerifiedUser | None:
+            row = await load_user(user_id)
+            await store.set_user_roles(user_id, [Role.ADMINISTRATOR.value])
+            return row
+
+        service._load_user = _read_then_sign_in  # type: ignore[method-assign]
+
+        outcome = await service._apply_reconcile_revocation(
+            revocation, watermark=await service._audit_watermark()
+        )
+
+        assert outcome == "quiet"
+        assert await store.get_user_role_ids(user.id) == [Role.ADMINISTRATOR.value], (
+            "a stale reconciler plan overwrote a newer role write"
+        )
+        assert notifier.sent == []
+        assert [r["sessions"] for r in _revoked_rows(await store.list_audit())] == [0]
     finally:
         await store.close()
 

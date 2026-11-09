@@ -42,6 +42,7 @@ import functools
 import math
 import struct
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -49,6 +50,8 @@ import pytest
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, _ldap3_receive_timeout
 from messagefoundry.config.settings import AuthSettings
 
+#: ``[auth].ad_bind_dn`` in :func:`_ad_settings`, the service account's DN.
+_SERVICE_DN = "CN=svc,DC=example,DC=com"
 _CONNECT_TIMEOUT = 7.5  # deliberately not the default, so a hardcoded literal cannot pass
 # Deliberately not the default, AFTER rounding: its ceiling is 12, not the default's 10, so a
 # hardcoded 10 cannot pass. Fractional on purpose: ldap3 needs an int on POSIX (see below).
@@ -62,7 +65,7 @@ def _ad_settings(**over: Any) -> AuthSettings:
         "ad_domain": "example.com",
         "ad_user_search_base": "OU=Users,DC=example,DC=com",
         "ad_group_search_base": "OU=Groups,DC=example,DC=com",
-        "ad_bind_dn": "CN=svc,DC=example,DC=com",
+        "ad_bind_dn": _SERVICE_DN,
         "ad_bind_password": "synthetic-bind-pw",
         "ad_connect_timeout": _CONNECT_TIMEOUT,
         "ad_receive_timeout": _RECEIVE_TIMEOUT,
@@ -122,6 +125,11 @@ class _Recorder:
         # aim the decoy at a real principal" assertion expressible at all.
         self.binds: list[str | None] = []
         self.unbinds: list[str | None] = []
+        # The service account's binds, apart from ``binds``: every lookup makes one, so the #1140
+        # assertions over ``binds`` read the user and decoy binds alone (BACKLOG #3017 L5).
+        self.service_binds: list[str | None] = []
+        # Each socket closed without sending (ldap3's ``BaseStrategy.close``), by bind DN.
+        self.closes: list[str | None] = []
 
 
 #: What ``_install_fakes(refer=...)`` answers a referred operation with (BACKLOG #2530).
@@ -134,11 +142,11 @@ REFERRAL_RESULT: dict[str, Any] = {
 def _install_fakes(
     monkeypatch: pytest.MonkeyPatch, *, bind_ok: bool = True, refer: str = ""
 ) -> _Recorder:
-    """Install recording ``ldap3`` doubles. ``bind_ok=False`` makes every EXPLICIT bind fail, which
-    is how the valid-user-wrong-password branch is driven (the service-account connection is built
-    with ``auto_bind=True``, which these doubles do not honour, so it is never an explicit bind).
-    ``refer`` names the operation, ``"bind"`` (explicit binds) or ``"group"`` (the group search),
-    that the directory answers with a referral instead."""
+    """Install recording ``ldap3`` doubles. ``bind_ok=False`` makes every bind but the service
+    account's fail, which is how the valid-user-wrong-password branch is driven. ``refer`` names the
+    operation, ``"bind"`` (the user and decoy binds) or ``"group"`` (the group search), that the
+    directory answers with a referral instead. The service account's bind always succeeds, and is
+    recorded in ``service_binds``, not ``binds``."""
     import ldap3
 
     rec = _Recorder()
@@ -153,6 +161,7 @@ def _install_fakes(
             self.entries: list[_FakeEntry] = []
             self._bind_dn: str | None = kwargs.get("user")
             self.result: dict[str, Any] | None = None  # no referral
+            self.strategy = SimpleNamespace(close=lambda: rec.closes.append(self._bind_dn))
 
         def __enter__(self) -> FakeConnection:
             return self
@@ -191,6 +200,10 @@ def _install_fakes(
             return True
 
         def bind(self) -> bool:
+            if self._bind_dn == _SERVICE_DN:
+                rec.service_binds.append(self._bind_dn)
+                self.result = {"result": 0}
+                return True
             rec.binds.append(self._bind_dn)
             if refer == "bind":
                 self.result = REFERRAL_RESULT
@@ -685,8 +698,8 @@ def test_a_rejected_password_still_unbinds_the_user_connection(
     spray — left the LDAP connection to be reclaimed by GC, while the doc said "the user bind is
     explicitly unbound".
     """
-    # ``bind_ok=False`` fails the USER bind only: the service-account connection is built with
-    # auto_bind=True, which these doubles do not honour, so it never takes the explicit-bind path.
+    # ``bind_ok=False`` fails the USER bind only: these doubles always let the service account's
+    # bind through.
     rec = _install_fakes(monkeypatch, bind_ok=False)
 
     rejected = LdapAuthenticator(_ad_settings()).authenticate("alice", "wrong-password")

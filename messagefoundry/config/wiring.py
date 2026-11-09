@@ -883,8 +883,8 @@ def refuse_resolved_verify_off(
     # Read as the connector reads it: an explicit None is the default, on (vault BACKLOG #3230).
     if not bool_setting(settings, "verify_tls", default=True) and settings.get("tls_ca_file"):
         raise WiringError(
-            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false or "
-            "empty value, which verifies nothing, and DICOMweb has no token hop."
+            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false "
+            "value, which verifies nothing, and DICOMweb has no token hop."
         )
 
 
@@ -2211,8 +2211,9 @@ def _url_may_carry_a_credential(value: str) -> bool:
 
     Any of these withholds it: an ``@`` anywhere in it; a ``%40``, ``%3A``, ``%26``, ``%3B``,
     ``%3F``, ``%23`` or ``%25`` anywhere in it, any case (:data:`_WITHHELD_URL_ESCAPES`); a value
-    ``urlsplit`` refuses; a credential-looking query name by the warning detector
-    (:func:`~messagefoundry.secretscrub.credential_query_params`); a credential-looking name in any
+    ``urlsplit`` refuses; a credential-looking query name by the credential refusals' reading of
+    the warning detector (:func:`~messagefoundry.secretscrub.credential_query_params` with
+    ``refusal=True``, so ``?code=`` too); a credential-looking name in any
     ``name=value`` segment after a ``?``, ``&``, ``#`` or ``;``
     (:func:`~messagefoundry.secretscrub.has_credential_like_segment`), or a credential word anywhere
     in such a name (:func:`_has_credential_named_segment`); or a path segment that is a credential
@@ -2240,7 +2241,7 @@ def _url_may_carry_a_credential(value: str) -> bool:
         return True
     return (
         has_credential_like_segment(value)
-        or bool(credential_query_params(value))
+        or bool(credential_query_params(value, refusal=True))
         or _has_credential_named_segment(value)
         or _has_credential_path_segment(parts.path)
         # A hash route, ``#/token/SECRET/x``, is a path to the page that reads it.
@@ -6884,12 +6885,15 @@ def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
-def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
+def query_credential_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
     """Every outbound and ``FhirLookup`` whose ``url`` carries a credential-like query parameter, as
     ``(name, parameter names)`` (ASVS 14.2.1). Lookup names are prefixed ``fhir_lookup:``.
 
     The single reader, on the contract of :func:`expiry_relaxed_hops`, so ``messagefoundry check``,
-    ``security_loosenings()`` and ``GET /security/posture`` cannot disagree. Sorted by name. The
+    ``security_loosenings()`` and ``GET /security/posture`` cannot disagree on a literal ``url``;
+    on an ``env()`` one they read the values each has, as below. Sorted by name. The
     second element is the parameter NAMES only, comma-joined, from
     :func:`~messagefoundry.secretscrub.credential_query_params`; a value never leaves this function.
 
@@ -6899,15 +6903,24 @@ def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
     it nowhere else, so it is reported rather than refused, except where
     ``transports.egress.warn_url_query_credentials`` says a build refuses it.
 
-    It reads a literal ``url`` only. An ``env()`` URL is unresolved here and cannot be read; the
-    construction WARNING, ``transports.egress.warn_url_query_credentials``, reads the resolved one.
-    Pure."""
+    An ``env()`` URL is resolved with :func:`resolve_env_settings`, the build's own resolution and
+    the one ``transports.egress.warn_url_query_credentials_before_build`` applies, against
+    ``env_values`` (the live posture route passes the runner's). A key the values do not hold, or
+    no values at all, falls back to its literal ``default=`` (vault BACKLOG #3766 item 15); one with
+    neither is not read. A ``deployed=False`` outbound with an ``env()`` URL is skipped, as the
+    DATABASE and ECH readers skip one: its values are never resolved and it is never built (ADR
+    0111 AC-1). It touches nothing but the graph and the values, except that resolving runs an
+    ``env()`` URL's operator ``cast``, as the build does."""
     out: list[tuple[str, str]] = []
     for name, settings in (
-        *((oc.name, oc.spec.settings) for oc in registry.outbound.values()),
+        *(
+            (oc.name, oc.spec.settings)
+            for oc in registry.outbound.values()
+            if oc.deployed or not isinstance(oc.spec.settings.get("url"), EnvRef)
+        ),
         *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
     ):
-        url = settings.get("url")
+        url = _db_setting(settings, "url", None, env_values or {})
         if isinstance(url, str) and (names := credential_query_params(url)):
             out.append((name, ", ".join(names)))
     return sorted(out)
@@ -7631,7 +7644,8 @@ def oauth_request_advisories(registry: Registry) -> OAuthRequestAdvisories:
       graded.
 
     **It reads literal values only, and that limit is large.** An ``env()`` reference is unresolved in
-    the loaded graph, exactly as :func:`query_credential_hops` records for ``url``. Measured
+    the loaded graph; :func:`query_credential_hops` resolves its ``url``, and this reader does not.
+    Measured
     2026-10-04 over the tracked tree: all five worked examples of the two composers spell the endpoint
     ``url`` and the token URL as ``env()``, and none sets an audience. So on a configuration written
     the documented way, both audience rules have nothing to compare. No construction-time reader of

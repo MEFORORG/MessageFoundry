@@ -838,6 +838,15 @@ def test_the_odbc_call_gate_leaf_imports_only_the_standard_library() -> None:
     assert sorted(m for m in modules if m.split(".")[0] not in sys.stdlib_module_names) == []
 
 
+def test_the_file_lock_leaf_imports_only_the_standard_library() -> None:
+    # BACKLOG #2279 item 9: config/, pipeline/, api/ and the eagerly loaded log spool all take
+    # their OS lock through it, so an engine import here would reach every one of them.
+    path = _ENGINE_ROOT / "file_lock.py"
+    modules = _imported_modules(path, path.parent)
+    assert "errno" in modules, "control: the walk did not read the module's imports"
+    assert sorted(m for m in modules if m.split(".")[0] not in sys.stdlib_module_names) == []
+
+
 def test_the_leaf_check_fires_on_a_root_import_and_a_third_party_one(tmp_path: Path) -> None:
     planted = tmp_path / "messagefoundry" / "leaf.py"
     planted.parent.mkdir()
