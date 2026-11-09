@@ -48,11 +48,13 @@ def test_builtins_satisfy_the_runtime_checkable_protocol() -> None:
 
 
 def test_known_providers_is_the_full_adr_enum() -> None:
-    # auto/env/dpapi (built-in) + the five external envelope-decrypt providers (ADR 0019 §2).
+    # auto/env/dpapi (built-in), the key custody host blob (vault BACKLOG #3411), and the five
+    # external envelope-decrypt providers (ADR 0019 §2).
     assert KNOWN_PROVIDERS == (
         "auto",
         "env",
         "dpapi",
+        "host",
         "aws_kms",
         "azure_kv",
         "gcp_kms",

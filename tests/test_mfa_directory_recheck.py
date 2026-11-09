@@ -53,6 +53,7 @@ from messagefoundry.store.base import Store
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import login_admin
+from tests._enrolment_code import enrolment_code_for
 from tests._fake_directory import FakeDirectory as _Directory
 
 _T0 = 1_700_000_000.0
@@ -111,7 +112,11 @@ async def _enrolled_directory_session(
     pin_totp_clock(monkeypatch, _T0)
     enroll = await service.begin_mfa_enrollment(first.identity)
     confirmed = await service.confirm_mfa_enrollment(
-        first.identity, totp.totp(enroll.secret, now=_T0), token=first.token
+        first.identity,
+        totp.totp(enroll.secret, now=_T0),
+        token=first.token,
+        # ADR 0207: a directory account's first factor binds only with an issued code.
+        enrolment_code=await enrolment_code_for(service, first.identity.user_id),
     )
     assert confirmed.ok
     second = await service._complete_ad_login(principal, None, mfa_verified=False)
@@ -481,7 +486,11 @@ async def test_a_local_account_is_never_role_checked(
     await store.set_ad_group_role_map([(_OPERATORS, "operator")])
     enroll = await service.begin_mfa_enrollment(identity)
     confirmed = await service.confirm_mfa_enrollment(
-        identity, fresh_totp(enroll.secret), token=token
+        identity,
+        fresh_totp(enroll.secret),
+        token=token,
+        # ADR 0207: a directory account's first factor binds only with an issued code.
+        enrolment_code=await enrolment_code_for(service, identity.user_id),
     )
     assert confirmed.ok and confirmed.recovery_codes
 
@@ -553,7 +562,11 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
         identity, first, _ = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
         confirmed = await service.confirm_mfa_enrollment(
-            identity, fresh_totp(enroll.secret), token=first
+            identity,
+            fresh_totp(enroll.secret),
+            token=first,
+            # ADR 0207: a directory account's first factor binds only with an issued code.
+            enrolment_code=await enrolment_code_for(service, identity.user_id),
         )
         assert confirmed.ok and confirmed.token is not None and confirmed.recovery_codes
         # A fresh session that still owes its factor, proved by a single-use recovery code.
@@ -662,7 +675,11 @@ async def test_a_factor_changed_during_the_check_charges_no_lockout(
     identity, first, _ = await login_admin(service)
     enroll = await service.begin_mfa_enrollment(identity)
     confirmed = await service.confirm_mfa_enrollment(
-        identity, fresh_totp(enroll.secret), token=first
+        identity,
+        fresh_totp(enroll.secret),
+        token=first,
+        # ADR 0207: a directory account's first factor binds only with an issued code.
+        enrolment_code=await enrolment_code_for(service, identity.user_id),
     )
     assert confirmed.ok and confirmed.token is not None and confirmed.recovery_codes
     user_id = identity.user_id
@@ -716,7 +733,11 @@ async def test_a_factor_changed_with_the_sessions_revoked_answers_a_lost_session
     identity, first, _ = await login_admin(service)
     enroll = await service.begin_mfa_enrollment(identity)
     confirmed = await service.confirm_mfa_enrollment(
-        identity, fresh_totp(enroll.secret), token=first
+        identity,
+        fresh_totp(enroll.secret),
+        token=first,
+        # ADR 0207: a directory account's first factor binds only with an issued code.
+        enrolment_code=await enrolment_code_for(service, identity.user_id),
     )
     assert confirmed.ok and confirmed.token is not None and confirmed.recovery_codes
     token = confirmed.token
@@ -771,7 +792,11 @@ async def test_the_failed_spend_reread_answers_the_holder_first(
     identity, first, _ = await login_admin(service)
     enroll = await service.begin_mfa_enrollment(identity)
     confirmed = await service.confirm_mfa_enrollment(
-        identity, fresh_totp(enroll.secret), token=first
+        identity,
+        fresh_totp(enroll.secret),
+        token=first,
+        # ADR 0207: a directory account's first factor binds only with an issued code.
+        enrolment_code=await enrolment_code_for(service, identity.user_id),
     )
     assert confirmed.ok and confirmed.token is not None and confirmed.recovery_codes
     user_id = identity.user_id
@@ -875,7 +900,11 @@ async def test_a_secret_that_does_not_open_for_the_check_is_refused_and_spends_n
     identity, first, _ = await login_admin(service)
     enroll = await service.begin_mfa_enrollment(identity)
     confirmed = await service.confirm_mfa_enrollment(
-        identity, fresh_totp(enroll.secret), token=first
+        identity,
+        fresh_totp(enroll.secret),
+        token=first,
+        # ADR 0207: a directory account's first factor binds only with an issued code.
+        enrolment_code=await enrolment_code_for(service, identity.user_id),
     )
     assert confirmed.ok and confirmed.recovery_codes
     token = await service._issue_session(
@@ -1042,7 +1071,11 @@ async def test_a_local_account_is_never_probed(store: MessageStore) -> None:
     identity, token, _ = await login_admin(service)
     enroll = await service.begin_mfa_enrollment(identity)
     confirmed = await service.confirm_mfa_enrollment(
-        identity, fresh_totp(enroll.secret), token=token
+        identity,
+        fresh_totp(enroll.secret),
+        token=token,
+        # ADR 0207: a directory account's first factor binds only with an issued code.
+        enrolment_code=await enrolment_code_for(service, identity.user_id),
     )
     assert confirmed.ok and confirmed.recovery_codes
 

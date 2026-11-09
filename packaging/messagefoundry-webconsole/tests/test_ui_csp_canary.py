@@ -61,6 +61,7 @@ from messagefoundry_webconsole._html import (
     SCRIPTS_OK_CLASS,
 )
 from messagefoundry_webconsole.routes.core import _is_expected_csp_probe_report
+from tests._log_absence import assert_capture_sees
 
 _NONCE_RE = re.compile(r"script-src 'nonce-([A-Za-z0-9_-]+)' 'strict-dynamic'")
 PROBE_TAG = '<script src="/ui/static/csp-probe.js">'
@@ -356,6 +357,7 @@ async def test_report_route_tags_the_canary_and_still_warns_on_a_real_violation(
                 },
             )
             assert expected.status_code == 204
+            assert_capture_sees(caplog, "messagefoundry_webconsole.routes.core")
             assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
         caplog.clear()
@@ -434,6 +436,7 @@ async def test_only_all_canary_batches_are_silenced(
                 ],
             )
             assert r.status_code == 204
+            assert_capture_sees(caplog, "messagefoundry_webconsole.routes.core")
             assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
 
 

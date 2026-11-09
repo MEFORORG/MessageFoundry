@@ -57,7 +57,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence  # noqa: E402
 from pathlib import (  # noqa: E402
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
-from typing import TYPE_CHECKING, Any, NamedTuple, cast  # noqa: E402
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast  # noqa: E402
 
 from messagefoundry import __version__  # noqa: E402
 from messagefoundry.cli_common import (  # noqa: E402  # the shared CLI shell and helpers (ADR 0201 slice 1)
@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
+    from messagefoundry.store.custody_host import MintedCustody
     from messagefoundry.store.store import UserRecord
 
 
@@ -720,6 +721,33 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
 
+    # ADR 0207 section 6: a site whose every enabled Administrator is a directory account with no
+    # engine factor has nobody who can issue an enrolment code. This is the host's exit, on
+    # admin-unlock's gate, for any directory account.
+    issue_enrolment_code = sub.add_parser(
+        "issue-enrolment-code",
+        help="issue a directory account's one-time enrolment code from the host (offline)",
+        description="Issue the single-use enrolment code a directory account needs to bind its "
+        "first engine factor, for a site where no Administrator can issue one from the console. "
+        "Runs against the store directly, on the same host gate as admin-unlock. On SQLite it "
+        "refuses while another connection holds the store, and when it cannot tell; on a server "
+        "store it cannot tell, so run it with the engine stopped. It prints the code once; hand it "
+        "over after confirming who is asking, never through the account's own mail or chat. It "
+        "refuses a local account, a disabled account and an account that holds a factor.",
+    )
+    issue_enrolment_code.add_argument(
+        "--username", required=True, help="the directory account the code is for"
+    )
+    issue_enrolment_code.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    issue_enrolment_code.add_argument(
+        "--db", default=None, help="store path (overrides [store].path)"
+    )
+    issue_enrolment_code.add_argument("--json", action="store_true", help="emit JSON")
+
     # BACKLOG #2614. DELETE /sessions ends sessions in bulk through the API; this is the same act
     # from the host, for when the API itself is what is not trusted. Same host gate as admin-unlock.
     admin_revoke_sessions = sub.add_parser(
@@ -776,6 +804,16 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--no-totp",
         action="store_true",
         help="do not enrol an authenticator app (refused while [security].require_mfa is on)",
+    )
+    # Vault BACKLOG #3411 (key custody S3): under [store].key_provider = 'host' this command mints
+    # the store key. Without this option it keeps the key for the account running it; with it, it
+    # writes the machine-scope handoff the named service account converts on its first start.
+    provision_admin.add_argument(
+        "--service-account",
+        default=None,
+        help="under [store].key_provider = 'host', mint the store key for this Windows service "
+        "account (such as 'NT SERVICE\\MessageFoundry') as a handoff it converts on its first "
+        "start; without it the key is kept for the account running this command",
     )
 
     # ADR 0183 Amendment A, Wave 1c (BACKLOG #1136). An enabled Administrator with no address is
@@ -2582,7 +2620,8 @@ def _remote_debug_refused(
     """True, with the reason printed, when :func:`messagefoundry.remotedebug.remote_debug_refusal`
     refuses ``posture`` and nothing lifts it (vault BACKLOG #2700). ``what`` is what is refused.
     Where the acceptance lifts it, the :func:`_remote_debug_audit` line is logged instead. The
-    caller logs it again once its log handlers exist, as BACKLOG #1989 does for its audit lines."""
+    caller logs it again once its log handlers exist, as BACKLOG #1989 does for its audit lines.
+    A refusal with the engine's hook missing also logs the ``remote_debug_unguarded`` entry."""
     audit = _remote_debug_audit(settings, posture, enforcing=enforcing, what=what)
     if audit is not None:
         logging.getLogger(__name__).warning("%s", audit)
@@ -2590,6 +2629,13 @@ def _remote_debug_refused(
     refused = remote_debug_refusal(posture) if enforcing else None
     if refused is None:
         return False
+    # Vault BACKLOG #3795: the residual line follows this gate, so without this a refused start
+    # would not say that the engine's hook did not answer. The relaunch the refusal names turns
+    # the interface off, and would leave what stopped the hook unreported.
+    if not posture.guard_installed and (unguarded := remote_debug_loosening(posture)) is not None:
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *unguarded
+        )
     print(f"error: refusing to {what}: {refused}.", file=sys.stderr)
     return True
 
@@ -5176,17 +5222,6 @@ def _supervise(args: argparse.Namespace) -> int:
     # forwarder (BACKLOG #2356).
     configure_logging("INFO")
 
-    # The supervisor has no API and builds no loosening list, so its own reading is reported here.
-    # Each shard reports its own through `serve`.
-    security_lines: list[tuple[str, str]] = []
-    remote_debug_reading = remote_debug_posture()
-    remote_debug = remote_debug_loosening(remote_debug_reading)
-    if remote_debug is not None:
-        security_lines.append(remote_debug)
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
-        )
-
     # ADR 0050 AC-9: anchor the discovery --config and the --db base under the project root HERE, before
     # discover_shard_specs runs load_config() — so `supervise --project-root R --config <relative>` from a
     # non-root CWD discovers shards under R, and each shard's <stem>_<shard>.db composes under R in the
@@ -5252,8 +5287,8 @@ def _supervise(args: argparse.Namespace) -> int:
 
     # Vault BACKLOG #2701: the start-up code check each engine shard's `serve` makes, for the same
     # reason as the gates around it, and because the supervisor's own interpreter ran that code
-    # too. The supervisor builds no loosening list, so its own reading is logged here, like the
-    # remote-debugging one above. Each engine shard reports its own through `serve`. The reading
+    # too. The supervisor builds no loosening list, so its own reading is logged below, once the
+    # start-file gate has passed. Each engine shard reports its own through `serve`. The reading
     # also searches the import path the engine shards inherit, so a module only they would run
     # refuses here.
     from messagefoundry.config.ai_policy import SecurityEnforcement
@@ -5271,10 +5306,23 @@ def _supervise(args: argparse.Namespace) -> int:
         return 2
     # Vault BACKLOG #2700: the supervisor's OWN process. Its engine shards start with the
     # interface off (messagefoundry/childenv.py), so none of them would refuse on it.
+    remote_debug_reading = remote_debug_posture()
     if _remote_debug_refused(
         settings, remote_debug_reading, enforcing=enforcing, what="start the fleet"
     ):
         return 2
+    # The supervisor has no API and builds no loosening list, so its own reading is reported here,
+    # and only after the refusal above (vault BACKLOG #3795 item 8): a fleet refused on the
+    # reading does not first log it as a residual. One exception: where the engine's hook did not
+    # answer, _remote_debug_refused logs `remote_debug_unguarded` before its refusal, on the log
+    # stream (stdout here), while the refusal goes to stderr.
+    security_lines: list[tuple[str, str]] = []
+    remote_debug = remote_debug_loosening(remote_debug_reading)
+    if remote_debug is not None:
+        security_lines.append(remote_debug)
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
+        )
     if settings.security.allow_remote_debugging:
         accepted = REMOTE_DEBUG_ACCEPTANCE_LOOSENING
         security_lines.append(accepted)
@@ -5411,13 +5459,8 @@ def _supervise(args: argparse.Namespace) -> int:
     if forwarder_installed:
         # The readings above were logged before a forwarder existed. Log them once more so the
         # off-box copy has them. With no forwarder installed this writes nothing.
-        for security_line in security_lines:
-            logging.getLogger(__name__).warning(
-                "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
-                "forwarder.)",
-                *security_line,
-            )
-        # Vault BACKLOG #2700: the AUDIT line the remote-debugging gate logged above, if any.
+        # Vault BACKLOG #2700: the AUDIT line the remote-debugging gate logged above, if any. First,
+        # because the gate logged it ahead of every line in security_lines (vault BACKLOG #3795).
         if (
             fleet_audit := _remote_debug_audit(
                 settings, remote_debug_reading, enforcing=enforcing, what="start the fleet"
@@ -5425,6 +5468,12 @@ def _supervise(args: argparse.Namespace) -> int:
         ) is not None:
             logging.getLogger(__name__).warning(
                 "%s (Logged again for the off-box forwarder.)", fleet_audit
+            )
+        for security_line in security_lines:
+            logging.getLogger(__name__).warning(
+                "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
+                "forwarder.)",
+                *security_line,
             )
 
     try:
@@ -6680,10 +6729,11 @@ def _host_gated_store_settings(
 ) -> ServiceSettings | int:
     """The host gate's settings for a command that acts on an EXISTING store, or an exit code.
 
-    Shared by ``admin-unlock``, ``admin-set-notify-email``, ``admin-reset-totp`` and
-    ``admin-revoke-sessions`` (BACKLOG #2614) so the gate is stated once (ADR 0171 and its
-    Amendment B, ADR 0183 Amendment A Wave 1c). ``provision-admin`` does not use it: it
-    legitimately creates the store, so it cannot carry the M-31 guard below.
+    Shared by ``admin-unlock``, ``admin-set-notify-email``, ``admin-reset-totp``,
+    ``admin-revoke-sessions`` (BACKLOG #2614) and ``issue-enrolment-code`` (ADR 0207) so the gate
+    is stated once (ADR 0171 and its Amendment B, ADR 0183 Amendment A Wave 1c).
+    ``provision-admin`` does not use it: it legitimately creates the store, so it cannot carry the
+    M-31 guard below.
     ``store attest-transit-bound`` and ``withdraw-transit-bound`` use it too (BACKLOG #2337). Each
     passes ``false_finding``, the result a fresh empty store would wrongly report for it.
 
@@ -6851,6 +6901,170 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         print(
             f"OK: cleared lockout for {args.username!r} ({states}; {cycles}, {kept}); "
             "the password is UNCHANGED"
+        )
+    return 0
+
+
+#: The 16-byte header every SQLite database file starts with.
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _starts_as_sqlite(path: str) -> bool:
+    """Whether ``path`` is empty or begins with the SQLite header. An empty file is the probe's
+    ``not_a_store`` case, so it is let through to that refusal; an unreadable one is the probe's
+    ``unchecked`` case."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(len(_SQLITE_HEADER))
+    except OSError:
+        return True
+    return head == b"" or head == _SQLITE_HEADER
+
+
+def _enrolment_code_host_refusal(settings: ServiceSettings) -> str | None:
+    """Why ``issue-enrolment-code`` refuses the store before it opens it, or ``None`` (ADR 0207
+    Amendment A, A4). On SQLite: another connection holds it, it is not a SQLite database, it holds
+    no store, or the probe cannot tell; a command that issues a credential fails closed when it
+    cannot tell, which is stricter than ``rotate-key``. A server store has no probe, so it proceeds
+    and the caller prints a note; the audit append there is serialized by the chain's own lock."""
+    from messagefoundry.config.settings import StoreBackend
+
+    if settings.store.backend != StoreBackend.SQLITE:
+        return None
+    where = _shown_path(settings.store.path)
+    probe = _sqlite_store_held_elsewhere(settings.store.path)
+    if probe.held:
+        return f"another connection holds the store at {where}; stop the engine and re-run"
+    if not _starts_as_sqlite(settings.store.path):
+        # The probe answers all-clear on a file SQLite cannot read as a database at all and leaves
+        # it to the store open, which rotate-key relies on. Here it is refused first (A4).
+        return f"{where} is not a SQLite database; check --db / [store].path"
+    if probe.not_a_store:
+        return (
+            f"{where} holds no MessageFoundry store; refusing to create one and issue a code into "
+            "it (check --db / [store].path)"
+        )
+    if probe.unchecked is not None:
+        return (
+            f"could not check whether an engine holds the store at {where}: {probe.unchecked}. "
+            "Stop the engine, make the store readable and writable by this account in WAL mode, "
+            "and re-run"
+        )
+    return None
+
+
+def _issue_enrolment_code(args: argparse.Namespace) -> int:
+    """Issue a directory account's single-use enrolment code from the host (ADR 0207 section 6).
+
+    THE GATE IS ``admin-unlock``'s HOST GATE (ADR 0171): whoever holds the service config, the store
+    and its key already holds the database. It issues for any directory account, not only an
+    Administrator, since host access already grants everything. It refuses a local account, a
+    disabled one and one that holds an engine factor, and its write is the same conditional sealed
+    write the route makes, so a disable or a factor that lands meanwhile leaves no code. It writes
+    the route's ``auth.enrolment_code_issued`` row, with ``via`` ``host``, the actor naming the OS
+    user, and no issuer, so a spend of it notifies nobody. Never logs the code; prints it once."""
+    import getpass
+
+    from messagefoundry.auth.notifications import deadline_utc
+    from messagefoundry.auth.service import (
+        ENROLMENT_CODE_ISSUE_REFUSALS,
+        enrolment_code_issue_refusal,
+        enrolment_code_issued_detail,
+        holds_engine_factor,
+        write_enrolment_code,
+    )
+    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal
+    from messagefoundry.last_resort import run_guarded
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+    )
+    from messagefoundry.store.row_seal import RowSealError
+
+    settings = _host_gated_store_settings(args)
+    if isinstance(settings, int):
+        return settings
+    refusal = _enrolment_code_host_refusal(settings)
+    if refusal is not None:
+        _emit_error(refusal, as_json=args.json)
+        return 2
+    if settings.store.backend != StoreBackend.SQLITE:
+        print(
+            f"note: a {settings.store.backend.value} store cannot be checked for a serving engine; "
+            "run this with the engine stopped",
+            file=sys.stderr,
+        )
+    posture = _command_hop_posture(settings)
+
+    async def run() -> tuple[str, dict[str, Any]]:
+        _warn_on_an_unrevoked_store_hop(settings)
+        store = await _open_store_or_refuse(
+            open_store(
+                settings.store,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
+        )
+        try:
+            user = await store.get_user_by_username(args.username)
+            if user is None:
+                return ("no-such-user", {})
+            reason = enrolment_code_issue_refusal(
+                user, holds_factor=await holds_engine_factor(store, user)
+            )
+            if reason is not None:
+                return (reason, {})
+            _refuse_an_unauditable_write(store)  # before the issue's write, not after it
+            issued = await write_enrolment_code(store, user, issuer_id=None)
+            if issued is None:
+                return ("changed", {})
+            await store.record_audit(
+                "auth.enrolment_code_issued",
+                actor=f"cli:{getpass.getuser()}",
+                detail=enrolment_code_issued_detail(user, issued, via="host"),
+            )
+            return (
+                "issued",
+                {"code": issued.code, "expires_at": issued.expires_at, "replaced": issued.replaced},
+            )
+        finally:
+            await store.close()
+
+    try:
+        outcome, report = run_guarded(run())
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _UnauditableWrite,
+        _StoreOpenRefused,
+    ) as exc:
+        _emit_error(str(exc), as_json=args.json)
+        return 2
+    except RowSealError:
+        return _emit_error(
+            _seal_refusal(args.username, "enrolment code issue") + ". Nothing was written",
+            as_json=args.json,
+        )
+    except sqlite3.DatabaseError as exc:
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    if outcome == "no-such-user":
+        return _emit_error(f"no account named {args.username!r}", as_json=args.json)
+    if outcome != "issued":
+        return _emit_error(
+            f"no enrolment code issued for {args.username!r}: "
+            f"{ENROLMENT_CODE_ISSUE_REFUSALS[outcome]}",
+            as_json=args.json,
+        )
+    if args.json:
+        print(json.dumps({"ok": True, "username": args.username, **report}))
+    else:
+        replaced = " It replaces the code issued before it." if report["replaced"] else ""
+        print(
+            f"Enrolment code for {args.username!r}, shown once: {report['code']}\n"
+            f"It expires at {deadline_utc(report['expires_at']) or 'its 24-hour limit'}."
+            f"{replaced} Hand it over "
+            "after confirming who is asking, never through the account's own mail or chat."
         )
     return 0
 
@@ -7033,6 +7247,121 @@ def _enrol_totp_at_terminal(
         "uses SHA-256 (add the account by its URI) and that the device's clock is right, then run "
         "the command again."
     )
+
+
+class _RecoveryKeyConsole:
+    """The console ``provision-admin`` shows a new store's recovery key on and reads it back from
+    (vault BACKLOG #3411): the console device itself for what is shown, never stdout, stderr or a
+    log, and the entry read without echo. Either raises ``OSError`` when the console is gone."""
+
+    def show(self, text: str) -> None:
+        _show_on_terminal(text)
+
+    def read(self) -> str:
+        import getpass
+
+        # Without echo, as the password is read, so the key typed back is not left on the screen.
+        return getpass.getpass("")
+
+
+#: The step a failed-mint warning gives for removing the key file this run minted, once the store
+#: holds no data under it and no run can start a store under it (PR 2804 eleventh hold). It
+#: promises no re-run: a store made at that address meanwhile refuses one (fourteenth hold).
+_REMOVE_THE_VOID_KEY = "remove that file"
+
+
+def _handoff_kept_step(store: StoreSettings, service_account: str) -> str:
+    """The way on for a handoff kept over a store that may have been started under it: a run here
+    cannot convert it, so a re-run over it never carries on (PR 2804 twelfth hold, item 2)."""
+    from messagefoundry.store.custody_host import keep_the_key_step
+
+    return (
+        "The service converts it into its host blob when it first starts as its own account, but "
+        "this command cannot provision the Administrator from a handoff under --service-account. "
+        + keep_the_key_step(store, new_store=True, service_account=service_account)
+    )
+
+
+def _discard_minted_custody(
+    path: Path,
+    store: StoreSettings,
+    failure: BaseException,
+    *,
+    service_account: str | None = None,
+) -> Path | None:
+    """Remove the host blob or handoff ``provision-admin`` minted when the store it was minted for
+    could not be created, so a second run can mint again, but only where this run can prove the
+    open wrote nothing under it: the store id pin refused before the open's first write
+    (:class:`~messagefoundry.store.store.StoreIdPinRefusedBeforeWrite`; a pin refusal raised later,
+    once the salt bind may have run, does not count), a server create batch that failed before its
+    commit (:class:`~messagefoundry.store.store.StoreCreateBatchFailedBeforeKeyUse`, PR 2804 hold
+    17), or a SQLite store whose file was never made.
+
+    Otherwise the file is kept, and the warning names it and says to keep it and the recovery key
+    shown, deleting neither: the store may hold data sealed under it, and no check this run or an
+    operator can make proves it does not (PR 2804 thirteenth and fourteenth holds). Returns the
+    kept file's path, so the closing line names it rather than say nothing was written, or
+    ``None`` when nothing is kept. Neither text carries the key."""
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.store.base import _absent_sqlite_store
+    from messagefoundry.store.custody_host import keep_the_key_step
+    from messagefoundry.store.store import (
+        StoreCreateBatchFailedBeforeKeyUse,
+        StoreIdPinRefusedBeforeWrite,
+    )
+
+    nothing_written = isinstance(
+        failure, (StoreIdPinRefusedBeforeWrite, StoreCreateBatchFailedBeforeKeyUse)
+    ) or (store.backend is StoreBackend.SQLITE and _absent_sqlite_store(store) is not None)
+    if not nothing_written:
+        if service_account is None:
+            # A re-run with the host file in place carries on with a store started under it, and
+            # otherwise names a way on that keeps the file.
+            then = (
+                "Run the command again with that file in place: if a store was started under it, "
+                "the run carries on with it, and if not, it names a way on that keeps the file"
+            )
+        else:
+            then = _handoff_kept_step(store, service_account)
+        print(
+            "WARNING: the store could not be created, and this run cannot prove that no store "
+            f"was started under the store key minted for it, so that key is kept in {path}. No "
+            "Administrator was provisioned into it. The store at that address may hold data "
+            "sealed under that key, and that file and the recovery key shown may be its only "
+            "keys. Keep both, and do not delete either: if a store was started under that key, "
+            "either one opens it. A run here stops at that file rather than mint over it. "
+            f"{then}",
+            file=sys.stderr,
+        )
+        return path
+    try:
+        path.unlink()
+        print(
+            f"The store key minted for it was removed from {path}, so the recovery key shown is "
+            "void; the next run mints a new one.",
+            file=sys.stderr,
+        )
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        # Void: nothing was written under it, so the closing line's "nothing was written"
+        # stays true, and it is not named there as a key to keep.
+        # A new store location only where the pin refused: a store another key made is there.
+        step = keep_the_key_step(
+            store,
+            new_store=isinstance(failure, StoreIdPinRefusedBeforeWrite),
+            service_account=service_account,
+        )
+        print(
+            f"WARNING: the store could not be created, and the store key minted for it in {path} "
+            f"could not be removed ({exc.strerror or type(exc).__name__}). This run minted it and "
+            "nothing was written under it, so it is no store's key and the recovery key shown "
+            "opens nothing; while it is there, a run here stops at it rather than mint over it. "
+            "No run can start a store under it, since only this run held its recovery wrap, so "
+            f"once it can be, {_REMOVE_THE_VOID_KEY}. {step}",
+            file=sys.stderr,
+        )
+    return None
 
 
 def _read_new_password(prompt: str) -> str:
@@ -7634,8 +7963,9 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
 
     Under ``vault_transit`` a local key counts whichever provider is pinned, as it did before #2077:
     the store's cipher never resolves ``key_provider`` there, so an ignored local key cannot make the
-    store open plaintext. The DR backup and ``rotate-key`` paths DO resolve it, and refuse an ignored
-    key there through ``store.base._checked_active_key``."""
+    store open plaintext. The DR backup path DOES resolve it, and refuses an ignored key there
+    through ``store.base._checked_active_key``. ``rotate-key`` refuses this mode before it resolves
+    a key (BACKLOG #2109)."""
     from messagefoundry.store.keyprovider import provider_reads_a_configured_key
 
     store = settings.store
@@ -8391,16 +8721,45 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     return left
 
 
-def _provision_open_refusal(exc: BaseException, store: StoreSettings) -> str:
+def _provision_open_refusal(
+    exc: BaseException, store: StoreSettings, *, kept: Path | None = None
+) -> str:
     """``provision-admin``'s text for a refused store open: the refusal, then what it left
     behind (:func:`_open_refusal_left_behind`, BACKLOG #5067). Through ``codec_safe_str``, as
     every other command prints an open refusal: a key source's codec error quotes a byte of what
-    it decoded (BACKLOG #2532)."""
+    it decoded (BACKLOG #2532). ``kept`` is the store key a failed create kept: the text then
+    names it, and never says nothing was written (PR 2804 fourteenth hold)."""
     from messagefoundry.redaction import codec_safe_str
 
     left = _open_refusal_left_behind(exc, store)
-    tail = _NOTHING_PROVISIONED if left is None else f"Refusing to provision. {left}"
+    if kept is not None:
+        held = (
+            "No Administrator was provisioned, and the store key minted for it is kept at "
+            f"{kept} (see the warning on stderr)"
+        )
+        tail = (
+            f"Refusing to provision. {held}"
+            if left is None
+            else (f"Refusing to provision. {_sentence(left)} {held}")
+        )
+    else:
+        tail = _NOTHING_PROVISIONED if left is None else f"Refusing to provision. {left}"
     return f"{_sentence(codec_safe_str(exc))} {tail}"
+
+
+def _never_started_refusal(store: StoreSettings, service_account: str | None) -> str:
+    """``provision-admin``'s text when the host blob here opens a store whose audit chain was
+    never started (PR 2804 hold 2 and fourth hold): a mint that failed before its genesis record,
+    or a blob another store in a shared directory owns. The engine cannot tell which, so the text
+    keeps the key and the store and gives the fallback way on. Names no key."""
+    from messagefoundry.store.custody_host import keep_the_key_step
+
+    step = keep_the_key_step(store, new_store=True, service_account=service_account)
+    return (
+        "the store's audit chain was never started, and only the run that minted this store's "
+        "key, holding its recovery wrap, may start it. The engine cannot tell whose key the host "
+        f"blob here holds, so it leaves it and the store in place. {step}"
+    )
 
 
 def _sentence(message: object) -> str:
@@ -8658,16 +9017,191 @@ def _provision_admin(args: argparse.Namespace) -> int:
             store_slot.current = None
             await store.close()
 
+    async def server_store_absent() -> bool:
+        """Under the host key provider with no blob here: whether the server database holds no
+        store yet (vault BACKLOG #3411): no store at all, or an empty audit chain over a store
+        that holds no data either, is absent; a chain with a genesis record, or data under an empty
+        chain, is a store this mint must not take. Connection and hop refusals surface here, before
+        the prompts, as the ordinary pre-check's do."""
+        return await server_store_found() != "held"
+
+    async def no_store_anywhere() -> Literal["none"]:
+        """``none`` once the server database's catalog shows no table under a store table name in
+        the schemas the open resolves (PR 2804 fourteenth and fifteenth holds). An open's "no
+        store" is only what its login may see there, so a store it cannot see reads the same.
+        Raises :class:`HostCustodyRefused` for such a table there, whoever made it, and for a
+        catalog it cannot show, a search_path it cannot
+        read included: neither is minted over. What the catalog read cannot see, at least, is in
+        :func:`~messagefoundry.store.base.server_store_schema_found_anywhere`."""
+        from messagefoundry.store import base as store_base
+        from messagefoundry.store.base import store_connect_errors, store_driver_errors
+        from messagefoundry.store.custody_host import HostCustodyRefused
+
+        try:
+            anywhere = await store_base.server_store_schema_found_anywhere(
+                settings.store, posture=posture
+            )
+        except (*store_driver_errors(), *store_connect_errors()) as unread:
+            # The class only: a driver's text can quote a value.
+            raise HostCustodyRefused(
+                "whether the database holds a store this login cannot see could not be read "
+                f"({type(unread).__name__}), so no key was minted. Check that this login can "
+                "read the database's catalog and that the server answers, then run the command "
+                "again"
+            ) from unread
+        if anywhere is None:
+            if settings.store.backend is StoreBackend.POSTGRES:
+                why = (
+                    "the search_path names no schema, or a schema name this check does not read, "
+                    "or the catalog returned no answer, so no key was minted. Set "
+                    "[store].db_schema, or the role's search_path when it is not set, to a plain "
+                    "lower-case schema name, then run the command again"
+                )
+            else:
+                why = (
+                    "the view definition permission on the login's default schema and on dbo is "
+                    "not shown as held, or the catalog returned no answer, so no key was minted. "
+                    "Grant this login that permission on both, or run with a login that holds "
+                    "it, then run the command again"
+                )
+            raise HostCustodyRefused(
+                "this login reads no store in the database, but cannot show that none is there: "
+                f"{why}"
+            )
+        if anywhere:
+            raise HostCustodyRefused(
+                "the schemas this login resolves already hold objects under names this store "
+                "creates, so no key was minted. Point [store] at a new database or schema, or "
+                "grant this login the store's schema if they are a store it cannot reach, then "
+                "run the command again"
+            )
+        return "none"
+
+    async def server_store_found() -> Literal["none", "empty", "held"]:
+        """What the server database holds, read as :func:`server_store_absent` reads it: ``none``,
+        no store schema in the schemas the open resolves, read whole by
+        :func:`no_store_anywhere`; ``empty``, an empty audit chain over a store that holds no data;
+        ``held``, anything else. Opened read-only under a throwaway blob nothing is written with,
+        so the store id pin answers. Raises what the open and the census raise, as
+        :class:`HostCustodyRefused` for at least a census it cannot complete or read, and for what
+        :func:`no_store_anywhere` refuses."""
+        from messagefoundry.store.base import (
+            TableCensusIncomplete,
+            store_connect_errors,
+            store_driver_errors,
+        )
+        from messagefoundry.store.custody import HostBlob, MasterKey, StoreId
+        from messagefoundry.store.custody_host import HostCustodyRefused, store_holds_data
+        from messagefoundry.store.store import StoreIdPinRefused
+
+        throwaway = HostBlob(MasterKey.mint(), StoreId.mint())
+        try:
+            store = await open_store(
+                settings.store,
+                read_only=True,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+                custody=throwaway,
+            )
+        except StoreNotFoundError:
+            return await no_store_anywhere()
+        except (StoreIdPinRefused, CipherError):
+            return "held"
+        try:
+            # An empty chain may be a store that ran keyless: one that holds data is not absent.
+            return "held" if await store_holds_data(store) else "empty"
+        except TableCensusIncomplete as incomplete:
+            # Fail closed, and say why: "the store already holds data" would send the operator to
+            # a new store when the store may hold nothing, and the fix is a grant.
+            raise HostCustodyRefused(f"{incomplete}, then run the command again") from incomplete
+        except (*store_driver_errors(), *store_connect_errors()) as unread:
+            # A table the census listed could not be read, or the server stopped answering
+            # mid-census: fail closed rather than end at the dispatch floor. The class only: a
+            # driver's text can quote a cell value.
+            raise HostCustodyRefused(
+                f"whether the store already holds data could not be read ({type(unread).__name__}),"
+                " so no key is minted over it. Check that this login can select every table in the"
+                " store's schema and that the server answers, then run the command again"
+            ) from unread
+        finally:
+            await store.close()
+
     # The store key could not be resolved. The texts of these classes name settings, environment
     # variables and files, never a key (see `_key_unresolved`). Exit 2, as `rotate-key` exits on
     # the same errors: the store could not be opened, so the command could not start. Before
     # BACKLOG #2081 they escaped to the dispatch floor, and a malformed key did until #3054.
     key_unresolved = _key_unresolved()
+    # Vault BACKLOG #3411: under [store].key_provider = 'host' a new store's key is minted here.
+    from messagefoundry.store.custody_host import (
+        HOST_PROVIDER,
+        HostCustodyMissing,
+        HostCustodyRefused,
+        keep_the_key_step,
+        mint_target,
+    )
+    from messagefoundry.store.store import (
+        StoreChainNeverStarted,
+        StoreCreateBatchFailedBeforeKeyUse,
+    )
+
+    host_custody = settings.store.key_provider == HOST_PROVIDER
+    if args.service_account is not None and not host_custody:
+        return _emit_error(
+            "--service-account mints a store key, which only [store].key_provider = 'host' does",
+            as_json=args.json,
+        )
+    mint_custody = False
 
     try:
         service = _build_provision_auth_service(settings, store_slot, posture=posture)
-        absent, exists = run_guarded(administrator_exists())
-        if absent and settings.store.backend is StoreBackend.SQLITE:
+        try:
+            absent, exists = run_guarded(administrator_exists())
+        except HostCustodyMissing as missing:
+            # A SQLite store that exists has no key here, and minting one cannot open it. A server
+            # database is asked, under a throwaway pin, whether it holds a store already.
+            if settings.store.backend is StoreBackend.SQLITE or not run_guarded(
+                server_store_absent()
+            ):
+                # On a server the probe refused only a store with a genesis record or with data.
+                held = "exists" if settings.store.backend is StoreBackend.SQLITE else "holds data"
+                step = keep_the_key_step(
+                    settings.store, new_store=True, service_account=args.service_account
+                )
+                raise HostCustodyRefused(
+                    f"the store already {held}, and {missing}. A new key cannot open a store "
+                    "another key made: run with the custody directory that holds the store's host "
+                    "blob, MEFOR_SECRETS_DIRECTORY set as the store's service has it, or unset for "
+                    "a SQLite store whose blob sits beside its file. If that blob is lost, the "
+                    f"store stays in place. {step}"
+                ) from missing
+            absent, exists = True, None
+        except StoreChainNeverStarted as unstarted:
+            # A mint that failed before its genesis record kept its key file (PR 2804 hold 2), or
+            # the blob here is another store's: the engine cannot tell, so the key is kept.
+            raise HostCustodyRefused(
+                _never_started_refusal(settings.store, args.service_account)
+            ) from unstarted
+        if host_custody and absent:
+            # Checked before the prompts, so a refused or repeated mint asks for nothing. The mint
+            # itself, and the recovery key it shows, come last, once nothing else can refuse.
+            mint_custody = True
+            if not sys.stdin.isatty():
+                return _emit_error(
+                    "refusing to provision without a terminal: the store's recovery key is shown "
+                    "once and entered back interactively. Run this from a console.",
+                    as_json=args.json,
+                )
+            mint_target(
+                settings.store,
+                service_account=args.service_account,
+                enforcing=posture.enforcing,
+            )
+        elif args.service_account is not None:
+            return _emit_error(
+                "--service-account mints a new store's key, and this store already exists",
+                as_json=args.json,
+            )
+        elif absent and settings.store.backend is StoreBackend.SQLITE:
             # `open_store` refuses an absent SQLite file before it resolves the key, so a key that
             # cannot be resolved (Vault with no Vault environment in this shell) would otherwise
             # first fail at the write, after the prompt. Resolved now and discarded; the write
@@ -8705,6 +9239,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
         return _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    except FileExistsError as exc:
+        # Vault BACKLOG #3411: a host blob or a handoff is already in the custody directory.
+        _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
+        return 2
     if exists is not None:
         return _emit_error(exists, as_json=args.json)
 
@@ -8774,6 +9312,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     # Set just before the service's write, which stores the seed (BACKLOG #5067).
     write_started = False
+    # Vault BACKLOG #3411: the minted blob, held in memory for the store's creation, and the file
+    # it was written to, removed if the store cannot be created.
+    minted: MintedCustody | None = None
 
     def after_the_key(refusal: str, before_write: str) -> str:
         """The text for a refusal the write's arms catch, after the key was shown (BACKLOG #5067).
@@ -8796,19 +9337,43 @@ def _provision_admin(args: argparse.Namespace) -> int:
             return before_write
         return (
             f"{_sentence(before_write)} If you added the entry this run showed to the "
-            "authenticator app, delete it: its seed was never stored, and a run that succeeds "
-            "shows a new key."
+            "authenticator app, delete it: its seed was never stored."
         )
 
+    # The store key a failed create kept, for the closing line (PR 2804 fourteenth hold).
+    kept_key: Path | None = None
+    # A create batch that failed before its commit (PR 2804 hold 17): no write started, so its
+    # error is never read as a refused write.
+    batch_failed = False
+
     async def run() -> tuple[ProvisionedAdministrator, str]:
-        nonlocal write_started
+        nonlocal write_started, kept_key, batch_failed
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
-        store = await open_store(
-            settings.store,
-            create=True,
-            posture=posture,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-        )
+        # Under the host key provider the store is created with the blob minted above, so its
+        # genesis record carries that blob's store id (vault BACKLOG #3411).
+        batch_failure: Exception | None = None
+        try:
+            store = await open_store(
+                settings.store,
+                create=True,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+                custody=None if minted is None else minted.blob,
+                recovery_wrap=b"" if minted is None else minted.recovery_wrap,
+            )
+        except BaseException as exc:
+            if minted is not None:
+                kept_key = _discard_minted_custody(
+                    minted.path, settings.store, exc, service_account=args.service_account
+                )
+            if not isinstance(exc, StoreCreateBatchFailedBeforeKeyUse):
+                raise
+            # The key is dealt with (PR 2804 hold 17); the batch's own error is what the operator
+            # is told, raised outside this arm so its own cause is kept.
+            batch_failure = exc.failure
+            batch_failed = True
+        if batch_failure is not None:
+            raise batch_failure
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:
                 # BACKLOG #1905: the settings name a key but the store opened keyless. Refuse before
@@ -8883,6 +9448,36 @@ def _provision_admin(args: argparse.Namespace) -> int:
             as_json=args.json,
         )
 
+    if mint_custody:
+        # Vault BACKLOG #3411: last before the write, so nothing after it can refuse for want of
+        # an answer the operator could have given first. The recovery key goes to the console
+        # device only, and nothing is written until it has been entered back.
+        from messagefoundry.store.custody_host import mint_host_custody
+
+        try:
+            minted = mint_host_custody(
+                settings.store,
+                service_account=args.service_account,
+                enforcing=posture.enforcing,
+                terminal=_RecoveryKeyConsole(),
+            )
+        except (HostCustodyRefused, FileExistsError, OSError) as exc:
+            _emit_error(after_the_key(str(exc), str(exc)), as_json=args.json)
+            return 2
+        except EOFError:
+            # getpass at end of input (Ctrl-D, Ctrl-Z): not an OSError, and no text of its own.
+            gone = (
+                "the input ended at the recovery key prompt, so the recovery key was not entered "
+                "back; nothing was written. Run the command again from a console"
+            )
+            _emit_error(after_the_key(gone, gone), as_json=args.json)
+            return 2
+        print(
+            "The recovery key was entered back and opens the store key. Keep that copy off this "
+            "host: this engine never shows it again.",
+            file=sys.stderr,
+        )
+
     # No TrustAnchorError arm: the anchors are checked at the build, before the prompt (#2081).
     try:
         outcome, store_path = run_guarded(run())
@@ -8900,7 +9495,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # short server schema (#1720) can first arrive here: with no `schema_meta` table the
         # pre-check finds no store, and only this create=True open runs the DDL batch. The text
         # says what the open may have changed, and that the shown key's entry has no seed (#5067).
-        text = after_the_key(codec_safe_str(exc), _provision_open_refusal(exc, settings.store))
+        text = after_the_key(
+            codec_safe_str(exc), _provision_open_refusal(exc, settings.store, kept=kept_key)
+        )
         _emit_error(text, as_json=args.json)
         return 2
     except (StoreKeylessError, CipherError) as exc:
@@ -8909,7 +9506,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # write itself may follow a row it wrote, so it reaches the floor as it did.
         if write_started:
             raise
-        text = after_the_key(codec_safe_str(exc), _provision_open_refusal(exc, settings.store))
+        text = after_the_key(
+            codec_safe_str(exc), _provision_open_refusal(exc, settings.store, kept=kept_key)
+        )
         _emit_error(text, as_json=args.json)
         return 2
     except sqlite3.IntegrityError as exc:
@@ -8923,6 +9522,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # MRO name as the service matches them; anything else propagates as it did before.
         if not _is_integrity_refusal(exc):
             raise
+        if batch_failed:
+            # The create batch's integrity error (PR 2804 hold 17): no account write started, and
+            # the driver's text can quote a colliding row's value, so the class alone is named.
+            return _emit_error(
+                f"the store could not be created: its create batch failed "
+                f"({type(exc).__name__}) before any account was written, so no Administrator was "
+                "provisioned",
+                as_json=args.json,
+            )
         return refused_write(exc)
 
     # True only once issued codes actually reached the console; ``recovery_codes_shown`` says so to
@@ -10325,6 +10933,10 @@ def _uploads_root_refusal(uploads_dir: str) -> str | None:
         )
 
 
+#: The docs/SECURITY.md section ``rotate-key``'s vault_transit refusal cites, by its bold title.
+_TRANSIT_AUDIT_RETIRE_SECTION = "Retiring an old version of the audit key breaks the chain"
+
+
 def _rotate_key(args: argparse.Namespace) -> int:
     """Re-encrypt every cipher-covered value under the active key (WP-5 key rotation, ASVS 11.2.2).
 
@@ -10332,7 +10944,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
     the prior key(s) in ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` so existing rows can be decrypted, then
     rotate. After it finishes the retired key can be removed. The store pass re-seals the
     secret-rotation fingerprint cells too, so no engine start needs the retired key to read them
-    (BACKLOG #3472, ADR 0213).
+    (BACKLOG #3472, ADR 0213). Under ``[store].cipher_provider = "vault_transit"`` it refuses right
+    after the settings load, before it resolves or unwraps a key, dials Vault or opens the store,
+    since no run there can finish (BACKLOG #2109).
 
     **Offline is checked on SQLite, once, before the store opens (BACKLOG #1915).** The command refuses
     a store another connection holds, which is how a serving engine holds it; see
@@ -10392,6 +11006,30 @@ def _rotate_key(args: argparse.Namespace) -> int:
     settings, detail = _load_service_settings(args.service_config, cli=cli)
     if settings is None:
         print(f"error: {detail}", file=sys.stderr)
+        return 2
+    if settings.store.cipher_provider == "vault_transit":
+        # BACKLOG #2109. The re-encrypt pass refuses the Transit cipher (BACKLOG #1165), so no run
+        # here can finish. Refuse before the key, the Vault hop and the writable open, which a run
+        # with a local key reached first, and before the "needs an active key" refusal below,
+        # which sends a run without one to set a key the Transit cipher never reads.
+        print(
+            'error: rotate-key does not run under [store].cipher_provider = "vault_transit". It '
+            "re-encrypts only under the in-process aesgcm cipher, and no command moves values "
+            "between that cipher and Transit, in either direction, or between two Transit keys "
+            "(BACKLOG #2109). To rotate the Transit data key, rotate it in Vault: that makes a "
+            "new version of the key named by MEFOR_STORE_TRANSIT_KEY, new values are sealed under "
+            "it, and values under an older version still read. Nothing re-seals those older "
+            "values, so rotating is safe and retiring a version that still seals a value or MACs "
+            "an audit row is not. At least these retire one. Raising the data key's "
+            "min_decryption_version above a version stops the values sealed under it from "
+            "decrypting. Raising the audit key's min_encryption_version above a version breaks "
+            "the audit chain at every row MACed under it; the audit key is the data key unless "
+            "MEFOR_STORE_TRANSIT_AUDIT_KEY names another. Trimming a version off either key does "
+            "the same to what it sealed or MACed, and cannot be undone. docs/SECURITY.md, under "
+            f"'{_TRANSIT_AUDIT_RETIRE_SECTION}', describes the audit chain break and what it "
+            "does to the attestation. Nothing was changed.",
+            file=sys.stderr,
+        )
         return 2
 
     posture = _command_hop_posture(settings)
@@ -10487,8 +11125,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
         )
         from messagefoundry.store.store import SecretRotationMetaStore
 
-        # BACKLOG #2109: in vault_transit mode the Transit key-type check runs inside this open, not
-        # at resolve_active_key above, so its refusal needs the same clean exit 2.
+        # A key the open cannot resolve, or a store hop the posture refuses, exits 2 as one at
+        # resolve_active_key above does. vault_transit mode never gets here (BACKLOG #2109).
         _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         store = await _open_store_or_refuse(open_store(settings.store, posture=posture))
         try:
@@ -12140,7 +12778,8 @@ def _security(args: argparse.Namespace) -> int:
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). Nor are the engine process's remote-debugging "
             "reading, its start-up reading (launch flags, start-up code, writable site "
-            "directories) and its Windows service-environment reading: this command is a separate "
+            "directories), its Windows service-environment reading and its key custody reading "
+            "(recovery_key_unproved, key_custody_non_local_account): this command is a separate "
             "process (GET /security/posture reports them). "
             "These are the AUTHORED values, so a `serve --host` bind override on a "
             "running engine is not reflected here either — see `messagefoundry check` or "
@@ -12563,6 +13202,7 @@ _DISPATCH = {
     "cert": _cert,
     "protect-key": _protect_key,
     "admin-unlock": _admin_unlock,
+    "issue-enrolment-code": _issue_enrolment_code,
     "provision-admin": _provision_admin,
     "store": _store,
     "check-privileges": _check_privileges,

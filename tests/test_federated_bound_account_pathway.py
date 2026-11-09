@@ -536,13 +536,15 @@ def test_the_bind_notice_tells_the_holder_what_the_bind_took_away() -> None:
 
 
 def test_the_security_doc_states_the_limits_beside_the_session_claim() -> None:
-    """RED when: the claim that nothing minted before a bind outlives it loses the limits written
-    beside it. The claim is true of the sweep as designed, and the limit is what a reader planning
-    on it has to know.
+    """RED when: the claim that nothing minted before a bind outlives it loses its pointer to the
+    sweep's limits, or goes back to naming a limit that is closed. The limits are what a reader
+    planning on the claim has to know.
 
     BACKLOG #2738 closed the second limit, the deadlock with a user delete, and corrected the
     first. So the old collision bullet must be gone, and the sweep's bullet must name the false
     alarm a missed session's ending raises. The bind claim must keep its pointer to that bullet.
+    BACKLOG #4974 closed the first limit, the rotation miss, so the claim no longer names a SQL
+    Server limit and the bullet names that row rather than a follow-up not yet filed.
     The bullet's count claim must not assert an exact figure: on
     SQL Server the bind's and the unbind's counts come from ``cursor.rowcount``, which a leaked
     ``SET NOCOUNT ON`` turns into -1 (BACKLOG #2283)."""
@@ -556,10 +558,16 @@ def test_the_security_doc_states_the_limits_beside_the_session_claim() -> None:
     assert "lasts until it expires" not in text
     assert "**That is a known false alarm, not intended behaviour:**" in text
     assert "**A bind and a user delete take one lock order on both server stores**" in text
-    assert "with one limit on the SQL Server store that *Limits of the session sweep* below" in flat
+    assert "with one limit on the SQL Server store" not in flat
+    assert (
+        "a session rotated while the bind runs included (*Limits of the session sweep* below)"
+        in flat
+    )
     # The sweep bullet alone, so an unrelated sentence elsewhere in the file cannot trip these.
     sweep = flat.split("**Limits of the session sweep.**", 1)[1]
     sweep = sweep.split("**A bind and a user delete take one lock order", 1)[0]
+    assert "BACKLOG #4974" in sweep
+    assert "not yet filed, is to carry the fix for the missed session" not in sweep
     assert "is short by one for each session it missed" not in sweep
     assert "they report -1 instead (BACKLOG #2283)" in sweep
 

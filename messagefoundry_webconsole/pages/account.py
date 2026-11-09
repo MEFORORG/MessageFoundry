@@ -38,6 +38,7 @@ __all__ = [
     "reauth",
     "reauth_continue",
     "reauth_nothing_ran",
+    "reauth_open_first",
     "reauth_idp",
     "sessions_page",
     "sso_challenge",
@@ -563,6 +564,32 @@ def reauth_nothing_ran(label: str, landing: str) -> Markup:
     return page("Verified", body, nav=minimal_nav())
 
 
+def reauth_open_first(next_path: str, label: str) -> Markup:
+    """``GET /ui/reauth`` toward an action-bound unlock page this session was not issued (vault
+    BACKLOG #3241, added item 2): a link to the page instead of a password form.
+
+    A typed, bookmarked or emailed link to such a page arrives with ``Sec-Fetch-Site: none``, which
+    issues nothing (owner ruling 2026-10-13, #3241 R3), so a password typed here would mint no
+    grant and the page would ask again: two re-auths. Opening the page from this console page is a
+    same-origin navigation, whose refusal issues it, so the operator re-authenticates once. Nothing
+    has run and nothing is minted here. ``next_path`` has already been validated as a registered
+    unlock page, never an arbitrary URL."""
+    body = el(
+        "div",
+        el("h1", "Open this page from the console"),
+        el("p", "Next: ", el("strong", label), class_="muted"),
+        el(
+            "p",
+            "The console has no request for this page from this session: it was opened from"
+            " outside the console, or its request expired. Open it from here, then confirm it's"
+            " you. Nothing has run.",
+        ),
+        el("p", el("a", f"Open: {label}", href=next_path, class_="btn-link")),
+        class_="card",
+    )
+    return page("Confirm it's you", body, nav=minimal_nav())
+
+
 def reauth_continue(next_path: str, label: str) -> Markup:
     """After a successful step-up, auto-POST the pending action (``next_path``) via app.js.
 
@@ -695,6 +722,11 @@ def account_page(
             "Not enrolled." + (" This account REQUIRES MFA — enroll now." if factor_owed else ""),
             class_="muted",
         )
+        if mfa.enrolment_code_required and not mfa.webauthn_enrolled:
+            # ADR 0207 section 8: the deliberate onboarding step, said where the person meets it.
+            status_line = Markup(
+                Markup(status_line) + el("p", ENROLMENT_CODE_NOTICE, class_="banner")
+            )
         action = el(
             "form",
             el("button", "Enroll an authenticator", type="submit"),
@@ -1014,10 +1046,41 @@ def notify_address_page(
     return page("Notification address", body, nav=minimal_nav())
 
 
-def mfa_enroll_page(secret: str, otpauth_uri: str) -> Markup:
+#: ADR 0207 sections 4 and 8: what a directory user whose first factor needs an enrolment code is
+#: told. It sends them to an Administrator through the site's identity check, and never invites a
+#: request by mail or chat, which the same directory password may open.
+ENROLMENT_CODE_NOTICE = (
+    "This is a directory account, so adding its first authenticator needs a one-time enrolment "
+    "code from an Administrator. Contact an Administrator in person or through your "
+    "organization's identity check; do not ask for the code by mail or chat."
+)
+
+
+def enrolment_code_input(owed: bool = True) -> Markup:
+    """The enrolment-code field a binding step's form carries when the session owes one (ADR
+    0207), or nothing when it does not. Not a password field: the code is shown to the holder, and
+    the browser must not offer to save it, so it is a plain text field with autocomplete off."""
+    if not owed:
+        return Markup("")
+    return el(
+        "label",
+        "Enrolment code from your Administrator",
+        el(
+            "input",
+            name="enrolment_code",
+            autocomplete="off",
+            spellcheck="false",
+            maxlength="64",
+            required=True,
+        ),
+    )
+
+
+def mfa_enroll_page(secret: str, otpauth_uri: str, *, enrolment_code: bool = False) -> Markup:
     """The staged-enrollment page: the TOTP secret + otpauth URI (shown once for authenticator entry)
     and the confirm-code form. No QR image — the /ui surface is zero-dependency (ADR 0065), so the
-    secret is entered manually or the URI pasted; the desktop console renders the QR."""
+    secret is entered manually or the URI pasted; the desktop console renders the QR.
+    ``enrolment_code`` adds the ADR 0207 field, for a session that owes one."""
     confirm = el(
         "form",
         el(
@@ -1031,6 +1094,7 @@ def mfa_enroll_page(secret: str, otpauth_uri: str) -> Markup:
                 autofocus=True,
             ),
         ),
+        enrolment_code_input(enrolment_code),
         el("button", "Activate MFA", type="submit"),
         method="post",
         action="/ui/account/mfa/verify",
@@ -1054,12 +1118,13 @@ def mfa_enroll_page(secret: str, otpauth_uri: str) -> Markup:
     return page("Enroll MFA", body, active="account")
 
 
-def webauthn_enroll_page(options_json: str) -> Markup:
+def webauthn_enroll_page(options_json: str, *, enrolment_code: bool = False) -> Markup:
     """The passkey creation ceremony page (ADR 0068 §6): the staged creation-options JSON rides a
     ``data-*`` hook (never an inline script — CSP is 'self'-only); app.js runs
     ``navigator.credentials.create`` and POSTs the attestation + label to
     /ui/account/webauthn/verify. The no-JS fallback is a plain explanation (progressive
-    enhancement — the TOTP path remains fully script-free)."""
+    enhancement — the TOTP path remains fully script-free). ``enrolment_code`` adds the ADR 0207
+    field, which app.js sends in the same body."""
     body = el(
         "div",
         el("h1", "Add a passkey"),
@@ -1068,9 +1133,11 @@ def webauthn_enroll_page(options_json: str) -> Markup:
             "Name this passkey, then follow your browser's prompt.",
             class_="muted",
         ),
+        el("p", ENROLMENT_CODE_NOTICE, class_="muted") if enrolment_code else Markup(""),
         el(
             "div",
             el("label", "Label", el("input", name="label", maxlength="100", value="")),
+            enrolment_code_input(enrolment_code),
             el(
                 "button",
                 "Create passkey",
@@ -1109,9 +1176,10 @@ def webauthn_enroll_page(options_json: str) -> Markup:
     return page("Add a passkey", body, nav=minimal_nav())
 
 
-def mfa_confirm_page(*, error: str | None = None) -> Markup:
+def mfa_confirm_page(*, error: str | None = None, enrolment_code: bool = False) -> Markup:
     """The standalone confirm-code form (the unlock re-entry point after a step-up re-auth): the
-    secret is already staged server-side and in the user's authenticator, so it is NOT re-shown."""
+    secret is already staged server-side and in the user's authenticator, so it is NOT re-shown.
+    ``enrolment_code`` adds the ADR 0207 field, for a session that owes one."""
     banner = el("p", error, class_="banner") if error else Markup("")
     form = el(
         "form",
@@ -1126,6 +1194,7 @@ def mfa_confirm_page(*, error: str | None = None) -> Markup:
                 autofocus=True,
             ),
         ),
+        enrolment_code_input(enrolment_code),
         el("button", "Activate MFA", type="submit"),
         method="post",
         action="/ui/account/mfa/verify",

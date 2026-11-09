@@ -423,3 +423,18 @@ def test_an_astral_code_point_is_a_surrogate_pair_that_decodes_as_itself() -> No
 def test_plain_non_ascii_is_left_raw() -> None:
     plain = "".join(chr(c) for c in (0xE9, 0xA0, 0x5F20, 0x1F600, 0x20000))
     assert scrub_control_chars(plain) == plain
+
+
+def test_escape_lone_surrogates_escapes_only_surrogates() -> None:
+    """BACKLOG #2279 item 2a: the forwarder's replay escapes a surrogate and keeps the rest of a
+    rendered line, line breaks and other log-alphabet characters included, as it was."""
+    from messagefoundry.controlchars import escape_lone_surrogates, scrub_control_chars
+
+    kept = "a\nb\tc " + chr(0x85) + " d"
+    assert escape_lone_surrogates(kept) is kept
+    raw = "x" + chr(0xDC80) + "y" + chr(0xD800) + "\nz"
+    escaped = escape_lone_surrogates(raw)
+    assert escaped == "x\\\\udc80y\\\\ud800\nz"
+    escaped.encode("utf-8")  # strict UTF-8 accepts it now
+    # The same spelling the full log scrub gives a surrogate.
+    assert scrub_control_chars(chr(0xDC80)) == escape_lone_surrogates(chr(0xDC80))
