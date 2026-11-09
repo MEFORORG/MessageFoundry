@@ -7,6 +7,9 @@
   design only, no code yet. Every answer below marked `CONTROL DECISION: yes` changes what a
   sign-in, a reconcile or a write refuses, pages or audits. *Owner rulings asked*, below, is the
   list the owner was asked at `94b485c2e1`, with the differences *Owner rulings* names.
+  **Build status, 2026-11-08:** "no code yet" above is superseded. Slice 1b-i is built on its
+  branch (the Transit sealer, its start probe and the SQLite seal seams); slices 1b-ii to 1b-iv
+  and 2 to 5 are not. The record of what is built is the code, not this line.
 - **Date:** 2026-11-05
 - **Related:** vault BACKLOG #4739 (this design), #2592 (its parent: identity and authorization
   row seals), #4350 and #6357 (the `vault_transit` seal gap; see *The duplicate question*), #3411
@@ -122,7 +125,10 @@ anchor/adr0217-owner-ruled-20261106 (94b485c2e1) and branch anchor/adr0217-owner
 (ae898dc817).
 
 Difference 6 was added to the list after that confirmation. The five it confirmed are differences
-1 to 5; difference 6 rests on the owner's ruling of 2026-11-07, recorded next.
+1 to 5; difference 6 rests on the owner's ruling of 2026-11-07, recorded next. Read "the five
+differences above" in the confirmation as differences 1 to 5 only. The 2026-11-07 rulings are
+anchored at branch `anchor/adr0217-build-rulings-20261107` (116049cb02), the commit that recorded
+them here.
 
 **Build rulings, 2026-11-07.** The owner answered three questions the slice 1 build raised, in the
 Manager's chat (`AskUserQuestion`), and the Manager relayed them to the build. No PR comment or
@@ -139,7 +145,22 @@ anchor records them yet; this paragraph is the record in this file.
   `_keep_or_end_session` end the session quietly with `key_changed=True`, built with the catch
   census on all three backends together. Until then the SQLite session writer turns the type back
   into `RowSealError`, as `main` raises. In that list, `rotate_session` names the rotation site in
-  `AuthService`, `_rotate_session_hash`, which calls the store's `rotate_session`.
+  `AuthService`, `_rotate_session_hash`, which calls the store's `rotate_session`. A session
+  under a retired key rarely reaches that call: `_rotate_session_hash` loads the session first,
+  and the loader already ends such a session quietly. The store's type reaches the rotation only
+  when the row changes between the load and the re-key. The 1b-iv catch census decides whether
+  that site needs a handler of its own.
+
+**Build rulings, 2026-11-08.** The owner answered two more questions from slice 1b-i, again in the
+Manager's chat (`AskUserQuestion`), relayed to the build.
+
+- **Amendment to the Outage answer, at a session rotation: "Revoke both".** A Transit Outage at a
+  rotation, in the session load or the store's re-key, revokes the session under its old hash and
+  its new one, as BACKLOG #3023 does for a store refusal. This is an exception to the Outage row's
+  "end nothing" in *The four answers, defined once*; that row's text is unchanged.
+- **The session loader's retired-key lookup: "Revoke, then report".** When the lookup that tells a
+  retired-key session apart raises under Transit, the row is ended first and then reported as an
+  integrity failure (`key_changed=False`), never left live.
 
 ## Context
 

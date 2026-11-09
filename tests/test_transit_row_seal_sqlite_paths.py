@@ -21,10 +21,14 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import (
+    AUTHORITY_SEAL_FAILED_ACTION,
+    AuthService,
+    _RotationStoreError,
+)
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
 from messagefoundry.store.row_seal import (
     RowSealError,
     RowSealUnverifiableError,
@@ -521,34 +525,79 @@ async def test_a_tombstone_under_a_retired_key_is_resealed_through_transit(tmp_p
         await store.close()
 
 
-async def test_session_loader_census_a_refused_retired_key_lookup_escapes(
+async def test_a_refused_retired_key_lookup_still_ends_and_reports_the_session(
     tmp_path: Path,
 ) -> None:
-    """Census pin (slice 2): ``_session_row_holds`` asks whether a failed session was sealed under
-    a retired key before it ends the row. Under Transit that lookup is a Transit call, so a 403
-    on the retired key raises Unverifiable there, and the session is neither ended nor reported.
-    The local sealer's lookup cannot raise, so on main the row was always ended."""
+    """Owner ruling 2026-11-08 ("Revoke, then report"): ``_session_row_holds`` asks whether a
+    failed session was sealed under a retired key. Under Transit that is a Transit call; when a
+    403 on the retired key makes it raise, the row is still ended, then reported as an integrity
+    failure. The control is the same row with the retired key answering: ended quietly."""
     path = tmp_path / "retired-session.db"
     store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
     try:
         store._row_sealer = TransitRowSealer(FakeBackend(active=RETIRED))
         await _user(store, "u-1")
-        token = await _session(store, "u-1")
+        refused = await _session(store, "u-1")
+        quiet = await _session(store, "u-1")
         backend = FakeBackend()
         store._row_sealer = TransitRowSealer(backend, retired_key_names=[RETIRED])
+        service = AuthService(store, AuthSettings())
         backend.forbid = {RETIRED}
-        with pytest.raises(TransitSealUnverifiableError):
-            await AuthService(store, AuthSettings()).identity_for_token(token)
-        assert _sql(
-            path, "SELECT revoked_at FROM sessions WHERE token_hash=?", (hash_token(token),)
-        ) == [(None,)]
-        # Control: with the retired key answering, the row is ended quietly, as on main.
+        assert await service.identity_for_token(refused) is None
+        assert _revoked(path, refused)
+        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
         backend.forbid = set()
         store._row_sealer = TransitRowSealer(backend, retired_key_names=[RETIRED])
-        assert await AuthService(store, AuthSettings()).identity_for_token(token) is None
-        (revoked_at,) = _sql(
-            path, "SELECT revoked_at FROM sessions WHERE token_hash=?", (hash_token(token),)
-        )[0]
-        assert revoked_at is not None
+        assert await AuthService(store, AuthSettings()).identity_for_token(quiet) is None
+        assert _revoked(path, quiet)
+        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
     finally:
         await store.close()
+
+
+def _revoked(path: Path, token: str) -> bool:
+    (revoked_at,) = _sql(
+        path, "SELECT revoked_at FROM sessions WHERE token_hash=?", (hash_token(token),)
+    )[0]
+    return revoked_at is not None
+
+
+async def test_an_outage_at_rotation_revokes_the_session(
+    transit: tuple[MessageStore, FakeBackend, Path],
+) -> None:
+    """Owner ruling 2026-11-08 ("Revoke both"): a Transit Outage at the rotation's load or at the
+    store's re-key revokes the session, as BACKLOG #3023 does for a store refusal, and raises the
+    rotation-store error. The control is a rotation with Transit up, which re-keys the row."""
+    store, backend, path = transit
+    await _user(store, "u-1")
+    service = AuthService(store, AuthSettings())
+    control = await _session(store, "u-1")
+    new = await service._rotate_session_hash(hash_token(control))
+    assert new is not None and not _revoked(path, new)
+    assert _sql(path, "SELECT 1 FROM sessions WHERE token_hash=?", (hash_token(control),)) == []
+    # The load: a fresh sealer has nothing cached, so the load's check meets the Outage.
+    at_load = await _session(store, "u-1")
+    store._row_sealer = TransitRowSealer(backend)
+    backend.down = True
+    try:
+        with pytest.raises(_RotationStoreError):
+            await service._rotate_session_hash(hash_token(at_load))
+    finally:
+        backend.down = False
+    assert _revoked(path, at_load)
+    # The re-key: the load's Holds answer is cached, and the new seal's hmac meets the Outage.
+    at_rekey = await _session(store, "u-1")
+    store._row_sealer = TransitRowSealer(backend)
+    assert await service.identity_for_token(at_rekey) is not None
+    hmac_down = backend.seal_hmac
+
+    def refused(digest: bytes) -> str:
+        raise CipherError("synthetic outage")
+
+    backend.seal_hmac = refused  # type: ignore[method-assign]
+    try:
+        with pytest.raises(_RotationStoreError):
+            await service._rotate_session_hash(hash_token(at_rekey))
+    finally:
+        backend.seal_hmac = hmac_down  # type: ignore[method-assign]
+    assert _revoked(path, at_rekey)

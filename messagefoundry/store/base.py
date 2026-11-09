@@ -2995,15 +2995,17 @@ class AuthStore(Protocol):
 
     # --- sessions ------------------------------------------------------------
     def row_sealer(self) -> AnyRowSealer | None:
-        """The sealer this store writes authority-row integrity seals with, or ``None`` when it
-        has none, in which case no seal is written or checked (BACKLOG #2592). A local
-        :class:`~messagefoundry.store.row_seal.RowSealer` needs an in-process key; a
-        :class:`~messagefoundry.store.row_seal.TransitRowSealer` (ADR 0217) needs none, and its
-        write helpers also raise the Unverifiable and Outage types beside ``RowSealError``.
+        """The sealer this store writes authority-row integrity seals with, or ``None`` when its
+        cipher holds no in-process key, in which case no seal is written or checked (BACKLOG
+        #2592). Today a store returns only the local
+        :class:`~messagefoundry.store.row_seal.RowSealer`: ``RowSealer.for_cipher`` does not yet
+        return a :class:`~messagefoundry.store.row_seal.TransitRowSealer` (ADR 0217 slice 1b-iii
+        wires it), so a ``vault_transit`` store still answers ``None``. The type admits either.
 
         The store writes the seals: every session write that changes a sealed column goes through
-        one helper per backend, which verifies the row it read before it re-seals it and raises
-        :class:`~messagefoundry.store.row_seal.RowSealError` rather than re-seal a row that fails.
+        one helper per backend, which verifies the row it read before it re-seals it and refuses
+        rather than re-seal a row that fails, as
+        :func:`~messagefoundry.store.row_seal.require_seal_for_write` says with what.
         A revoke blanks the seal, which needs no key. :class:`AuthService` checks the seals, in its
         one session loader; the store's readers return rows unchecked."""
         ...

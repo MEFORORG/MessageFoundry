@@ -165,6 +165,8 @@ from messagefoundry.store.row_seal import (
     AnyRowSealer,
     RowSealError,
     SealFailureThrottle,
+    TransitSealUnavailableError,
+    TransitSealUnverifiableError,
 )
 from messagefoundry.store.store import (
     AD_ROLE_MAP,
@@ -258,6 +260,13 @@ _ALWAYS_REPORTED_REASONS: Final = frozenset(
 )
 
 
+def _rotation_store_errors() -> tuple[type[Exception], ...]:
+    """What :meth:`AuthService._rotate_session_hash` treats as a refused rotation: every type
+    :func:`_session_write_errors` names, plus a Transit Outage (owner ruling 2026-11-08 on ADR
+    0217, "Revoke both")."""
+    return (*_session_write_errors(), TransitSealUnavailableError)
+
+
 @cache
 def _session_write_errors() -> tuple[type[Exception], ...]:
     """What a refused session read or write raises, at least on the store backends named there
@@ -269,8 +278,10 @@ def _session_write_errors() -> tuple[type[Exception], ...]:
     local sealer a session row's seal is a local HMAC, so no Transit call can refuse it, and an
     engine ``RuntimeError`` other than the acquire timeout still reads as a defect. Under the
     Transit sealer (ADR 0217) that premise is FALSE: an Outage or an Unverifiable seal raises a
-    type this tuple does not take, so it escapes the BACKLOG #3023 fail-closed revoke. Which
-    handling it gets is the catch census of slice 1b-iv, behind the owner gate."""
+    type this tuple does not take, so it escapes at least every site that catches only this tuple.
+    :meth:`AuthService._rotate_session_hash` adds the Outage type itself (owner ruling 2026-11-08,
+    "Revoke both"); every other such site, and the Unverifiable type, is the catch census of
+    slice 1b-iv (vault #4739 step 6)."""
     return store_open_errors()
 
 
@@ -10326,13 +10337,16 @@ class AuthService:
         audit and answer as ``session_lost``. If a revoke is refused too, the session stays live
         until it lapses; the error records which. On Postgres the re-key waits out a pool shortage
         rather than raising. On SQL Server it waits up to a longer, still finite limit, and a
-        ``StoreAcquireTimeout`` at that limit reaches this branch like any other refusal.
+        ``StoreAcquireTimeout`` at that limit reaches this branch like any other refusal. So does a
+        Transit Outage (``TransitSealUnavailableError``) at the load or the re-key: both hashes are
+        revoked, as for a store refusal (owner ruling 2026-11-08 on ADR 0217, "Revoke both"). An
+        Unverifiable session seal is not covered: it still escapes, for the 1b-iv catch census.
 
         A cancellation is not an ``Exception``, so it skips this branch and propagates with the old
         hash unrotated and unrevoked. The longer post-commit wait widens the window for one."""
         try:
             session = await self._load_session(old_hash)
-        except _session_write_errors() as exc:
+        except _rotation_store_errors() as exc:
             raise _RotationStoreError(await self._revoke_unrotated(old_hash, None, exc)) from exc
         if session is None:
             return None
@@ -10348,7 +10362,7 @@ class AuthService:
             except RowSealError:  # BACKLOG #2592: the row failed its seal; nothing was written
                 await self._session_seal_failed(old_hash)
                 return None
-            except _session_write_errors() as exc:
+            except _rotation_store_errors() as exc:
                 raise _RotationStoreError(
                     await self._revoke_unrotated(old_hash, hash_token(new_token), exc)
                 ) from exc
@@ -10457,7 +10471,8 @@ class AuthService:
         a deadline that passes during that wait is not caught.
 
         A store refusal anywhere from the lapse check to the re-key fails closed (BACKLOG #3023):
-        see :meth:`_rotate_session_hash`."""
+        see :meth:`_rotate_session_hash`, which says which Transit answers that covers. The lapse
+        check's own reads take only :func:`_session_write_errors`."""
         rotated: str | None = None
         failure: dict[str, object] = {"reason": "session_gone"}
         try:
@@ -10595,13 +10610,18 @@ class AuthService:
 
     async def _session_row_holds(self, session: SessionRecord, sealer: AnyRowSealer | None) -> bool:
         """Whether an unrevoked session row's seal verifies; a row that fails is handed to
-        :meth:`_session_seal_failed`, which ends it (BACKLOG #2592)."""
+        :meth:`_session_seal_failed`, which ends it (BACKLOG #2592).
+
+        Under Transit the retired-key lookup is itself a Transit call. When it raises, the row is
+        still ended first and then reported as an integrity failure (``key_changed=False``), never
+        left live (owner ruling 2026-11-08 on ADR 0217, "Revoke, then report")."""
         if await session_seal_ok_async(sealer, session):
             return True
-        await self._session_seal_failed(
-            session.token_hash,
-            key_changed=await session_sealed_by_retired_key_async(sealer, session),
-        )
+        try:
+            key_changed = await session_sealed_by_retired_key_async(sealer, session)
+        except (TransitSealUnverifiableError, TransitSealUnavailableError):
+            key_changed = False
+        await self._session_seal_failed(session.token_hash, key_changed=key_changed)
         return False
 
     async def _session_seal_failed(self, token_hash: str, *, key_changed: bool = False) -> None:
