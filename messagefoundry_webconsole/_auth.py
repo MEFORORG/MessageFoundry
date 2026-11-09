@@ -990,8 +990,8 @@ ACCOUNT_REAUTH_LANDING = "/ui/account"
 register_ui_action(
     r"^/ui/account$", None, auto_retry=False, unlock=True, label="Continue to your account page"
 )
-#: ``GET /ui/reauth``'s own cap on ``next`` (its ``max_length``). A longer continuation would be
-#: answered 422 there, with no re-auth form.
+#: The cap on ``next`` that ``GET /ui/reauth`` reads as its ``max_length``. A longer continuation
+#: would be answered 422 there, with no re-auth form.
 _REAUTH_NEXT_MAX = 512
 
 

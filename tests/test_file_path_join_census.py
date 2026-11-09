@@ -715,6 +715,24 @@ SITES: dict[str, Site] = {
         "directory is held; the child is then opened as itself and refused if it names another "
         "path (BACKLOG #4992).",
     ),
+    "messagefoundry/pipeline/dr_backup.py::_win_hold_below": Site(
+        1,
+        REVIEWED,
+        "The names walked below a held staging directory, joined only to compare against the held "
+        "directory's final path; never opened (BACKLOG #2420).",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_win_opens_another": Site(
+        1,
+        REVIEWED,
+        "A listed name joined to its directory only to ask whether Win32 would rewrite it; never "
+        "opened (BACKLOG #2420).",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_win_verbatim": Site(
+        1,
+        REVIEWED,
+        "A staging directory's own name joined to its parent only to print the verbatim path an "
+        "operator may remove it by; never opened (BACKLOG #2420).",
+    ),
     "messagefoundry/pipeline/dr_backup.py::_fd_walk": Site(
         1,
         REVIEWED,
@@ -827,6 +845,19 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/store/store.py::_write_closed_store": Site(
         1, OPERATOR, "A fixed SQLite sidecar suffix on the operator's store path."
+    ),
+    "messagefoundry/transports/database.py::_libpq_home": Site(
+        2,
+        INTERNAL,
+        "The fixed names `postgresql` and `.postgresql` under the engine process's own home: the "
+        "roaming application-data folder the Windows shell names, else $HOME, else the effective "
+        "user's password-file home, with `os.sep` for an empty one. No message or peer input.",
+    ),
+    "messagefoundry/transports/database.py::_libpq_root_cert": Site(
+        1,
+        INTERNAL,
+        "The fixed name `root.crt` under the libpq default home `_libpq_home` names. A set "
+        "$PGSSLROOTCERT is returned unjoined. No message or peer input.",
     ),
     "messagefoundry/transports/file.py::FileDestination._write": Site(
         1, GUARDED, _DEST_NAME, "messagefoundry/transports/file.py::render_filename", called=True

@@ -328,6 +328,18 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
     assert await store.get_webauthn_credential("h-orphan") is None
 
 
+async def assert_a_session_for_a_missing_account_is_refused(store: Any) -> None:
+    """BACKLOG #2733, pass F: the session's user foreign key, beside the passkey's above. SQL Server
+    lacked it, so a sign-in there committed a session for an account that does not exist, where
+    SQLite and Postgres refused it. Kept here, with the passkey case, so the three suites that run
+    this module run both."""
+    await _assert_integrity_refused(
+        store.create_session(token_hash="o" * 64, user_id="no-such-account", expires_at=9e9),
+        "a session for an account that does not exist",
+    )
+    assert await store.get_session("o" * 64) is None
+
+
 async def _assert_totp_contract(store: Any) -> None:
     """The TOTP store contract (WP-14) — backfilled so the server backends' row-lock paths
     (Postgres ``FOR UPDATE`` / SQL Server ``UPDLOCK``) finally execute under test."""

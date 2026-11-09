@@ -839,8 +839,10 @@ example, and `messagefoundry.parsing.x12` for the codec a Router/Handler uses.
   *inbound* TA1/997/999 **generator** and outbound **999/997** functional-ack classification are **not**
   built (a Router can branch on `X12Peek`'s `ST01`/`GS08` today). Strict **implementation-guide**
   validation *is* built as an on-demand library — `messagefoundry.parsing.x12.validate` behind the
-  `[x12]` extra (pyx12's bundled HIPAA IG maps, BACKLOG #32) — and its walk emits a conforming **999**
+  `[x12]` extra (pyx12's bundled HIPAA IG maps, BACKLOG #32) — and its walk emits a **999**
   (005010) / **997** (004010) as a by-product a Handler may return; it is never run by the connector.
+  An ack pyx12 did not finish to its closing IEA is not returned: `ack` is then `None`. A returned
+  ack echoes sender values unescaped, so it is complete but not thereby well-formed.
 
 ### HTTP web-service listener — `Http(...)` (inbound only, ADR 0023)
 
@@ -2274,7 +2276,37 @@ Two limits follow from this:
 - **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
   libpq still reads its CA from its default location or from the `PGSSLROOTCERT` environment
-  variable of the service.
+  variable of the service. The engine checks that file when it builds a psqlODBC connection
+  (BACKLOG #3090). It skips the check when `SSLmode` is `disable` or unset, because psqlODBC
+  then sends `disable` to libpq. It checks the file as it checks an `sslca`. So it refuses the
+  build in at least these cases:
+  - the file holds an encryption header or a private key;
+  - the path names another host;
+  - the engine can `stat` the file, but cannot read it, or it is over 1 MiB.
+
+  Off Windows, a `stat` failure that says no file is there, or that libpq could not `stat` it
+  either, is left to libpq, which loads no such file. That covers at least a missing name, a path
+  through a file, a name too long, a link loop and a permission denial. Other `stat` failures are
+  refused unless they say no file is there, at least an I/O fault such as `EIO`, `ETIMEDOUT` or
+  `ESTALE`. libpq stats the file again at every connect, so it may load the file once the fault
+  clears. A network fault the system reports as a denial or as a missing name is still left.
+
+  On Windows, the host check first walks the path, reading each name in it, before the file
+  itself is judged. The walk refuses at least a folder in the path the system could not read or
+  resolve, as on a denial or a device, sharing or network fault, and then says the file could not
+  be read. It also refuses at least a chain of links it will not follow further, a path through a
+  file and a share Windows could not reach, saying the file must be a plain local path, not a
+  share, a network drive, a link to one, or a path the check cannot read. A denial or fault on the
+  file's own name can pass the walk, since Windows answers it from the folder's listing; the
+  read then refuses it as a file that could not be read. A missing name, other than such a share,
+  ends the walk and is left to libpq.
+
+  The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
+  application-data folder. Elsewhere it is under `~/.postgresql`. The engine finds this home as
+  libpq 15 and later do. Another libpq version may read a different home. With libpq 16 and
+  later, `PGSSLROOTCERT=system` names no file, so the engine reads nothing. The check reads the
+  environment of the process that builds. So `messagefoundry check` judges its own machine's file.
+  The check runs at build, not at each connect. No ACL check covers the file.
 
 ##### Values on the generic dialect
 
@@ -4467,8 +4499,10 @@ Facts that are easy to get wrong, stated plainly first:
   **Two session writes wait longer, on purpose (BACKLOG #2283 on Postgres, #3023 on SQL
   Server).** `rotate_session` and `revoke_user_sessions` mostly run after their caller's own change
   has committed: a password reset, a disable, a role change, a completed second factor. Nothing
-  retries them, so a pool shortage at the ordinary limit would fail them after that change. Callers
-  with no earlier write, such as "sign out everywhere else", wait the same way.
+  retries a rotation, and the auth service runs a revoke again only within a short budget (vault
+  BACKLOG #3023), which one SQL Server pool wait uses up, so a pool shortage at the ordinary limit
+  would fail them after that change. Callers with no
+  earlier write, such as "sign out everywhere else", wait the same way.
 
   - On **SQL Server** they wait up to **2 times `acquire_timeout`**, 60 s at the default, and then
     raise `StoreAcquireTimeout` like any other borrow. The wait is still bounded. The limit comes
@@ -4484,8 +4518,10 @@ Facts that are easy to get wrong, stated plainly first:
 
   On both, `[store].command_timeout` still bounds the statement unless it is set to 0, and a lost
   connection still fails it. An HTTP request's own deadline still cancels the wait, and a cancelled
-  wait writes nothing and records nothing. A revoke that fails leaves the account's other sessions
-  unrevoked, and the change's own audit row and notice are lost with it. A rotation that fails,
+  wait writes nothing and records nothing. A revoke the store refuses after a committed change is
+  run again within a bounded budget, and one the service gives up on is recorded, as
+  [SECURITY.md](SECURITY.md) states; it leaves the account's other sessions unrevoked, and the
+  change's own audit row and notice are lost with it. A rotation that fails,
   including one that reached the SQL Server limit, is answered as a lost session: the old session
   is revoked, best effort, an `auth.session_rotation_failed` row with reason `store_error` records
   in `revokes_landed` whether every revoke landed, and the caller signs in again. The same callers

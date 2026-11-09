@@ -209,6 +209,25 @@ async def _temporary_credential_admin(store: Any, user_id: str, *, issued_at: fl
     await store.set_user_roles(user_id, [ADMIN], assigned_by="test")
 
 
+async def assert_grant_refuses_a_row_holding_a_passkey(store: Any) -> None:
+    """BACKLOG #3078 F2: ``provision-admin`` enrols no passkey and clears an earlier holder's
+    before it writes, so a passkey on the row at the grant was enrolled by that holder in the
+    repair window. The grant refuses it, writing no role, and grants the same row once it is gone.
+
+    RED when: the grant checks the password and the TOTP cell but not the passkeys."""
+    from tests._webauthn_store_contract import _cred
+
+    await seed_roles(store)
+    await provisioned_row(store, "a", totp=False)
+    await store.add_webauthn_credential(_cred("a", "earlier-holder", id_hash="h-earlier"))
+    assert await grant(store, "a", None) is AdminGrant.ACCOUNT_CHANGED
+    assert await store.get_user_role_ids("a") == []
+    # Paired control: the repair clears it, and then the same credentials are granted.
+    assert await store.delete_all_webauthn_credentials("a") == 1
+    assert await grant(store, "a", None) is AdminGrant.GRANTED
+    assert await store.get_user_role_ids("a") == [ADMIN]
+
+
 async def assert_concurrent_grants_leave_one(store: Any) -> None:
     """The finding's own scenario at the store: two accounts, two grants at once, no administrator
     before either. Exactly one is granted."""
