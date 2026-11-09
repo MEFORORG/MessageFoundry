@@ -606,10 +606,8 @@ def _row_record(row: route_gates.RouteRow) -> dict[str, Any]:
 #: walk found that demands a permission: the refusal accepts either declaration on a socket, and
 #: outside the refusal nothing reads one, so the reason alone would vouch for a socket that
 #: authorizes nobody. The walk finds a gate by its call, not by what the endpoint does with the
-#: answer. At run time the engine's ``WebSocketAcceptGate`` (api/security.py) refuses the accept of
-#: every socket whose latest recorded gate answer is a refusal, a public one included, and of a
-#: socket with no recorded answer unless a gate dependency or a ``public_route`` mark declares it;
-#: this check is the sweep's own reading, not a substitute for that control.
+#: answer. At run time the engine's ``WebSocketAcceptGate`` applies its own rule, stated in
+#: docs/SECURITY.md; this check is the sweep's own reading, not a substitute for that control.
 _WS_PASSES: Final = frozenset({route_gates.KIND_GATED})
 _WS_NEEDS_REASON: Final = frozenset(
     {route_gates.KIND_PUBLIC, route_gates.KIND_IN_BODY, route_gates.KIND_OUTSIDE}

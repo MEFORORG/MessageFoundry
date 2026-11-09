@@ -970,7 +970,7 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
 # declares its authorization some other way: a gate dependency, which ran before the body did, or a
 # ``public_route`` mark. An undeclared socket the refusal reaches never gets this far, because
 # :func:`refuse_undeclared_route` refuses it first; one outside the refusal, such as a socket in a
-# mount, is refused here at accept instead.
+# mount, is refused here at accept instead unless a gate it calls records an admission.
 #
 # The LATEST gate's answer stands: a refusal clears an earlier admission, so a body that ignores a
 # stricter gate's refusal after a laxer gate admitted the caller is still refused, and so is one
@@ -1006,16 +1006,16 @@ def ws_accept_allowed(scope: Mapping[str, Any]) -> bool:
         # refusal the body ignored is refused whatever the route declares.
         return answer is True
     route = scope.get("route")
-    if route is not None and route_has_gate(route):
-        # The gate dependency ran before the body and recorded nothing. If it returned, it admitted
-        # the caller. If it refused, it raised, so the body never ran and no accept follows: the
-        # denial response Starlette sends for that raise is the gate's own refusal, and passes
-        # here. A dependency that recorded a refusal before raising is refused above instead.
-        return True
-    # A public mark is the only declaration left. An in-body mark is not enough. FastAPI's router
-    # sets no route for a plain Starlette WebSocket route, so the scope's own endpoint is read then.
-    endpoint = scope.get("endpoint") if route is None else getattr(route, "endpoint", None)
-    declared = route_declaration_of(endpoint)
+    if route is not None:
+        # As the HTTP rule reads it: a gate dependency or a public mark; an in-body mark is not
+        # enough. A gate dependency that recorded nothing is trusted to have admitted the caller
+        # once it returned. If any dependency raised instead, the body never ran and no accept
+        # follows, and the denial response Starlette sends for that raise passes here, whichever
+        # dependency raised.
+        return route_is_declared(route, websocket=False)
+    # FastAPI's router sets no route for a plain Starlette WebSocket route: the endpoint's own public
+    # mark, when the scope names one, is the only declaration left to read.
+    declared = route_declaration_of(scope.get("endpoint"))
     return declared is not None and declared.public
 
 
