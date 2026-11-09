@@ -30,10 +30,12 @@
   are cleared through `BaseException`'s own descriptors, so an interrupt class's own `__setattr__`
   does not run. (`BACKLOG #4882`, `BACKLOG #3471`)
 - **Every other error from the store cipher build or the store key resolution is replaced by a new
-  refusal with a fixed text the site chooses, raised after the handler has exited, and nothing is
-  passed through at either site but the key check's own refusals, which `resolve_active_key`
-  raises as the engine built them. The store open's own key custody step differs, as the end of
-  this bullet says.** The class of every refusal at these sites, the previous bullet's included,
+  refusal with a fixed text the site chooses, raised after the handler has exited, and nothing
+  from the provider or the build is passed through at either site. What runs once the provider
+  has answered is not judged: the key check at `resolve_active_key`, whose refusals the engine
+  built and raises as built, and the keyring's assembly at `resolve_decrypt_keys`. The store
+  open's own key custody step differs, as the end of this bullet says.** The class of every
+  refusal at these sites, the previous bullet's included,
   depends on the codec judgement. An error the judgement refuses, one with a codec error on it, one
   whose chain cannot be read whole or one whose judgement raised, takes the previous bullet's two
   classes, so a hop refusal holding a codec error is a `StoreCipherConfigError` and a `DpapiError`
@@ -59,18 +61,22 @@
   error itself. The class of a replaced error the engine did not build, and of its cause, is logged
   as a WARNING by name alone. Before, a `ValueError` from the build was refused with its own text,
   and an error of any other class passed through as it was. The store open reads the key custody
-  in a step of its own under every key provider. Under `[store].key_provider = 'host'` it reads
-  the host blob, converting a handoff into it first where only a handoff is there and the open may
-  write, or, for a blob a minting caller passes, checks the settings instead of reading one, and
-  derives the store key from that blob, so the store key resolution does not run. Under any other
-  provider it looks for a host blob or a handoff in the custody directory. There a
-  `KeyProviderError` the engine built and recorded passes through as it is: it was raised with no
-  chain, and its text is the one the engine built it with, which reads no text from an error.
-  Any other `Exception` from that step, a `ValueError` included, is replaced by a
-  `HostCustodyRefused`, which is a `KeyProviderError` and never a `StoreCipherConfigError`. Its text
-  names `[store].key_provider` and the custody directory, then the recorded text of an error the
-  engine built, or else a fixed reason chosen by the error's class, and it is raised after the
-  handler has exited, with no cause and no context. The codec judgement does not run there, so a
+  in a step of its own under every key provider. Under `[store].key_provider = 'host'` it derives
+  the store key from the host blob, and the store key resolution does not run. On the way it at
+  least checks the settings, judges the engine's account, reads the host file, converts a handoff
+  into it where only a handoff is there and the open may write, settles a handoff left beside a
+  host file, deleting it or refusing the open, and records what it found; a blob a minting caller
+  passes is checked against the settings and not read. Under any other provider it looks for a
+  host blob or a handoff in the custody directory. Under every provider, a `KeyProviderError` the
+  engine built and recorded passes through the step as it is; its text is the one the engine
+  built it with, which reads no text from an error, and the engine raises each with no chain,
+  which the open does not check again. Any other `Exception` from that step, a `ValueError`
+  included, is replaced by a `HostCustodyRefused`, which is a `KeyProviderError` and never a
+  `StoreCipherConfigError`, unless building that refusal itself raises, which then leaves in its
+  place. Its text names `[store].key_provider` and where the custody directory comes from, not its
+  path, then the recorded text of an error the engine built, or else a fixed reason chosen by the
+  error's class, and it is raised after the handler has exited, with no cause and no context. The
+  codec judgement does not run there, so a
   codec error is replaced as any other error is, and its byte is not read. Where the step replaces
   an error, only that error's own class is logged, as a WARNING by name alone, and only for one the
   engine did not build; its cause's class is not logged there. The custody reads inside the step

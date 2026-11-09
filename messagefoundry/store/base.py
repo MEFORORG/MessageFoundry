@@ -4612,8 +4612,8 @@ async def open_store(
     try:
         cipher = build_store_cipher(settings, posture=posture, host_key=host_key)
     finally:
-        # The store data key, dropped whether the build refused or not, so no traceback through
-        # this frame, the build's refusal or a later open error, holds it.
+        # The store data key itself, dropped whether the build refused or not, so this frame does
+        # not hold it on the build's refusal. The cipher and audit key built from it stay below.
         del host_key
     setter = getattr(cipher, "set_refusal_hook", None)
     if refusal_hook is not None and callable(setter):

@@ -469,7 +469,9 @@ def test_a_settle_refusal_holds_no_reference_to_the_master_key(
 
 class _TrackedKey(str):
     """A base64 key text that can be weakly referenced, so a test can see whether anything still
-    holds it; ``str`` itself cannot be."""
+    holds it; ``str`` itself cannot be. Only this object is tracked: a copy of its text, or the
+    bytes it decodes to, is not, so the cases below show that the key object handed in is not
+    kept, not that no copy of it is."""
 
     __slots__ = ("__weakref__",)
 
