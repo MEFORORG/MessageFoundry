@@ -1005,10 +1005,11 @@ class HttpSource(SourceConnector):
 
         ``MLLPSource._handshake_accepted`` states each step's reasoning once: who owns the socket
         when, the DEBUG-only failure line, a failure before the transport holds the socket, and a
-        clean close during the handshake. Two differences. An admitted socket counts against
+        clean close during the handshake. Three differences. An admitted socket counts against
         ``max_handshakes_per_host`` until its handshake ends, however it ends (vault BACKLOG
         #4888). And no ``ssl_shutdown_timeout`` is passed, so the TLS close exchange keeps
-        asyncio's default, as on this listener's other path; start() says why."""
+        asyncio's default, as on this listener's other path; start() says why. And a cancellation
+        by stop() is followed by an abort of the TLS transport."""
         assert self._ssl is not None
         try:
             peer = _AcceptedPeer(sock)
@@ -1068,8 +1069,8 @@ class HttpSource(SourceConnector):
                 # stop() cancels a task still in `_handshakes`. Where the handshake completed
                 # before the task stepped, in either order against stop(), the cancellation makes
                 # `connect_accepted_socket` close the TLS transport with a close exchange, which a
-                # silent peer can hold open for asyncio's 30 s default after stop() returns. Nothing
-                # was read or written, so it is aborted instead.
+                # silent peer can hold open for asyncio's 30 s default after stop() returns. That
+                # close is followed at once by an abort.
                 if protocol.tls_transport is not None:
                     protocol.tls_transport.abort()
                 raise

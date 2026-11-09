@@ -11,4 +11,5 @@
   A loop that subclasses a stdlib loop now takes this path too, as it does for `MLLP()`; it
   already applied these controls before the handshake, through the listener's own upgrade. On
   every path, stop() waits, within its grace, for a connection that is still closing; on both TLS
-  paths, a socket whose handshake finished after stop() began is aborted unread. See [CONNECTIONS.md](../docs/CONNECTIONS.md). (`BACKLOG #2479`)
+  paths, a socket whose handshake finished after stop() began is closed and then aborted. See
+  [CONNECTIONS.md](../docs/CONNECTIONS.md). (`BACKLOG #2479`)
