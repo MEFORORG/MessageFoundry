@@ -3,8 +3,9 @@
   one proof could try any number of targets and learn from each answer whether the target was out
   of scope, unknown or unable to take the write. They now keep the spend, and the next request
   needs a new re-authentication. Any other refusal before the store write, such as a 400 or an
-  ingress guard's 413, 415 or 422, still gives the proof back. The guard runs after the target
-  checks in direct mode and after the origin check in re-route mode, so its refusal still tells
-  the caller that the target, or the origin inbound, passed them.
+  ingress guard's 413, 415 or 422, still gives the proof back. In direct mode the guard now runs
+  before the checks on whether the target is registered, deployed, on this engine shard and
+  running, so a body built to fail it no longer tells the caller whether those checks would pass.
   [ADR 0197](../docs/adr/0197-cap-repeated-lock-cycles-on-one-account-without-making-malicious-lockout-cheaper.md)
-  Amendment D records the owner's ruling. (vault `BACKLOG #3241`)
+  Amendment D records the owner's ruling and, under *The order of the checks*, the order in each
+  mode. (vault `BACKLOG #3241`)

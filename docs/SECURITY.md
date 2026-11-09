@@ -3288,9 +3288,9 @@ operator still submits the confirm form.
 A refusal the engine handler raises before its store write gives the proof back (owner ruling
 2026-10-13, #3241 R1; ADR 0197 Amendment C), so the operator resubmits without a new password,
 except a 403, 404 or 409, which keeps the spend (owner ruling 2026-11-07, #3241 added item 1; ADR
-0197 Amendment D). The ingress guard runs after the target checks in direct mode and after the
-origin check in re-route mode, so a guard refusal, which gives the proof back, also tells the
-caller that the target, or the origin inbound, passed those checks. A refusal from the store
+0197 Amendment D). An ingress guard refusal gives the proof back, and ADR 0197 Amendment D,
+*The order of the checks*, says which target checks run before the guard in each mode and so
+what such a refusal still tells the caller. A refusal from the store
 call on keeps the spend too, because the store may have committed. After any refusal that keeps
 the spend, the next submit asks again and re-opens the editor from the stored body, as an
 expired grant (300 s by default) does. The console resend checks

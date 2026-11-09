@@ -217,7 +217,7 @@ async def test_the_editor_asks_before_it_opens_and_the_resubmit_spends_it(engine
         assert _reauth_next(again) == editor
 
 
-async def test_an_edit_resubmit_the_ingress_guard_refuses_keeps_the_proof(
+async def test_an_edit_resubmit_the_ingress_guard_refuses_gives_the_proof_back(
     engine: Engine, tmp_path: Path
 ) -> None:
     """A refusal before the store write that is not a 403, 404 or 409 still gives the proof back

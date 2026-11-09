@@ -38,7 +38,8 @@
 - **Amended 2026-11-07: Amendment D, by owner ruling.** Asked *"Stop refunding on those three
   refusals?"*, the owner answered *"Stop refunding"* (vault BACKLOG #3241 added item 1). An
   edit-and-resubmit refused with a 403, 404 or 409 keeps the spend. Amendment D, at the end of this
-  file, records it, and Amendment C's text is cut to match.
+  file, records it, and Amendment C's text is cut to match. Amendment D also gives the direct-mode
+  order of the checks, set by a Manager decision of 2026-11-09, not by the owner.
 - **Date:** 2026-09-27
 - **Related:** BACKLOG #1131 (the row this answers; ASVS 6.1.1) · BACKLOG #1236 (closed 2026-09-26;
   its cycle-cap remainder moved to #1131 by owner ruling) · BACKLOG #1138 (re-proof failures count
@@ -1528,7 +1529,8 @@ pre-count.** The Manager put two reasons to the owner:
 BACKLOG #2625) bound `POST /messages/{id}/edit-resend` to a single-use proof. Its gate spends the
 proof before the handler runs, so a refusal the engine raises (an unknown message, an unknown or
 stopped target, an origin inbound another engine shard owns) cost the operator a password. The
-re-authentication cannot carry the typed body, so the console lost the edit too.
+re-authentication cannot carry the typed body, so the console lost the edit too. Amendment D
+(2026-11-07) supersedes this ruling for a 403, 404 or 409, which now keeps the spend.
 
 **What changes.** `message_edit_resend` joins `_REFUNDABLE_ACTIONS` beside the two credential
 resets. The route gives the proof back for an `HTTPException` it raises BEFORE the store write,
@@ -1570,11 +1572,24 @@ so its editor asks for a new proof after such a refusal. That re-authentication 
 editor, which opens on the stored body, so the operator's typed edit is lost again for these
 refusals, as it was before Amendment C.
 
+**The order of the checks.** Manager decision d20261109T161647779-2963e0, a class B tightening
+taken after an adversarial review, set the direct-mode order (a request that names a target `to`):
+
+1. the scoped read of the message, 404 when it is unknown or outside the caller's scope;
+2. the scope check on the target, 403, with its `auth.channel_denied` audit row;
+3. the engine-wide ingress guard, 413 or 422, which gives the proof back;
+4. the registry checks on the target: 404 when it is not registered, 409 when it is not deployed,
+   is owned by another engine shard or is not running.
+
+The direct-mode guard reads nothing from the target, so a body built to fail it gives the proof
+back without saying whether the target is registered, deployed, on this engine shard or running.
+It still follows step 2, so its refusal says the target is in the caller's own scope. Re-route
+mode is unchanged: its guard reads the origin inbound's ceiling and declared type, so it must
+follow the 409 for an origin inbound this engine does not hold, and its refusal says that the
+origin inbound is registered here.
+
 **What it does not change.** Every other refusal raised before the store write still gives the
 proof back, at least the 400 for a request with neither a target nor a re-route and the ingress
-guards' 413, 415 and 422. The ingress guard runs after the target checks in direct mode and after
-the origin check in re-route mode, so a guard refusal, which keeps the proof, also tells the
-caller that the target, or the origin inbound, passed those checks. A refusal from the store call
-on keeps the spend, as before.
+guards' 413, 415 and 422. A refusal from the store call on keeps the spend, as before.
 `tests/test_bound_step_up_injection.py` pins one case per spending status and a 400 and a 422
-still refunding.
+still refunding, and the direct-mode order of the checks.
