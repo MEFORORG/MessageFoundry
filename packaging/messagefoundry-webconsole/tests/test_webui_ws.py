@@ -25,7 +25,7 @@ from _webui_support import (
 from starlette.datastructures import Headers
 
 from messagefoundry.api import create_app
-from messagefoundry.api.security import record_ws_gate, ws_accept_allowed
+from messagefoundry.api.security import _WS_GATE_ADMITTED_KEY, record_ws_gate, ws_accept_allowed
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -132,6 +132,8 @@ async def test_ws_cookie_auth_requires_cookie_and_origin(engine: Engine) -> None
     assert (await authorize_ui_ws(bad, Permission.MONITORING_READ))[0] is None  # type: ignore[arg-type]
     # A refused handshake is never marked admitted (vault BACKLOG #2955).
     assert not any(ws_accept_allowed(w.scope) for w in (no_cookie, no_origin, bad))
+    # The native client's handshake is not this gate's, so it records no answer at all.
+    assert _WS_GATE_ADMITTED_KEY not in no_origin.scope
     # A native client's handshake is not this gate's to judge, so the header gate's admission
     # recorded before it stands (vault BACKLOG #2955).
     header_admitted = _FakeWS(origin=None, host="t", cookie=token, app=app)

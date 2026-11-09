@@ -1011,9 +1011,10 @@ def ws_accept_allowed(scope: Mapping[str, Any]) -> bool:
         # refused afterwards: that refusal stands.
         return answer is None
     # A public mark is the only declaration left, and a recorded refusal does not refuse it. An
-    # in-body mark is not enough. The route's match puts its endpoint in the scope, and so does a
-    # plain Starlette WebSocket route, for which FastAPI's router sets no route.
-    declared = route_declaration_of(scope.get("endpoint"))
+    # in-body mark is not enough. FastAPI's router sets no route for a plain Starlette WebSocket
+    # route, so the scope's own endpoint is read then.
+    endpoint = scope.get("endpoint") if route is None else getattr(route, "endpoint", None)
+    declared = route_declaration_of(endpoint)
     return declared is not None and declared.public
 
 
@@ -1067,9 +1068,15 @@ class WebSocketAcceptGate:
             if kind in ("websocket.accept", "websocket.http.response.start"):
                 if not ws_accept_allowed(scope):
                     refused = True
-                    # A denial after a gate's recorded refusal is that gate refusing, as it should,
-                    # so only an accept, or a denial no gate answered for, is counted as a defect.
-                    if kind == "websocket.accept" or _WS_GATE_ADMITTED_KEY not in scope:
+                    # A refusal status after a gate's recorded refusal is that gate refusing, as it
+                    # should. An accept, a denial no gate answered for, or a non-refusal status
+                    # after a refusal is a body that did not act on its gate: a defect.
+                    gate_refusing = (
+                        kind == "websocket.http.response.start"
+                        and scope.get(_WS_GATE_ADMITTED_KEY) is False
+                        and int(message.get("status", 0)) >= 400
+                    )
+                    if not gate_refusing:
                         _record_refused_accept(scope)
                     await send({"type": "websocket.close", "code": status.WS_1008_POLICY_VIOLATION})
                     if kind == "websocket.accept":

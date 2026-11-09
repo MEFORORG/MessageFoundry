@@ -231,8 +231,10 @@ body, the early sign-in check above still answers before it. A route passes in o
   a `public_route` mark on a route with no gate dependency. On a socket it refuses, it refuses a
   denial response the body sends the same way, whatever its status, so none of its status, headers
   or body goes out. The refusal is a close before accept, which the client gets as a bodyless HTTP
-  403. An accept it refuses, or a denial response no gate answered for, is also an ERROR line,
-  `refused accept on WebSocket route`, at most once a minute for each route the handshake names.
+  403. The web console's cookie gate records nothing for a handshake that sends no Origin, which
+  it leaves to the header path, so an earlier answer stands there. The accept gate writes an ERROR
+  line, `refused accept on WebSocket route`, for each refusal except a refusal status sent after a
+  gate's recorded refusal, at most once a minute for each route the handshake names.
   Refusals on handshakes that name no route share one count and one line. That count is in
   memory only; `GET /security/posture` does not report it.
 

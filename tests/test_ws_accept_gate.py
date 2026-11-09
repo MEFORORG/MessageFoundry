@@ -243,6 +243,12 @@ def _planted(engine: Engine, service: AuthService | None, outcome: _Outcome) -> 
         if await authorize_ws(websocket, Permission.MONITORING_READ) is None:
             await websocket.send_denial_response(PlainTextResponse("refused", status_code=403))
 
+    @app.websocket("/zz/refuses-then-denial-200")
+    @authorizes_in_body("a synthetic socket that ignores its gate's refusal with a 200 denial")
+    async def refuses_then_denial_200(websocket: WebSocket) -> None:
+        await authorize_ws(websocket, Permission.MONITORING_READ)
+        await websocket.send_denial_response(PlainTextResponse("synthetic-body", status_code=200))
+
     @app.websocket("/zz/public-identifies")
     @public_route("a synthetic public socket that asks a gate only to identify its caller")
     async def public_identifies(websocket: WebSocket) -> None:
@@ -351,14 +357,19 @@ async def test_every_denial_response_needs_an_admitted_caller(engine: Engine, pa
 
 @pytest.mark.parametrize(
     ("path", "logged"),
-    [("/zz/refuses-then-denial", False), ("/zz/denial-404", True)],
-    ids=["gate-refused", "no-gate-answered"],
+    [
+        ("/zz/refuses-then-denial", False),
+        ("/zz/denial-404", True),
+        ("/zz/refuses-then-denial-200", True),
+    ],
+    ids=["gate-refused", "no-gate-answered", "refusal-ignored"],
 )
 async def test_only_a_denial_no_gate_answered_for_is_logged_as_a_defect(
     engine: Engine, caplog: pytest.LogCaptureFixture, path: str, logged: bool
 ) -> None:
-    """A gate refusing with a denial response is the gate working, not a body that skipped it, so
-    it gets the bodyless 403 with no ERROR line. A denial no gate answered for is a defect."""
+    """A gate refusing with a refusal status is the gate working, not a body that skipped it, so
+    it gets the bodyless 403 with no ERROR line. A denial no gate answered for, or a non-refusal
+    status after a refusal, is a defect."""
     service = await _service(engine)
     peer = _Peer(_planted(engine, service, _Outcome()), path, None, denial_extension=True)
     with caplog.at_level(logging.ERROR, logger="messagefoundry.api.security"):
