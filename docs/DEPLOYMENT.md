@@ -169,7 +169,7 @@ socket, and its `_REFUSED` table holds the exact bytes.
 | A request that carries | What your proxy must do |
 |---|---|
 | Both `Content-Length` and `Transfer-Encoding` | Refuse it. Do not forward it with either header removed. |
-| `Transfer-Encoding` twice, or as a list whose last coding is not `chunked`, or `identity`, or a list ending in an empty element | Refuse it. |
+| `Transfer-Encoding: chunked` on two lines, or `Transfer-Encoding` as a list whose last coding is not `chunked`, or `identity`, or a list ending in an empty element | Refuse it. |
 | `Content-Length` twice, even with equal values, or as a list such as `2, 2`, or holding anything but digits, such as `+2` or `0_2` | Refuse it. |
 | Whitespace between a field name and its colon, such as `Content-Length : 2` | Refuse it. |
 | A header line folded onto the next line (obs-fold) | Refuse it. Do not unfold it and forward the result. |

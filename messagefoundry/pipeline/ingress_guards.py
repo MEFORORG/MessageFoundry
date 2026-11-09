@@ -581,12 +581,12 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
     The committed form is the ``\\r``-normalized text for HL7, the text verbatim for another text
     type, and canonical ``mfb64:v1:`` carriage for a binary type.
 
-    ``ic`` is ``None`` when there is no inbound to guard for: the edit-resend direct path writes an
-    outbound row, and a re-route whose origin inbound is no longer registered has no declared type. Only
-    the engine-wide rules apply then, the NUL rule and the engine ceiling, and ``raw`` is returned as
-    is. Strict validation is an inbound's setting, so it never applies there either. Both callers today
-    already bound that body below the ceiling (``EditResendRequest.raw`` and the API's 1 MiB request
-    cap), so the ceiling there is a backstop.
+    ``ic`` is ``None`` only on the edit-resend direct path, which writes an outbound row and so has no
+    inbound to guard for; a re-route whose origin inbound is not registered is refused with a 409
+    before this runs. Only the engine-wide rules apply then, the NUL rule and the engine ceiling, and
+    ``raw`` is returned as is. Strict validation is an inbound's setting, so it never applies there
+    either. ``EditResendRequest.raw``'s ``max_length`` already bounds that body below the ceiling, so
+    the ceiling there is a backstop.
 
     **Not mirrored, and a resubmission can therefore still differ from a sender's body:** document
     detach. A streaming inbound raises ``max_message_bytes`` to pay for a detach this path does not do,

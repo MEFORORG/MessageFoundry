@@ -63,6 +63,8 @@ _REFUSED: dict[str, bytes] = {
     + b"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
     "transfer-encoding repeated": _POST
     + b"Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    "content-length with transfer-encoding split over two lines": _POST
+    + b"Content-Length: 5\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
     "transfer-encoding not ending in chunked": _POST
     + b"Transfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n",
     "transfer-encoding identity": _POST
