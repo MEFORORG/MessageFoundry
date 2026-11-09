@@ -564,8 +564,14 @@ _PR_CELL_VERDICT_LEAD = re.compile(
     rf"(?i)(?:(?P<prefix>unchanged(?:[,;:]|{_PR_CELL_DASH})?|{_PR_STATE_VERB}){_PR_SEP})?"
     rf"{_PR_QUALIFIER}{_PR_VERDICT}(?:[.;,:](?:\s|$)|\s*\(|{_PR_CELL_DASH}(?:\s|$)|$)"
 )
-#: The markup a table cell wraps around a value, and the separators of a cell that lists identifiers.
-_PR_CELL_MARKUP = re.compile(_PR_MARKUP)
+#: The markup a table cell wraps around a value. Between two words it is a separator, as _PR_SEP reads
+#: it, so `stays`partial`` is two words and not "stayspartial"; anywhere else it is deleted, so a
+#: verdict keeps the punctuation after it ("`partial`."). An apostrophe between letters is part of a
+#: word ("isn't met") and stays.
+_PR_CELL_MARKUP_JOIN = re.compile(
+    r"(?<=[A-Za-z0-9])(?!(?<=[A-Za-z])'[A-Za-z])[*`_\"']+(?=[A-Za-z0-9])"
+)
+_PR_CELL_MARKUP = re.compile(r"[*`_\"]|(?<![A-Za-z])'|'(?![A-Za-z])")
 #: No "\s*" around a separator: on a long run of spaces it backtracks quadratically, so whitespace is a
 #: separator of its own and the empty parts are dropped.
 _PR_CELL_LIST = re.compile(r"[,;/&+]|(?i:\band\b)|\s+")
@@ -775,7 +781,10 @@ def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
     goes on binds only a row whose identifier is marked (_PR_CELL_VERDICT_LEAD)."""
     if not ids:
         return False
-    cells = [_PR_CELL_MARKUP.sub("", c).strip() for c in row.strip().strip("|").split("|")]
+    cells = [
+        _PR_CELL_MARKUP.sub("", _PR_CELL_MARKUP_JOIN.sub(" ", c)).strip()
+        for c in row.strip().strip("|").split("|")
+    ]
     keys = {_PR_CELL_ID_LEAD.sub("", i) for i in ids}
 
     def lists_ids(cell: str) -> bool:
