@@ -11352,12 +11352,12 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
 )
 #: What one page for many such accounts says, on a pass that rolls them up
 #: (``AuthService._record_unreached_accounts`` decides when), so a flapping directory opens one
-#: instance rather than one per signed-in account. It counts only the accounts entering on its pass, and says
-#: so: a later rollup updates the same open instance's text, so a count that read as a total
-#: would be replaced by a smaller one while more accounts stood (BACKLOG #3709). No process can
-#: say how many stand: each counts its own, and the instance is shared. ``probes`` is the
-#: shortest run among those entering, in probes, not passes, which differ under a probe budget
-#: smaller than the estate.
+#: instance rather than one per signed-in account. It counts only the accounts entering on its
+#: pass, and says so: a later rollup updates the same open instance's text, so a count that read
+#: as a total would be replaced by a smaller one while more accounts stood (BACKLOG #3709). No
+#: process can say how many stand: each counts its own, and the instance is shared. ``probes``
+#: is the shortest run among those entering, in probes, not passes, which differ under a probe
+#: budget smaller than the estate.
 _UNREACHED_ROLLUP_TEXT: Final[str] = (
     "Accounts newly unreachable: {entering}. Their sessions are not revoked; each failed {probes}+ "
     "directory probes running. Check the directory and the path to it. "

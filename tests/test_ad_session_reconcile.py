@@ -39,6 +39,7 @@ from messagefoundry.api.app import (
     _alert_reconcile_plan,
 )
 from messagefoundry.auth import channel_scope, reconcile
+from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import (
     AdPrincipal,
@@ -3105,17 +3106,24 @@ async def test_refused_unreached_rows_log_no_per_account_warning(
         await store.close()
 
 
+@pytest.mark.parametrize("raised", [RuntimeError, asyncio.CancelledError])
 @pytest.mark.parametrize("before", [0, 1])
-async def test_an_unreached_row_write_that_raises_keeps_the_earlier_warnings(
-    before: int, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+async def test_an_unreached_row_write_that_raises_warns_for_its_account_and_each_written_before(
+    before: int,
+    raised: type[BaseException],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """BACKLOG #3709, review round 3 and the final repair. A write that raises ends the pass with
     no page, so every account whose row was written before it still gets its WARNING. So does the
-    account whose own write raised, as when each WARNING was logged before its write: it has
-    neither row nor page, so that line is its only record. ``before`` is how many rows are written
-    before the raise.
+    account whose own write raised, as when each WARNING was logged before its write: here the
+    raise comes before its row is written, so it has neither row nor page, and that line is its
+    only record. ``before`` is how many rows are written before the raise. ``raised`` includes a
+    cancellation (review round 55a1f0b8): it is not an ``Exception``, and the reconciler's task is
+    cancelled at shutdown, so a write cancelled in flight keeps its account's WARNING too.
 
-    RED when: a raise leaves no WARNING for an account written before it, or for its own."""
+    RED when: a raise leaves no WARNING for an account written before it, or for its own, a
+    cancellation included."""
     store = await MessageStore.open(":memory:")
     try:
         names = ["ok", "flapA", "flapB"]
@@ -3132,7 +3140,7 @@ async def test_an_unreached_row_write_that_raises_keeps_the_earlier_warnings(
             if action == "auth.ad_reconcile_unreached":
                 tried.append(str(kwargs["actor"]))
                 if len(written) == before:
-                    raise RuntimeError("store gone")
+                    raise raised("store gone")
                 written.append(tried[-1])
             return await real(action, **kwargs)
 
@@ -3144,7 +3152,7 @@ async def test_an_unreached_row_write_that_raises_keeps_the_earlier_warnings(
         caplog.clear()
         with (
             caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"),
-            pytest.raises(RuntimeError, match="store gone"),
+            pytest.raises(raised, match="store gone"),
         ):
             await _pass(service, sink)
         assert len(written) == before and len(tried) == before + 1
@@ -3156,13 +3164,77 @@ async def test_an_unreached_row_write_that_raises_keeps_the_earlier_warnings(
         await store.close()
 
 
+class _RaisingEntries:
+    """An entry sequence that raises before it yields its first entry."""
+
+    def __iter__(self) -> _RaisingEntries:
+        return self
+
+    def __next__(self) -> tuple[str, str, int]:
+        raise RuntimeError("entries gone")
+
+
+@pytest.mark.parametrize("where", ["first-entry", "second-detail", "second-unpack"])
+async def test_a_raise_outside_an_unreached_row_write_warns_only_accounts_attempted(
+    where: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3709, review round 55a1f0b8. A raise that does not come out of a row write is
+    pinned to no account: the one it reaches is the raise itself, unchanged, and each account
+    whose row was written before it gets one WARNING. ``first-entry`` raises before any entry is
+    read, ``second-detail`` while the second entry's row detail is built, and ``second-unpack``
+    on a second entry that does not unpack.
+
+    RED when: the raise is replaced by an UnboundLocalError, an account whose write was never
+    attempted gets a WARNING, or the account written before the raise gets two."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, _ad_settings(), ldap=_FakeLdap({}))  # type: ignore[arg-type]
+        await service.initialize()
+        attempted: list[str] = []
+
+        async def write(action: str, **kwargs: Any) -> bool:
+            attempted.append(str(kwargs["actor"]))
+            return True
+
+        monkeypatch.setattr(service, "_audit_reconciler_row", write)
+        entries: Any = (("u1", "flapA", 3), ("u2", "flapB", 3))
+        if where == "first-entry":
+            entries = _RaisingEntries()
+        elif where == "second-unpack":
+            entries = (("u1", "flapA", 3), ("u2", "flapB"))
+        else:
+            real_json = service_module._json
+
+            def raise_second(obj: Any) -> str:
+                if attempted:
+                    raise RuntimeError("detail gone")
+                return real_json(obj)
+
+            monkeypatch.setattr(service_module, "_json", raise_second)
+        plan = replace(reconcile.ReconcilePlan(), unreached=entries)
+        caplog.clear()
+        with (
+            caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"),
+            pytest.raises(ValueError if where == "second-unpack" else RuntimeError),
+        ):
+            await service._record_unreached_accounts(plan)
+        expected = [] if where == "first-entry" else ["flapA"]
+        assert attempted == expected
+        warned = _unreached_warnings(caplog)
+        assert len(warned) == len(expected)
+        assert all(sum(name in w for w in warned) == 1 for name in expected)
+    finally:
+        await store.close()
+
+
 async def test_a_raise_after_more_than_five_written_rows_logs_one_count_line(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #3709, review round 3. Where the rows written before a raising write are more than
     the rollup bound, they are logged as the rollup's one count line, not one WARNING each, so a
     raise that recurs every pass does not bring back the per-account flood the rollup prevents.
-    Only the account whose own write raised has a WARNING of its own: it has no row.
+    Only the account whose own write raised has a WARNING of its own: here the raise comes before
+    its row is written, so it has no row.
 
     RED when: a raise after six written rows logs a WARNING per account."""
     store = await MessageStore.open(":memory:")

@@ -8615,27 +8615,31 @@ class AuthService:
             )
 
         written: list[tuple[str, str, int]] = []
+        # The entry whose row write is in flight, so a raise out of that write, a cancellation
+        # included, is pinned to the one account it ended; None outside the write, so the detail
+        # is built before it is set and a raise there is pinned to no account.
+        pending: tuple[str, str, int] | None = None
         try:
             for entry in plan.unreached:
                 _user_id, username, probes = entry
-                if await self._audit_reconciler_row(
-                    "auth.ad_reconcile_unreached",
-                    actor=username,
-                    detail=_json(
-                        {
-                            "reason": reconcile.UNREACHED_ACCOUNT,
-                            "probes": probes,
-                            "asked": plan.asked,
-                            "aborted": plan.aborted,
-                        }
-                    ),
-                ):
+                detail = _json(
+                    {
+                        "reason": reconcile.UNREACHED_ACCOUNT,
+                        "probes": probes,
+                        "asked": plan.asked,
+                        "aborted": plan.aborted,
+                    }
+                )
+                pending = entry
+                stored = await self._audit_reconciler_row(
+                    "auth.ad_reconcile_unreached", actor=username, detail=detail
+                )
+                pending = None
+                if stored:
                     written.append(entry)
-        except BaseException:
-            # Only the write can raise, so this is the account whose own write raised.
-            warn(username, probes)
-            raise
         finally:
+            if pending is not None:
+                warn(pending[1], pending[2])
             # A rollup only with something written: one with nothing would page nothing, and the
             # lifespan task reads the run's length off the entries (final-round finding 1).
             rollup = (
