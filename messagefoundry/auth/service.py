@@ -8618,23 +8618,23 @@ class AuthService:
         try:
             for entry in plan.unreached:
                 _user_id, username, probes = entry
-                try:
-                    if await self._audit_reconciler_row(
-                        "auth.ad_reconcile_unreached",
-                        actor=username,
-                        detail=_json(
-                            {
-                                "reason": reconcile.UNREACHED_ACCOUNT,
-                                "probes": probes,
-                                "asked": plan.asked,
-                                "aborted": plan.aborted,
-                            }
-                        ),
-                    ):
-                        written.append(entry)
-                except BaseException:
-                    warn(username, probes)
-                    raise
+                if await self._audit_reconciler_row(
+                    "auth.ad_reconcile_unreached",
+                    actor=username,
+                    detail=_json(
+                        {
+                            "reason": reconcile.UNREACHED_ACCOUNT,
+                            "probes": probes,
+                            "asked": plan.asked,
+                            "aborted": plan.aborted,
+                        }
+                    ),
+                ):
+                    written.append(entry)
+        except BaseException:
+            # Only the write can raise, so this is the account whose own write raised.
+            warn(username, probes)
+            raise
         finally:
             # A rollup only with something written: one with nothing would page nothing, and the
             # lifespan task reads the run's length off the entries (final-round finding 1).

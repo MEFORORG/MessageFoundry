@@ -3099,24 +3099,21 @@ async def test_refused_unreached_rows_log_no_per_account_warning(
         assert len(plan.unreached) == 1 and not plan.unreached_rollup
         warned = _unreached_warnings(caplog)
         assert len(warned) == 1 and "flap0" in warned[0]
-        refused = sorted(
-            r.getMessage()
-            for r in caplog.records
-            if r.levelno == logging.ERROR and "could not be written" in r.getMessage()
-        )
-        assert len(refused) == 6
-        assert all("auth.ad_reconcile_unreached" in m for m in refused)
-        assert [f"flap{i}" in m for i, m in enumerate(refused, start=1)] == [True] * 6
+        for i in range(1, 7):
+            assert _logged_at_error(caplog, "auth.ad_reconcile_unreached", f"flap{i}")
     finally:
         await store.close()
 
 
+@pytest.mark.parametrize("before", [0, 1])
 async def test_an_unreached_row_write_that_raises_keeps_the_earlier_warnings(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    before: int, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #3709, review round 3. A later write that raises ends the pass with no page, so
-    every account whose row was written before it still gets its WARNING, and so does the account
-    whose own write raised.
+    """BACKLOG #3709, review round 3 and the final repair. A write that raises ends the pass with
+    no page, so every account whose row was written before it still gets its WARNING. So does the
+    account whose own write raised, as when each WARNING was logged before its write: it has
+    neither row nor page, so that line is its only record. ``before`` is how many rows are written
+    before the raise.
 
     RED when: a raise leaves no WARNING for an account written before it, or for its own."""
     store = await MessageStore.open(":memory:")
@@ -3129,15 +3126,17 @@ async def test_an_unreached_row_write_that_raises_keeps_the_earlier_warnings(
             assert await _signed_in_ad_user(service, store, n) is not None
         real = service._audit_reconciler_row
         written: list[str] = []
+        tried: list[str] = []
 
-        async def raise_on_second(action: str, **kwargs: Any) -> bool:
+        async def raise_after(action: str, **kwargs: Any) -> bool:
             if action == "auth.ad_reconcile_unreached":
-                if written:
+                tried.append(str(kwargs["actor"]))
+                if len(written) == before:
                     raise RuntimeError("store gone")
-                written.append(str(kwargs["actor"]))
+                written.append(tried[-1])
             return await real(action, **kwargs)
 
-        monkeypatch.setattr(service, "_audit_reconciler_row", raise_on_second)
+        monkeypatch.setattr(service, "_audit_reconciler_row", raise_after)
         sink = _InverseSink()
         ldap.unreachable = set(names[1:])
         for _ in range(2):
@@ -3148,51 +3147,10 @@ async def test_an_unreached_row_write_that_raises_keeps_the_earlier_warnings(
             pytest.raises(RuntimeError, match="store gone"),
         ):
             await _pass(service, sink)
-        assert len(written) == 1
-        (raised,) = {"flapA", "flapB"} - set(written)
+        assert len(written) == before and len(tried) == before + 1
         warned = _unreached_warnings(caplog)
-        assert len(warned) == 2
-        assert sum(written[0] in w for w in warned) == 1 and sum(raised in w for w in warned) == 1
-    finally:
-        await store.close()
-
-
-async def test_the_account_whose_own_unreached_row_raises_still_gets_its_warning(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """BACKLOG #3709, final repair. Before the rollup was decided on the rows written, each
-    account's WARNING was logged before its write, so an account whose own write raised still had
-    one. It has neither row nor page, so that line is its only record, and it keeps it.
-
-    RED when: the account whose own write raised gets no per-account WARNING."""
-    store = await MessageStore.open(":memory:")
-    try:
-        names = ["ok", "flapA"]
-        ldap = _FakeLdap({n: _principal(n) for n in names})
-        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
-        await service.initialize()
-        for n in names:
-            assert await _signed_in_ad_user(service, store, n) is not None
-        real = service._audit_reconciler_row
-
-        async def raise_on_unreached(action: str, **kwargs: Any) -> bool:
-            if action == "auth.ad_reconcile_unreached":
-                raise RuntimeError("store gone")
-            return await real(action, **kwargs)
-
-        monkeypatch.setattr(service, "_audit_reconciler_row", raise_on_unreached)
-        sink = _InverseSink()
-        ldap.unreachable = {"flapA"}
-        for _ in range(2):
-            await _pass(service, sink)
-        caplog.clear()
-        with (
-            caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"),
-            pytest.raises(RuntimeError, match="store gone"),
-        ):
-            await _pass(service, sink)
-        warned = _unreached_warnings(caplog)
-        assert len(warned) == 1 and "flapA" in warned[0]
+        assert len(warned) == before + 1
+        assert all(sum(name in w for w in warned) == 1 for name in tried)
         assert not _unreached_events(sink)
     finally:
         await store.close()
