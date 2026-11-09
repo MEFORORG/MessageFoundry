@@ -1223,8 +1223,10 @@ jobs:
       #
       # BLOCKING ON EVERY EVENT. From the owner ruling of 2026-10-29 until BACKLOG #5247 item 9, a LOW
       # margin here was a warning in merge_group, and from 2026-10-30 a warning on pull_request down to
-      # 1.20x, both until the cap was re-measured. The shard re-measure recorded in
-      # scripts/ci/step_margin_baseline.toml put every leg far over 1.30x, so the softening is gone.
+      # 1.20x, both until the cap was re-measured. The test shard pools of 2026-11-09, recorded in
+      # scripts/ci/step_margin_baseline.toml, put every leg far over 1.30x against the caps in force,
+      # and the softening was reverted on that reading. No row or cap moved: re-sizing them from
+      # those pools is its own change, unfiled.
       # `test-shard2` carries the same body, and tests/test_ci_engine_suite_shards.py holds the two
       # identical; tests/test_ci_step_margin.py pins that a LOW margin reds on every event.
       - name: Step margin -- engine suite

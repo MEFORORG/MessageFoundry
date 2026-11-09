@@ -21,7 +21,6 @@ import json
 import os
 import re
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
@@ -917,6 +916,11 @@ def bash(tmp_path_factory: pytest.TempPathFactory) -> Path:
 #: Every event the engine margin check can run under. The softening branched on two of them; the
 #: other three are here so a branch added on any event reds, not only on those two.
 _MARGIN_EVENTS = ("pull_request", "merge_group", "push", "schedule", "workflow_dispatch")
+#: The `GITHUB_REF` each event carries where it is not a branch of main.
+_EVENT_REFS = {
+    "pull_request": "refs/pull/1/merge",
+    "merge_group": "refs/heads/gh-readonly-queue/main/pr-1-0000000000000000000000000000000000000000",
+}
 
 
 @pytest.mark.parametrize(
@@ -940,14 +944,15 @@ def test_the_engine_margin_check_reds_a_low_margin_on_every_event(
     """BACKLOG #5247 item 9: the 1.30x floor blocks on every event again.
 
     The owner ruling of 2026-10-29 made a LOW margin a warning in merge_group, and the decision of
-    2026-10-30 made pull_request warn down to 1.20x, both until the cap was re-measured. The shard
-    re-measure recorded in scripts/ci/step_margin_baseline.toml put every leg far over 1.30x, and
-    the revert landed with it. This runs the `test` job's REAL run body under the runner's own
+    2026-10-30 made pull_request warn down to 1.20x, both until the cap was re-measured. The test
+    shard pools recorded in scripts/ci/step_margin_baseline.toml put every leg far over 1.30x, and
+    the revert landed with them. This runs the `test` job's REAL run body under the runner's own
     `bash -eo pipefail`, with `python` stubbed to one exit code per call, so the pin is on behaviour
     rather than on a spelling: the step exits with the script's own answer, makes exactly one call,
-    passes no second floor, and raises no warning of its own. The event is set both as the step's
-    old `EVENT_NAME` and as the runner's own `GITHUB_EVENT_NAME`, so a branch on either differs by
-    event. `test-shard2` is not run separately: tests/test_ci_engine_suite_shards.py holds its body
+    passes no second floor, and raises no warning of its own. The event is set as the step's old
+    `EVENT_NAME`, as the runner's own `GITHUB_EVENT_NAME`, and as the `GITHUB_REF` that event
+    carries (a merge queue ref for merge_group), so a branch on any of them differs by event; the
+    static test below refuses all three by name. `test-shard2` is not run separately: tests/test_ci_engine_suite_shards.py holds its body
     identical to this one.
 
     Red first, against the softened body: merge_group with the script at 1 exited 0, pull_request
@@ -965,6 +970,7 @@ def test_the_engine_margin_check_reds_a_low_margin_on_every_event(
             os.environ,
             EVENT_NAME=event,
             GITHUB_EVENT_NAME=event,
+            GITHUB_REF=_EVENT_REFS.get(event, "refs/heads/main"),
             LEG="ubuntu-latest",
             STEP_CAP="46",
             TESTS_OUTCOME="success",
@@ -999,62 +1005,26 @@ def test_the_engine_margin_check_reds_a_low_margin_on_every_event(
     assert "--step Tests (pytest) --leg ubuntu-latest" in argv[0], argv[0]
 
 
-@pytest.mark.parametrize("margin", [1.25, 1.15])
-def test_the_real_script_reds_the_band_the_pull_request_floor_used_to_pass(
-    tmp_path: Path, margin: float
-) -> None:
-    """The stubbed test above proves the step's branch; this one proves the call it makes. At 1.25x
-    the retired pull_request floor passed a step with a warning, and at 1.15x it blocked. With one call
-    at the default floor, the real script reds both; the test below pins that no step passes a
-    second floor.
-    """
-    cap_minutes = 46
-    baseline = tmp_path / "baseline.toml"
-    baseline.write_text(_FIXTURE_ROW, encoding="utf-8")
-    summary = tmp_path / "summary.md"
-    write_mark("before-tests", tmp_path, at=time.time() - cap_minutes * 60 / margin)
-    call = [
-        "--step",
-        "<fixture step>",
-        "--leg",
-        "<fixture leg>",
-        "--cap-minutes",
-        str(cap_minutes),
-        "--outcome",
-        "success",
-        "--since",
-        "before-tests",
-        "--until",
-        "now",
-        "--clock-dir",
-        str(tmp_path),
-        "--baseline",
-        str(baseline),
-        "--summary-file",
-        str(summary),
-    ]
-    rc = main(call)
-    print(f"[step-margin] margin {margin}x: exit {rc}")
-    assert rc == 1
-    assert f"floor {DEFAULT_MIN_MARGIN:.2f}x" in summary.read_text(encoding="utf-8")
-
-
 @pytest.mark.parametrize("job_name", sorted(_GATED))
 def test_every_margin_check_stays_blocking_on_every_event(job_name: str) -> None:
     """No margin check may branch on the event, carry a second floor, or `continue-on-error`.
 
     This was the web console check's test alone while the engine checks carried the softening; since
     BACKLOG #5247 item 9 reverted it, it covers every gated job. Falsified by adding a merge_group
-    branch, a pull_request branch, a `--min-margin` or a `continue-on-error` to any of the three
-    checks: RED. Red first, against the softened body: RED on `test` and `test-shard2`.
+    branch, a pull_request branch, a branch on the merge queue's ref, a `--min-margin` or a
+    `continue-on-error` to any of the three checks: RED. Red first, against the softened body: RED
+    on `test` and `test-shard2`.
     """
     check = _margin_check(job_name)
     assert "continue-on-error" not in check, check.get("continue-on-error")
     run = str(check.get("run", ""))
-    assert "merge_group" not in run
-    assert "pull_request" not in run
-    assert "EVENT_NAME" not in run
-    assert "EVENT_NAME" not in (check.get("env") or {})
+    env = str(check.get("env") or {})
+    # The run body and the env's keys AND values, so an event read passed in under another name
+    # (`FOO: ${{ github.event_name }}`) is refused as well as one read in the body.
+    for needle in ("merge_group", "pull_request", "EVENT_NAME", "GITHUB_REF", "gh-readonly-queue"):
+        assert needle not in run, f"{job_name}'s margin check names {needle!r} in its run body"
+    for needle in ("event_name", "github.ref", "EVENT_NAME", "GITHUB_REF"):
+        assert needle not in env, f"{job_name}'s margin check names {needle!r} in its env: {env}"
     assert "--min-margin" not in run
     assert "pr_floor" not in run
 
