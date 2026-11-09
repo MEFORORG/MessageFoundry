@@ -2163,7 +2163,7 @@ class UploadStore:
                 exc.strerror or type(exc).__name__,
             )
             return ResealResult(root_missing=True)
-        blocked: str | None = None
+        blocked: _PairLockFailure | None = None
         if pairs:
             try:
                 # Once, before any file is decrypted. Finding a lock it cannot take per half would
@@ -2173,7 +2173,10 @@ class UploadStore:
                 with _pair_lock(self._root / LOCK_FILE_NAME, for_reseal=True):
                     pass
             except OSError as exc:
-                blocked = _RESEAL_BLOCKED[_pair_lock_failure(exc)]
+                blocked = _pair_lock_failure(exc)
+                if blocked == "gone":
+                    # The root went after the listing: the BACKLOG #4940 outcome, not N lost bodies.
+                    return ResealResult(root_missing=True)
         resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = 0
         for fid, _sidecar in pairs:
             try:
@@ -2237,7 +2240,7 @@ class UploadStore:
         kind: Literal["body", "meta"],
         *,
         over: tuple[_Half, Path] | None = None,
-        blocked: str | None = None,
+        blocked: _PairLockFailure | None = None,
     ) -> _Half:
         """Re-seal one half of upload ``fid`` and say what became of it. A sidecar passes ``over``,
         the body half's result and its path, because a plaintext sidecar is sealed only over a body
@@ -2255,8 +2258,9 @@ class UploadStore:
         runs, and a plain replace brought the sidecar back. The replace now happens under
         :func:`_pair_lock`, only while the path is still the file this ``lstat`` saw. ``blocked``
         names why the pass's first pair-lock check failed: the lock was busy, refused or timed
-        out, or the uploads root was gone. With it, a half that needs a write is a skip before it is
-        decrypted. A write that finds the root gone, or the lock not to be had, is a skip too."""
+        out (a root gone at that check ends the pass first). With it, a half that needs a write is a
+        skip before it is decrypted. A write that finds the uploads root gone, or the lock not to be
+        had, is a skip too."""
         try:
             info = path.lstat()
             if S_ISLNK(info.st_mode):
@@ -2337,7 +2341,10 @@ class UploadStore:
                 return _Half.SKIPPED
         if blocked is not None:
             _log.warning(
-                "uploaded file %s (%s): skipped, nothing is written: %s", fid, kind, blocked
+                "uploaded file %s (%s): skipped, nothing is written: %s",
+                fid,
+                kind,
+                _RESEAL_BLOCKED[blocked],
             )
             return _Half.SKIPPED
         try:
@@ -2381,7 +2388,7 @@ class UploadStore:
         except FileNotFoundError:
             # The target's own absence is _ChangedUnderReseal, so this is the root, or this pass's
             # temp file in it. Its error would name the lock file when the root went before the
-            # lock's open, so it is not logged as the cause.
+            # lock's open, so this half's warning does not give it as the cause.
             _log.warning(
                 "uploaded file %s (%s): skipped, could not be written: the uploads directory, or "
                 "this pass's temp file in it, is gone",
@@ -3275,7 +3282,6 @@ _RERUN_WHEN_FREE = "re-run rotate-key once whatever holds the lock releases it"
 #: What a re-seal half skipped for a failed first pair-lock check logs as the cause.
 _RESEAL_BLOCKED: dict[_PairLockFailure, str] = {
     "busy": f"the uploads pair lock was still held when the wait ran out; {_RERUN_WHEN_FREE}",
-    "gone": "the uploads directory was gone",
     "timeout": "the file system timed out taking the uploads pair lock",
     "refused": "the uploads pair lock could not be taken",
 }
@@ -3323,7 +3329,7 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
             lock = scrub_log_argument(str(lock_path_for(path)))
             failure = _pair_lock_failure(exc)
             consequence = (
-                "rotate-key writes nothing under it"
+                "rotate-key skips each file it would write under it"
                 if for_reseal
                 else "This removal goes on without it, so a rotate-key run meanwhile could "
                 "re-create the removed upload"

@@ -726,8 +726,8 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    such as root or an administrator, cannot be taken by the engine. The engine still removes uploads
    without it, so retention and delete keep working, and it logs one ERROR per process naming the
    lock file and that likely cause. A `rotate-key` that cannot take the lock at its first check,
-   because it is held, refused or timed out, writes nothing, and fails if any upload still needs a
-   write. One that cannot take it at a later write skips that file. To fix a lock file another
+   whatever the cause, such as a held, refused or timed-out lock, writes nothing, and fails if any
+   upload still needs a write. One that cannot take it at a later write skips that file. To fix a lock file another
    account owns, give it to the engine's service account, or delete it while neither the engine nor
    `rotate-key` runs.
    **At least one kind of refused upload is never sealed, so it is kept inside retention another way

@@ -398,9 +398,9 @@ def test_a_refused_lock_over_uploads_already_current_is_no_skip(
             "the uploads pair lock was still held when the wait ran out; re-run rotate-key once",
         ),
         (_timed_out, "the file system timed out taking the uploads pair lock"),
-        (_root_gone, "the uploads directory was gone"),
+        (_refused, "the uploads pair lock could not be taken"),
     ],
-    ids=["busy", "timeout", "gone"],
+    ids=["busy", "timeout", "refused"],
 )
 def test_a_first_lock_check_that_fails_stops_the_reseal_before_any_decrypt(
     tmp_path: Path,
@@ -410,8 +410,8 @@ def test_a_first_lock_check_that_fails_stops_the_reseal_before_any_decrypt(
     cause: str,
 ) -> None:
     """The lock fails at the pass's first check and at every later try. The pass decrypts nothing,
-    takes the lock no second time, writes nothing, and fails, and each skip names the cause rather
-    than giving account advice."""
+    takes the lock no second time, writes nothing, and fails, and each skip names the cause. Only a
+    refusal gives the account advice, at ERROR."""
     root = tmp_path / "uploads"
     old, new = generate_key(), generate_key()
     fids = [_seed(root, old), _seed(root, old)]
@@ -432,8 +432,25 @@ def test_a_first_lock_check_that_fails_stops_the_reseal_before_any_decrypt(
     assert result.skipped == len(fids) and result.incomplete and result.resealed == 0
     assert {n: (root / n).read_bytes() for n in upload_names(root)} == before
     assert f"uploaded file {fids[0]} (body): skipped, nothing is written: {cause}" in caplog.text
-    assert "Run rotate-key as the account" not in caplog.text
-    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
+    refused = lock is _refused
+    assert ("Run rotate-key as the account" in caplog.text) is refused, caplog.text
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == int(refused), caplog.text
+
+
+def test_a_root_gone_at_the_first_lock_check_is_root_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The root went after the listing, before the first lock check: the pass reports the missing
+    root (BACKLOG #4940) and reads no file, rather than calling every body lost."""
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    _seed(root, old)
+    monkeypatch.setattr(uploads_mod, "edit_lock", _root_gone)
+    reads = _record_decrypts(monkeypatch)
+    result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert result.root_missing and result.incomplete
+    assert (result.skipped, result.body_lost, reads) == (0, 0, [])
 
 
 def test_an_os_timeout_on_an_engine_removal_is_a_warning_not_the_account_error(
