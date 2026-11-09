@@ -47,7 +47,6 @@ from messagefoundry.api.models import (
     ReleaseBlocked,
     ResolveOutcome,
 )
-from messagefoundry.api.validation import DIGEST_ID_PATTERN
 
 from .._html import Markup, el, page, register_nav, rows_table
 from ._common import _reload_shortfall, _seg
@@ -156,7 +155,7 @@ _NONE_MEANS: dict[str, str] = {
 # _is_config_digest restates the test; tests/test_approval_release_blocked.py pins the two together.
 # The note is true on a pending row and an interrupted one alike.
 _RELOAD = "config_reload"
-_CONFIG_DIGEST = re.compile(DIGEST_ID_PATTERN)
+_CONFIG_DIGEST = re.compile(r"[0-9a-f]{64}")
 _NO_DIGEST = (
     "no usable config digest was recorded, and the engine will not release this reload without one"
 )
