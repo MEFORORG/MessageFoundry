@@ -274,7 +274,6 @@ given** — which is exactly AC-6.
   `--service-config`/`--project-root` is supplied.
   → `tests/test_checks_gate_parity.py::test_every_settings_leg_reads_an_instance_named_by_check_env`
   → `tests/test_checks_gate_parity.py::test_check_env_beats_mefor_ai_environment_and_the_file`
-  → `tests/test_cli_offline_resolution.py::test_check_matches_serve_env_resolution`
   → `tests/test_cli_offline_resolution.py::test_offline_does_not_inherit_serve_posture_refusal`
 - **AC-7** — THE SYSTEM SHALL honor an explicit **absolute** `--config`/`--service-config`/`--db`/
   `[store].path` as-is even when a project root is set, AND SHALL resolve a **relative**

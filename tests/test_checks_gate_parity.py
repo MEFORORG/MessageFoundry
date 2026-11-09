@@ -732,6 +732,32 @@ def test_the_check_command_fails_a_service_config_that_names_no_file(
     assert not legs["posture"]["ok"] and not legs["posture"]["skipped"], legs["posture"]
 
 
+def test_a_missing_service_config_is_named_before_the_value_file_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # serve stops on the missing settings file before it looks for <env>.toml. The value-file check
+    # ran first in check and exited 2 naming a guessed directory, so the real cause went unsaid.
+    cfg = _bare_config(
+        tmp_path,
+        monkeypatch,
+        "from messagefoundry import inbound, outbound, router, handler, MLLP, Send, env\n"
+        "inbound('IB_V', MLLP(port=2630), router='r')\n"
+        "outbound('OB_V', MLLP(host=env('peer_host'), port=2631))\n"
+        "@router('r')\n"
+        "def r(m): return ['h']\n"
+        "@handler('h')\n"
+        "def h(m): return [Send('OB_V', m)]\n",
+    )
+    argv = ["--config", str(cfg), "--project-root", str(tmp_path), "--env", "prod"]
+    typo = ["--service-config", str(tmp_path / "typo.toml")]
+    rc, legs = _cli_check(capsys, *argv, *typo)
+    assert rc == 1, legs
+    assert "service config not found" in str(legs["posture"]["detail"]), legs["posture"]
+    # Control: validate reads no settings, so the value-file check still answers for it.
+    assert main(["validate", *argv, *typo]) == 2
+    assert "no value file" in capsys.readouterr().err
+
+
 def test_a_graph_skip_is_not_tagged_as_an_environment_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

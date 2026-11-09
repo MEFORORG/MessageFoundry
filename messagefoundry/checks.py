@@ -2085,6 +2085,8 @@ def _settings_source(
     * Dev shells and CI export other ``MEFOR_<SECTION>_*`` variables, a store key or a whole SQL
       Server connection, beside a bare config dir. Triggering on any of them would end the documented
       fail-safe SKIP for a bare dir and run every leg against an instance nobody declared.
+    * ``check --env`` is a declaration on the command line, not an ambient variable, so it counts:
+      ADR 0050's Amendment A has ``check --env`` read the name as ``serve --env`` does.
 
     An explicit ``--service-config`` is always ``toml``, existing or not, so it never falls through
     to the environment (:func:`_resolve_service_toml`).
@@ -2132,7 +2134,7 @@ def _load_check_settings(
             # BACKLOG #3063 item 3: say what the path is, where opening it would report only an OS
             # error (on Windows, "Permission denied") that sends the operator to the wrong cause.
             raise IsADirectoryError(
-                f"{toml} is a directory; serve stops on a directory named messagefoundry.toml"
+                f"{toml} is a directory; serve stops on a directory given as its settings file"
             )
         return load_settings(config_path=toml, cli=cli)
     return load_settings(cli=cli, default_file=False)
@@ -2202,7 +2204,8 @@ def _serve_reads_other_note(
     #2355, because it may hold another instance's file."""
     from messagefoundry.config.settings import settings_file_path
 
-    if toml is None or explicit or not suppress_search:
+    # A path that is no file is the settings load's to refuse; samefile would raise on it.
+    if toml is None or explicit or not suppress_search or not toml.is_file():
         return None
     here = settings_file_path(None)
     if here.is_file() and toml.samefile(here):

@@ -1397,7 +1397,9 @@ def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str | None = None
     )
 
 
-def _resolve_offline_anchor(args: argparse.Namespace) -> tuple[str, str | None] | int:
+def _resolve_offline_anchor(
+    args: argparse.Namespace, *, defer_missing_service_config: bool = False
+) -> tuple[str, str | None] | int:
     """Apply the ADR 0050 project-root anchor to an offline subcommand's paths, and fail loud on the
     one scoped missing-value-file case. Returns ``(config_dir, service_config)`` resolved under the
     root, or a non-zero exit code (already reported to stderr) on the hard failure.
@@ -1430,7 +1432,16 @@ def _resolve_offline_anchor(args: argparse.Namespace) -> tuple[str, str | None] 
     # Fail loud only under an EXPLICIT root with an env name AND an env-referencing graph AND no file
     # (ADR 0050 §2, ratified). Without --env there is no value file to require; without --project-root
     # the silent-empty default is preserved; a zero-env() graph is never failed.
-    if args.project_root is not None and args.env is not None and root is not None:
+    #
+    # defer_missing_service_config is check's: a --service-config that is no file stops serve before
+    # its value-file check, and check's settings legs fail on it in serve's words. The value-file
+    # check here would name a guessed directory instead, so it is left to them.
+    deferred = (
+        defer_missing_service_config
+        and service_config is not None
+        and not Path(service_config).is_file()
+    )
+    if args.project_root is not None and args.env is not None and root is not None and not deferred:
         env_dir = _env_dir_name(service_config)
         rc = _check_env_file_present(config_dir, root, args.env, env_dir)
         if rc is not None:
@@ -1463,7 +1474,8 @@ def _env_dir_name(service_config: str | None) -> str:
     env_section = data.get("environments")
     if isinstance(env_section, dict):
         name = env_section.get("dir")
-        if isinstance(name, str) and name:
+        if isinstance(name, str):
+            # A blank dir is taken as given, as serve's loader takes it.
             return name
     return "environments"
 
@@ -12144,7 +12156,7 @@ def _check(args: argparse.Namespace) -> int:
     """Commit/CI gate: exit 0 iff every *required* check passed (advisory failures only print)."""
     from messagefoundry.checks import run_checks
 
-    resolved = _resolve_offline_anchor(args)
+    resolved = _resolve_offline_anchor(args, defer_missing_service_config=True)
     if isinstance(resolved, int):
         return resolved
     config_dir, service_config = resolved
