@@ -299,11 +299,12 @@ def _passkey_read_errors() -> tuple[type[Exception], ...]:
     #3775; vault BACKLOG #4728 finding 3 decided it):
     :func:`~messagefoundry.store.base.store_call_errors` and
     :func:`~messagefoundry.store.base.store_connect_errors`. Wider than
-    :func:`_session_write_errors` by ``ValueError`` and ``RuntimeError``; the connect set adds
-    pyodbc's ``Error`` root, which pyodbc raises for a deadlock victim. The caller re-raises
-    ``AUDIT_WRITE_DEFECTS`` first, so not every class under these is refused: which faults the
-    read refuses, and which still raise, is ADR 0068, amendment of 2026-10-17. Cached, as
-    ``store_call_errors`` is, so a refusal does not run the driver import on the event loop."""
+    :func:`_session_write_errors` by ``ValueError`` and ``RuntimeError``; of the two sets, only the
+    connect set takes pyodbc's ``Error`` root, which pyodbc raises for a deadlock victim. The caller
+    re-raises ``AUDIT_WRITE_DEFECTS`` first, so ``NotImplementedError``, ``RecursionError`` and
+    ``sqlite3.ProgrammingError`` raise although these sets take them, and so does every class
+    outside both sets, ``sqlite3.InterfaceError`` among them. Cached, as ``store_call_errors`` is,
+    so a refusal does not run the driver import on the event loop."""
     return (*store_call_errors(), *store_connect_errors())
 
 
@@ -16563,10 +16564,10 @@ class AuthService:
         flight, the sign count does not move, and nothing is charged, so the same assertion
         verifies once the directory confirms the account. After the sign-count write the passkey set is
         read, then the session, the account and the lock, so the last read before the factor write
-        is the holder re-read, with no other await between it and the write (BACKLOG #3068). At
-        least some store faults in the passkey re-read refuse, audited with ``reason=store_error``
-        (BACKLOG #3775), and others still raise, ``sqlite3.InterfaceError`` among them; ADR 0068,
-        amendment of 2026-10-17, says which."""
+        is the holder re-read, with no other await between it and the write (BACKLOG #3068). An
+        exception in the passkey re-read that :func:`_passkey_read_errors` takes refuses, audited
+        with ``reason=store_error``, unless it is one of ``AUDIT_WRITE_DEFECTS``; every other
+        exception raises (BACKLOG #3775)."""
         if not token:
             return Elevation()
         session = await self._load_session(hash_token(token))
@@ -16738,11 +16739,11 @@ class AuthService:
             # SQL Server a bad statement is a driver DatabaseError, so it is refused below.
             raise
         except _passkey_read_errors():
-            # BACKLOG #3775: after the sign-count write, a store fault here refuses with an audit
-            # row rather than raising past the ceremony with none; what the set holds is in its
-            # docstring, and ADR 0068 lists what still raises. Soft, so a store that refuses that
-            # row too still gets the refusal back: the refusal is the fail-closed control, and the
-            # row only records it.
+            # BACKLOG #3775: after the sign-count write, an exception the set takes refuses with an
+            # audit row rather than raising past the ceremony with none; the set's docstring says
+            # what it takes and what still raises. Soft, so a store that refuses that row too still
+            # gets the refusal back: the refusal is the fail-closed control, and the row only
+            # records it.
             _log.exception("finish_webauthn_assertion: the passkey re-read raised")
             await write_audit_soft(
                 lambda: self._assertion_refused(user, client, "store_error"),
