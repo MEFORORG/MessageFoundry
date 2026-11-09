@@ -1366,6 +1366,41 @@ async def test_a_totp_enabled_after_it_was_judged_is_not_removed() -> None:
         await store.close()
 
 
+@pytest.mark.parametrize("moved", [True, False], ids=["a-cell-that-moved", "control-same-cell"])
+async def test_a_usable_judgement_of_a_cell_that_moved_does_not_open_the_rotation(
+    monkeypatch: pytest.MonkeyPatch, moved: bool
+) -> None:
+    """The store's conditional rotation judges the TOTP from a read made before its lock, so a
+    re-enrolment can land between the two. A usable verdict on the old cell then counts for
+    nothing under the lock (:meth:`TotpJudgement.moved`): the account, re-enrolled onto a refused
+    marker and holding no passkey, is refused. The race is planted by handing the pre-lock read the
+    record from before the re-enrolment. The control: the same stale read of a cell the row still
+    holds lets the write land. RED when a judgement counts for a cell it did not judge."""
+    store = await MessageStore.open(":memory:")
+    try:
+        identity, _token, _ = await login_admin(_service(store))
+        await _enable_totp(store, identity.user_id, _USABLE_TOTP)
+        stale = await store.get_user(identity.user_id)
+        assert stale is not None
+        if moved:
+            assert await store.disable_totp(identity.user_id)
+            await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
+
+        async def pre_lock_read(_user_id: str) -> Any:
+            return stale
+
+        monkeypatch.setattr(store, "get_user", pre_lock_read)
+        written = await store.set_password(
+            identity.user_id,
+            password_hash="$argon2id$synthetic-not-a-real-hash",
+            password_generated=False,
+            require_way_past=_opened_totp_state,
+        )
+        assert written is not moved
+    finally:
+        await store.close()
+
+
 async def test_a_totp_cell_that_does_not_open_is_judged_unknown_and_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1665,8 +1700,9 @@ async def test_an_unknown_totp_opens_the_rotation_gate(
         gate_opens = len(opened)
         assert gate_opens, "the rotation gate judged nothing, so the stub measured nothing"
         assert await service.change_password(identity, _NEW_PASSWORD) == []
-        # The password change opens it twice: in its early refusal and in the store's conditional
-        # write (BACKLOG #3948), so a change where either stopped judging it shows.
+        # The password change opens it twice more: in its early refusal and in the store's
+        # conditional write (BACKLOG #3948). The count alone does not say which site opened it;
+        # test_a_password_change_opens_the_totp_cell_in_the_early_refusal_and_in_the_write does.
         assert len(opened) == gate_opens + 2, (gate_opens, len(opened))
         row = await store.get_user(identity.user_id)
         assert row is not None and row.password_hash != before.password_hash

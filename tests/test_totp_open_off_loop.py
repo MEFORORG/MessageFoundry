@@ -401,21 +401,25 @@ async def test_a_password_change_opens_the_totp_cell_in_the_early_refusal_and_in
     monkeypatch: pytest.MonkeyPatch, store: MessageStore
 ) -> None:
     """BACKLOG #3948: a password change by a covered account with TOTP on opens the TOTP cell twice,
-    once in the early refusal before the hash and once in the store's conditional write, which
-    judges the cell itself. Under a Transit cipher each open is one round trip. RED when either
-    stops judging the cell, or a third open is added."""
+    once in the early refusal before the argon2 hash and once in the store's conditional write
+    after it. Under a Transit cipher each open is one round trip. RED when either site stops
+    opening the cell, or a third open is added."""
     service, identity, _password, _steps, _codes = await _totp_admin(
         store, monkeypatch, before_confirm=lambda: None
     )
     real_open = store.open_totp_secret
-    opens: list[str] = []
+    real_argon2 = service._argon2
+    events: list[str] = []
 
     def counting(user_id: str, cell: str | None) -> str | None:
-        opens.append(user_id)
+        events.append("open")
         return real_open(user_id, cell)
 
+    async def marking(fn: Callable[..., Any], *args: Any) -> Any:
+        events.append("hash")
+        return await real_argon2(fn, *args)
+
     monkeypatch.setattr(store, "open_totp_secret", counting)
+    monkeypatch.setattr(service, "_argon2", marking)
     assert await service.change_password(identity, "a fresh synthetic passphrase 7341") == []
-    assert opens == [identity.user_id, identity.user_id], (
-        f"the change opened the TOTP cell {len(opens)} times"
-    )
+    assert events == ["open", "hash", "open"], events

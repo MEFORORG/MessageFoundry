@@ -5874,8 +5874,8 @@ configured `rp_id` (ADR 0197 Amendment A, wave 2; BACKLOG #3937). The rotation i
 the same order before it hashes. It judges the TOTP first. Only where that TOTP is no way past and
 a passkey can count does this early check read the passkey set, through the verified read
 `_has_way_past` uses. It refuses an account with neither. The store's conditional write judges
-the TOTP again itself, on the cell it writes against (BACKLOG #3948), and reads the passkey set
-under its lock on every conditional rotation. Without the `[webauthn]` extra the write counts no passkey, as
+the TOTP again itself before its lock, counts that judgement under the lock only for the cell it
+judged (BACKLOG #3948), and reads the passkey set under its lock on every conditional rotation. Without the `[webauthn]` extra the write counts no passkey, as
 `_has_way_past` counts none.
 One whose passkeys are not discoverable must also enrol a factor that is a way past
 before it rotates, so after the passkey it goes to the enrolment page, and only then to the password
