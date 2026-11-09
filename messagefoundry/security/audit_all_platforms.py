@@ -75,7 +75,10 @@ write at least an index URL, ``--trusted-host`` and ``--find-links`` lines unles
 a requirement that continues onto a line other than a hash, option or comment, where a marker
 would stay in place; and a copy from which pip-audit's parser would read a number of requirements
 other than the number counted, as ``_pip_audit_requirement_count`` reads it, which says what that
-covers; and a ``--skip-private`` that names the engine or another published
+covers; and a copy holding a requirement in which that parser could still find an environment
+marker, as ``_pip_audit_may_see_marker`` reads it, which pip-audit would skip unaudited where the
+host fails the marker (the ``;`` the strip leaves inside a bare URL's ``#egg=`` fragment, say); and
+a ``--skip-private`` that names the engine or another published
 MessageFoundry package, a package the lock does not pin, or every pin, or that comes after the lock
 as a word of its own (the ``=`` form or an abbreviation there reaches pip-audit, which fails on it
 as an unknown option). It does not judge
@@ -114,6 +117,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 
@@ -273,9 +277,15 @@ _COUNT_REFUSAL = (
     "cannot tell that it would"
 )
 
+#: Fixed, so it names no lock content.
+_MARKER_REFUSAL = (
+    "its copy holds a requirement in which pip-audit's parser could find an environment marker, "
+    "and skip that pin unaudited"
+)
 
-def _pip_audit_requirement_count(text: str) -> int | None:
-    """How many requirements pip-audit reads from ``text``, or ``None`` where this cannot say.
+
+def _pip_audit_requirements(text: str) -> list[str] | None:
+    """The requirement strings pip-audit reads from ``text``, or ``None`` where this cannot say.
 
     pip-audit 2.10.1 reads the copy with pip-requirements-parser 32.0.1, whose ``preprocess`` splits
     ``text`` with ``str.splitlines``, joins a line ending in a backslash to the next unless it is a
@@ -283,10 +293,7 @@ def _pip_audit_requirement_count(text: str) -> int | None:
     splits each comment off and drops blank lines (``split_comments``, whose ``COMMENT_RE`` is
     :data:`_COMMENT` with a group around the comment). A line left is a requirement when
     ``break_args_options`` leaves it words before the first that starts with ``-``, which is when
-    the line does not start with ``-``.
-
-    What this catches: a pin the strip leaves ending in a backslash, as ``foo @ <url>\\ ; <marker>``
-    does, joins the next pin onto it, so the copy holds one requirement fewer than the lock.
+    the line does not start with ``-``; those words, joined by a space, are its requirement string.
 
     Its limits. A line of options alone is ``None``: optparse makes it an editable requirement when
     it finds ``-e`` there, which this does not model. The strip leaves one only where it empties a
@@ -305,13 +312,67 @@ def _pip_audit_requirement_count(text: str) -> int | None:
         logical.append(joined + (f" {line}" if comment else line))
         joined = ""
     logical.append(joined)
-    count = 0
+    requirements: list[str] = []
     for line in logical:
         code = _COMMENT.sub("", line).strip()
         if code.startswith("-"):
             return None
-        count += bool(code)
-    return count
+        if code:
+            words = code.split(" ")
+            first = next((n for n, word in enumerate(words) if word.startswith("-")), len(words))
+            requirements.append(" ".join(words[:first]))
+    return requirements
+
+
+def _pip_audit_requirement_count(text: str) -> int | None:
+    """How many requirements pip-audit reads from ``text`` (:func:`_pip_audit_requirements`).
+
+    What this catches: a pin the strip leaves ending in a backslash, as ``foo @ <url>\\ ; <marker>``
+    does, joins the next pin onto it, so the copy holds one requirement fewer than the lock.
+    """
+    requirements = _pip_audit_requirements(text)
+    return None if requirements is None else len(requirements)
+
+
+#: What ``urllib.parse.urlsplit`` deletes from anywhere in a URL.
+_URL_REMOVED = str.maketrans("", "", "\t\r\n")
+
+
+def _decoded(requirement: str) -> str:
+    """``requirement`` percent-decoded, and with tab, CR and LF removed, until neither changes it.
+
+    ``urllib.parse.urlsplit`` removes those three before it splits, so they can part a ``%3B``.
+    Each pass that changes the text shortens it, so the loop ends.
+    """
+    while (decoded := urllib.parse.unquote(requirement.translate(_URL_REMOVED))) != requirement:
+        requirement = decoded
+    return requirement
+
+
+def _pip_audit_may_see_marker(requirement: str) -> bool:
+    """Whether pip-requirements-parser 32.0.1 could attach an environment marker to ``requirement``.
+
+    ``requirement`` is a requirement string as :func:`_pip_audit_requirements` gives it. pip-audit
+    2.10.1 drops a pin whose ``InstallRequirement.marker`` the host does not satisfy, with no skip
+    and no error, so a marker left in the copy is a pin the count says was audited and was not.
+
+    Every marker the parser makes comes through a ``;``. ``parse_reqparts_from_string`` splits one
+    off at the first ``; `` after a URL, else at the first ``;``; and ``InstallRequirement`` takes
+    ``req.marker`` from a ``packaging`` ``Requirement``, whose grammar starts a marker with a ``;``.
+    That ``Requirement`` is read from the requirement string itself, or for a URL or path that is
+    not a wheel from its ``#egg=`` or ``&egg=`` fragment, which the strip's ``; `` rule leaves
+    whole (``https://h/evil-1.0.tar.gz#egg=evil==1.0;<marker>``), or for a wheel from its file
+    name, which ``Link`` percent-decodes twice. A relative ``file:`` URL is re-made from its decoded
+    path, so its egg fragment is decoded once and its file name three times. So this answers yes to
+    any ``;`` in the string once :func:`_decoded`.
+
+    That answers yes to more than the parser marks: a ``;`` elsewhere in a URL, or a decoded one
+    where no route decodes. Each such answer refuses, failing closed. The strip leaves a literal
+    ``;`` only in a bare URL, so any other pin is refused here only where it percent-encodes one.
+    A pin with a URL fails the audit anyway when pip-audit keeps it: 2.10.1 reports it skipped as
+    a URL requirement, which ``--strict`` fails.
+    """
+    return ";" in _decoded(requirement)
 
 
 #: The schemes pip 26's ``is_url`` takes for a URL: its four, and each VCS's ``vcs+`` forms.
@@ -550,8 +611,12 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         return 2
     counted = requirements - len(skipped)
     audited = "".join(kept)
-    if _pip_audit_requirement_count(audited) != counted:
+    read = _pip_audit_requirements(audited)
+    if read is None or len(read) != counted:
         print(f"::error::{args.lock}: {_COUNT_REFUSAL}", file=sys.stderr)
+        return 2
+    if any(map(_pip_audit_may_see_marker, read)):
+        print(f"::error::{args.lock}: {_MARKER_REFUSAL}", file=sys.stderr)
         return 2
     # A skipped pin is neither counted nor listed as audited.
     stripped = [

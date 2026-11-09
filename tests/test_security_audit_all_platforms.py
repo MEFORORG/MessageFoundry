@@ -705,6 +705,75 @@ def test_a_copy_whose_parser_count_matches_is_audited(
     assert _EVIL in read[0], read
 
 
+_MARKER_REFUSED = (
+    "its copy holds a requirement in which pip-audit's parser could find an environment"
+)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param("https://h/evil-1.0.tar.gz#egg=evil==1.0;sys_platform=='zz'", id="egg-https"),
+        pytest.param(
+            "git+https://h/evil.git@v1#egg=evil==1.0;sys_platform=='zz'", id="egg-git+https"
+        ),
+        pytest.param("file:///tmp/evil-1.0.tar.gz#egg=evil==1.0;sys_platform=='zz'", id="egg-file"),
+        pytest.param(
+            "https://h/evil-1.0.tar.gz?a=1&egg=evil==1.0;sys_platform=='zz'",
+            id="egg-after-ampersand",
+        ),
+        pytest.param("https://h/evil-1.0.tar.gz#egg=evil;sys_platform=='zz'", id="egg-name-only"),
+        # A wheel's version, from its file name: the parser turns "_" there into "-", so this
+        # marker names no variable with one. Link percent-decodes the file name twice, and
+        # urlsplit drops a tab first.
+        pytest.param("https://h/evil-1.0;extra=='x'-py3-none-any.whl", id="wheel-version"),
+        pytest.param(
+            "https://h/evil-1.0%253Bextra%253D%253D%2527x%2527-py3-none-any.whl",
+            id="wheel-version-encoded-twice",
+        ),
+        pytest.param(
+            "https://h/evil-1.0%3\tBextra%3D%3D%27x%27-py3-none-any.whl",
+            id="wheel-version-encoded-across-a-tab",
+        ),
+        # A relative file: URL is re-made from its decoded path, egg fragment and all.
+        pytest.param(
+            "file:///x/../evil-1.0.tar.gz%23egg=evil==1.0%3Bextra=='x'",
+            id="relative-file-egg-encoded",
+        ),
+    ],
+)
+def test_a_marker_the_strip_leaves_inside_a_url_is_refused(
+    url: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Lander hold 6 on PR 2840 (issuecomment-6739690438): the strip splits a bare URL's marker off
+    only at a ``; ``, as pip does, so a ``;`` inside the URL stays in the copy. pip-requirements-parser
+    32.0.1 reads a marker from there, and pip-audit skips the pin with no error where the host fails
+    it. Each URL here is one the parser itself marked, recorded 2026-11-09. Step 1 is stubbed: pip
+    26.2 refuses an egg fragment holding a ``;``, but the auditor must not lean on that."""
+    digest = f"--hash=sha256:{_DIGEST}"
+    src = tmp_path / "x.lock"
+    src.write_text(f"{url} {digest}\nbar==2 {digest}\n", encoding="utf-8")
+    ran, run = _recorder(0)
+    status = main([str(src)], run=run)
+    out, err = capsys.readouterr()
+    # Was exit 0 and "2 pinned requirements audited", while pip-audit audited bar alone.
+    assert (status, ran) == (2, []), out
+    assert "pinned requirements audited" not in out
+    err = err.replace(str(src), "")
+    assert _MARKER_REFUSED in err, err
+    assert "evil" not in err and "extra" not in err, err
+
+
+def test_a_url_pin_with_no_marker_left_in_it_is_handed_on(tmp_path: Path) -> None:
+    """The control for the refusal above: an egg fragment with no ``;`` reaches pip-audit."""
+    digest = f"--hash=sha256:{_DIGEST}"
+    src = tmp_path / "x.lock"
+    url = "https://h/evil-1.0.tar.gz#egg=evil==1.0"
+    src.write_text(f"{url} ; sys_platform == 'zz' {digest}\nbar==2 {digest}\n", encoding="utf-8")
+    status, copies = _audit_copies(src)
+    assert (status, copies) == (0, [[f"{url} {digest}", f"bar==2 {digest}"]])
+
+
 #: Each text with the requirement count pip-requirements-parser 32.0.1 itself gave for it
 #: (``preprocess``, then its line parser: a requirement string or an editable), recorded 2026-11-09.
 _PARSER_COUNTS = [
