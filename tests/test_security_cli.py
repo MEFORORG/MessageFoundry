@@ -283,7 +283,7 @@ def test_the_label_names_a_variable_by_the_loaders_rule(
         assert "48 hour" in entry["risk"], entry
 
 
-@pytest.mark.parametrize("error", ["security_edit", "os"])
+@pytest.mark.parametrize("error", ["security_edit", "os", "validation"])
 def test_set_preview_does_not_refuse_an_edit_whose_candidate_read_raises(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -295,8 +295,10 @@ def test_set_preview_does_not_refuse_an_edit_whose_candidate_read_raises(
     load accepted (vault BACKLOG #2600). Only the candidate's read raises; the live file reads.
 
     The fallback logs a WARNING naming the exception's type and nothing of its text, which can
-    quote the file's values. The control is an edit whose candidate reads: it logs no such line.
-    The handler sits on the module's logger, since `--json` replaces the root's handlers."""
+    quote the file's values, and the report says it is partial and why, so the pre-check view
+    never reads as complete (vault BACKLOG #8171, item 38). The control is an edit whose candidate
+    reads: it logs no such line, and its report is not partial. The handler sits on the module's
+    logger, since `--json` replaces the root's handlers."""
     import logging
 
     from messagefoundry.config import security_edit
@@ -314,11 +316,15 @@ def test_set_preview_does_not_refuse_an_edit_whose_candidate_read_raises(
     logger = logging.getLogger("messagefoundry.__main__")
     logger.addHandler(handler)
     try:
-        rc, _ = _set(toml, {"require_mfa": True}, capsys)
+        rc, control = _set(toml, {"require_mfa": True}, capsys)
         assert rc == 0 and not [r for r in records if marker in r.getMessage()]
+        assert control["loosenings_partial"] is False
+        assert control["loosenings_partial_reason"] is None
 
         def failing_candidate(service_config: str | Path) -> dict:
             if Path(service_config) != toml:
+                if error == "validation":  # a [security] that fails alone
+                    return {"require_mfa": "secret-sentinel-0451"}
                 if error == "os":
                     raise OSError("secret-sentinel-0451")
                 raise security_edit.SecurityEditError("secret-sentinel-0451")
@@ -333,9 +339,13 @@ def test_set_preview_does_not_refuse_an_edit_whose_candidate_read_raises(
     assert _entries(res, "max_session_hours")
     (record,) = [r for r in records if marker in r.getMessage()]
     assert record.levelno == logging.WARNING and record.exc_info is None
-    expected = "OSError" if error == "os" else "SecurityEditError"
+    expected = {"os": "OSError", "validation": "ValidationError"}.get(error, "SecurityEditError")
     assert f"({expected})" in record.getMessage()
     assert all("secret-sentinel-0451" not in r.getMessage() for r in records)
+    assert res["loosenings_partial"] is True
+    reason = res["loosenings_partial_reason"]
+    assert marker in reason and f"({expected})" in reason
+    assert "secret-sentinel-0451" not in json.dumps(res)
 
 
 def test_an_unset_session_limit_reads_the_auth_default(

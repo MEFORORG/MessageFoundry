@@ -12661,7 +12661,9 @@ def _security(args: argparse.Namespace) -> int:
 
     path = args.service_config
 
-    def _posture(sec: SecuritySettings, saved: ServiceSettings | None = None) -> dict[str, object]:
+    def _posture(
+        sec: SecuritySettings, saved: ServiceSettings | None = None, *, degraded: str | None = None
+    ) -> dict[str, object]:
         """The loosening list for ``sec`` and its scope marker.
 
         This subcommand edits [security], but security_loosenings() also reports the other sections'
@@ -12687,7 +12689,11 @@ def _security(args: argparse.Namespace) -> int:
 
         The two session limits are also read off the load, and a loosening only the load sees is
         named after the authored entries (vault BACKLOG #2600). docs/SECURITY-LOOSENING.md, the
-        idle-limit entry, says when one is named and how it is labelled."""
+        idle-limit entry, says when one is named and how it is labelled.
+
+        ``degraded`` is why ``sec`` is not the [security] the caller meant to report, as when `set`
+        could not re-read the [security] it saved (vault BACKLOG #8171, item 38). It marks the report
+        partial too, beside any reason the load gives."""
         full: ServiceSettings | None = saved
         partial_reason: str | None = None
         # An ABSENT file is not a degraded read -- the shipped defaults ARE the effective posture
@@ -12788,7 +12794,9 @@ def _security(args: argparse.Namespace) -> int:
                 loosenings.append({"switch": s, "risk": f"{source}: {r}"})
         # Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
         # degraded or settings-only report for a complete one. `partial` means the sections outside
-        # [security] could not be read at all (the file did not load), so they report shipped defaults; the scope string is the standing limitation above. It names
+        # [security] could not be read at all (the file did not load), so they report shipped defaults,
+        # or that `set` could not re-read the [security] it saved (``degraded``); the scope string is
+        # the standing limitation above. It names
         # ALL the connection-scoped deviations (#333, ADR 0173) — naming only cleartext_accepted made the DECLARED
         # scope itself incomplete, which is the same defect one level up.
         #
@@ -12802,11 +12810,12 @@ def _security(args: argparse.Namespace) -> int:
         # Vault BACKLOG #2599 added a FIFTH, named for the same reason: the config-source escape is an
         # environment variable, and security_loosenings() reads it from the process that calls it. Here
         # that is the operator's shell, not the service.
+        reasons = [r for r in (degraded, partial_reason) if r is not None]
         return {
             "loosenings": loosenings,
-            "loosenings_partial": partial_reason is not None,
-            # None unless the report is partial. Then: why the whole-file load failed.
-            "loosenings_partial_reason": partial_reason,
+            "loosenings_partial": bool(reasons),
+            # None unless the report is partial. Then: why it is.
+            "loosenings_partial_reason": "; ".join(reasons) or None,
             "loosenings_scope": (
                 "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]/"
                 "[cert_monitor]/[backup]/[secrets]/[ai]); the "
@@ -12864,7 +12873,7 @@ def _security(args: argparse.Namespace) -> int:
 
     # Also how a relocated legacy key is refused at edit time rather than at the next start.
     saved: list[ServiceSettings] = []
-    saved_sec: list[SecuritySettings | None] = []
+    saved_sec: list[SecuritySettings | str] = []
     check_candidate = _post_write_settings_check(security_edit.SecurityEditError, keep=saved)
 
     def validate(candidate: Path) -> None:
@@ -12874,19 +12883,19 @@ def _security(args: argparse.Namespace) -> int:
         # [security] with this candidate's other sections. This read is for the report only and
         # must not refuse an edit the whole-file load accepted, so a [security] that fails alone
         # (a MEFOR_SECURITY_* variable overrides its bad value), or a read of the candidate that
-        # raises, falls back to the pre-check view.
+        # raises, falls back to the pre-check view, and the report says it is partial and why.
         try:
             saved_sec.append(
                 SecuritySettings.model_validate(security_edit.read_security(candidate))
             )
         except (ValueError, OSError) as exc:  # ValidationError, SecurityEditError are ValueErrors
             # The type only: a validation or read error's text can quote the file's values.
-            logging.getLogger(__name__).warning(
-                "security set: the saved [security] could not be re-read for the report (%s), so "
-                "the loosenings are reported from the [security] checked before the edit",
-                type(exc).__name__,
+            reason = (
+                f"the saved [security] could not be re-read for the report ({type(exc).__name__}), "
+                "so the loosenings are reported from the [security] checked before the edit"
             )
-            saved_sec.append(None)
+            logging.getLogger(__name__).warning("security set: %s", reason)
+            saved_sec.append(reason)
 
     try:
         data = args.data if args.data is not None else sys.stdin.read()
@@ -12908,8 +12917,10 @@ def _security(args: argparse.Namespace) -> int:
             return _emit_error(f"invalid [security] value: {exc}", as_json=args.json)
         result = security_edit.set_security(path, updates, validate=validate)
         # The candidate the write validated, so the preview reports the posture the edit left.
-        view = saved_sec[-1] if saved_sec and saved_sec[-1] is not None else sec
-        result.update(_posture(view, saved[-1] if saved else None))
+        reread = saved_sec[-1] if saved_sec else None
+        view = reread if isinstance(reread, SecuritySettings) else sec
+        degraded = reread if isinstance(reread, str) else None
+        result.update(_posture(view, saved[-1] if saved else None, degraded=degraded))
     except _OperatorJsonError as exc:
         return _emit_error(str(exc), as_json=args.json)
     except (security_edit.SecurityEditError, FileNotFoundError, ValueError, OSError) as exc:
