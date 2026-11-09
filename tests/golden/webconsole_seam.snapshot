@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-44d2ecd02c8d2b1b
+e233fc19966d856a
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -492,4 +492,4 @@ middleware 0: messagefoundry_webconsole._security:UiFetchMetadataMiddleware()
 middleware 1: messagefoundry_webconsole._security:UiSecurityHeadersMiddleware()
 app.state.ui_connections_render: function
 app.state.ui_csp: str
-app.state.ui_ws_authorize: messagefoundry_webconsole._auth:authorize_ui_ws#2dee08067b6c()
+app.state.ui_ws_authorize: messagefoundry_webconsole._auth:authorize_ui_ws#ff868ed0a37f()

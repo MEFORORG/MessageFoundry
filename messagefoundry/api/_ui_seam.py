@@ -842,12 +842,16 @@ from typing import Any
 #: Merged with main's ``2a4589213e5e782c`` and re-derived with ``--write`` over both, to
 #: ``44d2ecd02c8d2b1b``.
 #:
+#: Vault BACKLOG #2955, review round 5: ``authorize_ui_ws`` records nothing for a native client's
+#: handshake, so it no longer clears the header gate's admission. Its body moved, and with it the
+#: digest, re-derived with ``--write`` from ``44d2ecd02c8d2b1b`` to ``e233fc19966d856a``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "44d2ecd02c8d2b1b"
+ENGINE_UI_SEAM: str = "e233fc19966d856a"
 
 
 @dataclass(frozen=True, slots=True)
