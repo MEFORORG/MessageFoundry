@@ -38,7 +38,9 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_UPLOAD_RESEND,
     AuthService,
 )
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import AuthSettings, EgressSettings, StoreSettings
+from messagefoundry.config.wiring import ConnectionSpec, OutboundConnection
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore, ResendKeyConflict
 from tests._admin_account import create_local_user_chosen
@@ -369,7 +371,17 @@ async def _edit_resend_engine(tmp_path: Path) -> Engine:
         poll_interval=0.02,
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    engine.add_registry(_registry(tmp_path))
+    registry = _registry(tmp_path)
+    # Present in the config but not deployed (ADR 0111), for the direct-mode order test below.
+    (tmp_path / "o3").mkdir(exist_ok=True)
+    registry.add_outbound(
+        OutboundConnection(
+            "OB_UNDEPLOYED",
+            ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "o3")}),
+            deployed=False,
+        )
+    )
+    engine.add_registry(registry)
     await engine.start()
     return engine
 
@@ -476,6 +488,88 @@ async def test_an_edit_resend_refused_at_its_store_write_keeps_the_spend(
             token = await _reauth(c, await _login(c, "adm"), STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
             assert (await _edit_resend(c, token, mid, reroute=True)).status_code == 409
             again = await _edit_resend(c, token, mid, reroute=True, key="k2")
+            assert _refused_for(again, STEP_UP_ACTION_MESSAGE_EDIT_RESEND), again.status_code
+    finally:
+        await engine.stop()
+
+
+# --- direct mode checks the body before it reveals the target (ADR 0197 Amendment D) ----------
+#: An edited body the engine-wide guard refuses whatever the target: a NUL is refused 422.
+NUL_BODY = ADT + "NTE|1||x\x00\r"
+
+
+@pytest.mark.parametrize(
+    ("case", "to", "status"),
+    [
+        pytest.param("unknown", "OB_NOPE", 404, id="unknown"),
+        pytest.param("not-deployed", "OB_UNDEPLOYED", 409, id="not-deployed"),
+        pytest.param("another-engine-shard", "OB2", 409, id="another-engine-shard"),
+        pytest.param("stopped", "OB2", 409, id="stopped"),
+    ],
+)
+async def test_a_direct_edit_resend_with_a_bad_body_does_not_reveal_its_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str, to: str, status: int
+) -> None:
+    """A body the guard refuses gets the guard's 422 and its proof back, whatever state the target
+    is in, so a run of such bodies cannot map which outbounds are registered, deployed, on this
+    engine shard or running. The same proof then sends a good body, which meets the target's own
+    404 or 409 and spends it: the guard did refund, and the target checks still hold."""
+    pytest.importorskip("psutil")
+    engine = await _edit_resend_engine(tmp_path)
+    try:
+        rr = engine.registry_runner
+        assert rr is not None
+        if case == "another-engine-shard":
+            monkeypatch.setattr(rr, "destination_owner", lambda _name: "other-shard")
+        elif case == "stopped":
+            monkeypatch.setattr(rr, "outbound_running", lambda _name: False)
+        service = await _service(engine)
+        await _add(service, "adm", [Role.ADMINISTRATOR.value])
+        mid = await engine.store.enqueue_message(
+            channel_id="in1", raw=ADT, deliveries=[], message_type="ADT^A01", control_id="MSG1"
+        )
+        async with _client(engine, service, tmp_path) as c:
+            token = await _reauth(c, await _login(c, "adm"), STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
+            bad = await _edit_resend(c, token, mid, raw=NUL_BODY, to=to)
+            assert bad.status_code == 422 and _past_the_step_up(bad), (bad.status_code, bad.text)
+            assert to not in bad.text, bad.text
+            audit = await engine.store.list_audit()
+            assert [a for a in audit if a["action"] == "message_edit_resend_reject"]
+            good = await _edit_resend(c, token, mid, to=to, key="k2")
+            assert good.status_code == status and _past_the_step_up(good), (
+                good.status_code,
+                good.text,
+            )
+            again = await _edit_resend(c, token, mid, to=to, key="k3")
+            assert _refused_for(again, STEP_UP_ACTION_MESSAGE_EDIT_RESEND), again.status_code
+    finally:
+        await engine.stop()
+
+
+async def test_a_direct_edit_resend_with_a_bad_body_out_of_scope_is_still_403(
+    tmp_path: Path,
+) -> None:
+    """The scope check stays ahead of the guard: a bad body to a target outside the caller's scope
+    gets the audited 403 and spends the proof, and the guard never runs on it."""
+    pytest.importorskip("psutil")
+    engine = await _edit_resend_engine(tmp_path)
+    try:
+        service = await _service(engine)
+        # An operator, since the administrator role is unscoped whatever its stored scope says.
+        user_id = await _add(service, "op", [Role.OPERATOR.value])
+        await service.set_channel_scope(user_id, ["in1", "OB1"], actor="test")
+        mid = await engine.store.enqueue_message(
+            channel_id="in1", raw=ADT, deliveries=[], message_type="ADT^A01", control_id="MSG1"
+        )
+        async with _client(engine, service, tmp_path) as c:
+            token = await _reauth(c, await _login(c, "op"), STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
+            bad = await _edit_resend(c, token, mid, raw=NUL_BODY, to="OB2")
+            assert bad.status_code == 403 and _past_the_step_up(bad), (bad.status_code, bad.text)
+            audit = await engine.store.list_audit()
+            denied = [a for a in audit if a["action"] == "auth.channel_denied"]
+            assert [a["channel_id"] for a in denied] == ["OB2"], denied
+            assert not [a for a in audit if a["action"] == "message_edit_resend_reject"]
+            again = await _edit_resend(c, token, mid, raw=NUL_BODY, to="OB2", key="k2")
             assert _refused_for(again, STEP_UP_ACTION_MESSAGE_EDIT_RESEND), again.status_code
     finally:
         await engine.stop()

@@ -8469,6 +8469,20 @@ def create_app(
                 if not identity.can_access_channel(body.to):
                     await _audit_channel_denied(engine, identity, body.to, client_ip(request))
                     raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
+                # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
+                # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling). They
+                # run BEFORE the registry checks below and read nothing from the target, so a body
+                # built to fail them learns nothing about it (ADR 0197 Amendment D gives the order).
+                admitted = await _guard_resubmission(
+                    engine,
+                    identity,
+                    request,
+                    raw=body.raw,
+                    inbound=None,
+                    action="message_edit_resend_reject",
+                    channel_id=row["channel_id"],
+                    detail={"message_id": message_id, "mode": "direct", "to": body.to},
+                )
                 rr = engine.registry_runner
                 if rr is None or body.to not in rr.registry.outbound:
                     raise HTTPException(404, f"no such outbound connection: {body.to}")
@@ -8490,18 +8504,6 @@ def create_app(
                         raise HTTPException(409, _outbound_down_detail(rr, body.to))
                 except KeyError:
                     raise HTTPException(404, f"no such outbound connection: {body.to}") from None
-                # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
-                # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling).
-                admitted = await _guard_resubmission(
-                    engine,
-                    identity,
-                    request,
-                    raw=body.raw,
-                    inbound=None,
-                    action="message_edit_resend_reject",
-                    channel_id=row["channel_id"],
-                    detail={"message_id": message_id, "mode": "direct", "to": body.to},
-                )
                 _refuse_head_only(message_id, row)
                 client = client_ip(request)
 
