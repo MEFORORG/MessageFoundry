@@ -60,43 +60,17 @@
   own text, and the site drops the error, so no frame local of the refusal's traceback holds the
   error itself. The class of a replaced error the engine did not build, and of its cause, is logged
   as a WARNING by name alone. Before, a `ValueError` from the build was refused with its own text,
-  and an error of any other class passed through as it was. The store open reads the key custody
-  in a step of its own under every key provider. Under `[store].key_provider = 'host'` it derives
-  the store key from the host blob, and the store key resolution does not run. On the way it at
-  least checks the settings, judges the engine's account and reads the host file. Where the open
-  may write, it also converts a handoff into the host file where only a handoff is there, and
-  settles a handoff it finds beside a host file it read: it deletes one that names the host file's
-  current store id and holds the same key, refuses the open on any other, on one it cannot read
-  and on one it cannot show deleted, and goes on where the handoff is already gone, as when
-  another start removed it. A conversion that fails where a host file is there by then can go on
-  from that file and leave the handoff unsettled. A handoff is read on Windows only, so a POSIX
-  host never converts or deletes one, and outside that case a writable open there refuses on one
-  it finds. A read-only store open leaves a handoff beside a host file as it is and opens from the
-  host file, and refuses where only a handoff is there. Where the read, and any conversion or
-  settle, does not refuse, the step records what it found, before it derives the store key; a
-  refusal later in the open leaves that record in place. Where a minting caller passes a blob, the
-  step checks the settings as a read does and takes the store key and the pin from that blob; it
-  judges no account, reads neither custody file, converts and settles nothing, and records
-  nothing. Outside the store open, the `host` key provider converts and settles a handoff as a
-  writable open does, whatever the command, a read-only one included; a refusal there refuses the
-  key resolution, and the provider records nothing. Under any other provider it looks for a
-  host blob or a handoff in the custody directory. Under every provider, a `KeyProviderError` the
-  engine built and recorded passes through the step as it is; its text is the one the engine
-  built it with, which reads no text from an error, and the engine raises each with no chain,
-  which the open does not check again. Any other `Exception` from that step, a `ValueError`
-  included, is replaced by a `HostCustodyRefused`, which is a `KeyProviderError` and never a
-  `StoreCipherConfigError`, unless building that refusal itself raises, which then leaves in its
-  place. Its text names `[store].key_provider` and where the custody directory comes from, not its
-  path, then the recorded text of an error the engine built, or else a fixed reason chosen by the
-  error's class, and it is raised after the handler has exited, with no cause and no context. The
-  codec judgement does not run there, so a
-  codec error is replaced as any other error is, and its byte is not read. Where the step replaces
-  an error, only that error's own class is logged, as a WARNING by name alone, and only for one the
-  engine did not build; its cause's class is not logged there. The custody reads inside the step
-  log the class of an error they replaced the same way, so a refusal that passes through, or an
-  open that goes on, can follow such a WARNING. A `BaseException` that is not an `Exception` is not
-  caught there, and a caller that passes a minted blob or a recovery wrap under another provider
-  gets a `ValueError` with a fixed text before the step runs. (`BACKLOG #4882`)
+  and an error of any other class passed through as it was. At the open, under every key provider,
+  the key custody step runs inside one guard: a `KeyProviderError` the engine built and recorded is
+  re-raised as it is, and any other `Exception` from the step, a `ValueError` included, is replaced
+  by a `HostCustodyRefused`, raised with no cause or context and with a text the engine wrote, none
+  of it read from the error, unless building that refusal raises, which then leaves in its place.
+  Of the replaced error, the guard logs at most its class name, as a WARNING. A `BaseException`
+  that is not an `Exception` is not caught there, and a check before the guard raises a
+  `ValueError` with a fixed text where a caller passes a host blob or a recovery wrap under another
+  provider. What the step itself reads, converts, settles and refuses is defined by
+  `load_host_custody` and `_host_custody_steps` (`messagefoundry/store/custody_host.py`,
+  `messagefoundry/store/base.py`); this entry does not restate it. (`BACKLOG #4882`)
 - **The PostgreSQL store's TLS context refusal at the open, `StoreTlsRefused`, carries a fixed text
   that names `[store].ssl_root_cert`, `[store].ssl_crl_file` and the hop's suites, and reads
   nothing from the context builder's `ValueError`.** Before, it carried that error's text, which
