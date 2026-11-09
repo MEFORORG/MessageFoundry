@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import logging
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -119,6 +120,16 @@ def test_a_held_write_role_beside_a_null_is_still_over_granted() -> None:
 def test_a_driver_that_answers_booleans_reads_the_same() -> None:
     row = tuple(r == "db_owner" for r in _ROLES)
     assert classify_login_roles(row).held == ("database role db_owner",)
+
+
+@pytest.mark.parametrize("value", ["1", "0", 2, -1, 1.0, Decimal(1), b"\x01"])
+def test_a_value_other_than_0_or_1_cannot_judge_and_is_never_clean(value: object) -> None:
+    """Only 0, 1 and a bool read. Any other answer, such as a driver's text "1", is unread, so it
+    can never fold to "not held" and read clean (vault BACKLOG #8171, item 45)."""
+    row = tuple(value if r == "db_owner" else 0 for r in _ROLES)
+    reading = classify_login_roles(row)
+    assert reading.verdict is LoginRoleVerdict.CANNOT_JUDGE
+    assert reading.unread == ("database role db_owner",) and reading.held == ()
 
 
 def test_a_row_of_the_wrong_width_did_not_run() -> None:
