@@ -4900,8 +4900,8 @@ async def probe_login_roles(pool: Any, *, label: str, acquire_timeout: float) ->
 
     **It never refuses, and never raises an** ``Exception``. An over-granted login warns, and the hop
     goes ahead. A probe that cannot run, because the partner went unreachable after the pool opened,
-    the statement failed or no row came back, warns and returns :attr:`LoginRoleVerdict.NOT_RUN`, so a
-    partner outage never blocks a lookup or a sync on this probe. A cancellation is let through.
+    the statement failed or no row came back, warns and returns :attr:`LoginRoleVerdict.NOT_RUN`. A
+    cancellation is let through.
 
     The borrow is bounded by ``acquire_timeout``, as a lookup's is. The statement is not: like the
     lookup's own statement, it runs until the driver returns."""
