@@ -841,7 +841,7 @@ class HttpSource(SourceConnector):
         self._upgrade_tls = False
         # The `_handshake_accepted` tasks still inside the loop's TLS handshake, which stop() cancels
         # so their sockets close at once rather than at the handshake bound (BACKLOG #2479).
-        self._handshakes: dict[asyncio.Task[None], _HandshakeProtocol] = {}
+        self._handshakes: set[asyncio.Task[None]] = set()
         # Intake authentication (ADR 0154 D6) — a PEER control: it authorises SUBMITTING a message on
         # this inbound, mints no identity and opens no session. Defaults to "none", which makes every
         # path below a no-op and every shipped configuration byte-identical. The env() refs are already
@@ -1031,7 +1031,7 @@ class HttpSource(SourceConnector):
             protocol = _HandshakeProtocol(reader)
             task = asyncio.current_task()
             assert task is not None  # always: `_on_tls_socket` runs this as a task
-            self._handshakes[task] = protocol
+            self._handshakes.add(task)
             # See `MLLPSource._handshake_accepted`: this runs only once the call below first
             # suspends, by when the TLS layer's transport holds the socket.
             disown = loop.call_soon(unwrapped.clear)
@@ -1047,7 +1047,7 @@ class HttpSource(SourceConnector):
             except OSError as exc:
                 # Out of `_handshakes` before the report below awaits, so a stop() that cancels the
                 # tasks still in their handshake cannot cancel a report already in flight.
-                self._handshakes.pop(task, None)
+                self._handshakes.discard(task)
                 if unwrapped:
                     # Not a handshake failure, so not counted; the done callback closes the socket.
                     logger.debug(
@@ -1064,8 +1064,17 @@ class HttpSource(SourceConnector):
                 if not isinstance(exc, HUNG_UP):  # as in `_start_tls`
                     await self._tls_failures.note(peer_host, handshake_cause(exc))
                 return
+            except asyncio.CancelledError:
+                # stop() cancels a task still in `_handshakes`. Where the handshake completed
+                # before the task stepped, in either order against stop(), the cancellation makes
+                # `connect_accepted_socket` close the TLS transport with a close exchange, which a
+                # silent peer can hold open for asyncio's 30 s default after stop() returns. Nothing
+                # was read or written, so it is aborted instead.
+                if protocol.tls_transport is not None:
+                    protocol.tls_transport.abort()
+                raise
             finally:
-                self._handshakes.pop(task, None)
+                self._handshakes.discard(task)
                 disown.cancel()
             if not protocol.connected:
                 logger.debug(
@@ -1183,14 +1192,11 @@ class HttpSource(SourceConnector):
             # (BACKLOG #2479). Where it upgrades TLS itself it is in `_clients` (`_on_tls_accept`),
             # so this loop closes it and its handshake fails rather than completing mid-stop. Under
             # `_AcceptingServer` its task is in `_handshakes`, and cancelling that task makes
-            # `connect_accepted_socket` close the socket. A handshake that already completed, with
-            # its task not yet stepped, is aborted first: that close would otherwise run the TLS
-            # close exchange, which a silent peer can hold open for asyncio's 30 s default.
+            # `connect_accepted_socket` close the socket; `_handshake_accepted` aborts one whose
+            # handshake had already completed.
             for writer in list(self._clients):
                 writer.close()
-            for handshake, protocol in list(self._handshakes.items()):
-                if protocol.tls_transport is not None:
-                    protocol.tls_transport.abort()
+            for handshake in list(self._handshakes):
                 handshake.cancel()
             pending = [task for task in self._client_tasks if not task.done()]
             if pending:

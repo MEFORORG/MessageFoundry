@@ -1799,8 +1799,8 @@ class _HandshakeProtocol(asyncio.StreamReaderProtocol):
     may already hold a whole frame."""
 
     connected = False
-    # The TLS transport, once connected: a stop() that finds a handshake already complete but its
-    # task not yet stepped aborts it here (BACKLOG #2479).
+    # The TLS transport, once connected, so the HTTP listener can abort a handshake that completed
+    # before its cancelled task stepped (BACKLOG #2479).
     tls_transport: asyncio.Transport | None = None
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
@@ -1912,18 +1912,20 @@ class _AcceptingServer:
                     skipped += 1
                 if exc.errno not in _ACCEPT_SHORTAGE and skipped <= _ACCEPT_SKIP_RUN:
                     # This connection's own failure, the peer gone before the accept among them:
-                    # skip it and keep accepting. A run of such failures cannot spin, since each
-                    # accept awaits a new task (`_accept_one`), which yields a turn. asyncio's own
-                    # servers are no model here: the selector one tries at most backlog + 1
-                    # accepts per wakeup and hands any failure but a dropped connection or a
-                    # shortage to the loop's exception handler, and the Proactor one closes its
-                    # listening socket on any failed accept.
+                    # skip it and keep accepting. A turn is yielded first, or a run of such failures
+                    # could spin: `_accept_one` suspends only while its task is pending, and under
+                    # an eager task factory a selector loop's failed accept completes without
+                    # suspending. asyncio's own servers are no model here: the selector one tries
+                    # at most backlog + 1 accepts per wakeup and hands any failure but a dropped
+                    # connection or a shortage to the loop's exception handler, and the Proactor
+                    # one closes its listening socket on any failed accept.
                     logger.debug(
                         "%s listener %s skipped a failed accept: %s",
                         self._transport,
                         self._name,
                         safe_exc(exc),
                     )
+                    await asyncio.sleep(0)
                     continue
                 skipped = 0
                 logger.warning(
@@ -1946,8 +1948,10 @@ class _AcceptingServer:
                     self._name,
                     safe_exc(exc),
                 )
-            # No turn is yielded here: the next accept awaits a new task (`_accept_one`), which
-            # yields one, so a flood of queued connections cannot starve the loop.
+            # One turn per accept keeps a flood of queued connections from starving the loop, the
+            # admission tasks above included, even where an accept completes without suspending,
+            # as under an eager task factory (see the skip arm above).
+            await asyncio.sleep(0)
 
     def close(self) -> None:
         """Stop accepting. Each listening socket closes once its accept loop has finished."""

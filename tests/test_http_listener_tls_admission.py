@@ -22,6 +22,7 @@ wait in the count tests, so only the cap or the allowlist can close the socket i
 from __future__ import annotations
 
 import asyncio
+import socket
 import ssl
 import sys
 from collections.abc import Awaitable, Callable
@@ -243,16 +244,19 @@ async def test_stop_closes_a_socket_still_in_its_handshake(
             await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
+@pytest.mark.parametrize("completed", [True, False], ids=["completed", "in_progress"])
 async def test_stop_aborts_a_handshake_that_completed_before_its_task_stepped(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, completed: bool
 ) -> None:
-    """Under the accept loop, a handshake can complete in the same turn stop() runs, before its
-    task steps. Cancelling that task alone makes ``connect_accepted_socket`` close the transport
-    with the TLS close exchange, which a silent peer can hold open for asyncio's 30 s default, so
-    stop() aborts such a transport first. The handshake still in progress is the control: it has
-    no transport, so it is only cancelled. The interleaving is pinned by registering both entries
-    by hand."""
+    """Under the accept loop, a handshake can complete before its task steps, in either order
+    against stop(). The cancellation stop() sends then makes ``connect_accepted_socket`` close the
+    transport with the TLS close exchange, which a silent peer can hold open for asyncio's 30 s
+    default, so `_handshake_accepted` aborts it. The stand-in for ``connect_accepted_socket`` does
+    what asyncio's does: it connects the protocol once the handshake completes, and closes the
+    transport when cancelled. A handshake still in progress is the control: it has no transport to
+    abort, so it is only closed."""
     monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
+    loop_class = type(asyncio.get_running_loop())
     ends: list[str] = []
 
     class _Transport(asyncio.Transport):
@@ -262,27 +266,41 @@ async def test_stop_aborts_a_handshake_that_completed_before_its_task_stepped(
         def close(self) -> None:
             ends.append("close")
 
+    async def connect(
+        self: asyncio.AbstractEventLoop,
+        protocol_factory: Callable[[], asyncio.BaseProtocol],
+        sock: socket.socket,
+        **kwargs: object,
+    ) -> object:
+        transport = _Transport()
+        protocol = protocol_factory()
+        if completed:
+            protocol.connection_made(transport)
+        try:
+            await asyncio.get_running_loop().create_future()  # the task has not stepped yet
+        except asyncio.CancelledError:
+            transport.close()
+            sock.close()
+            raise
+        raise AssertionError("never resolved")
+
+    monkeypatch.setattr(loop_class, "connect_accepted_socket", connect)
     source, _cert = _tls_source(tmp_path)
     await source.start(receipt_handler(_Intake()))
-    gate: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-
-    async def handshaking() -> None:
-        await asyncio.shield(gate)
-
-    tasks = [asyncio.create_task(handshaking()) for _ in range(2)]
+    stopped = False
     try:
         _on_path(source, "accept_loop")
-        completed = mllp_module._HandshakeProtocol(asyncio.StreamReader())
-        completed.connection_made(_Transport())
-        in_progress = mllp_module._HandshakeProtocol(asyncio.StreamReader())
-        source._handshakes[tasks[0]] = completed
-        source._handshakes[tasks[1]] = in_progress
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            await _until(lambda: len(source._handshakes) == 1, "the handshake never started")
+            await asyncio.wait_for(source.stop(), timeout=10.0)
+            stopped = True
+        finally:
+            await _close_raw(writer)
     finally:
-        await asyncio.wait_for(source.stop(), timeout=10.0)
-        await asyncio.gather(*tasks, return_exceptions=True)
-    assert ends == ["abort"]
-    assert all(task.cancelled() for task in tasks)
-    assert not gate.cancelled()
+        if not stopped:
+            await asyncio.wait_for(source.stop(), timeout=10.0)
+    assert ends == (["close", "abort"] if completed else ["close"])
 
 
 async def test_a_handshake_finishing_after_stop_began_is_refused_unread(
@@ -527,6 +545,10 @@ _Scenario = Callable[[Path, pytest.MonkeyPatch], Awaitable[None]]
                 p, m, "uvloop"
             ),
             id="handshake_after_stop",
+        ),
+        pytest.param(
+            lambda p, _m: test_a_connection_stays_tracked_until_its_last_event(p, "uvloop"),
+            id="tracked_until_closed",
         ),
         pytest.param(
             lambda p, _m: test_a_listener_running_its_own_handshake_counts_each_failure_once(
