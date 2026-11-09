@@ -2933,7 +2933,7 @@ async def test_a_flapping_directory_pages_once_for_many_unreached_accounts() -> 
         ]
         assert (kind, source) == ("ad_reconcile_aborted", "directory-reconciler-unreached")
         assert payload["reason"] == reconcile.UNREACHED_ACCOUNT and payload["probed"] == 8
-        assert "7 accounts' sessions are not revoked" in payload["detail"]
+        assert payload["detail"].startswith("Accounts newly unreachable: 7.")
         assert len(payload["detail"]) <= 200 and "flap" not in payload["detail"]
         assert sorted(a for a, _n in await _unreached_rows(store)) == sorted(names[1:])
         assert (await _pass(service, sink)).unreached == ()
@@ -2941,12 +2941,13 @@ async def test_a_flapping_directory_pages_once_for_many_unreached_accounts() -> 
         await store.close()
 
 
-async def test_a_later_rollup_counts_every_account_standing_not_only_those_entering() -> None:
-    """BACKLOG #3709. A later rollup under the bare source updates the open instance's text. When
-    it counted only the accounts entering on its own pass, one more account entering after seven
-    replaced "7 accounts" with "1 accounts", though eight stood.
+async def test_a_later_rollup_says_it_counts_only_the_accounts_entering() -> None:
+    """BACKLOG #3709. A later rollup under the bare source updates the open instance's text. The
+    text read "7 accounts' sessions are not revoked", a total, and one more account entering
+    after seven replaced it with "1 accounts' ...", though eight stood. No process can count
+    every account standing, so the text names its count as the accounts newly unreachable.
 
-    RED when: the later rollup's text counts only the account entering."""
+    RED when: the rollup's text reads as a total of the accounts standing."""
     store = await MessageStore.open(":memory:")
     try:
         names = ["ok", "late"] + [f"flap{i}" for i in range(7)]
@@ -2959,17 +2960,58 @@ async def test_a_later_rollup_counts_every_account_standing_not_only_those_enter
         ldap.unreachable = set(names[2:])
         for _ in range(3):
             first = await _pass(service, sink)
-        assert first.unreached_rollup and first.unreached_standing == 7
+        assert first.unreached_rollup and len(first.unreached) == 7
         ldap.unreachable = set(names[1:])  # "late" joins; the seven still fail
         for _ in range(3):
             later = await _pass(service, sink)
         assert [name for _uid, name, _n in later.unreached] == ["late"]
-        assert later.unreached_rollup and later.unreached_standing == 8
+        assert later.unreached_rollup
         rollups = [p for _k, s, p in sink.events if s == _UNREACHED_ALERT_SOURCE]
-        assert len(rollups) == 2
-        assert rollups[0]["detail"].startswith("7 accounts' sessions are not revoked (7 new, ")
-        assert rollups[1]["detail"].startswith("8 accounts' sessions are not revoked (1 new, ")
-        assert "each after 3 or more failed directory probes running" in rollups[1]["detail"]
+        assert [p["detail"].split(".")[0] for p in rollups] == [
+            "Accounts newly unreachable: 7",
+            "Accounts newly unreachable: 1",
+        ]
+        assert "each failed 3 or more directory probes running" in rollups[1]["detail"]
+        assert all("sessions are not revoked;" in p["detail"] for p in rollups)
+    finally:
+        await store.close()
+
+
+async def test_a_rollup_left_with_five_or_fewer_written_rows_pages_each_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3709. The rollup is decided before the rows are written. Where rows are refused
+    and five or fewer accounts stand, a rollup is not for them: each written account pages under
+    its own source, and the refused ones are left to the next pass.
+
+    RED when: one written account of seven entering still pages under the bare source, naming
+    none, and gets no instance of its own."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ["ok"] + [f"flap{i}" for i in range(7)]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        real = service._audit_reconciler_row
+
+        async def only_flap0(action: str, **kwargs: Any) -> bool:
+            if action == "auth.ad_reconcile_unreached" and kwargs.get("actor") != "flap0":
+                return False
+            return await real(action, **kwargs)
+
+        monkeypatch.setattr(service, "_audit_reconciler_row", only_flap0)
+        sink = _InverseSink()
+        ldap.unreachable = set(names[1:])
+        for _ in range(3):
+            plan = await _pass(service, sink)
+        assert [name for _uid, name, _n in plan.unreached] == ["flap0"]
+        assert not plan.unreached_rollup
+        assert [source for _k, source, _p in _unreached_events(sink)] == [
+            f"{_UNREACHED_PREFIX}flap0"
+        ]
+        assert not [e for e in sink.events if e[1] == _UNREACHED_ALERT_SOURCE]
     finally:
         await store.close()
 
@@ -3004,7 +3046,6 @@ async def test_a_rollup_whose_rows_are_all_refused_pages_nothing_and_does_not_ra
         for _ in range(3):
             plan = await _pass(service, sink)  # raised ValueError on the third pass before the fix
         assert plan.unreached == () and not plan.unreached_rollup
-        assert plan.unreached_standing == 0, "a refused account was counted as standing"
         assert _unreached_events(sink) == []
         assert not [e for e in sink.events if e[1] == "directory-reconciler-unreached"]
     finally:

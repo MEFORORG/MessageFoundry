@@ -11352,12 +11352,15 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
 )
 #: What one page for many such accounts says, where more than five stand unreachable at once
 #: (``AuthService._note_unreached_accounts``), so a flapping directory opens one instance rather
-#: than one per signed-in account. ``accounts`` is ``ReconcilePlan.unreached_standing``.
-#: ``probes`` is the shortest run among those entering only: probes, not passes, which differ
-#: under a probe budget smaller than the estate (BACKLOG #3709).
+#: than one per signed-in account. It counts only the accounts entering on its pass, and says
+#: so: a later rollup updates the same open instance's text, so a count that read as a total
+#: would be replaced by a smaller one while more accounts stood (BACKLOG #3709). No process can
+#: say how many stand: each counts its own, and the instance is shared. ``probes`` is the
+#: shortest run among those entering, in probes, not passes, which differ under a probe budget
+#: smaller than the estate.
 _UNREACHED_ROLLUP_TEXT: Final[str] = (
-    "{accounts} accounts' sessions are not revoked ({entering} new, each after {probes} or more "
-    "failed directory probes running). Check the directory; audit rows name each account."
+    "Accounts newly unreachable: {entering}. Their sessions are not revoked; each failed {probes} "
+    "or more directory probes running. Check the directory and the path to it; rows name each."
 )
 
 
@@ -11542,21 +11545,19 @@ def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
 
 def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
     """Page each account that has just entered the lasting unreachable state (BACKLOG #3100
-    closing step 2; ``AuthService._note_unreached_accounts`` says when one enters). Its probe
-    failed to reach the directory on that many of its passes running, so the
+    closing step 2; ``AuthService._note_unreached_accounts`` says when one enters). That many of
+    its probes running failed to reach the directory, so the
     reconciler has neither struck nor revoked it. Once per entry, like a paging refusal, and with
     no inverse: an operator resolves it. The account name is in the source only, as for a paging
     refusal. On a rolled-up pass (``plan.unreached_rollup``), one page under the bare source covers
-    those entering, naming none, and counts every account standing (``plan.unreached_standing``)."""
+    those entering, naming none, and counting only them."""
     if plan.unreached_rollup:
         sink.ad_reconcile_aborted(
             _UNREACHED_ALERT_SOURCE,
             reason=UNREACHED_ACCOUNT,
             probed=plan.asked,
             detail=_UNREACHED_ROLLUP_TEXT.format(
-                accounts=plan.unreached_standing,
-                entering=len(plan.unreached),
-                probes=min(n for _u, _n, n in plan.unreached),
+                entering=len(plan.unreached), probes=min(n for _u, _n, n in plan.unreached)
             ),
         )
         return

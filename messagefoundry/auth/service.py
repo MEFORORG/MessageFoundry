@@ -8552,8 +8552,7 @@ class AuthService:
         **A flapping directory must not page every account.** Where the accounts already paged
         and those entering would be more than :data:`_UNREACHED_ROLLUP_ABOVE`, as a directory that
         answers a few probes in each pass would make them, the lifespan task pages once for those
-        entering (``unreached_rollup``), and each still gets its own row. That page counts every
-        account standing (``ReconcilePlan.unreached_standing`` says why).
+        entering (``unreached_rollup``), and each still gets its own row.
 
         The latch is set only at the end of the pass, for the accounts whose row was written
         (:meth:`_latch_unreached_accounts`), so a pass that raises, or whose row is refused,
@@ -8630,13 +8629,12 @@ class AuthService:
             )
         # The rollup only for what was written: a rollup with nothing written would page nothing,
         # and the lifespan task reads the run's length off the entries (final-round finding 1).
+        # Decided again on what was written (BACKLOG #3709): with rows refused, the accounts that
+        # stand may be five or fewer, and each of those then pages under its own source. Nothing
+        # is latched before the pass ends, so the paged set holds only earlier passes' accounts.
+        rollup = len(self._reconcile_unreached_paged) + len(written) > _UNREACHED_ROLLUP_ABOVE
         return replace(
-            plan,
-            unreached=tuple(written),
-            unreached_rollup=plan.unreached_rollup and bool(written),
-            # BACKLOG #3709. Nothing is latched before the pass ends, so these are the accounts
-            # paged before and those entering whose row was written; a refused one does not stand.
-            unreached_standing=len(self._reconcile_unreached_paged) + len(written),
+            plan, unreached=tuple(written), unreached_rollup=plan.unreached_rollup and rollup
         )
 
     def _latch_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:
