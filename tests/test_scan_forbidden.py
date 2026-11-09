@@ -790,6 +790,39 @@ _PR_RESIDUE_MUST_FIRE: list[tuple[str, str]] = [
     ("map", f"`example_setting` now counts this posture, and {_REQ}’s warning fires."),
     ("map", f"`example_setting` covers the {_REQ} requirement."),
     ("map", f"`EXAMPLE_CHANGED` is an account notice under ASVS {_REQ}."),
+    # "ASVS" marks an identifier however it is set off from it.
+    ("gap", f"ASVS V{_REQ} lacks a row-completeness pin."),
+    ("gap", f"ASVS `{_REQ}` lacks a row-completeness pin."),
+    ("gap", f"ASVS: {_REQ} lacks a row-completeness pin."),
+    ("gap", f"asvs {_REQ} lacks a row-completeness pin."),
+    ("verdict", f"It satisfies ASVS `{_REQ}`."),
+    # A modal binds a marked identifier whatever follows the verdict, and chains into a record verb.
+    ("verdict", f"ASVS {_REQ} would not be met by this change."),
+    ("verdict", f"ASVS {_REQ} cannot {_PASS} at present."),
+    ("verdict", f"ASVS {_REQ} will remain {_PARTIAL}."),
+    ("verdict", f"ASVS {_REQ} will stay {_PARTIAL} after this."),
+    # Markdown `_` emphasis does not unbind a word, and a typographic apostrophe is a contraction.
+    ("gap", f"ASVS {_REQ} _lacks_ a row-completeness pin."),
+    ("gap", f"_cell_ {_REQ} omits it."),
+    ("verdict", f"It _satisfies_ cell {_REQ}."),
+    ("verdict", f"The re-read _held_ it at {_PARTIAL} near {_REQ}."),
+    ("verdict", f"ASVS {_REQ} doesn’t {_PASS}."),
+    # An identifier cell listed with "&", "+", a space or "And", or with its lead set off by markup.
+    ("verdict", f"| {_REQ} & {_REQ_B} | the outbound limb | {_PARTIAL} |"),
+    ("verdict", f"| {_REQ} + {_REQ_B} | the outbound limb | {_PARTIAL} |"),
+    ("verdict", f"| {_REQ} {_REQ_B} | the outbound limb | {_PARTIAL} |"),
+    ("verdict", f"| {_REQ} And {_REQ_B} | the outbound limb | {_PARTIAL} |"),
+    ("verdict", f"| ASVS `{_REQ}` | the outbound limb | {_PARTIAL} |"),
+    ("verdict", f"| **ASVS** {_REQ} | the outbound limb | {_PARTIAL} |"),
+    ("verdict", f"| ASVS V{_REQ} | the outbound limb | {_PARTIAL} |"),
+    # A verdict cell set off by a colon, a parenthesis or a dash.
+    ("verdict", f"| {_REQ} | the outbound limb | {_PARTIAL}: no build reaches it |"),
+    ("verdict", f"| {_REQ} | the outbound limb | {_PARTIAL} (no build reaches it) |"),
+    ("verdict", f"| {_REQ} | the outbound limb | {_PARTIAL} -- no build |"),
+    ("verdict", f"| {_REQ} | the outbound limb | unchanged - {_PARTIAL}. |"),
+    # A nested or chained call in backticks is a code symbol.
+    ("map", f"The ASVS {_REQ} binding needs `example_aad(key())` on every call."),
+    ("map", f"The ASVS {_REQ} binding needs `load_example(path).routers` on every call."),
 ]
 #: The negative controls for the residue rules: the same shapes beside a version or a plain number.
 _PR_RESIDUE_MUST_STAY_QUIET = [
@@ -820,6 +853,13 @@ _PR_RESIDUE_MUST_STAY_QUIET = [
     "Fixes incomplete reads in the framer for 2.9.1 batches.",
     "Messages on 2.9.1 lack the Z segment, so the router omits it.",
     "Bumps `example_pkg` from V2.9.1 to V2.9.2.",
+    # A hold verb before an ordinary noun, a preposition after a verdict verb, and a modal before a
+    # verdict that does not end its clause, beside an HL7 version, are engine prose.
+    f"For 2.5.1 batches the framer holds {_PARTIAL} frames until EOF.",
+    f"On 2.3.1 feeds the store kept {_PARTIAL} batches for replay.",
+    f"Messages tagged 2.5.1 will {_FAIL} on the strict validator.",
+    f"Messages tagged 2.5.1 would {_FAIL} under the strict profile.",
+    f"Support for 2.5.1 will be {_PARTIAL} in this release.",
     # A file name in backticks is not code, whatever its case.
     f"The `example_a01.hl7` sample and `README.MD` are read under ASVS {_REQ}.",
 ]
@@ -850,8 +890,8 @@ def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str)
 )
 def test_a_long_table_row_scans_in_linear_time(sf, row: str) -> None:
     """A row is one window for every identifier in it and has no length limit, so each search over it
-    must run once and in linear time. Both rows scan in well under a second here, against about 80
-    seconds for the first and 7 for the second before; the bound is loose for a slow runner."""
+    must run once and in linear time. Each row scans in well under a second here, against about 80
+    seconds, 7 and 55 before, in order; the bound is loose for a slow runner."""
     began = time.perf_counter()
     sf.scan_pr_body(row)
     assert time.perf_counter() - began < 10
