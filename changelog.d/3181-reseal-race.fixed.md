@@ -4,6 +4,5 @@
   its write, and the write re-created the file. The engine's removals of an upload and each re-seal
   write now hold one lock file in the uploads directory, `.mefor-edit.lock`, and the re-seal
   replaces a file only while it is still the one it read. Such an upload is a skip, so the run exits
-  non-zero. Run `rotate-key` as the engine's account: an engine that is refused the lock still
-  removes uploads, without it, and logs an ERROR naming the lock file. See
-  [PHI.md](../docs/PHI.md). (`BACKLOG #3181`)
+  non-zero. Run `rotate-key` as the engine's account: an engine that cannot take the lock still
+  removes uploads, without it. See [PHI.md](../docs/PHI.md). (`BACKLOG #3181`)

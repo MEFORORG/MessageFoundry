@@ -544,27 +544,38 @@ def test_an_os_timeout_on_an_engine_removal_is_a_warning_not_the_account_error(
     assert uploads_mod._unlocked_logged == set()
 
 
-def test_a_root_gone_at_a_half_write_does_not_blame_the_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    ("fail", "gone"), [(_root_gone, True), (_dangling, False)], ids=["root-gone", "root-there"]
+)
+def test_enoent_at_a_half_write_names_the_directory_only_when_it_is_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fail: Callable[..., Any],
+    gone: bool,
 ) -> None:
-    """The first check takes the lock; a half's write then finds the root gone at the lock's open.
-    That half is a skip whose warning names the missing directory, not the lock file."""
+    """The first check takes the lock; a half's write then finds ``ENOENT`` at the lock's open.
+    That half is a skip. Its warning says the uploads directory is gone only when the root is
+    really gone, and does not name the lock file then; under a root still there it gives the
+    error."""
     root = tmp_path / "uploads"
     old, new = generate_key(), generate_key()
     fid = _seed(root, old)
-    _busy_at(monkeypatch, names=lambda name: name != LOCK_FILE_NAME, fail=_root_gone)
+    _busy_at(monkeypatch, names=lambda name: name != LOCK_FILE_NAME, fail=fail)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
         result = asyncio.run(_store(root, new, old).reseal_to_active())
-    assert not root.exists()
-    assert result.skipped == 1 and result.incomplete
+    assert root.exists() is not gone
+    assert result.skipped == 1 and result.incomplete and not result.root_missing
     half = [
         r.getMessage() for r in caplog.records if f"uploaded file {fid} (body)" in r.getMessage()
     ]
-    assert half == [
-        f"uploaded file {fid} (body): skipped, could not be written: the uploads directory, or "
-        "this pass's temp file in it, is gone"
-    ], caplog.text
-    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
+    written = f"uploaded file {fid} (body): skipped, could not be written: "
+    if gone:
+        assert half == [written + "the uploads directory is gone"], caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
+    else:
+        assert len(half) == 1 and half[0].startswith(written), caplog.text
+        assert "[Errno 2]" in half[0] and "is gone" not in half[0], half
 
 
 def test_pair_lock_failures_are_classified_apart(
@@ -575,43 +586,41 @@ def test_pair_lock_failures_are_classified_apart(
     a gone root only while the root is no directory. Only an errno in ``atomic_edit._REFUSED``, a
     planted file that is not regular, or ``ENOENT`` under a root still there is a refusal, which
     gets the account and remove-it advice."""
-    root = tmp_path
+
+    def failure(exc: OSError, root: Path = tmp_path) -> str:
+        return uploads_mod._pair_lock_failure(exc, root)
+
     try:
         try:
             raise OSError(errno.ELOOP, "Too many levels of symbolic links")
         except OSError as loop:
             raise uploads_mod._PairLockBusy("x is a link") from loop
     except OSError as exc:
-        assert uploads_mod._pair_lock_failure(exc, root) == "refused"
-
-    def failure(exc: OSError) -> str:
-        return uploads_mod._pair_lock_failure(exc, root)
-
+        assert failure(exc) == "refused"
     assert failure(uploads_mod._PairLockBusy("still in progress")) == "busy"
     assert failure(TimeoutError(errno.ETIMEDOUT, "Connection timed out")) == "timeout"
     missing = FileNotFoundError(errno.ENOENT, "gone")
-    assert uploads_mod._pair_lock_failure(missing, tmp_path / "absent") == "gone"
+    assert failure(missing, tmp_path / "absent") == "gone"
     assert failure(missing) == "refused"
     for code in (errno.EACCES, errno.EPERM, errno.EROFS, errno.EISDIR, errno.ENXIO):
         assert failure(OSError(code, os.strerror(code))) == "refused", code
     for code in (errno.EIO, errno.EINVAL, errno.ESTALE, errno.ENOTDIR):
         assert failure(OSError(code, os.strerror(code))) == "failed", code
     # The socket and planted-link errnos of macOS and the BSDs are refusals only there.
-    bsd_only = {errno.EOPNOTSUPP, errno.EMLINK}
-    eftype = getattr(errno, "EFTYPE", None)
-    if eftype is not None:
-        bsd_only.add(eftype)
-    for platform in ("linux", "win32"):
-        assert uploads_mod._not_a_file_errnos(platform) == {errno.EISDIR, errno.ENXIO}, platform
+    linux = uploads_mod._not_a_file_errnos("linux")
+    assert linux == uploads_mod._not_a_file_errnos("win32") == {errno.EISDIR, errno.ENXIO}
     darwin = uploads_mod._not_a_file_errnos("darwin")
     assert errno.EOPNOTSUPP in darwin and errno.EMLINK not in darwin
+    eftype = getattr(errno, "EFTYPE", None)
     assert eftype is None or eftype in darwin
     freebsd = uploads_mod._not_a_file_errnos("freebsd14")
     assert {errno.EOPNOTSUPP, errno.EMLINK} <= freebsd
-    for code in sorted(bsd_only):
-        monkeypatch.setattr(uploads_mod, "_NOT_A_FILE", freebsd)
+    bsd_only = sorted(freebsd - linux)
+    monkeypatch.setattr(uploads_mod, "_NOT_A_FILE", freebsd)
+    for code in bsd_only:
         assert failure(OSError(code, os.strerror(code))) == "refused", code
-        monkeypatch.setattr(uploads_mod, "_NOT_A_FILE", uploads_mod._not_a_file_errnos("linux"))
+    monkeypatch.setattr(uploads_mod, "_NOT_A_FILE", linux)
+    for code in bsd_only:
         assert failure(OSError(code, os.strerror(code))) == "failed", code
 
 

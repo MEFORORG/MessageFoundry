@@ -2388,13 +2388,13 @@ class UploadStore:
             )
             return _Half.SKIPPED
         except OSError as exc:
-            if isinstance(exc, FileNotFoundError) and not os.path.isdir(self._root):
-                # The target's own absence is _ChangedUnderReseal, and the root is gone. Its error
-                # would name the lock file when the root went before the lock's open, so this
-                # half's warning does not give it as the cause.
+            if _root_gone(exc, self._root):
+                # The target's own absence is _ChangedUnderReseal. Its error would name the lock
+                # file when the root went before the lock's open, so this half's warning does not
+                # give it as the cause.
                 _log.warning(
-                    "uploaded file %s (%s): skipped, could not be written: the uploads directory, "
-                    "or this pass's temp file in it, is gone",
+                    "uploaded file %s (%s): skipped, could not be written: the uploads directory "
+                    "is gone",
                     fid,
                     kind,
                 )
@@ -3285,11 +3285,22 @@ def _not_a_file_errnos(platform: str) -> frozenset[int]:
 _NOT_A_FILE = _not_a_file_errnos(sys.platform)
 
 
+def _root_gone(exc: OSError, root: Path) -> bool:
+    """Whether ``exc`` is a ``FileNotFoundError`` from a missing uploads root ``root``, and not
+    from something missing under a root still there. ``os.path.isdir`` follows links, so a root
+    that is a link to a missing target is gone too."""
+    return isinstance(exc, FileNotFoundError) and not os.path.isdir(root)
+
+
+def _lock_name(path: Path) -> str:
+    """The pair lock file for ``path``, as it is logged and as ``_unlocked_logged`` keys it."""
+    return scrub_log_argument(str(lock_path_for(path)))
+
+
 def _pair_lock_failure(exc: OSError, root: Path) -> _PairLockFailure:
     """Why :func:`_pair_lock` could not take the lock in the uploads root ``root``. ``busy``:
-    another holder kept it past the wait. ``gone``: a ``FileNotFoundError`` while ``root`` is no
-    directory; ``os.path.isdir`` follows links, so a root that is a link to a missing target is gone
-    too. ``timeout``: the OS timed out (``ETIMEDOUT``), as a network file system can. ``refused``:
+    another holder kept it past the wait. ``gone``: the root is missing (:func:`_root_gone`).
+    ``timeout``: the OS timed out (``ETIMEDOUT``), as a network file system can. ``refused``:
     the file system refused this account (``atomic_edit._REFUSED``), such as a lock file another
     account owns; ``edit_lock`` also raises ``busy_error`` for a lock path planted as a link,
     chained from the ``ELOOP``, and that is one too, as is a planted file that is not regular
@@ -3299,7 +3310,7 @@ def _pair_lock_failure(exc: OSError, root: Path) -> _PairLockFailure:
     if isinstance(exc, _PairLockBusy):
         return "refused" if exc.__cause__ is not None else "busy"
     if isinstance(exc, FileNotFoundError):
-        return "refused" if os.path.isdir(root) else "gone"
+        return "gone" if _root_gone(exc, root) else "refused"
     if isinstance(exc, TimeoutError):
         return "timeout"
     if exc.errno in _REFUSED or exc.errno in _NOT_A_FILE:
@@ -3363,9 +3374,8 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
                 edit_lock(path, busy_error=_PairLockBusy, timeout=_PAIR_LOCK_TIMEOUT_SECONDS)
             )
         except OSError as exc:
-            lock_path = lock_path_for(path)
-            lock = scrub_log_argument(str(lock_path))
-            failure = _pair_lock_failure(exc, lock_path.parent)
+            lock = _lock_name(path)
+            failure = _pair_lock_failure(exc, lock_path_for(path).parent)
             consequence = (
                 "rotate-key skips each file it would write under it"
                 if for_reseal
@@ -3422,7 +3432,7 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
         else:
             if _unlocked_logged:
                 with _unlocked_logged_lock:
-                    _unlocked_logged.discard(scrub_log_argument(str(lock_path_for(path))))
+                    _unlocked_logged.discard(_lock_name(path))
         yield
 
 

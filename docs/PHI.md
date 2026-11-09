@@ -724,7 +724,7 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    sides log a warning and go on without it, and an engine that cannot take the lock.
    **Run `rotate-key` as the account the engine runs as.** A lock file that another account created,
    such as root or an administrator, cannot be taken by the engine. The engine still removes uploads
-   without it, so retention and delete keep working, and it logs one ERROR per process naming the
+   without it, so retention and delete keep working, and it logs an ERROR naming the
    lock file and that likely cause. A `rotate-key` that cannot take the lock at its first check,
    such as a held, refused or timed-out lock, writes nothing, and fails if any
    upload still needs a write. One that cannot take it at a later write skips that file. To fix a lock file another
