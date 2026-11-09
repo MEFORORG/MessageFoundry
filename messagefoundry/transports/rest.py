@@ -1609,9 +1609,8 @@ def refuse_unrevoked_verified_hop(
     ``expiry_relaxed`` is passed through to :meth:`RevocationHopGuard.capture`. A hop whose opener
     sets ``tls_allow_expired`` passes it true, beside ``opener=None``, so its refusal names
     ``tls_allow_expired`` and offers :data:`~messagefoundry.config.tls_policy.EXPIRY_RELAXED_WAYS_ACROSS`
-    rather than a ``[tls].crl_file``, which cannot admit that hop (vault BACKLOG #2977 item 2). It
-    changes the record's words only: with no opener the guard credits no CRL either way. The
-    record's lead then drops "no revocation check", as on MLLP and the DICOM SCU: a CRL that
+    rather than a ``[tls].crl_file``, which cannot admit that hop (vault BACKLOG #2977 item 2). With
+    no opener the guard credits no CRL either way. The record's lead then drops "no revocation check", as on MLLP and the DICOM SCU: a CRL that
     reaches such a hop still refuses a leaf it lists, and the relaxed record says what it lacks.
 
     ``connection`` is the declaring connection's name, recorded in the audit line logged when an
