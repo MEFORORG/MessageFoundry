@@ -2430,10 +2430,13 @@ def test_a_plain_value_does_not_print_a_later_braced_password(line: str) -> None
     The installed chain is not one of these surfaces: its query filter still prints the tail on the
     ``token=`` line, before this pass runs. That half is the query filter's own."""
     first = line.split()[2].split("=")[0]
+    # Each "-" or "_" piece of the words, not the whole words, so a tail printed in part counts.
+    pieces = {piece for word in _BRACED_WORDS for piece in re.split(r"[-_]", word)}
+    # The five pieces are "bv", "br", "a", "71" and "bvbrbwq"; an empty set would pass the absence below.
+    # Top level, not inside the loop, so the lint counts it as having run.
+    assert len(pieces) >= 5, pieces
     for surface, apply in _SWALLOW_SURFACES:
         out = apply(line)
-        # Each "-" or "_" piece of the words, not the whole words, so a tail printed in part counts.
-        pieces = {piece for word in _BRACED_WORDS for piece in re.split(r"[-_]", word)}
         printed = sorted(
             piece
             for piece in pieces
