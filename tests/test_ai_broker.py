@@ -248,6 +248,30 @@ async def test_ai_chat_managed_endpoint_returns_reply(
     assert stub_broker == ["write a handler that forwards to OB"]
 
 
+async def test_ai_chat_builds_the_broker_off_the_event_loop(
+    engine: Engine, stub_broker: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #2484: the broker's constructor builds rest.py's shared opener on first use, so the
+    # route must not run it on the loop's thread.
+    import threading
+
+    loop_thread = threading.get_ident()
+    build_threads: list[int] = []
+    real = ai_broker_mod.ai_broker_from_settings
+
+    def recording(*args: object, **kwargs: object) -> AiBroker:
+        build_threads.append(threading.get_ident())
+        return real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("messagefoundry.api.app.ai_broker_from_settings", recording)
+    app = create_app(engine, ai_settings=_managed_ai(), allow_no_auth=True)
+    async with _client(app) as c:
+        r = await c.post("/ai/chat", json={"prompt": "hi"})
+    assert r.status_code == 200
+    assert len(build_threads) == 1
+    assert build_threads[0] != loop_thread
+
+
 async def test_ai_chat_ignores_ide_claimed_scope_and_denies_overclaim(
     engine: Engine, stub_broker: list[str]
 ) -> None:
