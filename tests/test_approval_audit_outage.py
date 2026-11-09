@@ -312,11 +312,13 @@ class _SiblingMoved(_StandingStore):
     def __init__(self, store: Any, *, outcome: str) -> None:
         super().__init__(store)
         self.outcome = outcome
+        self.sibling_moved = False
 
     async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
         audit = kw.get("audit")
         if audit is not None and audit.action == self.outcome:
-            assert await self._store.decide_pending_approval(
+            # Recorded rather than asserted: _settle catches any exception raised here.
+            self.sibling_moved = await self._store.decide_pending_approval(
                 approval_id,
                 status="interrupted",
                 approver=kw["approver"],
@@ -335,9 +337,11 @@ async def test_an_outcome_row_moved_by_a_sibling_pages_audit_write_failed(
     row was never written and the read-back must not page copy-only (vault BACKLOG #3193 N1)."""
     sink = _Sink()
     runs: list[str] = []
-    gate = _gate(_SiblingMoved(store, outcome="approval.approved"), sink, runs=runs)
+    sibling = _SiblingMoved(store, outcome="approval.approved")
+    gate = _gate(sibling, sink, runs=runs)
     approval_id = await _request(gate)
     await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert sibling.sibling_moved
     assert runs == ["ran"] and await _status(store, approval_id) == "interrupted"
     assert await store.list_audit(action="approval.approved") == []
     assert sink.lost == [(f"approval:{approval_id}", "approval.approved")]
@@ -350,7 +354,8 @@ async def test_an_interrupted_outcome_moved_by_a_sibling_pages_audit_write_faile
     """The sibling leaves the row at the very status and approver this write would have, so only
     the write's own decision time tells the two apart (vault BACKLOG #3193 N1)."""
     sink = _Sink()
-    gate = _gate(_SiblingMoved(store, outcome="approval.interrupted"), sink)
+    sibling = _SiblingMoved(store, outcome="approval.interrupted")
+    gate = _gate(sibling, sink)
     approval_id = await _request(gate)
     assert await store.decide_pending_approval(
         approval_id, status="executing", approver="checker", decided_at=1.0
@@ -358,6 +363,7 @@ async def test_an_interrupted_outcome_moved_by_a_sibling_pages_audit_write_faile
     await gate._record_interrupted_execution(
         approval_id, operation="dead_letter_replay", approver="checker", requester="r", client=None
     )
+    assert sibling.sibling_moved
     assert await _status(store, approval_id) == "interrupted"
     rows = await store.list_audit(action="approval.interrupted")
     assert [r["actor"] for r in rows] == ["system"]  # only the sibling's row

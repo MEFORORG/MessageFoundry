@@ -1760,9 +1760,10 @@ class ApprovalGate:
 
         combined = AuditAppend(action, actor=approver, detail=detail(True), client=client)
         # Kept to recognise this write on a read-back: every other move stamps its own clock.
-        decided_at = self._clock()
+        decided_at: float | None = None
         moved: bool | None
         try:
+            decided_at = self._clock()
             moved = await self._store.decide_pending_approval(
                 approval_id,
                 status=status,
@@ -1795,6 +1796,7 @@ class ApprovalGate:
                 landed = await self._read_back_request(approval_id)
                 if (
                     isinstance(landed, ApprovalRow)
+                    and decided_at is not None
                     and landed.status == status
                     and landed.decided_at == decided_at
                 ):
@@ -1814,12 +1816,18 @@ class ApprovalGate:
                 else:
                     log.error(
                         "approval %s: %s; the row was no longer 'executing' and reading it back "
-                        "did not find this write's '%s', so its %s row was not written or its "
-                        "outcome is unknown. No row is written alone",
+                        "did not find this write's '%s' (read back: %s), so its %s row was not "
+                        "written or its outcome is unknown. No row is written alone. Lost "
+                        "detail: actor=%s detail=%s",
                         approval_id,
                         context,
                         status,
+                        landed
+                        if isinstance(landed, str)
+                        else f"'{scrub_log_argument(landed.status)}' at {landed.decided_at}",
                         action,
+                        scrub_log_argument(approver),
+                        scrub_log_argument(detail(False)),  # JSON, so the scrub leaves it as is
                     )
                     self._alert_lost_audit(approval_id, action)
                 return
