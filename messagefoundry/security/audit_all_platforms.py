@@ -313,18 +313,18 @@ def _pip_audit_requirement_count(text: str) -> int | None:
     return count
 
 
-#: The schemes pip 26's ``is_url`` takes for a URL: its four, and each VCS's own and ``vcs+`` forms.
+#: The schemes pip 26's ``is_url`` takes for a URL: its four, and each VCS's ``vcs+`` forms.
 _URL_SCHEMES = frozenset(
     ["http", "https", "file", "ftp"]
     + [
-        f"{vcs}{suffix}"
+        f"{vcs}+{scheme}"
         for vcs, schemes in {
-            "git": ("", "+http", "+https", "+ssh", "+git", "+file"),
-            "hg": ("+file", "+http", "+https", "+ssh", "+static-http"),
-            "svn": ("", "+ssh", "+http", "+https", "+svn", "+file"),
-            "bzr": ("+http", "+https", "+ssh", "+sftp", "+ftp", "+lp", "+file"),
+            "git": ("http", "https", "ssh", "git", "file"),
+            "hg": ("file", "http", "https", "ssh", "static-http"),
+            "svn": ("ssh", "http", "https", "svn", "file"),
+            "bzr": ("http", "https", "ssh", "sftp", "ftp", "lp", "file"),
         }.items()
-        for suffix in schemes
+        for scheme in schemes
     ]
 )
 

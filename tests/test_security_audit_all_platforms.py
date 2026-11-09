@@ -456,6 +456,26 @@ def _audit_copies(src: Path) -> tuple[int, list[list[str]]]:
     return main([str(src)], run=run), copies
 
 
+@pytest.mark.parametrize("scheme", ["git", "svn"])
+def test_a_bare_vcs_scheme_is_no_url_so_its_marker_is_stripped(
+    scheme: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Lander hold 5 on PR 2840 (issuecomment-6738522998): bare ``git`` and ``svn`` were read as URL
+    schemes, which neither pip 26's ``is_url`` nor pip-requirements-parser 32.0.1's takes, so the
+    marker after a ``;`` with no space was kept. pip-audit's parser split it off and skipped the pin
+    for its false marker, while the run exited 0 and counted it audited."""
+    url = f"{scheme}://h/evil-1.0-py3-none-any.whl"
+    digest = f"--hash=sha256:{_DIGEST}"
+    src = tmp_path / "x.lock"
+    src.write_text(f"{url};sys_platform=='zz' {digest}\nbar==2 {digest}\n", encoding="utf-8")
+    status, copies = _audit_copies(src)
+    out = capsys.readouterr().out
+    # Was the lock's own first line, marker and all, with "0 un-gated".
+    assert (status, copies) == (0, [[f"{url} {digest}", f"bar==2 {digest}"]])
+    assert "2 pinned requirements audited, 1 un-gated" in out
+    assert f"  {url} ; sys_platform=='zz'\n" in out
+
+
 @pytest.mark.parametrize(
     "raw",
     [
