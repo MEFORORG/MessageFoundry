@@ -150,7 +150,11 @@ class HostKeyProvider:
     """``host`` — the store key derived from the key custody host blob (vault BACKLOG #3411). It
     converts a handoff as a store open does, since in the service it may be asked first (the upload
     cipher is built before the store opens). ``posture`` is the caller's, and ``None`` counts as
-    enforcing for the account check."""
+    enforcing for the account check.
+
+    A custody refusal from here reaches a caller as a new ``KeyProviderError`` that keeps its
+    custody text, the paths and the remedy, as
+    :class:`~messagefoundry.store.custody_host.HostCustodyRefused` says (BACKLOG #4882)."""
 
     def __init__(self, settings: StoreSettings, posture: HopPosture | None = None) -> None:
         self._settings = settings

@@ -246,6 +246,71 @@ def test_no_host_blob_and_no_handoff_names_provision_admin(tmp_path: Path) -> No
     assert isinstance(HostCustodyMissing("x"), KeyProviderError)
 
 
+@pytest.mark.parametrize("case", ["no blob", "a second key source", "an unreadable host file"])
+def test_every_key_seam_keeps_the_custody_refusal_and_its_remedy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """The seams that resolve the key without ``open_store``'s own custody read (at least serve's
+    upload cipher, ``rotate-key``, ``cipher-audit`` and the DR commands) report the custody refusal
+    with its paths and its remedy, not the generic key provider text (PR 2804, the Lander's hold on
+    the merge of engine PR 2818)."""
+    from messagefoundry.store.base import (
+        build_store_cipher,
+        resolve_active_key,
+        resolve_decrypt_keys,
+    )
+
+    settings = _settings(tmp_path)
+    if case == "no blob":
+        expected = [
+            "provision-admin",
+            str(tmp_path / "master.key"),
+            str(tmp_path / "handoff.key"),
+        ]
+    elif case == "a second key source":
+        settings = _settings(tmp_path, encryption_key=base64.b64encode(bytes(32)).decode())
+        expected = ["MEFOR_STORE_ENCRYPTION_KEY", "Remove it"]
+    else:
+
+        def _refuse(path: Path) -> HostBlob:
+            raise OSError(13, "a stand-in OS text")
+
+        (tmp_path / "master.key").write_bytes(b"not read")
+        monkeypatch.setattr(custody, "read_host_file", _refuse)
+        expected = [f"the host file {tmp_path / 'master.key'} was refused"]
+    for seam in (resolve_active_key, resolve_decrypt_keys, build_store_cipher):
+        with pytest.raises(KeyProviderError) as excinfo:
+            seam(settings)
+        text = str(excinfo.value)
+        assert all(part in text for part in expected), (seam.__name__, text)
+        assert "stand-in" not in text
+        assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
+
+
+async def test_a_host_custody_refusal_at_open_reads_no_text_from_the_error_it_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host custody refusal at the open has a fixed text, the paths and the remedy, and no
+    chain: an OSError's own text, which the engine did not write, never reaches it (BACKLOG #4882,
+    as PR 2818 holds the cipher build to)."""
+    import traceback
+
+    sentinel = "SENTINEL-not-an-engine-text-4882"
+
+    def _refuse(path: Path) -> HostBlob:
+        raise OSError(13, sentinel)
+
+    (tmp_path / "master.key").write_bytes(b"not read")
+    monkeypatch.setattr(custody, "read_host_file", _refuse)
+    with pytest.raises(HostCustodyRefused) as excinfo:
+        await open_store(_settings(tmp_path), create=True)
+    refusal = excinfo.value
+    assert str(tmp_path / "master.key") in str(refusal)
+    assert sentinel not in f"{refusal} {refusal!r}"
+    assert refusal.__cause__ is None and refusal.__context__ is None
+    assert sentinel not in "".join(traceback.format_exception(refusal))
+
+
 # --- the mint -------------------------------------------------------------------------------------
 
 
@@ -2474,7 +2539,8 @@ def test_end_of_input_at_the_recovery_prompt_is_a_refusal(
 def test_a_cleanup_that_cannot_remove_the_host_file_keeps_the_original_reason(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Item 10: the unlink in the conversion's cleanup replaced the read-back's own error.
+    # Item 10: the unlink in the conversion's cleanup replaced the read-back's own error. The
+    # reason is the read-back's, as its class gives it, never its text (BACKLOG #4882).
     _handoff(tmp_path / "handoff.key", _proved_blob())
     calls: list[Path] = []
 
@@ -2492,7 +2558,8 @@ def test_a_cleanup_that_cannot_remove_the_host_file_keeps_the_original_reason(
     with pytest.raises(HostCustodyRefused) as excinfo:
         load_host_custody(_settings(tmp_path), enforcing=True, environ={})
     text = str(excinfo.value)
-    assert "the read-back stand-in refusal" in text and "could not be removed" in text
+    assert "the custody checks refused it" in text and "could not be removed" in text
+    assert "stand-in" not in text and "Access is denied" not in text
 
 
 @host_file_platforms

@@ -104,8 +104,15 @@ _HOST_STORE_KEY_INFO = b"mefor/host-store-key/v1"
 class HostCustodyRefused(KeyProviderError):
     """The ``host`` key provider could not provide the store key. A
     :class:`~messagefoundry.store.keyprovider.KeyProviderError`, so every command that already
-    reports an unresolved store key as "could not start" reports this the same way. The message
-    names files, settings and accounts, never key material."""
+    reports an unresolved store key as "could not start" reports it as one. The message names
+    files, settings, accounts and the remedy, never key material.
+
+    ``open_store`` raises it as it is. A seam that resolves the key without that open, at least
+    :func:`~messagefoundry.store.base.resolve_active_key`, ``resolve_decrypt_keys`` and
+    ``build_store_cipher``, replaces it with a new ``KeyProviderError`` (BACKLOG #4882) that keeps
+    its text, since each refusal :func:`load_host_custody` raises is recorded as built by the
+    engine (:func:`_recorded_as`). That text reads nothing from an error it replaced, and the
+    refusal keeps no cause and no context."""
 
 
 class MintedCustody(NamedTuple):
@@ -150,7 +157,9 @@ def custody_directory(
     if raw:
         path = Path(raw)
         if not path.is_absolute():
-            raise HostCustodyRefused(f"{SECRETS_DIRECTORY_VARIABLE} must be an absolute path")
+            raise _recorded_as(
+                HostCustodyRefused, f"{SECRETS_DIRECTORY_VARIABLE} must be an absolute path"
+            )
         return path
     if settings.backend is StoreBackend.SQLITE and settings.path != ":memory:":
         return Path(settings.path).resolve().parent
@@ -252,13 +261,16 @@ def non_local_account_reading(
     # SYSTEM and the shared service accounts first, refused whatever the setting, so they are
     # never named as a domain account.
     if (shared := custody_engine_problem(sid)) is not None:
-        raise HostCustodyRefused(f"the store key is not held for this account: {shared}")
+        raise _recorded_as(
+            HostCustodyRefused, f"the store key is not held for this account: {shared}"
+        )
     assert sid is not None  # custody_engine_problem refuses an unread account
     problem = custody_non_local_account_problem(sid, local_account_domain_sid())
     if problem is not None and enforcing:
-        raise HostCustodyRefused(
+        raise _recorded_as(
+            HostCustodyRefused,
             f"the store key is not held for this account: {problem}. "
-            "[security].enforcement = enforce refuses it"
+            "[security].enforcement = enforce refuses it",
         )
     return problem
 
@@ -290,9 +302,48 @@ def store_pin(blob: HostBlob, recovery_wrap: bytes = b"") -> StorePin:
 
 
 def _refused(what: str, exc: BaseException) -> HostCustodyRefused:
-    """A refusal naming ``what`` and the reason ``exc`` gives. Every error this module wraps comes
-    from the custody primitives, the DPAPI calls or the file system, whose texts carry no key."""
+    """A refusal naming ``what`` and the reason ``exc`` gives, for the mint. Every error this module
+    wraps comes from the custody primitives, the DPAPI calls or the file system, whose texts carry
+    no key. A read at open is refused by :func:`_read_refusal` instead, which reads no text."""
     return HostCustodyRefused(f"{what}: {exc}")
+
+
+def _recorded_as[E: Exception](kind: type[E], text: str) -> E:
+    """A new ``kind`` with ``text``, recorded as built by the engine, so a seam that replaces it
+    (:func:`~messagefoundry.store.base.resolve_active_key` and its siblings, BACKLOG #4882) keeps
+    ``text``, read from the record and never from the instance."""
+    from messagefoundry.store.base import _recorded
+
+    refusal = kind(text)
+    _recorded(refusal, text)
+    return refusal
+
+
+def _read_reason(exc: BaseException) -> str:
+    """Why a custody read refused, for a refusal at open: the text this module recorded for an
+    error it built itself (:func:`_recorded_as`), or else a fixed text chosen by ``exc``'s class as
+    read with ``type``. No text is read from ``exc``, so an OS, DPAPI or custody primitive text
+    never reaches the refusal (BACKLOG #4882)."""
+    from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
+    from messagefoundry.store.base import _recorded_text
+    from messagefoundry.store.custody import CustodyError
+
+    if (recorded := _recorded_text(exc)) is not None:
+        return recorded
+    kind = type(exc)
+    if issubclass(kind, DpapiUnavailable):
+        return "DPAPI is not available on this host"
+    if issubclass(kind, DpapiError):
+        return "DPAPI could not open it for this account"
+    if issubclass(kind, CustodyError):
+        return "the custody checks refused it (its owner, access list, size or contents)"
+    return "the file system refused it"
+
+
+def _read_refusal(what: str, exc: BaseException) -> HostCustodyRefused:
+    """A refusal of a read at open naming ``what``, which holds the paths and any remedy, then
+    :func:`_read_reason`. :func:`load_host_custody` raises it with no chain."""
+    return _recorded_as(HostCustodyRefused, f"{what}: {_read_reason(exc)}")
 
 
 def _custody_errors() -> tuple[type[BaseException], ...]:
@@ -313,28 +364,33 @@ def _settle_left_handoff(handoff: Path, blob: HostBlob) -> None:
         # The store id, and the key: a handoff that names this store under another key is not a
         # copy of what the host file holds.
         if left.store_id != blob.store_id or left.master_key != blob.master_key:
-            raise CustodyError(
+            raise _recorded_as(
+                CustodyError,
                 f"it names store id {left.store_id.hex()} and the host file names "
                 f"{blob.store_id.hex()}, or it holds another key, so it is not this store's. "
                 "It may be another store's only key, so keep the file: move it out of "
                 f"{handoff.parent} to a path outside that directory that does not exist yet, on "
                 "the same volume and in a directory readable by no one but administrators, so it "
-                "keeps its own access list, then run the command again"
+                "keeps its own access list, then run the command again",
             )
 
     try:
         consume_handoff_file(handoff, same_store)
     except FileNotFoundError:
         return  # another start settled it first
-    except HandoffLeftBehind as exc:
-        raise _refused(f"the handoff {handoff} beside the host file", exc) from exc
+    except HandoffLeftBehind:
+        refusal = _left_behind(f"the handoff {handoff} beside the host file was settled")
     except _custody_errors() as exc:
-        raise _refused(f"the handoff {handoff} beside the host file was refused", exc) from exc
+        refusal = _read_refusal(f"the handoff {handoff} beside the host file was refused", exc)
+    else:
+        return
+    raise refusal  # outside the handler, so it has no context (BACKLOG #4882)
 
 
 class _ConversionLeftHostFile(Exception):  # noqa: N818 -- a carrier, caught one frame up
-    """A conversion refused, and the host file it wrote could not be removed. Its text keeps the
-    read-back's own reason and names the file to remove; it carries no key material."""
+    """A conversion refused, and the host file it wrote could not be removed. Its recorded text
+    keeps the read-back's reason, as :func:`_read_reason` gives it, and names the file to remove;
+    it carries no key material."""
 
 
 def _convert_handoff(host: Path, handoff: Path) -> HostBlob:
@@ -349,15 +405,13 @@ def _convert_handoff(host: Path, handoff: Path) -> HostBlob:
         write_host_file,
     )
 
-    def remove_written() -> str | None:
-        """Remove the host file this conversion wrote; why it could not be, or ``None``."""
+    def remove_written() -> bool:
+        """Remove the host file this conversion wrote; whether it is gone."""
         try:
-            host.unlink()
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            return exc.strerror or type(exc).__name__
-        return None
+            host.unlink(missing_ok=True)
+        except OSError:
+            return False
+        return True
 
     def convert(blob: HostBlob) -> None:
         write_host_file(host, blob)
@@ -365,27 +419,25 @@ def _convert_handoff(host: Path, handoff: Path) -> HostBlob:
         # is removed, so the next start finds the handoff alone and converts again, rather than
         # refuse on this file or take it for a copy the crash rule may keep. A removal that fails
         # never replaces the reason the read-back gave.
-        reason: str | None = None
         try:
             same = read_host_file(host) == blob
         except Exception as exc:
-            left = remove_written()
-            if left is None:
+            if remove_written():
                 raise
-            reason = f"{exc}"
+            reason = _read_reason(exc)
         except BaseException:
             remove_written()
             raise
         else:
             if same:
                 return
-            left = remove_written()
             reason = "the host file written does not open to the handoff's key"
-            if left is None:
-                raise CustodyError(reason)
-        raise _ConversionLeftHostFile(
-            f"{reason}; and the host file it wrote could not be removed ({left}): remove {host} "
-            "by hand, and the next start converts the handoff again"
+            if remove_written():
+                raise _recorded_as(CustodyError, reason)
+        raise _recorded_as(
+            _ConversionLeftHostFile,
+            f"{reason}; and the host file it wrote could not be removed: remove {host} by hand, "
+            "and the next start converts the handoff again",
         )
 
     return consume_handoff_file(handoff, convert)
@@ -400,7 +452,8 @@ def _read_host(host: Path) -> HostBlob | None:
     except FileNotFoundError:
         return None
     except _custody_errors() as exc:
-        raise _refused(f"the host file {host} was refused", exc) from exc
+        refusal = _read_refusal(f"the host file {host} was refused", exc)
+    raise refusal  # outside the handler, so it has no context (BACKLOG #4882)
 
 
 def _read_or_convert(host: Path, handoff: Path, *, convert: bool) -> HostBlob:
@@ -417,40 +470,58 @@ def _read_or_convert(host: Path, handoff: Path, *, convert: bool) -> HostBlob:
         blob = _read_host(host)
         if blob is not None:
             return blob
-        raise HostCustodyMissing(
-            f"no host blob ({host}) and no handoff ({handoff}): no store key was minted for this "
-            "store here. Run `messagefoundry provision-admin`, which mints it with the store"
-        )
+        raise _missing(host, handoff)
     if not convert:
-        raise HostCustodyRefused(
+        raise _recorded_as(
+            HostCustodyRefused,
             f"the handoff {handoff} has not been converted yet: start the service once, as its "
-            "own account, and it converts the handoff into its host blob"
+            "own account, and it converts the handoff into its host blob",
         )
+    unconverted = (
+        f"the handoff {handoff} could not be converted, and the start refuses rather than run "
+        "from it"
+    )
+    refusal: HostCustodyRefused | None = None
     try:
         return _convert_handoff(host, handoff)
     except FileNotFoundError:
         pass  # another start (an engine shard) converted it between the two reads
-    except HandoffLeftBehind as exc:
-        raise _refused("the handoff was converted, but", exc) from exc
+    except HandoffLeftBehind:
+        refusal = _left_behind(f"the handoff {handoff} was converted into the host file {host}")
     except _ConversionLeftHostFile as exc:
-        raise _refused(
-            f"the handoff {handoff} could not be converted, and the start refuses rather than "
-            "run from it",
-            exc,
-        ) from exc
+        refusal = _read_refusal(unconverted, exc)
     except _custody_errors() as exc:
         # An engine shard converting it at the same moment holds it, or has it pending delete;
         # the host file it leaves is read below. With none there, the start refuses.
         if not os.path.lexists(host):
-            raise _refused(
-                f"the handoff {handoff} could not be converted, and the start refuses rather than "
-                "run from it",
-                exc,
-            ) from exc
+            refusal = _read_refusal(unconverted, exc)
+    if refusal is not None:
+        raise refusal  # outside the handler, so it has no context (BACKLOG #4882)
     blob = _read_host(host)
     if blob is None:
-        raise HostCustodyMissing(f"the handoff {handoff} went away and left no host file")
+        raise _recorded_as(
+            HostCustodyMissing, f"the handoff {handoff} went away and left no host file"
+        )
     return blob
+
+
+def _left_behind(done: str) -> HostCustodyRefused:
+    """``done``, and the handoff was not shown deleted (:class:`HandoffLeftBehind`), whose own
+    text, which may quote an OS reason, is not read."""
+    return _recorded_as(
+        HostCustodyRefused,
+        f"{done}, but it could not be shown deleted: check that it is gone, and delete it if it "
+        "is not",
+    )
+
+
+def _missing(host: Path, handoff: Path) -> HostCustodyMissing:
+    """Neither ``host`` nor ``handoff`` is there."""
+    return _recorded_as(
+        HostCustodyMissing,
+        f"no host blob ({host}) and no handoff ({handoff}): no store key was minted for this "
+        "store here. Run `messagefoundry provision-admin`, which mints it with the store",
+    )
 
 
 def check_host_custody_settings(
@@ -463,12 +534,13 @@ def check_host_custody_settings(
     environ = os.environ if environ is None else environ
     refusal = _precedence_refusal(settings, environ)
     if refusal is not None:
-        raise HostCustodyRefused(refusal)
+        raise _recorded_as(HostCustodyRefused, refusal)
     directory = custody_directory(settings, environ=environ)
     if directory is None:
-        raise HostCustodyRefused(
+        raise _recorded_as(
+            HostCustodyRefused,
             "[store].key_provider = 'host' needs a directory for the host blob: set "
-            f"{SECRETS_DIRECTORY_VARIABLE}, since this store has no data directory of its own"
+            f"{SECRETS_DIRECTORY_VARIABLE}, since this store has no data directory of its own",
         )
     return _custody_paths(directory)
 
@@ -489,15 +561,17 @@ def load_host_custody(
     :class:`HostCustodyMissing` when neither file is there. ``convert`` lets a handoff be
     converted; a read-only open passes ``False``. ``observe`` records what was found as this
     process's custody observation; only a store open passes it, so a key read for another purpose
-    (a backup, the upload cipher) never overwrites what the open found."""
+    (a backup, the upload cipher) never overwrites what the open found.
+
+    Each refusal's text is fixed: it names the paths, the settings and the remedy, and reads no
+    text from an error it replaced (BACKLOG #4882). One that replaces an error is raised outside
+    the handler, so it has no cause and no context, and each is recorded as built by the engine,
+    so a seam that replaces it keeps that text."""
     host, handoff = check_host_custody_settings(settings, environ=environ)
     if not (os.path.lexists(host) or os.path.lexists(handoff)):
         # Before the account is judged: no key is here for any account, and a command that mints
         # one for another account (provision-admin --service-account) must learn that first.
-        raise HostCustodyMissing(
-            f"no host blob ({host}) and no handoff ({handoff}): no store key was minted for this "
-            "store here. Run `messagefoundry provision-admin`, which mints it with the store"
-        )
+        raise _missing(host, handoff)
     account = non_local_account_reading(enforcing=enforcing)
     blob = _read_or_convert(host, handoff, convert=convert)
     if observe:
