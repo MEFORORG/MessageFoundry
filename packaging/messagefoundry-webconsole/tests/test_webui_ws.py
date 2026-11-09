@@ -25,7 +25,7 @@ from _webui_support import (
 from starlette.datastructures import Headers
 
 from messagefoundry.api import create_app
-from messagefoundry.api.security import ws_accept_allowed
+from messagefoundry.api.security import record_ws_gate, ws_accept_allowed
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -126,6 +126,9 @@ async def test_ws_cookie_auth_requires_cookie_and_origin(engine: Engine) -> None
     assert (await authorize_ui_ws(no_origin, Permission.MONITORING_READ))[0] is None  # type: ignore[arg-type]
     # A bad/expired cookie value → rejected.
     bad = _FakeWS(origin="http://t", host="t", cookie="not-a-real-token", app=app)
+    # An earlier gate's admission, which this refusal must clear (vault BACKLOG #2955).
+    record_ws_gate(bad, admitted=True)  # type: ignore[arg-type]
+    assert ws_accept_allowed(bad.scope)  # control: the planted admission reads as admitted
     assert (await authorize_ui_ws(bad, Permission.MONITORING_READ))[0] is None  # type: ignore[arg-type]
     # A refused handshake is never marked admitted (vault BACKLOG #2955).
     assert not any(ws_accept_allowed(w.scope) for w in (no_cookie, no_origin, bad))

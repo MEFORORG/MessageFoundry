@@ -22,10 +22,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi import Depends, FastAPI, WebSocket
+from fastapi import Depends, FastAPI, WebSocket, WebSocketException
 from starlette.responses import PlainTextResponse
 from starlette.websockets import WebSocketDisconnect
 
+import messagefoundry.api.security as security_module
 from messagefoundry.api import app as app_module
 from messagefoundry.api import create_app
 from messagefoundry.api.header_floor import SecurityHeaderFloorMiddleware
@@ -186,11 +187,11 @@ def _planted(engine: Engine, service: AuthService | None, outcome: _Outcome) -> 
     async def accept_then_send(websocket: WebSocket) -> None:
         try:
             await websocket.accept()
-        except Exception as exc:  # the refusal; recorded so the test can name it
+        except WebSocketException as exc:  # the refusal; recorded so the test can name it
             outcome.accept_error = exc
             try:
                 await websocket.send_json({"leaked": True})
-            except Exception as again:
+            except WebSocketException as again:
                 outcome.send_error = again
             raise
         try:
@@ -236,6 +237,13 @@ def _planted(engine: Engine, service: AuthService | None, outcome: _Outcome) -> 
 
     @app.websocket("/zz/dependency-gated", dependencies=[Depends(mark_route_gate(admit))])
     async def dependency_gated(websocket: WebSocket) -> None:
+        await accept_then_send(websocket)
+
+    @app.websocket(
+        "/zz/dependency-gated-ignores-refusal", dependencies=[Depends(mark_route_gate(admit))]
+    )
+    async def dependency_gated_ignores_refusal(websocket: WebSocket) -> None:
+        await authorize_ws(websocket, Permission.MONITORING_READ)
         await accept_then_send(websocket)
 
     return app
@@ -308,6 +316,51 @@ async def test_a_later_refusal_clears_an_earlier_admission(engine: Engine) -> No
     _assert_refused_before_accept(peer)
 
 
+@pytest.mark.parametrize(
+    ("roles", "accepted"),
+    [((), False), ((Role.OPERATOR,), True)],
+    ids=["wrong-permission", "authorized"],
+)
+async def test_a_refusal_the_body_ignores_stands_on_a_dependency_gated_socket(
+    engine: Engine, roles: tuple[Role, ...], accepted: bool
+) -> None:
+    """A gate dependency admitted the caller, then the body's own stricter gate refused and the body
+    accepted anyway: the recorded refusal stands, as the latest answer does on an in-body socket."""
+    service = await _service(engine)
+    token = await _token(service, "caller", *roles)
+    peer = _Peer(
+        _planted(engine, service, _Outcome()), "/zz/dependency-gated-ignores-refusal", token
+    )
+    await peer.run()
+    if accepted:
+        assert peer.kinds[:2] == [_ACCEPT, "websocket.send"], peer.sent
+    else:
+        _assert_refused_before_accept(peer)
+
+
+async def test_a_gate_that_raises_leaves_no_earlier_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``authorize_ws`` records a refusal before it asks, so a raise inside it clears an earlier
+    gate's admission rather than leaving it standing."""
+
+    async def boom(websocket: WebSocket, *permissions: Permission) -> None:
+        raise RuntimeError("synthetic failure inside the gate")
+
+    monkeypatch.setattr(security_module, "_authorize_ws", boom)
+
+    class _Handshake:
+        def __init__(self) -> None:
+            self.scope: dict[str, Any] = {}
+
+    handshake = _Handshake()
+    record_ws_gate(handshake, admitted=True)  # type: ignore[arg-type]
+    assert ws_accept_allowed(handshake.scope)  # control: the earlier admission reads as admitted
+    with pytest.raises(RuntimeError, match="synthetic failure"):
+        await authorize_ws(handshake, Permission.MONITORING_READ)  # type: ignore[arg-type]
+    assert not ws_accept_allowed(handshake.scope)
+
+
 async def test_the_refusal_gets_the_header_floors_403(engine: Engine) -> None:
     """With the denial extension offered, the floor outside turns the refusal close into a 403
     carrying the baseline headers, as for a gate's own refusal."""
@@ -351,7 +404,8 @@ def test_the_latest_recorded_answer_decides_an_in_body_scope() -> None:
 
 
 def test_a_plain_route_with_no_route_in_scope_is_read_by_its_endpoint() -> None:
-    """A plain Starlette WebSocket route sets no ``route``: its endpoint's public mark decides."""
+    """FastAPI's router sets no ``route`` for a plain Starlette WebSocket route, so its endpoint's
+    public mark decides. The scope is built by hand here, not routed."""
 
     @public_route("a synthetic public socket")
     async def public(websocket: WebSocket) -> None:

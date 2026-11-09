@@ -681,8 +681,12 @@ def _allowlist_drift(
     why: str,
 ) -> str | None:
     """The error line when ``rows``' ``(METHOD, path)`` set differs from the policy's ``key``
-    allow-list, else ``None``. Raises :class:`PolicyError` on a malformed entry."""
-    expected = {_key(e) for e in policy.get(key, [])}
+    allow-list, else ``None``. Raises :class:`PolicyError` on a malformed entry, or an allow-list
+    that is not a list, so a bad policy reads as could-not-measure rather than as a finding."""
+    entries = policy.get(key, [])
+    if not isinstance(entries, list):
+        raise PolicyError(f"the policy's {key!r} must be a list, got {type(entries).__name__}")
+    expected = {_key(e) for e in entries}
     actual = {(str(r["method"]).upper(), str(r["path"])) for r in rows}
     if actual == expected:
         return None

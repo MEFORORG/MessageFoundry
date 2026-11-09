@@ -965,18 +965,19 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
 # that ignored a refusal, or never reached its gate, would still accept. So every WebSocket gate
 # records on the handshake's scope whether it admitted the caller, through :func:`record_ws_gate`,
 # and :class:`WebSocketAcceptGate` refuses ``websocket.accept``, and a non-refusal denial response,
-# on any socket whose scope does not read admitted, unless the route declares its authorization
-# some other way: a gate dependency, which ran and admitted the caller before the body did, or a
-# ``public_route`` mark. An undeclared socket the refusal reaches never gets this far, because
-# :func:`refuse_undeclared_route` refuses it first; one outside the refusal, such as a socket in a
-# mount, is refused here at accept instead.
+# on any socket whose scope records a refusal, and on one whose scope records no answer unless the
+# route declares its authorization some other way: a gate dependency, which ran and admitted the
+# caller before the body did, or a ``public_route`` mark. An undeclared socket the refusal reaches
+# never gets this far, because :func:`refuse_undeclared_route` refuses it first; one outside the
+# refusal, such as a socket in a mount, is refused here at accept instead.
 #
 # The LATEST gate's answer stands: a refusal clears an earlier admission, so a body that ignores a
-# stricter gate's refusal after a laxer gate admitted the caller is still refused. The record is a
-# flag, not an identity: it does not say which permission the route needed. The route walk reads
-# which permissions the body asks for, and refuses a body that records an answer itself.
+# stricter gate's refusal after a laxer gate admitted the caller is still refused, and so is one
+# whose route a gate dependency admitted first. The record is a flag, not an identity: it does not
+# say which permission the route needed. The route walk reads which permissions the body asks for,
+# and refuses an endpoint body that calls ``record_ws_gate`` by that name.
 
-#: The scope key a WebSocket gate sets when it admits the caller. Its value is ``True``.
+#: The scope key a WebSocket gate sets to record its answer: ``True`` admitted, ``False`` refused.
 _WS_GATE_ADMITTED_KEY = "mefor.ws_gate_admitted"
 #: The route attribute that holds the :class:`_RefusalTally` of accepts :class:`WebSocketAcceptGate`
 #: refused there. Apart from the undeclared-route tally, so neither count includes the other. Unlike
@@ -990,18 +991,21 @@ _UNKNOWN_ROUTE_ACCEPT_REFUSALS = _RefusalTally()
 def record_ws_gate(websocket: HTTPConnection, *, admitted: bool) -> None:
     """Record on ``websocket``'s scope whether a gate admitted its caller, replacing any earlier
     answer. Only a gate calls this; ``scripts/security/route_gates.py`` refuses an endpoint body
-    that does."""
+    that calls it by this name."""
     websocket.scope[_WS_GATE_ADMITTED_KEY] = admitted
 
 
 def ws_accept_allowed(scope: Mapping[str, Any]) -> bool:
     """Whether :class:`WebSocketAcceptGate` lets this WebSocket scope's ``accept`` through."""
-    if scope.get(_WS_GATE_ADMITTED_KEY) is True:
-        return True
+    answer = scope.get(_WS_GATE_ADMITTED_KEY)
+    if answer is not None:
+        # A recorded answer stands on every socket, a declared one included: a refusal the body
+        # ignored is refused even where a gate dependency admitted the caller first.
+        return answer is True
     route = scope.get("route")
     if route is None:
-        # A scope a router did not fill sets no route: the endpoint's own public mark, when the
-        # scope names one, is the only declaration left to read.
+        # FastAPI's router sets no route for a plain Starlette WebSocket route: the endpoint's own
+        # public mark, when the scope names one, is the only declaration left to read.
         declared = route_declaration_of(scope.get("endpoint"))
         return declared is not None and declared.public
     # As the HTTP rule reads it: a gate dependency, or a public mark. An in-body mark is not enough.

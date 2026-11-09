@@ -39,6 +39,7 @@ from messagefoundry.api.security import (
     authorizes_in_body,
     mark_route_gate,
     public_route,
+    record_ws_gate,
     require,
 )
 from messagefoundry.auth.permissions import Permission
@@ -382,12 +383,25 @@ async def _records_its_own_admission(websocket: WebSocket) -> None:
     await websocket.accept()
 
 
-def test_a_websocket_body_that_records_its_own_admission_fails_the_walk() -> None:
+async def _records_its_own_admission_bare(websocket: WebSocket) -> None:
+    await authorize_ws(websocket, Permission.MONITORING_READ)
+    record_ws_gate(websocket, admitted=True)
+    await websocket.accept()
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [_records_its_own_admission, _records_its_own_admission_bare],
+    ids=["attribute", "bare"],
+)
+def test_a_websocket_body_that_records_its_own_admission_fails_the_walk(
+    endpoint: Callable[[WebSocket], Awaitable[None]],
+) -> None:
     """Vault BACKLOG #2955: the admission record is a gate's to write. A body that writes it would
     pass the engine's accept gate whatever its gate answered, so the walk refuses to vouch for it,
-    whether the call is bare or through an attribute."""
+    whether the call is bare or through an attribute. Only a call by that name is caught."""
     with pytest.raises(ValueError, match="calls record_ws_gate itself"):
-        route_gates.route_rows(_app_with(_records_its_own_admission))
+        route_gates.route_rows(_app_with(endpoint))
 
 
 def _request_reader(request: Request) -> None:

@@ -1271,6 +1271,29 @@ def test_a_policy_without_the_public_websocket_allowlist_fails_closed(
     assert "'public_websocket_allowlist'" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("key", ["anonymous_allowlist", "public_websocket_allowlist"])
+def test_an_allow_list_that_is_not_a_list_cannot_measure(key: str) -> None:
+    """A null allow-list is a bad policy, so evaluate() answers 2, not a crash that exits 1."""
+    policy = _policy()
+    receipt: dict[str, Any] = {
+        "gated_http_rows": 99,
+        "route_rows_examined": 105,
+        "negative_probes": 198,
+        "reached": 46,
+        "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
+        "write_reached": 61,
+        "write_bfla_probes": 43,
+        "unreached_unexplained": 0,
+        "ungated_routes": _declared_public(policy),
+        "findings": [],
+    }
+    assert evaluate(receipt, policy) == (0, [])  # control: the same receipt passes
+    policy[key] = None
+    code, errors = evaluate(receipt, policy)
+    assert code == 2 and any(key in line and "must be a list" in line for line in errors), errors
+
+
 async def _planted_undeclared(websocket: WebSocket) -> None:
     """A WebSocket endpoint with no gate and no declaration, so the engine refuses it."""
     await websocket.close()
