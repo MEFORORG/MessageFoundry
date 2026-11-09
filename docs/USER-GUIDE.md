@@ -230,8 +230,8 @@ Some `messagefoundry` and `messagefoundry-toolkit` commands refuse a set of opti
 | `protect-key` | `--generate` and the `MEFOR_STORE_ENCRYPTION_KEY` variable | One of the two supplies the key. | An error message and exit code 2 |
 | `backup` | `--destination` and the `[backup].destination` setting | One of the two names the destination. | An error message and a non-zero exit |
 | `provision-admin` | `--no-totp` and the `[security].require_mfa` setting | `--no-totp` is refused while MFA is required. | An error message and a non-zero exit |
-| `store provision-schema` | `--username` and the `[store].auth` setting | `--username` applies only to SQL authentication. | An error message and a non-zero exit |
-| `verify` | `--fed-id-token` and `--fed-jwks` | Both or neither. | The federation check is reported as skipped |
+| `store provision-schema` | `--username` and the `[store].auth` setting | On a SQL Server store, `--username` applies only to SQL authentication. | An error message and a non-zero exit |
+| `verify` | `--fed-id-token` and `--fed-jwks` | Both or neither. | With OIDC on, the `fed.replay` row is reported SKIP |
 
 The `messagefoundry` rules are in [`messagefoundry/__main__.py`](../messagefoundry/__main__.py), except `verify`'s, which is in `verify/federation.py`. The toolkit rules are in `messagefoundry_toolkit/__main__.py`. The table leaves out a rule that one action needs one option, such as `service install` needing `--env`. The rules for the engine's API and the web console are in [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md#rules-over-two-or-more-items), which also says how the search ran. The rules over two or more items in a message payload are in [INPUT-SURFACES.md](INPUT-SURFACES.md#rules-over-two-or-more-items-in-a-payload).
 

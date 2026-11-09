@@ -204,9 +204,8 @@ HL7-VALIDATION.md lists what that covers. It does not check field content.
 - When your code reads a value, `unescape` decodes it. `\F\`, `\S\`, `\R\`, `\T\` and `\E\` become
   the message's own delimiters, and `\Xhh\` is read as hex. A sequence it cannot map is dropped from
   the value, not refused. An escape character that nothing closes is kept as data.
-- Inside a field, ingress checks only the escape expansion budget above. It does not check at least
-  that the separators differ from each other, that an escape sequence is known, or how many
-  components a field holds.
+- Inside a field, ingress does not check at least that the separators differ from each other, that
+  an escape sequence is known, or how many components a field holds.
 
 **The engine defines no rule for what a field's value means.** A date, a code, an identifier or a
 name inside a field is not checked at ingress, at either tier. Checking it is the job of your Router
@@ -266,7 +265,7 @@ model you supply adds its own.
 | `json` | Any JSON text Python's `json.loads` accepts. A repeated key is not refused: the last value wins. `NaN` and `Infinity` are accepted. No depth or size limit applies beyond the ingress size limit; a body nested too deeply raises a `JSONDecodeError`. | `RawMessage.json` in `parsing/message.py` |
 | `fhir` | A JSON object, never a scalar or an array. `FhirPeek` refuses an XML body and a key repeated anywhere in the body. `FhirResource` then needs a known `resourceType` and checks the resource against its model. | `FhirPeek.parse` and `FhirResource.parse` in `parsing/fhir/` |
 | `xml` | Well-formed XML with no `DOCTYPE`. `RawMessage.xml()` also refuses entity declarations and external references. The hardened parser resolves no entity, loads no DTD and fetches nothing over the network. A schema you pass to `validate_against` is loaded from local sources only. | `RawMessage.xml`; `hardened_parser` and `parse_bytes` in `parsing/xml/harden.py`; `validate_against` in `parsing/xml/schema.py` |
-| `x12` | One interchange that opens with `ISA`, with a full 106-character `ISA` header. The element separator must sit at every position the header fixes, and the delimiters must all differ. | `find_isa_start` and `discover_delimiters` in `parsing/x12/delimiters.py` |
+| `x12` | A body that opens with `ISA`, with a full 106-character `ISA` header. The element separator must sit at every position the header fixes, and the delimiters must all differ. | `find_isa_start` and `discover_delimiters` in `parsing/x12/delimiters.py` |
 | `dicom` | A DICOM Part 10 object: the preamble, `DICM`, then a dataset `pydicom` can read. A deflated object is held to an inflate limit. | `DicomPeek.parse` and `DicomDataset.parse` in `parsing/dicom/` |
 | `binary` | Any bytes. The engine carries them as `mfb64:v1:` followed by standard base64. `RawMessage.raw_bytes` refuses a value without that prefix, or with base64 that does not decode strictly. | `carry_binary_ingress` in `pipeline/ingress_guards.py`; `encode` and `decode` in `parsing/binary.py` |
 | `text` | Text that decodes in the connection's declared encoding, holds no NUL and fits the ingress size limit. Nothing else. `RawMessage.text` is the decoded text as received. | `decode_body` and `check_decoded` in `pipeline/ingress_guards.py` |
@@ -277,7 +276,7 @@ model you supply adds its own.
 
 **A rule over two or more items checks that values in one payload fit each other.** Each value can
 pass its own rule and the payload can still be refused. This section lists what the engine itself
-enforces for each payload type, from a search of the parsing and connector code. Where the search
+checks for each payload type, from a search of the parsing and connector code. Where the search
 found nothing, the row says so. A rule worded unusually, or held in code the search did not open,
 would not be listed, so read the rows as "at least".
 
@@ -285,15 +284,15 @@ Every rule here runs only when your Handler calls it, except where a row says ot
 need and the engine does not enforce is written in your Handler, as
 [USER-GUIDE.md](USER-GUIDE.md) describes for non-HL7 payloads.
 
-| Payload | Rules the engine enforces over two or more items | Where |
+| Payload | Rules the engine checks over two or more items | Where |
 |---|---|---|
-| HL7 v2 | None at ingress. Six opt-in primitives compare fields, at least `same_across` and `dates_in_order`; HL7-VALIDATION.md, Tier 3, describes them. `extract_obx_document` reads an embedded document only when `OBX-2` is `ED` and `OBX-5.4` is `Base64`. | `parsing/consistency.py`; `parsing/binary.py` |
+| HL7 v2 | At ingress, only on a streaming inbound that detaches a document: the detach refuses a body whose `MSH-1` or `MSH-2` holds a base64 character, and an `OBX-5.5` Base64 document that holds an escape sequence. The opt-in primitives `same_across` and `dates_in_order` compare fields and return the violations; they refuse nothing. HL7-VALIDATION.md, Tier 3, describes them. `extract_obx_document` reads an embedded document only when `OBX-2` is `ED` and `OBX-5.4` is `Base64`. | `iter_obx_documents` and `parsing/consistency.py`; `parsing/binary.py` |
 | `json` | None. | |
 | `text` | None. | |
 | `binary` | None. | |
 | `xml` | None of its own. An XML Schema you supply may define some. | `validate_against` in `parsing/xml/schema.py` |
 | `x12` | `check_integrity` compares the envelope with itself: `ISA13` with `IEA02`, `IEA01` with the number of groups, `GS06` with `GE02`, `GE01` with the number of sets in the group, `ST02` with `SE02`, and `SE01` with the number of segments in the set. The engine applies no rule of its own inside a transaction set. The implementation-guide check in `validate` applies the guide's rules. | `parsing/x12/interchange.py`; `parsing/x12/validate.py` |
-| `fhir`, inbound | None of its own. `FhirResource.parse` applies the resource model. | `parsing/fhir/resource.py` |
+| `fhir`, inbound | `FhirPeek` refuses a JSON object that repeats a key. `FhirResource.parse` applies the resource model. | `parsing/fhir/peek.py`; `parsing/fhir/resource.py` |
 | `fhir`, outbound `transaction` or `batch` Bundle | At least these, enforced before the engine sends the Bundle: no JSON object repeats a key; each entry's `request.url` has the form its `request.method` needs; and a `POST` or `PUT` entry's resource has the resource type its URL names. The screen also compares the Bundle with the connection's own settings. [CONNECTIONS.md](CONNECTIONS.md), section "A Bundle connection screens every entry", lists the screen's rules. | `_bundle_refusal` and `_entry_refusal` in `transports/fhir.py` |
 | `dicom` | None. In particular, the C-STORE receiver does not compare the request's SOP class or instance with the dataset's own `SOPClassUID` or `SOPInstanceUID`, and does not refuse an object where they differ. | `DicomScpSource._on_c_store` in `transports/dicom.py` |
 
@@ -364,8 +363,7 @@ The two read-only lookups return data from outside the engine, so treat the resu
 | `db_lookup` | A list of rows, each a `{column: value}` dict, with the driver's own value types. An empty list when nothing matched. | More rows than the connection's `max_rows` (default 500) are refused, never truncated. The engine does not check the columns or the values. Two columns with one name keep the last value. |
 | `fhir_lookup` | A dict: one resource for a read by id, or a search Bundle. | The body must be a JSON object that repeats no key, as `FhirPeek` requires, and fit the response size limit. The engine does not check that the resource type matches the query. |
 
-A result that fails a check raises `DbLookupError` or `FhirLookupError`, and the message takes the
-`ERROR` or dead-letter disposition. The code is `db_lookup` in
+A result that fails a check raises `DbLookupError` or `FhirLookupError`. The code is `db_lookup` in
 [`config/db_lookup.py`](../messagefoundry/config/db_lookup.py) and `fhir_lookup` in
 [`config/fhir_lookup.py`](../messagefoundry/config/fhir_lookup.py).
 [ADR 0010](adr/0010-handler-callable-db-lookup.md) and [ADR 0043](adr/0043-fhir-read-lookup.md)
@@ -481,8 +479,7 @@ unauthenticated reads, `GET /health` and `GET /ui`.
 The scripts under [`scripts/service/`](../scripts/service/) take parameters from an operator.
 [SERVICE.md](SERVICE.md) shows how to run them. **`Get-Help` prints only a script's syntax line,
 not its parameter descriptions,** so this table is where their structure is written down. Each rule
-is in the script's `param()` block or its body. A parameter not listed has no rule of its own beyond
-its PowerShell type.
+is in the script's `param()` block or its body.
 
 | Script | Parameter | Rule |
 |---|---|---|
