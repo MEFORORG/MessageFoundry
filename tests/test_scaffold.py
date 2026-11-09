@@ -686,6 +686,15 @@ _STALE_CASES = [
     # A version or marker pip joins in from a continuation line is read, joined as pip joins it.
     ("messagefoundry \\\n    ==0.6.0\n", "requirements.txt asks for messagefoundry==0.6.0", None),
     ("messagefoundry==0.\\\n6.0\n", "requirements.txt asks for messagefoundry==0.6.0", None),
+    # pip strips the backslash from a file's last line too, with or without a final newline.
+    ("messagefoundry==0.6.0 \\\n", "requirements.txt asks for messagefoundry==0.6.0", None),
+    ("messagefoundry==0.6.0 \\", "requirements.txt asks for messagefoundry==0.6.0", None),
+    # A comment that ends a continued line is joined after a space, so it is stripped as a comment.
+    (
+        "messagefoundry==0.6.0\\\n# see https://host.invalid/notes\n",
+        "requirements.txt asks for messagefoundry==0.6.0",
+        None,
+    ),
     # pip expands ${VAR}; an unset one is left as written, which no parser reads.
     (
         "messagefoundry==${MF_UNSET_3786}\n",

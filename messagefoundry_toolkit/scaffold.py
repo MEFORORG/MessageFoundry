@@ -403,8 +403,18 @@ from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
 from pip._vendor.packaging.utils import canonicalize_name
 
 
+def comment(line):
+    return line.lstrip().startswith("#")
+
+
+def continued(line):
+    # pip 26's join_lines joins a line that ends in a backslash to the next, unless it is a comment.
+    return line.endswith("\\") and not comment(line)
+
+
 def logical_lines(path):
-    # Each logical line of a requirements file, as its physical lines, read as pip 26 reads it.
+    # Each logical line of a requirements file, as its physical lines, read as pip 26 reads it. The
+    # last group is a file's last lines when that file ends on a continued line.
     raw = Path(path).read_bytes()
     boms = [(codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32")]
     boms += [(codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16")]
@@ -422,7 +432,7 @@ def logical_lines(path):
     groups, group = [], []
     for line in text.splitlines():
         group.append(line)
-        if line.endswith("\\") and not line.lstrip().startswith("#"):
+        if continued(line):
             continue
         groups.append(group)
         group = []
@@ -432,10 +442,13 @@ def logical_lines(path):
 def parsed(group):
     # The requirement on a logical line, parsed by the packaging copy pip carries, after this
     # script's copy of pip 26's line handling: join_lines (a continued line loses its backslashes
-    # and joins with nothing), the comment strip, ${VAR} expansion and break_args_options (options
-    # start at the first word beginning with "-"). None for a line with no requirement; its text
-    # when packaging cannot read it.
-    joined = "".join([*(ln.strip("\\") for ln in group[:-1]), group[-1]])
+    # and joins with nothing, a file's last line included, and a comment joins after a space), the
+    # comment strip, ${VAR} expansion and break_args_options (options start at the first word
+    # beginning with "-"). None for a line with no requirement; its text when packaging cannot read
+    # it.
+    joined = "".join(
+        ln.strip("\\") if continued(ln) else f" {ln}" if comment(ln) else ln for ln in group
+    )
     code = re.sub(r"(^|\s+)#.*$", "", joined)
     code = re.sub(r"\$\{([A-Z0-9_]+)\}", lambda m: os.environ.get(m[1], m[0]), code)
     words = code.split(" ")
