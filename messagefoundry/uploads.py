@@ -3268,7 +3268,7 @@ def _not_a_file_errnos(platform: str) -> frozenset[int]:
     regular file. ``EISDIR``: a directory. ``ENXIO``: a socket, on Linux. On macOS and the BSDs,
     ``EOPNOTSUPP`` is a socket and ``EFTYPE`` is a link that ``O_NOFOLLOW`` refused, as NetBSD
     reports one; ``EMLINK`` is such a link on FreeBSD and DragonFly. Never on Linux, where
-    ``EOPNOTSUPP`` is ``ENOTSUP`` and comes from a FUSE or 9p mount, not a planted file."""
+    ``EOPNOTSUPP`` comes from a FUSE or 9p mount, not a planted file."""
     codes = {errno.EISDIR, errno.ENXIO}
     if platform.startswith(("darwin", "freebsd", "openbsd", "netbsd", "dragonfly")):
         codes.add(errno.EOPNOTSUPP)
@@ -3280,8 +3280,8 @@ def _not_a_file_errnos(platform: str) -> frozenset[int]:
     return frozenset(codes)
 
 
-#: Like a planted link, a planted file that is not regular is a refusal, so the engine logs it at
-#: ERROR with the advice to remove it.
+#: Like a planted link, a planted directory or socket is a refusal, so the engine logs it at ERROR
+#: with the advice to remove it.
 _NOT_A_FILE = _not_a_file_errnos(sys.platform)
 
 
@@ -3303,9 +3303,9 @@ def _pair_lock_failure(exc: OSError, root: Path) -> _PairLockFailure:
     ``timeout``: the OS timed out (``ETIMEDOUT``), as a network file system can. ``refused``:
     the file system refused this account (``atomic_edit._REFUSED``), such as a lock file another
     account owns; ``edit_lock`` also raises ``busy_error`` for a lock path planted as a link,
-    chained from the ``ELOOP``, and that is one too, as is a planted file that is not regular
-    (``_NOT_A_FILE``), and a ``FileNotFoundError`` while ``root`` is there, as a dangling link or
-    junction planted at the lock path gives. ``failed``: any other error, such as ``EIO`` or
+    chained from the ``ELOOP``, and that is one too, as is what ``_NOT_A_FILE`` names, and a
+    ``FileNotFoundError`` while ``root`` is there, as Windows gives for a link planted at the lock
+    path whose target's directory is missing. ``failed``: any other error, such as ``EIO`` or
     ``ESTALE`` from a network file system."""
     if isinstance(exc, _PairLockBusy):
         return "refused" if exc.__cause__ is not None else "busy"
@@ -3423,7 +3423,8 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
                     "without it, and a rotate-key run meanwhile could re-create a removed upload. "
                     "If another account owns it, as when rotate-key ran as root or an "
                     "administrator, give it to the engine's service account; if it is not a "
-                    "regular file, remove it",
+                    "regular file, remove it. Until this process takes the lock again, later "
+                    "refusals of it are logged at DEBUG",
                     lock,
                     codec_safe_str(exc),
                 )

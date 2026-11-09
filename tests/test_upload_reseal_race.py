@@ -262,8 +262,9 @@ def _root_gone(path: Path, **_: Any) -> Any:
 
 
 def _dangling(path: Path, **_: Any) -> Any:
-    """A pair lock whose open fails ``ENOENT`` while the uploads root is there, as a dangling link
-    or junction planted at the lock path makes it on Windows, which has no ``O_NOFOLLOW``."""
+    """A pair lock whose open fails ``ENOENT`` while the uploads root is there, as Windows, which
+    has no ``O_NOFOLLOW``, fails it for a link planted at the lock path whose target's directory is
+    missing."""
     lock = lock_path_for(path)
     assert lock.parent.is_dir()
     raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(lock))
@@ -470,7 +471,7 @@ def test_a_lock_path_missing_under_a_root_still_there_is_a_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """``ENOENT`` at the lock's open while the root is there is no missing root: something planted
-    at the lock path, such as a dangling link or junction, keeps it from being taken. The engine
+    at the lock path, such as a link whose target's directory is missing, keeps it from being taken. The engine
     removal logs the refusal at ERROR with the advice to remove it; the re-seal skips every half
     that needs a write and does not report the root missing."""
     root = tmp_path / "uploads"
@@ -528,7 +529,7 @@ def test_an_os_timeout_on_an_engine_removal_is_a_warning_not_the_account_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """An OS timeout is neither another account's lock file nor a busy lock: the removal goes on,
-    one WARNING names the timeout, and the once-per-process ERROR is not used up."""
+    one WARNING names the timeout, and the refusal's ERROR is not used up."""
     root = tmp_path / "uploads"
     key = generate_key()
     fid = _seed(root, key)
