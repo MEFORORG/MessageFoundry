@@ -103,7 +103,7 @@ async def _service(engine: Engine, *, require_action_step_up: bool = True) -> Au
     return service
 
 
-async def _add(service: AuthService, username: str, roles: list[str]) -> None:
+async def _add(service: AuthService, username: str, roles: list[str]) -> str:
     user_id = await create_local_user_chosen(
         service,
         username=username,
@@ -122,6 +122,7 @@ async def _add(service: AuthService, username: str, roles: list[str]) -> None:
         must_change_password=False,
         password_generated=False,
     )
+    return user_id
 
 
 def _client(engine: Engine, service: AuthService, tmp_path: Path) -> httpx.AsyncClient:
@@ -213,12 +214,9 @@ async def test_a_bound_route_admits_its_own_proof_once(
         first = await _call(c, token, method, path, body, query)
         assert _past_the_step_up(first), (first.status_code, dict(first.headers), first.text)
         again = await _call(c, token, method, path, body, query)
-        if action == STEP_UP_ACTION_MESSAGE_EDIT_RESEND:
-            # The id names nothing, so the 404 came before the store write and the proof was given
-            # back (owner ruling 2026-10-13, #3241 R1). Single use after a write is pinned below.
-            assert _past_the_step_up(again), (again.status_code, dict(again.headers))
-        else:
-            assert _refused_for(again, action), "the grant must be single-use"
+        # Edit-resend's 404 for the id that names nothing spends the proof too (owner ruling
+        # 2026-11-07, #3241 added item 1), so every bound route is single-use here.
+        assert _refused_for(again, action), "the grant must be single-use"
 
 
 @pytest.mark.parametrize(("action", "method", "path", "body", "query"), BOUND, ids=_IDS)
@@ -358,7 +356,9 @@ def test_the_bound_route_suites_run_with_the_proof_on() -> None:
         assert "reproving_transport" in source, f"{name} no longer re-proves as a client does"
 
 
-# --- edit-resend refunds a proof its refusal never used (owner ruling 2026-10-13, #3241 R1) -------
+# --- which edit-resend refusals give the proof back -----------------------------------------------
+# A refusal raised before the store write gives the proof back (owner ruling 2026-10-13, #3241 R1),
+# except a 403, 404 or 409, which spends it (owner ruling 2026-11-07, #3241 added item 1).
 
 
 async def _edit_resend_engine(tmp_path: Path) -> Engine:
@@ -382,12 +382,52 @@ async def _edit_resend(c: httpx.AsyncClient, token: str, mid: str, **extra: Any)
     )
 
 
-async def test_an_edit_resend_refused_before_its_store_write_gives_the_proof_back(
+@pytest.mark.parametrize(
+    ("status", "origin", "scope", "payload"),
+    [
+        # The direct target is outside the caller's channel scope.
+        pytest.param(403, "in1", ["in1", "OB1"], {"to": "OB2"}, id="403-target-out-of-scope"),
+        pytest.param(404, "in1", None, {"to": "OB_NOPE"}, id="404-unknown-target"),
+        # The origin inbound is not registered on this engine.
+        pytest.param(409, "IB_NOT_HERE", None, {"reroute": True}, id="409-origin-not-here"),
+    ],
+)
+async def test_an_edit_resend_refused_403_404_or_409_spends_the_proof(
+    tmp_path: Path, status: int, origin: str, scope: list[str] | None, payload: dict[str, Any]
+) -> None:
+    """Each of these refusals comes before the store write and still spends the proof, so the
+    same request sent again asks for a new one rather than answering the same refusal."""
+    pytest.importorskip("psutil")
+    engine = await _edit_resend_engine(tmp_path)
+    try:
+        service = await _service(engine)
+        # An operator, since the administrator role is unscoped whatever its stored scope says.
+        user_id = await _add(service, "op", [Role.OPERATOR.value])
+        if scope is not None:
+            await service.set_channel_scope(user_id, scope, actor="test")
+        mid = await engine.store.enqueue_message(
+            channel_id=origin, raw=ADT, deliveries=[], message_type="ADT^A01", control_id="MSG1"
+        )
+        async with _client(engine, service, tmp_path) as c:
+            token = await _reauth(c, await _login(c, "op"), STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
+            refused = await _edit_resend(c, token, mid, **payload)
+            assert refused.status_code == status and _past_the_step_up(refused), refused.text
+            again = await _edit_resend(c, token, mid, key="k2", **payload)
+            assert _refused_for(again, STEP_UP_ACTION_MESSAGE_EDIT_RESEND), (
+                again.status_code,
+                again.text,
+            )
+    finally:
+        await engine.stop()
+
+
+async def test_an_edit_resend_refused_otherwise_before_its_store_write_gives_the_proof_back(
     tmp_path: Path,
 ) -> None:
-    """Each refusal raised before the store write (an unknown message 404, an unknown target 404, an
-    origin inbound this engine does not own 409) gives the proof back. The edit that follows then
-    runs on the SAME proof, and spends it: the write is what single use counts."""
+    """A refusal before the store write that is not a 403, 404 or 409 still gives the proof back
+    (owner ruling 2026-10-13, #3241 R1): a 400 for a request with neither a target nor a re-route,
+    and the ingress guard's 422 for a body that is not HL7. The edit that follows then runs on the
+    SAME proof, and spends it: the write is what single use counts."""
     pytest.importorskip("psutil")
     engine = await _edit_resend_engine(tmp_path)
     try:
@@ -396,14 +436,16 @@ async def test_an_edit_resend_refused_before_its_store_write_gives_the_proof_bac
         mid = await engine.store.enqueue_message(
             channel_id="in1", raw=ADT, deliveries=[], message_type="ADT^A01", control_id="MSG1"
         )
-        stray = await engine.store.enqueue_message(
-            channel_id="IB_NOT_HERE", raw=ADT, deliveries=[], message_type="ADT^A01"
-        )
         async with _client(engine, service, tmp_path) as c:
             token = await _reauth(c, await _login(c, "adm"), STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
-            assert (await _edit_resend(c, token, NO_SUCH, reroute=True)).status_code == 404
-            assert (await _edit_resend(c, token, mid, to="OB_NOPE")).status_code == 404
-            assert (await _edit_resend(c, token, stray, reroute=True)).status_code == 409
+            neither = await _edit_resend(c, token, mid, reroute=False)
+            assert neither.status_code == 400 and _past_the_step_up(neither), neither.text
+            not_hl7 = await _edit_resend(c, token, mid, raw="not an HL7 message", reroute=True)
+            assert not_hl7.status_code == 422 and _past_the_step_up(not_hl7), not_hl7.text
+            # The guard's refusal, after the spend, not the framework's 422 before it.
+            assert isinstance(not_hl7.json()["detail"], str), not_hl7.text
+            audit = await engine.store.list_audit()
+            assert [a for a in audit if a["action"] == "message_edit_resend_reject"]
             done = await _edit_resend(c, token, mid, reroute=True)
             assert done.status_code == 200 and done.json()["status"] == "resubmitted", done.text
             # CONTROL: the write spent it, so the next edit asks again.

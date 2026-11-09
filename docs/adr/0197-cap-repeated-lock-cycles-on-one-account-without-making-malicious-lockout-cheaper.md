@@ -35,6 +35,10 @@
   for vault BACKLOG #3241 R1, in an AskUserQuestion dialog with the batch 256 Manager. It widens
   Amendment A's refund set by one action, edit-and-resubmit. Amendment C, at the end of this file,
   records it. The Decision, Amendment A's other text and Amendment B are unchanged.
+- **Amended 2026-11-07: Amendment D, by owner ruling.** Asked *"Stop refunding on those three
+  refusals?"*, the owner answered *"Stop refunding"* (vault BACKLOG #3241 added item 1). An
+  edit-and-resubmit refused with a 403, 404 or 409 keeps the spend. Amendment D, at the end of this
+  file, records it, and Amendment C's text is cut to match.
 - **Date:** 2026-09-27
 - **Related:** BACKLOG #1131 (the row this answers; ASVS 6.1.1) · BACKLOG #1236 (closed 2026-09-26;
   its cycle-cap remainder moved to #1131 by owner ruling) · BACKLOG #1138 (re-proof failures count
@@ -1527,16 +1531,50 @@ stopped target, an origin inbound another engine shard owns) cost the operator a
 re-authentication cannot carry the typed body, so the console lost the edit too.
 
 **What changes.** `message_edit_resend` joins `_REFUNDABLE_ACTIONS` beside the two credential
-resets. The route gives the proof back for an `HTTPException` it raises BEFORE the store write
-(`refund_action_step_up`, which restores only the grant this request spent, with its original
-deadline). From the store call on, a refusal keeps the spend, because the store may have committed.
-The console calls the handler in-process after its own spend, so the refund reaches both planes.
+resets. The route gives the proof back for an `HTTPException` it raises BEFORE the store write,
+other than a 403, 404 or 409 (Amendment D) (`refund_action_step_up`, which restores only the grant
+this request spent, with its original deadline). From the store call on, a refusal keeps the
+spend, because the store may have committed. The console calls the handler in-process after its
+own spend, so the refund reaches both planes.
 
 **What it does not change.** Amendment A's rule that a refund can never mint, extend or restore an
 expired grant. Only a request refused before its message-store write is refunded. Such a request
-may still have written an audit row, such as `message_edit_resend_reject` or
-`auth.channel_denied`, so one proof can drive repeated audited refusals, each limited by the
-admin-write pacing. Single use still holds: the route spends the proof at its top, and once it
-reaches the store call it keeps the spend, even when that call refuses without writing.
-`tests/test_bound_step_up_injection.py` pins a pre-write refusal refunding and a store-call
-refusal keeping the spend.
+may still have written an audit row, such as `message_edit_resend_reject`, so one proof can drive
+repeated audited refusals, each limited by the admin-write pacing. Single use still holds: the
+route spends the proof at its top, and once it reaches the store call it keeps the spend, even
+when that call refuses without writing. `tests/test_bound_step_up_injection.py` pins a pre-write
+refusal refunding and a store-call refusal keeping the spend.
+
+> **Superseded text, kept as a record.** Amendment D (2026-11-07) cut two passages above. Until
+> then *What changes* read *"The route gives the proof back for an `HTTPException` it raises
+> BEFORE the store write (`refund_action_step_up`, ...)"*, and *What it does not change* named
+> *"`message_edit_resend_reject` or `auth.channel_denied`"* as the audit rows a refunded request
+> may have written.
+
+---
+
+## Amendment D (2026-11-07) -- edit-and-resubmit spends its proof on a 403, 404 or 409
+
+**Ruling.** Owner ruling 2026-11-07 (vault BACKLOG #3241 added item 1). Asked *"Stop refunding on
+those three refusals?"*, the owner answered *"Stop refunding"*. It supersedes Amendment C (#3241
+R1) for those three statuses only. Under Amendment C, one proof could send edit-and-resubmit to
+any number of outbound names and read from each 403, 404 or 409 whether the name was out of scope,
+unknown, not deployed, owned by another engine shard or stopped.
+
+**What changes.** `_edit_resend_core` in `api/app.py` gives no proof back for an `HTTPException`
+whose status is in `_EDIT_RESEND_SPENDING_REFUSALS` (403, 404, 409), wherever it is raised. At
+least an out-of-scope target, an unknown message or target, a target not deployed, owned by
+another engine shard or not running, an origin inbound this engine does not hold, and a refused
+body stored as its head take one of those statuses. The console calls the same handler in-process,
+so its editor asks for a new proof after such a refusal. That re-authentication returns to the
+editor, which opens on the stored body, so the operator's typed edit is lost again for these
+refusals, as it was before Amendment C.
+
+**What it does not change.** Every other refusal raised before the store write still gives the
+proof back, at least the 400 for a request with neither a target nor a re-route and the ingress
+guards' 413, 415 and 422. The ingress guard runs after the target checks in direct mode and after
+the origin check in re-route mode, so a guard refusal, which keeps the proof, also tells the
+caller that the target, or the origin inbound, passed those checks. A refusal from the store call
+on keeps the spend, as before.
+`tests/test_bound_step_up_injection.py` pins one case per spending status and a 400 and a 422
+still refunding.

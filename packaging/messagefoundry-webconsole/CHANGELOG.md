@@ -226,6 +226,11 @@ this line.**
   listing, not every route to the fact; [`docs/SECURITY.md`](../../docs/SECURITY.md) says what it
   leaves out. Seam change: `list_approvals` takes `request`, which the handshake does not check, so
   this console and an engine without that change raise TypeError on the page. (BACKLOG #3747)
+- **An edit-resend the engine refuses with a 403, 404 or 409 now spends its proof.** The editor
+  and the next submit ask for a new re-auth after such a refusal, as they do after a refusal at
+  the store write. That re-auth reopens the editor on the stored body, so the typed edit is lost.
+  Any other refusal before the store write still gives the proof back. The change is in the
+  engine handler the console calls; no seam changes. (BACKLOG #3241)
 
 ### Fixed
 

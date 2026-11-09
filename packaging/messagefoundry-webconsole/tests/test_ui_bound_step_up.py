@@ -199,22 +199,79 @@ async def test_the_editor_asks_before_it_opens_and_the_resubmit_spends_it(engine
         )
         assert bad.status_code == 400 and "choose an outbound connection" in bad.text
         assert (await c.get(editor)).status_code == 200
-        # A resubmit the engine refuses before its store write (ch1 is no registered inbound) gives
-        # the proof back (owner ruling 2026-10-13, #3241 R1), so the editor still opens and the
-        # operator's next submit asks for no new password. Before the ruling it spent the proof.
+        # A resubmit the engine refuses with a 409 before its store write (ch1 is no registered
+        # inbound) spends the proof (owner ruling 2026-11-07, #3241 added item 1, which supersedes
+        # R1's refund for a 403, 404 or 409), so the editor and the next submit ask for a new one.
         sent = await c.post(
             post,
             data={"raw": EDITED, "idempotency_key": "k2", "mode": "reroute"},
             headers=SAME_ORIGIN,
         )
         assert sent.status_code == 400 and _reauth_next(sent) is None
-        assert (await c.get(editor)).status_code == 200
+        assert _reauth_next(await c.get(editor)) == editor
         again = await c.post(
             post,
             data={"raw": "MSH|other", "idempotency_key": "k2", "mode": "reroute"},
             headers=SAME_ORIGIN,
         )
-        assert again.status_code == 400 and _reauth_next(again) is None
+        assert _reauth_next(again) == editor
+
+
+async def test_an_edit_resubmit_the_ingress_guard_refuses_keeps_the_proof(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """A refusal before the store write that is not a 403, 404 or 409 still gives the proof back
+    through the console (owner ruling 2026-10-13, #3241 R1): the guard's 422 for a body that is not
+    HL7 leaves the editor open, and the corrected resubmit runs on the same proof and spends it."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
+
+    (tmp_path / "in").mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "ch1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    engine.add_registry(reg)
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    mid = await seed_message(engine)
+    editor = f"/ui/messages/{mid}/edit"
+    post = f"/ui/messages/{mid}/edit-resend"
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        await mint_bound_proof(c, editor)  # the one proof
+        refused = await c.post(
+            post,
+            data={"raw": "not an HL7 message", "idempotency_key": "k1", "mode": "reroute"},
+            headers=SAME_ORIGIN,
+        )
+        assert refused.status_code == 400 and _reauth_next(refused) is None
+        # The engine guard refused it after the spend, not the console's own check before it.
+        assert "invalid input" not in refused.text
+        audit = await engine.store.list_audit()
+        assert [a for a in audit if a["action"] == "message_edit_resend_reject"]
+        assert (await c.get(editor)).status_code == 200
+        done = await c.post(
+            post,
+            data={"raw": EDITED, "idempotency_key": "k2", "mode": "reroute"},
+            headers=SAME_ORIGIN,
+        )
+        assert done.status_code == 303 and done.headers["location"] != f"/ui/messages/{mid}"
+        # Control: the write spent it, so a new key asks again.
+        again = await c.post(
+            post,
+            data={"raw": EDITED, "idempotency_key": "k3", "mode": "reroute"},
+            headers=SAME_ORIGIN,
+        )
+        assert _reauth_next(again) == editor
 
 
 async def test_an_edit_resubmit_repeated_with_one_proof_lands_once(

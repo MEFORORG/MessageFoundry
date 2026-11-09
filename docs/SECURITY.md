@@ -3286,10 +3286,14 @@ query is past the 512-character cap on `next` or not ASCII, when the page opens 
 before. The page still re-derives each destination's eligibility from live quiescence, and the
 operator still submits the confirm form.
 A refusal the engine handler raises before its store write gives the proof back (owner ruling
-2026-10-13, #3241 R1; ADR 0197 Amendment C), so the operator resubmits without a new password. A
-refusal from the store call on keeps the spend, because the store may have committed: the next
-submit asks again and re-opens the editor from the stored body, as an expired grant (300 s by
-default) does. The console resend checks
+2026-10-13, #3241 R1; ADR 0197 Amendment C), so the operator resubmits without a new password,
+except a 403, 404 or 409, which keeps the spend (owner ruling 2026-11-07, #3241 added item 1; ADR
+0197 Amendment D). The ingress guard runs after the target checks in direct mode and after the
+origin check in re-route mode, so a guard refusal, which gives the proof back, also tells the
+caller that the target, or the origin inbound, passed those checks. A refusal from the store
+call on keeps the spend too, because the store may have committed. After any refusal that keeps
+the spend, the next submit asks again and re-opens the editor from the stored body, as an
+expired grant (300 s by default) does. The console resend checks
 its own input before it spends the proof too. On both, a double-click asks for no second proof.
 The console marks each request it spends a proof on. Only an identical request rides on that mark.
 For a resend that means the same key, target and source. For an edit-resend it means the same key,

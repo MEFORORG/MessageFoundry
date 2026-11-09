@@ -1947,8 +1947,9 @@ async def spend_step_up_action(request: Request, action: str) -> None:
     before it holds or runs anything. A refusal the route makes after the spend, such as a 404 or
     a 409, still costs the proof, unless the route gives it back with
     ``AuthService.refund_action_step_up``, as edit-resend does for a refusal before its store write
-    (owner ruling 2026-10-13, #3241 R1). With no auth service attached it does nothing, as the dependency
-    does."""
+    (owner ruling 2026-10-13, #3241 R1), other than one in ``_EDIT_RESEND_SPENDING_REFUSALS`` in
+    ``api/app.py`` (owner ruling 2026-11-07, #3241 added item 1). With no auth service attached it
+    does nothing, as the dependency does."""
     auth = get_auth(request)
     if auth is None:
         return

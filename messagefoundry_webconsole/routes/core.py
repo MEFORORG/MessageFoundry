@@ -1616,8 +1616,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Held, not spent, in the gate (vault BACKLOG #2625): the grant is spent below, after this
         # route's own input checks, so a refusal of those (direct mode with no outbound, an invalid
         # body) costs the operator no proof. A refusal the engine handler raises before its store
-        # write gives the proof back (owner ruling 2026-10-13, #3241 R1); any later one keeps the
-        # spend, so the next submit asks again and re-opens the editor from the stored body.
+        # write gives the proof back (owner ruling 2026-10-13, #3241 R1), except a status the
+        # engine's _EDIT_RESEND_SPENDING_REFUSALS names (owner ruling 2026-11-07, #3241 added item
+        # 1); any of those, or any later refusal, keeps the spend, so the next submit asks again
+        # and re-opens the editor from the stored body.
         identity: Identity = Depends(
             require_ui_step_up_action(
                 STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
@@ -1699,9 +1701,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except HTTPException as exc:
             # A refused resubmit drops its spend record BEFORE the two audited reads in _reject,
             # so a repeat waiting on it is answered at once. A refusal the engine raised before
-            # its store write has given the proof back (owner ruling 2026-10-13, #3241 R1), so the
-            # re-rendered editor's next submit asks for none; any other refusal kept the spend,
-            # and that submit asks for a proof again.
+            # its store write, other than a status the engine's _EDIT_RESEND_SPENDING_REFUSALS
+            # names, has given the proof back (owner rulings 2026-10-13, #3241 R1, and 2026-11-07,
+            # #3241 added item 1), so the re-rendered editor's next submit asks for none; any other
+            # refusal kept the spend, and that submit asks for a proof again.
             settle_ui_action_step_up(spend, refused=True, refusal=exc)
             # str(exc.detail) carries ids only (the endpoint never interpolates the body).
             return await _reject(str(exc.detail))

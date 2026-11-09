@@ -3892,6 +3892,13 @@ _INGRESS_GUARD_STATUS: dict[str, int] = {
     "strict": 422,
 }
 
+#: The edit-resend refusals that spend the step-up proof even before the store write: at least a
+#: target out of scope, an unknown message or target, and a target or origin that cannot take the
+#: write (owner ruling 2026-11-07, #3241 added item 1, which supersedes R1 for these three
+#: statuses). Every other refusal before the write refunds, so a new refusal raised before the
+#: write in ``_edit_resend_core`` is checked against this set.
+_EDIT_RESEND_SPENDING_REFUSALS = frozenset({403, 404, 409})
+
 
 async def _guard_resubmission(
     engine: Engine,
@@ -8417,7 +8424,9 @@ def create_app(
 
         The step-up proof is spent in this route, after FastAPI has validated the body, so a 422
         costs no proof (owner ruling 2026-10-13, #3241 R1 and R2); a refusal raised before the
-        store write gives the proof back."""
+        store write gives the proof back, except one whose status
+        :data:`_EDIT_RESEND_SPENDING_REFUSALS` names, which spends it (owner ruling 2026-11-07,
+        #3241 added item 1)."""
         await spend_step_up_action(request, STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
         return await _edit_resend_core(
             message_id, body=body, engine=engine, identity=identity, request=request
@@ -8444,10 +8453,11 @@ def create_app(
         The console calls this in-process after its own spend."""
         # Owner ruling 2026-10-13 (#3241 R1): a refusal raised BEFORE the store write gives back the
         # proof the gate spent (ADR 0197 Amendment C), so an edit the engine refused costs the
-        # operator no password and the console can re-open the editor without a re-auth. `written`
-        # turns true just before the store call: a refusal from there on keeps the spend, because the
-        # store may have committed. The console calls this handler in-process after its own spend,
-        # so the refund reaches both planes.
+        # operator no password and the console can re-open the editor without a re-auth, except a
+        # status in _EDIT_RESEND_SPENDING_REFUSALS, which keeps the spend. `written` turns true
+        # just before the store call: a refusal from there on keeps the spend, because the store
+        # may have committed. The console calls this handler in-process after its own spend, so the
+        # refund reaches both planes.
         written = False
         try:
             # 404 (not 403) outside the caller's channel scope (mirrors resend/replay/get_message).
@@ -8610,9 +8620,13 @@ def create_app(
                 reroute=True,
                 new_message_id=outcome.new_message_id,
             )
-        except HTTPException:
+        except HTTPException as exc:
             auth = get_auth(request)
-            if not written and auth is not None:
+            if (
+                not written
+                and exc.status_code not in _EDIT_RESEND_SPENDING_REFUSALS
+                and auth is not None
+            ):
                 auth.refund_action_step_up(STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
             raise
 
