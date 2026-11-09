@@ -1,6 +1,7 @@
-- **The rolled-up unreachable-account alert no longer reads as a total.** Where the accounts
-  the directory keeps failing to answer for that already paged, and those entering whose audit row
-  was written, are more than five, those entering page as one
+- **The rolled-up unreachable-account alert no longer reads as a total.** Where those entering
+  whose audit row was written, plus the accounts this process has latched as paged that still hold
+  a live session and a directory key and were not since answered for, are more than five, those
+  entering page as one
   `ad_reconcile_aborted` alert under the bare `directory-reconciler-unreached` source. Its text
   read "N accounts' sessions are not revoked", counting only the accounts entering on that pass,
   so a later rollup that updated the open alert replaced the count with a smaller one while more

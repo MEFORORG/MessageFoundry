@@ -355,7 +355,8 @@ class ReconcilePlan:
     #: page stands (``AuthService._note_unreached_accounts``).
     unreached: tuple[tuple[str, str, int], ...] = ()
     #: Set by ``AuthService._record_unreached_accounts`` (BACKLOG #3100, #3709), on the rows it
-    #: wrote: True when the accounts already paged and those entering whose row was written are
+    #: wrote: True when those entering whose row was written, plus the accounts latched as paged
+    #: that still hold a live session and a directory key and were not since answered for, are
     #: more than ``AuthService``'s fixed rollup bound, so the lifespan task pages once for those
     #: entering rather than once per account. A directory that answers only a few probes
     #: in each pass would otherwise open an instance per signed-in account.

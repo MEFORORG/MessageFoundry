@@ -662,8 +662,9 @@ _FORFEIT_NOBODY_ELSE: Final[str] = (
     ", because a restarted process does not resolve one it finds open, and a [cluster] node or "
     "an engine of more than one engine shard resolves none itself"
 )
-#: Where the accounts already paged unreachable plus those whose row this pass wrote are more than
-#: this, those entering page as one (BACKLOG #3100 closing step 2, #3709;
+#: Where those whose row this pass wrote, plus the accounts latched as paged unreachable that still
+#: hold a live session and a directory key and were not since answered for, are more than this,
+#: those entering page as one (BACKLOG #3100 closing step 2, #3709;
 #: `AuthService._record_unreached_accounts`). A fixed number, not a setting, so tuning the
 #: mass-revoke breaker does not change how these page.
 _UNREACHED_ROLLUP_ABOVE: Final[int] = 5
