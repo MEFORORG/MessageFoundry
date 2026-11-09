@@ -1438,18 +1438,20 @@ async def test_a_hold_that_captured_no_digest_is_refused_at_release(
     assert await engine.store.list_audit(action="config_reload") == []
 
 
+@pytest.mark.parametrize("held", [None, "A" * 64], ids=["none", "malformed"])
 async def test_a_no_digest_hold_past_the_gate_is_still_refused_by_the_executor(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, held: str | None
 ) -> None:
     """The defence behind the gate's check (vault BACKLOG #3192): with that check made to pass, a
-    release bound to no digest reaches the executor, which still refuses every config, 422 and
-    ``no_approved_digest``, and loads nothing. The executor reads its own reference to the test,
-    so only the gate's copy is patched."""
+    release bound to no digest, or to one not of the form the engine writes, reaches the executor,
+    which still refuses every config, 422 and ``no_approved_digest``, and loads nothing. The
+    executor reads its own reference to the test, so only the gate's copy is patched."""
+    from messagefoundry.pipeline import ApprovedConfig
 
-    async def _none(_config_dir: object) -> None:
-        return None
+    async def _held(_config_dir: object) -> ApprovedConfig | None:
+        return None if held is None else ApprovedConfig(held)
 
-    monkeypatch.setattr(engine, "reload_target_approval", _none)
+    monkeypatch.setattr(engine, "reload_target_approval", _held)
     monkeypatch.setattr("messagefoundry.api.approvals.held_fingerprint", lambda _p: "bypassed")
     service = await _service(engine)
     approval_id, r = await _hold_then_release(engine, service, {})
@@ -1457,7 +1459,7 @@ async def test_a_no_digest_hold_past_the_gate_is_still_refused_by_the_executor(
     assert r.json()["detail"] == (
         "this request named no config digest, so it cannot be released; request the reload again"
     )
-    assert _held_params(await engine.store.get_pending_approval(approval_id))["fingerprint"] is None
+    assert _held_params(await engine.store.get_pending_approval(approval_id))["fingerprint"] == held
     [row] = [
         json.loads(r["detail"])
         for r in await engine.store.list_audit(action="config_reload_failed")

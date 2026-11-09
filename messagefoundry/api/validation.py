@@ -45,8 +45,7 @@ the standard library.
 
 from __future__ import annotations
 
-import re
-from typing import Annotated, TypeGuard
+from typing import Annotated
 
 from pydantic import Field, StringConstraints
 
@@ -74,18 +73,6 @@ RESOURCE_ID_PATTERN = r"^[0-9a-f]{32}$"
 
 #: 64 lowercase hex characters -- a SHA-256 hex digest.
 DIGEST_ID_PATTERN = r"^[0-9a-f]{64}$"
-
-_DIGEST_ID = re.compile(DIGEST_ID_PATTERN)
-
-
-def is_config_digest(value: object) -> TypeGuard[str]:
-    """Whether ``value`` has the shape of the config digest a held reload records: the SHA-256 hex
-    digest :data:`DIGEST_ID_PATTERN` names, which
-    :func:`~messagefoundry.config.fingerprint.snapshot_fingerprint` returns and a release compares.
-    A value of any other shape matches no config. The approvals gate and the web console read this
-    one test, so the page never shows a value the gate refuses as a digest (vault BACKLOG #3192)."""
-    return isinstance(value, str) and _DIGEST_ID.fullmatch(value) is not None
-
 
 #: A custom role id: the ``custom:`` prefix ``messagefoundry.auth.permissions`` defines, then 32 hex.
 #: Built-in role ids are words and are never accepted by the ``/roles/custom`` routes.

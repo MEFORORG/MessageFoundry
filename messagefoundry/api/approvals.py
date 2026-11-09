@@ -61,11 +61,11 @@ from typing import Any, Literal, NoReturn
 from uuid import uuid4
 
 from messagefoundry.api.models import ReleaseBlocked
-from messagefoundry.api.validation import is_config_digest
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
+from messagefoundry.config.fingerprint import is_config_digest
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline.alerts import (
@@ -144,10 +144,10 @@ def named_requester(params: Mapping[str, Any]) -> str | None:
 
 def held_fingerprint(params: Mapping[str, Any]) -> str | None:
     """The config digest a held reload's params carry, or ``None`` when it is missing or is not of
-    the shape a release compares (:func:`~messagefoundry.api.validation.is_config_digest`; vault
-    BACKLOG #3192). A release bound to
-    ``None`` refuses every config, and so would one bound to a value of another shape, so the
-    reload executor and the queue's ``params_no_fingerprint`` prediction read this one test."""
+    the shape a release compares (:func:`~messagefoundry.config.fingerprint.is_config_digest`;
+    vault BACKLOG #3192). A release bound to ``None`` refuses every config, and so would one bound
+    to a value of another shape, so the reload executor and the queue's ``params_no_fingerprint``
+    prediction read this one test."""
     value = params.get("fingerprint")
     return value if is_config_digest(value) else None
 

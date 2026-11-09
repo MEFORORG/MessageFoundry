@@ -26,9 +26,10 @@ exactly like ``load_config`` itself.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, TypeGuard
 
 from messagefoundry.config.snapshot import (
     ConfigDirMissing,
@@ -50,6 +51,7 @@ __all__ = [
     "describe_left_out",
     "fingerprint_matches",
     "digest_coverage",
+    "is_config_digest",
     "is_missing_directory",
     "left_out_of",
     "same_digest",
@@ -122,6 +124,17 @@ def _fold(entries: list[tuple[str, bytes]]) -> str:
         h.update(digest)
         h.update(b"\0")
     return h.hexdigest()
+
+
+#: The shape :func:`_fold` returns: a SHA-256 hex digest, 64 lowercase hex characters.
+_DIGEST_SHAPE = re.compile(r"[0-9a-f]{64}")
+
+
+def is_config_digest(value: object) -> TypeGuard[str]:
+    """Whether ``value`` has the shape of a digest this module returns, the one a dual-control
+    release compares a held reload's against. A value of any other shape matches no config, so the
+    approvals gate refuses a hold that carries one before its claim (vault BACKLOG #3192)."""
+    return isinstance(value, str) and _DIGEST_SHAPE.fullmatch(value) is not None
 
 
 def snapshot_fingerprint(snapshot: ConfigSnapshot) -> str:

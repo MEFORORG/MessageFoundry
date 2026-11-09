@@ -2493,8 +2493,9 @@ Approvals page keys on.
 on directly, so where it names a reason the two cannot disagree. It names at least a request with
 no requester id, an operation no longer registered, one dual control no longer gates, unreadable
 parameters, parameters naming no requester for an operation whose executor needs one (a purge or a
-reload, `params_no_requester`), a held reload whose parameters carry no config digest, which its
-release could only refuse whatever the directory holds (`params_no_fingerprint`), and a requester who no longer holds the authority the operation needs, such as a held
+reload, `params_no_requester`), a held reload whose parameters carry no config digest, or one not
+of the form the engine writes, which its release could only refuse whatever the directory holds
+(`params_no_fingerprint`), and a requester who no longer holds the authority the operation needs, such as a held
 reload or purge whose requester has since been channel-scoped (`requester_not_authorized`, BACKLOG
 #3189). The requester's standing is read when the queue is listed, by the rule the release
 applies, so a change after the listing, or a standing the listing could not read, is met only at
@@ -2679,7 +2680,8 @@ the environment values it had. A reload applies the values it re-read only with 
 rolled-back swap puts the old ones back. A dry run checks the values and never applies them. The
 approve answers **422**, the request moves to `failed`, and a `config_reload_failed` row records
 reason `digest_mismatch` with `approved_fingerprint` and `current_fingerprint`. A hold whose
-params carry no digest is refused before its claim instead (vault BACKLOG #3192): the queue marks
+params carry no digest, or one not of the form the engine writes, is refused before its claim
+instead (vault BACKLOG #3192): the queue marks
 it `release_blocked: "params_no_fingerprint"`, the approve answers **409** and writes an
 `approval.params_no_fingerprint` row, nothing runs, and the request stays pending for a reject.
 The executor still refuses such a hold with reason `no_approved_digest`, but only a release that

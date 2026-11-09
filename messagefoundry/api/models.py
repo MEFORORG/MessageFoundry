@@ -557,7 +557,8 @@ class PendingApprovalInfo(BaseModel):
     executor needs the requester's name, as at least a held purge's and reload's do, and these
     parameters carry none; vault BACKLOG #3217), ``params_no_fingerprint`` (the operation binds
     its release to a config digest the hold captured, as a held reload does, and these parameters
-    carry none, so the release could only refuse every config; vault BACKLOG #3192), and
+    carry none, or one not of the form the engine writes, so the release could only refuse every
+    config; vault BACKLOG #3192), and
     ``requester_not_authorized``, which the gate raises after the dwell floor: the requester no longer holds the authority the operation needs, read when the queue is
     listed (BACKLOG #3189). A held reload or purge whose requester has since been channel-scoped is
     one. The listing writes no ``approval.stale_requester`` row; only an approve refused on it

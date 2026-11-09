@@ -38,6 +38,7 @@ Every value goes through the escaping ``el`` builder.
 from __future__ import annotations
 
 import json
+import re
 
 from messagefoundry.api.models import (
     ApprovalDecisionResult,
@@ -46,7 +47,7 @@ from messagefoundry.api.models import (
     ReleaseBlocked,
     ResolveOutcome,
 )
-from messagefoundry.api.validation import is_config_digest
+from messagefoundry.api.validation import DIGEST_ID_PATTERN
 
 from .._html import Markup, el, page, register_nav, rows_table
 from ._common import _reload_shortfall, _seg
@@ -149,12 +150,19 @@ _NONE_MEANS: dict[str, str] = {
     "config_dir": "the engine's startup config directory",
 }
 
-# A held reload's digest (vault BACKLOG #2596). The engine refuses to approve a hold whose digest
-# is missing or not 64 lowercase hex characters, the form it writes, before anything is claimed or
-# runs, and marks the row params_no_fingerprint (vault BACKLOG #3192). Any such value, None, empty,
-# not a string or malformed, reads as this note, never raw, so it does not pass for a digest.
-# The engine's test is this one (is_config_digest).
-_NO_DIGEST = "no usable config digest was recorded, so the engine refuses to approve this request"
+# A held reload's digest (vault BACKLOG #2596). A value the engine's own test,
+# messagefoundry.config.fingerprint.is_config_digest, refuses reads as this note, never raw, so it
+# does not pass for a digest (vault BACKLOG #3192). This console may not import that package, so
+# _is_config_digest restates the test; tests/test_approval_release_blocked.py pins the two together.
+# The note is true on a pending row and an interrupted one alike.
+_RELOAD = "config_reload"
+_CONFIG_DIGEST = re.compile(DIGEST_ID_PATTERN)
+_NO_DIGEST = "no usable config digest was recorded, and the engine loads no config without one"
+
+
+def _is_config_digest(value: object) -> bool:
+    return isinstance(value, str) and _CONFIG_DIGEST.fullmatch(value) is not None
+
 
 # Guidance for a refusal, keyed by the status the engine raised. The engine's own message follows it
 # verbatim, because one status covers several causes (a 409 is at least already decided, expired,
@@ -220,8 +228,8 @@ def _when(value: float | None) -> str:
     return "—" if value is None else _ts(value)
 
 
-def _param_value(key: str, value: object) -> str:
-    if key == "fingerprint" and not is_config_digest(value):
+def _param_value(operation: str, key: str, value: object) -> str:
+    if operation == _RELOAD and key == "fingerprint" and not _is_config_digest(value):
         return _NO_DIGEST
     if value is None:
         return _NONE_MEANS.get(key, "not set")
@@ -241,7 +249,10 @@ def _params(a: PendingApprovalInfo) -> Markup:
     shown = sorted(k for k in a.params if k != "requester" or a.params[k] != a.requester)
     if not shown:
         return el("span", "none", class_="muted")
-    return el("div", *(el("div", f"{key}: {_param_value(key, a.params[key])}") for key in shown))
+    return el(
+        "div",
+        *(el("div", f"{key}: {_param_value(a.operation, key, a.params[key])}") for key in shown),
+    )
 
 
 def _pending_row(a: PendingApprovalInfo) -> list[object]:

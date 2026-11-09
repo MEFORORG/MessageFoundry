@@ -1,7 +1,7 @@
 - **The approvals queue no longer offers Approve on a held reload that names no config digest.**
-  A digest that is not 64 lowercase hex characters, the form the engine writes, counts as none.
   Such a release could only be refused, since a reload bound to no digest matches no config, and
-  it was refused only after the gate claimed it, so the request ended `failed`. `GET /approvals`
+  it was refused only after the gate claimed it, so the request ended `failed`. A digest not of
+  the form the engine writes now counts as none. `GET /approvals`
   now marks it `release_blocked: "params_no_fingerprint"`, and the gate refuses it before its claim
   with 409 and an `approval.params_no_fingerprint` row, so it stays pending for a reject. The web
   console's Approvals page offers it only Reject or Withdraw, with a note. A queue with no identity
