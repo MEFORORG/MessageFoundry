@@ -4672,19 +4672,15 @@ def _host_custody_for_open(
                 settings, custody, posture=posture, read_only=read_only, recovery_wrap=recovery_wrap
             )
         except Exception as exc:
-            if _recorded_text(exc) is not None:
-                raise  # one the engine built, already with no chain
+            if isinstance(exc, KeyProviderError) and _recorded_text(exc) is not None:
+                raise  # a custody refusal the engine built, already with no chain
             caught = exc
-        # Built and raised outside the handler, and both locals dropped, so no cycle through this
-        # frame keeps the replaced error or the refusal.
+        # Built and raised outside the handler, never bound here, and the replaced error dropped,
+        # so no cycle through this frame keeps either.
         try:
-            refusal = custody_refusal_at_open(caught)
+            raise custody_refusal_at_open(caught)
         finally:
             del caught
-        try:
-            raise refusal
-        finally:
-            del refusal
     finally:
         _flush_unjudged()  # the replaced class, logged once no handler is running
 

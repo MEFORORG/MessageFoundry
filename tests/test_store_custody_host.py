@@ -423,6 +423,7 @@ def test_a_settle_refusal_holds_no_reference_to_the_master_key(
     # Handed over once, so the stand-in read keeps no reference after it.
     held = [HostBlob(key, StoreId.mint(), (), 1_800_000_000)]
     del key
+    assert alive() is not None, "the blob does not hold the tracked key"  # the positive control
     (tmp_path / "master.key").write_bytes(b"not read")
     (tmp_path / "handoff.key").write_bytes(b"not read")
     monkeypatch.setattr(custody, "read_host_file", lambda path: held.pop())

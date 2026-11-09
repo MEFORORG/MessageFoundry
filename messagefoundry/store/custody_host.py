@@ -649,15 +649,12 @@ def load_host_custody(
                 )
             return blob
         # Built and raised outside the handler, so neither the refusal nor anything its build
-        # raises has the caught error as its context.
+        # raises has the caught error as its context. The refusal is never bound here and the
+        # caught error is dropped, so no cycle through this frame keeps either.
         try:
-            refusal = _read_refusal(stage, caught)
+            raise _read_refusal(stage, caught)
         finally:
             del caught
-        try:
-            raise refusal
-        finally:
-            del refusal  # no cycle through this frame
     finally:
         _flush_unjudged()  # the replaced classes, logged once no handler is running
 
