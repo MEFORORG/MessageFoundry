@@ -812,6 +812,27 @@ from typing import Any
 #: ``messagefoundry`` floor instead. An older console on this engine passes the handshake and still
 #: answers a scoped caller's bad flag direction with the unaudited 404.
 #:
+#: Vault BACKLOG #3241, added item 9: ``AuthService.complete_oidc_step_up`` gained the keyword
+#: ``mint_grant``, which ``/ui/oidc/callback`` passes as False at least for a flow whose continuation
+#: another re-auth took. A keyword the console passes, so it forces a bump. Re-derived with ``--write`` (from
+#: 734e7007fb95eb75, to ce424894d11883ec on its own branch).
+#:
+#: ADR 0207 (vault BACKLOG #2609 item 2): ``AdminHandlers`` gained the required
+#: ``issue_user_enrolment_code`` and ``revoke_user_enrolment_code``, ``my_mfa`` is now the core that
+#: takes the console's session ``token``, and the MFA reset and status replies gained the
+#: enrolment-code fields the console renders. The digest moved from ``734e7007fb95eb75`` (to
+#: ``348fe2ce7f78d903`` on main).
+#:
+#: Merge of the two entries above (``mint_grant`` and the ADR 0207 enrolment-code surface): the
+#: two digests were each derived without the other's change, so neither held for the merged surface.
+#: Re-derived with ``--write`` over both, from ``ce424894d11883ec`` and ``348fe2ce7f78d903``
+#: to ``bfae7aa7c6c809e6``.
+#:
+#: Engine PR 2815 (BACKLOG #5197): ``DrStatus`` gained ``failures``, the steps a degraded DR
+#: activation left unfinished, which the console's status page renders. The digest moved from
+#: ``348fe2ce7f78d903`` (to ``4b8f0c19e6301e96`` on its own branch). Merged with main's ``bfae7aa7c6c809e6`` and re-derived with ``--write`` over
+#: both, to ``2a4589213e5e782c``.
+#:
 #: Vault BACKLOG #3192 and #3193 N3: ``ReleaseBlocked`` gained ``params_no_fingerprint``, a held
 #: reload whose params carry no config digest, which the gate now refuses before its claim, and
 #: ``PendingApprovalInfo`` lost ``gated``, which ``release_blocked = "not_gated"`` already said.
@@ -819,12 +840,16 @@ from typing import Any
 #: this engine is refused at mount rather than meeting a value it has no note for. The digest
 #: moved from ``734e7007fb95eb75`` (derived with ``--digest``, then written with ``--write``).
 #:
+#: Merge of the #3192/#3193 entry with main after engine PR 2815: each digest was derived without
+#: the other's change, so neither held for the merged surface. Re-derived with ``--write`` over
+#: both, from ``1cbeb65e0ed8e86d`` and ``2a4589213e5e782c`` to ``a71505053af14cae``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "1cbeb65e0ed8e86d"
+ENGINE_UI_SEAM: str = "a71505053af14cae"
 
 
 @dataclass(frozen=True, slots=True)
@@ -956,6 +981,11 @@ class AdminHandlers:
     refuse_own_channel_scope: Callable[..., Awaitable[Any]]
     reset_user_password: Callable[..., Awaitable[Any]]
     reset_user_mfa: Callable[..., Awaitable[Any]]
+    # ADR 0207 section 4: POST and DELETE /users/{id}/enrolment-code. The issue is the core past
+    # the JSON route's gate and takes ``via``; the /ui route in front of each must be
+    # require_ui_step_up_action with that route's own action and USERS_MANAGE.
+    issue_user_enrolment_code: Callable[..., Awaitable[Any]]
+    revoke_user_enrolment_code: Callable[..., Awaitable[Any]]
     # BACKLOG #1143 / #295 (ADR 0184 slice B): PUT and DELETE /users/{id}/federated-identity. Their
     # JSON gate is require_step_up_action(admin_federated_identity, USERS_MANAGE), so the /ui route in
     # front of each must be require_ui_step_up_action with that same action.

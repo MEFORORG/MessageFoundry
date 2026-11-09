@@ -27,8 +27,10 @@ names claim.
 
 from __future__ import annotations
 
+import socket
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import pytest
@@ -155,6 +157,27 @@ def delenv_at_rest_opt_out(monkeypatch: pytest.MonkeyPatch) -> None:
 #: there because the forwarder's #1498 revocation guard refuses verified TLS with no revocation
 #: check under `enforce`, and nothing attests past it.
 VERIFIED_LOG_FORWARDING_HOST = "siem.invalid"
+
+
+class ProvisionedCollectorResolver:
+    """``socket.getaddrinfo`` that answers the provisioned collector itself (BACKLOG #2279 item 3).
+
+    "Never resolves" was a fact about DNS, so every test that started the forwarder asked a live
+    resolver to prove it. That was a network dependency, and where the resolver is unreachable it
+    answers ``EAI_AGAIN``, which the forwarder defers instead of reporting permanently. This
+    refuses :data:`VERIFIED_LOG_FORWARDING_HOST` with the platform's ``EAI_NONAME``, what a real
+    resolver says for a reserved name, and passes every other host to ``real``. ``tests/conftest.py``
+    installs one for the session. It reaches this process only: a child process resolves for
+    itself."""
+
+    def __init__(self, real: Callable[..., Any]) -> None:
+        self.real = real
+
+    def __call__(self, host: object, *args: Any, **kwargs: Any) -> Any:
+        name = host.decode("ascii", "replace") if isinstance(host, bytes) else host
+        if isinstance(name, str) and name.rstrip(".").lower() == VERIFIED_LOG_FORWARDING_HOST:
+            raise socket.gaierror(socket.EAI_NONAME, f"{name}: reserved, never resolves (stub)")
+        return self.real(host, *args, **kwargs)
 
 
 def make_syslog_ca_and_crl(dir_path: Path) -> str:

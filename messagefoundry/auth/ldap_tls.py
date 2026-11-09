@@ -10,11 +10,14 @@ replaces the one method that builds the context. The context comes from
 
 **What is copied from ldap3, and why.** The wrap step below is ldap3's own, for the arguments the
 engine passes: wrap the socket client-side, then, on a handshake with verification on, run ldap3's
-host name check. That check is ldap3's function, called, not copied. The alternative was to patch
-``ldap3.core.tls.create_default_context`` for the length of one call. That is a module global, and
-``AuthService`` runs binds on worker threads, so two concurrent binds could each see the other's
-patch. ``tests/test_ldap_tls.py`` pins the source of ldap3's ``wrap_socket``, so an ldap3 that
-changes it goes red rather than drifting from this copy.
+host name check. That check is ldap3's function, called, not copied. **One deliberate difference:**
+when that check refuses, this copy closes the TLS socket before it re-raises, where ldap3 leaves it
+open while the error's traceback is held. ldap3's ``Connection.open`` re-raises a copy without the
+traceback, so on that path it was freed promptly anyway (BACKLOG #3017; keep it when re-deriving).
+The alternative was to patch ``ldap3.core.tls.create_default_context`` for the length of one call.
+That is a module global, and ``AuthService`` runs binds on worker threads, so two concurrent binds
+could each see the other's patch. ``tests/test_ldap_tls.py`` pins the source of ldap3's
+``wrap_socket``, so an ldap3 that changes it goes red rather than drifting from this copy.
 
 Imported lazily by :mod:`messagefoundry.auth.ldap`, like ldap3 itself, so a local-only deployment
 never loads it.
@@ -124,5 +127,18 @@ class NarrowedTls(ldap3.Tls):  # type: ignore[misc]  # ldap3 ships no type infor
             server_hostname=self.sni or None,
         )
         if do_handshake and self.validate in (ssl.CERT_REQUIRED, ssl.CERT_OPTIONAL):
-            check_hostname(wrapped, connection.server.host, self.valid_names)
+            try:
+                check_hostname(wrapped, connection.server.host, self.valid_names)
+            except BaseException:
+                # ssl took the socket over, so ``connection.socket`` holds a detached one and
+                # ``wrapped`` is reachable only through the error's traceback: close it here
+                # (``_close_without_sending``). A close fault must not replace the refusal, so it
+                # is logged and dropped, as ssl does.
+                try:
+                    wrapped.close()
+                except OSError as failed:
+                    logger.debug(
+                        "LDAPS socket close after a host name refusal: %s", type(failed).__name__
+                    )
+                raise
         connection.socket = wrapped

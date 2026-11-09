@@ -77,6 +77,7 @@ from tests._content_free import (
     assert_content_free,
     escapes,
 )
+from tests._log_absence import assert_capture_sees
 
 #: Small chunk for the fake client, so a test body is delivered in several pieces without needing a
 #: multi-MiB fixture. The shipped chunk size is asserted separately, below.
@@ -1255,6 +1256,7 @@ def test_plain_ftp_with_credentials_refused_even_with_escape(
     for refusal in (out.value, inb.value):
         assert "MEFOR_ALLOW_INSECURE_TLS" not in str(refusal)  # no escape is offered
     assert "'OB_RF'" in str(out.value) and "'inbound:IB_RF'" in str(inb.value)
+    assert_capture_sees(caplog, remotefile_log)
     assert not [r for r in caplog.records if r.name == remotefile_log]
 
 

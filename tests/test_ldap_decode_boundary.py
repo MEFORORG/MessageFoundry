@@ -166,9 +166,9 @@ def test_a_service_bind_ldap3_cannot_decode_is_refused(
 
 
 def test_the_service_bind_socket_is_closed_when_its_response_cannot_be_decoded() -> None:
-    """Review finding 10. The bind runs inside ldap3's constructor, so no caller holds the
-    connection to unbind; the refusal closes it. The control: the bare ldap3 bind leaves the socket
-    open while its error is held."""
+    """Review finding 10. A failed service bind leaves no session to unbind, so ``_service_conn``
+    closes the socket on the refusal (BACKLOG #3017 L4). The control: the bare ldap3 bind leaves
+    the socket open while its error is held."""
     reply = _result(_BIND_RESPONSE, 4242)
 
     def bind(_raw: bytes) -> _Reply:
@@ -644,7 +644,7 @@ def test_an_engine_fault_propagates_whatever_its_value(fault: Exception) -> None
     with pytest.raises(type(fault)) as raised:
         ldap_module._search(double, "user search")
     assert raised.value is fault
-    with pytest.raises(type(fault)) as raised, ldap_module._ldap3_call("user bind", close=True):
+    with pytest.raises(type(fault)) as raised, ldap_module._ldap3_call("user bind"):
         _raise(fault)()
     assert raised.value is fault
 

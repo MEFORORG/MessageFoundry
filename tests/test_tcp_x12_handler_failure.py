@@ -32,6 +32,7 @@ from messagefoundry.config.models import AckMode, ContentType
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.tcp import TcpSource
 from messagefoundry.transports.x12 import X12Source
+from tests._log_absence import assert_capture_sees
 from tests.test_x12_connection_events import (
     EDI,
     Event,
@@ -107,6 +108,8 @@ async def test_no_reply_a_blip_the_first_retries_recover_records_no_fault(
         events = await _drive(_no_reply(build), _ThenEof(wire), _Peer(), handler=handler)
     assert seen == [body] * REPORT_AFTER, "the last attempt records the frame"
     assert _kinds(events) == ["established", "closed"], "a recovered blip records no fault"
+    assert_capture_sees(caplog, "messagefoundry.transports.x12")
+    assert_capture_sees(caplog, "messagefoundry.transports.tcp")
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 

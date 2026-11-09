@@ -741,7 +741,7 @@ def forbidden_path_reason(posix: str) -> str | None:
 
 # --------------------------------------------------------------------------------------------------
 # Token authority (EXTERNALIZED -- never committed). These module globals are (re)computed by
-# ``reload_tokens()`` and read by the anonymizer leak-check bridges (messagefoundry/anon/leak.py and
+# ``reload_tokens()`` and read by the anonymizer leak-check bridges (messagefoundry_toolkit/anon/leak.py and
 # tee/anon/leak.py) as the single source of truth, so their names/shapes are a stable public contract.
 # --------------------------------------------------------------------------------------------------
 

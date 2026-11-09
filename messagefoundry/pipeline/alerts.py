@@ -760,19 +760,26 @@ class AlertSink(Protocol):
         the account enters that state, which leaves it unjudged too; or the directory has stayed
         unreachable for ``[auth].ad_reconcile_outage_passes`` passes running
         (``directory_unavailable``, BACKLOG #3709, the ``auth.ad_reconcile_skipped`` row whose
-        ``passes`` the page names), raised once per run. The type's name predates every case but the first. Read
-        ``reason`` before naming the cause.
+        ``passes`` the page names), raised once per run; or one account's probe has failed to reach
+        the directory on that many of its passes running while other probes got an answer
+        (``account_unreachable``, BACKLOG #3100, the ``auth.ad_reconcile_unreached`` row), raised
+        once as the account enters that state. The type's name predates every case but the first.
+        Read ``reason`` before naming the cause.
 
         ``name`` labels the source: ``"directory-reconciler"`` for the breaker,
         ``"directory-reconciler-referral"`` for a referral, ``"directory-reconciler-probe-fault"``
         for a probe fault, ``"directory-reconciler-misconfigured"`` for a configuration refusal,
-        ``"directory-reconciler-paging:<username>"`` for a paging refusal, and
-        ``"directory-reconciler-outage"`` for a lasting outage, so each is its own instance and
-        throttle. ``reason`` is one of those seven closed-set slugs. ``probed`` is, for
+        ``"directory-reconciler-paging:<username>"`` for a paging refusal,
+        ``"directory-reconciler-outage"`` for a lasting outage, and
+        ``"directory-reconciler-unreached:<username>"`` for an unreached account, or the bare
+        ``"directory-reconciler-unreached"`` where more than five stand unreachable at once, so each
+        is its own instance and throttle. ``reason`` is one of those eight closed-set slugs.
+        ``probed`` is, for
         the breaker, how many principals the pass judged, its denominator, and a paging refusal
         carries that same count of candidates the pass took up, asked or not, which counts any
         id-less row: a paging refusal concerns one account, and its count is still the pass's. For
-        a referral, a configuration refusal, a probe fault and a lasting outage it is how many
+        a referral, a configuration refusal, a probe fault, a lasting outage and an unreached
+        account it is how many
         probes the pass sent to the directory, which leaves out an id-less row (BACKLOG #3170).
         ``detail`` is the operator-facing explanation the auth service latches, or for a paging
         refusal or a lasting outage a fixed sentence. No PHI. Emitted by the API-lifespan
@@ -1419,8 +1426,9 @@ class LoggingAlertSink:
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
             # The count is the candidates the pass took up for the breaker and a paging refusal, or
-            # the probes the pass asked for a referral, a configuration refusal, a probe fault and a
-            # lasting outage (BACKLOG #3170, #3709); see AlertSink.ad_reconcile_aborted.
+            # the probes the pass asked for a referral, a configuration refusal, a probe fault, a
+            # lasting outage and an unreached account (BACKLOG #3170, #3709, #3100); see
+            # AlertSink.ad_reconcile_aborted.
             "ALERT ad_reconcile_aborted: %r left accounts unrevoked or unjudged, in a pass counting "
             "%d principal(s) "
             "(%s): %s",

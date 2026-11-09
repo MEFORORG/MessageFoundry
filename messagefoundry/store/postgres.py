@@ -54,6 +54,7 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import ssl
 import time
@@ -111,9 +112,11 @@ from messagefoundry.store.base import (
     SchemaProvisionResult,
     StoreGrantsMissingError,
     StoreNotFoundError,
-    _carries_a_codec_error,
+    _codec_chain_reading,
+    _flush_unjudged,
     acquire_pooled,
     driver_sqlstate,
+    seed_filter_clause,
     warm_pool_connections,
     warm_pool_target,
     warn_stale_schema_read_only,
@@ -254,6 +257,7 @@ from messagefoundry.store.store import (
     DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
+    EnrolmentCodeOutcome,
     EpochBump,
     EpochRaise,
     FailOutcome,
@@ -315,8 +319,13 @@ from messagefoundry.store.store import (
     birth_notify_email,
     build_audit_mac_keys,
     check_caller_event_kind,
+    check_open_store_pin,
     check_password_generated,
+    create_batch_failure,
     delivery_key,
+    enrolment_code_issue,
+    enrolment_code_revoke,
+    enrolment_code_spend,
     escalation_passkeys,
     escalation_verdict,
     existing_roles_only,
@@ -363,6 +372,7 @@ from messagefoundry.store.store import (
     require_operator_audit,
     require_totp_rule,
     role_seal_ok,
+    roles_if_held,
     roll_audit_key_range,
     rotation_reseal,
     scope_if_source,
@@ -380,12 +390,14 @@ from messagefoundry.store.store import (
     should_record_event,
     tee_audits,
     totp_enable,
+    totp_enable_spending_code,
     totp_removal,
     totp_replace,
     totp_stage,
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
+    user_disabled_change,
     user_insert_params,
     user_reseal_params,
     user_seal_ok,
@@ -540,6 +552,12 @@ _NOT_PT_MARKER = "NOT (stage = 'outbound' AND COALESCE(handler_name, '') = '@pas
 _NOT_PT_MARKER_Q = _NOT_PT_MARKER.replace("stage", "q.stage").replace(
     "handler_name", "q.handler_name"
 )
+
+
+class _GrantRolledBack(Exception):  # noqa: N818 - control-flow signal, not an error condition
+    """Raised inside the first-administrator grant's ``conn.transaction()`` so asyncpg rolls back a
+    role write the grant then refuses (BACKLOG #3078 F2). Caught immediately outside; never escapes
+    the store."""
 
 
 class _FencedWrite(Exception):
@@ -885,6 +903,21 @@ _SCHEMA: list[str] = [
         audit_seq   BIGINT NOT NULL,
         audit_hash  TEXT NOT NULL
     )""",
+    # The keyring (vault BACKLOG #3411) -- see the SQLite `_SCHEMA`.
+    """CREATE TABLE IF NOT EXISTS keyring (
+        key_id      TEXT NOT NULL,
+        purpose     TEXT NOT NULL,
+        key_class   TEXT NOT NULL DEFAULT '',
+        state       TEXT NOT NULL,
+        period_from DOUBLE PRECISION,
+        period_to   DOUBLE PRECISION,
+        wrapped_by  TEXT NOT NULL,
+        wrapped     TEXT NOT NULL DEFAULT '',
+        created_at  DOUBLE PRECISION NOT NULL,
+        state_at    DOUBLE PRECISION NOT NULL,
+        proved_at   DOUBLE PRECISION,
+        PRIMARY KEY (key_id, purpose, wrapped_by)
+    )""",
     # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112), one row per upload in
     # flight (vault BACKLOG #3180) — see the SQLite `_SCHEMA` for the rationale. This is the backend
     # a real engine-sharded deployment runs: `require_unified_store` makes a server DB mandatory
@@ -978,16 +1011,15 @@ _SCHEMA: list[str] = [
         -- BACKLOG #2592: the digest of the account's passkeys, and the integrity seal over the
         -- account's row and role rows. Both written only by the store's user write helper.
         cred_digest          TEXT NOT NULL DEFAULT '',
+        -- ADR 0207: the outstanding enrolment code's hash_token digest, its expiry, and the issuing
+        -- Administrator's account id (NULL for a host-issued code). All NULL with no code.
+        enrolment_code_digest TEXT,
+        enrolment_code_expires_at DOUBLE PRECISION,
+        enrolment_code_issuer TEXT,
         authz_seal           TEXT NOT NULL DEFAULT ''
     )""",
-    # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
-    # its read and its write are separate awaits, so two concurrent FIRST logins for one subject can
-    # both observe "no holder" and both bind. Same shape as ux_webauthn_label (ADR 0068 4).
-    # PARTIAL so unfederated rows coexist; Postgres treats NULLs as distinct, so the WHERE states
-    # intent here and is REQUIRED on SQL Server, where NULLs compare equal.
-    """CREATE UNIQUE INDEX IF NOT EXISTS ux_users_federated_subject
-        ON users(oidc_issuer, oidc_subject)
-        WHERE oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL""",
+    # ux_users_federated_subject (BACKLOG #1256) is built in _migrate_lease_columns, after the ADD
+    # of the two columns it keys on; _FEDERATED_SUBJECT_INDEX_DDL says why.
     """CREATE TABLE IF NOT EXISTS roles (
         id           TEXT PRIMARY KEY,
         display_name TEXT NOT NULL,
@@ -1244,6 +1276,12 @@ _SCHEMA.append(_gated_add_column("sessions", "global_epoch", "INTEGER NOT NULL D
 # nothing seals it here.
 _SCHEMA.append(_gated_add_column("users", "cred_digest", "TEXT NOT NULL DEFAULT ''"))
 _SCHEMA.append(_gated_add_column("users", "authz_seal", "TEXT NOT NULL DEFAULT ''"))
+# ADR 0207: the enrolment code's digest, expiry and issuer, for a users table created before them.
+# NULL on an existing row is "no code outstanding", and a NULL column stays out of the user seal
+# (store.py's USER_SEAL_WHEN_SET), so the add re-seals nobody. In _SCHEMA, so no _MIGRATION_REV bump.
+_SCHEMA.append(_gated_add_column("users", "enrolment_code_digest", "TEXT"))
+_SCHEMA.append(_gated_add_column("users", "enrolment_code_expires_at", "DOUBLE PRECISION"))
+_SCHEMA.append(_gated_add_column("users", "enrolment_code_issuer", "TEXT"))
 # BACKLOG #2592: a role's integrity seal. An existing custom role gets an empty seal and grants nothing
 # until an administrator saves it again; store.py's report_unsealed_role_records says why.
 _SCHEMA.append(_gated_add_column("roles", "seal", "TEXT NOT NULL DEFAULT ''"))
@@ -1288,7 +1326,9 @@ _SCHEMA.append(
 # 8 (BACKLOG #1720): the same function's catalog reads are scoped to current_schema(), and the open
 # now checks the live schema before it writes the marker. _SCHEMA is unchanged, so this bump is the
 # only thing that sends a store marked by an earlier build through both once.
-_MIGRATION_REV = 8
+# 9 (BACKLOG #1720): the same function builds ux_users_federated_subject, moved out of _SCHEMA. The
+# _SCHEMA edit moves the hash too; the bump is what the contract above ties the body to.
+_MIGRATION_REV = 9
 
 # BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's plan
 # is pinned by a test; this backend's plan has not been measured. Built in _migrate_lease_columns with
@@ -1315,6 +1355,19 @@ _FIFO_OUT_SEQ_INDEX_DDL = (
 # name dropped here is not expected (BACKLOG #5062).
 _FIFO_IN_DROP_DDL = "DROP INDEX IF EXISTS ix_queue_fifo_in"
 _FIFO_OUT_DROP_DDL = "DROP INDEX IF EXISTS ix_queue_fifo_out"
+# BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself -- its
+# read and its write are separate awaits, so two concurrent FIRST logins for one subject can both
+# observe "no holder" and both bind. Same shape as ux_webauthn_label (ADR 0068 4). PARTIAL so
+# unfederated rows coexist; Postgres treats NULLs as distinct, so the WHERE states intent here and is
+# REQUIRED on SQL Server, where NULLs compare equal. Built after the migration ADDs its two columns
+# (BACKLOG #1720): in _SCHEMA it ran first, and on a users table that predates them, a 0.3.2 one, the
+# build failed with the driver's undefined-column error before the live-schema check could name the
+# store's real differences. SQLite builds it in its _migrate for the same reason.
+_FEDERATED_SUBJECT_INDEX_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_federated_subject"
+    " ON users(oidc_issuer, oidc_subject)"
+    " WHERE oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL"
+)
 #: What the live-schema check expects: the batch, then every index the migration builds or drops, in
 #: the order it runs them. The migration's columns are in the batch's CREATE TABLE statements
 #: already, so it adds none here; a test holds each ADD's type and nullability to that CREATE TABLE.
@@ -1326,6 +1379,7 @@ _MIGRATION_INDEX_DDL: Final = (
     _FIFO_IN_DROP_DDL,
     _FIFO_OUT_DROP_DDL,
     _RECEIVED_INDEX_DDL,
+    _FEDERATED_SUBJECT_INDEX_DDL,
 )
 
 # The live shape, read on the schema transaction's own connection after the batch (BACKLOG #1720).
@@ -1404,6 +1458,37 @@ def _relkind_label(kind: str | None, wanted: tuple[str, ...], label: str) -> str
     if kind is None:
         return None
     return label if kind in wanted else _RELKINDS.get(kind, f"relation of kind {kind!r}")
+
+
+#: A search_path element that names one schema: an unquoted simple name, or a quoted one.
+_SIMPLE_SCHEMA_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+_QUOTED_SCHEMA_NAME = re.compile(r'"((?:[^"]|"")+)"')
+
+
+def _search_path_schemas(path: str, role: str) -> list[str] | None:
+    """The schemas a ``search_path`` setting names, read as Postgres reads them: ``$user`` as
+    ``role``, an unquoted simple name folded to lower case, a quoted one as written. ``None`` for
+    any other element, such as a hyphenated or dotted name or a quoted name a comma split, so a
+    caller reads a path it cannot parse as "cannot show" (PR 2804 fifteenth hold)."""
+    schemas: list[str] = []
+    for element in path.split(","):
+        # Postgres skips ASCII whitespace alone (PR 2804 sixteenth hold); any other space stays in
+        # the element, so it fails the name patterns and reads as "cannot show". A vertical tab,
+        # which PostgreSQL 16 and later also skip, reads as "cannot show" too: closed, not open.
+        item = element.strip(" \t\n\r\f")
+        if not item:
+            continue
+        if item in ("$user", '"$user"'):
+            schemas.append(role)
+            continue
+        quoted = _QUOTED_SCHEMA_NAME.fullmatch(item)
+        if quoted is not None:
+            schemas.append(quoted.group(1).replace('""', '"'))
+            continue
+        if _SIMPLE_SCHEMA_NAME.fullmatch(item) is None:
+            return None
+        schemas.append(item.lower())
+    return schemas
 
 
 def _declared_schema() -> ServerSchemaShape:
@@ -1504,9 +1589,10 @@ _PG_USER_INSERT: Final = (
     " totp_enabled, totp_enrolled_at, totp_recovery_codes, last_totp_step, oidc_issuer,"
     " oidc_subject, directory_object_id, password_claimed_at, channel_scope_source, lock_cycles,"
     " second_step_failed_attempts, second_step_locked_until, second_step_lock_cycles,"
-    " password_generated, session_epoch, cred_digest, authz_seal)"
+    " password_generated, session_epoch, cred_digest, enrolment_code_digest,"
+    " enrolment_code_expires_at, enrolment_code_issuer, authz_seal)"
     " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,"
-    "$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)"
+    "$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)"
 )
 _PG_USER_RESEAL: Final = (
     "UPDATE users SET username=$1, auth_provider=$2, display_name=$3, email=$4, notify_email=$5,"
@@ -1517,7 +1603,8 @@ _PG_USER_RESEAL: Final = (
     " directory_object_id=$23, password_claimed_at=$24, channel_scope_source=$25,"
     " lock_cycles=$26, second_step_failed_attempts=$27, second_step_locked_until=$28,"
     " second_step_lock_cycles=$29, password_generated=$30, session_epoch=$31, cred_digest=$32,"
-    " authz_seal=$33 WHERE id=$34 AND authz_seal=$35"
+    " enrolment_code_digest=$33, enrolment_code_expires_at=$34, enrolment_code_issuer=$35,"
+    " authz_seal=$36 WHERE id=$37 AND authz_seal=$38"
 )
 _PG_USER_ROLE_INSERT: Final = (
     "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by) VALUES ($1,$2,$3,$4)"
@@ -1662,30 +1749,90 @@ def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
     The builder refuses the hop's own TLS settings with a ``ValueError``, at least for the pin
     file, the CRL file and its dates, and the suites; typed, such a refusal is could not start
     rather than the CLI floor's exit 1. Not an ``OSError`` that is also a ``ValueError``, such as a
-    CRL staging copy that failed: that is a fault of the host, not a verdict on the settings, and
-    keeps its own type. Nor an ``OSError`` alone, such as a CRL file the engine may not read, which
-    this does not catch (a pin file it may not read arrives as a ``ValueError`` naming the setting,
-    and is typed).
+    CRL staging copy that failed: that is a fault of the host, not a verdict on the settings, and is
+    raised as a :class:`_TlsHostFault`, which has both bases. Nor an ``OSError`` alone, such as a
+    CRL file the engine may not read, which this does not catch (a pin file it may not read arrives
+    as a ``ValueError`` naming the setting, and is typed).
 
     **A codec error is neither quoted nor chained**, as
     :func:`~messagefoundry.store.base.build_store_cipher` does not chain one (BACKLOG #2532,
     #3471): its text names a byte of what it decoded. A ``ValueError`` that is one, holds one, or
-    has one on its chain is refused with a fixed text naming the settings and the class, raised
-    outside the handler. Not its ``codec_safe_str`` rendering: the CRL judge re-raises a codec
-    error as a ``ValueError`` whose own text already quotes the byte, which that rendering prints
-    whole. Every other ``ValueError`` keeps its text and its chain."""
+    has one on its chain, or whose chain cannot be read whole, is refused with a fixed text naming
+    the settings and which of the two it is, raised outside the handler (BACKLOG #4882). Not its
+    ``codec_safe_str`` rendering: the CRL judge re-raises a codec error as a ``ValueError`` whose
+    own text already quotes the byte, which that rendering prints whole. It names no class, as
+    :func:`~messagefoundry.store.base._codec_safe_refusal`'s fallback names none (the third hold
+    on engine PR 2818). Every other ``ValueError`` is refused with a fixed text naming the
+    settings and what they must hold (the seventh hold).
+
+    NO ``ValueError`` IS PASSED THROUGH (the eighth hold). Every refusal of one here is a new
+    exception, raised outside the handler ``from None``, with a fixed text chosen by the builder's
+    error's class as read with ``type``: a hop refusal as an ``InsecureHopRefused``, a
+    ``StoreTlsRefused`` kept as one with the settings text, and a host fault that is also a
+    ``ValueError`` as :class:`_TlsHostFault`. Nothing is read from the error and no chain is kept,
+    so its text, the ``ssl`` or ``cryptography`` library's included, is not printed from here. At
+    least an error of the builder's that is not a ``ValueError``, such as a plain ``OSError`` or an
+    ``ssl.SSLError``, is not caught here and leaves as it is."""
     try:
-        return _verifying_context(settings)
-    except ValueError as exc:
-        if isinstance(exc, (InsecureHopRefused, OSError)):
-            raise
-        if not _carries_a_codec_error(exc):
-            raise StoreTlsRefused(str(exc)) from exc
-        kind = type(exc).__name__
-    raise StoreTlsRefused(
-        "the PostgreSQL store's TLS context could not be built from [store].ssl_root_cert, "
-        f"[store].ssl_crl_file or the system trust store: a {kind} from a codec error, not quoted"
-    )
+        try:
+            return _verifying_context(settings)
+        except ValueError as exc:
+            kind = type(exc)
+            judged = not issubclass(kind, (InsecureHopRefused, OSError))
+            reading = _codec_chain_reading(exc) if judged else None
+        # Built outside the handler, so nothing raised here has the builder's error as its
+        # context; chosen by the class alone, read with ``type``, so nothing is read from the error.
+        # A ``StoreTlsRefused`` is a refusal of the settings, not of the posture.
+        refusal: ValueError
+        if issubclass(kind, StoreTlsRefused):
+            refusal = StoreTlsRefused(_TLS_REFUSED)
+        elif issubclass(kind, InsecureHopRefused):
+            refusal = InsecureHopRefused(_TLS_HOP_REFUSED)
+        elif issubclass(kind, OSError):
+            refusal = _TlsHostFault(_TLS_HOST_FAULT)
+        elif reading is None:
+            refusal = StoreTlsRefused(_TLS_REFUSED)
+        else:
+            refusal = StoreTlsRefused(f"{_TLS_UNBUILT}: an error {reading}, not quoted")
+        raise refusal from None
+    finally:
+        # In ``finally``, so a line held for a judgement that an interrupt escaped is still written
+        # here, not by a later, unrelated refusal on this thread.
+        _flush_unjudged()
+
+
+class _TlsHostFault(OSError, ValueError):
+    """A fault of the host while :func:`_verifying_context` built the context, such as a CRL
+    staging copy that failed, raised in place of the builder's own with a fixed text (the eighth
+    hold on engine PR 2818). Both bases, as the builder's ``_CrlStagingFailed`` has, so a caller
+    catching either still catches it."""
+
+
+#: What every :class:`StoreTlsRefused` from :func:`_verifying_context_at_open`'s handler opens with.
+_TLS_UNBUILT = (
+    "the PostgreSQL store's TLS context could not be built from [store].ssl_root_cert, "
+    "[store].ssl_crl_file or the system trust store"
+)
+
+#: The text of a hop refusal the builder raised, replaced at the open (the eighth hold). The
+#: builder takes no posture, so this names the settings it reads, not a posture lever.
+_TLS_HOP_REFUSED = (
+    f"{_TLS_UNBUILT}: the store hop was refused by the engine's TLS checks on those settings; the "
+    "refusal's own text is not shown"
+)
+
+#: The text of a host fault the builder raised, replaced at the open (the eighth hold).
+_TLS_HOST_FAULT = (
+    f"{_TLS_UNBUILT}: the host could not stage or read a file those settings name; the error's "
+    "own text is not shown"
+)
+
+#: The refusal of every other ``ValueError`` the builder raises at the open (the seventh hold).
+_TLS_REFUSED = (
+    f"{_TLS_UNBUILT}: the pin file must hold a readable CA certificate, the CRL file readable CRLs "
+    "in effect from a CA the hop already trusts, and the hop's suites must narrow to the approved "
+    "list; the error's own text is not shown"
+)
 
 
 def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
@@ -2040,6 +2187,7 @@ class PostgresStore:
         try:
             await store._ensure_schema(create=create, read_only=read_only)
             if not read_only:
+                await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
@@ -2154,6 +2302,53 @@ class PostgresStore:
             yield store
         finally:
             await store.close()
+
+    @classmethod
+    async def schema_meta_anywhere(
+        cls, settings: StoreSettings, *, posture: HopPosture | None = None
+    ) -> bool | None:
+        """Whether a schema this connection's search_path names holds a relation or type under
+        a table or index name :func:`_declared_schema` declares (PR 2804 fourteenth to sixteenth holds), or ``None`` when
+        that cannot be shown. The path is ``db_schema`` when it is set, else the role's own path, read
+        by :func:`_search_path_schemas`; an element it cannot read as one schema name, or a path
+        that names none, is ``None``. Names are bound as ``text[]`` and cast to ``name[]`` in SQL,
+        which truncates as Postgres does, where a bound ``name`` too long is refused.
+        Read from ``pg_catalog.pg_class``, which lists every relation to every role whatever its
+        schema privileges, where ``to_regclass`` skips a schema the role has no USAGE on. A schema
+        the path does not name, such as another install's ``db_schema``, is not asked. A missing
+        row is ``None``. Reads only."""
+        async with (
+            cls._one_connection_store(settings, posture=posture) as store,
+            store._timed_acquire() as conn,
+        ):
+            setting = await conn.fetchrow(
+                "SELECT current_setting('search_path') AS path, current_user::text AS who"
+            )
+            if setting is None:
+                return None
+            schemas = _search_path_schemas(str(setting["path"]), str(setting["who"]))
+            # An index shares the relation namespace, so its name collides as a table's does.
+            declared = _declared_schema()
+            tables = sorted({*declared.columns, *declared.named_indexes})
+            if not schemas or not tables:
+                return None
+            # Any relation or type under a store table's name, a view, sequence or enum
+            # included: each breaks the create as a table does (PR 2804 sixteenth hold).
+            row = await conn.fetchrow(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c"
+                " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+                " WHERE n.nspname = ANY($1::text[]::name[])"
+                " AND c.relname = ANY($2::text[]::name[]))"
+                " OR EXISTS (SELECT 1 FROM pg_catalog.pg_type t"
+                " JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace"
+                " WHERE n.nspname = ANY($1::text[]::name[])"
+                " AND t.typname = ANY($2::text[]::name[])) AS found",
+                schemas,
+                tables,
+            )
+        if row is None or row["found"] is None:
+            return None
+        return bool(row["found"])
 
     @classmethod
     async def probe_privileges(
@@ -2293,9 +2488,15 @@ class PostgresStore:
                 except Exception as exc:
                     # 55P03 is lock_not_available (asyncpg's LockNotAvailableError), read off the
                     # error rather than by importing the lazy driver.
+                    translated = None
                     if driver_sqlstate(exc) == _LOCK_NOT_AVAILABLE:
-                        raise SchemaDdlLockTimeout(self.backend, lock, wait) from exc
-                    raise
+                        translated = SchemaDdlLockTimeout(self.backend, lock, wait)
+                    # Raised inside the transaction, before its commit, so the batch rolls back
+                    # and nothing was sealed under a minted key (PR 2804 hold 17).
+                    failure = create_batch_failure(exc, translated)
+                    if failure is exc:
+                        raise
+                    raise failure from failure.__cause__
         log.info("postgres: schema DDL batch applied (%s…)", expected[:12])
         return True
 
@@ -2467,9 +2668,10 @@ class PostgresStore:
         open. Gating on ``information_schema`` keeps re-opens of an already-migrated DB lock-free
         (this runs under the schema advisory lock alongside the CREATEs). Also creates the lease
         index here — AFTER the columns are guaranteed present — since on a Step-1 table the index
-        would reference a not-yet-added column if it lived in the _SCHEMA loop. Also runs the index
-        builds that need asyncpg's client timeout lifted (the FIFO covering indexes and
-        ix_messages_received), which the _SCHEMA loop cannot give per statement.
+        would reference a not-yet-added column if it lived in the _SCHEMA loop, and for the same
+        reason builds ux_users_federated_subject after the users ADD loop (BACKLOG #1720). Also
+        runs the index builds that need asyncpg's client timeout lifted (the FIFO covering indexes
+        and ix_messages_received), which the _SCHEMA loop cannot give per statement.
 
         Every catalog read here is scoped to ``current_schema()``, the schema the unqualified DDL
         resolves into (BACKLOG #1720). Unscoped, a second store in another schema of the same database
@@ -2560,6 +2762,7 @@ class PostgresStore:
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
+        await conn.execute(_FEDERATED_SUBJECT_INDEX_DDL)
         # Claimed-ness (BACKLOG #1245): whether the holder has ever set their own credential. It was
         # added for the first-run account's auto-retirement, and ADR 0183 Amendment A retired that
         # account and its one reader. The column stays, because its writers stay and the fact it
@@ -3042,14 +3245,18 @@ class PostgresStore:
         ``rotate_session`` and ``revoke_user_sessions`` finish what an auth change started: a reset
         password, a disabled account, a changed role, a completed factor ceremony. By the time they
         run, that change is committed. Under ``[store].acquire_timeout`` a saturated pool would make
-        them raise after it, and nothing retries them: a reset password would leave every other
-        session live with no audit row, and a factor ceremony would leave the old token elevated and
-        unrotated. Waiting for a connection instead finishes the write once the pool frees, which is
-        what both did before BACKLOG #2283 moved them onto the bounded ``_execute``.
+        them raise after it: a reset password would leave every other session live, and a factor
+        ceremony would leave the old token elevated and unrotated. Waiting for a connection instead
+        finishes the write once the pool frees, which is what both did before BACKLOG #2283 moved
+        them onto the bounded ``_execute``.
 
-        This closes the gap at these two statements only. The same callers make other bounded
-        writes after their change commits, such as stamps and audit rows, and any of those can
-        still fail at the limit.
+        Waiting answers a pool shortage only. A statement timeout or a lost connection still fails
+        either write. The auth service runs a revoke that follows a committed change again, a
+        bounded number of times, and audits one refused every time
+        (``AuthService._revoke_after_commit``, vault BACKLOG #3023); a refused rotation is its
+        fail-closed branch. This closes the gap at these two statements only. The same callers make
+        other bounded writes after their change commits, such as stamps and audit rows, and any of
+        those can still fail at the limit.
 
         Not every caller has committed first. At least "sign out everywhere else", an
         administrator's force sign-out and the directory reconciler when it writes no roles have no
@@ -9809,6 +10016,54 @@ class PostgresStore:
         change = totp_enable(recovery_code_hashes, now, expected_secret_cell=expected_secret_cell)
         return await self._write_user_txn(user_id, change) is not None
 
+    # --- ADR 0207: the directory account's enrolment code (Store protocol states the contract) ---
+    # One conditional sealed write each, through ``_write_user`` in a transaction of its own, with
+    # the account row locked; store.py's change builders hold every condition.
+
+    async def issue_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        code_digest: str,
+        expires_at: float,
+        issuer_id: str | None,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = enrolment_code_issue(
+            code_digest=code_digest, expires_at=expires_at, issuer_id=issuer_id, now=now
+        )
+        return change.outcome(await self._write_user_txn(user_id, change))
+
+    async def revoke_enrolment_code(self, user_id: str, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        return await self._write_user_txn(user_id, enrolment_code_revoke(now)) is not None
+
+    async def spend_enrolment_code(
+        self, user_id: str, *, code_digest: str, now: float | None = None
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = enrolment_code_spend(code_digest=code_digest, now=now)
+        return change.outcome(await self._write_user_txn(user_id, change))
+
+    async def enable_totp_spending_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        code_digest: str,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = totp_enable_spending_code(
+            recovery_code_hashes,
+            now,
+            expected_secret_cell=expected_secret_cell,
+            code_digest=code_digest,
+        )
+        return change.outcome(await self._write_user_txn(user_id, change))
+
     async def replace_totp_enrolment(
         self,
         user_id: str,
@@ -9904,7 +10159,7 @@ class PostgresStore:
     ) -> None:
         now = time.time() if now is None else now
         await self._write_user_txn(
-            user_id, lambda r: r.changed(disabled=bool(disabled), updated_at=float(now))
+            user_id, lambda r: user_disabled_change(r, disabled=disabled, now=now)
         )
 
     async def update_user_profile(
@@ -10177,7 +10432,7 @@ class PostgresStore:
                     return False  # nothing written; the commit releases the lock
             if change is AdminRemoval.DISABLE:
                 await self._write_user(
-                    conn, user_id, lambda r: r.changed(disabled=True, updated_at=float(now))
+                    conn, user_id, lambda r: user_disabled_change(r, disabled=True, now=now)
                 )
             elif change is AdminRemoval.DELETE:
                 await self._delete_user_rows(conn, user_id)
@@ -10213,24 +10468,32 @@ class PostgresStore:
             assigned_by=assigned_by,
             now=now,
         )
-        async with self._timed_acquire() as conn, conn.transaction():
-            await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
-            rows = await conn.fetch(
-                _PG_SQL_ADMIN_GUARD_HOLDERS,
-                user_id,
-                admin_role_id,
-            )
-            _, others = await admin_guard_counts(
-                [(str(r["id"]), bool(r["is_target"])) for r in rows],
-                self._row_sealer,
-                lambda holder: self._read_user_record(conn, holder, lock=False),
-                counts_as_admin,
-                role_id=admin_role_id,
-            )
-            if others:
-                return AdminGrant.ADMIN_EXISTS  # nothing written; the commit releases the lock
-            if await self._write_user(conn, user_id, change) is None:
-                return AdminGrant.ACCOUNT_CHANGED
+        try:
+            async with self._timed_acquire() as conn, conn.transaction():
+                await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
+                rows = await conn.fetch(
+                    _PG_SQL_ADMIN_GUARD_HOLDERS,
+                    user_id,
+                    admin_role_id,
+                )
+                _, others = await admin_guard_counts(
+                    [(str(r["id"]), bool(r["is_target"])) for r in rows],
+                    self._row_sealer,
+                    lambda holder: self._read_user_record(conn, holder, lock=False),
+                    counts_as_admin,
+                    role_id=admin_role_id,
+                )
+                if others:
+                    return AdminGrant.ADMIN_EXISTS  # nothing written; the commit releases the lock
+                if await self._write_user(conn, user_id, change) is None:
+                    return AdminGrant.ACCOUNT_CHANGED
+                # BACKLOG #3078 F2, as on SQLite. After the write, which holds the account row FOR
+                # UPDATE as every passkey write does, so a passkey committed before it is seen here
+                # and a later one waits for this commit. The raise rolls the role write back.
+                if await conn.fetchval(_PG_WEBAUTHN_ANY_FOR_USER, user_id) is not None:
+                    raise _GrantRolledBack
+        except _GrantRolledBack:
+            return AdminGrant.ACCOUNT_CHANGED
         return AdminGrant.GRANTED
 
     @staticmethod
@@ -10419,6 +10682,24 @@ class PostgresStore:
             await self._write_user(
                 conn, user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
             )
+
+    async def set_user_roles_if_held(
+        self,
+        user_id: str,
+        role_ids: Sequence[str],
+        *,
+        expected_role_ids: Iterable[str],
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """The compare-and-set role write (vault BACKLOG #3085); see ``AuthStore``. The compare
+        runs on the row ``_write_user`` reads ``FOR UPDATE``, so a concurrent writer waits."""
+        now = time.time() if now is None else now
+        change = roles_if_held(
+            role_ids, expected_role_ids=expected_role_ids, assigned_by=assigned_by, now=now
+        )
+        async with self._timed_acquire() as conn, conn.transaction():
+            return await self._write_user(conn, user_id, change) is not None
 
     async def set_user_channel_scope(
         self,
@@ -11446,6 +11727,34 @@ class PostgresStore:
             audit=await self._count("audit_log"),
             synchronous=None,  # SQLite-only knob; Postgres WAL durability is not a per-store PRAGMA
         )
+
+    async def table_occupancy(self) -> dict[str, bool]:
+        """See :meth:`Store.table_occupancy`: the ordinary and partitioned tables in the schema
+        that holds the store's own ``schema_meta`` (``pg_catalog.to_regclass`` resolves the
+        unqualified name through the pool's ``search_path``), less the tables an extension owns
+        (a ``pg_depend`` row of type ``e``). A table of another owner there still counts: a later
+        ``provision-schema`` run under another role may have made a store table. Read from
+        ``pg_catalog`` by the stored name; each probe names the schema too, because an
+        unqualified name would resolve through ``pg_catalog`` first."""
+        rows = await self._fetchall(
+            "SELECT n.nspname AS s, c.relname AS t FROM pg_catalog.pg_class c"
+            " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+            " JOIN pg_catalog.pg_class m ON m.oid = pg_catalog.to_regclass('schema_meta')"
+            " WHERE c.relkind IN ('r', 'p') AND c.relnamespace = m.relnamespace"
+            " AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d"
+            " WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = c.oid"
+            " AND d.deptype = 'e')"
+        )
+        occupancy: dict[str, bool] = {}
+        for row in rows:
+            schema, table = str(row["s"]), str(row["t"])
+            qualified = ".".join('"' + name.replace('"', '""') + '"' for name in (schema, table))
+            occupancy[table] = bool(
+                await self._fetchval(
+                    f"SELECT EXISTS (SELECT 1 FROM {qualified}{seed_filter_clause(table)})"
+                )
+            )
+        return occupancy
 
     async def integrity_check(self) -> tuple[bool, str]:
         # A connectivity probe; deep checks (amcheck / pg_amcheck) are an out-of-band DBA task.
