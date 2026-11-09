@@ -2622,7 +2622,7 @@ another database on the same server, which a statement can still reach by a thre
 |---|---|
 | clean | logs one INFO line |
 | a role beyond read, such as `db_datawriter`, `db_owner` or `sysadmin` | logs a WARNING naming each role. **Nothing is refused**: the lookup or sync goes ahead |
-| a role that reads NULL, or a value that is neither a 1 nor an integer 0 | logs a WARNING that it **cannot judge** the login. A NULL means the name did not resolve for this login, so it is never read as "not a member", and never as clean |
+| a role that reads NULL, or any value but an integer or boolean 0 or 1, such as the text `"1"` | logs a WARNING that it **cannot judge** the login. A NULL means the name did not resolve for this login, so it is never read as "not a member", and never as clean |
 | no answer: the borrow timed out, the statement failed, or no row came back | logs a WARNING that the probe did not run, naming the timeout, the SQLSTATE or the error type, never the driver's message. The lookup or sync goes ahead |
 
 The warning names the connection as `db_lookup:<name>` or `reference:<name>`, and never the server,
