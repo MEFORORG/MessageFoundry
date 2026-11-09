@@ -620,13 +620,17 @@ blind sample optional. Three things change here.
   holding more than 3 disagreements is a breach, with the 60 fresh ratings to recover. Fewer than
   60 ratings no longer holds a class back, so AC-7's *"calibrated only at 60 rated samples"* and
   the gate section's *"Today it answers REVIEW (or HALT) for every seat"* are superseded.
-- **The gate needs the act to say what it touches**: `-Touches <paths>` or `-TouchesNothing`.
-  Neither is REVIEW, and so is a path `Get-DecisionClassCPath` names or cannot classify. The
-  paths are the session's own statement and the list is a denylist naming at least the Class C
-  paths, so a NO-REVIEW still never shows the act is not a security control. The record schema
-  gains `touches`, still version 1, filled empty for an older record.
+- **The gate needs the act to name every path it changes**, with `-Touches`. No path is REVIEW,
+  since an act that changes no file has no git undo, and so is a path `Get-DecisionClassCPath`
+  names or cannot classify. The paths are the session's own statement and the list is a denylist
+  naming at least the paths plan R3 lists, not every security path, so a NO-REVIEW still never
+  shows the act is not a security control. The record schema gains `touches`, still version 1,
+  filled empty for an older record.
+- **A seat is read through `docs/roles/seats.json`**: an alias shares its seat's calibration and
+  budget, and a label the roster does not resolve answers REVIEW. A signal outcome is never a
+  decision's latest outcome, so a hold or red logged after a reversal does not hide it.
 - **The digest's calibration table** gains the two signal rates.
 
-**Designed, not built:** a writer that records `red-after-merge` and `held` as they happen. Until
-one exists those two signals count only what a seat logs by hand. The UNKNOWN cost reading still
+**Designed, not built:** a writer for any of the three signals. Every input is an `outcome` record
+a seat logs by hand, so a seat that logs none reads clean. The UNKNOWN cost reading still
 answers REVIEW, and the kill switch, the reversal budget and the chain limit are unchanged.

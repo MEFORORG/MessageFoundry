@@ -80,7 +80,7 @@ It replaces the driver skill's decision process and becomes the default for ever
   - it is not a security control;
   - live state was read this turn;
   - no earlier decision on the same item was reversed;
-  - the class is in calibration by the automated signals (section 4.2).
+  - the class is in calibration by the signals in section 4.2.
 
   `scripts/coord/decision.ps1 -Gate` checks the conditions it can see, and says which ones it cannot (ADR 0211). Its NO-REVIEW is necessary, not sufficient.
 - **Otherwise, run adversarial review.** Use a fresh context, on a different model where one is available. The reviewer must state what reading would refute the proposal. Act only on an affirmative. A split goes to the Class C bundle.
@@ -108,7 +108,7 @@ Order of operations: **build these, then retire the owner's plan go, then widen 
 
    It is private, so it lives in the vault.
 2. **Calibration by automated signals, and optional blind sampling** (amended 2026-11-09, section 12).
-   - A class stays on the T1 fast path for a seat only while each automated signal over its trailing 14 days stays at 5% or less: the reversal rate (a reversal is a revert, a reopen, a re-brief or an override), the rate of decisions with a required check red after merge, and the rate with a Lander hold. These are at least the signals; more may be added.
+   - A class stays on the T1 fast path for a seat only while each automated signal over its trailing 14 days stays at 5% or less: the reversal rate (a reversal is a revert, a reopen, a re-brief or an override), the rate of decisions with a required check red after merge, and the rate with a Lander hold. These are at least the signals; more may be added. The arithmetic is automatic; its inputs are `outcome` records seats log by hand (section 12).
    - Blind sampling is **optional**. When you rate, the digest shows you 5 Class B decisions, or 10% of them if that is more, **with the Recommended mark hidden**, and records your pick. More than 3 disagreements in any trailing 60 of your ratings is a breach, and it drops that class back to the review path for that seat until 60 fresh ratings pass. Fewer than 60 ratings no longer holds a class back.
    - An adversarial reviewer that rejects under 5% of the time over 50 runs is treated as broken.
    - *Retired 2026-11-09:* this read "A class stays autonomous for a seat only while your disagreement on its trailing 60 blind samples is 3 or fewer" and "**Owner cost: about 10 minutes a day.**"
@@ -262,13 +262,13 @@ T2, which would have moved playbook, skill, CLAUDE.md, hook and workflow edits t
 - **T3, reclaim and spawn.** Taking over a verified-dead holder's worktree, branch or claim becomes Class B, after anchoring the work. Dead means dead for more than 2 hours, matching the held-PR repair window in CLAUDE.md section 5. Builders may spawn a session for their own fixes. Managers pick and decompose ledger work themselves.
 - **T4, ADR-bound scope.** Ledger rows and work an accepted ADR names as its direction become Class B. Genuinely new product directions stay Class C.
 
-**Unchanged, and still the owner's in person:** register signing, money, credentials, irreversible acts, merging (the Lander's), the PHI rules, branch protection, and weakening a control.
+**Unchanged, at least:** register signing, money, credentials, irreversible acts, the PHI rules, branch protection and weakening a control stay the owner's in person; merging stays the Lander's; and every other Class C item in R3 stays Class C.
 
 **What is built, and what is not.**
 
-- **Built:** `scripts/coord/decision.ps1 -Gate` reads calibration as the automated signals: the reversal rate, and `outcome` records marked `red-after-merge` or `held`, each over 14 days at 5% or less, plus any blind-sample breach. It needs the act to state what it touches, `-Touches <paths>` or `-TouchesNothing`, and answers REVIEW for a path on its Class C denylist (`_decisionlog.ps1` `Get-DecisionClassCPath`) or a path it cannot classify. An UNKNOWN cost reading still answers REVIEW.
-- **Rules, not controls:** the paths are the session's own statement, and the denylist names at least the Class C paths, not every one; "not a security control", "one item", "live state read" and "a single revert undoes it" are the session's judgment, which the gate cannot see. Nothing makes a session run the gate before it acts.
-- **Designed, not built:** a writer that records `red-after-merge` and `held` outcomes as they happen. Until one exists, those two signals count only what a seat logs by hand, and the reversal rate, the reversal budget and the chain limit carry the weight. A tripwire that stops an act touching a Class C path is still designed, not built (section 4.4).
+- **Built:** `scripts/coord/decision.ps1 -Gate` computes calibration from the signals: the reversal rate, and the rates of decisions whose `outcome` records mark `red-after-merge` or `held`, each over 14 days at 5% or less and leaving out decisions it answered HALT, plus any blind-sample breach. It reads a seat through `docs/roles/seats.json`, so an alias shares its seat's calibration and budget, and an unknown seat answers REVIEW. It needs the act to name every path it changes with `-Touches`; no path, a path on its Class C denylist (`_decisionlog.ps1` `Get-DecisionClassCPath`), or a path it cannot classify answers REVIEW, so an act that changes no file has no fast path. An UNKNOWN cost reading still answers REVIEW.
+- **Rules, not controls:** the paths are the session's own statement. The denylist names at least the paths R3 lists, and not every security path. "Not a security control", "one item", "live state read" and "a single revert undoes it with no effect outside git" are the session's judgment, which the gate cannot see. Nothing makes a session run the gate before it acts.
+- **Designed, not built:** a writer for any of the three signals. The arithmetic is automatic, but every input is an `outcome` record a seat logs by hand with `decision.ps1 -Log -Kind outcome`; a seat that logs none reads 0% on all three. Until a writer exists, the reversal budget, the chain limit and the gate's path check bound the fast path more than calibration does. Deriving the touched paths from the act's branch diff, rather than the session's list, is designed, not built, as is a tripwire that stops an act touching a Class C path (section 4.4).
 
 **R5.** The owner exempted this change from ledger ruling R5's freeze on new method rules (answer 2 above). The exemption covers this change only.
 
