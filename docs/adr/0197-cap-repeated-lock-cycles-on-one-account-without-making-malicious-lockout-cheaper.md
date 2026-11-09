@@ -1579,8 +1579,10 @@ At least these checks run, in this order:
 1. the scoped read of the message: 404 when it is unknown or outside the caller's scope, and 423,
    which gives the proof back, when an in-scope row's cells fail their integrity tag;
 2. the scope check on the target, 403, with its `auth.channel_denied` audit row;
-3. the engine-wide ingress guard (the NUL rule and the 16 MiB ceiling), whose refusal gives the
-   proof back;
+3. the engine-wide ingress guard for a direct target, which here refuses a body holding a NUL
+   byte, and whose refusal gives the proof back. Its 16 MiB ceiling is not reached on this route,
+   because `_limit_request_body` refuses any request body over 1 MiB with a 413 before the
+   handler runs;
 4. the registry checks on the target: 404 when it is not registered, 409 when it is not deployed,
    is owned by another engine shard or is not running;
 5. the 409 for a refused body stored only as its head, the last check before the store write.
@@ -1596,6 +1598,8 @@ origin inbound is registered here.
 proof back, at least the 400 for a request with neither a target nor a re-route and the ingress
 guards' 413, 415 and 422. A refusal from the store call on keeps the spend, as before.
 `tests/test_bound_step_up_injection.py` pins one case per spending status and a 400 and a 422
-still refunding, and steps 2 to 4 of the direct-mode order: a body the guard refuses gets the
-same answer for a running target and for one that fails step 4, and the scope check stays ahead
-of the guard.
+still refunding, and two parts of the direct-mode order: a body the guard refuses gets the
+same answer for a running target and for each of four step-4 refusals (not registered, not
+deployed, owned by another engine shard, not running), and the out-of-scope 403 stays ahead of
+the guard. It does not pin the step-4 404 for an engine with no registry graph, nor the one raised
+when `outbound_running` finds no such lane.
