@@ -79,6 +79,9 @@ _REFUSED: dict[str, bytes] = {
     "content-length with a plus sign": _POST + b"Content-Length: +2\r\n\r\n{}",
     "content-length with an underscore": _POST + b"Content-Length: 0_2\r\n\r\n{}",
     "content-length negative": _POST + b"Content-Length: -5\r\n\r\n{}",
+    # An empty Transfer-Encoding after a Content-Length; ahead of one, it passes (_FRAMED).
+    "content-length, then an empty transfer-encoding": _POST
+    + b"Content-Length: 2\r\nTransfer-Encoding: \r\n\r\n{}",
     "obs-folded transfer-encoding": _POST + b"Transfer-Encoding:\r\n chunked\r\n\r\n0\r\n\r\n",
     "head ended by bare LFs": b"POST /health HTTP/1.1\nHost: localhost\nContent-Length: 2\n\n{}",
     "bare CR inside a header line": _POST
@@ -118,11 +121,11 @@ _FRAMED: dict[str, tuple[bytes, list[int]]] = {
         _POST + b"Transfer-Encoding:  CHUNKED \r\n\r\n0\r\n\r\n",
         [411, 200],
     ),
-    # BACKLOG #5345: an empty Transfer-Encoding passes llhttp, which frames by Content-Length or
-    # reads no body. The refusal is the app's, by the header's presence: 411 alone, 400 beside a
+    # BACKLOG #5345: an empty Transfer-Encoding ahead of any Content-Length passes llhttp, which
+    # frames by Content-Length or reads no body. The refusal is the app's, by the header's presence: 411 alone, 400 beside a
     # Content-Length. The 200 after it shows the body was read to the length it declared.
     "transfer-encoding empty": (_POST + b"Transfer-Encoding: \r\n\r\n", [411, 200]),
-    "transfer-encoding empty, with a content-length": (
+    "transfer-encoding empty, then a content-length": (
         _POST + b"Transfer-Encoding: \r\nContent-Length: 2\r\n\r\n{}",
         [400, 200],
     ),

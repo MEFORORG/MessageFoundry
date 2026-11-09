@@ -4,9 +4,10 @@
   framed as chunked by the llhttp parser `serve` pins, so with no `Content-Length` the limit admitted
   the chunked body at any size: a public route that reads a body, such as `POST /auth/login`, would
   read it unbounded before any authentication; a gated route refuses a caller with no identity
-  before reading the body. Under `serve`, an empty `Transfer-Encoding` beside a `Content-Length`
-  also reached a route. The limit also read the length with `int()`, which takes `+2`, `-5` and
-  `0_2`, and read only the first of several `Content-Length` lines. Now any `Transfer-Encoding`
+  before reading the body. Under `serve`, an empty `Transfer-Encoding` ahead of a `Content-Length`
+  also reached a route. On a server other than the one `serve` pins, which refuses these first, the
+  limit also took `+2`, `-5` and `0_2` as lengths through `int()`, and read only the first of
+  several `Content-Length` lines. Now any `Transfer-Encoding`
   line, whatever its value, is refused **411**, or **400** beside a `Content-Length`; a
   `Content-Length` must be one line of plain decimal digits or the request is refused **400**; and
   the 1 MiB cap on the declared length is unchanged. [SECURITY.md](../docs/SECURITY.md) control 5

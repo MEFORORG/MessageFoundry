@@ -4808,8 +4808,8 @@ def create_app(
             )
         if not lengths:
             return None
-        # One line holding `1*DIGIT` (RFC 9112 §6.2), the rule the inbound HTTP listener applies, not
-        # int(): int() takes `+2`, `-5` and `0_2`, and a repeated line is a second framing claim.
+        # One line holding `1*DIGIT` (RFC 9112 §6.2), not int(): int() takes `+2`, `-5` and `0_2`,
+        # and a repeated line is a second framing claim.
         value = lengths[0].strip(" \t")
         if len(lengths) > 1 or not (value.isascii() and value.isdigit()):
             return refuse(400, "invalid Content-Length", "invalid Content-Length")
