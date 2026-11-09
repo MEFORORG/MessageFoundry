@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterator
@@ -2174,7 +2175,7 @@ class UploadStore:
                 with _pair_lock(self._root / LOCK_FILE_NAME, for_reseal=True):
                     pass
             except OSError as exc:
-                blocked = _pair_lock_failure(exc)
+                blocked = _pair_lock_failure(exc, self._root)
                 if blocked == "gone":
                     # The root went after the listing: the BACKLOG #4940 outcome, not N lost bodies.
                     return ResealResult(root_missing=True)
@@ -2386,18 +2387,18 @@ class UploadStore:
                 changed,
             )
             return _Half.SKIPPED
-        except FileNotFoundError:
-            # The target's own absence is _ChangedUnderReseal, so this is the root, or this pass's
-            # temp file in it. Its error would name the lock file when the root went before the
-            # lock's open, so this half's warning does not give it as the cause.
-            _log.warning(
-                "uploaded file %s (%s): skipped, could not be written: the uploads directory, or "
-                "this pass's temp file in it, is gone",
-                fid,
-                kind,
-            )
-            return _Half.SKIPPED
         except OSError as exc:
+            if isinstance(exc, FileNotFoundError) and not os.path.isdir(self._root):
+                # The target's own absence is _ChangedUnderReseal, and the root is gone. Its error
+                # would name the lock file when the root went before the lock's open, so this
+                # half's warning does not give it as the cause.
+                _log.warning(
+                    "uploaded file %s (%s): skipped, could not be written: the uploads directory, "
+                    "or this pass's temp file in it, is gone",
+                    fid,
+                    kind,
+                )
+                return _Half.SKIPPED
             # The write failed and the temp-and-replace left the file as it was. A skip, like a read
             # failure, so one file that cannot be written does not stop the pass.
             _log.warning(
@@ -3261,24 +3262,44 @@ class _PairLockBusy(TimeoutError):
 
 type _PairLockFailure = Literal["busy", "gone", "timeout", "refused", "failed"]
 
-#: What opening the lock path raises on POSIX when something planted there is not a regular file: a
-#: directory (``EISDIR``) or a socket (``ENXIO``). Like a planted link, that is a refusal, so it gets
-#: the once-per-process ERROR and the advice to remove it.
-_NOT_A_FILE = frozenset({errno.EISDIR, errno.ENXIO})
+
+def _not_a_file_errnos(platform: str) -> frozenset[int]:
+    """What opening the lock path raises on ``platform`` when something planted there is not a
+    regular file. ``EISDIR``: a directory. ``ENXIO``: a socket, on Linux. On macOS and the BSDs,
+    ``EOPNOTSUPP`` is a socket and ``EFTYPE`` is a link that ``O_NOFOLLOW`` refused, as NetBSD
+    reports one; ``EMLINK`` is such a link on FreeBSD and DragonFly. Never on Linux, where
+    ``EOPNOTSUPP`` is ``ENOTSUP`` and comes from a FUSE or 9p mount, not a planted file."""
+    codes = {errno.EISDIR, errno.ENXIO}
+    if platform.startswith(("darwin", "freebsd", "openbsd", "netbsd", "dragonfly")):
+        codes.add(errno.EOPNOTSUPP)
+        eftype = getattr(errno, "EFTYPE", None)
+        if eftype is not None:
+            codes.add(eftype)
+    if platform.startswith(("freebsd", "dragonfly")):
+        codes.add(errno.EMLINK)
+    return frozenset(codes)
 
 
-def _pair_lock_failure(exc: OSError) -> _PairLockFailure:
-    """Why :func:`_pair_lock` could not take the lock. ``busy``: another holder kept it past the wait.
-    ``gone``: the uploads root is not there. ``timeout``: the OS timed out (``ETIMEDOUT``), as a
-    network file system can. ``refused``: the file system refused this account
-    (``atomic_edit._REFUSED``), such as a lock file another account owns; ``edit_lock`` also raises
-    ``busy_error`` for a lock path planted as a link, chained from the ``ELOOP``, and that is one
-    too, as is a planted directory or socket (``_NOT_A_FILE``). ``failed``: any other error, such
-    as ``EIO`` or ``ESTALE`` from a network file system."""
+#: Like a planted link, a planted file that is not regular is a refusal, so the engine logs it at
+#: ERROR with the advice to remove it.
+_NOT_A_FILE = _not_a_file_errnos(sys.platform)
+
+
+def _pair_lock_failure(exc: OSError, root: Path) -> _PairLockFailure:
+    """Why :func:`_pair_lock` could not take the lock in the uploads root ``root``. ``busy``:
+    another holder kept it past the wait. ``gone``: a ``FileNotFoundError`` while ``root`` is no
+    directory; ``os.path.isdir`` follows links, so a root that is a link to a missing target is gone
+    too. ``timeout``: the OS timed out (``ETIMEDOUT``), as a network file system can. ``refused``:
+    the file system refused this account (``atomic_edit._REFUSED``), such as a lock file another
+    account owns; ``edit_lock`` also raises ``busy_error`` for a lock path planted as a link,
+    chained from the ``ELOOP``, and that is one too, as is a planted file that is not regular
+    (``_NOT_A_FILE``), and a ``FileNotFoundError`` while ``root`` is there, as a dangling link or
+    junction planted at the lock path gives. ``failed``: any other error, such as ``EIO`` or
+    ``ESTALE`` from a network file system."""
     if isinstance(exc, _PairLockBusy):
         return "refused" if exc.__cause__ is not None else "busy"
     if isinstance(exc, FileNotFoundError):
-        return "gone"
+        return "refused" if os.path.isdir(root) else "gone"
     if isinstance(exc, TimeoutError):
         return "timeout"
     if exc.errno in _REFUSED or exc.errno in _NOT_A_FILE:
@@ -3299,12 +3320,10 @@ _RESEAL_BLOCKED: dict[_PairLockFailure, str] = {
 }
 
 
-# The lock files whose refusal an engine removal has already logged at ERROR in this process, so a
-# lock that stays refused is one ERROR, not one per pair on every prune pass.
+# The lock files whose refusal an engine removal has logged at ERROR since this process last took
+# them, so a lock that stays refused is one ERROR, not one per pair on every prune pass. Taking the
+# lock clears its entry, so a refusal that comes back gets its ERROR again.
 _unlocked_logged: set[str] = set()
-# The lock files whose ``failed`` error an engine removal has already logged at WARNING in this
-# process: such an error can last, as a stale mount does, so it is one WARNING, not one per pair.
-_failed_logged: set[str] = set()
 _unlocked_logged_lock = threading.Lock()
 
 
@@ -3327,14 +3346,15 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
 
     **A lock the engine cannot take does not stop it removing uploads.** Retention and delete must
     not depend on a file anyone who can write the uploads directory can plant, so the removal goes
-    on unlocked. It is logged at ERROR once per process per lock file, naming it and the likely
-    cause: a lock file another account created, as when ``rotate-key`` ran as root or as an
-    administrator. A lock whose directory is gone is not logged: there is nothing left to remove.
-    A lock still held when the wait runs out is not a refusal: it is logged at WARNING each time,
-    with ``edit_lock``'s own reason, and never uses up that one ERROR. Nor is an OS timeout, which
-    is logged at WARNING each time as a timeout, nor any other error that is not a refusal, which
-    an engine removal logs at WARNING once per process per lock file, naming the error, and the
-    re-seal logs at WARNING each time (:func:`_pair_lock_failure`).
+    on unlocked. A refusal is logged at ERROR, naming the lock file and the likely cause: a lock
+    file another account created, as when ``rotate-key`` ran as root or as an administrator. While
+    it lasts, each later refusal of that lock file is logged at DEBUG; once this process takes the
+    lock again, the next refusal is an ERROR again. A lock whose directory is gone is not logged:
+    there is nothing left to remove. A lock still held when the wait runs out is not a refusal: it
+    is logged at WARNING each time, with ``edit_lock``'s own reason, and never uses up that ERROR.
+    Nor is an OS timeout, which is logged at WARNING each time as a timeout, nor any other error
+    that is not a refusal, which is logged at WARNING each time, naming the error
+    (:func:`_pair_lock_failure`).
     **The re-seal fails closed (``for_reseal``):** a lock it cannot take is logged and raised. At
     the pass's first check that stops every write; at a half's write, that half is a skip."""
     with contextlib.ExitStack() as held:
@@ -3343,8 +3363,9 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
                 edit_lock(path, busy_error=_PairLockBusy, timeout=_PAIR_LOCK_TIMEOUT_SECONDS)
             )
         except OSError as exc:
-            lock = scrub_log_argument(str(lock_path_for(path)))
-            failure = _pair_lock_failure(exc)
+            lock_path = lock_path_for(path)
+            lock = scrub_log_argument(str(lock_path))
+            failure = _pair_lock_failure(exc, lock_path.parent)
             consequence = (
                 "rotate-key skips each file it would write under it"
                 if for_reseal
@@ -3359,13 +3380,7 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
                     f"; {_RERUN_WHEN_FREE}" if for_reseal else "",
                 )
             elif failure in ("timeout", "failed"):
-                first = True
-                if failure == "failed" and not for_reseal:
-                    with _unlocked_logged_lock:
-                        first = lock not in _failed_logged
-                        _failed_logged.add(lock)
-                _log.log(
-                    logging.WARNING if first else logging.DEBUG,
+                _log.warning(
                     "uploaded-logs pair lock %s: the file system %s taking it (%s: %s). %s",
                     lock,
                     "timed out" if failure == "timeout" else "failed",
@@ -3398,12 +3413,16 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
                     "without it, and a rotate-key run meanwhile could re-create a removed upload. "
                     "If another account owns it, as when rotate-key ran as root or an "
                     "administrator, give it to the engine's service account; if it is not a "
-                    "regular file, remove it. Logged once",
+                    "regular file, remove it",
                     lock,
                     codec_safe_str(exc),
                 )
             if for_reseal:
                 raise
+        else:
+            if _unlocked_logged:
+                with _unlocked_logged_lock:
+                    _unlocked_logged.discard(scrub_log_argument(str(lock_path_for(path))))
         yield
 
 

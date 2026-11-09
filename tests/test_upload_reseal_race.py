@@ -16,6 +16,7 @@ import asyncio
 import errno
 import logging
 import os
+import shutil
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -253,8 +254,19 @@ def _timed_out(path: Path, **_: Any) -> Any:
 
 
 def _root_gone(path: Path, **_: Any) -> Any:
-    """A pair lock whose open finds the uploads root gone."""
-    raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(path))
+    """A pair lock whose open finds the uploads root gone: the root is removed, then the open
+    fails as it would."""
+    lock = lock_path_for(path)
+    shutil.rmtree(lock.parent)
+    raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(lock))
+
+
+def _dangling(path: Path, **_: Any) -> Any:
+    """A pair lock whose open fails ``ENOENT`` while the uploads root is there, as a dangling link
+    or junction planted at the lock path makes it on Windows, which has no ``O_NOFOLLOW``."""
+    lock = lock_path_for(path)
+    assert lock.parent.is_dir()
+    raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(lock))
 
 
 def _record_decrypts(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
@@ -449,8 +461,67 @@ def test_a_root_gone_at_the_first_lock_check_is_root_missing(
     monkeypatch.setattr(uploads_mod, "edit_lock", _root_gone)
     reads = _record_decrypts(monkeypatch)
     result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert not root.exists()
     assert result.root_missing and result.incomplete
     assert (result.skipped, result.body_lost, reads) == (0, 0, [])
+
+
+def test_a_lock_path_missing_under_a_root_still_there_is_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``ENOENT`` at the lock's open while the root is there is no missing root: something planted
+    at the lock path, such as a dangling link or junction, keeps it from being taken. The engine
+    removal logs the refusal at ERROR with the advice to remove it; the re-seal skips every half
+    that needs a write and does not report the root missing."""
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    fids = [_seed(root, old), _seed(root, old)]
+    before = {n: (root / n).read_bytes() for n in upload_names(root)}
+    monkeypatch.setattr(uploads_mod, "edit_lock", _dangling)
+    monkeypatch.setattr(uploads_mod, "_unlocked_logged", set())
+    reads = _record_decrypts(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert not result.root_missing
+    assert result.skipped == len(fids) and result.incomplete and result.resealed == 0
+    assert reads == []
+    assert {n: (root / n).read_bytes() for n in upload_names(root)} == before
+    assert (
+        f"uploaded file {fids[0]} (body): skipped, nothing is written: the uploads pair lock "
+        "could not be taken"
+    ) in caplog.text, caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert _store(root, old)._discard_cancelled_sync(fids[0]) is True
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, caplog.text
+    assert "if it is not a regular file, remove it" in errors[0].getMessage()
+    assert LOCK_FILE_NAME in errors[0].getMessage()
+
+
+def test_a_refusal_that_comes_back_after_the_lock_was_taken_is_an_error_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """While a refusal lasts it is one ERROR, then DEBUG. Once the lock is taken again, a refusal
+    that comes back is a new ERROR, not hidden by the first."""
+    root = tmp_path / "uploads"
+    key = generate_key()
+    fids = [_seed(root, key) for _ in range(4)]
+    engine = _store(root, key)
+    _refuse_the_lock(monkeypatch)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.uploads"):
+        assert engine._discard_cancelled_sync(fids[0]) is True
+        assert engine._discard_cancelled_sync(fids[1]) is True
+        assert len([r for r in caplog.records if r.levelno == logging.ERROR]) == 1, caplog.text
+        monkeypatch.setattr(uploads_mod, "edit_lock", edit_lock)
+        assert engine._discard_cancelled_sync(fids[2]) is True
+        assert uploads_mod._unlocked_logged == set()
+        monkeypatch.setattr(uploads_mod, "edit_lock", _refused)
+        assert engine._discard_cancelled_sync(fids[3]) is True
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 2, caplog.text
+    assert all("another account owns it" in r.getMessage() for r in errors)
+    assert upload_names(root) == []
 
 
 def test_an_os_timeout_on_an_engine_removal_is_a_warning_not_the_account_error(
@@ -481,13 +552,10 @@ def test_a_root_gone_at_a_half_write_does_not_blame_the_lock(
     root = tmp_path / "uploads"
     old, new = generate_key(), generate_key()
     fid = _seed(root, old)
-    _busy_at(
-        monkeypatch,
-        names=lambda name: name != LOCK_FILE_NAME,
-        fail=lambda path, **_: _root_gone(lock_path_for(path)),
-    )
+    _busy_at(monkeypatch, names=lambda name: name != LOCK_FILE_NAME, fail=_root_gone)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
         result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert not root.exists()
     assert result.skipped == 1 and result.incomplete
     half = [
         r.getMessage() for r in caplog.records if f"uploaded file {fid} (body)" in r.getMessage()
@@ -499,25 +567,51 @@ def test_a_root_gone_at_a_half_write_does_not_blame_the_lock(
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
 
 
-def test_pair_lock_failures_are_classified_apart() -> None:
+def test_pair_lock_failures_are_classified_apart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``edit_lock`` raises ``busy_error`` for a planted link too, chained from the ELOOP; that one
-    is a refusal. An OS ``ETIMEDOUT`` is a timeout, neither contention nor a refusal. Only an errno
-    in ``atomic_edit._REFUSED``, or a planted directory or socket, is a refusal, which gets the
-    account and remove-it advice."""
+    is a refusal. An OS ``ETIMEDOUT`` is a timeout, neither contention nor a refusal. ``ENOENT`` is
+    a gone root only while the root is no directory. Only an errno in ``atomic_edit._REFUSED``, a
+    planted file that is not regular, or ``ENOENT`` under a root still there is a refusal, which
+    gets the account and remove-it advice."""
+    root = tmp_path
     try:
         try:
             raise OSError(errno.ELOOP, "Too many levels of symbolic links")
         except OSError as loop:
             raise uploads_mod._PairLockBusy("x is a link") from loop
     except OSError as exc:
-        assert uploads_mod._pair_lock_failure(exc) == "refused"
-    failure = uploads_mod._pair_lock_failure
+        assert uploads_mod._pair_lock_failure(exc, root) == "refused"
+
+    def failure(exc: OSError) -> str:
+        return uploads_mod._pair_lock_failure(exc, root)
+
     assert failure(uploads_mod._PairLockBusy("still in progress")) == "busy"
     assert failure(TimeoutError(errno.ETIMEDOUT, "Connection timed out")) == "timeout"
-    assert failure(FileNotFoundError(errno.ENOENT, "gone")) == "gone"
+    missing = FileNotFoundError(errno.ENOENT, "gone")
+    assert uploads_mod._pair_lock_failure(missing, tmp_path / "absent") == "gone"
+    assert failure(missing) == "refused"
     for code in (errno.EACCES, errno.EPERM, errno.EROFS, errno.EISDIR, errno.ENXIO):
         assert failure(OSError(code, os.strerror(code))) == "refused", code
     for code in (errno.EIO, errno.EINVAL, errno.ESTALE, errno.ENOTDIR):
+        assert failure(OSError(code, os.strerror(code))) == "failed", code
+    # The socket and planted-link errnos of macOS and the BSDs are refusals only there.
+    bsd_only = {errno.EOPNOTSUPP, errno.EMLINK}
+    eftype = getattr(errno, "EFTYPE", None)
+    if eftype is not None:
+        bsd_only.add(eftype)
+    for platform in ("linux", "win32"):
+        assert uploads_mod._not_a_file_errnos(platform) == {errno.EISDIR, errno.ENXIO}, platform
+    darwin = uploads_mod._not_a_file_errnos("darwin")
+    assert errno.EOPNOTSUPP in darwin and errno.EMLINK not in darwin
+    assert eftype is None or eftype in darwin
+    freebsd = uploads_mod._not_a_file_errnos("freebsd14")
+    assert {errno.EOPNOTSUPP, errno.EMLINK} <= freebsd
+    for code in sorted(bsd_only):
+        monkeypatch.setattr(uploads_mod, "_NOT_A_FILE", freebsd)
+        assert failure(OSError(code, os.strerror(code))) == "refused", code
+        monkeypatch.setattr(uploads_mod, "_NOT_A_FILE", uploads_mod._not_a_file_errnos("linux"))
         assert failure(OSError(code, os.strerror(code))) == "failed", code
 
 
@@ -529,8 +623,8 @@ def test_an_os_error_that_is_no_refusal_is_failed_without_the_account_advice(
 ) -> None:
     """An error outside ``atomic_edit._REFUSED`` (an NFS soft mount's ``EIO``, Windows'
     ``ERROR_SEM_TIMEOUT`` as ``EINVAL``, ``ESTALE``) is no account's lock file. The removal goes on,
-    a WARNING names the error once per process, the once-per-process ERROR is not used up, and the
-    re-seal skips with the neutral cause and no account advice."""
+    a WARNING names the error each time, the refusal's ERROR is not used up, and the re-seal skips
+    with the neutral cause and no account advice."""
 
     def _fails(path: Path, **_: Any) -> Any:
         raise OSError(code, os.strerror(code), str(path))
@@ -540,7 +634,6 @@ def test_an_os_error_that_is_no_refusal_is_failed_without_the_account_advice(
     fid = _seed(root, old)
     monkeypatch.setattr(uploads_mod, "edit_lock", _fails)
     monkeypatch.setattr(uploads_mod, "_unlocked_logged", set())
-    monkeypatch.setattr(uploads_mod, "_failed_logged", set())
     with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
         result = asyncio.run(_store(root, new, old).reseal_to_active())
         assert _store(root, old)._discard_cancelled_sync(fid) is True
@@ -548,7 +641,7 @@ def test_an_os_error_that_is_no_refusal_is_failed_without_the_account_advice(
         assert caplog.text.count(removal) == 1, caplog.text
         second = _seed(root, old)
         assert _store(root, old)._discard_cancelled_sync(second) is True
-        assert caplog.text.count(removal) == 1, caplog.text
+        assert caplog.text.count(removal) == 2, caplog.text
     assert result.skipped == 1 and result.incomplete and result.resealed == 0
     assert upload_names(root) == []
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
