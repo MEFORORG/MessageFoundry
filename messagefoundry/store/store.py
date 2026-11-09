@@ -1510,13 +1510,34 @@ async def require_session_seal_for_write(
     )
 
 
+#: The audit action a Forged authority row writes: ``AUTHORITY_SEAL_FAILED_ACTION`` in
+#: ``auth/service.py``, which the store may not import; a test pins the two equal.
+AUTHORITY_SEAL_FAILED_AUDIT_ACTION: Final = "integrity.authority_seal_failed"
+#: The audit action an Unverifiable authority row writes (ADR 0217, *The four answers*).
+AUTHORITY_SEAL_UNVERIFIABLE_AUDIT_ACTION: Final = "integrity.authority_seal_unverifiable"
+
+
+@dataclass(frozen=True, slots=True)
+class _RevokeSealRefusal:
+    """One Forged or Unverifiable answer a revoke went ahead without: the row kind, the WHOLE
+    stored id (kept in memory for the subject's digest, never logged or audited whole), and the
+    Transit verdict's two triage integers, 0 for Forged."""
+
+    unverifiable: bool
+    kind: str
+    ident: str
+    stored_version: int = 0
+    probe_version: int = 0
+
+
 @dataclass
 class RevokeSealOutcome:
-    """What one revoke's sealed writes met (decision d20261109T200352805-599b24 on ADR 0217, item
-    2). ``tripped`` is set by the first Transit Outage: after it, no account's epoch raise calls
-    Transit (``skipped`` counts them), every session is still marked revoked, and the kept
+    """What one revoke's sealed writes met (decision d20261109T200352805-599b24 on ADR 0217, items
+    2 and 4). ``tripped`` is set by the first Transit Outage: after it, no account's epoch raise
+    calls Transit (``skipped`` counts them), every session is still marked revoked, and the kept
     session's re-stamp is not attempted, so it is ended with the rest. A Forged or Unverifiable
-    answer does not trip it, so the accounts after it still call Transit.
+    answer does not trip it, so the accounts after it still call Transit; each is held in
+    ``refusals`` until :meth:`report` writes its audit row and page after the revoke commits.
 
     ``pager`` is the store's :class:`~messagefoundry.store.row_seal.SealPager` (item 5); ``None``
     pages nothing."""
@@ -1524,11 +1545,12 @@ class RevokeSealOutcome:
     pager: SealPager | None = None
     tripped: bool = False
     skipped: int = 0
+    refusals: list[_RevokeSealRefusal] = field(default_factory=list)
 
     def refused(self, exc: Exception, *, what: str, kind: str, ident: str) -> None:
         """Take one refusal :func:`revoke_seal_refusals` names, which the revoke goes ahead without.
-        Logs its class only. An Outage pages ``authority-seal-transit`` and trips the outcome."""
-        del kind, ident
+        Logs its class only. An Outage pages ``authority-seal-transit`` at once, as before, and
+        trips the outcome; a Forged or Unverifiable answer is held for :meth:`report`."""
         log.warning(
             "%s was refused (%s); the revoke ends the sessions anyway", what, type(exc).__name__
         )
@@ -1538,6 +1560,19 @@ class RevokeSealOutcome:
                 self.pager.outage(
                     f"{what} met a Vault transit outage; the revoke went ahead without it"
                 )
+            return
+        if isinstance(exc, RowSealError):
+            self.refusals.append(_RevokeSealRefusal(False, kind, ident))
+            return
+        self.refusals.append(
+            _RevokeSealRefusal(
+                True,
+                kind,
+                ident,
+                getattr(exc, "stored_version", 0),
+                getattr(exc, "probe_version", 0),
+            )
+        )
 
     def log_skipped(self) -> None:
         """Log how many accounts went without their raise because of the Outage, if any."""
@@ -1547,6 +1582,50 @@ class RevokeSealOutcome:
                 "skipped without calling Transit, and every session is still ended",
                 self.skipped,
             )
+
+    async def report(self, record_audit: Callable[..., Awaitable[object]]) -> None:
+        """After the revoke commits, write each held refusal's audit row, softly, and page it
+        (decision d20261109T200352805-599b24, item 4): ``integrity.authority_seal_unverifiable``
+        under the row's capped subject for Unverifiable, ``integrity.authority_seal_failed`` under
+        ``AUTHORITY_SEAL_SUBJECT`` for Forged. ``record_audit`` is the store's own, so the row is
+        never inside the revoke's writer transaction. A refused audit write is logged and the page
+        still goes; a defect in :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` raises.
+        Names each row by a 12-character ref, never a whole id or a token hash."""
+        from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
+        from messagefoundry.store.base import audit_write_errors
+
+        refusals, self.refusals = self.refusals, []
+        for refusal in refusals:
+            ref = refusal.ident.casefold()[:12]
+            detail: dict[str, object] = {"kind": refusal.kind, "ref": ref, "during": "revoke"}
+            if refusal.unverifiable:
+                action = AUTHORITY_SEAL_UNVERIFIABLE_AUDIT_ACTION
+                detail["stored_version"] = refusal.stored_version
+                detail["probe_version"] = refusal.probe_version
+                reason = (
+                    f"a {refusal.kind} row's integrity seal could not be verified by Vault transit"
+                    f" during a revoke ({refusal.kind} {ref}); the revoke ended the sessions anyway"
+                )
+            else:
+                action = AUTHORITY_SEAL_FAILED_AUDIT_ACTION
+                reason = (
+                    f"a {refusal.kind} row failed its integrity check during a revoke"
+                    f" ({refusal.kind} {ref}); the revoke ended the sessions anyway"
+                )
+            await write_audit_soft(
+                functools.partial(record_audit, action, detail=json.dumps(detail, sort_keys=True)),
+                log=log,
+                message="the %s audit row for a revoke's refused authority row could not be written",
+                args=(action,),
+                errors=audit_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
+            )
+            if self.pager is None:
+                continue
+            if refusal.unverifiable:
+                self.pager.unverifiable(refusal.kind, refusal.ident, reason)
+            else:
+                self.pager.forged(reason)
 
 
 async def raise_account_epoch(
@@ -18980,8 +19059,8 @@ class MessageStore:
         own seal does not verify, that raises :class:`RowSealError` and the whole transaction,
         revokes included, rolls back."""
         now = time.time() if now is None else now
+        outcome = RevokeSealOutcome(self._seal_pager)
         async with _writer_txn(self._db, self._lock):
-            outcome = RevokeSealOutcome(self._seal_pager)
             raised = await self._bump_session_epoch(user_id, outcome)
             if except_token_hash is None:
                 cur = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
@@ -19003,6 +19082,9 @@ class MessageStore:
                     outcome,
                 )
             await self._commit()
+        # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
+        # revoke went ahead without is audited and paged once it has committed, never inside it.
+        await outcome.report(self.record_audit)
         return result
 
     async def _keep_or_end_session(
@@ -19052,13 +19134,17 @@ class MessageStore:
         """Revoke every account's sessions but ``except_token_hash`` (BACKLOG #2614). See
         :meth:`AuthStore.revoke_all_sessions`."""
         now = time.time() if now is None else now
+        outcome = RevokeSealOutcome(self._seal_pager)
         async with _writer_txn(self._db, self._lock):
-            result = await self._revoke_all_sessions_in_txn(except_token_hash, now)
+            result = await self._revoke_all_sessions_in_txn(except_token_hash, now, outcome)
             await self._commit()
+        # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
+        # revoke went ahead without is audited and paged once it has committed, never inside it.
+        await outcome.report(self.record_audit)
         return result
 
     async def _revoke_all_sessions_in_txn(
-        self, except_token_hash: str | None, now: float
+        self, except_token_hash: str | None, now: float, outcome: RevokeSealOutcome
     ) -> RevokeResult:
         """The body of :meth:`revoke_all_sessions`, inside the caller's writer transaction.
 
@@ -19078,7 +19164,6 @@ class MessageStore:
         if cur.rowcount != 1:
             raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
         cur = await self._db.execute("SELECT id FROM users ORDER BY id")
-        outcome = RevokeSealOutcome(self._seal_pager)
         raised = {
             str(row[0]): await self._bump_session_epoch(str(row[0]), outcome)
             for row in await cur.fetchall()
@@ -19123,6 +19208,7 @@ class MessageStore:
         restored file then queue on the lock, and the second finds the marker gone, rather than
         both reading it and one failing its upgrade from a stale snapshot."""
         now = time.time() if now is None else now
+        outcome = RevokeSealOutcome(self._seal_pager)
         async with _writer_txn(self._db, self._lock):
             await self._db.execute("UPDATE restore_marker SET id = id WHERE id = 1")
             cur = await self._db.execute(
@@ -19139,7 +19225,7 @@ class MessageStore:
                 last_audit_at=finite_or_none(row[2]),
                 restored_at=now if (at := finite_or_none(row[3])) is None else at,
                 sessions_revoked=int(row[4] or 0)
-                + (await self._revoke_all_sessions_in_txn(None, now)).count,
+                + (await self._revoke_all_sessions_in_txn(None, now, outcome)).count,
             )
             audit = AuditAppend(
                 action=STORE_RESTORED_ACTION,
@@ -19166,6 +19252,9 @@ class MessageStore:
             await self._db.execute("DELETE FROM restore_marker")
             await self._commit()
         tee_audits((audit,), appended, ts=now)
+        # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
+        # revoke went ahead without is audited and paged once it has committed, never inside it.
+        await outcome.report(self.record_audit)
         return record
 
     async def _global_session_epoch(self) -> int:

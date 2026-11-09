@@ -15814,9 +15814,9 @@ class SqlServerStore:
         (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
         :meth:`_acquire_after_commit`'s, for the reason it gives (BACKLOG #3023)."""
         now = time.time() if now is None else now
+        outcome = RevokeSealOutcome(self._seal_pager)
         async with self._acquire_after_commit() as conn, self._cursor(conn) as cur:
             try:
-                outcome = RevokeSealOutcome(self._seal_pager)
                 raised = await self._bump_session_epoch(cur, user_id, outcome)
                 if except_token_hash is None:
                     await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
@@ -15842,6 +15842,9 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
+        # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
+        # revoke went ahead without is audited and paged once it has committed, never inside it.
+        await outcome.report(self.record_audit)
         return result
 
     async def _keep_or_end_session(
@@ -15925,10 +15928,10 @@ class SqlServerStore:
         reasoning. Read from the code and not run against a server that has
         READ_COMMITTED_SNAPSHOT off."""
         now = time.time() if now is None else now
+        outcome = RevokeSealOutcome(self._seal_pager)
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("SELECT id FROM users ORDER BY id")
-                outcome = RevokeSealOutcome(self._seal_pager)
                 raised = {
                     str(user_id): await self._bump_session_epoch(cur, str(user_id), outcome)
                     for (user_id,) in await cur.fetchall()
@@ -15969,6 +15972,9 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
+        # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
+        # revoke went ahead without is audited and paged once it has committed, never inside it.
+        await outcome.report(self.record_audit)
         return result
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:

@@ -610,6 +610,21 @@ own on the engine's sink, or the logging sink, so an engine started without that
 and `Engine.stop` removes it; `admin-revoke-sessions` arms the logging sink, `serve`'s fallback,
 since the CLI holds no notifier. A hook that raises is logged at WARNING and the revoke goes on.
 
+**A revoke audits and pages each seal refusal it went ahead without (decision
+d20261109T200352805-599b24, item 4).** The decision reads: *"During a revoke, an Unverifiable
+answer writes `integrity.authority_seal_unverifiable` and a Forged answer writes
+`integrity.authority_seal_failed`. Each pages with the ADR's capped subject. Write the row after
+the revoke commits, or softly, and never inside the writer transaction."* On all three backends a
+revoke, the restore's revoke on SQLite included, holds each Forged or Unverifiable answer of an
+account's epoch raise, and each Unverifiable answer of the kept session's re-stamp, and once its
+transaction has committed writes the row through the store's own `record_audit`, softly, then
+pages: Unverifiable under `authority-seal-transit-unverifiable:<kind>:<ref>:<digest suffix>`,
+capped per store at `MAX_SUBJECT_ALERTS` distinct rows per window and then `:*`; Forged under
+`AUTHORITY_SEAL_SUBJECT`, as the table above gives it. The row names the kind, a 12-character ref,
+`during: revoke`, and for Unverifiable the two triage integers; never a whole id or a token hash.
+A refused row is logged at ERROR and the page still goes. An Outage is still paged at once and is
+not audited, as the table says.
+
 **Other legs that read a map** decide access and write nothing: at least the client-certificate
 identity (`identity_for_cert_user_id`), the step-up role test (`_directory_roles_lost`) and the
 enrolment and re-bind legs. On the step-up, enrolment and re-bind legs an Unverifiable map takes

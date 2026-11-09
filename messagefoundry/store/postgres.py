@@ -10910,8 +10910,8 @@ class PostgresStore:
         (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
         :meth:`_after_commit_txn`'s, for the reason it gives."""
         now = time.time() if now is None else now
+        outcome = RevokeSealOutcome(self._seal_pager)
         async with self._after_commit_txn() as conn:
-            outcome = RevokeSealOutcome(self._seal_pager)
             raised = await self._bump_session_epoch(conn, user_id, outcome)
             status = await conn.execute(
                 _PG_REVOKE_USER_SESSIONS_SQL + " AND ($3::text IS NULL OR token_hash != $3)",
@@ -10920,16 +10920,21 @@ class PostgresStore:
                 except_token_hash,
             )
             if except_token_hash is None:
-                return RevokeResult(_rowcount(status))
-            unmoved = global_epoch_unmoved(await self._global_session_epoch_value(conn))
-            return await self._keep_or_end_session(
-                conn,
-                _rowcount(status),
-                except_token_hash,
-                KeptSessionRestamp(user_id, raised, unmoved),
-                now,
-                outcome,
-            )
+                result = RevokeResult(_rowcount(status))
+            else:
+                unmoved = global_epoch_unmoved(await self._global_session_epoch_value(conn))
+                result = await self._keep_or_end_session(
+                    conn,
+                    _rowcount(status),
+                    except_token_hash,
+                    KeptSessionRestamp(user_id, raised, unmoved),
+                    now,
+                    outcome,
+                )
+        # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
+        # revoke went ahead without is audited and paged once it has committed, never inside it.
+        await outcome.report(self.record_audit)
+        return result
 
     async def _keep_or_end_session(
         self,
@@ -10983,6 +10988,18 @@ class PostgresStore:
         epoch reads it without a lock clause, and under MVCC such a read never waits on a writer,
         so holding it while the loop below waits on account rows cannot close a cycle."""
         now = time.time() if now is None else now
+        outcome = RevokeSealOutcome(self._seal_pager)
+        result = await self._revoke_all_sessions_on(except_token_hash, now, outcome)
+        # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
+        # revoke went ahead without is audited and paged once it has committed, never inside it.
+        await outcome.report(self.record_audit)
+        return result
+
+    async def _revoke_all_sessions_on(
+        self, except_token_hash: str | None, now: float, outcome: RevokeSealOutcome
+    ) -> RevokeResult:
+        """The body of :meth:`revoke_all_sessions`, in its own transaction, which has committed
+        when this returns."""
         async with self._timed_acquire() as conn, conn.transaction():
             global_raised = global_epoch_raise(
                 global_epoch_or_refuse(
@@ -10992,7 +11009,6 @@ class PostgresStore:
                     )
                 )
             )
-            outcome = RevokeSealOutcome(self._seal_pager)
             raised = {
                 str(row["id"]): await self._bump_session_epoch(conn, str(row["id"]), outcome)
                 for row in await conn.fetch("SELECT id FROM users ORDER BY id")

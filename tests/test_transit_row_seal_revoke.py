@@ -123,7 +123,11 @@ async def test_an_unverifiable_account_still_has_every_session_ended(
     _plant(path, "users", "authz_seal", "id", "u-1")
     result = await store.revoke_user_sessions("u-1")
     assert result.count == 2 and _live(path, "u-1") == 0
-    assert pages == []  # Unverifiable is no Outage, so no transit page
+    # Unverifiable is no Outage, so no authority-seal-transit page; since decision
+    # d20261109T200352805-599b24 item 4 it pages under its own capped subject instead.
+    assert [p.split("|")[0].rsplit(":", 2)[0] for p in pages] == [
+        "authority-seal-transit-unverifiable:user"
+    ]
 
 
 async def test_an_outage_at_the_epoch_raise_still_ends_every_session_and_pages(
@@ -520,3 +524,185 @@ def test_the_cli_revoke_pages_through_the_logging_sink(
     assert armed == [True]
     # The CLI configures its own logging, which writes to stderr.
     assert "ALERT integrity_drift: 'authority-seal-transit'" in capsys.readouterr().err
+
+
+# --- decision d20261109T200352805-599b24, item 4: a revoke audits and pages each seal refusal ----
+
+
+async def _audits(store: MessageStore, action: str) -> list[dict[str, Any]]:
+    import json
+
+    rows = await store.list_audit(action=action, limit=50)
+    return [json.loads(str(row["detail"])) for row in rows]
+
+
+def _subjects(pages: list[str]) -> list[str]:
+    return [page.split("|", 1)[0] for page in pages]
+
+
+def _post_commit_audit(store: MessageStore, seen: list[bool]) -> None:
+    """Record, for each audit row the store writes, whether its writer transaction was open."""
+    record = store.record_audit
+
+    async def watched(*args: Any, **kwargs: Any) -> Any:
+        seen.append(bool(store._db.in_transaction))
+        return await record(*args, **kwargs)
+
+    store.record_audit = watched  # type: ignore[method-assign]
+
+
+async def test_an_unverifiable_account_is_audited_and_paged_after_the_revoke_commits(
+    transit: tuple[MessageStore, FakeBackend, Path], pages: list[str]
+) -> None:
+    from messagefoundry.store.row_seal import unverifiable_subject
+
+    store, _, path = transit
+    await _user(store, "u-1")
+    await _session(store, "u-1")
+    _plant(path, "users", "authz_seal", "id", "u-1")
+    in_txn: list[bool] = []
+    _post_commit_audit(store, in_txn)
+    await store.revoke_user_sessions("u-1")
+    assert in_txn == [False]
+    (detail,) = await _audits(store, "integrity.authority_seal_unverifiable")
+    assert detail["kind"] == "user" and detail["ref"] == "u-1" and detail["during"] == "revoke"
+    assert detail["stored_version"] == 5 and isinstance(detail["probe_version"], int)
+    assert _subjects(pages) == [unverifiable_subject("user", "u-1")]
+    assert await _audits(store, "integrity.authority_seal_failed") == []
+
+
+async def test_a_forged_account_is_audited_and_paged_as_main_pages_one(
+    transit: tuple[MessageStore, FakeBackend, Path], pages: list[str]
+) -> None:
+    from messagefoundry.store.row_seal import AUTHORITY_SEAL_FAILED_SUBJECT
+
+    store, _, path = transit
+    await _user(store, "u-1")
+    await _session(store, "u-1")
+    _sql(path, "UPDATE users SET display_name=? WHERE id=?", ("bent", "u-1"))
+    await store.revoke_all_sessions()
+    (detail,) = await _audits(store, "integrity.authority_seal_failed")
+    assert detail == {"kind": "user", "ref": "u-1", "during": "revoke"}
+    assert _subjects(pages) == [AUTHORITY_SEAL_FAILED_SUBJECT]
+    assert _live(path, "u-1") == 0
+
+
+async def test_an_unverifiable_kept_session_is_audited_by_its_ref_only(
+    transit: tuple[MessageStore, FakeBackend, Path], pages: list[str]
+) -> None:
+    store, _, path = transit
+    await _user(store, "u-1")
+    kept = await _session(store, "u-1")
+    _plant(path, "sessions", "seal", "token_hash", hash_token(kept))
+    result = await store.revoke_user_sessions("u-1", except_token_hash=hash_token(kept))
+    assert result.ended_kept
+    (detail,) = await _audits(store, "integrity.authority_seal_unverifiable")
+    assert detail["kind"] == "session" and detail["ref"] == hash_token(kept)[:12]
+    assert hash_token(kept) not in str(detail) and hash_token(kept) not in "".join(pages)
+    assert len(pages) == 1
+
+
+async def test_a_refused_audit_row_still_pages_and_keeps_the_revoke(
+    transit: tuple[MessageStore, FakeBackend, Path],
+    pages: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store, _, path = transit
+    await _user(store, "u-1")
+    await _session(store, "u-1")
+    _plant(path, "users", "authz_seal", "id", "u-1")
+
+    async def refused(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("synthetic audit refusal")
+
+    store.record_audit = refused  # type: ignore[method-assign]
+    result = await store.revoke_user_sessions("u-1")
+    assert result.count == 1 and _live(path, "u-1") == 0
+    assert len(pages) == 1
+    assert any("could not be written" in r.getMessage() for r in caplog.records)
+
+
+async def test_unverifiable_pages_are_capped_per_store(
+    transit: tuple[MessageStore, FakeBackend, Path], pages: list[str]
+) -> None:
+    from messagefoundry.store.row_seal import UNVERIFIABLE_SUBJECT_CAP, UNVERIFIABLE_SUBJECT_PREFIX
+
+    store, _, path = transit
+    users = [f"u-{n}" for n in range(UNVERIFIABLE_SUBJECT_CAP + 2)]
+    for user in users:
+        await _user(store, user)
+        _plant(path, "users", "authz_seal", "id", user)
+    await store.revoke_all_sessions()
+    subjects = _subjects(pages)
+    assert len(subjects) == len(users)
+    named = [s for s in subjects if not s.endswith(":*")]
+    assert len(set(named)) == UNVERIFIABLE_SUBJECT_CAP
+    assert subjects.count(f"{UNVERIFIABLE_SUBJECT_PREFIX}:*") == 2
+    assert len(await _audits(store, "integrity.authority_seal_unverifiable")) == len(users)
+
+
+async def test_the_restore_revoke_audits_its_refusals_after_it_commits(
+    tmp_path: Path, pages: list[str]
+) -> None:
+    from messagefoundry.store.store import write_restore_marker
+
+    path = tmp_path / "restored.db"
+    key = generate_key()
+    backend = FakeBackend()
+    store = await MessageStore.open(path, cipher=make_cipher(key, write_v2=True))
+    store._row_sealer = TransitRowSealer(backend)
+    await _user(store, "u-1")
+    await store.close()
+    _plant(path, "users", "authz_seal", "id", "u-1")
+    write_restore_marker(
+        path, archive_sha256="ab" * 32, archive_created_at=None, last_audit_at=None, restored_at=5.0
+    )
+    store = await MessageStore.open(path, cipher=make_cipher(key, write_v2=True))
+    try:
+        store._row_sealer = TransitRowSealer(backend)
+        _arm(store, pages)
+        in_txn: list[bool] = []
+        _post_commit_audit(store, in_txn)
+        assert await store.consume_restore_record() is not None
+        assert in_txn == [False]
+        assert len(await _audits(store, "integrity.authority_seal_unverifiable")) == 1
+        assert len(pages) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+async def test_a_server_revoke_holds_each_refusal_for_its_report(backend: str) -> None:
+    """The server twins take a Forged and an Unverifiable raise into the outcome, for the report
+    each public revoke runs after its commit; an Outage is paged at once, not held."""
+    store = _server(backend)
+    answers = iter([_raise(RowSealError), _raise(TransitSealUnverifiableError)])
+
+    async def refused(*_args: Any, **_kwargs: Any) -> None:
+        raise next(answers)
+
+    store._write_user = refused
+    outcome = RevokeSealOutcome(store.seal_pager())
+    for user in ("u-1", "u-2"):
+        assert await store._bump_session_epoch(object(), user, outcome) is None
+    assert [(r.unverifiable, r.ident) for r in outcome.refusals] == [
+        (False, "u-1"),
+        (True, "u-2"),
+    ]
+    assert outcome.refusals[1].stored_version == 5 and not outcome.tripped
+
+
+def test_the_store_side_names_match_the_service_and_alert_names() -> None:
+    """The store may not import ``auth/`` or ``pipeline/``, so it spells these itself."""
+    from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
+    from messagefoundry.pipeline.alerts import AUTHORITY_SEAL_SUBJECT
+    from messagefoundry.pipeline.security_signals import MAX_SUBJECT_ALERTS
+    from messagefoundry.store.row_seal import (
+        AUTHORITY_SEAL_FAILED_SUBJECT,
+        UNVERIFIABLE_SUBJECT_CAP,
+    )
+    from messagefoundry.store.store import AUTHORITY_SEAL_FAILED_AUDIT_ACTION
+
+    assert AUTHORITY_SEAL_FAILED_SUBJECT == AUTHORITY_SEAL_SUBJECT
+    assert UNVERIFIABLE_SUBJECT_CAP == MAX_SUBJECT_ALERTS
+    assert AUTHORITY_SEAL_FAILED_AUDIT_ACTION == AUTHORITY_SEAL_FAILED_ACTION
