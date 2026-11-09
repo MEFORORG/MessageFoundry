@@ -2189,14 +2189,33 @@ The check reads the path one name at a time, so a name ending in a space or a do
 name, counts only when every folder before it exists; a path that ends at a missing folder first
 is left to the driver, as a missing file is. A `subst` drive onto a share counts as leading to
 another host.
-When the check cannot finish, a WARNING names the kind of cause, never the path; the path is
-logged at DEBUG only. The value is judged as the text the build sends, so `0` is checked as the
-path `0`. The check is defence in depth, not a guarantee. It misses at least: links to some
-object paths; paths that change after the build; the contents of an `SSLCAPATH` folder; and, on
-POSIX, anything beyond the spelling. The owner, 2026-11-03, accepted two of these as recorded
-limits: a path that changes after a check, which also leaves the anchor check below a swap
-window, and the contents of an `SSLCAPATH` folder, which that anchor check does not read either.
-The check does not change the value sent to the driver.
+When the check cannot finish, or finds that the path leads to another host, a WARNING names the
+kind of cause, never the path; the path is logged at DEBUG only. The value is judged as the text
+the build sends, so `0` is checked as the path `0`. On Windows each entry of an `SSLCAPATH` folder
+takes the same check, since the driver opens a `<hash>.0` entry there by name: an entry that leads
+to another host, or one the check cannot finish, refuses the value, and so does a folder the engine
+cannot list or one holding more entries than the cap `transports.database._MAX_CAPATH_ENTRIES`
+names. A missing folder, or a value that names a file, is left to the driver. The build runs
+these checks itself, so every build judges the entries and a refusal fails it. A running engine
+builds a connector in a worker thread, off its event loop, at least at a lane start (at boot, at
+an operator start and when a reload or a DR activation binds a lane), in a reload's build check,
+a dry-run reload's included, and its rebuilds, and in a connection test. What happens to a build
+at any of these points when the executor cannot run it is stated once, in
+[`SECURITY.md`](SECURITY.md), in the paragraph *A reload's `config_reload_failed` row names why in
+`reason`*. `messagefoundry check` runs no event loop, so it
+builds in place.
+The lane check runs this check again on all four
+keywords, and on Windows on the folder entries too, at least when the lane is built or an operator starts it and before a reload that builds it or keeps it
+running, so a path that leads to another host after the build is refused there as a setting.
+The check is defence in depth, not a guarantee. It misses at least: links to some object paths;
+paths that change after a check, an entry added to an `SSLCAPATH` folder included; who can write
+an `SSLCAPATH` folder; and, on POSIX, anything beyond the spelling. The owner, 2026-11-03,
+accepted two of these as recorded limits: a path that changes after a check, which also leaves
+the anchor check below a swap window, and the contents of an `SSLCAPATH` folder, which that
+anchor check does not read either. Where each entry leads is now checked as above (vault BACKLOG
+#5197). The rest of the second limit stands, at least: who can write the folder or its entries,
+and what an entry holds, since no entry takes the content checks or the audit an `SSLCA` file
+takes below. The check does not change the value sent to the driver.
 
 This is a rule about keywords. It assumes `odbc_driver` names a network database driver that
 reads `SERVER` as its target.
@@ -2228,10 +2247,22 @@ anchor. There is no pin for this file. A missing file or a directory is left to 
 too, and a pipe or device is refused unread. **What it does not
 cover**, at least: a running lane's pool goes on reading the file at each new connect until the
 lane is rebuilt, even after a later check refuses it; any check-then-load leaves a swap window, as
-for `SSLKEY`; and an `SSLCAPATH` directory is not checked this way at all. The swap window and
-the `SSLCAPATH` contents are the recorded limits the paragraph on file keywords above names. A
-padded or boolean `SSLCA` value is refused here too, as the build refuses it, before either
-spelling is read.
+for `SSLKEY`; and an `SSLCAPATH` directory is not checked this way at all, though its entries
+take the file-keyword check above. The swap window and the rest of the `SSLCAPATH` limit are the
+recorded limits that paragraph names. A padded or boolean value of any file keyword is refused here too, as the build refuses it, before
+any spelling is read.
+
+On Windows the check of who can write a trust anchor's path, this file's and every other
+anchor's, a `tls_ca_file` included, walks the path with the reader the file-keyword check above
+uses (`auth.anchor_path`). So at least the spellings that check cannot finish, and a path on a
+share, a `subst` drive onto one included, leave the anchor check unable to judge the path. Each
+is audited as `path_indeterminate`, which warns at `warn` and refuses at `enforce`, unless a
+matching pin lets it through where `auth.trust_anchors` module item 6 allows one. An `SSLCA`
+value of that kind is refused by the file-keyword check first, in either mode. A `tls_ca_file`
+takes no file-keyword check, so the anchor check is the only one it meets. Where that check reads
+the file but cannot judge its path, it audits `path_indeterminate`. At `warn` it then warns and
+does not refuse. At `enforce` it refuses, unless a matching pin lets it through as above. A file
+the check cannot read at all is refused in either mode, and so is a pin that does not match.
 
 An `SSLKEY` file, and an `SSLCERT` file when no `SSLKEY` is set, takes the key-wrap check
 (BACKLOG #1352, #3090) when the connection is built, with `sslpassword` as its passphrase. A key

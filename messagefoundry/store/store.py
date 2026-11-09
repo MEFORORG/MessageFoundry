@@ -62,6 +62,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as _dc_fields
 from enum import Enum, StrEnum
@@ -160,6 +161,7 @@ from messagefoundry.store.gcm_bound import (
     counts_under_dek,
     reserve_invocations_ahead,
 )
+from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_reference_value,
@@ -5482,34 +5484,54 @@ _AUDIT_STORE_ID_FIELD: Final = "store_id"
 #: is a literal, not interpolated, so the ReDoS scanner in tests/test_security_static.py reads the
 #: pattern; a test pins it to the constant.
 _AUDIT_STORE_ID_HEX: Final = re.compile("[0-9a-f]{32}")
+#: A genesis record keeps the recovery wrap (vault BACKLOG #3411; the key custody draft, rule 4) as
+#: the lowercase hex of its bytes, 65 of them in version 1 of the wrap; a test pins the width to
+#: ``store.custody``. The wrap is not secret.
+_AUDIT_RECOVERY_WRAP_FIELD: Final = "recovery_wrap"
+_AUDIT_RECOVERY_WRAP_HEX: Final = re.compile("[0-9a-f]{130}")
 _ABSENT: Final = object()
 
 
-def audit_genesis_detail(key_id: str, store_id: bytes = NO_STORE_ID) -> str:
+def audit_genesis_detail(
+    key_id: str, store_id: bytes = NO_STORE_ID, recovery_wrap: bytes = b""
+) -> str:
     """The ``detail`` of the genesis row: a typed record naming the key the first range is MAC'd
     under, and the scheme it is sealed with (BACKLOG #3420). JSON, so a later field can be added
     beside them.
 
     ``store_id``, when minted, is recorded as a label (vault BACKLOG #3411): the row MAC covers it,
-    and no key is derived from it. :data:`NO_STORE_ID`, the default, records none, so the record has
-    today's shape; no caller passes one yet. Raises ``ValueError`` for any other store id that is
-    not :data:`STORE_ID_BYTES` long."""
+    and no key is derived from it. :data:`NO_STORE_ID`, the default, records none. A store opened
+    under the ``host`` key provider records the host blob's current store id
+    (:class:`StorePin`). Raises ``ValueError`` for any other store id that is not
+    :data:`STORE_ID_BYTES` long.
+
+    ``recovery_wrap``, the master key under the recovery key (not a secret), is kept beside the
+    store id when the store is minted, so the recovery key opens something held in the store and in
+    every backup of it (draft rule 4). Raises ``ValueError`` for one with no store id, or not 65
+    bytes long."""
     record: dict[str, object] = {"genesis": 1, "key_id": key_id}
     record.update(_audit_scheme_fields(audit_scheme_for(key_id)))
     if store_id != NO_STORE_ID:
         if len(store_id) != STORE_ID_BYTES:
             raise ValueError(f"a store id is {STORE_ID_BYTES} bytes, not {len(store_id)}")
         record[_AUDIT_STORE_ID_FIELD] = store_id.hex()
+    if recovery_wrap:
+        if store_id == NO_STORE_ID or not _AUDIT_RECOVERY_WRAP_HEX.fullmatch(recovery_wrap.hex()):
+            raise ValueError("a recovery wrap is 65 bytes, and kept only beside a store id")
+        record[_AUDIT_RECOVERY_WRAP_FIELD] = recovery_wrap.hex()
     return json.dumps(record, sort_keys=True)
 
 
 _AUDIT_GENESIS_FIELDS: Final = frozenset({"genesis", "key_id"})
 
 
-def _parse_audit_genesis(detail: object) -> tuple[str, AuditScheme | None, bytes | None] | None:
-    """``(key_id, scheme, store_id)`` from a genesis row's ``detail``; see
+def _parse_audit_genesis(
+    detail: object,
+) -> tuple[str, AuditScheme | None, bytes | None, bytes | None] | None:
+    """``(key_id, scheme, store_id, recovery_wrap)`` from a genesis row's ``detail``; see
     :func:`parse_audit_genesis_record`. ``store_id`` is ``None`` when the record carries none, or
-    carries one that is refused.
+    carries one that is refused, and ``recovery_wrap`` likewise. A recovery wrap that is malformed,
+    or that sits on a record with no store id, is refused as a malformed store id is.
 
     A ``store_id`` field that is not the lowercase hex of :data:`STORE_ID_BYTES` bytes, or that sits
     on a record naming no scheme (no release wrote one there: the field postdates BACKLOG #3420),
@@ -5526,6 +5548,7 @@ def _parse_audit_genesis(detail: object) -> tuple[str, AuditScheme | None, bytes
     if not isinstance(obj, dict):
         return None
     raw_store_id = obj.pop(_AUDIT_STORE_ID_FIELD, _ABSENT)
+    raw_wrap = obj.pop(_AUDIT_RECOVERY_WRAP_FIELD, _ABSENT)
     try:
         scheme = _audit_record_scheme(obj, _AUDIT_GENESIS_FIELDS)
     except ValueError:
@@ -5535,15 +5558,20 @@ def _parse_audit_genesis(detail: object) -> tuple[str, AuditScheme | None, bytes
         return None
     if not isinstance(key_id, str) or not key_id:
         return None
-    if raw_store_id is _ABSENT:
-        return key_id, scheme, None
+    if raw_store_id is _ABSENT and raw_wrap is _ABSENT:
+        return key_id, scheme, None, None
+    wrap_ok = raw_wrap is _ABSENT or (
+        isinstance(raw_wrap, str) and _AUDIT_RECOVERY_WRAP_HEX.fullmatch(raw_wrap) is not None
+    )
     if (
         scheme is not None
+        and wrap_ok
         and isinstance(raw_store_id, str)
         and _AUDIT_STORE_ID_HEX.fullmatch(raw_store_id)
     ):
-        return key_id, scheme, bytes.fromhex(raw_store_id)
-    return key_id, _AuditStoreIdRefused(mac="", kdf="", named=scheme), None
+        wrap = None if raw_wrap is _ABSENT else bytes.fromhex(str(raw_wrap))
+        return key_id, scheme, bytes.fromhex(raw_store_id), wrap
+    return key_id, _AuditStoreIdRefused(mac="", kdf="", named=scheme), None, None
 
 
 def parse_audit_genesis_record(detail: object) -> tuple[str, AuditScheme | None] | None:
@@ -5570,6 +5598,8 @@ class AuditGenesisStoreId(NamedTuple):
     #: none beside a store id, or its store id is malformed. So a caller comparing labels never
     #: reads such a record as one with none.
     refused: bool
+    #: The recovery wrap kept beside the store id, or ``None`` when the record keeps none.
+    recovery_wrap: bytes | None = None
 
 
 def parse_audit_genesis_store_id(detail: object) -> AuditGenesisStoreId | None:
@@ -5578,10 +5608,202 @@ def parse_audit_genesis_store_id(detail: object) -> AuditGenesisStoreId | None:
     parsed = _parse_audit_genesis(detail)
     if parsed is None:
         return None
-    key_id, scheme, store_id = parsed
+    key_id, scheme, store_id, wrap = parsed
     if audit_scheme_refusal(key_id, scheme) is not None:
         return AuditGenesisStoreId(store_id=None, refused=True)
-    return AuditGenesisStoreId(store_id=store_id, refused=False)
+    return AuditGenesisStoreId(store_id=store_id, refused=False, recovery_wrap=wrap)
+
+
+class StorePin(NamedTuple):
+    """The store ids a host blob names (vault BACKLOG #3411; the key custody draft, rules 1 and 4),
+    which every open of a store under the ``host`` key provider holds the store to.
+
+    ``current`` is the id a new genesis record is written with. ``accepted`` is every id the blob
+    names, the current one and the earlier ones: an earlier id is the one a store restored under a
+    new id still carries in its genesis record (draft rule 4, *What a restore does*).
+    ``recovery_wrap`` is the wrap a minting command writes into a new genesis record beside the
+    current id; empty for every other open, which writes a genesis record only into an empty chain
+    no command minted for."""
+
+    current: bytes
+    accepted: frozenset[bytes]
+    recovery_wrap: bytes = b""
+
+
+class StoreIdPinRefused(KeyProviderError):
+    """The store's audit genesis record does not name a store id the host blob names, so the key
+    custody host blob belongs to another store, or the store to no host blob (vault BACKLOG #3411).
+    A :class:`~messagefoundry.store.keyprovider.KeyProviderError`, so every command that treats an
+    unresolved store key as "could not start" treats this the same way. The message names store ids,
+    which are not secret, and never a key."""
+
+
+class StoreIdPinRefusedBeforeWrite(StoreIdPinRefused):
+    """The pin refused the store before the open wrote anything to it: raised by
+    :func:`check_open_store_pin`, ahead of the salt bind. Any other :class:`StoreIdPinRefused`
+    may follow the open's at-open writes, so a caller that must know nothing was written (a
+    minting command deciding whether to remove the key it minted) asks for this class."""
+
+
+class StoreChainNeverStarted(StoreIdPinRefusedBeforeWrite):
+    """The store's audit chain was never started, and this writable open holds no recovery wrap,
+    which alone may start it. Raised by :func:`check_open_store_pin` before any write. A command
+    that can name the host blob in the way (``provision-admin``, PR 2804) asks for this class."""
+
+
+class StoreCreateBatchFailedBeforeKeyUse(Exception):
+    """A minting open's create batch failed before its commit (PR 2804 hold 17). The batch is one
+    transaction on each server backend, and nothing is sealed under the store key before it commits:
+    the first seal follows ``bind_store_salt``, after the batch and the pin check, which only reads.
+    So nothing was sealed under the key, and a minting command may remove the key
+    it minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the batch's own error,
+    also the cause. Raised only on a minting open (:func:`minting_open`), so no other caller sees a
+    new class; a failure at or after the commit is never this."""
+
+    def __init__(self, failure: Exception) -> None:
+        # The failure itself is the one argument, so a copy or an unpickle rebuilds it whole.
+        super().__init__(failure)
+        self.failure = failure
+
+
+#: The pin of the store open in progress, set by ``store.base.open_store`` around the backend open
+#: and read by :func:`_load_audit_chain`, which all three backends share. A context variable rather
+#: than a parameter of each backend's open, as the hop posture is held during connector
+#: construction; ``None`` for every open that is not under the ``host`` key provider.
+OPEN_STORE_PIN: ContextVar[StorePin | None] = ContextVar("mefor_open_store_pin", default=None)
+
+
+def minting_open() -> bool:
+    """Whether the open in progress is a minting command's, the one open that carries a recovery
+    wrap for a new genesis record (PR 2804 hold 17)."""
+    pin = OPEN_STORE_PIN.get()
+    return pin is not None and bool(pin.recovery_wrap)
+
+
+def create_batch_failure(raised: Exception, translated: Exception | None = None) -> Exception:
+    """What a server backend raises for ``raised``, caught inside its create batch before the
+    commit: ``translated`` (a lock timeout the backend names) when given, chained to ``raised``,
+    else ``raised``; wrapped as :class:`StoreCreateBatchFailedBeforeKeyUse` on a minting open (PR
+    2804 hold 17). Shared, so both backends answer the same way."""
+    failure = raised
+    if translated is not None:
+        translated.__cause__ = raised
+        failure = translated
+    if not minting_open():
+        return failure
+    wrapped = StoreCreateBatchFailedBeforeKeyUse(failure)
+    wrapped.__cause__ = failure
+    return wrapped
+
+
+def store_pin_problem(genesis: Mapping[str, Any] | None, pin: StorePin) -> str | None:
+    """Why the audit row at sequence number 1, ``genesis`` (``None`` when there is none), does not
+    hold the store to ``pin``, or ``None`` when it names an id the pin accepts.
+
+    Refused: no row there, a row that is not a genesis record, a genesis record the walk refuses, one
+    that names no store id, and one that names an id the host blob does not. Total over
+    attacker-written rows: every answer is a string or ``None``. Whether the row is authentic is
+    :func:`_store_pin_refusal`'s question, not this one's."""
+    if genesis is None:
+        return (
+            "the store's audit chain has no genesis record, so the store id the host blob names "
+            "cannot be compared with the store's"
+        )
+    try:  # a driver row (sqlite3.Row among them) is read by key, and has no .get
+        detail = genesis["detail"]
+    except (KeyError, IndexError):
+        detail = None
+    label = parse_audit_genesis_store_id(detail)
+    if label is None:
+        return "the row at the start of the store's audit chain is not a genesis record"
+    if label.refused:
+        return "the store's audit genesis record is one this engine refuses"
+    if label.store_id is None:
+        return (
+            "the store's audit genesis record names no store id, so the store was not created "
+            "under this host blob"
+        )
+    if label.store_id in pin.accepted:
+        return None
+    return (
+        f"the store's audit genesis record names store id {label.store_id.hex()}, and the host "
+        f"blob names {pin.current.hex()}"
+        + (f" and {len(pin.accepted) - 1} earlier id(s)" if len(pin.accepted) > 1 else "")
+        + ": the host blob belongs to another store"
+    )
+
+
+#: Why a writable open refuses to start an empty chain under a pin that carries no recovery wrap.
+_PIN_NEEDS_THE_WRAP: Final = (
+    "the store's audit chain was never started, and only the command that minted its key, which "
+    "holds its recovery wrap, may start it: a chain started without the recovery wrap would leave "
+    "the recovery key opening nothing kept in the store. The engine cannot tell whose key the "
+    "host blob here is, so keep it and the store: run `messagefoundry provision-admin`, which "
+    "names the way on"
+)
+
+
+class _PinRefusal(NamedTuple):
+    """Why the chain does not hold the store to a pin, and whether that is a chain never started
+    (:class:`StoreChainNeverStarted`), told by this flag rather than by the text."""
+
+    text: str
+    never_started: bool = False
+
+
+async def _store_pin_refusal(
+    host: AuditRangeHost, first: Mapping[str, Any] | None, pin: StorePin, *, writable: bool
+) -> _PinRefusal | None:
+    """Why the chain does not hold the store to ``pin``, or ``None``.
+
+    An EMPTY chain passes a read-only open, which writes nothing, and a writable open whose pin
+    carries the recovery wrap: the minting command's, which writes the genesis record with the pin
+    and the wrap before it asks again. A writable open whose pin carries no wrap is refused there,
+    so no chain under a host blob is ever started without the wrap its recovery key opens. A
+    genesis record must name an id the pin accepts AND verify under a key this handle holds, which
+    is derived from the host blob, so a database writer without the key cannot name the blob's id
+    on another store's chain."""
+    if first is None and not await host._audit_rows(limit=1):
+        if writable and not pin.recovery_wrap:
+            return _PinRefusal(_PIN_NEEDS_THE_WRAP, never_started=True)
+        return None
+    problem = store_pin_problem(first, pin)
+    if problem is not None or first is None:
+        return None if problem is None else _PinRefusal(problem)
+    genesis = _audit_genesis(first)
+    secret = (
+        None
+        if genesis is None
+        else _audit_secret_for(genesis[0], host._audit_mac_keys, host._audit_mac_fn)
+    )
+    expected: str | None = None
+    if secret is not None:
+        with suppress(AuditKeyVersionRefusedError):
+            expected = _audit_row_mac(first, "", secret[0], secret[1])
+    if expected is None or not hmac.compare_digest(
+        audit_mac_bytes(first["row_hash"]), audit_mac_bytes(expected)
+    ):
+        return _PinRefusal(
+            "the store's audit genesis record does not verify under the key the host blob "
+            "holds, so the store id it names cannot be trusted"
+        )
+    return None
+
+
+async def check_open_store_pin(host: AuditRangeHost) -> None:
+    """Refuse a store the open's host blob does not name, before the open writes to it (vault
+    BACKLOG #3411). Each backend's writable open calls this once its schema is in place and BEFORE
+    it binds a salt, reserves a cipher block or seals a row, so a blob that is not this store's
+    writes nothing under its key. An empty chain passes here; :func:`_load_audit_chain` writes its
+    genesis record with the pin and checks it there. A no-op when no pin is set."""
+    pin = OPEN_STORE_PIN.get()
+    if pin is None:
+        return
+    refusal = await _store_pin_refusal(host, await host._audit_genesis_row(), pin, writable=True)
+    if refusal is None:
+        return
+    refused = StoreChainNeverStarted if refusal.never_started else StoreIdPinRefusedBeforeWrite
+    raise refused(f"refusing to open the store: {refusal.text}")
 
 
 def parse_audit_genesis(detail: object) -> str | None:
@@ -6250,8 +6472,12 @@ async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
     host._audit_range_keys = []
     host._audit_ranges_trusted = True
     active_id = audit_active_key_id(host._audit_mac_key, host._audit_mac_fn)
+    pin = OPEN_STORE_PIN.get()
     first = await host._audit_genesis_row()
     if first is None and active_id is not None and not read_only:
+        if pin is not None and not pin.recovery_wrap:
+            # Vault BACKLOG #3411: never start a chain under a host blob without its recovery wrap.
+            raise StoreIdPinRefused(f"refusing to open the store: {_PIN_NEEDS_THE_WRAP}")
         # The append requires an EMPTY log, so it writes nothing when any row is there. Suppressed:
         # another process started the chain between the read and the append, or the log holds rows
         # and none at seq 1. The re-read below tells the two apart.
@@ -6259,10 +6485,22 @@ async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
             await host.record_audit(
                 AUDIT_KEY_EPOCH_ACTION,
                 actor=AUDIT_GENESIS_ACTOR,
-                detail=audit_genesis_detail(active_id),
+                detail=(
+                    audit_genesis_detail(active_id)
+                    if pin is None
+                    else audit_genesis_detail(active_id, pin.current, pin.recovery_wrap)
+                ),
                 expect_prev="",
             )
         first = await host._audit_genesis_row()
+    if (
+        pin is not None
+        and (refusal := await _store_pin_refusal(host, first, pin, writable=not read_only))
+        is not None
+    ):
+        # Vault BACKLOG #3411: at EVERY open under the host key provider, the host blob's store id
+        # must be the one the store was created under, or an earlier one of the same blob.
+        raise StoreIdPinRefused(f"refusing to open the store: {refusal.text}")
     genesis = _audit_genesis(first) if first is not None else None
     if first is None or genesis is None:
         # No genesis row at seq 1. On an empty log that is a chain nobody has started, and a
@@ -9916,6 +10154,7 @@ class MessageStore:
             )
             store._read_only = read_only
             if not read_only:
+                await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
@@ -19343,6 +19582,29 @@ class MessageStore:
                 audit=await self._count(db, "audit_log"),
                 synchronous=self.synchronous,
             )
+
+    async def table_occupancy(self) -> dict[str, bool]:
+        """See :meth:`Store.table_occupancy`: the main schema's tables in ``sqlite_master`` less
+        virtual tables, as ``schema_verify`` skips them (a probe of one whose module is not loaded
+        raises), and less SQLite's own ``sqlite_*`` tables, each probed for one row. The names
+        come from the file, so each is quoted as an identifier, never interpolated bare."""
+        from messagefoundry.store.base import seed_filter_clause
+
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT name FROM main.sqlite_master WHERE type = 'table'"
+                " AND (sql IS NULL OR sql NOT LIKE 'CREATE VIRTUAL TABLE%')"
+                " AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+            )
+            names = [str(row[0]) for row in await cur.fetchall()]
+            occupancy: dict[str, bool] = {}
+            for name in names:
+                quoted = '"' + name.replace('"', '""') + '"'
+                cur = await db.execute(
+                    f"SELECT 1 FROM main.{quoted}{seed_filter_clause(name)} LIMIT 1"
+                )
+                occupancy[name] = await cur.fetchone() is not None
+            return occupancy
 
     def pool_status(self) -> PoolStatus | None:
         """No connection pool on SQLite (a single writer + lockfree read connections, not a contended

@@ -437,7 +437,7 @@ def test_a_root_certificate_the_walk_stops_in_without_a_read_failure_is_not_clea
             def unread_target(drive: str) -> str | None:
                 raise OSError(f"the drive {drive} could not be read (winerror 31)")
 
-            monkeypatch.setattr(database, "_windows_drive_target", unread_target)
+            monkeypatch.setattr(database, "query_drive_target", unread_target)
         else:
             monkeypatch.setattr(database, "_windows_drive_type", lambda root: 0)  # DRIVE_UNKNOWN
     else:
