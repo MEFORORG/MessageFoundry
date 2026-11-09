@@ -553,7 +553,8 @@ def _requirements_pip_audit_reads(raw: bytes) -> list[str]:
     """The requirement lines pip-requirements-parser 32.0.1 makes of the copy: ``join_lines`` joins
     a line ending in a backslash, unless it is a comment, to the next, with its backslashes stripped;
     ``split_comments`` drops each comment and blank line; a line left that does not start with an
-    option is a requirement. Apart from the module's own model, as the reader above is."""
+    option is a requirement. Written apart from the module's model but from the same parser source,
+    so it shares any misreading of that source; the recorded counts below are the parser's own."""
     comment = re.compile(r"(^|\s+)(#.*)$")
     logical: list[str] = []
     pending = ""
@@ -574,8 +575,9 @@ def _requirements_pip_audit_reads(raw: bytes) -> list[str]:
         "foo @ https://example.invalid/foo-1.0-py3-none-any.whl\\",
         "https://example.invalid/foo-1.0-py3-none-any.whl\\",
         "foo===1.0\\",
+        "",
     ],
-    ids=["name-at-url", "bare-url", "arbitrary-equality"],
+    ids=["name-at-url", "bare-url", "arbitrary-equality", "empty-pin"],
 )
 def test_a_pin_left_ending_in_a_backslash_is_refused_before_the_count(
     pin: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -583,22 +585,42 @@ def test_a_pin_left_ending_in_a_backslash_is_refused_before_the_count(
     """Lander hold on PR 2840 (issuecomment-6736152691): a pin that ends in a backslash once its
     marker is removed joins the next pin onto it in the copy. The auditor printed "2 pinned
     requirements audited" while pip-audit's parser read one. The copy is now counted as that parser
-    counts it, and refused before the count is printed unless the two agree."""
+    counts it, and refused before the count is printed unless the two agree. A pin the strip
+    empties is the same short count by another road."""
     status, ran, printed, read, err = _counted_and_read(
         tmp_path, capsys, f"{pin} ; sys_platform == 'zz'\n"
     )
-    # Was exit 0, printed [2], and pip-audit's parser read one requirement with evil folded into it.
+    # Was exit 0, printed [2], and pip-audit's parser read one requirement.
     assert [len(reqs) for reqs in read] == printed, (printed, read)
     assert (status, ran) == (2, [])
-    assert "its copy would not hand pip-audit's parser as many requirements as were counted" in err
+    assert _COUNT_REFUSED in err, err
     assert "evil" not in err and "example.invalid" not in err and "foo" not in err, err
 
 
+def test_a_backslash_pin_before_a_skipped_one_is_refused_by_the_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The count is checked before ``--skip-private`` reads the stripped lines, so the refusal
+    names the fold, not a private pin the lock does pin."""
+    head = (
+        "foo @ https://example.invalid/foo-1.0-py3-none-any.whl\\ ; os_name == 'nt'\n"
+        f"priv==1 --hash=sha256:{_DIGEST}\n"
+    )
+    status, ran, _, _, err = _counted_and_read(tmp_path, capsys, head, ["--skip-private", "priv"])
+    assert (status, ran) == (2, [])
+    assert _COUNT_REFUSED in err, err
+    assert "does not pin" not in err, err
+
+
+_COUNT_REFUSED = "its copy would not hand pip-audit's parser the number of requirements counted"
+
+
 def _counted_and_read(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], head: str
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], head: str, before: list[str] | None = None
 ) -> tuple[int, list[list[str]], list[int], list[list[str]], str]:
-    """Run ``main`` on ``head`` then the evil pin: its status, the commands it ran, each count it
-    printed, the requirements pip-audit's parser reads from each copy it was handed, and stderr."""
+    """Run ``main`` on ``head`` then the evil pin, with ``before`` ahead of the lock: its status,
+    the commands it ran, each count it printed, the requirements pip-audit's parser reads from each
+    copy it was handed, and stderr without the lock's path."""
     src = tmp_path / "x.lock"
     src.write_text(f"{head}{_EVIL}\n", encoding="utf-8")
     ran: list[list[str]] = []
@@ -610,10 +632,10 @@ def _counted_and_read(
             read.append(_requirements_pip_audit_reads(Path(cmd[cmd.index("-r") + 1]).read_bytes()))
         return 0
 
-    status = main([str(src)], run=run)
+    status = main([*(before or []), str(src)], run=run)
     out, err = capsys.readouterr()
     printed = [int(n) for n in re.findall(r": (\d+) pinned requirements audited", out)]
-    return status, ran, printed, read, err
+    return status, ran, printed, read, err.replace(str(src), "")
 
 
 @pytest.mark.parametrize(
@@ -633,6 +655,44 @@ def test_a_copy_whose_parser_count_matches_is_audited(
     assert status == 0
     assert printed == [2] and [len(reqs) for reqs in read] == printed, (printed, read)
     assert _EVIL in read[0], read
+
+
+#: Each text with the requirement count pip-requirements-parser 32.0.1 itself gave for it
+#: (``preprocess``, then its line parser: a requirement string or an editable), recorded 2026-11-09.
+_PARSER_COUNTS = [
+    (
+        "foo==1 \\\n    --hash=sha256:a \\\n    --hash=sha256:b\n    # via x\n"
+        "bar==2 \\\n    --hash=sha256:c\n",
+        2,
+    ),
+    ("foo @ https://h/x.whl\\\nbar==1 --hash=sha256:a\n", 1),
+    ("https://h/x.whl\\\nbar==1\n", 1),
+    ("foo===1.0\\\nbar==1\n", 1),
+    ("foo @ https://h/x.whl\\\n# note\nbar==1\n", 2),
+    ("foo==1 \\\n\nbar==1\n", 2),
+    ("\\\\foo==1\\\\\nbar==1\n", 1),
+    ("foo==1 # c \\\nbar==1\n", 1),
+    ("  # c \\\nbar==1\n", 1),
+    ("foo==1\\", 1),
+    ("\n\n   \nfoo==1\n", 1),
+    ("foo==1\x0bbar==2\n", 2),
+    ("a#b==1\n", 1),
+]
+
+
+@pytest.mark.parametrize(("text", "count"), _PARSER_COUNTS)
+def test_the_count_model_agrees_with_the_parser(text: str, count: int) -> None:
+    # Imported here, so the rest of this file still collects against a module without it.
+    from messagefoundry.security.audit_all_platforms import _pip_audit_requirement_count
+
+    assert _pip_audit_requirement_count(text) == count
+
+
+def test_a_line_of_options_alone_is_not_counted_either_way() -> None:
+    """Optparse would read ``-e`` there as an editable requirement; the model does not guess."""
+    from messagefoundry.security.audit_all_platforms import _pip_audit_requirement_count
+
+    assert _pip_audit_requirement_count("--hash=sha256:a\nfoo==1\n") is None
 
 
 def test_utf8_failing_falls_back_to_the_locale_as_pip_does(
