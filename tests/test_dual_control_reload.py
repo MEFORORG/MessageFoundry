@@ -2939,16 +2939,17 @@ def test_the_undrained_row_wait_fits_inside_the_engine_stop_reserve() -> None:
 
 
 @pytest.mark.parametrize("cause", ["executor-fault", "invalid-config"])
-async def test_an_executor_fault_in_a_reload_build_is_a_fault_row_not_an_invalid_config(
+async def test_an_executor_fault_in_a_reload_build_is_never_an_invalid_config(
     engine: Engine, tmp_path: Path, cause: str
 ) -> None:
-    """A reload whose connector build the executor fails, by a broken pool, answers the reload's
-    generic 500 and writes a reload_fault row naming the executor's fault, as any fault inside the
-    reload does: nothing is wrong with the config. The build that meets it is the restart of the
-    running inbound, which every reload makes through _build_off_loop before it rebuilds an
-    outbound. Red (Lander hold 6703767989): _build_off_loop raised a plain
-    WiringError, which the route answered 422 invalid configuration with reason invalid_config.
-    The control is a config that really is wrong, which still answers 422 invalid_config."""
+    """A reload whose connector builds the executor fails, by a broken pool, builds them on the
+    loop instead, since the pool never began them, and succeeds with no failed row: nothing is
+    wrong with the config. The build that meets it first is the restart of the running inbound,
+    which every reload makes through _build_off_loop before it rebuilds an outbound. Red (Lander
+    hold 6703767989): _build_off_loop raised a plain WiringError, which the route answered 422
+    invalid configuration with reason invalid_config; then (Lander hold 6730392844, item 3) a
+    WiringBuildFault, which failed the reload where main, building on the loop, succeeded. The
+    control is a config that really is wrong, which still answers 422 invalid_config."""
     from concurrent.futures.thread import BrokenThreadPool
 
     service = await _service(engine)
@@ -2976,9 +2977,8 @@ async def test_an_executor_fault_in_a_reload_build_is_a_fault_row_not_an_invalid
             r = await c.post("/config/reload", json={}, headers=headers)
     rows = await _failed_reload_rows(engine)
     if cause == "executor-fault":
-        assert r.status_code == 500, r.text
-        assert r.json() == {"detail": _FAULT_DETAIL}
-        assert [(d["reason"], d["error"]) for d in rows] == [("reload_fault", "BrokenThreadPool")]
+        assert r.status_code == 200, r.text
+        assert rows == []
     else:
         assert r.status_code == 422, r.text
         assert [d["reason"] for d in rows] == ["invalid_config"]
@@ -3006,10 +3006,11 @@ async def test_a_convergence_reload_records_an_executor_fault_as_a_reload_error(
 async def test_a_reload_executor_fault_leaves_the_previous_inbounds_running(
     engine: Engine,
 ) -> None:
-    """The pool stays broken for the whole reload, its rollback included. The rollback restarts
-    the previous graph's inbounds without the faulted pool, so intake is as it was before the
-    reload. Red (Lander hold 6704342060, item 1): the rollback built through the same pool, so
-    IB_T_ADT failed to start and intake was left down."""
+    """The pool stays broken for the whole reload. Every build the pool never began runs on the
+    loop, so the reload goes through and intake is up. Red (Lander hold 6704342060, item 1): the
+    rollback built through the same pool, so IB_T_ADT failed to start and intake was left down;
+    then (Lander hold 6730392844, item 3) the reload failed where main, building on the loop,
+    succeeded."""
     from concurrent.futures.thread import BrokenThreadPool
 
     service = await _service(engine)
@@ -3033,11 +3034,9 @@ async def test_a_reload_executor_fault_leaves_the_previous_inbounds_running(
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(loop, "run_in_executor", faulty)
             r = await c.post("/config/reload", json={}, headers=headers)
-            assert r.status_code == 500, r.text
+            assert r.status_code == 200, r.text
             assert rr.inbound_running("IB_T_ADT")
             assert rr.inbound_failed("IB_T_ADT") is None
-            # Only the rollback built on the loop: a later build goes to the pool again.
-            assert cast(Any, rr)._rollback_builds_on_loop is False
 
 
 @pytest.mark.parametrize(
@@ -3055,9 +3054,9 @@ async def test_a_bare_executor_refusal_in_a_reload_leaves_the_previous_inbounds_
 ) -> None:
     """A hop other than the connector build meets the executor's refusal at submit, a bare
     RuntimeError, and the pool stays refusing for the rollback. The rollback still restarts the
-    previous inbounds without the pool. Red (Lander hold 6704973771, item 1): only a
-    WiringBuildFault or a broken pool switched the rollback, so its builds met the refusing pool
-    and IB_T_ADT was left down."""
+    previous inbounds, building on the loop what the pool refuses. Red (Lander hold 6704973771,
+    item 1): only a WiringBuildFault or a broken pool switched the rollback, so its builds met the
+    refusing pool and IB_T_ADT was left down."""
     from messagefoundry.pipeline.wiring_runner import RegistryRunner
 
     service = await _service(engine)
@@ -3089,4 +3088,46 @@ async def test_a_bare_executor_refusal_in_a_reload_leaves_the_previous_inbounds_
             assert r.status_code == 500, r.text
             assert rr.inbound_running("IB_T_ADT")
             assert rr.inbound_failed("IB_T_ADT") is None
-            assert cast(Any, rr)._rollback_builds_on_loop is False
+
+
+async def test_a_reload_that_fails_for_another_reason_then_meets_a_refusing_pool_keeps_intake(
+    engine: Engine,
+) -> None:
+    """A reload fails for a reason that is no executor fault, a bind conflict, and from then on the
+    pool refuses a new thread, so the rollback's restarts meet the refusal. Each build the pool
+    never began runs on the loop, so the previous inbounds are running after the rollback, as on
+    main. Red (Lander hold 6730392844, item 3): the rollback switched to on-loop builds only after
+    an executor fault, so its builds met the refusing pool and IB_T_ADT was left down."""
+    from messagefoundry.config.wiring import PortConflictError
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    loop = asyncio.get_running_loop()
+    real = loop.run_in_executor
+    refusing = False
+
+    def faulty(executor: Any, fn: Any, *args: Any) -> asyncio.Future[Any]:
+        if refusing and "_build_off_loop" in getattr(fn, "__qualname__", ""):
+            raise RuntimeError("can't start new thread")
+        return real(executor, fn, *args)
+
+    async def bind_conflict(self: RegistryRunner, *_args: Any) -> Any:
+        nonlocal refusing
+        refusing = True
+        raise PortConflictError("IB_T_ADT: port 2575 is already bound on 127.0.0.1")
+
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "op")
+        first = await c.post("/config/reload", json={}, headers=headers)
+        assert first.status_code == 200, first.text
+        rr = engine.registry_runner
+        assert rr is not None and rr.inbound_running("IB_T_ADT")
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(loop, "run_in_executor", faulty)
+            patch.setattr(RegistryRunner, "_reconcile_outbounds", bind_conflict)
+            r = await c.post("/config/reload", json={}, headers=headers)
+            assert r.status_code != 200, r.text
+            assert refusing
+            assert rr.inbound_running("IB_T_ADT")
+            assert rr.inbound_failed("IB_T_ADT") is None

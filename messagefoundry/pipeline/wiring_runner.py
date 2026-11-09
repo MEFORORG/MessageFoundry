@@ -107,7 +107,6 @@ from messagefoundry.config.wiring import (
     OutboundConnection,
     PortConflictError,
     Registry,
-    WiringBuildFault,
     WiringError,
     _refuse_attested_and_accepted,
     apply_hop_attestation,
@@ -123,7 +122,6 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
-from messagefoundry.exception_origin import ExceptionChainTooLong, exception_chain
 from messagefoundry.fhirsearch import FhirSearchParams
 from messagefoundry.log_backoff import IN_THIS_RUN, FailureRun
 from messagefoundry.logging_guard import LogSinkEvent
@@ -2094,10 +2092,6 @@ class RegistryRunner:
         # of restating it.
         self._running = False
         self._reload_lock = asyncio.Lock()  # serialize concurrent reloads
-        # True only while a reload's rollback, under the reload lock, restarts the previous
-        # graph's inbounds after an executor fault: their builds then run on the loop rather than
-        # through the faulted pool (Lander hold 6704342060, item 1).
-        self._rollback_builds_on_loop = False
         # BACKLOG #2348: the post-reload stranded-row report runs detached, so a committed reload never
         # waits on (or is cancelled inside) its store reads. Held here so the task is not collected.
         self._reload_report_tasks: set[asyncio.Task[dict[str, int]]] = set()
@@ -3771,16 +3765,10 @@ class RegistryRunner:
         """:meth:`build_test_connector` for a caller on the event loop: the configuration is
         resolved here, on the loop, and only the build runs in a worker thread
         (:func:`_build_off_loop`), since a build can list folders and read files (engine PR 2815,
-        hold F2). Raises as that method does: an executor fault, which the build's own normaliser
-        never sees, is a :class:`WiringError` too, so the route records it as a refused build
-        (Lander hold 6703229134, item 2)."""
+        hold F2). Raises as that method does. A build the executor never began runs on the loop
+        instead, so an executor fault never fails a test (Lander hold 6730392844, item 3)."""
         direction, build = self._test_connector_build(name)
-        try:
-            return direction, await _build_off_loop(self._hop_posture, build)
-        except WiringError:
-            raise
-        except Exception as exc:
-            raise WiringError(f"connector build failed: {exc}") from exc
+        return direction, await _build_off_loop(self._hop_posture, build)
 
     def _test_connector_build(
         self, name: str
@@ -5216,7 +5204,6 @@ class RegistryRunner:
         source = await _build_off_loop(
             self._hop_posture,
             functools.partial(build_source, source_cfg, egress=self._egress),
-            on_loop=self._rollback_builds_on_loop,
         )
         # Inject the connection-event sink (#46) BEFORE start so a listen source can emit accept/refuse/
         # close. None when capture is off (byte-identical). transports/ stays store-agnostic — the sink
@@ -8291,18 +8278,11 @@ class RegistryRunner:
                 # a worker to is how a rollback would create two claimers on one lane.
                 for name in list(self._sources):
                     await self._stop_inbound_unsafe(name)
-                # A reload the executor failed restarts the previous inbounds with their builds on
-                # the loop, so the rollback does not meet the faulted pool again and leave intake
-                # down (Lander hold 6704342060, item 1).
-                self._rollback_builds_on_loop = _executor_faulted(exc)
-                try:
-                    for name in old_inbound_names:
-                        try:
-                            await self._checked_inbound_start(name)  # vault BACKLOG #2371
-                        except Exception:
-                            log.exception("rollback: could not restart inbound %r", name)
-                finally:
-                    self._rollback_builds_on_loop = False
+                for name in old_inbound_names:
+                    try:
+                        await self._checked_inbound_start(name)  # vault BACKLOG #2371
+                    except Exception:
+                        log.exception("rollback: could not restart inbound %r", name)
                 raise
 
             # The swap committed, so nothing can put the previous graph's executor back any more.
@@ -12586,9 +12566,7 @@ def _dest_config(
     )
 
 
-async def _build_off_loop[T](
-    posture: HopPosture | None, build: Callable[[], T], *, on_loop: bool = False
-) -> T:
+async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T]) -> T:
     """Run a connector ``build`` in a worker thread, inside ``active_hop_posture(posture)``. A
     build can list folders and read files, such as a DATABASE connector's ``sslcapath`` entries and
     its driver key and CA files, so the runner builds a connector here rather than on the event
@@ -12605,21 +12583,19 @@ async def _build_off_loop[T](
     what it builds (Lander hold 6698688363, item 5). As in :func:`asyncio.to_thread`, the thread
     runs in the default executor, in a copy of the caller's context.
 
-    An executor fault, a build it cancelled, failed as a broken pool or refused because it was shut
-    down, raises :class:`WiringBuildFault`, a :class:`WiringError`, with the fault as its cause, so no
-    caller meets a bare ``RuntimeError`` (Lander hold 6703229134, item 2). A build the pool queued
-    before it failed to start a thread is cancelled, or, if a worker already took it, awaited, and
-    its own result or refusal is the answer.
-
-    With ``on_loop``, the build runs on the loop instead, as it did before builds left the loop:
-    a reload's rollback after an executor fault asks for that."""
+    A build the executor never began, because it refused the work at submit (shut down, a broken
+    pool, or no thread it could start) or cancelled or failed it while queued, runs on the loop
+    instead, as every build did before builds left the loop, with a WARNING naming the cause. So
+    an executor fault never leaves a connector unbuilt, intake down included (Lander hold
+    6730392844, item 3). ``run()`` never began there, so nothing is built twice. A build the pool
+    queued before it failed to start a thread is cancelled first, or, if a worker already took it,
+    awaited, and its own result or refusal is the answer. A build that began and then failed
+    raises its own error."""
 
     def stamped() -> T:
         with active_hop_posture(posture):
             return build()
 
-    if on_loop:
-        return stamped()
     loop = asyncio.get_running_loop()
     context = contextvars.copy_context()
     built: concurrent.futures.Future[T] = concurrent.futures.Future()
@@ -12636,28 +12612,30 @@ async def _build_off_loop[T](
 
     def settle(queued: asyncio.Future[None]) -> None:
         # A work item the executor cancelled or failed before run() began leaves ``built`` pending;
-        # settle it so the caller is not left waiting. The fault is read even when ``built`` is
-        # already done, so asyncio never logs it as an exception that was never retrieved.
+        # build it here, on the loop, so the caller is not left waiting. The fault is read even
+        # when ``built`` is already done, so asyncio never logs it as an exception that was never
+        # retrieved.
         exc = None if queued.cancelled() else queued.exception()
         if built.done():
             return
-        if queued.cancelled():
-            # A failure, not a cancellation: the caller was not cancelled, and must not read as if.
-            built.set_exception(
-                _executor_fault(RuntimeError("the executor cancelled the connector build"))
-            )
-        elif exc is not None:
-            # Only the executor fails ``queued`` with run() not begun, so this is never the build's
-            # own failure. A BaseException that is not an Exception passes through unchanged.
-            built.set_exception(_executor_fault(exc) if isinstance(exc, Exception) else exc)
+        if exc is not None and not isinstance(exc, Exception):
+            built.set_exception(exc)  # a BaseException that is not an Exception passes through
+            return
+        # Only the executor cancels or fails ``queued`` with run() not begun, so this is never the
+        # build's own failure.
+        _log_build_on_loop(
+            "the executor cancelled the connector build" if exc is None else safe_exc(exc)
+        )
+        run()
 
     try:
         queued = loop.run_in_executor(None, run)
     except RuntimeError as exc:  # the executor was shut down, or its pool is broken
         # A pool can queue the work item and then fail to start a thread for it, so a later
-        # dequeue must find the build cancelled and build nothing for a caller told it failed.
+        # dequeue must find the build cancelled and build nothing, since it is built here.
         if built.cancel():
-            raise _executor_fault(exc) from exc
+            _log_build_on_loop(safe_exc(exc))
+            return context.run(stamped)
         # A worker already took it, so the build's own outcome is the answer, awaited below
         # (Lander hold 6704342060, item 2). The fault is logged, since nothing else reports it.
         log.warning(
@@ -12675,48 +12653,12 @@ async def _build_off_loop[T](
         raise
 
 
-#: The text of the bare ``RuntimeError`` a worker-thread hop meets when the default executor
-#: refuses work at submit: ``ThreadPoolExecutor.submit`` after a shutdown, asyncio's
-#: ``run_in_executor`` after ``shutdown_default_executor``, and a thread the pool could not start.
-#: ``_build_off_loop`` turns each of these into a :class:`WiringBuildFault` on the build path;
-#: another hop, such as ``asyncio.to_thread``, raises it bare (Lander hold 6704973771, item 1).
-_EXECUTOR_REFUSAL_TEXT: tuple[str, ...] = (
-    "cannot schedule new futures after",
-    "Executor shutdown has been called",
-    "can't start new thread",
-    "can't create new thread",
-)
-
-
-def _is_executor_refusal(exc: BaseException) -> bool:
-    """Whether ``exc`` is an executor fault: a :class:`WiringBuildFault`, a broken pool, or a bare
-    ``RuntimeError`` carrying one of :data:`_EXECUTOR_REFUSAL_TEXT`."""
-    if isinstance(exc, (WiringBuildFault, concurrent.futures.BrokenExecutor)):
-        return True
-    return isinstance(exc, RuntimeError) and str(exc).startswith(_EXECUTOR_REFUSAL_TEXT)
-
-
-def _executor_faulted(exc: BaseException) -> bool:
-    """Whether ``exc``, or an exception it wraps, is an executor fault (:func:`_is_executor_refusal`):
-    the executor refused a connector build or another worker-thread hop. A chain that
-    cannot be read is taken as one, so a reload's rollback still restarts its inbounds rather than
-    stopping on the walk."""
-    try:
-        return any(_is_executor_refusal(e) for e in exception_chain(exc))
-    except ExceptionChainTooLong:
-        return True
-    except Exception:  # noqa: BLE001 - a third-party chain's attribute read; logged, never raised
-        log.warning("could not read a failed reload's exception chain", exc_info=True)
-        return True
-
-
-def _executor_fault(exc: Exception) -> WiringBuildFault:
-    """The :class:`WiringBuildFault` for an executor ``exc`` that kept a build from running
-    (:func:`_build_off_loop`), with ``exc`` as its cause, as ``raise ... from exc`` sets it."""
-    fault = WiringBuildFault(f"connector build failed: {exc}")
-    fault.__cause__ = exc
-    fault.__suppress_context__ = True
-    return fault
+def _log_build_on_loop(cause: str) -> None:
+    """Say that the executor never began a connector build, and why (``cause``, already redacted),
+    before :func:`_build_off_loop` builds it on the loop."""
+    log.warning(
+        "the executor never began a connector build, so it is built on the event loop: %s", cause
+    )
 
 
 #: Close tasks for connectors whose build finished after its caller was cancelled, held so the

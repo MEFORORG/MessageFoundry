@@ -372,19 +372,24 @@ async def test_a_gate_refused_window_open_alerts_once_over_three_ticks(
         await runner.stop()
 
 
-# --- Lander hold 6703229134, item 2: an executor fault on the inbound build -----------------------
+# --- Lander hold 6730392844, item 3: a build the executor never began runs on the loop ----------
 
 
 @pytest.mark.parametrize("fault", ["cancelled", "broken", "shut-down"])
 @pytest.mark.parametrize("action", ["start", "restart"])
-async def test_an_executor_fault_on_an_operator_start_answers_409_and_is_audited(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, action: str, fault: str
+async def test_an_executor_fault_on_an_operator_start_builds_on_the_loop_and_starts(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    action: str,
+    fault: str,
 ) -> None:
     """The executor cancels the inbound's build, fails it as a broken pool, or refuses it because
-    it was shut down. The build never ran, so this is no refusal of the build's own, yet the start
-    must still reach the route as a WiringError with the fault as its cause, so the route answers
-    409 and writes the refused row. Red (Lander hold 6703229134, item 2): a bare RuntimeError or
-    BrokenThreadPool escaped _build_off_loop, which the route answered with a 500 and no row."""
+    it was shut down. The build never began, so it runs on the loop instead, as every build did
+    before builds left the loop, and the start succeeds, with a WARNING naming the cause. Red
+    (Lander hold 6730392844, item 3): the start raised a WiringBuildFault and answered 409, so an
+    executor fault left the inbound down where main started it. Before that (Lander hold
+    6703229134, item 2), a bare RuntimeError or BrokenThreadPool escaped as a 500."""
     engine = Engine(
         store,
         inbound_bind_host="127.0.0.1",
@@ -396,7 +401,6 @@ async def test_an_executor_fault_on_an_operator_start_answers_409_and_is_audited
     await engine.start()
     loop = asyncio.get_running_loop()
     real = loop.run_in_executor
-    faults: list[BaseException] = []
 
     def faulty(executor: Any, fn: Any, *args: Any) -> asyncio.Future[Any]:
         if "_build_off_loop" not in getattr(fn, "__qualname__", ""):
@@ -410,52 +414,97 @@ async def test_an_executor_fault_on_an_operator_start_answers_409_and_is_audited
             queued.set_exception(BrokenThreadPool("a thread initializer failed"))
         return queued
 
-    original = wiring_runner.RegistryRunner._checked_inbound_start
-
-    async def recording(self: RegistryRunner, name: str) -> None:
-        try:
-            await original(self, name)
-        except BaseException as exc:
-            faults.append(exc)
-            raise
-
-    monkeypatch.setattr(wiring_runner.RegistryRunner, "_checked_inbound_start", recording)
     try:
         transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
         monkeypatch.setattr(loop, "run_in_executor", faulty)
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
-            r = await client.post(f"/connections/IB_DOWN/{action}")
+        with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+                r = await client.post(f"/connections/IB_DOWN/{action}")
         monkeypatch.setattr(loop, "run_in_executor", real)
-        assert r.status_code == 409, r.text
-        assert len(faults) == 1 and isinstance(faults[0], WiringError), faults
-        cause = faults[0].__cause__
-        expected = {
-            "cancelled": (RuntimeError, "the executor cancelled the connector build"),
-            "broken": (BrokenThreadPool, "a thread initializer failed"),
-            "shut-down": (RuntimeError, "Executor shutdown has been called"),
+        assert r.status_code == 200, r.text
+        cause = {
+            "cancelled": "the executor cancelled the connector build",
+            "broken": "a thread initializer failed",
+            "shut-down": "Executor shutdown has been called",
         }[fault]
-        assert type(cause) is expected[0] and str(cause) == expected[1], repr(cause)
+        assert any(
+            "built on the event loop" in rec.getMessage() and cause in rec.getMessage()
+            for rec in caplog.records
+            if rec.levelno == logging.WARNING
+        ), [rec.getMessage() for rec in caplog.records]
         rows = await store.list_audit(action="connection_control", limit=10)
         assert len(rows) == 1
         assert json.loads(rows[0]["detail"] or "{}") == {
             "connection": "IB_DOWN",
             "action": action,
             "role": "source",
-            "running": False,
-            "refused": True,
+            "running": True,
         }
         rr = engine.registry_runner
-        assert rr is not None and not rr.inbound_running("IB_DOWN")
+        assert rr is not None and rr.inbound_running("IB_DOWN")
+        assert rr.inbound_failed("IB_DOWN") is None
     finally:
         await engine.stop()
 
 
-async def test_a_build_the_pool_queued_before_it_failed_to_start_a_thread_never_runs() -> None:
-    """A pool can queue the work item and then raise from its thread start. The caller is told
-    the build failed, so a later dequeue must build nothing that no caller would close."""
+async def test_an_engine_restart_whose_build_submit_is_refused_leaves_the_inbound_running(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An engine-driven restart, as an alert rule drives one, meets a pool that refuses a new
+    thread at submit. The build never began, so it runs on the loop, and the inbound is running
+    again after the restart, as on main, which built on the loop. Red (Lander hold 6730392844,
+    item 3): the restart raised a WiringBuildFault and left the inbound down, recorded failed."""
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection("IB_UP", ConnectionSpec(ConnectorType.MLLP, {"port": 0}), router="r")
+    )
+    reg.add_router("r", lambda m: [])
+    engine = Engine(
+        store,
+        inbound_bind_host="127.0.0.1",
+        hop_posture=HopPosture(enforcing=False),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(reg)
+    await engine.start()
     loop = asyncio.get_running_loop()
-    ran = threading.Event()
+    real = loop.run_in_executor
+
+    def refusing(executor: Any, fn: Any, *args: Any) -> asyncio.Future[Any]:
+        if "_build_off_loop" in getattr(fn, "__qualname__", ""):
+            raise RuntimeError("can't start new thread")
+        return real(executor, fn, *args)
+
+    try:
+        rr = engine.registry_runner
+        assert rr is not None and rr.inbound_running("IB_UP")
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(loop, "run_in_executor", refusing)
+            with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+                await rr.restart_inbound("IB_UP")
+        assert rr.inbound_running("IB_UP")
+        assert rr.inbound_failed("IB_UP") is None
+        assert any(
+            "built on the event loop" in rec.getMessage()
+            and "can't start new thread" in rec.getMessage()
+            for rec in caplog.records
+        )
+    finally:
+        await engine.stop()
+
+
+async def test_a_build_the_pool_queued_before_it_failed_to_start_a_thread_is_built_once() -> None:
+    """A pool can queue the work item and then raise from its thread start. The build is made on
+    the loop, so a later dequeue must build nothing, or the build would run twice and one
+    connector would be built that no caller would close."""
+    loop = asyncio.get_running_loop()
+    runs: list[object] = []
     queued_items: list[Callable[[], object]] = []
+
+    def build() -> object:
+        built = object()
+        runs.append(built)
+        return built
 
     def queue_then_raise(_executor: Any, fn: Callable[[], object], *_args: Any) -> Any:
         queued_items.append(fn)
@@ -463,11 +512,10 @@ async def test_a_build_the_pool_queued_before_it_failed_to_start_a_thread_never_
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(loop, "run_in_executor", queue_then_raise)
-        with pytest.raises(WiringError):
-            await wiring_runner._build_off_loop(None, ran.set)
+        answer = await wiring_runner._build_off_loop(None, build)
     assert len(queued_items) == 1
     queued_items[0]()  # the late dequeue
-    assert not ran.is_set()
+    assert runs == [answer]
 
 
 @pytest.mark.parametrize("outcome", ["built", "refused"])
@@ -513,33 +561,3 @@ async def test_a_build_a_worker_took_before_the_pool_failed_to_start_a_thread_is
     assert handed == []
     # The executor's own fault is not lost: it is logged.
     assert any("can't start new thread" in r.getMessage() for r in caplog.records)
-
-
-def test_an_executor_fault_anywhere_in_a_reload_chain_is_read_as_one() -> None:
-    """The rollback's on-loop switch reads the reload's whole failure: a WiringBuildFault, a raw
-    broken pool or a bare submit-time executor refusal, raised from or during it, and a chain it
-    cannot read, count; another failure does not."""
-    from concurrent.futures.thread import BrokenThreadPool
-
-    from messagefoundry.config.wiring import WiringBuildFault
-
-    class Unreadable(Exception):
-        @property
-        def reason(self) -> object:
-            raise KeyError("reason")
-
-    def raised_from(outer: Exception, inner: BaseException) -> Exception:
-        outer.__cause__ = inner
-        return outer
-
-    faulted = wiring_runner._executor_faulted
-    assert faulted(WiringBuildFault("x"))
-    assert faulted(raised_from(RuntimeError("outer"), BrokenThreadPool("pool")))
-    assert faulted(Unreadable("odd"))
-    assert not faulted(raised_from(PortConflictError("busy"), OSError("bind")))
-    # A bare submit-time refusal another hop met (Lander hold 6704973771, item 1); an unrelated
-    # RuntimeError is not one.
-    assert faulted(
-        raised_from(ValueError("outer"), RuntimeError("Executor shutdown has been called"))
-    )
-    assert not faulted(RuntimeError("the reload failed for another reason"))

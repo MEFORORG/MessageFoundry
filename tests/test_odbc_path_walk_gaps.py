@@ -1404,14 +1404,20 @@ def test_hold_d_a_build_whose_loop_stopped_unclosed_logs_that_it_was_not_closed(
 
 
 @pytest.mark.parametrize("fault", ["cancelled", "shut-down"])
-async def test_hold_an_executor_fault_reaches_the_connection_test_as_a_wiring_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore, fault: str
+async def test_hold_an_executor_fault_on_the_connection_test_builds_on_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db_store: MessageStore,
+    caplog: pytest.LogCaptureFixture,
+    fault: str,
 ) -> None:
     """A connection test whose build the executor cancels, or refuses because it was shut down,
-    reaches the caller as the WiringError a refused build is, with the executor's fault as its
-    cause, so the route records it as one. Red (Lander hold 6703229134, item 2): a bare
-    RuntimeError escaped, which the route answers with a 500 and no audit row."""
-    from messagefoundry.config.wiring import WiringError
+    builds on the loop instead, since the build never began, and the test gets its connector.
+    Red (Lander hold 6730392844, item 3): the test failed with a WiringBuildFault where main,
+    building on the loop, built it. Before that (Lander hold 6703229134, item 2), a bare
+    RuntimeError escaped as a 500 with no audit row."""
+    from messagefoundry.pipeline import wiring_runner
+    from messagefoundry.transports.base import DestinationConnector
 
     runner = _db_runner(db_store, _db_graph(_capath(tmp_path, "0a1b2c3d.0")))
     loop = asyncio.get_running_loop()
@@ -1424,9 +1430,15 @@ async def test_hold_an_executor_fault_reaches_the_connection_test_as_a_wiring_er
         return queued
 
     monkeypatch.setattr(loop, "run_in_executor", faulty)
-    with pytest.raises(WiringError) as raised:
-        await asyncio.wait_for(runner.build_test_connector_off_loop(_OUT), timeout=5)
-    assert isinstance(raised.value.__cause__, RuntimeError)
+    with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+        direction, connector = await asyncio.wait_for(
+            runner.build_test_connector_off_loop(_OUT), timeout=5
+        )
+    monkeypatch.undo()
+    assert direction == "out"
+    assert isinstance(connector, DestinationConnector)
+    await connector.aclose()
+    assert any("built on the event loop" in r.getMessage() for r in caplog.records)
 
 
 def test_hold_e_an_abandoned_build_that_has_not_started_never_runs() -> None:
