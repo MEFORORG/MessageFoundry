@@ -4,8 +4,8 @@
 
 Engine PR 2390 note 1: the route walk reads an ``authorizes_in_body`` socket's gate as a CALL in its
 body, which is not proof the body acts on it. ``WebSocketAcceptGate`` closes that gap at run time:
-``authorize_ws`` and the web console's ``authorize_ui_ws`` record on the handshake whether they
-admitted the caller, and the gate refuses ``websocket.accept``, and a denial response of any status,
+``authorize_ws`` records on the handshake whether it admitted the caller, and the web console's
+``authorize_ui_ws`` does so only on a browser handshake (one with an Origin); the gate refuses ``websocket.accept``, and a denial response of any status,
 on a socket that does not read admitted, as ``ws_accept_allowed`` defines it.
 
 Each socket here is driven through the whole app, middleware included, by an in-memory ASGI peer on

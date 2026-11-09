@@ -223,8 +223,8 @@ body, the early sign-in check above still answers before it. A route passes in o
   pending session inside the handler, such as `/ui/mfa`. `authorizes_in_body` marks a WebSocket
   that authorizes the caller inside its own body, and `/ws/stats` is the engine route that uses it.
   On an HTTP route with no gate, that mark does not count, so the route is refused. The mark is
-  not trusted on its own (vault BACKLOG #2955): the in-body WebSocket gates, at least `authorize_ws`
-  and the web console's `authorize_ui_ws`, record on the handshake whether they admitted the caller,
+  not trusted on its own (vault BACKLOG #2955): `authorize_ws` records on the handshake whether it admitted the caller,
+  and the web console's `authorize_ui_ws` does so only on a browser handshake (one with an Origin),
   the latest answer standing. `WebSocketAcceptGate` reads that record before it lets an accept
   through. When the latest recorded answer is a refusal, it refuses accept on every socket, whatever its route declares. With no
   recorded answer, a socket passes only where its route declares its authorization another way: a
