@@ -354,7 +354,7 @@ jobs:
       # no lock pin holds. A requirement it cannot parse fails, and so does a line of options with
       # no requirement that pip cannot read. An include or constraint line (-r, --requirement, -c or
       # --constraint, in any spelling pip takes, with no editable on the line) fails too: this step
-      # reads no file a line names, and no new lock clears such a line.
+      # follows no file a line names, and no new lock clears such a line.
       - name: Check requirements.lock is not stale against requirements.txt
         if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
         run: |
@@ -534,33 +534,39 @@ for group in logical_lines("requirements.lock"):
     if isinstance(req, Requirement) and (req.marker is None or req.marker.evaluate()):
         exact = [s.version for s in req.specifier if s.operator in ("==", "===")]
         locked.setdefault(canonicalize_name(req.name), set()).update(exact)
-stale, refused = [], []
+REGENERATE = "regenerate requirements.lock from requirements.txt"
+# Each error with its remedy, in file order.
+errors = []
 for group in logical_lines("requirements.txt"):
     text, options, line = split_line(group)
     req = requirement(text)
     if req is None:
         kind = option_kind(options)
         if kind is None:
-            stale.append(f"{line} is not a line pip can read")
+            errors.append((f"{line} is not a line pip can read", REGENERATE))
         elif kind == "editable":
             print(f"::notice::{line} is editable, so it is not checked against requirements.lock")
         elif kind == "include":
-            # No new lock clears these two, so each carries its own remedy.
-            refused.append(
-                f"{line} includes another requirements file, which this check does not read;"
-                " list its pins in requirements.txt"
+            # No new lock clears these two, so each names a remedy that keeps what the file does.
+            errors.append(
+                (
+                    f"{line} includes another requirements file, which this check does not follow",
+                    "move that file's lines into requirements.txt",
+                )
             )
         elif kind == "constraint":
-            refused.append(
-                f"{line} names a constraints file, which this check does not read;"
-                " take it out of requirements.txt"
+            errors.append(
+                (
+                    f"{line} names a constraints file, which this check does not follow",
+                    "set PIP_CONSTRAINT to that file instead wherever requirements.txt is installed",
+                )
             )
         continue
     if isinstance(req, str):
         if unnamed(req):
             print(f"::notice::{line} names no package, so it is not checked against requirements.lock")
         else:
-            stale.append(f"{line} is not a requirement this check can read")
+            errors.append((f"{line} is not a requirement this check can read", REGENERATE))
         continue
     name = canonicalize_name(req.name)
     if req.marker is not None and not req.marker.evaluate():
@@ -569,18 +575,16 @@ for group in logical_lines("requirements.txt"):
     if req.extras:
         print(f"::notice::{name}'s extras are not checked: requirements.lock records none")
     if name not in locked:
-        stale.append(f"{name} is in requirements.txt but not in requirements.lock")
+        errors.append((f"{name} is in requirements.txt but not in requirements.lock", REGENERATE))
         continue
     versions = [version(v) for v in locked[name]]
     allowed = [v for v in versions if isinstance(v, Version) and req.specifier.contains(v, prereleases=True)]
     if req.specifier and not allowed:
         have = ", ".join(sorted(locked[name])) or "unpinned"
-        stale.append(f"requirements.txt asks for {name}{req.specifier}, requirements.lock pins {have}")
-for problem in stale:
-    print(f"::error::{problem}; regenerate requirements.lock from requirements.txt")
-for problem in refused:
-    print(f"::error::{problem}")
-sys.exit(1 if stale or refused else 0)
+        errors.append((f"requirements.txt asks for {name}{req.specifier}, requirements.lock pins {have}", REGENERATE))
+for problem, remedy in errors:
+    print(f"::error::{problem}; {remedy}")
+sys.exit(1 if errors else 0)
 """
 
 

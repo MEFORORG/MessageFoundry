@@ -802,11 +802,12 @@ def test_a_stale_lock_fails_its_own_step_and_hides_no_audit(
 
 
 _INCLUDE = (
-    "includes another requirements file, which this check does not read;"
-    " list its pins in requirements.txt"
+    "includes another requirements file, which this check does not follow;"
+    " move that file's lines into requirements.txt"
 )
 _CONSTRAINT = (
-    "names a constraints file, which this check does not read; take it out of requirements.txt"
+    "names a constraints file, which this check does not follow;"
+    " set PIP_CONSTRAINT to that file instead wherever requirements.txt is installed"
 )
 
 #: (the line after ``foo==1.0``, the ::error:: it raises, whether the pins audit's grep also sees it).
@@ -819,6 +820,8 @@ _INCLUDE_CASES = [
     ("--requirement=extra.txt", f"--requirement=extra.txt {_INCLUDE}", True),
     ("-c extra.txt", f"-c extra.txt {_CONSTRAINT}", False),
     ("--constraint=extra.txt", f"--constraint=extra.txt {_CONSTRAINT}", False),
+    ("-rextra.txt", f"-rextra.txt {_INCLUDE}", True),
+    ("-cextra.txt", f"-cextra.txt {_CONSTRAINT}", False),
     # pip follows the include when a line names both.
     ("-c other.txt -r extra.txt", f"-c other.txt -r extra.txt {_INCLUDE}", False),
     # Printed as written, before ${VAR} expansion.
@@ -854,6 +857,25 @@ def test_an_include_or_constraint_line_fails_the_stale_check(
         if not (grepped and c.startswith("pip-audit -r requirements.txt"))
     ]
     assert audited.exists()
+
+
+def test_each_error_keeps_its_own_remedy_in_file_order(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
+) -> None:
+    """A stale pin and a constraint line in one file: each error names its own remedy."""
+    _, _, output, failed = _run_audit_job(
+        scaffolded_ci,
+        tmp_path,
+        _STALE_LOCK,
+        requirements="messagefoundry==0.5.1\n-c extra.txt\nacme-hl7-utils==1.2\n",
+    )
+    assert failed == [_STALE], output
+    errors = [ln for ln in output.splitlines() if ln.startswith("::error::")]
+    assert errors == [
+        f"::error::-c extra.txt {_CONSTRAINT}",
+        "::error::acme-hl7-utils is in requirements.txt but not in requirements.lock;"
+        " regenerate requirements.lock from requirements.txt",
+    ]
 
 
 def test_a_lock_pin_whose_marker_is_false_here_covers_nothing(

@@ -225,10 +225,11 @@ that package's build code may run in CI:
     holds) are only noted. A requirement it cannot parse fails, and so does a line of options with
     no requirement that pip cannot read. An include or constraint line (`-r`, `--requirement`, `-c`
     or `--constraint`, in any spelling pip takes, with no editable on the line) fails too, because
-    the step reads no file a line names, so it cannot check an included file's pins or a
-    constraints file's limits against the lock. No new lock clears it: list the included pins in
-    `requirements.txt`, or take the constraint line out. The options on a line that also holds a
-    requirement are not read.
+    the step follows no file a line names, so it cannot check an included file's pins or a
+    constraints file's limits against the lock. No new lock clears it: move the included file's
+    lines into `requirements.txt`, or set `PIP_CONSTRAINT` to the constraints file wherever
+    `requirements.txt` is installed. The options on a line that also holds a requirement are not
+    read.
   - The job takes the engine's pin out of the lock, as pip reads the lock, and installs that pin
     alone with `--no-deps --require-hashes`. The lock must pin `messagefoundry` exactly once, or the
     job says so and fails; pip refuses the pin if it carries no hash. No other locked package is
