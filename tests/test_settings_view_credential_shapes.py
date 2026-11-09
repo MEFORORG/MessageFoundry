@@ -180,6 +180,14 @@ def test_a_compound_query_name_holding_a_credential_word_is_withheld(query: str)
     assert _shown({"url": url})["url"] == "https://<redacted>"
 
 
+@pytest.mark.parametrize("query", [f"code={MARK}", f"fmt=json&CODE={MARK}"])
+def test_a_code_query_parameter_is_withheld(query: str) -> None:
+    """An Azure Functions function key rides ``?code=``, which the HTTP-family credential
+    refusals count (vault BACKLOG #3533 item 7), so the settings view withholds it too."""
+    url = f"https://h.example.invalid/x?{query}"
+    assert _shown({"url": url})["url"] == "https://<redacted>"
+
+
 @pytest.mark.parametrize(
     "query",
     [

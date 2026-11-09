@@ -321,9 +321,10 @@ def check_fhir_lookup_allowed(
     being empty says nothing about whether the proxy is permitted (BACKLOG #1659, DELTA-04 lockstep).
 
     ``warn_query_credentials=False`` drops ONLY the :func:`warn_url_query_credentials` line, never a
-    refusal. The runner's live builds pass it and log nothing: at a start the runner's
-    ``_build_fhir_lookup_executor`` logs the line once per lookup before it builds, and a reload's
-    build follows its build check, which has logged it (vault BACKLOG #2910)."""
+    refusal. The runner's live builds pass it and log nothing, because the line is logged before
+    them, at least: at a start the runner's ``_build_fhir_lookup_executor`` logs it once per lookup
+    before it builds, and a reload's build follows its build check, which has logged it (vault
+    BACKLOG #2910)."""
     # ASVS 14.2.1, before every refusal, so a lookup a refusal takes down is still recorded.
     if warn_query_credentials:
         warn_url_query_credentials(f"FhirLookup {name!r}", settings)
@@ -360,8 +361,9 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
 
     This warns and does not refuse. On the hops docs/SECURITY-LOOSENING.md *No escape sends a
     credential to an unverified peer* covers, ``transports.rest.refuse_verify_off`` and
-    ``transports.rest.refuse_cleartext_credentials`` refuse the same names with no escape, and
-    accept a false refusal because the peer is unverified (vault BACKLOG #3230, #3533). Elsewhere
+    ``transports.rest.refuse_cleartext_credentials`` refuse these names and ``code`` with no
+    escape, and accept a false refusal because the peer is unverified (vault BACKLOG #3230, #3533).
+    Elsewhere
     the warning is all there is, and the reason is the difference from the userinfo precedent.
     ``transports.rest.refuse_url_credentials`` REFUSES ``user:password@`` because that shape never
     authenticated anything: urllib reads it as part of the host, and the error text carried the
@@ -449,10 +451,10 @@ def check_egress_allowed(
     outright (fail-closed); with the list set, the per-list matching below is unchanged.
 
     ``warn_query_credentials=False`` drops ONLY the :func:`warn_url_query_credentials` line, never a
-    refusal. The runner's lane builds pass it: a start, an operator start and a schedule window's
-    opening log the line in :func:`warn_url_query_credentials_before_build` just before the build
-    (BACKLOG #4997), and a reload's builds follow its build check, which has logged it (vault
-    BACKLOG #2910)."""
+    refusal. The runner's lane builds pass it, because the line is logged before them, at least:
+    a start, an operator start and a schedule window's opening log it in
+    :func:`warn_url_query_credentials_before_build` just before the build (BACKLOG #4997), and a
+    reload's builds follow its build check, which has logged it (vault BACKLOG #2910)."""
     # ASVS 14.2.1: a recorded loosening, never a silent one. Before every refusal, so a lane a
     # refusal takes down is still recorded.
     if warn_query_credentials:

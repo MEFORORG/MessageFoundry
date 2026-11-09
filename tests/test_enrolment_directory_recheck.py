@@ -41,6 +41,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore, UserRecord
 from tests._admin_account import login_admin
+from tests._enrolment_code import enrolment_code_for
 from tests._fake_directory import FakeDirectory as _Directory
 
 _T0 = 1_700_000_000.0
@@ -99,6 +100,8 @@ class _Signed:
     directory: _Directory
     identity: Identity
     token: str
+    # ADR 0207: the unstamped session's first factor binds only with an issued enrolment code.
+    code: str | None = None
 
 
 async def _directory_sign_in(
@@ -113,7 +116,9 @@ async def _directory_sign_in(
     await service.initialize()
     out = await service._complete_ad_login(principal, None, mfa_verified=False)
     assert out.token is not None and out.identity is not None
-    return _Signed(service, store, directory, out.identity, out.token)
+    code = await enrolment_code_for(service, out.identity.user_id)
+    assert code is not None
+    return _Signed(service, store, directory, out.identity, out.token, code)
 
 
 async def _mapped_sign_in(store: MessageStore, *groups: str) -> _Signed:
@@ -165,7 +170,9 @@ async def _totp_staged(
 
 async def _assert_totp_refused_and_unspent(t: _TotpStaged, outcome: str) -> None:
     s = t.signed
-    refused = await s.service.confirm_mfa_enrollment(s.identity, t.code, token=s.token)
+    refused = await s.service.confirm_mfa_enrollment(
+        s.identity, t.code, token=s.token, enrolment_code=s.code
+    )
     assert refused.ok is False
     assert refused.directory_refusal is (
         DirectoryRefusal.DEMOTED
@@ -208,7 +215,7 @@ async def test_a_directory_the_account_is_not_confirmed_in_refuses_the_totp_enro
     t.signed.directory.answer = DirectoryAnswer.FOUND
     t.signed.directory.unreachable = False
     served = await t.signed.service.confirm_mfa_enrollment(
-        t.signed.identity, t.code, token=t.signed.token
+        t.signed.identity, t.code, token=t.signed.token, enrolment_code=t.signed.code
     )
     assert served.ok is True and len(served.recovery_codes) > 0
     assert served.token is not None and await t.signed.service.mfa_satisfied(served.token)
@@ -247,7 +254,7 @@ async def test_a_present_enabled_directory_account_still_enrols_totp(
     t = await _totp_staged(await _directory_sign_in(store), monkeypatch)
 
     served = await t.signed.service.confirm_mfa_enrollment(
-        t.signed.identity, t.code, token=t.signed.token
+        t.signed.identity, t.code, token=t.signed.token, enrolment_code=t.signed.code
     )
 
     assert served.ok is True and t.minted != []
@@ -269,7 +276,7 @@ async def test_a_session_revoked_during_the_lookup_is_a_lost_totp_enrolment(
     monkeypatch.setattr(t.signed.service, "_probe_principal", _probe_while_revoked)
 
     lost = await t.signed.service.confirm_mfa_enrollment(
-        t.signed.identity, t.code, token=t.signed.token
+        t.signed.identity, t.code, token=t.signed.token, enrolment_code=t.signed.code
     )
 
     assert lost.ok is False and lost.session_lost is True and lost.directory_refusal is None
@@ -280,7 +287,7 @@ async def test_a_session_revoked_during_the_lookup_is_a_lost_totp_enrolment(
     assert again.token is not None and again.identity is not None
     monkeypatch.setattr(t.signed.service, "_probe_principal", real_probe)
     served = await t.signed.service.confirm_mfa_enrollment(
-        again.identity, t.code, token=again.token
+        again.identity, t.code, token=again.token, enrolment_code=t.signed.code
     )
     assert served.ok is True
 
@@ -294,7 +301,9 @@ async def test_the_totp_enrolment_lookup_comes_after_the_floor(
     t = await _totp_staged(s, monkeypatch)
     s.directory.answer = DirectoryAnswer.DISABLED  # a lookup ahead of the floor would refuse
 
-    floored = await s.service.confirm_mfa_enrollment(s.identity, t.code, token=s.token)
+    floored = await s.service.confirm_mfa_enrollment(
+        s.identity, t.code, token=s.token, enrolment_code=s.code
+    )
 
     assert floored.ok is False and floored.directory_refusal is None
     assert s.directory.probes == []
@@ -316,7 +325,7 @@ async def test_a_slow_lookup_does_not_push_a_good_enrolment_code_out_of_its_step
     monkeypatch.setattr(t.signed.service, "_probe_principal", _probe_past_the_step)
 
     served = await t.signed.service.confirm_mfa_enrollment(
-        t.signed.identity, t.code, token=t.signed.token
+        t.signed.identity, t.code, token=t.signed.token, enrolment_code=t.signed.code
     )
 
     assert served.ok is True
@@ -347,7 +356,7 @@ async def test_a_second_step_locked_directory_account_cannot_enrol(
     await _lock_second_step(store, t.signed.identity.user_id)
 
     refused = await t.signed.service.confirm_mfa_enrollment(
-        t.signed.identity, t.code, token=t.signed.token
+        t.signed.identity, t.code, token=t.signed.token, enrolment_code=t.signed.code
     )
 
     assert refused.ok is False and refused.directory_refusal is None
@@ -433,13 +442,22 @@ async def test_a_totp_enabled_by_another_confirm_is_still_a_lost_session_not_a_f
         earlier = _T0 - totp.DEFAULT_PERIOD
         pin_totp_clock(monkeypatch, earlier)
         code = totp.totp(staged.secret, now=earlier)
-        assert (await s.service.confirm_mfa_enrollment(other.identity, code, token=other.token)).ok
+        # Its own code: issuing it replaces the one this confirm holds, which no longer matters
+        # once the other confirm has enabled TOTP.
+        other_code = await enrolment_code_for(s.service, other.identity.user_id)
+        assert (
+            await s.service.confirm_mfa_enrollment(
+                other.identity, code, token=other.token, enrolment_code=other_code
+            )
+        ).ok
         pin_totp_clock(monkeypatch, _T0)
         return await real_probe(user)
 
     monkeypatch.setattr(s.service, "_probe_principal", _probe_while_another_confirm_enables)
 
-    lost = await s.service.confirm_mfa_enrollment(s.identity, t.code, token=s.token)
+    lost = await s.service.confirm_mfa_enrollment(
+        s.identity, t.code, token=s.token, enrolment_code=s.code
+    )
 
     assert lost.session_lost is True and lost.ok is False and lost.recovery_codes == ()
     assert await store.list_audit(action="auth.mfa_denied") == []
@@ -499,7 +517,13 @@ async def _passkey_staged(s: _Signed) -> _PasskeyStaged:
 
 async def _register(p: _PasskeyStaged) -> Elevation:
     return await p.signed.service.finish_webauthn_registration(
-        p.signed.identity, p.response, label="key", token=p.signed.token, rp_id=_RP, origin=_ORIGIN
+        p.signed.identity,
+        p.response,
+        label="key",
+        token=p.signed.token,
+        rp_id=_RP,
+        origin=_ORIGIN,
+        enrolment_code=p.signed.code,
     )
 
 

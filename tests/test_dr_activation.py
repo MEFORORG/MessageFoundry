@@ -96,6 +96,67 @@ async def test_acquire_vip_hook_success_activates(tmp_path: Path) -> None:
         await store.close()
 
 
+async def test_a_profile_step_that_did_not_finish_is_on_the_result_and_the_row(
+    tmp_path: Path,
+) -> None:
+    """The engine callback returns each follow-on step its reload could not finish. The activation
+    stands, and names the step on its result and its ``dr.activate`` row. Red (engine PR 2815,
+    Lander hold 6698688363 item 3): nothing carried it, so the activation read as clean."""
+    store, archive, ss = await _seed(tmp_path)
+    try:
+
+        async def act() -> dict[str, str]:
+            return {"outbound_close": "outbound 'out': OSError: synthetic close failure"}
+
+        async def deact() -> None:
+            return None
+
+        coord = DrCoordinator(
+            store,
+            DrSettings(enabled=True, seed_archive=archive),
+            store_settings=ss,
+            activate_profile=act,
+            deactivate_profile=deact,
+        )
+        result = await coord.activate(actor="alice")
+        assert result.active and coord.active
+        assert result.failures == ("outbound_close",)
+        rows = [r for r in await store.list_audit(limit=50) if r["action"] == "dr.activate"]
+        assert len(rows) == 1
+        assert json.loads(rows[0]["detail"])["failed_steps"] == ["outbound_close"]
+    finally:
+        await store.close()
+
+
+async def test_a_retry_of_a_degraded_activation_still_names_its_steps(tmp_path: Path) -> None:
+    """A repeated activate finds the box active and answers with the posture. When the activation
+    that made it active left a step unfinished, the retry names that step too, since the route
+    makes a retry the way to read an outcome its deadline cut off. Red (Lander hold 6702318430,
+    item A): the already-active branch answered with no failures, so a retry read as clean."""
+    store, archive, ss = await _seed(tmp_path)
+    try:
+
+        async def act() -> dict[str, str]:
+            return {"outbound_close": "outbound 'out': OSError: synthetic close failure"}
+
+        async def deact() -> None:
+            return None
+
+        coord = DrCoordinator(
+            store,
+            DrSettings(enabled=True, seed_archive=archive),
+            store_settings=ss,
+            activate_profile=act,
+            deactivate_profile=deact,
+        )
+        first = await coord.activate(actor="alice")
+        retry = await coord.activate(actor="alice")
+        assert first.failures == ("outbound_close",)
+        assert retry.active and retry.failures == ("outbound_close",)
+    finally:
+        await store.close()
+
+
 async def test_acquire_vip_or_abort_records_audit(tmp_path: Path) -> None:
     # AC-6: a takeover_hook that FAILS (non-zero) → abort, no priority listener bound (the
     # run-profile never activated), stays passive, records dr_activation_aborted. What that row

@@ -67,10 +67,18 @@ interpreter it starts.
 Two things undo this, and the engine refuses or reports each:
 
 - **Overriding the entry point** (`--entrypoint messagefoundry`, or a `command:` that replaces it
-  in Kubernetes) starts the engine without the options. Under `enforce` it then refuses to
-  start, because remote debugging is on (vault BACKLOG #2700). Under `warn`, or with
-  `[security].allow_remote_debugging`, it reports `interpreter_not_isolated` and
-  `remote_debug_enabled`.
+  in Kubernetes) can start the engine without the options. Remote debugging is then on unless
+  something turns it off, as at least these do: the start passes `-X disable-remote-debug`; or the start passes
+  neither `-I` nor `-E`, as the `messagefoundry` console script does, and the container's
+  environment sets `PYTHON_DISABLE_REMOTE_DEBUG`. The interpreter ignores that variable under
+  either option, so an override that keeps `-I` and drops only `-X disable-remote-debug` has it
+  on. With it on, under `enforce` the start refusal for it stops the engine unless
+  `[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). A start that goes on
+  reports `interpreter_not_isolated` where the override drops `-I`, and `remote_debug_enabled`
+  or `remote_debug_unguarded` while the interface is on. The refusal is stated in full in
+  [`docs/SECURITY-LOOSENING.md`](../docs/SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process),
+  and the acceptance, which is for a developer's own start and never a deployment, in
+  [its own section](../docs/SECURITY-LOOSENING.md#allow_remote_debugging--true----start-under-enforce-with-the-interpreters-remote-debugging-on).
 - **A derived image that leaves the venv owned by uid 10001.** Install extra packages as root and
   switch back: `USER root`, then `RUN /opt/venv/bin/pip install ...`, then `USER 10001`. The engine
   reports `startup_directory_writable` when its account can write there.
@@ -216,9 +224,10 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
   ([the rule](../docs/SECURITY.md#multi-factor-authentication-totp-wp-14)). An exposed instance with
   `require_mfa=false` is **refused at startup** under the shipped `enforce`, unless
   `[security].allow_single_factor_admin_when_exposed` is set.
-- **Never bake `MEFOR_ALLOW_INSECURE_TLS`** — it disables outbound/peer TLS verification across **all**
-  transports (store incl. Postgres/SQL Server, MLLP-outbound, REST/SOAP/FHIR/SMART/DATABASE, SFTP host-key,
-  LDAP, alert webhooks). It is a CI-only switch for self-signed test containers.
+- **Never bake `MEFOR_ALLOW_INSECURE_TLS`.** See
+  [the escape hatch](../docs/DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) for the hops it
+  reaches, and the ones it does not. It has no effect on the alert webhook. It is a CI-only switch
+  for self-signed test containers.
 - **Cert-expiry monitor skips `env()`-referenced cert paths.** Use literal paths for any cert you want the
   built-in expiry alert to watch (the `[api]` cert is always literal and covered).
 - **In-engine TLS revocation is delegated** (ADR 0002). For enforced revocation use Topology B with an
