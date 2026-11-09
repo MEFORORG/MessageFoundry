@@ -198,7 +198,6 @@ from messagefoundry.store.store import (
     RevokeResult,
     RoleRow,
     SessionRecord,
-    TotpJudgement,
     TotpState,
     UserAuthzRecord,
     UsernameAuditAppendError,
@@ -14001,28 +14000,26 @@ class AuthService:
         between this read and the write makes the write match no row, and the change is refused
         rather than landing on an account with no way past.
 
-        For a covered account with a TOTP on, this method opens the TOTP cell once, before the
-        argon2 hash, in :meth:`_refuse_rotation_without_way_past`, and the store's conditional
-        write takes that judgement and confirms under its lock that the cell is the one judged
-        (BACKLOG #3948); a route that asks :meth:`must_enrol_before_rotating` first opens it once
-        more there, before the current password. Without the ``[webauthn]`` extra the write counts
-        no passkey, as :meth:`_has_way_past` counts none.
+        For a covered account with a TOTP on, this method opens the TOTP cell twice: before the
+        argon2 hash, in :meth:`_refuse_rotation_without_way_past`, and in the store's conditional
+        write, which judges the cell it writes against (BACKLOG #3948); a route that asks
+        :meth:`must_enrol_before_rotating` first opens it once more there, before the current
+        password. Without the ``[webauthn]`` extra the write counts no passkey, as
+        :meth:`_has_way_past` counts none.
         """
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
             return violations
         user = await self._load_user(identity.user_id)
         covered = user is not None and self._covered_by_requirement(user, identity.roles)
-        judged = None
         if covered and user is not None:
-            judged = await self._refuse_rotation_without_way_past(user)
+            await self._refuse_rotation_without_way_past(user)
         written = await self._store.set_password(
             identity.user_id,
             password_hash=await self._argon2(hash_password, new_password),
             must_change_password=must_change,
             password_generated=False,
             require_way_past=_opened_totp_state if covered else None,
-            totp_judged=judged,
             # Without the [webauthn] extra no passkey can sign in, so the write counts none, as
             # _has_way_past counts none (BACKLOG #3948).
             passkey_counts=self._gate_counts if webauthn.available() else _passkey_counts_nothing,
@@ -14042,7 +14039,7 @@ class AuthService:
         )
         return []
 
-    async def _refuse_rotation_without_way_past(self, user: VerifiedUser) -> TotpJudgement:
+    async def _refuse_rotation_without_way_past(self, user: VerifiedUser) -> None:
         """The rotation's early refusal, before the argon2 hash: raise
         :class:`FactorEnrolmentRequired` where ``user`` holds no factor with a way past, in the
         order :meth:`_has_way_past` asks. The TOTP is judged first, with no passkey read: one that
@@ -14055,16 +14052,13 @@ class AuthService:
         (:func:`passkey_cell_undecodable`), as the census counts it. Any other read error raises,
         before the hash. Where the TOTP counts, the store's write still reads the set under its
         lock, after the hash, so a row that does not parse or a cell that cannot be decoded raises
-        there.
-
-        Returns the TOTP judgement, which the store's conditional write takes in place of opening
-        the cell again (``totp_judged``), so the rotation opens it once (BACKLOG #3948)."""
+        there."""
         judged = await judge_totp(self._store.open_totp_secret, _opened_totp_state, user)
         if judged.state != "refused":
-            return judged
+            return
         try:
             if await self._holds_gate_passkey(user):
-                return judged
+                return
         except (UnicodeDecodeError, sqlite3.OperationalError) as exc:
             if not passkey_cell_undecodable(exc):
                 raise

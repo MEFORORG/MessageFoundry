@@ -126,7 +126,6 @@ from messagefoundry.store.store import (
     SignCountAnswer,
     Stage,
     StreamingAttachmentsUnsupported,
-    TotpJudgement,
     TotpUsable,
     UserRecord,
     WebAuthnCredential,
@@ -2369,9 +2368,7 @@ class AuthStore(Protocol):
     # recorded as discoverable, read from the set the account's seal covers. So an
     # ``admin_reset_mfa`` or a passkey removal that lands between the caller's check and this write
     # makes it match no row. Returns whether a row was written; a conditional caller refuses on
-    # False. ``totp_judged`` is the caller's own judgement of the TOTP (``TotpJudgement``), taken
-    # in place of opening the cell again; under the lock a cell other than the one it judged counts
-    # for nothing. It is read only with ``require_way_past``.
+    # False.
     async def set_password(
         self,
         user_id: str,
@@ -2381,7 +2378,6 @@ class AuthStore(Protocol):
         must_change_password: bool = True,
         require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
-        totp_judged: TotpJudgement | None = None,
         now: float | None = None,
     ) -> bool: ...
 
