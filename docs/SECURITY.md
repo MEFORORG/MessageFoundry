@@ -5875,8 +5875,8 @@ the same order before it hashes. It judges the TOTP first. Only where that TOTP 
 a passkey can count does this early check read the passkey set, through the verified read
 `_has_way_past` uses. It refuses an account with neither. The store's conditional write judges
 the TOTP again itself before its lock, counts that judgement under the lock only for the cell it
-judged (BACKLOG #3948), and reads the passkey set under its lock on every conditional rotation. Without the `[webauthn]` extra the write counts no passkey, as
-`_has_way_past` counts none.
+judged (BACKLOG #3948), and reads the passkey set under its lock on every conditional rotation.
+Without the `[webauthn]` extra the write counts no passkey, as `_has_way_past` counts none.
 One whose passkeys are not discoverable must also enrol a factor that is a way past
 before it rotates, so after the passkey it goes to the enrolment page, and only then to the password
 page. Such an account exists only where its passkey came before the requirement covered it, or

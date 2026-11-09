@@ -1386,7 +1386,12 @@ async def test_a_usable_judgement_of_a_cell_that_moved_does_not_open_the_rotatio
             assert await store.disable_totp(identity.user_id)
             await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
 
-        async def pre_lock_read(_user_id: str) -> Any:
+        before = await _password_hash(store, identity.user_id)
+        real_get_user = store.get_user
+        reads: list[str] = []
+
+        async def pre_lock_read(user_id: str) -> Any:
+            reads.append(user_id)
             return stale
 
         monkeypatch.setattr(store, "get_user", pre_lock_read)
@@ -1396,7 +1401,10 @@ async def test_a_usable_judgement_of_a_cell_that_moved_does_not_open_the_rotatio
             password_generated=False,
             require_way_past=_opened_totp_state,
         )
+        assert reads == [identity.user_id], "the planted pre-lock read was not used"
         assert written is not moved
+        monkeypatch.setattr(store, "get_user", real_get_user)
+        assert (await _password_hash(store, identity.user_id) != before) is written
     finally:
         await store.close()
 

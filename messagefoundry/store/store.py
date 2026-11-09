@@ -3258,7 +3258,7 @@ async def judge_totp(
     usable: TotpUsable | None,
     user: UserRecord | None,
 ) -> TotpJudgement | None:
-    """The :data:`TotpCounts` a backend passes to :func:`holds_way_past`,
+    """The :data:`TotpCounts` a backend passes to the conditional-write rules, at least
     :func:`removal_keeps_way_past`, :func:`totp_removal`, :func:`lockout_increment` and
     :func:`password_change`. A caller outside a backend may call it too, with no lock to confirm
     the cell under, and then reads only the judgement's ``state``.

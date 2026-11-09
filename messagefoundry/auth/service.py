@@ -14004,8 +14004,8 @@ class AuthService:
         TOTP cell before the argon2 hash, and the store's conditional write opens it again before
         its lock and, under the lock, counts that judgement only for the cell it judged (BACKLOG
         #3948); a route that asks :meth:`must_enrol_before_rotating` first opens it there too,
-        before the current password. Without the ``[webauthn]`` extra the write counts no passkey, as
-        :meth:`_has_way_past` counts none.
+        before the current password. Without the ``[webauthn]`` extra the write counts no passkey,
+        as :meth:`_has_way_past` counts none.
         """
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:

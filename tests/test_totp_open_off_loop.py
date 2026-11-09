@@ -412,7 +412,7 @@ async def test_a_password_change_opens_the_totp_cell_in_the_early_refusal_and_in
     events: list[str] = []
 
     def counting(user_id: str, cell: str | None) -> str | None:
-        events.append("open")
+        events.append(f"open:{user_id}")
         return real_open(user_id, cell)
 
     async def marking(fn: Callable[..., Any], *args: Any) -> Any:
@@ -422,4 +422,5 @@ async def test_a_password_change_opens_the_totp_cell_in_the_early_refusal_and_in
     monkeypatch.setattr(store, "open_totp_secret", counting)
     monkeypatch.setattr(service, "_argon2", marking)
     assert await service.change_password(identity, "a fresh synthetic passphrase 7341") == []
-    assert events == ["open", "hash", "open"], events
+    opened = f"open:{identity.user_id}"
+    assert events == [opened, "hash", opened], events
