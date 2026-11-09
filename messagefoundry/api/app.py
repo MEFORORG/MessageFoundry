@@ -4777,6 +4777,10 @@ def create_app(
 
         return middleware
 
+    def _refuse_body(request: Request, status: int, detail: str, what: str) -> JSONResponse:
+        _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
+        return JSONResponse({"detail": detail}, status_code=status)
+
     def _body_refusal(request: Request) -> JSONResponse | None:
         """The response refusing ``request``'s body before any route runs, or None to admit it."""
         # The HTTP API carries only small JSON (HL7 payloads arrive via MLLP/file, not here), so a
@@ -4785,23 +4789,20 @@ def create_app(
         # DoS probe) and were previously dropped silently. We log to the rotating general log rather
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
         lengths = request.headers.getlist("content-length")
-
-        def refuse(status: int, detail: str, what: str) -> JSONResponse:
-            _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
-            return JSONResponse({"detail": detail}, status_code=status)
-
         # The API takes only Content-Length bodies, so ANY Transfer-Encoding is refused, by presence
         # on any line and whatever its value. Beside a Content-Length the request is ambiguously
         # framed (RFC 9112 §6.1, the CL.TE smuggling vector, ASVS 4.2.1); without one its body has
         # no length the cap can bound up front (review M-19).
         if "transfer-encoding" in request.headers:
             if lengths:
-                return refuse(
+                return _refuse_body(
+                    request,
                     400,
                     "ambiguous framing: Content-Length with Transfer-Encoding is not accepted",
                     "request with both Content-Length and Transfer-Encoding",
                 )
-            return refuse(
+            return _refuse_body(
+                request,
                 411,
                 "Transfer-Encoding is not accepted; send a Content-Length",
                 "Transfer-Encoding request body",
@@ -4812,7 +4813,7 @@ def create_app(
         # and a repeated line is a second framing claim.
         value = lengths[0].strip(" \t")
         if len(lengths) > 1 or not (value.isascii() and value.isdigit()):
-            return refuse(400, "invalid Content-Length", "invalid Content-Length")
+            return _refuse_body(request, 400, "invalid Content-Length", "invalid Content-Length")
         # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
         upload_store = getattr(request.app.state, "upload_store", None)
         cap = (
@@ -4823,7 +4824,7 @@ def create_app(
         # Digit count first: int() raises past 4300 digits, and a longer number is over any cap.
         digits = value.lstrip("0") or "0"
         if len(digits) > len(str(cap)) or int(digits) > cap:
-            return refuse(413, "request body too large", "oversized request body")
+            return _refuse_body(request, 413, "request body too large", "oversized request body")
         return None
 
     # add_middleware inserts at index 0, so registering in this order keeps _limit_request_body

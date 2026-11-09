@@ -157,8 +157,8 @@ connection. For most shapes llhttp refuses the request head before any engine co
 
 The two chunk shapes in the last row fail in the body instead. The engine starts handling a request
 once its head is read, and it answers a request carrying `Transfer-Encoding` and no
-`Content-Length` with `411` from the head alone. When the bad body arrives in the same read as the head, the engine writes only the
-`400`, and nothing after it.
+`Content-Length` with `411` from the head alone. When the bad body arrives in the same read as
+the head, the engine writes only the `400`, and nothing after it.
 When the head arrives first and the bad body later, the engine can send its `411` and then the
 `400`: two responses to one request. Rule 1 below keeps a proxy clear of this, because a proxy that
 sends one `Content-Length` never forwards a chunked body.
@@ -191,8 +191,8 @@ Your proxy must also meet at least these four rules.
    engine refuses any request carrying `Transfer-Encoding`. nginx buffers by default
    (`proxy_request_buffering on`).
 2. **Do not reuse a connection to the engine after an error.** After an engine `400`, or a response
-   the proxy could not read to its framed end, drop that connection. The engine closes it after its parser's `400`. One
-   request per connection to the engine is the simplest safe setting. nginx works that way unless
+   the proxy could not read to its framed end, drop that connection. The engine closes it after
+   its parser's `400`. One request per connection to the engine is the simplest safe setting. nginx works that way unless
    you configure keep-alive to the upstream.
 3. **Re-check requests that arrive over HTTP/2 or HTTP/3.** If the proxy speaks HTTP/1.1 to the
    engine, it must refuse such a request when it carries `Transfer-Encoding`, or a `content-length`

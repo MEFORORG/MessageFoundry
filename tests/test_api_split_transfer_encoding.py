@@ -97,6 +97,13 @@ _ADMITTED = 422
         # Controls: the cap, and what the limit admits.
         pytest.param((("content-length", "9" * 5000),), 413, id="Content-Length past int digits"),
         pytest.param((("content-length", "1"),), _ADMITTED, id="plain Content-Length"),
+        pytest.param((("content-length", "1048576"),), _ADMITTED, id="Content-Length at the cap"),
+        pytest.param((("content-length", "1048577"),), 413, id="Content-Length one past the cap"),
+        pytest.param(
+            (("content-length", "0" * 20 + "1"),),
+            _ADMITTED,
+            id="plain Content-Length, more leading zeros than the cap has digits",
+        ),
         pytest.param(
             (("content-length", " \t0001\t "),),
             _ADMITTED,

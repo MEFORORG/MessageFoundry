@@ -122,8 +122,9 @@ _FRAMED: dict[str, tuple[bytes, list[int]]] = {
         [411, 200],
     ),
     # BACKLOG #5345: an empty Transfer-Encoding ahead of any Content-Length passes llhttp, which
-    # frames by Content-Length or reads no body. The refusal is the app's, by the header's presence: 411 alone, 400 beside a
-    # Content-Length. The 200 after it shows the body was read to the length it declared.
+    # frames by Content-Length or reads no body. The refusal is the app's, by the header's
+    # presence: 411 alone, 400 beside a Content-Length. The 200 after it shows the body was read
+    # to the length it declared.
     "transfer-encoding empty": (_POST + b"Transfer-Encoding: \r\n\r\n", [411, 200]),
     "transfer-encoding empty, then a content-length": (
         _POST + b"Transfer-Encoding: \r\nContent-Length: 2\r\n\r\n{}",

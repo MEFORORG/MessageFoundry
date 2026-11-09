@@ -7,7 +7,7 @@ INNERMOST user middleware (``add_middleware`` inserts at index 0 and the stack i
 ``reversed(user_middleware)``). Any response that originates OUTSIDE it therefore ships without the
 baseline headers unless its emitter hand-copies them, and hand-copying has already failed twice over:
 
-* the request body cap's four short-circuits (ambiguous CL+TE framing, chunked-without-length,
+* the request body cap's four short-circuits (ambiguous CL+TE framing, Transfer-Encoding-without-length,
   invalid ``Content-Length``, oversized body) are emitted one layer out and carried NONE of them; and
 * ``client_networks._DENIAL_HEADERS`` and ``request_timeout._TIMEOUT_HEADERS`` do hand-copy, but both
   copies are missing ``Strict-Transport-Security`` -- a copy drifts from its original silently.
