@@ -711,7 +711,7 @@ _MARKER_REFUSED = (
 
 
 @pytest.mark.parametrize(
-    "url",
+    "pin",
     [
         pytest.param("https://h/evil-1.0.tar.gz#egg=evil==1.0;sys_platform=='zz'", id="egg-https"),
         pytest.param(
@@ -740,19 +740,22 @@ _MARKER_REFUSED = (
             "file:///x/../evil-1.0.tar.gz%23egg=evil==1.0%3Bextra=='x'",
             id="relative-file-egg-encoded",
         ),
+        # No URL: the strip does not rewrite a continuation line that starts with "-", and the
+        # parser joins it onto the pin as "evil-x;<marker>".
+        pytest.param("evil\\\n-x;sys_platform=='zz'", id="continued-onto-an-option-line"),
     ],
 )
-def test_a_marker_the_strip_leaves_inside_a_url_is_refused(
-    url: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_a_marker_the_strip_leaves_in_the_copy_is_refused(
+    pin: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Lander hold 6 on PR 2840 (issuecomment-6739690438): the strip splits a bare URL's marker off
     only at a ``; ``, as pip does, so a ``;`` inside the URL stays in the copy. pip-requirements-parser
     32.0.1 reads a marker from there, and pip-audit skips the pin with no error where the host fails
-    it. Each URL here is one the parser itself marked, recorded 2026-11-09. Step 1 is stubbed: pip
+    it. Each pin here is one the parser itself marked, recorded 2026-11-09. Step 1 is stubbed: pip
     26.2 refuses an egg fragment holding a ``;``, but the auditor must not lean on that."""
     digest = f"--hash=sha256:{_DIGEST}"
     src = tmp_path / "x.lock"
-    src.write_text(f"{url} {digest}\nbar==2 {digest}\n", encoding="utf-8")
+    src.write_text(f"{pin} {digest}\nbar==2 {digest}\n", encoding="utf-8")
     ran, run = _recorder(0)
     status = main([str(src)], run=run)
     out, err = capsys.readouterr()
@@ -764,14 +767,49 @@ def test_a_marker_the_strip_leaves_inside_a_url_is_refused(
     assert "evil" not in err and "extra" not in err, err
 
 
-def test_a_url_pin_with_no_marker_left_in_it_is_handed_on(tmp_path: Path) -> None:
-    """The control for the refusal above: an egg fragment with no ``;`` reaches pip-audit."""
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param("https://h/evil-1.0.tar.gz#egg=evil==1.0", id="egg"),
+        pytest.param("https://h/evil-1.0%2Blocal-py3-none-any.whl", id="percent-encoded-wheel"),
+    ],
+)
+def test_a_url_pin_with_no_marker_left_in_it_is_handed_on(url: str, tmp_path: Path) -> None:
+    """The control for the refusal above: a URL pin with no ``;``, as written or decoded, reaches
+    pip-audit."""
     digest = f"--hash=sha256:{_DIGEST}"
     src = tmp_path / "x.lock"
-    url = "https://h/evil-1.0.tar.gz#egg=evil==1.0"
     src.write_text(f"{url} ; sys_platform == 'zz' {digest}\nbar==2 {digest}\n", encoding="utf-8")
     status, copies = _audit_copies(src)
     assert (status, copies) == (0, [[f"{url} {digest}", f"bar==2 {digest}"]])
+
+
+def test_a_requirement_still_decoding_after_the_last_pass_is_refused() -> None:
+    """The parser decodes three times at most; the model stops after a fixed number of passes,
+    which keeps it linear, and answers yes where it cannot tell."""
+    from messagefoundry.security.audit_all_platforms import _pip_audit_may_see_marker
+
+    assert _pip_audit_may_see_marker("https://h/a%2541") is False
+    assert _pip_audit_may_see_marker("https://h/a%" + "25" * 64 + "41") is True
+
+
+#: Each text with the requirement strings pip-requirements-parser 32.0.1 itself gave for it
+#: (``preprocess``, then ``break_args_options``), recorded 2026-11-09. The marker check reads these.
+_PARSER_STRINGS = [
+    ("evil\\\n-x;sys_platform=='zz' --hash=sha256:a\n", ["evil-x;sys_platform=='zz'"]),
+    ("foo==1 \\\n    --hash=sha256:a\n    # via x\n", ["foo==1    "]),
+    ("https://h/x.tar.gz#egg=a==1;m  --hash=sha256:a\n", ["https://h/x.tar.gz#egg=a==1;m "]),
+    ("foo @ https://h/x.whl # c;d\n", ["foo @ https://h/x.whl"]),
+    ("a#b==1 --hash=sha256:a;b\n", ["a#b==1"]),
+    ("foo==1\tx --hash=sha256:a\n", ["foo==1\tx"]),
+]
+
+
+@pytest.mark.parametrize(("text", "strings"), _PARSER_STRINGS)
+def test_the_requirement_strings_agree_with_the_parser(text: str, strings: list[str]) -> None:
+    from messagefoundry.security.audit_all_platforms import _pip_audit_requirements
+
+    assert _pip_audit_requirements(text) == strings
 
 
 #: Each text with the requirement count pip-requirements-parser 32.0.1 itself gave for it

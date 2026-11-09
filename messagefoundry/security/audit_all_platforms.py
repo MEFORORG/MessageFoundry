@@ -334,19 +334,14 @@ def _pip_audit_requirement_count(text: str) -> int | None:
     return None if requirements is None else len(requirements)
 
 
-#: What ``urllib.parse.urlsplit`` deletes from anywhere in a URL.
+#: What ``urllib.parse.urlsplit`` deletes from anywhere in a URL, before it splits, so a tab can
+#: part a ``%3B`` the parser still decodes.
 _URL_REMOVED = str.maketrans("", "", "\t\r\n")
 
-
-def _decoded(requirement: str) -> str:
-    """``requirement`` percent-decoded, and with tab, CR and LF removed, until neither changes it.
-
-    ``urllib.parse.urlsplit`` removes those three before it splits, so they can part a ``%3B``.
-    Each pass that changes the text shortens it, so the loop ends.
-    """
-    while (decoded := urllib.parse.unquote(requirement.translate(_URL_REMOVED))) != requirement:
-        requirement = decoded
-    return requirement
+#: More decoding passes than the parser makes on any route (three at most), with a margin. A fixed
+#: number keeps the check linear in the line: a nested ``%25`` chain would otherwise take one pass
+#: per level, each over the whole line.
+_DECODE_PASSES = 8
 
 
 def _pip_audit_may_see_marker(requirement: str) -> bool:
@@ -364,15 +359,25 @@ def _pip_audit_may_see_marker(requirement: str) -> bool:
     whole (``https://h/evil-1.0.tar.gz#egg=evil==1.0;<marker>``), or for a wheel from its file
     name, which ``Link`` percent-decodes twice. A relative ``file:`` URL is re-made from its decoded
     path, so its egg fragment is decoded once and its file name three times. So this answers yes to
-    any ``;`` in the string once :func:`_decoded`.
+    any ``;`` in the string, as written or after any of :data:`_DECODE_PASSES` passes that each
+    remove :data:`_URL_REMOVED` and percent-decode; and yes, since it cannot tell, to a string that
+    is still decoding after the last of them.
 
-    That answers yes to more than the parser marks: a ``;`` elsewhere in a URL, or a decoded one
-    where no route decodes. Each such answer refuses, failing closed. The strip leaves a literal
-    ``;`` only in a bare URL, so any other pin is refused here only where it percent-encodes one.
-    A pin with a URL fails the audit anyway when pip-audit keeps it: 2.10.1 reports it skipped as
-    a URL requirement, which ``--strict`` fails.
+    A ``;`` survives the strip at least inside a bare URL, which the strip splits only at a ``; ``,
+    and on a line a requirement continues onto that starts with ``-``, which the strip does not
+    rewrite and the parser joins onto the pin: ``evil\\`` then ``-x;<marker>`` reads as
+    ``evil-x;<marker>``. This answers yes to more than the parser marks, at least to a ``;``
+    elsewhere in a URL and to a decoded one where no route decodes. Each such answer refuses,
+    failing closed, and can refuse a pin pip-audit would have audited.
     """
-    return ";" in _decoded(requirement)
+    for _ in range(_DECODE_PASSES):
+        if ";" in requirement:
+            return True
+        decoded = urllib.parse.unquote(requirement.translate(_URL_REMOVED))
+        if decoded == requirement:
+            return False
+        requirement = decoded
+    return True
 
 
 #: The schemes pip 26's ``is_url`` takes for a URL: its four, and each VCS's ``vcs+`` forms.
