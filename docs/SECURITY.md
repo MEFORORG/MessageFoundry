@@ -2578,7 +2578,9 @@ written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mi
 reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline, a dry run
 included, and released, any error the reload raises that none of the other reasons names is
 `reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
-raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`. That reason is
+raised by a runner start or swap. For an executor fault wrapped as `WiringBuildFault`, the row
+names the executor fault's type, for example `BrokenThreadPool`, not `WiringBuildFault`. Either
+way the row never carries the error's text. A `FileNotFoundError` there is never `not_found`. That reason is
 for the config directory itself: at least one that is missing, and one moved away between the
 reload's target check and its read of the directory. The row does not claim the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
