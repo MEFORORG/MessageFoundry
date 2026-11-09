@@ -169,6 +169,13 @@ def load_policy(path: Path) -> dict[str, Any]:
     ):
         if key not in parsed:
             raise PolicyError(f"the policy at {path} is missing the required {key!r} section")
+    for key in ("unreachable_allowlist", "anonymous_allowlist", "public_websocket_allowlist"):
+        # Every reader iterates these, some outside evaluate()'s PolicyError handler, so a null or
+        # a string must stop the run here, as could-not-measure, and not crash it later as exit 1.
+        if not isinstance(parsed[key], list):
+            raise PolicyError(
+                f"the policy at {path} has {key!r} as {type(parsed[key]).__name__}, not a list"
+            )
     return parsed
 
 
@@ -600,7 +607,7 @@ def _row_record(row: route_gates.RouteRow) -> dict[str, Any]:
 #: outside the refusal nothing reads one, so the reason alone would vouch for a socket that
 #: authorizes nobody. The walk finds a gate by its call, not by what the endpoint does with the
 #: answer. At run time the engine's ``WebSocketAcceptGate`` (api/security.py) refuses the accept of
-#: an in-body socket no gate admitted, so a body that ignores its gate's refusal is refused there;
+#: a socket whose latest recorded gate answer is a refusal, and of an in-body socket with no answer;
 #: this check is the sweep's own reading, not a substitute for that control.
 _WS_PASSES: Final = frozenset({route_gates.KIND_GATED})
 _WS_NEEDS_REASON: Final = frozenset(
@@ -929,7 +936,8 @@ def receipt_lines(receipt: dict[str, Any], policy: dict[str, Any], verdict: str)
         f"declared public with a reason -- "
         f"{len(ungated_rows) - len(not_public)}/{len(ungated_rows)} ungated routes"
         + (f"; NOT: {not_public}" if not_public else ""),
-        f"WebSocket rows gated, declared public with a reason, or declared with a gate found -- "
+        "WebSocket rows gated with a permission, declared public with a reason, or declared with a "
+        f"reason and a gate found that demands a permission -- "
         f"{len(ws) - len(ws_undeclared)}/{len(ws)}"
         + (f"; NOT: {ws_undeclared}" if ws_undeclared else ""),
         f"negative probes -- {receipt.get('negative_probes')} requests "

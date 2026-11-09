@@ -408,11 +408,21 @@ def _request_reader(request: Request) -> None:
     return None
 
 
-def test_a_websocket_gate_whose_sub_dependency_takes_a_request_fails_the_walk() -> None:
-    """Vault BACKLOG #2955: FastAPI cannot supply a ``Request`` anywhere under a socket's gate."""
+def _websocket_reader(websocket: WebSocket) -> None:
+    return None
 
-    def require_reading_a_request(*permissions: Permission) -> Callable[..., Awaitable[None]]:
-        async def dependency(websocket: WebSocket, _r: None = Depends(_request_reader)) -> None:
+
+@pytest.mark.parametrize("reads_a_request", [True, False], ids=["request", "control-websocket"])
+def test_a_websocket_gate_whose_sub_dependency_takes_a_request_fails_the_walk(
+    reads_a_request: bool,
+) -> None:
+    """Vault BACKLOG #2955: FastAPI cannot supply a ``Request`` anywhere under a socket's gate. The
+    control is the same gate whose sub-dependency takes the ``WebSocket``: its gate and permission
+    are still read."""
+    reader = _request_reader if reads_a_request else _websocket_reader
+
+    def require_reading(*permissions: Permission) -> Callable[..., Awaitable[None]]:
+        async def dependency(websocket: WebSocket, _r: None = Depends(reader)) -> None:
             assert permissions
 
         return mark_route_gate(dependency)
@@ -421,10 +431,14 @@ def test_a_websocket_gate_whose_sub_dependency_takes_a_request_fails_the_walk() 
     app.add_api_websocket_route(
         "/ws/planted",
         _dependency_gated,
-        dependencies=[Depends(require_reading_a_request(Permission.MONITORING_READ))],
+        dependencies=[Depends(require_reading(Permission.MONITORING_READ))],
     )
-    with pytest.raises(ValueError, match="takes a Request"):
-        route_gates.route_rows(app)
+    if reads_a_request:
+        with pytest.raises(ValueError, match="takes a Request"):
+            route_gates.route_rows(app)
+    else:
+        (row,) = _ws_rows(app)
+        assert row.gates and row.permissions == ("monitoring:read",), row
 
 
 class _CallableGate:

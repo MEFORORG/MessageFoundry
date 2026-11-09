@@ -232,6 +232,12 @@ def _planted(engine: Engine, service: AuthService | None, outcome: _Outcome) -> 
         await authorize_ws(websocket, Permission.MONITORING_READ)
         await accept_then_send(websocket)
 
+    @app.websocket("/zz/lax-only")
+    @authorizes_in_body("the control: the lax gate alone")
+    async def lax_only(websocket: WebSocket) -> None:
+        await authorize_ws(websocket)
+        await accept_then_send(websocket)
+
     async def admit(websocket: WebSocket) -> None:
         return None
 
@@ -311,7 +317,12 @@ async def test_a_later_refusal_clears_an_earlier_admission(engine: Engine) -> No
     """The body asks a lax gate, then ignores a stricter gate's refusal: the latest answer stands."""
     service = await _service(engine)
     token = await _token(service, "norole")  # signed in, but no monitoring:read
-    peer = _Peer(_planted(engine, service, _Outcome()), "/zz/lax-then-strict", token)
+    app = _planted(engine, service, _Outcome())
+    # Control: the lax gate alone admits this caller, so the refusal below is the stricter gate's.
+    control = _Peer(app, "/zz/lax-only", token)
+    await control.run()
+    assert control.kinds[:2] == [_ACCEPT, "websocket.send"], control.sent
+    peer = _Peer(app, "/zz/lax-then-strict", token)
     await peer.run()
     _assert_refused_before_accept(peer)
 

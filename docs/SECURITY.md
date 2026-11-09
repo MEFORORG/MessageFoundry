@@ -227,7 +227,8 @@ body, the early sign-in check above still answers before it. A route passes in o
   and the web console's `authorize_ui_ws`, record on the handshake whether they admitted the caller,
   the latest answer standing, and `WebSocketAcceptGate` refuses the accept of an in-body socket whose
   handshake does not read admitted, with a 1008 close and an ERROR line,
-  `refused accept on WebSocket route`, at most once a minute for each route. That count is in
+  `refused accept on WebSocket route`, at most once a minute for each route the handshake names.
+  Refusals on handshakes that name no route share one count and one line. That count is in
   memory only; `GET /security/posture` does not report it.
 
 Any other route answers **403** `this route declares no authorization`, and a WebSocket is refused

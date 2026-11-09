@@ -1294,6 +1294,21 @@ def test_an_allow_list_that_is_not_a_list_cannot_measure(key: str) -> None:
     assert code == 2 and any(key in line and "must be a list" in line for line in errors), errors
 
 
+@pytest.mark.parametrize(
+    "key", ["unreachable_allowlist", "anonymous_allowlist", "public_websocket_allowlist"]
+)
+def test_a_policy_whose_allow_list_is_not_a_list_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], key: str
+) -> None:
+    """Read before any sweep runs, so receipt_lines() and the reach check never iterate a null."""
+    policy = _policy()
+    policy[key] = None
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(policy), encoding="utf-8")
+    assert main(["--policy", str(path)]) == 2
+    assert f"{key!r} as NoneType, not a list" in capsys.readouterr().err
+
+
 async def _planted_undeclared(websocket: WebSocket) -> None:
     """A WebSocket endpoint with no gate and no declaration, so the engine refuses it."""
     await websocket.close()
