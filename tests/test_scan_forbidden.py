@@ -911,7 +911,7 @@ _PR_CELL_MARKUP_MUST_FIRE = [
 
 
 @pytest.mark.parametrize("row", _PR_CELL_MARKUP_MUST_FIRE)
-def test_markup_inside_a_table_cell_separates_words_and_keeps_an_apostrophe(sf, row: str) -> None:
+def test_a_table_cell_is_read_both_trimmed_and_with_its_markup_deleted(sf, row: str) -> None:
     """A cell is read with its markup trimmed from its ends, as engine PR 2448 read it, and again with
     all of it deleted, so neither reading loses what the other catches."""
     assert "verdict" in _pr_kinds(sf, row), row

@@ -566,8 +566,8 @@ _PR_CELL_VERDICT_LEAD = re.compile(
 )
 #: The markup a table cell wraps around a value, and the separators of a cell that lists identifiers.
 _PR_CELL_MARKUP = re.compile(_PR_MARKUP)
-#: The same characters plus a space, as str.strip takes them, to trim only a cell's ends.
-_PR_CELL_EDGE = " " + _PR_MARKUP[1:-1].replace("\\", "")
+#: The characters _PR_MARKUP matches plus a space, as str.strip takes them, to trim only a cell's ends.
+_PR_CELL_EDGE = " *`_\"'"
 #: No "\s*" around a separator: on a long run of spaces it backtracks quadratically, so whitespace is a
 #: separator of its own and the empty parts are dropped.
 _PR_CELL_LIST = re.compile(r"[,;/&+]|(?i:\band\b)|\s+")
@@ -776,9 +776,10 @@ def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
     whitespace, each with or without its ASVS or V lead. A cell that opens with a bare verdict and
     goes on binds only a row whose identifier is marked (_PR_CELL_VERDICT_LEAD).
 
-    Each cell is read twice. Trimmed at its ends only, as engine PR 2448 read it, the markup inside
-    it is a separator the cell patterns read through _PR_SEP ("stays`partial`", "isn't met"). With
-    all its markup deleted, an identifier cell's lead and list read whole ("ASVS `<id>`")."""
+    Every cell, identifier or verdict, is read twice, and either reading may match. Trimmed at its
+    ends only, as engine PR 2448 read it, the markup inside it stays where the cell patterns expect
+    it ("stays`partial`" through _PR_SEP, "isn't met" as a contraction). With all its markup deleted,
+    a lead or a verdict reads beside its neighbour ("ASVS `<id>`", "unchanged, `partial`.")."""
     if not ids:
         return False
     raw = row.strip().strip("|").split("|")
