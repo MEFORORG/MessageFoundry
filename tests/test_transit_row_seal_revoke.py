@@ -366,12 +366,20 @@ async def test_a_server_outage_trips_the_revoke_and_skips_the_rest(
     async def no_session_write(*_args: Any, **_kwargs: Any) -> SessionRecord | None:
         raise AssertionError("the kept session's re-stamp ran after the Outage")
 
+    locked: list[str] = []
+
+    async def lock(_conn: Any, user_id: str) -> None:
+        locked.append(user_id)
+
     store._write_user = refused
     store._write_session = no_session_write
+    store._lock_account_row = lock
     outcome = RevokeSealOutcome(store.seal_pager())
     for user in ("u-1", "u-2", "u-3"):
         assert await store._bump_session_epoch(object(), user, outcome) is None
     assert attempts == ["u-1"] and outcome.skipped == 2 and len(pages) == 1
+    # Each skipped account's row is still locked before the sweep, with no Transit call.
+    assert locked == ["u-2", "u-3"]
     conn: Any = _PgConn() if backend == "postgres" else _MssqlCur()
     result = await store._keep_or_end_session(
         conn, 3, "c" * 64, KeptSessionRestamp("u-1", None, None), 1.0, outcome
@@ -571,7 +579,7 @@ async def test_an_unverifiable_account_is_audited_and_paged_after_the_revoke_com
     await store.revoke_user_sessions("u-1")
     assert in_txn == [False]
     (detail,) = await _audits(store, "integrity.authority_seal_unverifiable")
-    assert detail["kind"] == "user" and detail["ref"] == "u-1" and detail["during"] == "revoke"
+    assert detail["kind"] == "user" and detail["user_id"] == "u-1" and detail["during"] == "revoke"
     assert detail["stored_version"] == 5 and isinstance(detail["probe_version"], int)
     assert _subjects(pages) == [unverifiable_subject("user", "u-1")]
     assert await _audits(store, "integrity.authority_seal_failed") == []
@@ -588,7 +596,7 @@ async def test_a_forged_account_is_audited_and_paged_as_main_pages_one(
     _sql(path, "UPDATE users SET display_name=? WHERE id=?", ("bent", "u-1"))
     await store.revoke_all_sessions()
     (detail,) = await _audits(store, "integrity.authority_seal_failed")
-    assert detail == {"kind": "user", "ref": "u-1", "during": "revoke"}
+    assert detail == {"kind": "user", "user_id": "u-1", "during": "revoke"}
     assert _subjects(pages) == [AUTHORITY_SEAL_FAILED_SUBJECT]
     assert _live(path, "u-1") == 0
 
@@ -603,23 +611,27 @@ async def test_an_unverifiable_kept_session_is_audited_by_its_ref_only(
     result = await store.revoke_user_sessions("u-1", except_token_hash=hash_token(kept))
     assert result.ended_kept
     (detail,) = await _audits(store, "integrity.authority_seal_unverifiable")
-    assert detail["kind"] == "session" and detail["ref"] == hash_token(kept)[:12]
+    assert detail["kind"] == "session" and detail["session"] == hash_token(kept)[:12]
     assert hash_token(kept) not in str(detail) and hash_token(kept) not in "".join(pages)
     assert len(pages) == 1
 
 
+@pytest.mark.parametrize("fault", [RuntimeError, NotImplementedError], ids=["refusal", "defect"])
 async def test_a_refused_audit_row_still_pages_and_keeps_the_revoke(
     transit: tuple[MessageStore, FakeBackend, Path],
     pages: list[str],
     caplog: pytest.LogCaptureFixture,
+    fault: type[Exception],
 ) -> None:
+    """The revoke has committed, so neither a store refusal nor a defect in the audit write
+    raises out of it: each is logged and the page still goes."""
     store, _, path = transit
     await _user(store, "u-1")
     await _session(store, "u-1")
     _plant(path, "users", "authz_seal", "id", "u-1")
 
     async def refused(*_args: Any, **_kwargs: Any) -> None:
-        raise RuntimeError("synthetic audit refusal")
+        raise fault("synthetic audit fault")
 
     store.record_audit = refused  # type: ignore[method-assign]
     result = await store.revoke_user_sessions("u-1")
@@ -712,3 +724,28 @@ def test_the_store_side_names_match_the_service_and_alert_names() -> None:
     assert AUTHORITY_SEAL_FAILED_SUBJECT == AUTHORITY_SEAL_SUBJECT
     assert UNVERIFIABLE_SUBJECT_CAP == MAX_SUBJECT_ALERTS
     assert AUTHORITY_SEAL_FAILED_AUDIT_ACTION == AUTHORITY_SEAL_FAILED_ACTION
+
+
+def test_a_page_no_sink_took_spends_no_capped_slot() -> None:
+    """A sink that raises, through the engine's own adapter, spends none of the cap's named slots;
+    the control is a working sink, armed after, whose next row still pages under its own name."""
+    from messagefoundry.pipeline.alerts import authority_seal_page
+    from messagefoundry.store.row_seal import (
+        UNVERIFIABLE_SUBJECT_CAP,
+        SealPager,
+        unverifiable_subject,
+    )
+
+    class _Broken(LoggingAlertSink):
+        def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
+            raise RuntimeError("synthetic sink failure")
+
+    pager = SealPager()
+    disarm = pager.arm(authority_seal_page(_Broken()))
+    for n in range(UNVERIFIABLE_SUBJECT_CAP + 1):
+        pager.unverifiable("user", f"u-{n}", "synthetic")
+    disarm()
+    good = _DriftSink()
+    pager.arm(authority_seal_page(good))
+    pager.unverifiable("user", "u-next", "synthetic")
+    assert good.subjects == [unverifiable_subject("user", "u-next")]

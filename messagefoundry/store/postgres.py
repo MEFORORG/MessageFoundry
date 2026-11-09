@@ -9580,8 +9580,18 @@ class PostgresStore:
         ``MessageStore._bump_session_epoch`` says why a seal refusal does not stop the revoke that
         called this, and reports no raise, and why an Outage is not refused on every read."""
         return await raise_account_epoch(
-            lambda bump: self._write_user(conn, user_id, bump), outcome, user_id
+            lambda bump: self._write_user(conn, user_id, bump),
+            outcome,
+            user_id,
+            lambda: self._lock_account_row(conn, user_id),
         )
+
+    async def _lock_account_row(self, conn: Any, user_id: str) -> None:
+        """Lock the account row as :meth:`_write_user`'s read does, calling no Transit: a revoke a
+        Transit Outage tripped still holds every account row before its session sweep, the lock
+        order :meth:`revoke_all_sessions` relies on (decision d20261109T200352805-599b24, item
+        2)."""
+        await conn.fetchval("SELECT 1 FROM users WHERE id=$1 FOR UPDATE", user_id)
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);

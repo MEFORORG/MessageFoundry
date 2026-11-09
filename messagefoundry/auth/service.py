@@ -292,8 +292,9 @@ def _session_write_errors() -> tuple[type[Exception], ...]:
     type this tuple does not take, so it escapes at least every site that catches only this tuple.
     A session rotation adds the Outage type through :func:`_rotation_store_errors`, at the lapse
     check in :meth:`AuthService._elevated_hash` and at the load and re-key in
-    :meth:`AuthService._rotate_session_hash` (owner ruling 2026-11-08, "Revoke both"); every other
-    such site, and the Unverifiable type, is the catch census of slice 1b-iv (vault #4739 step 6)."""
+    :meth:`AuthService._rotate_session_hash` (owner ruling 2026-11-08, "Revoke both"). The slice
+    1b-iv catch census (vault #4739 step 6) read the other such sites and changed none, since each
+    fails closed; at least the Unverifiable type still escapes them, a question its report raises."""
     return store_open_errors()
 
 
@@ -10415,7 +10416,8 @@ class AuthService:
         audit row names ``transit_unavailable`` rather than ``store_error``. On the elevation path
         :meth:`_elevated_hash`'s lapse check loads the session first, takes the same Outage, and
         usually leaves this load a cache hit. An Unverifiable session seal is not covered: it still
-        escapes, for the 1b-iv catch census.
+        escapes, failing closed, and the 1b-iv catch census left it so, as a question its report
+        raises. A session under a retired key at the re-key is ended quietly (build ruling 3).
 
         A cancellation is not an ``Exception``, so it skips this branch and propagates with the old
         hash unrotated and unrevoked. The longer post-commit wait widens the window for one."""
@@ -10485,6 +10487,8 @@ class AuthService:
             if isinstance(cause, TransitSealUnavailableError)
             else "the store"
             if isinstance(cause, _session_write_errors())
+            else "a cancel"
+            if isinstance(cause, asyncio.CancelledError)
             else "an error",
             type(cause).__name__,
             outcome,
@@ -10849,11 +10853,16 @@ class AuthService:
     async def _revoke_stamped_shielded(self, token_hash: str, cause: BaseException) -> bool:
         """:meth:`_revoke_unrotated` for a stamp window's hash, run to completion through a cancel
         the way :func:`_write_through_cancellation` runs a refused sign-in's rows; a cancel that
-        lands meanwhile is re-raised after it. ``True`` when the revoke landed."""
+        lands meanwhile is re-raised after it. ``True`` when the revoke landed. A revoke that fails
+        outside the errors :meth:`_revoke_unrotated` takes is logged and reads as not landed, so
+        the window's own exception, a cancel included, is still the one raised."""
         landed: list[bool] = []
 
         async def revoke() -> None:
-            landed.append(await self._revoke_unrotated(token_hash, None, cause))
+            try:
+                landed.append(await self._revoke_unrotated(token_hash, None, cause))
+            except Exception:  # noqa: BLE001 -- best effort: the window's exception stands
+                _log.exception("auth: the stamp window's revoke failed; the window's error stands")
 
         await _write_through_cancellation([revoke])
         return bool(landed and landed[0])

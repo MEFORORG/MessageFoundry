@@ -1621,13 +1621,11 @@ def authority_seal_page(sink: AlertSink) -> Callable[[str, str], None]:
     The store builds the subject, at least ``authority-seal-transit`` for an Outage, and the reason
     names no row value, token or Vault reply.
 
-    Never raises: an alert failure must not change what a revoke does."""
+    A sink failure propagates to the pager, whose ``page`` logs it and never raises, so a revoke is
+    unchanged and a capped Unverifiable subject spends no slot on a page no sink took."""
 
     def _raise(subject: str, reason: str) -> None:
-        try:
-            sink.integrity_drift(subject, reason=reason, drift_count=1)
-        except Exception:  # noqa: BLE001 — an alert-sink failure must never break a revoke
-            log.warning("a store seal page could not be delivered")
+        sink.integrity_drift(subject, reason=reason, drift_count=1)
 
     return _raise
 

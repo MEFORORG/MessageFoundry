@@ -359,6 +359,39 @@ async def test_a_real_cancel_after_the_stamp_still_lands_the_revoke(
         await store.close()
 
 
+@pytest.mark.parametrize(
+    "exc",
+    [asyncio.CancelledError(), TransitSealUnavailableError()],
+    ids=["cancelled", "answered_outage"],
+)
+async def test_a_failed_window_revoke_never_replaces_the_windows_own_exception(
+    monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> None:
+    """The revoke itself fails with an error ``_revoke_unrotated`` does not take (a closed
+    aiosqlite connection's ``ValueError``): a cancel is still re-raised as a cancel, and an
+    answered Outage still answers ``session_lost``, rather than either turning into that error."""
+    store, service = await _service()
+    try:
+        token, secret, t1 = await _pre_mfa(service, monkeypatch)
+
+        async def raising(*_args: object, **_kwargs: object) -> None:
+            raise exc
+
+        async def closed(*_args: object, **_kwargs: object) -> None:
+            raise ValueError("synthetic: no active connection")
+
+        monkeypatch.setattr(store, "record_login_success", raising)
+        monkeypatch.setattr(store, "revoke_session", closed)
+        if isinstance(exc, asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError):
+                await service.verify_mfa(token, totp.totp(secret, now=t1))
+        else:
+            elevation = await service.verify_mfa(token, totp.totp(secret, now=t1))
+            assert elevation.session_lost
+    finally:
+        await store.close()
+
+
 async def test_verify_mfa_answers_a_refused_success_audit_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

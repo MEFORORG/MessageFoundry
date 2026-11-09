@@ -634,7 +634,8 @@ row or page. `AuthService._sealed_stamp` and `_rotate_session_hash` end it throu
 refused, so no success is recorded. The census answers the ruling's open question: the rotation
 site needs its own handler, since without one the type escapes it as an error.
 `revoke_other_sessions` and `revoke_every_session` need none, because the store's revoke no longer
-raises the type. The census found no other catch site that fails open, so no other site changed.
+raises the type. The census covered at least the three store backends and `auth/`, not the API
+routes or the CLI. Within it, no other catch site was found to fail open, so no other site changed.
 
 **Other legs that read a map** decide access and write nothing: at least the client-certificate
 identity (`identity_for_cert_user_id`), the step-up role test (`_directory_roles_lost`) and the

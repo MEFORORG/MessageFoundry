@@ -1587,16 +1587,24 @@ class RevokeSealOutcome:
         (decision d20261109T200352805-599b24, item 4): ``integrity.authority_seal_unverifiable``
         under the row's capped subject for Unverifiable, ``integrity.authority_seal_failed`` under
         ``AUTHORITY_SEAL_SUBJECT`` for Forged. ``record_audit`` is the store's own, so the row is
-        never inside the revoke's writer transaction. A refused audit write is logged and the page
-        still goes; a defect in :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` raises.
-        Names each row by a 12-character ref, never a whole id or a token hash."""
-        from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
-        from messagefoundry.store.base import audit_write_errors
+        never inside the revoke's writer transaction. A failed audit write, a defect included, is
+        logged at ERROR and the page still goes: the revoke has committed, so a raise here would
+        report it as failed and drop the pages after it.
+
+        The detail keys match ``AuthService``'s rows of the same actions: a user by its whole id
+        (``user_id``), a session by its 12-character ref (``session``), never a token hash."""
+        if not self.refusals:
+            return
+        from messagefoundry.audit_write import write_audit_soft
 
         refusals, self.refusals = self.refusals, []
         for refusal in refusals:
             ref = refusal.ident.casefold()[:12]
-            detail: dict[str, object] = {"kind": refusal.kind, "ref": ref, "during": "revoke"}
+            detail: dict[str, object] = {"kind": refusal.kind, "during": "revoke"}
+            if refusal.kind == SESSION_KIND:
+                detail["session"] = refusal.ident[:12]
+            else:
+                detail["user_id"] = refusal.ident
             if refusal.unverifiable:
                 action = AUTHORITY_SEAL_UNVERIFIABLE_AUDIT_ACTION
                 detail["stored_version"] = refusal.stored_version
@@ -1616,8 +1624,9 @@ class RevokeSealOutcome:
                 log=log,
                 message="the %s audit row for a revoke's refused authority row could not be written",
                 args=(action,),
-                errors=audit_write_errors(),
-                defects=AUDIT_WRITE_DEFECTS,
+                # No defect raises: the revoke has committed (write_audit_soft's rule for ()).
+                errors=(Exception,),
+                defects=(),
             )
             if self.pager is None:
                 continue
@@ -1631,15 +1640,22 @@ async def raise_account_epoch(
     write: Callable[[EpochBump], Awaitable[UserAuthzRecord | None]],
     outcome: RevokeSealOutcome,
     user_id: str,
+    lock: Callable[[], Awaitable[object]] | None = None,
 ) -> EpochRaise | None:
     """One account's session epoch raise for a revoke, shared by the three backends'
     ``_bump_session_epoch``: ``write`` is the backend's ``_write_user`` for ``user_id``. Returns
     the raise, or ``None`` where none was written. A refusal :func:`revoke_seal_refusals` names goes
     without the raise (decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2) and is
     taken by ``outcome``; an Outage trips it, after which no raise is attempted (decision
-    d20261109T200352805-599b24, item 2)."""
+    d20261109T200352805-599b24, item 2).
+
+    ``lock`` takes the account row's lock without calling Transit. A tripped revoke still runs it,
+    so it holds every account row it would have written before its session sweep, the lock order a
+    server backend's revoke relies on; SQLite's write lock already covers the whole file."""
     if outcome.tripped:
         outcome.skipped += 1
+        if lock is not None:
+            await lock()
         return None
     bump = EpochBump()
     try:
@@ -18902,7 +18918,8 @@ class MessageStore:
         Reads the unrevoked row, verifies its seal, applies ``change``, seals the result and writes
         every sealed column with a compare on the seal it read. Returns the new row, or ``None`` when
         there is no unrevoked row or the compare lost to a concurrent write. A row sealed under a
-        retired key raises ``RowSealError``, as on ``main``. Raises
+        retired key raises :class:`RowSealKeyRetiredError`, which every caller ends quietly
+        (build ruling 3, slice 1b-iv). Raises
         :class:`RowSealError` (Forged) or, under a Transit sealer, its sibling
         :class:`RowSealUnverifiableError` or :class:`TransitSealUnavailableError` (Outage), and
         writes nothing, when the row it read does not verify or cannot be checked: re-sealing
