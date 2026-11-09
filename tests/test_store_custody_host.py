@@ -287,28 +287,54 @@ def test_every_key_seam_keeps_the_custody_refusal_and_its_remedy(
         assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
 
 
+@pytest.mark.parametrize("kind", [OSError, ValueError])
 async def test_a_host_custody_refusal_at_open_reads_no_text_from_the_error_it_replaced(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    kind: type[Exception],
 ) -> None:
     """A host custody refusal at the open has a fixed text, the paths and the remedy, and no
-    chain: an OSError's own text, which the engine did not write, never reaches it (BACKLOG #4882,
-    as PR 2818 holds the cipher build to)."""
+    chain: an error's own text, which the engine did not write, never reaches it (BACKLOG #4882,
+    as PR 2818 holds the cipher build to), whether or not the custody reads expect its class. The
+    replaced class is logged by name alone."""
     import traceback
 
     sentinel = "SENTINEL-not-an-engine-text-4882"
 
     def _refuse(path: Path) -> HostBlob:
-        raise OSError(13, sentinel)
+        raise kind(13, sentinel) if kind is OSError else kind(sentinel)
 
     (tmp_path / "master.key").write_bytes(b"not read")
     monkeypatch.setattr(custody, "read_host_file", _refuse)
-    with pytest.raises(HostCustodyRefused) as excinfo:
+    with caplog.at_level(logging.WARNING), pytest.raises(HostCustodyRefused) as excinfo:
         await open_store(_settings(tmp_path), create=True)
     refusal = excinfo.value
     assert str(tmp_path / "master.key") in str(refusal)
     assert sentinel not in f"{refusal} {refusal!r}"
     assert refusal.__cause__ is None and refusal.__context__ is None
     assert sentinel not in "".join(traceback.format_exception(refusal))
+    assert "a host custody error was replaced (" in caplog.text and sentinel not in caplog.text
+
+
+def test_a_handoff_left_behind_names_the_handoff_to_delete_and_reads_no_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The crash rule's left-behind refusal names the handoff, not the host file, as the file to
+    delete, and reads nothing from the custody primitive's own text, which may quote an OS
+    reason (BACKLOG #4882)."""
+
+    def _left(path: Path, convert: object) -> HostBlob:
+        raise custody.HandoffLeftBehind("SENTINEL-left-behind")
+
+    handoff = tmp_path / "handoff.key"
+    monkeypatch.setattr(custody, "consume_handoff_file", _left)
+    with pytest.raises(HostCustodyRefused) as excinfo:
+        custody_host._settle_left_handoff(handoff, _proved_blob())
+    text = str(excinfo.value)
+    assert f"Check that {handoff} is gone" in text and "keep the host file" in text
+    assert "SENTINEL" not in text
+    assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
 
 
 # --- the mint -------------------------------------------------------------------------------------
@@ -2558,7 +2584,7 @@ def test_a_cleanup_that_cannot_remove_the_host_file_keeps_the_original_reason(
     with pytest.raises(HostCustodyRefused) as excinfo:
         load_host_custody(_settings(tmp_path), enforcing=True, environ={})
     text = str(excinfo.value)
-    assert "the custody checks refused it" in text and "could not be removed" in text
+    assert "a custody check refused it" in text and "could not be removed" in text
     assert "stand-in" not in text and "Access is denied" not in text
 
 

@@ -107,12 +107,13 @@ class HostCustodyRefused(KeyProviderError):
     reports an unresolved store key as "could not start" reports it as one. The message names
     files, settings, accounts and the remedy, never key material.
 
-    ``open_store`` raises it as it is. A seam that resolves the key without that open, at least
+    What follows holds for each refusal :func:`load_host_custody` raises, and not for every
+    instance: at least the mint's (:func:`_refused`) quote the error they replace and chain it.
+    ``open_store`` raises one as it is. A seam that resolves the key without that open, at least
     :func:`~messagefoundry.store.base.resolve_active_key`, ``resolve_decrypt_keys`` and
     ``build_store_cipher``, replaces it with a new ``KeyProviderError`` (BACKLOG #4882) that keeps
-    its text, since each refusal :func:`load_host_custody` raises is recorded as built by the
-    engine (:func:`_recorded_as`). That text reads nothing from an error it replaced, and the
-    refusal keeps no cause and no context."""
+    its text, since it is recorded as built by the engine (:func:`_recorded_as`). That text reads
+    nothing from an error it replaced, and the refusal keeps no cause and no context."""
 
 
 class MintedCustody(NamedTuple):
@@ -320,24 +321,31 @@ def _recorded_as[E: Exception](kind: type[E], text: str) -> E:
 
 
 def _read_reason(exc: BaseException) -> str:
-    """Why a custody read refused, for a refusal at open: the text this module recorded for an
-    error it built itself (:func:`_recorded_as`), or else a fixed text chosen by ``exc``'s class as
-    read with ``type``. No text is read from ``exc``, so an OS, DPAPI or custody primitive text
-    never reaches the refusal (BACKLOG #4882)."""
+    """Why a custody read or conversion refused, for a refusal at open: the text this module
+    recorded for an error it built itself (:func:`_recorded_as`), or else a fixed text chosen by
+    ``exc``'s class as read with ``type``. No text is read from ``exc``, so an OS, DPAPI or custody
+    primitive text never reaches the refusal (BACKLOG #4882). A replaced error's class is logged by
+    name alone, once the caller has left its handler (:func:`load_host_custody`)."""
     from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
-    from messagefoundry.store.base import _recorded_text
+    from messagefoundry.store.base import _log_unjudged, _recorded_text
     from messagefoundry.store.custody import CustodyError
 
     if (recorded := _recorded_text(exc)) is not None:
         return recorded
     kind = type(exc)
+    _log_unjudged("a host custody error was replaced", kind)
     if issubclass(kind, DpapiUnavailable):
-        return "DPAPI is not available on this host"
+        return "DPAPI, which a handoff and a Windows host file need, is not available on this host"
     if issubclass(kind, DpapiError):
-        return "DPAPI could not open it for this account"
+        return "a DPAPI call refused it"
     if issubclass(kind, CustodyError):
-        return "the custody checks refused it (its owner, access list, size or contents)"
-    return "the file system refused it"
+        return (
+            "a custody check refused it; those checks read at least the engine's account, the "
+            "file's owner and access list, the file system it is on, and its contents"
+        )
+    if issubclass(kind, OSError):
+        return "the file system refused it"
+    return "it failed"
 
 
 def _read_refusal(what: str, exc: BaseException) -> HostCustodyRefused:
@@ -379,7 +387,7 @@ def _settle_left_handoff(handoff: Path, blob: HostBlob) -> None:
     except FileNotFoundError:
         return  # another start settled it first
     except HandoffLeftBehind:
-        refusal = _left_behind(f"the handoff {handoff} beside the host file was settled")
+        refusal = _left_behind("the handoff beside the host file was settled", handoff)
     except _custody_errors() as exc:
         refusal = _read_refusal(f"the handoff {handoff} beside the host file was refused", exc)
     else:
@@ -487,7 +495,7 @@ def _read_or_convert(host: Path, handoff: Path, *, convert: bool) -> HostBlob:
     except FileNotFoundError:
         pass  # another start (an engine shard) converted it between the two reads
     except HandoffLeftBehind:
-        refusal = _left_behind(f"the handoff {handoff} was converted into the host file {host}")
+        refusal = _left_behind(f"the handoff was converted into the host file {host}", handoff)
     except _ConversionLeftHostFile as exc:
         refusal = _read_refusal(unconverted, exc)
     except _custody_errors() as exc:
@@ -505,13 +513,14 @@ def _read_or_convert(host: Path, handoff: Path, *, convert: bool) -> HostBlob:
     return blob
 
 
-def _left_behind(done: str) -> HostCustodyRefused:
-    """``done``, and the handoff was not shown deleted (:class:`HandoffLeftBehind`), whose own
+def _left_behind(done: str, handoff: Path) -> HostCustodyRefused:
+    """``done``, and ``handoff`` was not shown deleted (:class:`HandoffLeftBehind`), whose own
     text, which may quote an OS reason, is not read."""
     return _recorded_as(
         HostCustodyRefused,
-        f"{done}, but it could not be shown deleted: check that it is gone, and delete it if it "
-        "is not",
+        f"{done}, but the handoff {handoff} could not be shown deleted: its delete was refused, or "
+        "another handle still holds it and its name goes when that closes. Check that "
+        f"{handoff} is gone, and delete the handoff if it is not; keep the host file",
     )
 
 
@@ -563,24 +572,39 @@ def load_host_custody(
     process's custody observation; only a store open passes it, so a key read for another purpose
     (a backup, the upload cipher) never overwrites what the open found.
 
-    Each refusal's text is fixed: it names the paths, the settings and the remedy, and reads no
-    text from an error it replaced (BACKLOG #4882). One that replaces an error is raised outside
-    the handler, so it has no cause and no context, and each is recorded as built by the engine,
-    so a seam that replaces it keeps that text."""
+    Each refusal's text is fixed: it names the paths and settings, and the remedy where there is
+    one, and reads no text from an error it replaced (BACKLOG #4882). An ``Exception`` from the
+    account read, the file reads or the conversion that this module did not build is replaced by
+    one too, its class logged by name alone. One that replaces an error is raised outside the
+    handler, so it has no cause and no context, and each is recorded as built by the engine, so a
+    seam that replaces it keeps that text."""
+    from messagefoundry.store.base import _flush_unjudged, _recorded_text
+
     host, handoff = check_host_custody_settings(settings, environ=environ)
     if not (os.path.lexists(host) or os.path.lexists(handoff)):
         # Before the account is judged: no key is here for any account, and a command that mints
         # one for another account (provision-admin --service-account) must learn that first.
         raise _missing(host, handoff)
-    account = non_local_account_reading(enforcing=enforcing)
-    blob = _read_or_convert(host, handoff, convert=convert)
-    if observe:
-        record_key_custody(
-            KeyCustodyPosture(
-                recovery_key_proved=blob.recovery_proved_at is not None, non_local_account=account
-            )
-        )
-    return blob
+    try:
+        try:
+            account = non_local_account_reading(enforcing=enforcing)
+            blob = _read_or_convert(host, handoff, convert=convert)
+        except Exception as exc:
+            if _recorded_text(exc) is not None:
+                raise  # one this module built, already with no chain
+            refusal = _read_refusal(f"the host custody read of {host} and {handoff} failed", exc)
+        else:
+            if observe:
+                record_key_custody(
+                    KeyCustodyPosture(
+                        recovery_key_proved=blob.recovery_proved_at is not None,
+                        non_local_account=account,
+                    )
+                )
+            return blob
+        raise refusal  # outside the handler, so it has no context
+    finally:
+        _flush_unjudged()  # the replaced classes, logged once no handler is running
 
 
 #: The table whose row a server schema build writes before anything uses the store, so a row in
