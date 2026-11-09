@@ -14041,9 +14041,9 @@ class AuthService:
         """The rotation's early refusal, before the argon2 hash: raise
         :class:`FactorEnrolmentRequired` where ``user`` holds no factor with a way past, except that
         a TOTP that is on beside a passkey set that reads is left to the write's own judgement
-        (BACKLOG #3948 finding 13). Where no TOTP is on and no passkey can count (no
-        configured relying party, or no ``[webauthn]`` extra), it refuses before reading anything,
-        since no read could change the answer.
+        (BACKLOG #3948 finding 13), which refuses a KNOWN refusal only after the hash. Where no
+        TOTP is on and no passkey can count (no configured relying party, or no ``[webauthn]``
+        extra), it refuses before reading anything, since no read could change the answer.
 
         Otherwise the passkeys are read wherever the account's sealed record names one, even where
         a TOTP is on and no passkey can count: the store's write reads them too, and would raise on

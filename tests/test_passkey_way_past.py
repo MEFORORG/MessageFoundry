@@ -2342,7 +2342,9 @@ async def test_a_passkey_cell_the_driver_cannot_decode_refuses_the_rotation_befo
     names the account and none of the cell. Where none can (no configured relying party, or no
     ``[webauthn]`` extra), the refusal comes before any read, so nothing is warned. The control:
     the same account with its cell intact rotates on its passkey. RED when: the rotation's early
-    refusal lets the driver's decode failure escape."""
+    refusal lets the driver's decode failure escape (the arm with a relying party and the
+    extra), or reads the set where no passkey can count, which only the empty warning list of the
+    other two arms catches."""
     from messagefoundry.auth import webauthn as wa
 
     store = await MessageStore.open(":memory:")
@@ -2406,7 +2408,7 @@ async def test_a_store_error_cannot_turn_the_rotation_refusal_into_an_exception(
         before = await _password_hash(store, identity.user_id)
         with pytest.raises(FactorEnrolmentRequired if refused else sqlite3.OperationalError):
             await service.change_password(identity, _NEW_PASSWORD)
-        assert hashes == [], "the refusal came after the argon2 hash"
+        assert hashes == [], "the argon2 hash ran"
         assert reads == ([] if refused else [identity.user_id])
         assert await _password_hash(store, identity.user_id) == before
     finally:
@@ -2423,8 +2425,10 @@ async def test_beside_an_undecodable_passkey_set_the_rotation_judges_the_totp(
 ) -> None:
     """A covered account with a TOTP on whose passkey set the driver cannot decode in the early
     refusal's read: the set counts for nothing, so the TOTP alone decides, judged there. A refused
-    TOTP is the enrolment refusal before the hash. The control: a usable one lets the write run
-    and the rotation lands. RED when: an undecodable set skips the TOTP judgement, and the write
+    TOTP is the enrolment refusal before the hash. The control: a usable one lets the write run.
+    Only the service's read is made to fail here, so the write reads intact rows and the rotation
+    lands; with a real undecodable cell the write raises the driver's error after the hash, which
+    this test does not pin. RED when: an undecodable set skips the TOTP judgement, and the write
     lets the refused TOTP through on the intact passkey it reads."""
     store = await MessageStore.open(":memory:")
     try:
