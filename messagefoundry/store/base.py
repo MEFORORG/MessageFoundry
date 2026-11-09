@@ -4577,7 +4577,11 @@ async def open_store(
     place and before its first write (``store.store.check_open_store_pin``), so a store that is not
     the blob's is refused before anything is written to it, its salt bind and at-rest sweep
     included.
-    Every custody refusal is a :class:`~messagefoundry.store.keyprovider.KeyProviderError`.
+    Every custody refusal is a :class:`~messagefoundry.store.keyprovider.KeyProviderError`. One
+    the engine built passes through as it is; any other ``Exception`` from the custody path, at
+    least an ``OSError`` from a step the custody reads do not wrap, is replaced by a
+    :class:`~messagefoundry.store.custody_host.HostCustodyRefused` with a fixed text and no cause
+    or context (BACKLOG #4882, :func:`_host_custody_for_open`).
     """
     if create and read_only:
         raise ValueError("open_store: create and read_only exclude each other")
@@ -4651,7 +4655,49 @@ def _host_custody_for_open(
 ) -> tuple[StorePin | None, str | None]:
     """``(pin, key)`` for an open under the ``host`` key provider, or ``(None, None)`` for any other
     provider once no host blob or handoff is found beside it (vault BACKLOG #3411). See
-    :func:`open_store`."""
+    :func:`open_store`.
+
+    A refusal the engine built passes through as it is. Any other ``Exception`` from the custody
+    path, at least an ``OSError`` from a step the custody reads do not wrap (the custody
+    directory's resolve, the minted blob's checks and key, the observation), is replaced by a
+    refusal with a fixed text that reads nothing from it, raised outside the handler, so it has no
+    cause and no context (BACKLOG #4882)."""
+    from messagefoundry.store.custody_host import custody_refusal_at_open
+
+    if settings.key_provider != HOST_KEY_PROVIDER and (custody is not None or recovery_wrap):
+        raise ValueError("open_store: custody is for the 'host' key provider only")
+    try:
+        try:
+            return _host_custody_steps(
+                settings, custody, posture=posture, read_only=read_only, recovery_wrap=recovery_wrap
+            )
+        except Exception as exc:
+            if _recorded_text(exc) is not None:
+                raise  # one the engine built, already with no chain
+            caught = exc
+        # Built and raised outside the handler, and both locals dropped, so no cycle through this
+        # frame keeps the replaced error or the refusal.
+        try:
+            refusal = custody_refusal_at_open(caught)
+        finally:
+            del caught
+        try:
+            raise refusal
+        finally:
+            del refusal
+    finally:
+        _flush_unjudged()  # the replaced class, logged once no handler is running
+
+
+def _host_custody_steps(
+    settings: StoreSettings,
+    custody: HostBlob | None,
+    *,
+    posture: HopPosture | None,
+    read_only: bool,
+    recovery_wrap: bytes,
+) -> tuple[StorePin | None, str | None]:
+    """:func:`_host_custody_for_open`'s work, before an error from it is judged."""
     from messagefoundry.store.custody_host import (
         HostCustodyRefused,
         check_host_custody_settings,
@@ -4662,11 +4708,10 @@ def _host_custody_for_open(
     )
 
     if settings.key_provider != HOST_KEY_PROVIDER:
-        if custody is not None or recovery_wrap:
-            raise ValueError("open_store: custody is for the 'host' key provider only")
         refusal = foreign_custody_refusal(settings)
         if refusal is not None:
-            raise HostCustodyRefused(refusal)
+            # Recorded, so open_store passes it through with its remedy rather than replace it.
+            raise _recorded(HostCustodyRefused(refusal), refusal)
         return None, None
     if custody is None:
         enforcing = posture is None or posture.enforcing

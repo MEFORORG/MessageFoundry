@@ -328,13 +328,122 @@ def test_a_handoff_left_behind_names_the_handoff_to_delete_and_reads_no_text(
         raise custody.HandoffLeftBehind("SENTINEL-left-behind")
 
     handoff = tmp_path / "handoff.key"
+    handoff.write_bytes(b"not read")
+    monkeypatch.setattr(custody, "read_host_file", lambda path: _proved_blob())
     monkeypatch.setattr(custody, "consume_handoff_file", _left)
     with pytest.raises(HostCustodyRefused) as excinfo:
-        custody_host._settle_left_handoff(handoff, _proved_blob())
+        custody_host._read_or_convert(tmp_path / "master.key", handoff, convert=True)
     text = str(excinfo.value)
     assert f"Check that {handoff} is gone" in text and "keep the host file" in text
     assert "SENTINEL" not in text
     assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        "the custody directory",
+        "the custody directory, under another provider",
+        "the minted blob's settings check",
+        "the minted blob's key",
+        pytest.param("the observation", marks=host_file_platforms),
+    ],
+)
+async def test_a_custody_step_outside_the_reads_reaches_the_open_with_a_fixed_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    step: str,
+) -> None:
+    """An error from a step on the open's custody path that the custody reads do not wrap, at
+    least the custody directory's ``Path.resolve``, the minted blob's settings check and key, and
+    the observation, reaches ``open_store``'s caller as a refusal with a fixed text and no chain,
+    never with the error's own text (BACKLOG #4882; the Lander's hold on PR 2804)."""
+    import traceback
+
+    sentinel = "SENTINEL-not-an-engine-text-open-path"
+
+    def _raise(*args: object, **kwargs: object) -> Any:
+        raise OSError(5, sentinel)
+
+    settings = _settings(tmp_path)
+    blob: HostBlob | None = None
+    if step.startswith("the custody directory"):
+        real = Path.resolve
+
+        def _resolve(self: Path, strict: bool = False) -> Path:
+            if self.name == "store.db":
+                _raise()
+            return real(self, strict)
+
+        monkeypatch.setattr(Path, "resolve", _resolve)
+        if step.endswith("another provider"):
+            settings = settings.model_copy(update={"key_provider": "env"})
+    elif step == "the minted blob's settings check":
+        blob = _proved_blob()
+        monkeypatch.setattr(custody_host, "check_host_custody_settings", _raise)
+    elif step == "the minted blob's key":
+        blob = _proved_blob()
+        monkeypatch.setattr(custody_host, "host_store_key", _raise)
+    else:
+        custody.write_host_file(tmp_path / "master.key", _proved_blob())
+        monkeypatch.setattr(custody_host, "record_key_custody", _raise)
+    with caplog.at_level(logging.WARNING), pytest.raises(HostCustodyRefused) as excinfo:
+        await open_store(settings, create=True, custody=blob)
+    refusal = excinfo.value
+    assert "[store].key_provider" in str(refusal)
+    assert sentinel not in f"{refusal} {refusal!r}"
+    assert refusal.__cause__ is None and refusal.__context__ is None
+    assert sentinel not in "".join(traceback.format_exception(refusal))
+    assert "a host custody error was replaced (OSError)" in caplog.text
+    assert sentinel not in caplog.text
+
+
+@pytest.mark.parametrize("raised", ["left behind", "refused"])
+def test_a_settle_refusal_holds_no_reference_to_the_master_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: str
+) -> None:
+    """The crash rule's refusal, raised through the open's custody read, holds nothing that keeps
+    the host blob's master key, and leaves no cycle that keeps it once the refusal is dropped,
+    with the cyclic collector off, so no frame on its traceback keeps the blob (BACKLOG #4882; the
+    Lander's hold on PR 2804)."""
+    import gc
+    import weakref
+
+    class _Tracked(MasterKey):
+        __slots__ = ("__weakref__",)
+
+    def _consume(path: Path, convert: object) -> HostBlob:
+        if raised == "left behind":
+            raise custody.HandoffLeftBehind("left behind")
+        raise OSError(5, "refused")
+
+    key = _Tracked.mint()
+    alive = weakref.ref(key)
+    # Handed over once, so the stand-in read keeps no reference after it.
+    held = [HostBlob(key, StoreId.mint(), (), 1_800_000_000)]
+    del key
+    (tmp_path / "master.key").write_bytes(b"not read")
+    (tmp_path / "handoff.key").write_bytes(b"not read")
+    monkeypatch.setattr(custody, "read_host_file", lambda path: held.pop())
+    monkeypatch.setattr(custody, "consume_handoff_file", _consume)
+    monkeypatch.setattr(custody_host, "non_local_account_reading", lambda **kwargs: None)
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        try:
+            load_host_custody(_settings(tmp_path), enforcing=True, environ={})
+        except HostCustodyRefused as caught:
+            refusal = caught
+        else:
+            pytest.fail("the crash rule did not refuse")
+        assert not held, "the stand-in read was not reached"
+        assert alive() is None, "the refusal keeps the master key"
+        del refusal
+        assert alive() is None, "the master key outlived its dropped refusal"
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def test_a_conversion_left_behind_reaches_the_open_and_every_seam_with_its_remedy(

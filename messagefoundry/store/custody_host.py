@@ -362,6 +362,20 @@ def _read_refusal(what: str, exc: BaseException) -> HostCustodyRefused:
     return _recorded_as(HostCustodyRefused, f"{what}: {_read_reason(exc)}")
 
 
+def custody_refusal_at_open(exc: BaseException) -> HostCustodyRefused:
+    """The refusal ``open_store`` raises in place of an error on its custody path that the engine
+    did not build, at least one from the custody directory's resolve, the minted blob's checks and
+    key, or the observation, which the custody reads do not wrap: :func:`_read_refusal`'s fixed
+    text, reading nothing from ``exc``. The caller raises it with no chain and then flushes the
+    replaced class's log line (BACKLOG #4882)."""
+    return _read_refusal(
+        "the store's key custody could not be read or checked at the open: check "
+        f"[store].key_provider, the custody directory ({SECRETS_DIRECTORY_VARIABLE}, or else a "
+        "SQLite store's data directory) and the host file and handoff in it",
+        exc,
+    )
+
+
 def _custody_errors() -> tuple[type[BaseException], ...]:
     from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
     from messagefoundry.store.custody import CustodyError
@@ -370,10 +384,11 @@ def _custody_errors() -> tuple[type[BaseException], ...]:
     return (CustodyError, DpapiError, DpapiUnavailable, OSError)
 
 
-def _settle_left_handoff(handoff: Path, blob: HostBlob) -> None:
+def _settle_left_handoff(handoff: Path, blob: HostBlob) -> HostCustodyRefused | None:
     """The crash rule (draft rule 3 step 3): a handoff found beside a host file that opens is
     deleted when it names the host file's store id, through the handle that read it, and refused
-    when it names another."""
+    when it names another. Returns the refusal, or ``None`` when the handoff is settled or another
+    start settled it first; the caller raises it once it has dropped the blob (BACKLOG #4882)."""
     from messagefoundry.store.custody import CustodyError, HandoffLeftBehind, consume_handoff_file
 
     def same_store(left: HostBlob) -> None:
@@ -393,14 +408,12 @@ def _settle_left_handoff(handoff: Path, blob: HostBlob) -> None:
     try:
         consume_handoff_file(handoff, same_store)
     except FileNotFoundError:
-        return  # another start settled it first
+        return None  # another start settled it first
     except HandoffLeftBehind:
-        refusal = _left_behind("the handoff beside the host file was settled", handoff)
+        return _left_behind("the handoff beside the host file was settled", handoff)
     except _custody_errors() as exc:
-        refusal = _read_refusal(f"the handoff {handoff} beside the host file was refused", exc)
-    else:
-        return
-    raise refusal  # outside the handler, so it has no context (BACKLOG #4882)
+        return _read_refusal(f"the handoff {handoff} beside the host file was refused", exc)
+    return None
 
 
 class _ConversionLeftHostFile(Exception):  # noqa: N818 -- a carrier, caught one frame up
@@ -472,7 +485,10 @@ def _read_host(host: Path) -> HostBlob | None:
         return None
     except _custody_errors() as exc:
         refusal = _read_refusal(f"the host file {host} was refused", exc)
-    raise refusal  # outside the handler, so it has no context (BACKLOG #4882)
+    try:
+        raise refusal  # outside the handler, so it has no context (BACKLOG #4882)
+    finally:
+        del refusal  # no cycle through this frame
 
 
 def _read_or_convert(host: Path, handoff: Path, *, convert: bool) -> HostBlob:
@@ -482,7 +498,17 @@ def _read_or_convert(host: Path, handoff: Path, *, convert: bool) -> HostBlob:
     if blob is not None:
         # A read that may not convert leaves a handoff beside the host file as it is.
         if convert and os.path.lexists(handoff):
-            _settle_left_handoff(handoff, blob)
+            left = _settle_left_handoff(handoff, blob)
+            if left is not None:
+                # The master key is dropped from this frame, which the refusal's traceback keeps,
+                # and the refusal from it, so the refusal never holds the key and leaves no
+                # cycle. The frame that judged the handoff has returned, so the traceback does not
+                # hold it either.
+                del blob
+                try:
+                    raise left  # outside any handler, so it has no context (BACKLOG #4882)
+                finally:
+                    del left
         return blob
     if not os.path.lexists(handoff):
         # An engine shard may have converted it between the two looks.
@@ -519,7 +545,10 @@ def _read_or_convert(host: Path, handoff: Path, *, convert: bool) -> HostBlob:
 
             _log_unjudged("a handoff conversion failed beside a host file", type(exc))
     if refusal is not None:
-        raise refusal  # outside the handler, so it has no context (BACKLOG #4882)
+        try:
+            raise refusal  # outside the handler, so it has no context (BACKLOG #4882)
+        finally:
+            del refusal  # no cycle through this frame
     blob = _read_host(host)
     if blob is None:
         raise _recorded_as(
@@ -625,7 +654,10 @@ def load_host_custody(
             refusal = _read_refusal(stage, caught)
         finally:
             del caught
-        raise refusal
+        try:
+            raise refusal
+        finally:
+            del refusal  # no cycle through this frame
     finally:
         _flush_unjudged()  # the replaced classes, logged once no handler is running
 
