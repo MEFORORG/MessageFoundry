@@ -10522,7 +10522,9 @@ class AuthService:
             failure = {"reason": _rotation_failure_reason(exc), "revokes_landed": revoked}
         if rotated is None:
             # Soft, so a refused audit write still answers session_lost rather than a 500: the
-            # answer is the fail-closed control, and the row only records it.
+            # answer is the fail-closed control, and the row only records it. The audit set, not
+            # the session set: on a vault_transit store a Transit Outage that refused the rotation
+            # also refuses the audit-chain MAC, as CipherError (ADR 0217).
             await write_audit_soft(
                 lambda: self._audit(
                     "auth.session_rotation_failed",
@@ -10532,7 +10534,7 @@ class AuthService:
                 ),
                 log=_log,
                 message="the auth.session_rotation_failed audit row could not be written",
-                errors=_session_write_errors(),
+                errors=audit_write_errors(),
                 defects=AUDIT_WRITE_DEFECTS,
             )
             return Elevation(session_lost=True)

@@ -29,7 +29,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
 from messagefoundry.store.row_seal import (
     RowSealError,
     RowSealUnverifiableError,
@@ -680,3 +680,39 @@ async def test_an_outage_at_the_elevation_lapse_check_revokes_the_old_hash(
     assert failures == [
         {"ceremony": "mfa_verify", "reason": "transit_unavailable", "revokes_landed": True}
     ]
+
+
+async def test_an_outage_that_also_refuses_the_audit_mac_still_answers_session_lost(
+    transit: tuple[MessageStore, FakeBackend, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a vault_transit store the audit-chain MAC is a Transit call too, so the Outage that
+    refused the rotation refuses its audit row as ``CipherError``. The elevation still answers
+    ``session_lost`` with the old hash revoked, and the lost row is logged, never a 500. The
+    control is the same Outage with the audit write landing: one row is recorded."""
+    store, backend, path = transit
+    await _user(store, "u-1")
+    service = AuthService(store, AuthSettings())
+    record_audit = store.record_audit
+
+    async def refused(*args: object, **kwargs: object) -> None:
+        if backend.down:
+            raise CipherError("synthetic outage")
+        await record_audit(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "record_audit", refused)
+    for audit_up in (True, False):
+        token = await _session(store, "u-1")
+        store._row_sealer = TransitRowSealer(backend)
+        backend.down = True
+        if audit_up:
+            monkeypatch.setattr(store, "record_audit", record_audit)
+        try:
+            lost = await service._elevated_hash(hash_token(token), ceremony="mfa_verify", actor="a")
+        finally:
+            backend.down = False
+            monkeypatch.setattr(store, "record_audit", refused)
+        assert lost.session_lost and lost.token is None
+        assert _revoked(path, token)
+    rows = await store.list_audit(action="auth.session_rotation_failed")
+    assert len(rows) == 1  # the control's row; the refused one is logged, not raised
