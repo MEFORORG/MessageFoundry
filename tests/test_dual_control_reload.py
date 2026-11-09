@@ -2943,14 +2943,13 @@ async def test_an_executor_fault_in_a_reload_build_is_never_an_invalid_config(
     engine: Engine, tmp_path: Path, cause: str
 ) -> None:
     """A reload whose connector builds the executor fails, by a broken pool, builds them on the
-    loop instead, since the pool never began them, and succeeds with no failed row (the fake
-    leaves the build check's own hop to the real pool, which has no such fallback): nothing is
-    wrong with the config. The build that meets it first is the restart of the running inbound,
-    which every reload makes through _build_off_loop before it rebuilds an outbound. Red (Lander
-    hold 6703767989): _build_off_loop raised a plain WiringError, which the route answered 422
-    invalid configuration with reason invalid_config; then (Lander hold 6730392844, item 3) a
-    WiringBuildFault, which failed the reload where main, building on the loop, succeeded. The
-    control is a config that really is wrong, which still answers 422 invalid_config."""
+    loop instead, since the pool never began them, and succeeds with no failed row: nothing is
+    wrong with the config. The build that meets it first is the reload's build check, which goes
+    through _build_off_loop too (Lander hold 6733221092, item 2). Red (Lander hold 6703767989):
+    _build_off_loop raised a plain WiringError, which the route answered 422 invalid
+    configuration with reason invalid_config; then (Lander hold 6730392844, item 3) an executor
+    fault of its own type, which failed the reload where main, building on the loop, succeeded.
+    The control is a config that really is wrong, which still answers 422 invalid_config."""
     from concurrent.futures.thread import BrokenThreadPool
 
     service = await _service(engine)
@@ -2988,16 +2987,15 @@ async def test_an_executor_fault_in_a_reload_build_is_never_an_invalid_config(
 async def test_a_convergence_reload_records_an_executor_fault_as_a_reload_error(
     engine: Engine,
 ) -> None:
-    """A convergence reload records an executor fault with reason reload_error and the executor
-    fault's type, as it did before the fault was a WiringBuildFault, not as a refused reload."""
+    """A convergence reload records an executor fault, as a hop with no on-loop fallback raises
+    it, with reason reload_error and the fault's own type, not as a refused reload."""
     from concurrent.futures.thread import BrokenThreadPool
 
     from messagefoundry.api.app import _audit_failed_convergence
-    from messagefoundry.config.wiring import WiringBuildFault
 
-    fault = WiringBuildFault("connector build failed: a thread initializer failed")
-    fault.__cause__ = BrokenThreadPool("a thread initializer failed")
-    await _audit_failed_convergence(engine, fault, 7, set())
+    await _audit_failed_convergence(
+        engine, BrokenThreadPool("a thread initializer failed"), 7, set()
+    )
     rows = await _failed_reload_rows(engine)
     assert [(d["reason"], d["error"], d["config_version"]) for d in rows] == [
         ("reload_error", "BrokenThreadPool", 7)
@@ -3007,9 +3005,9 @@ async def test_a_convergence_reload_records_an_executor_fault_as_a_reload_error(
 async def test_a_reload_executor_fault_leaves_the_previous_inbounds_running(
     engine: Engine,
 ) -> None:
-    """The pool fails every connector build for the whole reload, rollback included; the fake
-    leaves the build check's own hop to the real pool. Every connector build the pool never began
-    runs on the loop, so the reload goes through and intake is up. Red (Lander hold 6704342060,
+    """The pool fails every connector build for the whole reload, the build check included.
+    Every connector build the pool never began runs on the loop, so the reload goes through and
+    intake is up. Red (Lander hold 6704342060,
     item 1): the rollback built through the same pool, so IB_T_ADT failed to start and intake was
     left down; then (Lander hold 6730392844, item 3) the reload failed where main, building on the
     loop, succeeded."""
@@ -3057,8 +3055,8 @@ async def test_a_bare_executor_refusal_in_a_reload_leaves_the_previous_inbounds_
     """A hop other than the connector build meets the executor's refusal at submit, a bare
     RuntimeError, and the pool stays refusing for the rollback. The rollback still restarts the
     previous inbounds, building on the loop what the pool refuses. Red (Lander hold 6704973771,
-    item 1): only a WiringBuildFault or a broken pool switched the rollback, so its builds met the
-    refusing pool and IB_T_ADT was left down."""
+    item 1): only an executor fault from a connector build or a broken pool switched the
+    rollback, so its builds met the refusing pool and IB_T_ADT was left down."""
     from messagefoundry.pipeline.wiring_runner import RegistryRunner
 
     service = await _service(engine)
@@ -3133,3 +3131,71 @@ async def test_a_reload_that_fails_for_another_reason_then_meets_a_refusing_pool
             assert refusing
             assert rr.inbound_running("IB_T_ADT")
             assert rr.inbound_failed("IB_T_ADT") is None
+
+
+@pytest.mark.parametrize("bad_config", [False, True])
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_a_reload_whose_build_check_submit_is_refused_checks_on_the_loop(
+    engine: Engine, caplog: pytest.LogCaptureFixture, dry_run: bool, bad_config: bool
+) -> None:
+    """The pool refuses the reload's build check at submit, as a pool that cannot start a new
+    thread does. The check never began, so it runs on the loop instead, with a WARNING, and the
+    reload, applied or a dry run, succeeds with no failed row, as on main, which ran the check on
+    the loop. Only the check's own submit is refused, so every other hop of the reload meets the
+    real pool. The control is a connector the check refuses, which the check run on the loop
+    still refuses, 422 invalid_config. Red (Lander hold 6733221092, item 2): build_check_off_loop
+    ran the check through asyncio.to_thread with no such fallback, so the reload failed
+    reload_fault with a 500."""
+    from messagefoundry.pipeline import wiring_runner
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    loop = asyncio.get_running_loop()
+    real = loop.run_in_executor
+    real_check = RegistryRunner.build_check_off_loop
+    checking: set[asyncio.Task[Any] | None] = set()
+    refused: list[object] = []
+
+    async def check(self: RegistryRunner, *args: Any, **kwargs: Any) -> None:
+        # A submit made from this task while it awaits the check is the check's own.
+        task = asyncio.current_task()
+        checking.add(task)
+        try:
+            await real_check(self, *args, **kwargs)
+        finally:
+            checking.discard(task)
+
+    def refuse_connector(*_args: Any, **_kwargs: Any) -> None:
+        raise WiringError("OB_X: connector build failed: a refused setting")
+
+    def refusing(executor: Any, fn: Any, *args: Any) -> asyncio.Future[Any]:
+        if asyncio.current_task() in checking:
+            refused.append(fn)
+            raise RuntimeError("can't start new thread")
+        return real(executor, fn, *args)
+
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "op")
+        first = await c.post("/config/reload", json={}, headers=headers)
+        assert first.status_code == 200, first.text
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(loop, "run_in_executor", refusing)
+            patch.setattr(RegistryRunner, "build_check_off_loop", check)
+            if bad_config:
+                patch.setattr(wiring_runner, "build_check_registry", refuse_connector)
+            with caplog.at_level(logging.WARNING, logger=wiring_runner.log.name):
+                r = await c.post("/config/reload", json={"dry_run": dry_run}, headers=headers)
+    assert refused, "the control: the check's submit was refused"
+    rows = await _failed_reload_rows(engine)
+    if bad_config:
+        assert r.status_code == 422, r.text
+        assert [d["reason"] for d in rows] == ["invalid_config"]
+    else:
+        assert r.status_code == 200, r.text
+        assert rows == []
+    assert any(
+        "never began a connector build check" in rec.getMessage()
+        and "can't start new thread" in rec.getMessage()
+        for rec in caplog.records
+    ), [rec.getMessage() for rec in caplog.records]

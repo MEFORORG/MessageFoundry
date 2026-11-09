@@ -1415,7 +1415,7 @@ async def test_hold_an_executor_fault_on_the_connection_test_builds_on_the_loop(
 ) -> None:
     """A connection test whose build the executor cancels, or refuses because it was shut down,
     builds on the loop instead, since the build never began, and the test gets its connector.
-    Red (Lander hold 6730392844, item 3): the test failed with a WiringBuildFault where main,
+    Red (Lander hold 6730392844, item 3): the test failed with an executor fault where main,
     building on the loop, built it. Before that (Lander hold 6703229134, item 2), a bare
     RuntimeError escaped as a 500 with no audit row."""
     from messagefoundry.pipeline import wiring_runner
@@ -1440,7 +1440,7 @@ async def test_hold_an_executor_fault_on_the_connection_test_builds_on_the_loop(
     assert direction == "out"
     assert isinstance(connector, DestinationConnector)
     await connector.aclose()
-    assert any("built on the event loop" in r.getMessage() for r in caplog.records)
+    assert any("runs on the event loop" in r.getMessage() for r in caplog.records)
 
 
 def test_hold_e_an_abandoned_build_that_has_not_started_never_runs() -> None:

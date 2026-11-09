@@ -387,7 +387,7 @@ async def test_an_executor_fault_on_an_operator_start_builds_on_the_loop_and_sta
     """The executor cancels the inbound's build, fails it as a broken pool, or refuses it because
     it was shut down. The build never began, so it runs on the loop instead, as every build did
     before builds left the loop, and the start succeeds, with a WARNING naming the cause. Red
-    (Lander hold 6730392844, item 3): the start raised a WiringBuildFault and answered 409, so an
+    (Lander hold 6730392844, item 3): the start raised an executor fault and answered 409, so an
     executor fault left the inbound down where main started it. Before that (Lander hold
     6703229134, item 2), a bare RuntimeError or BrokenThreadPool escaped as a 500."""
     engine = Engine(
@@ -428,7 +428,7 @@ async def test_an_executor_fault_on_an_operator_start_builds_on_the_loop_and_sta
             "shut-down": "Executor shutdown has been called",
         }[fault]
         assert any(
-            "built on the event loop" in rec.getMessage() and cause in rec.getMessage()
+            "runs on the event loop" in rec.getMessage() and cause in rec.getMessage()
             for rec in caplog.records
             if rec.levelno == logging.WARNING
         ), [rec.getMessage() for rec in caplog.records]
@@ -453,7 +453,7 @@ async def test_an_engine_restart_whose_build_submit_is_refused_leaves_the_inboun
     """An engine-driven restart, as an alert rule drives one, meets a pool that refuses a new
     thread at submit. The build never began, so it runs on the loop, and the inbound is running
     again after the restart, as on main, which built on the loop. Red (Lander hold 6730392844,
-    item 3): the restart raised a WiringBuildFault and left the inbound down, recorded failed."""
+    item 3): the restart raised an executor fault and left the inbound down, recorded failed."""
     reg = Registry()
     reg.add_inbound(
         InboundConnection("IB_UP", ConnectionSpec(ConnectorType.MLLP, {"port": 0}), router="r")
@@ -485,7 +485,7 @@ async def test_an_engine_restart_whose_build_submit_is_refused_leaves_the_inboun
         assert rr.inbound_running("IB_UP")
         assert rr.inbound_failed("IB_UP") is None
         assert any(
-            "built on the event loop" in rec.getMessage()
+            "runs on the event loop" in rec.getMessage()
             and "can't start new thread" in rec.getMessage()
             for rec in caplog.records
         )
@@ -543,9 +543,7 @@ async def test_a_build_a_worker_took_before_the_pool_failed_to_start_a_thread_is
     """The other order: a busy worker takes the queued build before the pool's thread start
     raises. The build's own outcome is the answer: a good build is returned, and a refusal is
     raised as itself, not as an executor fault, and nothing goes to the abandoned-build close.
-    Red (Lander hold 6704342060, item 2): a WiringBuildFault was raised either way."""
-    from messagefoundry.config.wiring import WiringBuildFault
-
+    Red (Lander hold 6704342060, item 2): an executor fault was raised either way."""
     loop = asyncio.get_running_loop()
     handed: list[object] = []
 
@@ -573,9 +571,133 @@ async def test_a_build_a_worker_took_before_the_pool_failed_to_start_a_thread_is
     else:
         with pytest.raises(WiringError) as raised:
             await wiring_runner._build_off_loop(None, build)
-        assert not isinstance(raised.value, WiringBuildFault)
+        assert type(raised.value) is WiringError
         assert str(raised.value) == "the build's own refusal"
     monkeypatch.undo()
     assert handed == []
     # The executor's own fault is not lost: it is logged.
     assert any("can't start new thread" in r.getMessage() for r in caplog.records)
+
+
+# --- Lander hold 6733221092, item 1: a fault in the WARNING never strands the build -------------
+
+
+class _RaisingFilter(logging.Filter):
+    """A log filter that raises, so any record the runner's logger is handed raises from the
+    logging call itself."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        raise RuntimeError("a log filter failed")
+
+
+@pytest.mark.parametrize("outcome", ["built", "refused"])
+@pytest.mark.parametrize("fault", ["cancelled", "broken", "refused", "worker-took"])
+async def test_a_raising_log_filter_never_strands_a_build_the_executor_never_began(
+    fault: str, outcome: str
+) -> None:
+    """The executor cancels the queued build, fails it as a broken pool, refuses it at submit,
+    or fails after a worker took it, and the WARNING that says so raises, from a log filter. The
+    build still runs once and its caller gets it, or its own refusal with no context, and the
+    filter's fault reaches the loop's exception handler, naming the executor's fault by type,
+    rather than being swallowed. Red (Lander hold 6733221092, item 1): for a
+    cancelled or broken item, settle() logged before run() with no finally, so the build was
+    never made and the caller waited forever, holding the reload lock in a reload; for a refusal
+    at submit, or a worker that took it, the filter's fault escaped in place of the build."""
+    loop = asyncio.get_running_loop()
+    runs: list[object] = []
+
+    def build() -> object:
+        built = object()
+        runs.append(built)
+        if outcome == "refused":
+            raise WiringError("the build's own refusal")
+        return built
+
+    def faulty(_executor: Any, fn: Callable[[], None], *_args: Any) -> Any:
+        if fault == "refused":
+            raise RuntimeError("can't start new thread")
+        if fault == "worker-took":
+            worker = threading.Thread(target=fn)
+            worker.start()
+            worker.join()
+            raise RuntimeError("can't start new thread")
+        queued: asyncio.Future[None] = loop.create_future()
+        if fault == "cancelled":
+            queued.cancel()
+        else:
+            queued.set_exception(BrokenThreadPool("a thread initializer failed"))
+        return queued
+
+    handled: list[dict[str, Any]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: handled.append(context))
+    raising = _RaisingFilter()
+    wiring_runner.log.addFilter(raising)
+    answer: object = None
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(loop, "run_in_executor", faulty)
+            if outcome == "built":
+                answer = await asyncio.wait_for(wiring_runner._build_off_loop(None, build), 5)
+            else:
+                with pytest.raises(WiringError) as raised:
+                    await asyncio.wait_for(wiring_runner._build_off_loop(None, build), 5)
+                assert raised.value.__context__ is None
+        await asyncio.sleep(0)  # a done callback's fault reaches the handler on a later pass
+    finally:
+        wiring_runner.log.removeFilter(raising)
+        loop.set_exception_handler(previous)
+    assert len(runs) == 1
+    if outcome == "built":
+        assert runs == [answer]
+    cause = {
+        "cancelled": "a cancellation",
+        "broken": "BrokenThreadPool",
+        "refused": "RuntimeError",
+        "worker-took": "RuntimeError",
+    }[fault]
+    assert any(
+        isinstance(context.get("exception"), RuntimeError)
+        and str(context["exception"]) == "a log filter failed"
+        and context["message"].endswith(f"the executor's fault: {cause}")
+        for context in handled
+    ), handled
+
+
+@pytest.mark.parametrize("fault", ["cancelled", "refused"])
+async def test_a_raising_handler_filter_that_also_breaks_the_loop_handler_never_strands_a_build(
+    fault: str,
+) -> None:
+    """A raising filter sits on a root handler, so the loop's default exception handler, which
+    logs through the same handler, fails too when it is handed the WARNING's fault. The build
+    still runs once and its caller gets it, and the loop keeps running. Red (Lander hold
+    6733221092, item 1, round two of its repair): the handler's own fault escaped, raising in
+    place of the build on a refused submit and killing the loop from a cancelled item's done
+    callback."""
+    loop = asyncio.get_running_loop()
+    runs: list[object] = []
+
+    def build() -> object:
+        built = object()
+        runs.append(built)
+        return built
+
+    def faulty(_executor: Any, _fn: Callable[[], None], *_args: Any) -> Any:
+        if fault == "refused":
+            raise RuntimeError("can't start new thread")
+        queued: asyncio.Future[None] = loop.create_future()
+        queued.cancel()
+        return queued
+
+    handler = logging.Handler()
+    handler.addFilter(_RaisingFilter())
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(loop, "run_in_executor", faulty)
+            answer = await asyncio.wait_for(wiring_runner._build_off_loop(None, build), 5)
+        await asyncio.sleep(0)  # the loop is still running after the done callback's pass
+    finally:
+        root.removeHandler(handler)
+    assert runs == [answer]

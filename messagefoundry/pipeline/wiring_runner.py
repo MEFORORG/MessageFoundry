@@ -35,7 +35,7 @@ import time
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum, auto
@@ -7444,15 +7444,18 @@ class RegistryRunner:
         2815, hold F2). What the build reads from this runner is read here, on the loop, first
         (:meth:`_build_check_call`), and the one write the build makes to ``registry``, the
         idempotent :func:`apply_sync_reply_capture_implication`, is made here too, so the thread
-        repeats it as a no-op."""
+        repeats it as a no-op. A check the executor never began runs on the loop instead, with a
+        WARNING (:func:`_build_off_loop`); one that began and then failed raises."""
 
         def prepare() -> Callable[[], None]:
             apply_sync_reply_capture_implication(registry)
             return self._build_check_call(registry, env_values, now)
 
-        # Prepared here, on the loop; only the builds run in the thread.
+        # Prepared here, on the loop; only the builds run in the thread, through the connector
+        # builds' own hop, so a check the executor never began runs on the loop instead (Lander
+        # hold 6733221092, item 2).
         check = _normalised_build_failure(prepare)()
-        await asyncio.to_thread(check)
+        await _build_off_loop(self._hop_posture, check, what="connector build check")
         self._check_store_backends(registry)
 
     def _build_check_call(
@@ -12574,7 +12577,9 @@ def _dest_config(
     )
 
 
-async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T]) -> T:
+async def _build_off_loop[T](
+    posture: HopPosture | None, build: Callable[[], T], *, what: str = "connector build"
+) -> T:
     """Run a connector ``build`` in a worker thread, inside ``active_hop_posture(posture)``. A
     build can list folders and read files, such as a DATABASE connector's ``sslcapath`` entries and
     its driver key and CA files, so the runner builds a connector here rather than on the event
@@ -12595,11 +12600,15 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
     pool, or no thread it could start) or cancelled or failed it while queued, runs on the loop
     instead, as every build did before builds left the loop, with a WARNING naming the cause. So
     an executor fault at this hop never leaves a connector unbuilt (Lander hold 6730392844, item
-    3). ``run()`` never began in those cases, so nothing is built twice. Another worker-thread
-    hop, at least a reload's build check and a lane's anchor check, has no such fallback. A build
-    the pool queued before it failed to start a thread is cancelled first, or, if a worker already
-    took it, awaited, and its own result or refusal is the answer. A build that began and then
-    failed raises its own error."""
+    3). ``run()`` never began in those cases, so nothing is built twice. A reload's build check
+    comes through here too (:meth:`RegistryRunner.build_check_off_loop`, ``what`` naming it in
+    the WARNING), so it has the same fallback (Lander hold 6733221092, item 2). Another
+    worker-thread hop, at least a lane's anchor check, has no such fallback. A build still queued
+    behind a busy or hung pool has not been refused, so the caller waits for it. A build the pool
+    queued before it failed to start a thread is cancelled first, or, if a worker already took
+    it, awaited, and its own result or refusal is the answer. A build that began and then failed
+    raises its own error. A fault in the WARNING itself, such as a raising log filter, never
+    stops or strands the build (Lander hold 6733221092, item 1)."""
 
     def stamped() -> T:
         with active_hop_posture(posture):
@@ -12631,11 +12640,14 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
             built.set_exception(exc)  # a BaseException that is not an Exception passes through
             return
         # Only the executor cancels or fails ``queued`` with run() not begun, so this is never the
-        # build's own failure.
-        _log_build_on_loop(
-            "the executor cancelled the connector build" if exc is None else safe_exc(exc)
-        )
-        run()
+        # build's own failure. The WARNING never raises an Exception (_warn_build_fault), so a
+        # raising log filter neither leaves ``built`` pending, with its caller waiting forever
+        # while it holds the reload lock, nor becomes the context of a refusal the build raises;
+        # run() is in the finally as well (Lander hold 6733221092, item 1).
+        try:
+            _warn_build_fault(loop, what, exc)
+        finally:
+            run()
 
     try:
         queued = loop.run_in_executor(None, run)
@@ -12644,15 +12656,11 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
         # dequeue must find the build cancelled and build nothing, since it is built below.
         refused = built.cancel()
         if refused:
-            _log_build_on_loop(safe_exc(exc))
+            _warn_build_fault(loop, what, exc)
         else:
             # A worker already took it, so the build's own outcome is the answer, awaited below
             # (Lander hold 6704342060, item 2). The fault is logged, since nothing else reports it.
-            log.warning(
-                "the executor failed after a worker took a connector build; the build's own "
-                "outcome stands: %s",
-                safe_exc(exc),
-            )
+            _warn_build_fault(loop, what, exc, taken=True)
     else:
         refused = False
         queued.add_done_callback(settle)
@@ -12668,12 +12676,46 @@ async def _build_off_loop[T](posture: HopPosture | None, build: Callable[[], T])
         raise
 
 
-def _log_build_on_loop(cause: str) -> None:
-    """Say that the executor never began a connector build, and why (``cause``, already redacted),
-    before :func:`_build_off_loop` builds it on the loop."""
-    log.warning(
-        "the executor never began a connector build, so it is built on the event loop: %s", cause
-    )
+def _warn_build_fault(
+    loop: asyncio.AbstractEventLoop,
+    what: str,
+    fault: BaseException | None,
+    *,
+    taken: bool = False,
+) -> None:
+    """Log the WARNING :func:`_build_off_loop` gives for an executor ``fault`` (``None`` for a
+    cancellation) that met ``what``: that the build runs on the loop instead, or, when ``taken``,
+    that a worker already took it and its own outcome stands.
+
+    It never raises an Exception, so the WARNING never stops or strands the build it announces
+    (Lander hold 6733221092, item 1). A fault in it, such as a raising log filter, goes to
+    ``loop``'s exception handler, named with the executor's fault by type alone and not chained
+    to it, so the cause the WARNING would have given is not lost and the executor's text is not
+    logged unredacted. A handler that fails as well, because the same broken filter sits on its
+    logger, is dropped: logging itself is what failed, so there is nowhere left to report it."""
+    try:
+        cause = f"the executor cancelled the {what}" if fault is None else safe_exc(fault)
+        if taken:
+            log.warning(
+                "the executor failed after a worker took a %s; the build's own outcome stands: %s",
+                what,
+                cause,
+            )
+        else:
+            log.warning(
+                "the executor never began a %s, so it runs on the event loop: %s", what, cause
+            )
+    except Exception as log_fault:  # noqa: BLE001 - reported to the loop's handler below
+        log_fault.__suppress_context__ = True
+        kind = "a cancellation" if fault is None else type(fault).__name__
+        with suppress(Exception):
+            loop.call_exception_handler(
+                {
+                    "message": f"the WARNING about a {what} failed to log; the executor's fault: "
+                    f"{kind}",
+                    "exception": log_fault,
+                }
+            )
 
 
 #: Close tasks for connectors whose build finished after its caller was cancelled, held so the
