@@ -65,9 +65,18 @@ def _is_module_gated(path: Path) -> bool:
     Two shapes count: a module-level ``pytestmark`` carrying a skipif on a gate var, and a
     module-level ``pytest.skip(..., allow_module_level=True)`` guarded by one. Both yield zero
     executed tests when the gate is unset; a decorator on an individual test does not.
+
+    A file whose text names no gate var is skipped before the parse. Since this test left the
+    tooling tier for the engine legs (vault BACKLOG #3652), parsing every test file cost about ten
+    seconds there, against a step-duration gate. The cost of the skip: a gate var spelled only by
+    implicit string concatenation is no longer seen. The AST check already missed one built at run
+    time.
     """
+    text = path.read_text(encoding="utf-8")
+    if not any(var in text for var in GATE_ENV_VARS):
+        return False
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        tree = ast.parse(text)
     except SyntaxError:  # pragma: no cover - a broken test file fails elsewhere, loudly
         return False
     for node in tree.body:

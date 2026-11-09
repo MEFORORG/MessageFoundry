@@ -45,6 +45,7 @@ from messagefoundry.uploads import UploadStore
 from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import reproving_transport
 from tests._deadline_capture import DeadlineCapture, capture_deadlines, expect_cut_off
+from tests._log_absence import assert_capture_sees
 from tests._upload_root import upload_entries
 from tests.test_uploads_strict_ciphertext import _BREAKS
 
@@ -1725,6 +1726,7 @@ async def test_a_drained_delete_the_store_refused_logs_no_lost_row(
                 grace=5.0,
             )
             await asyncio.sleep(0.1)  # time for a done callback to have logged, had it
+    assert_capture_sees(caplog, "messagefoundry.api.app")
     assert not [rec for rec in caplog.records if "Lost row" in rec.getMessage()]
     assert await engine.store.list_audit(action="upload.delete") == []
 

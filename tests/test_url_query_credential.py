@@ -46,6 +46,7 @@ from messagefoundry.transports.egress import (
     check_fhir_lookup_allowed,
     warn_url_query_credentials,
 )
+from tests._log_absence import assert_capture_sees
 from tests._phi_log_capture import filtered_sink
 
 _MARK = "carries a credential in its query string"
@@ -414,6 +415,7 @@ def test_build_with_a_benign_query_is_silent(caplog: pytest.LogCaptureFixture) -
             _rest("https://p.example.invalid/x?fmt=json&keyword=lab"),
             EgressSettings(deny_by_default=False),
         )
+    assert_capture_sees(caplog, "messagefoundry.transports.egress")
     assert not [r for r in caplog.records if _MARK in r.getMessage()]
 
 
@@ -450,6 +452,83 @@ def _registry() -> Registry:
 
 def test_reader_lists_only_the_credentialed_url_and_no_value() -> None:
     assert query_credential_hops(_registry()) == [("OB_KEYED", "key")]
+
+
+def _env_url_registry() -> Registry:
+    """``_registry`` plus an ``env()`` URL whose literal default carries a credential, one whose
+    default is benign, and a ``FhirLookup`` with a credentialed default."""
+    reg = _registry()
+    for name, default in (
+        ("OB_ENV_KEYED", "https://p.example.invalid/x?subscription-key=SYNTHETIC-7"),
+        ("OB_ENV_PLAIN", "https://p.example.invalid/x?fmt=json"),
+    ):
+        url = EnvRef(f"MEFOR_{name}", default=default)
+        reg.add_outbound(
+            build_outbound_connection(
+                name, ConnectionSpec(type=ConnectorType.REST, settings={"url": url})
+            )
+        )
+    reg.add_fhir_lookup(
+        FhirLookupSpec(
+            name="LK_ENV",
+            settings={
+                "url": EnvRef("MEFOR_LK_ENV", default="https://f.example.invalid/R4?sig=SYNTHETIC")
+            },
+        )
+    )
+    return reg
+
+
+def test_reader_reads_an_env_url_by_its_literal_default_with_no_values() -> None:
+    """Vault BACKLOG #3766 item 15: the default is the URL the build takes when the instance sets no
+    value, so it is read. The benign default is the control, and an ``env()`` URL with no default
+    (``OB_ENV`` in ``_registry``) has nothing to read and is not listed."""
+    assert query_credential_hops(_env_url_registry()) == [
+        ("OB_ENV_KEYED", "subscription-key"),
+        ("OB_KEYED", "key"),
+        ("fhir_lookup:LK_ENV", "sig"),
+    ]
+
+
+def test_reader_reads_an_env_url_against_the_values_it_is_given() -> None:
+    """With the instance's values, the reader names the URL the build resolves: a value overrides
+    the default in both directions, and a key with no value falls back to the default."""
+    found = query_credential_hops(
+        _env_url_registry(),
+        env_values={
+            "MEFOR_OB_ENV_KEYED": "https://p.example.invalid/x?fmt=json",  # a benign override
+            "MEFOR_ENV_URL": "https://p.example.invalid/x?access_token=SYNTHETIC-8",
+        },
+    )
+    assert found == [("OB_ENV", "access_token"), ("OB_KEYED", "key"), ("fhir_lookup:LK_ENV", "sig")]
+    assert "SYNTHETIC" not in repr(found)
+
+
+def test_reader_skips_a_not_deployed_env_url_and_never_runs_its_cast() -> None:
+    """ADR 0111 AC-1: a ``deployed=False`` connection's ``env()`` values are never resolved, so its
+    cast never runs and the reader does not list it. A not-deployed literal URL resolves nothing and
+    is still read, which is the control."""
+    casts: list[object] = []
+
+    def cast(value: object) -> object:
+        casts.append(value)
+        return value
+
+    reg = Registry()
+    for name, url in (
+        ("OB_DARK_ENV", EnvRef("MEFOR_DARK", cast=cast)),
+        ("OB_DARK_LITERAL", "https://p.example.invalid/x?key=SYNTHETIC-9"),
+    ):
+        reg.add_outbound(
+            build_outbound_connection(
+                name,
+                ConnectionSpec(type=ConnectorType.REST, settings={"url": url}),
+                deployed=False,
+            )
+        )
+    values = {"MEFOR_DARK": "https://p.example.invalid/x?api_key=SYNTHETIC-10"}
+    assert query_credential_hops(reg, env_values=values) == [("OB_DARK_LITERAL", "key")]
+    assert casts == []
 
 
 def test_reader_and_build_cover_a_fhir_lookup(caplog: pytest.LogCaptureFixture) -> None:
@@ -515,6 +594,29 @@ def test_check_names_the_connection_and_parameter(tmp_path: Path) -> None:
     assert r.ok and not r.required and not r.skipped
     assert "OB_KEYED (sig)" in r.detail
     assert "OB_PLAIN" not in r.detail and "SYNTHETIC" not in r.detail
+
+
+def test_check_reads_an_env_url_by_its_default(tmp_path: Path) -> None:
+    """Vault BACKLOG #3766 item 15, end to end through ``run_checks``: an ``env()`` URL is read by
+    its ``default=``. The clean control, a benign default, names none and says what it skipped."""
+    from messagefoundry.checks import run_checks
+
+    def detail(default: str, where: Path) -> str:
+        config = _CONFIG.replace("?sig=SYNTHETIC-4", "?fmt=xml").replace(
+            'outbound("OB_PLAIN", Rest(url="https://p.example.invalid/x?fmt=json"))',
+            f'outbound("OB_PLAIN", Rest(url=env("plain_url", default="{default}")))',
+        )
+        assert "env(" in config
+        config = config.replace("from messagefoundry import ", "from messagefoundry import env, ")
+        report = run_checks(_write(where, config), run_lint=False)
+        return next(x for x in report.results if x.name == "url-query-credential").detail
+
+    (tmp_path / "keyed").mkdir()
+    (tmp_path / "plain").mkdir()
+    keyed = detail("https://p.example.invalid/x?key=SYNTHETIC-12", tmp_path / "keyed")
+    assert "OB_PLAIN (key)" in keyed and "SYNTHETIC" not in keyed
+    plain = detail("https://p.example.invalid/x?fmt=json", tmp_path / "plain")
+    assert "no outbound or FhirLookup url carries" in plain and "default=" in plain
 
 
 def test_check_says_none_on_a_clean_graph(tmp_path: Path) -> None:

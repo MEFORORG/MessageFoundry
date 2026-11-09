@@ -92,7 +92,11 @@ def _engine(monkeypatch: pytest.MonkeyPatch, body: bytes) -> None:
         return (200, body) if kw.get("bearer") else (401, b"")
 
     monkeypatch.setattr(rigadmin, "_call", fake_call)
-    monkeypatch.setattr(rigadmin, "sign_in", lambda base, admin=None, *, cacert=None: "session")
+    monkeypatch.setattr(
+        rigadmin,
+        "sign_in",
+        lambda base, admin=None, *, cacert=None, wait_out_rate_limit=False: "session",
+    )
 
 
 def _get(path: str, capsys: pytest.CaptureFixture[str]) -> str:

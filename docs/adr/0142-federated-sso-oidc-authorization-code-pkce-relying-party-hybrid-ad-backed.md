@@ -542,7 +542,11 @@ B.1 left the verification of what comes back to the build. These are its criteri
   #3174). IF a role stored on the account is
   not among the roles its current directory groups map to, THEN THE SYSTEM SHALL refuse with
   `directory_roles_demoted`, write no roles, and leave the session as it was (BACKLOG #2154). Only a
-  lost role refuses, and channel scope is not compared.
+  lost role refuses on the roles. **Amended 2026-11-06 (vault BACKLOG #3081 item 4):** this criterion
+  said "and channel scope is not compared". IF the account's current groups would narrow its stored
+  channel scope, THEN THE SYSTEM SHALL refuse with `directory_scope_narrowed`, or with
+  `directory_scope_map_unsealed` when the group-to-channel map fails its seal, and write no scope;
+  `docs/SECURITY.md` states the rule.
 - **AC-17 (flow kinds do not cross)** — A step-up flow SHALL NOT mint a session, and a sign-in flow
   SHALL NOT elevate one. Either completion refuses the other kind with `flow_purpose_mismatch`.
 - **AC-18 (the same elevation)** — WHEN the proof holds, THE SYSTEM SHALL elevate through the password
@@ -603,6 +607,10 @@ a user delete has since been closed on both server stores (BACKLOG #2733, #2738)
 retried" did not say who retries a failed request. It also did not say that both limits were read
 from the code and not run. SECURITY.md, linked above, is the source of record for what remains,
 including what a failed request costs.
+
+**CORRECTED 2026-11-05 (BACKLOG #4974).** The first limit is closed: a session rotated while the
+bind's sweep runs is swept too, on SQL Server because a rotation now takes the account's row
+before its session row. SECURITY.md, *Limits of the session sweep*, says how.
 
 **Not decided here.** An account with no binding still enrols its first engine factor on proof of the
 directory credential alone. Closing that needs its own decision.
