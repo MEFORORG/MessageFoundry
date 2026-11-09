@@ -302,9 +302,10 @@ def _passkey_read_errors() -> tuple[type[Exception], ...]:
     :func:`_session_write_errors` by ``ValueError`` and ``RuntimeError``; of the two sets, only the
     connect set takes pyodbc's ``Error`` root, which pyodbc raises for a deadlock victim. The caller
     re-raises ``AUDIT_WRITE_DEFECTS`` first, so those classes raise although these sets take them,
-    and so does every class outside both sets, ``sqlite3.InterfaceError`` among them. These classes
-    do not tell a store fault from a bug, so a bug that raises one of them refuses too. Cached, as
-    ``store_call_errors`` is, so a refusal does not run the driver import on the event loop."""
+    and so does every other class that reaches the catch, ``sqlite3.InterfaceError`` among them.
+    These classes do not tell a store fault from a bug, so a bug that raises one of them refuses
+    too. Cached, as ``store_call_errors`` is, so a refusal does not run the driver import on the
+    event loop."""
     return (*store_call_errors(), *store_connect_errors())
 
 
@@ -16744,23 +16745,30 @@ class AuthService:
         except _passkey_read_errors() as exc:
             # BACKLOG #3775: after the sign-count write, an exception the set takes refuses with an
             # audit row rather than raising past the ceremony with none; the set's docstring says
-            # what it takes and what still raises. Soft, so a store that refuses that row too still
-            # gets the refusal back: the refusal is the fail-closed control, and the row only
-            # records it.
-            # The type only at ERROR: a ValueError's message can quote a row's value, as the
-            # directory probe's log line avoids. The traceback, with the message, goes to DEBUG.
+            # what it takes and what still raises. The type only at ERROR, with its module so a
+            # driver's ``Error`` names its driver: a ValueError's message can quote a row's value,
+            # as the directory probe's log line avoids. The traceback, with the message, goes to
+            # DEBUG.
+            kind = type(exc)
             _log.error(
-                "finish_webauthn_assertion: the passkey re-read raised %s", type(exc).__name__
+                "finish_webauthn_assertion: the passkey re-read raised %s.%s, for %s",
+                kind.__module__,
+                kind.__qualname__,
+                user.username,
             )
             _log.debug("finish_webauthn_assertion: the passkey re-read raised", exc_info=exc)
-            await write_audit_soft(
-                lambda: self._assertion_refused(user, client, "store_error"),
-                log=_log,
-                message="the auth.webauthn_failed store_error audit row could not be written",
-                errors=audit_write_errors(),
-                defects=AUDIT_WRITE_DEFECTS,
-            )
-            return None
+        # Outside the except block, so a refused audit write's logged traceback carries no
+        # ``__context__`` naming the read fault and its message. Soft, so a store that refuses that
+        # row too still gets the refusal back: the refusal is the fail-closed control, and the row
+        # only records it.
+        await write_audit_soft(
+            lambda: self._assertion_refused(user, client, "store_error"),
+            log=_log,
+            message="the auth.webauthn_failed store_error audit row could not be written",
+            errors=audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
+        return None
 
     async def _passkey_still_held(self, user_id: str, cred: WebAuthnCredential) -> bool:
         """Whether the account still holds ``cred`` after a conditional delete wrote nothing, which

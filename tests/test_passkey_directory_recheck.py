@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import sys
 import time
@@ -1295,13 +1296,16 @@ async def test_a_store_fault_in_the_passkey_re_read_refuses_with_an_audit_row(
     the attempt with no audit row. RED when: the fault raises past ``finish_webauthn_assertion``,
     the factor is marked, no ``auth.webauthn_failed`` row names ``store_error`` when the audit
     write lands, or a refused audit write (any class ``audit_write_errors`` names) turns the
-    refusal into a raise. The fault is logged either way."""
+    refusal into a raise. The fault is logged either way, by type: RED when the read fault's
+    message reaches an ERROR record, the refused audit write's chained traceback included."""
     store, token, refused = await _assert_with_the_set_read_failing(
         monkeypatch, sqlite3.OperationalError("synthetic: the set read was refused"), audit_fault
     )
     try:
         assert refused.ok is False and refused.session_lost is False
         assert "the passkey re-read raised" in caplog.text
+        # A refused audit write's own traceback must not carry the read fault as its context.
+        assert "the set read was refused" not in _error_log_text(caplog)
         failures = await _audited_assertion_failures(store)
         assert ({"reason": "store_error"} in failures) is (audit_fault is None)
         assert await store.list_audit(action="auth.webauthn_verified") == []
@@ -1311,6 +1315,13 @@ async def test_a_store_fault_in_the_passkey_re_read_refuses_with_an_audit_row(
         assert session.mfa_verified_at is None  # the factor was not marked
     finally:
         await store.close()
+
+
+def _error_log_text(caplog: pytest.LogCaptureFixture) -> str:
+    """Every ERROR-or-above record caplog holds, formatted with its traceback and any chained
+    exception, as a handler would write it."""
+    formatter = logging.Formatter()
+    return "\n".join(formatter.format(r) for r in caplog.records if r.levelno >= logging.ERROR)
 
 
 async def test_a_defect_in_the_passkey_re_read_still_raises(
@@ -1371,6 +1382,9 @@ async def _assert_the_read_fault_refuses(
     try:
         assert refused.ok is False and refused.session_lost is False
         assert "the passkey re-read raised" in caplog.text
+        logged = _error_log_text(caplog)
+        assert type(read_fault).__qualname__ in logged
+        assert str(read_fault) not in logged  # the type only, never the message
         assert {"reason": "store_error"} in await _audited_assertion_failures(store)
         assert await store.list_audit(action="auth.webauthn_verified") == []
         assert await _clone_answers(store) == []
