@@ -63,13 +63,12 @@
   and an error of any other class passed through as it was. At the open, under every key provider,
   the key custody step runs inside one guard: a `KeyProviderError` the engine built and recorded is
   re-raised as it is, and any other `Exception` from the step, a `ValueError` included, is replaced
-  by a `HostCustodyRefused`, raised with no cause or context and with a text the engine wrote, none
-  of it read from the error, unless building that refusal raises, which then leaves in its place.
-  Of the replaced error, the guard logs at most its class name, as a WARNING. A `BaseException`
-  that is not an `Exception` is not caught there, and a check before the guard raises a
-  `ValueError` with a fixed text where a caller passes a host blob or a recovery wrap under another
-  provider. What the step itself reads, converts, settles and refuses is defined by
-  `load_host_custody` and `_host_custody_steps` (`messagefoundry/store/custody_host.py`,
+  by a `HostCustodyRefused`, raised with no cause or context, unless building that refusal raises,
+  which then leaves in its place. Of the replaced error, the guard logs at most its class name. A
+  `BaseException` that is not an `Exception` is not caught there, and a check before the guard
+  raises a `ValueError` with a fixed text where a caller passes a host blob or a recovery wrap
+  under any key provider but `host`. What the step itself reads, converts, settles and refuses is
+  defined by `load_host_custody` and `_host_custody_steps` (`messagefoundry/store/custody_host.py`,
   `messagefoundry/store/base.py`); this entry does not restate it. (`BACKLOG #4882`)
 - **The PostgreSQL store's TLS context refusal at the open, `StoreTlsRefused`, carries a fixed text
   that names `[store].ssl_root_cert`, `[store].ssl_crl_file` and the hop's suites, and reads
