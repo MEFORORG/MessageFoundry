@@ -127,7 +127,7 @@ function Format-DecisionComment($Record) {
 $script:DecisionFields = [ordered]@{
     v = 1; id = ''; ts = ''; kind = ''; item = ''; seat = ''; session = ''; account = ''; host = ''; class = ''
     predicates = @(); recommendation = ''; alternatives = @(); undo = ''; confidence = $null; reviewed = 'no'
-    reviewedBy = ''; outcome = ''; ref = ''; rating = ''; note = ''; buildsOn = @(); gate = ''
+    reviewedBy = ''; outcome = ''; ref = ''; rating = ''; note = ''; buildsOn = @(); gate = ''; touches = @()
 }
 
 function Complete-DecisionRecord($Record) {
@@ -593,42 +593,107 @@ function Get-DecisionOutcome($Record, [hashtable]$Outcomes) {
     return [string]$Record.outcome
 }
 
+# The outcome values that are automated calibration signals besides `reversed` (owner ruling
+# 2026-11-09, tier T1; docs/AUTONOMY-PLAN.md section 12): a required check that went red after the
+# act merged, and a Lander hold on the act's pull request.
+$script:DecisionSignalOutcomes = @('red-after-merge', 'held')
+
+function Get-DecisionSignals($Records) {
+    <#
+      Every signal outcome ever recorded per decision, as ref -> list of values. Unlike `reversed`,
+      which reads the LATEST outcome so a mistaken one can be corrected, a signal counts once any
+      `outcome` record carries it: a hold that was later cleared was still a hold.
+    #>
+    $map = @{}
+    foreach ($o in @($Records | Where-Object { $_.kind -eq 'outcome' -and $_.ref -and $script:DecisionSignalOutcomes -contains [string]$_.outcome })) {
+        $ref = [string]$o.ref
+        if (-not $map.ContainsKey($ref)) { $map[$ref] = [System.Collections.Generic.List[string]]::new() }
+        if (-not $map[$ref].Contains([string]$o.outcome)) { $map[$ref].Add([string]$o.outcome) }
+    }
+    return $map
+}
+
+function Format-DecisionRate([int]$Count, [int]$Of) {
+    # Invariant culture, so the table reads the same on every machine. Above 5 percent is a breach.
+    if (-not $Of) { return 'n/a' }
+    $rate = $Count / $Of
+    return ($rate * 100).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) + '%' + $(if ($rate -gt 0.05) { ' BREACH' } else { '' })
+}
+
 function Get-DecisionCalibration {
     <#
-      One seat and class's calibration, plan section 4.2: the owner's disagreement on the trailing 60
-      rated decisions (calibrated at 60 with 3 or fewer; after a breach, 60 ratings newer than it must
-      pass), and the reversal rate over the decisions logged on -RecentDays (a breach above 5
-      percent). Calibrated means both hold. The digest's calibration table prints this, and the gate
-      reads Calibrated.
+      One seat and class's calibration. Since the owner ruling of 2026-11-09 (tier T1; plan section
+      12) it is the automated signals over the decisions logged on -RecentDays: the reversal rate,
+      the rate of decisions with a red after merge, and the rate with a Lander hold, each a breach
+      above 5 percent. No decisions in the window is no breach.
+
+      The owner's blind sample is optional now, so fewer than 60 ratings no longer holds a class on
+      the review path. A rating the owner did give still counts: any trailing window of up to 60
+      ratings holding more than 3 disagreements is a breach, and after the latest one, 60 ratings
+      newer than it must pass (plan section 4.2). Calibrated means no breach of any kind. The
+      digest's calibration table prints this, and the gate reads Calibrated.
     #>
-    param($Decisions, [hashtable]$Ratings, [hashtable]$Outcomes, [string[]]$RecentDays)
-    # Verdicts oldest first. A breach is any trailing 60 holding more than 3 disagreements; after
-    # the latest one, 60 newer ratings must pass before the class is calibrated again.
+    param($Decisions, [hashtable]$Ratings, [hashtable]$Outcomes, [string[]]$RecentDays, [hashtable]$Signals = @{})
+    # Verdicts oldest first.
     $verdicts = @($Decisions | Where-Object { $Ratings.ContainsKey([string]$_.id) } |
             Sort-Object { [string]$Ratings[[string]$_.id].id } | ForEach-Object { [string]$Ratings[[string]$_.id].rating -eq 'disagree' })
     $n = $verdicts.Count
     $lastBreach = -1
-    for ($i = 59; $i -lt $n; $i++) {
-        if (@($verdicts[($i - 59)..$i] | Where-Object { $_ }).Count -gt 3) { $lastBreach = $i }
+    for ($i = 0; $i -lt $n; $i++) {
+        if (@($verdicts[[Math]::Max(0, $i - 59)..$i] | Where-Object { $_ }).Count -gt 3) { $lastBreach = $i }
     }
     $rated = [Math]::Min($n, 60)
     $dis = if ($n) { @($verdicts[($n - $rated)..($n - 1)] | Where-Object { $_ }).Count } else { 0 }
     $since = $n - 1 - $lastBreach
     $blindOk = $false
-    $blind = if ($n -lt 60) { "review path, $n/60 samples" }
-    elseif ($lastBreach -ge 0 -and $since -lt 60) { "BREACH: review path, $since/60 fresh samples" }
+    $blind = if ($lastBreach -ge 0 -and $since -lt 60) { "BREACH: review path, $since/60 fresh samples" }
+    elseif ($n -lt 60) { $blindOk = $true; "optional, $n/60 samples" }
     else { $blindOk = $true; 'calibrated' }
     $recent = @($Decisions | Where-Object { $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) })
     $revd = @($recent | Where-Object { (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed' }).Count
-    $revRate = if ($recent.Count) { $revd / $recent.Count } else { 0 }
-    $breach = $revRate -gt 0.05
-    # Invariant culture, so the table reads the same on every machine.
-    $pct = ($revRate * 100).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) + '%'
-    $rateText = if ($recent.Count) { $pct + $(if ($breach) { ' BREACH' } else { '' }) } else { 'n/a' }
+    $red = @($recent | Where-Object { $Signals.ContainsKey([string]$_.id) -and $Signals[[string]$_.id].Contains('red-after-merge') }).Count
+    $held = @($recent | Where-Object { $Signals.ContainsKey([string]$_.id) -and $Signals[[string]$_.id].Contains('held') }).Count
+    $of = $recent.Count
+    $breach = $of -and (($revd / $of) -gt 0.05 -or ($red / $of) -gt 0.05 -or ($held / $of) -gt 0.05)
     return [pscustomobject]@{
-        Rated = $rated; Disagree = $dis; Blind = $blind; Recent = $recent.Count; Reversed = $revd
-        RateText = $rateText; Calibrated = ($blindOk -and -not $breach)
+        Rated = $rated; Disagree = $dis; Blind = $blind; Recent = $of; Reversed = $revd
+        RateText = (Format-DecisionRate $revd $of); Red = $red; RedText = (Format-DecisionRate $red $of)
+        Held = $held; HeldText = (Format-DecisionRate $held $of); Calibrated = ($blindOk -and -not $breach)
     }
+}
+
+function Get-DecisionClassCPath([string]$Path) {
+    <#
+      Why a path the act touches keeps it off the T1 fast path, or '' when this list does not name
+      it. AT LEAST these: the rules that bind the fleet (plan R3's Class C list), the coordination
+      and gate scripts this check lives in, the security, PHI and de-identification code, and the
+      dependency manifests. A path that cannot be classified (empty, absolute, or climbing out with
+      `..`) is refused too. It is a denylist, so a path it does not name is not thereby safe: the
+      session still judges that the act is not a security control.
+    #>
+    $p = ([string]$Path).Trim() -replace '\\', '/'
+    while ($p.StartsWith('./')) { $p = $p.Substring(2) }
+    if (-not $p) { return 'an empty path cannot be classified' }
+    if ($p -match '^(/|~|[A-Za-z]:)') { return "'$Path' is not a path relative to the repository, so it cannot be classified" }
+    if (@($p -split '/') -contains '..') { return "'$Path' climbs out with '..', so it cannot be classified" }
+    $l = $p.ToLowerInvariant()
+    $leaf = ($l -split '/')[-1]
+    if ($leaf -in @('claude.md', 'agents.md')) { return "'$Path' is a CLAUDE.md or AGENTS.md, a rule file (Class C)" }
+    if ($leaf -like '.env*') { return "'$Path' is an environment file, which holds secrets (Class C)" }
+    $prefixes = @(
+        '.claude/', '.github/', 'scripts/hooks/', 'scripts/coord/', 'scripts/worktree/', 'scripts/security/', 'scripts/asvs/',
+        'docs/roles/', 'docs/security/', 'roles/', 'skills/', 'messagefoundry/auth/', 'messagefoundry/security/',
+        'messagefoundry_toolkit/anon/', 'tee/anon/'
+    )
+    foreach ($x in $prefixes) { if ($l.StartsWith($x)) { return "'$Path' is under $x, a rule, gate or security path (Class C)" } }
+    $exact = @(
+        '.pre-commit-config.yaml', 'docs/autonomy-plan.md', 'docs/secure_ai_development_standards.md',
+        'docs/secure_development_standards.md', 'docs/security.md', 'docs/phi.md', 'docs/method.md', 'docs/review-standards.md',
+        'docs/ledger-gate.md', 'docs/worktrees.md', 'messagefoundry/api/security.py', 'messagefoundry/api/auth_routes.py',
+        'messagefoundry/support/redact.py', 'pyproject.toml', 'requirements.lock', 'uv.lock'
+    )
+    if ($exact -contains $l) { return "'$Path' is a rule, security or dependency file (Class C)" }
+    return ''
 }
 
 function Get-DecisionReversals($Records) {

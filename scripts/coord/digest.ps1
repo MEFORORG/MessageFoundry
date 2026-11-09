@@ -34,12 +34,16 @@
     owner's word, never on its own judgment or a peer's message. The calibration below is only as
     good as that rule.
 
-    CALIBRATION, per seat and class, over the records -Window days back (default 60):
-      * the owner's disagreement on the trailing 60 rated decisions -- calibrated at 60 samples with
-        3 or fewer disagreements. After a breach the class stays on the review path until 60 ratings
-        newer than the breach pass (plan section 4.2), not until the trailing count drops back;
+    CALIBRATION, per seat and class, over the records -Window days back (default 60). Since the
+    owner ruling of 2026-11-09 (tier T1; docs/AUTONOMY-PLAN.md section 12) it is automated signals,
+    and the blind sample is optional:
       * the 14-day reversal rate -- decisions marked `reversed` by an `outcome` record, over the
-        decisions logged in the 14 days ending -Day; above 5 percent is a breach.
+        decisions logged in the 14 days ending -Day; above 5 percent is a breach;
+      * the 14-day rates of reds after merge and of Lander holds -- decisions any `outcome` record
+        marks `red-after-merge` or `held`; above 5 percent is a breach;
+      * the owner's disagreement on the ratings given -- any trailing window of up to 60 holding
+        more than 3 disagreements is a breach, and the class then stays on the review path until 60
+        ratings newer than the breach pass (plan section 4.2). Fewer than 60 ratings is no breach.
     A rating older than the window is not read, so the trailing 60 is a trailing 60 within it.
 
     THE GATE'S STATE (plan 4.5 to 4.7): the reversal budget fleet-wide and per seat, the cost rung
@@ -156,6 +160,7 @@ $today = @($all | Where-Object { (Get-DecisionIdDay ([string]$_.id)) -eq $Day })
 $todayDecisions = @($today | Where-Object { $_.kind -eq 'decision' })
 $ratings = Get-DecisionLatest $all 'rating'
 $outcomes = Get-DecisionLatest $all 'outcome'
+$signals = Get-DecisionSignals $all
 function Get-Outcome($r) { Get-DecisionOutcome $r $outcomes }
 
 # The blind sample: the saved draw, every id ever drawn that day, topped up at random to the target
@@ -275,18 +280,18 @@ $md.Add('')
 
 $md.Add('## Calibration, per seat and class')
 $md.Add('')
-$md.Add("Trailing 60 rated decisions within the last $Window days; reversals over the 14 days ending $Day.")
+$md.Add("Trailing 60 rated decisions within the last $Window days; reversals, reds after merge and Lander holds over the 14 days ending $Day.")
 $md.Add('')
-$md.Add('| Seat | Class | Rated | Disagree | Blind status | Decisions, 14 days | Reversed | Reversal rate |')
-$md.Add('|---|---|---|---|---|---|---|---|')
+$md.Add('| Seat | Class | Rated | Disagree | Blind status | Decisions, 14 days | Reversed | Reversal rate | Red after merge | Lander holds |')
+$md.Add('|---|---|---|---|---|---|---|---|---|---|')
 $recent = @(Get-DecisionDayRange $Day 14)
 # Kept by "seat|class", so the gate-state table below reads each seat's Class B row from here.
 $calibration = @{}
 foreach ($g in @($decisions | Group-Object { "$($_.seat)|$($_.class)" } | Sort-Object Name)) {
     $seat, $class = $g.Name -split '\|', 2
-    $c = Get-DecisionCalibration -Decisions $g.Group -Ratings $ratings -Outcomes $outcomes -RecentDays $recent
+    $c = Get-DecisionCalibration -Decisions $g.Group -Ratings $ratings -Outcomes $outcomes -Signals $signals -RecentDays $recent
     $calibration[$g.Name] = $c
-    $md.Add("| $seat | $class | $($c.Rated) | $($c.Disagree) | $($c.Blind) | $($c.Recent) | $($c.Reversed) | $($c.RateText) |")
+    $md.Add("| $seat | $class | $($c.Rated) | $($c.Disagree) | $($c.Blind) | $($c.Recent) | $($c.Reversed) | $($c.RateText) | $($c.RedText) | $($c.HeldText) |")
 }
 
 # THE GATE'S STATE (plan 4.5-4.7), from the shared functions decision.ps1 -Gate calls, as of the end

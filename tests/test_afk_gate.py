@@ -8,7 +8,9 @@ trailing hours before now. The cost rung reads a stand-in usage reader the test 
 host account's own usage files.
 
 A calibrated seat with nothing else against it answers NO-REVIEW, and each REVIEW or HALT test
-starts from that seat, so a REVIEW proves the one condition the test adds closed the path.
+starts from that seat, so a REVIEW proves the one condition the test adds closed the path. Every
+gate call names what the act touches (a plain engine file) unless the test is about that, because
+the T1 fast path (owner ruling 2026-11-09; docs/AUTONOMY-PLAN.md section 12) needs it.
 """
 
 from __future__ import annotations
@@ -129,12 +131,28 @@ def _thresholds(sb: Sandbox) -> Path:
     return sb.state_path.parent / "thresholds.json"
 
 
+PLAIN = ("-Touches", "messagefoundry/parsing/peek.py")
+
+
 def gate(
     sb: Sandbox, *args: str, item: str = "4242", seat: str | None = "manager", **extra: str
 ) -> tuple[int, dict[str, Any]]:
+    return gate_touching(sb, PLAIN, *args, item=item, seat=seat, **extra)
+
+
+def gate_touching(
+    sb: Sandbox,
+    touches: tuple[str, ...],
+    *args: str,
+    item: str = "4242",
+    seat: str | None = "manager",
+    **extra: str,
+) -> tuple[int, dict[str, Any]]:
     seat_args = ("-Seat", seat) if seat is not None else ()
     proc = sb.run(
-        DECISION, *no_host_usage(sb, ("-Gate", "-Item", item, *seat_args, "-Json", *args)), **extra
+        DECISION,
+        *no_host_usage(sb, ("-Gate", "-Item", item, *seat_args, "-Json", *touches, *args)),
+        **extra,
     )
     assert proc.stdout.strip(), (proc.stdout, proc.stderr)
     doc: dict[str, Any] = json.loads(proc.stdout)
@@ -155,18 +173,169 @@ def test_a_calibrated_seat_with_nothing_against_it_may_act_without_review(sb: Sa
     assert (code, doc["result"]) == (NO_REVIEW, "NO-REVIEW"), why(doc)
 
 
-def test_an_uncalibrated_seat_takes_the_review_path(sb: Sandbox) -> None:
-    """Nothing is calibrated today, so this is every seat's answer until 60 blind samples exist."""
+def test_a_seat_with_no_samples_and_no_signals_may_act_without_review(sb: Sandbox) -> None:
+    """T1 replaced the 60-sample gate: with no owner rating and no signal against it, a seat is
+    calibrated, and the reversal budget and the chain limit bound its first acts."""
     code, doc = gate(sb)
-    assert (code, doc["result"]) == (REVIEW, "REVIEW")
-    assert "not calibrated (review path, 0/60 samples" in why(doc)
+    assert (code, doc["result"]) == (NO_REVIEW, "NO-REVIEW"), why(doc)
 
 
 def test_the_plain_answer_is_one_word_with_the_reasons_on_stderr(sb: Sandbox) -> None:
     proc = sb.run(DECISION, *no_host_usage(sb, ("-Gate", "-Item", "1", "-Seat", "manager")))
     assert proc.returncode == REVIEW
     assert proc.stdout.strip() == "REVIEW"
-    assert "decision.ps1: gate: calibration:" in proc.stderr
+    assert "decision.ps1: gate: touches:" in proc.stderr
+
+
+# --- T1: what the act touches ------------------------------------------------------------------
+
+
+def test_an_act_that_names_nothing_it_touches_reviews(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    code, doc = gate_touching(sb, ())
+    assert code == REVIEW and "neither -Touches nor -TouchesNothing" in why(doc)
+
+
+def test_an_act_that_touches_no_file_may_act_without_review(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    code, doc = gate_touching(sb, ("-TouchesNothing",))
+    assert code == NO_REVIEW, why(doc)
+    assert doc["touches"] == ["nothing"]
+
+
+def test_touches_and_touches_nothing_together_are_refused(sb: Sandbox) -> None:
+    proc = sb.run(
+        DECISION,
+        *no_host_usage(sb, ("-Gate", "-Item", "1", "-Seat", "manager", *PLAIN, "-TouchesNothing")),
+    )
+    assert proc.returncode == 2 and "not both" in proc.stderr
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "CLAUDE.md",
+        "messagefoundry/CLAUDE.md",
+        "harness\\CLAUDE.md",
+        "./AGENTS.md",
+        "docs/AUTONOMY-PLAN.md",
+        "docs/Secure_AI_Development_Standards.md",
+        "docs/Secure_Development_Standards.md",
+        "docs/SECURITY.md",
+        "docs/PHI.md",
+        "docs/METHOD.md",
+        "docs/roles/builder.card.md",
+        "docs/security/asvs-scorecard.toml",
+        "roles/BUILDER.md",
+        "skills/empower/SKILL.md",
+        ".claude/settings.json",
+        ".github/workflows/ci.yml",
+        ".pre-commit-config.yaml",
+        "scripts/hooks/claim_check.py",
+        "scripts/coord/decision.ps1",
+        "scripts/worktree/ensure-venv.ps1",
+        "scripts/security/scan_forbidden.py",
+        "scripts/asvs/scorecard.py",
+        "messagefoundry/auth/service.py",
+        "MessageFoundry/Security/keys.py",
+        "messagefoundry/api/security.py",
+        "messagefoundry/support/redact.py",
+        "messagefoundry_toolkit/anon/rules.py",
+        "pyproject.toml",
+        "requirements.lock",
+        ".env.local",
+        "/etc/passwd",
+        "D:/Code/x.py",
+        "../korus/roles/COMMON.md",
+        "docs/../CLAUDE.md",
+    ],
+)
+def test_a_class_c_or_unclassifiable_path_reviews(sb: Sandbox, path: str) -> None:
+    seed_vault(sb, calibrated("manager"))
+    code, doc = gate_touching(sb, ("-Touches", path))
+    assert code == REVIEW and "touches: " in why(doc), why(doc)
+
+
+def test_one_class_c_path_among_several_reviews(sb: Sandbox) -> None:
+    """-Touches is split at newlines, so one argument carries the whole list from pwsh -File."""
+    seed_vault(sb, calibrated("manager"))
+    listed = "messagefoundry/parsing/peek.py\ntests/test_peek.py\nscripts/hooks/push_guard.py"
+    code, doc = gate_touching(sb, ("-Touches", listed))
+    assert code == REVIEW and "scripts/hooks/push_guard.py" in why(doc), why(doc)
+    assert doc["touches"] == [
+        "messagefoundry/parsing/peek.py",
+        "tests/test_peek.py",
+        "scripts/hooks/push_guard.py",
+    ]
+
+
+# --- T1: the automated calibration signals -----------------------------------------------------
+
+
+def _signal(decision: dict[str, Any], outcome: str) -> dict[str, Any]:
+    return rec("outcome", at=ago(hours=2), seat="lander", ref=decision["id"], outcome=outcome)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "label"),
+    [
+        ("reversed", "reversal rate"),
+        ("red-after-merge", "red after merge"),
+        ("held", "Lander holds"),
+    ],
+)
+def test_a_signal_above_five_percent_in_14_days_reviews(
+    sb: Sandbox, outcome: str, label: str
+) -> None:
+    """Two of ten recent decisions is 20 percent. The decisions are on other items, so the item
+    condition does not fire; the reversals are 5 and 6 days old, so the budget is open."""
+    recent = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(10)]
+    signals = [
+        rec("outcome", at=ago(days=5 + i), seat="lander", ref=d["id"], outcome=outcome)
+        for i, d in enumerate(recent[:2])
+    ]
+    seed_vault(sb, recent + signals)
+    code, doc = gate(sb)
+    assert code == REVIEW, why(doc)
+    assert f"{label} 20.0% BREACH" in why(doc), why(doc)
+
+
+def test_a_hold_later_cleared_still_counts(sb: Sandbox) -> None:
+    """A signal counts once any outcome record carries it; unlike a reversal it is not undone by a
+    later outcome."""
+    recent = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(10)]
+    later = [
+        rec("outcome", at=ago(hours=1), seat="lander", ref=d["id"], outcome="merged")
+        for d in recent[:2]
+    ]
+    seed_vault(sb, recent + [_signal(d, "held") for d in recent[:2]] + later)
+    code, doc = gate(sb)
+    assert code == REVIEW and "Lander holds 20.0% BREACH" in why(doc), why(doc)
+
+
+def test_one_signal_in_twenty_is_inside_the_bar(sb: Sandbox) -> None:
+    recent = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(20)]
+    seed_vault(sb, [*recent, _signal(recent[0], "red-after-merge"), _signal(recent[1], "held")])
+    code, doc = gate(sb)
+    assert code == NO_REVIEW, why(doc)
+
+
+def test_owner_disagreement_under_sixty_ratings_still_breaches(sb: Sandbox) -> None:
+    """Sampling is optional, but a rating given counts: four disagreements in ten is a breach."""
+    decided = [rec(at=ago(days=20, minutes=i), item="calib") for i in range(10)]
+    rated = [
+        rec(
+            "rating",
+            at=ago(days=20, minutes=-1 - i),
+            seat="owner",
+            ref=d["id"],
+            rating="disagree" if i < 4 else "agree",
+        )
+        for i, d in enumerate(decided)
+    ]
+    seed_vault(sb, decided + rated)
+    code, doc = gate(sb)
+    assert code == REVIEW and "BREACH: review path" in why(doc), why(doc)
 
 
 def test_a_kill_switch_that_is_not_off_reviews_without_reading_the_log(sb: Sandbox) -> None:
@@ -1058,15 +1227,16 @@ def test_builds_on_walks_the_unsampled_ancestors_on_the_item(
 
 
 def test_a_builds_on_day_outside_the_window_does_not_widen_calibration(sb: Sandbox) -> None:
-    """Calibration reads the 60-day window alone, as the digest does, whatever else is read."""
+    """Calibration reads the 60-day window alone, as the digest does, whatever else is read: a
+    breach 80 days old, on a day read only for -BuildsOn, does not close the path."""
     old = [rec(at=ago(days=80, minutes=i), seat="manager", item="calib") for i in range(60)]
     rated = [
-        rec("rating", at=ago(days=80, minutes=-1 - i), seat="owner", ref=d["id"], rating="agree")
+        rec("rating", at=ago(days=80, minutes=-1 - i), seat="owner", ref=d["id"], rating="disagree")
         for i, d in enumerate(old)
     ]
     seed_vault(sb, old + rated)
     code, doc = gate(sb, "-BuildsOn", old[0]["id"])
-    assert code == REVIEW and "review path, 0/60 samples" in why(doc)
+    assert code == NO_REVIEW, why(doc)
 
 
 def test_builds_on_a_decision_the_log_does_not_hold_reviews(sb: Sandbox) -> None:
@@ -1081,8 +1251,10 @@ def test_builds_on_a_decision_the_log_does_not_hold_reviews(sb: Sandbox) -> None
 LOG_B = ("-Log", "-Item", "4242", "-Seat", "manager", "-Recommendation", "go")
 
 
-def _log(sb: Sandbox, *args: str, klass: str = "B") -> subprocess.CompletedProcess[str]:
-    return sb.run(DECISION, *no_host_usage(sb, (*LOG_B, "-Class", klass, *args)))
+def _log(
+    sb: Sandbox, *args: str, klass: str = "B", touches: tuple[str, ...] = PLAIN
+) -> subprocess.CompletedProcess[str]:
+    return sb.run(DECISION, *no_host_usage(sb, (*LOG_B, "-Class", klass, *touches, *args)))
 
 
 def _logged(sb: Sandbox) -> list[dict[str, Any]]:
@@ -1093,14 +1265,22 @@ def _logged(sb: Sandbox) -> list[dict[str, Any]]:
 
 
 def test_an_unreviewed_class_b_record_is_logged_and_exits_with_the_gate(sb: Sandbox) -> None:
-    proc = _log(sb)
+    proc = _log(sb, touches=("-Touches", "CLAUDE.md"))
     assert proc.returncode == REVIEW, (proc.stdout, proc.stderr)
     lines = proc.stdout.split("\n")
     assert lines[0].startswith("LOGGED ") and lines[0].endswith(" posted")
     assert lines[1] == "GATE REVIEW"
-    assert "decision.ps1: gate: calibration:" in proc.stderr
+    assert "decision.ps1: gate: touches: 'CLAUDE.md'" in proc.stderr
     (row,) = _logged(sb)
     assert row["gate"] == "REVIEW" and row["posted"] is True
+    assert row["touches"] == ["CLAUDE.md"]
+
+
+def test_a_logged_record_that_names_nothing_it_touches_reviews(sb: Sandbox) -> None:
+    proc = _log(sb, touches=())
+    assert proc.returncode == REVIEW, (proc.stdout, proc.stderr)
+    (row,) = _logged(sb)
+    assert row["touches"] == [] and row["gate"] == "REVIEW"
 
 
 def test_logging_a_halted_decision_exits_halt(sb: Sandbox) -> None:
@@ -1581,7 +1761,8 @@ def test_the_digest_shows_the_gate_state_and_lists_the_attic_without_pruning(
     gate_part = out[out.index("## Gate state") : out.index("## The attic")]
     assert "fleet-wide: 2 of 3 in the trailing 24 hours; open" in gate_part
     assert "| manager | 2 of 2 in the trailing 24 hours; CLOSED" in gate_part
-    assert "| builder | 0 of 2 in the trailing 24 hours; open | no |" in gate_part
+    # Three recent decisions with no signal against them: calibrated under T1.
+    assert "| builder | 0 of 2 in the trailing 24 hours; open | yes |" in gate_part
     assert "Cost rung, read now on the account this digest ran on: **OK**" in gate_part
     assert "- item 77: 3 unsampled Class B decisions" in gate_part
     attic = out[out.index("## The attic") :]

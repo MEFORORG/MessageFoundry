@@ -316,13 +316,26 @@ def test_after_a_breach_sixty_fresh_samples_must_pass(sb: Sandbox, count: int, s
     assert cells[4] == status
 
 
-def test_under_sixty_samples_stay_on_the_review_path(sb: Sandbox) -> None:
+def test_under_sixty_samples_the_blind_sample_is_optional(sb: Sandbox) -> None:
+    """Owner ruling 2026-11-09, tier T1: fewer than 60 ratings no longer holds a class back."""
     decided = [rec(recommendation="r") for _ in range(10)]
     seed_vault(
         sb, decided + [rec("rating", seat="owner", ref=d["id"], rating="agree") for d in decided]
     )
     cells = _calibration_row(digest(sb, "-Sample", "0"), "manager", "B")
-    assert cells[4] == "review path, 10/60 samples"
+    assert cells[4] == "optional, 10/60 samples"
+
+
+def test_the_digest_shows_reds_after_merge_and_lander_holds(sb: Sandbox) -> None:
+    recent = [rec(seat="lander", recommendation="r") for _ in range(10)]
+    signals = [
+        rec("outcome", seat="lander", ref=recent[0]["id"], outcome="red-after-merge"),
+        rec("outcome", seat="lander", ref=recent[1]["id"], outcome="held"),
+        rec("outcome", seat="lander", ref=recent[2]["id"], outcome="held"),
+    ]
+    seed_vault(sb, recent + signals)
+    cells = _calibration_row(digest(sb, "-Sample", "0"), "lander", "B")
+    assert cells[7:10] == ["0.0%", "10.0% BREACH", "20.0% BREACH"]
 
 
 def test_the_fourteen_day_reversal_rate_breaches_above_five_percent(sb: Sandbox) -> None:
@@ -402,7 +415,8 @@ def test_end_to_end_a_logged_decision_is_sampled_and_rated(sb: Sandbox) -> None:
     day = utc_day_with_room()
     args = ("-Log", "-Item", "7", "-Class", "B", "-Seat", "manager", "-Recommendation", "go")
     logged = sb.run(DECISION, *no_host_usage(sb, (*args, "-Alternative", "stop")))
-    # Unreviewed and uncalibrated: the gate answers REVIEW (11), and the record is still logged.
+    # Unreviewed, and naming nothing it touches: the gate answers REVIEW (11), and the record is
+    # still logged.
     assert logged.returncode == 11, logged.stderr
     did = logged.stdout.split()[1]
     assert id_day(did) == day, "the id is not dated on the UTC day it was logged"
