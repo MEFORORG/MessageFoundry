@@ -34,7 +34,7 @@ A third required check, ``posture``, is **best-effort**: when a ``messagefoundry
 environment is set whose production tier is unresolved (a *custom* name with no
 ``[security].production_instance``) — it FAILS, mirroring ``serve``'s fail-closed ``require_posture()`` so the
 foot-gun is caught at commit/CI time instead of at runtime. No ``messagefoundry.toml`` → SKIP, unless
-``MEFOR_AI_ENVIRONMENT`` declares the instance in the environment: then this leg and every other
+``check --env`` or ``MEFOR_AI_ENVIRONMENT`` declares the instance: then this leg and every other
 settings leg read the settings from the environment alone and say so on their line (vault BACKLOG
 #2355).
 
@@ -44,8 +44,8 @@ instance's derived security posture stamped, so a config ``serve`` would REFUSE 
 production-PHI cleartext / weakened-TLS transport hop (#200, ADR 0092), or a cleartext off-loopback
 inbound listener (vault BACKLOG #2622 item 1) — FAILS at commit/CI time instead of only at runtime.
 Fail-safe SKIP when it can't resolve a real posture (no ``messagefoundry.toml`` and no
-``MEFOR_AI_ENVIRONMENT``, or a graph that won't load), so a bare config dir is byte-identical.
-Settings that won't load FAIL (BACKLOG #1318).
+``check --env`` or ``MEFOR_AI_ENVIRONMENT``, or a graph that won't load), so a bare config dir is
+byte-identical. Settings that won't load FAIL (BACKLOG #1318).
 
 A fifth required check, ``reference-backend``, closes the ADR 0006 gap: a config declaring a
 ``Reference(...)`` against a ``[store] backend`` with no reference-snapshot store (SQL Server — its schema
@@ -230,6 +230,7 @@ def run_checks(
     project_root: str | Path | None = None,
     allow_empty_config: bool = False,
     service_config_from_root: bool = False,
+    env: str | None = None,
 ) -> CheckReport:
     """Run the gate against ``config_dir``; ``messages_dir`` enables the dry-run check when it has
     fixtures. Set ``run_lint=False`` to skip the advisory ruff/mypy pass. ``strict_handler_security``
@@ -272,16 +273,25 @@ def run_checks(
     connections, and there are none. The skip line they print says "config did not load", which is
     inexact for this one cause; threading the keyword further was left out of scope.
 
+    ``env`` (``check --env``) names the active environment the way ``serve --env`` does: every
+    settings leg reads it as a CLI override of ``[ai].environment``. The dry-run preview takes
+    only ``snapshot_on_send`` from those settings; its Handlers still run with no active
+    environment.
+
     With no ``messagefoundry.toml``, the legs that read service settings, and the dry-run
-    preview's ``snapshot_on_send``, read them from the environment when ``MEFOR_AI_ENVIRONMENT``
-    names the instance (vault BACKLOG #2355). Each of those legs' lines that ran says so; the
-    dry-run line does not. :func:`_settings_source` says why that variable is the trigger.
+    preview's ``snapshot_on_send``, read them from the environment when ``env`` or
+    ``MEFOR_AI_ENVIRONMENT`` names the instance (vault BACKLOG #2355). Each of those legs' lines
+    that ran says so; the dry-run line does not. :func:`_settings_source` says why those are the
+    trigger.
     """
     toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_service_toml_search
+        config_dir,
+        service_config=service_config,
+        suppress_search=suppress_service_toml_search,
+        env=env,
     )
     source_note = (
-        _ENV_ONLY_SOURCE
+        _env_only_source(env)
         if env_only
         else _serve_reads_other_note(
             toml,
@@ -298,12 +308,14 @@ def run_checks(
             messages_dir,
             service_config=service_config,
             suppress_search=suppress_service_toml_search,
+            env=env,
         ),
         _with_source(
             _check_posture(
                 config_dir,
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
+                env=env,
             ),
             source_note,
         ),
@@ -313,6 +325,7 @@ def run_checks(
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
                 project_root=project_root,
+                env=env,
             ),
             source_note,
         ),
@@ -321,6 +334,7 @@ def run_checks(
                 config_dir,
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
+                env=env,
             ),
             source_note,
         ),
@@ -331,6 +345,7 @@ def run_checks(
                 config_dir,
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
+                env=env,
             ),
             source_note,
         ),
@@ -341,6 +356,7 @@ def run_checks(
                 config_dir,
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
+                env=env,
             ),
             source_note,
         ),
@@ -351,6 +367,7 @@ def run_checks(
                 config_dir,
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
+                env=env,
             ),
             source_note,
         ),
@@ -361,6 +378,7 @@ def run_checks(
                 config_dir,
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
+                env=env,
             ),
             source_note,
         ),
@@ -394,6 +412,7 @@ def run_checks(
                 config_dir,
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
+                env=env,
             ),
             source_note,
         ),
@@ -419,6 +438,7 @@ def run_checks(
                 config_dir,
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
+                env=env,
             ),
             source_note,
         ),
@@ -429,6 +449,7 @@ def run_checks(
                 config_dir,
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
+                env=env,
             ),
             source_note,
         ),
@@ -439,6 +460,7 @@ def run_checks(
                 config_dir,
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
+                env=env,
             ),
             source_note,
         ),
@@ -1794,6 +1816,7 @@ def _resolve_snapshot_on_send(
     *,
     service_config: str | Path | None,
     suppress_search: bool,
+    env: str | None,
 ) -> bool:
     """Best-effort ``[pipeline].snapshot_on_send`` for the dry-run preview (#230 parity, ADR 0104).
 
@@ -1808,14 +1831,14 @@ def _resolve_snapshot_on_send(
     from messagefoundry.config.settings import PipelineSettings
 
     toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_search
+        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
     )
     if toml is None and not env_only:
         return PipelineSettings().snapshot_on_send
     try:
         # An instance declared in the environment alone previews its own MEFOR_PIPELINE_* value
         # (vault BACKLOG #2355), exactly as the settings legs read it.
-        return _load_check_settings(toml).pipeline.snapshot_on_send
+        return _load_check_settings(toml, env=env).pipeline.snapshot_on_send
     except (FileNotFoundError, ValueError, ValidationError, OSError):
         return PipelineSettings().snapshot_on_send
 
@@ -1826,6 +1849,7 @@ def _check_dryrun(
     *,
     service_config: str | Path | None = None,
     suppress_search: bool = False,
+    env: str | None = None,
 ) -> CheckResult:
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_message_sets
@@ -1897,7 +1921,7 @@ def _check_dryrun(
     # #230 P4 (ADR 0104): preview under the engine's copy-on-Send posture (best-effort; fallback = the
     # Settings-model default, ON) so the gate exercises the fixtures exactly as the engine would run them.
     snapshot_on_send = _resolve_snapshot_on_send(
-        config_dir, service_config=service_config, suppress_search=suppress_search
+        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
     )
     errors: list[str] = []
     total = 0
@@ -1968,9 +1992,13 @@ def _resolve_service_toml(
     """The ``messagefoundry.toml`` a check reads, by the ADR 0050 rules the other checks spell inline:
     an explicit ``--service-config`` wins, ``--project-root`` confines the look to the config dir, and
     otherwise the legacy upward walk runs. ``None`` when there is none. Every settings-reading leg
-    calls this, through :func:`_settings_source`."""
+    calls this, through :func:`_settings_source`.
+
+    An explicit ``--service-config`` is returned whether or not it exists. ``serve`` exits 2 on one
+    that names no file (``load_settings`` raises ``FileNotFoundError``), so the load below raises
+    the same refusal and each settings leg FAILS rather than SKIPs."""
     if service_config is not None:
-        return Path(service_config) if Path(service_config).is_file() else None
+        return Path(service_config)
     if suppress_search:
         candidate = Path(config_dir) / "messagefoundry.toml"
         return candidate if candidate.is_file() else None
@@ -2028,32 +2056,40 @@ def insecure_bind_note(detail: str, command: str) -> str:
     )
 
 
-#: Appended to a settings leg's line when no file was read (vault BACKLOG #2355), so a verdict about
-#: settings never reads as one about a file nobody wrote.
-_ENV_ONLY_SOURCE = (
-    "settings from environment only: no messagefoundry.toml, and MEFOR_AI_ENVIRONMENT names the "
-    "instance"
-)
+def _env_only_source(env: str | None) -> str:
+    """Appended to a settings leg's line when no file was read (vault BACKLOG #2355), so a verdict
+    about settings never reads as one about a file nobody wrote. It names what named the instance:
+    ``check --env`` beats ``MEFOR_AI_ENVIRONMENT``, as ``serve --env`` does, so the flag is named
+    whenever it was given."""
+    trigger = "MEFOR_AI_ENVIRONMENT" if env is None else "check --env"
+    return (
+        f"settings from environment only: no messagefoundry.toml, and {trigger} names the instance"
+    )
 
 
 def _settings_source(
-    config_dir: str | Path, *, service_config: str | Path | None, suppress_search: bool
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None,
+    suppress_search: bool,
+    env: str | None = None,
 ) -> tuple[Path | None, bool]:
     """Where a settings leg reads from: ``(toml, env_only)``.
 
     ``toml`` is :func:`_resolve_service_toml`'s answer. With no file, ``env_only`` says whether the
-    environment declares an instance anyway, and the explicit trigger is ``MEFOR_AI_ENVIRONMENT``
-    (vault BACKLOG #2355). Two things fix that choice:
+    environment declares an instance anyway, and the explicit trigger is ``check --env`` (``env``)
+    or ``MEFOR_AI_ENVIRONMENT`` (vault BACKLOG #2355). Three things fix that choice:
 
     * ``serve`` refuses to start with no active environment, so ``MEFOR_*`` variables naming none
       describe nothing ``serve`` would run, and there is no refusal for a leg to bring forward.
     * Dev shells and CI export other ``MEFOR_<SECTION>_*`` variables, a store key or a whole SQL
       Server connection, beside a bare config dir. Triggering on any of them would end the documented
       fail-safe SKIP for a bare dir and run every leg against an instance nobody declared.
+    * ``check --env`` is a declaration on the command line, not an ambient variable, so it counts:
+      ADR 0050's Amendment A has ``check --env`` read the name as ``serve --env`` does.
 
-    An explicit ``--service-config`` naming a file that does not exist never falls through to the
-    environment. ``serve`` refuses that file outright, so reading defaults plus the environment in its
-    place would pass a config ``serve`` will not start. It keeps the SKIP it always had.
+    An explicit ``--service-config`` is always ``toml``, existing or not, so it never falls through
+    to the environment (:func:`_resolve_service_toml`).
 
     Under ``--project-root``, a ``./messagefoundry.toml`` in the working directory also keeps the
     SKIP, named in its text (:func:`_unread_working_dir_toml`).
@@ -2064,31 +2100,41 @@ def _settings_source(
     toml = _resolve_service_toml(
         config_dir, service_config=service_config, suppress_search=suppress_search
     )
-    if toml is not None or service_config is not None:
+    if toml is not None:
         return toml, False
     if _unread_working_dir_toml(service_config, suppress_search) is not None:
         # serve started here would read that file as well as the environment, so an
         # environment-only verdict would grade settings serve does not run with. SKIP and name it.
         return None, False
-    return None, environment_named_by_env() is not None
+    return None, env is not None or environment_named_by_env() is not None
 
 
 def _load_check_settings(
-    toml: Path | None, *, cli: Mapping[str, Mapping[str, Any]] | None = None
+    toml: Path | None,
+    *,
+    cli: Mapping[str, Mapping[str, Any]] | None = None,
+    env: str | None = None,
 ) -> ServiceSettings:
     """Load the settings :func:`_settings_source` resolved: the file when there is one, otherwise the
     environment alone. The env-only load reads NO file, not even ``./messagefoundry.toml``, which
     ``load_settings`` would otherwise pick up from the gate's working directory. Under
     ``--project-root``, :func:`_settings_source` does not choose this load when that file exists;
-    it SKIPs and names the file instead."""
+    it SKIPs and names the file instead.
+
+    ``env`` is ``check --env``, applied as ``serve`` applies its own ``--env``: a CLI override of
+    ``[ai].environment``, above the file and ``MEFOR_AI_ENVIRONMENT`` (vault BACKLOG #2355)."""
     from messagefoundry.config.settings import load_settings
 
+    if env is not None:
+        overrides = dict(cli or {})
+        overrides["ai"] = {**overrides.get("ai", {}), "environment": env}
+        cli = overrides
     if toml is not None:
         if toml.is_dir():
             # BACKLOG #3063 item 3: say what the path is, where opening it would report only an OS
             # error (on Windows, "Permission denied") that sends the operator to the wrong cause.
             raise IsADirectoryError(
-                f"{toml} is a directory; serve stops on a directory named messagefoundry.toml"
+                f"{toml} is a directory; serve stops on a directory given as its settings file"
             )
         return load_settings(config_path=toml, cli=cli)
     return load_settings(cli=cli, default_file=False)
@@ -2101,6 +2147,7 @@ def _leg_settings(
     required: bool,
     service_config: str | Path | None,
     suppress_search: bool,
+    env: str | None,
     cli: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> ServiceSettings | CheckResult:
     """The prologue at least ten settings legs share: the settings a leg grades, or the line it
@@ -2116,12 +2163,12 @@ def _leg_settings(
     rendered by :func:`_settings_error`, never ``str(exc)``: a ``ValidationError`` echoes input
     values, and the environment-sourced secrets are among them.
 
-    ``name`` and ``required`` are the leg's own, on both lines. ``cli`` is passed to
-    :func:`_load_check_settings` unchanged."""
+    ``name`` and ``required`` are the leg's own, on both lines. ``env`` (``check --env``) and
+    ``cli`` are passed to :func:`_settings_source` and :func:`_load_check_settings` unchanged."""
     from pydantic import ValidationError
 
     toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_search
+        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
     )
     if toml is None and not env_only:
         return CheckResult(
@@ -2132,7 +2179,7 @@ def _leg_settings(
             detail=_no_settings_detail(service_config, suppress_search),
         )
     try:
-        return _load_check_settings(toml, cli=cli)
+        return _load_check_settings(toml, cli=cli, env=env)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
         return CheckResult(
             name,
@@ -2157,7 +2204,8 @@ def _serve_reads_other_note(
     #2355, because it may hold another instance's file."""
     from messagefoundry.config.settings import settings_file_path
 
-    if toml is None or explicit or not suppress_search:
+    # A path that is no file is the settings load's to refuse; samefile would raise on it.
+    if toml is None or explicit or not suppress_search or not toml.is_file():
         return None
     here = settings_file_path(None)
     if here.is_file() and toml.samefile(here):
@@ -2171,7 +2219,7 @@ def _serve_reads_other_note(
 
 def _with_source(result: CheckResult, note: str | None) -> CheckResult:
     """``result`` with ``note`` on its line, so where the settings came from shares a line with the
-    verdict: :data:`_ENV_ONLY_SOURCE`, or :func:`_serve_reads_other_note`'s text.
+    verdict: :func:`_env_only_source`'s text, or :func:`_serve_reads_other_note`'s text.
 
     A SKIP is left alone. Under an environment declaration no settings leg skips for a settings
     reason, so a skip there is about the graph (``config did not load``) or the fixtures, and the
@@ -2223,6 +2271,7 @@ def _check_posture(
     *,
     service_config: str | Path | None = None,
     suppress_search: bool = False,
+    env: str | None = None,
 ) -> CheckResult:
     """Catch the ADR-0017 foot-gun at commit/CI time: a CUSTOM active-environment name (not
     dev/staging/prod) with no explicit ``[security].production_instance`` makes ``serve`` fail
@@ -2234,7 +2283,7 @@ def _check_posture(
     ``_find_service_toml`` upward-walk runs, unchanged.
 
     Best-effort: no ``messagefoundry.toml`` → SKIP (this gate also runs against a bare config dir),
-    unless ``MEFOR_AI_ENVIRONMENT`` declares the instance in the environment, when the settings are
+    unless ``check --env`` or ``MEFOR_AI_ENVIRONMENT`` declares the instance, when the settings are
     read from the environment alone (:func:`_settings_source`, vault BACKLOG #2355).
     No active environment set → SKIP (``serve`` reports that separately; not this check's concern).
     Settings that won't load → FAIL (BACKLOG #1318)."""
@@ -2244,6 +2293,7 @@ def _check_posture(
         required=True,
         service_config=service_config,
         suppress_search=suppress_search,
+        env=env,
     )
     if isinstance(settings, CheckResult):
         return settings
@@ -2275,6 +2325,7 @@ def _check_build(
     service_config: str | Path | None = None,
     suppress_search: bool = False,
     project_root: str | Path | None = None,
+    env: str | None = None,
 ) -> CheckResult:
     """Run the **posture-stamped** ``build_check_registry`` that ``serve``/``reload`` run, so a config
     ``serve`` would REFUSE — most importantly a production-PHI cleartext / weakened-TLS transport hop
@@ -2288,9 +2339,9 @@ def _check_build(
     posture** stamped — so a prod-PHI cleartext egress hop raises a ``WiringError`` and FAILS the gate.
 
     Required, but **fail-safe SKIP** when it can't resolve a real posture, so it never blocks a bare
-    config dir or a dev checkout: no ``messagefoundry.toml`` and no ``MEFOR_AI_ENVIRONMENT`` → SKIP (a
-    bare dir has no declared posture, byte-identical to before this check); a graph that won't load →
-    SKIP (``validate`` already reports that). Only a genuine build/posture refusal on a fully-resolved
+    config dir or a dev checkout: no ``messagefoundry.toml`` and no ``check --env`` or
+    ``MEFOR_AI_ENVIRONMENT`` → SKIP (a bare dir has no declared posture, byte-identical to before
+    this check); a graph that won't load → SKIP (``validate`` already reports that). Only a genuine build/posture refusal on a fully-resolved
     config blocks. With no file but an environment declaration the settings come from the environment
     alone (:func:`_settings_source`, vault BACKLOG #2355)."""
     import os
@@ -2323,6 +2374,7 @@ def _check_build(
         required=True,
         service_config=service_config,
         suppress_search=suppress_search,
+        env=env,
         cli=cli,
     )
     if isinstance(settings, CheckResult):
@@ -2431,6 +2483,7 @@ def _check_alert_smtp_tls(
     *,
     service_config: str | Path | None = None,
     suppress_search: bool = False,
+    env: str | None = None,
 ) -> CheckResult:
     """Surface whether the ``[alerts]`` SMTP hop **authenticates the relay** (#323 layer 3).
 
@@ -2456,6 +2509,7 @@ def _check_alert_smtp_tls(
         required=False,
         service_config=service_config,
         suppress_search=suppress_search,
+        env=env,
     )
     if isinstance(settings, CheckResult):
         return settings
@@ -2982,6 +3036,7 @@ def _check_vault_revocation_attested(
     *,
     service_config: str | Path | None = None,
     suppress_search: bool = False,
+    env: str | None = None,
 ) -> CheckResult:
     """Surface each Vault hop whose revocation is attested, with its reason (vault BACKLOG #2983).
 
@@ -3007,6 +3062,7 @@ def _check_vault_revocation_attested(
         required=False,
         service_config=service_config,
         suppress_search=suppress_search,
+        env=env,
     )
     if isinstance(settings, CheckResult):
         return settings
@@ -3267,6 +3323,7 @@ def _check_static_credentials(
     *,
     service_config: str | Path | None = None,
     suppress_search: bool = False,
+    env: str | None = None,
 ) -> CheckResult:
     """Surface every backend hop that presents an unchanging credential or none (BACKLOG #1182, ASVS
     13.2.1), with whether a compliant credential kind exists for it and whether it is opted out.
@@ -3305,7 +3362,7 @@ def _check_static_credentials(
             name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
         )
     toml, env_only = _settings_source(
-        config_dir, service_config=service_config, suppress_search=suppress_search
+        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
     )
     settings: ServiceSettings | None = None
     scope = "graph and service settings"
@@ -3316,7 +3373,7 @@ def _check_static_credentials(
         )
     else:
         try:
-            settings = _load_check_settings(toml)
+            settings = _load_check_settings(toml, env=env)
         except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
             # Present-but-refused is a failure, not a skip (BACKLOG #1318, the alert-smtp-tls rule).
             return CheckResult(
@@ -3393,6 +3450,7 @@ def _check_oidc_auth_params(
     *,
     service_config: str | Path | None = None,
     suppress_search: bool = False,
+    env: str | None = None,
 ) -> CheckResult:
     """Report the authorization parameters the relying party sends that nothing else screens
     (#1159, ASVS 10.2.3 — "the OAuth client only requests the required scopes (or other
@@ -3438,6 +3496,7 @@ def _check_oidc_auth_params(
         required=False,
         service_config=service_config,
         suppress_search=suppress_search,
+        env=env,
     )
     if isinstance(settings, CheckResult):
         return settings
@@ -3594,6 +3653,7 @@ def _check_upstream_hop_ack(
     *,
     service_config: str | Path | None = None,
     suppress_search: bool = False,
+    env: str | None = None,
 ) -> CheckResult:
     """Refuse a declared upstream TLS terminator with no ``[api].tls_cert_file`` and no
     ``[api].plaintext_upstream_hop_acknowledged`` -- the BACKLOG #1179 refusal ``serve`` applies,
@@ -3609,8 +3669,9 @@ def _check_upstream_hop_ack(
     Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_leg_settings`: no
     ``messagefoundry.toml`` → SKIP; present but refused by the loader → FAIL (BACKLOG #1318). A
     terminator declared through ``MEFOR_API_*`` environment variables with no file is read when
-    ``MEFOR_AI_ENVIRONMENT`` also names the instance (vault BACKLOG #2355). With neither, this leg
-    still SKIPs, so a site that names its environment only on ``serve --env`` gets no parity here.
+    ``check --env`` or ``MEFOR_AI_ENVIRONMENT`` also names the instance (vault BACKLOG #2355). With
+    neither, this leg still SKIPs, so a site that names its environment only on ``serve --env``
+    gets parity here only when ``check`` is given the same ``--env``.
     The file lookup differs from ``serve``'s in the ways :func:`_check_posture` documents."""
     from messagefoundry.api.tls import (
         api_tls_source,
@@ -3625,6 +3686,7 @@ def _check_upstream_hop_ack(
         required=True,
         service_config=service_config,
         suppress_search=suppress_search,
+        env=env,
     )
     if isinstance(settings, CheckResult):
         return settings
@@ -3678,6 +3740,7 @@ def _check_oidc_revocation(
     *,
     service_config: str | Path | None = None,
     suppress_search: bool = False,
+    env: str | None = None,
 ) -> CheckResult:
     """Report the OIDC revocation refusal ``serve`` applies, at commit/CI time (BACKLOG #2131,
     ADR 0173 AC-4).
@@ -3701,6 +3764,7 @@ def _check_oidc_revocation(
         required=True,
         service_config=service_config,
         suppress_search=suppress_search,
+        env=env,
     )
     if isinstance(settings, CheckResult):
         return settings
@@ -3721,8 +3785,9 @@ def _check_oidc_revocation(
 
 
 #: The name the two retention legs print where ``serve`` would print the environment, when the
-#: settings they read name none. ``serve`` can take its own from ``--env``, which ``check`` does
-#: not have, or from a ``MEFOR_AI_ENVIRONMENT`` this command's environment does not hold.
+#: settings they read name none. ``serve`` can take its own from a ``--env`` this ``check`` was
+#: not given, or from a ``MEFOR_AI_ENVIRONMENT`` this command's environment does not hold. Given
+#: ``check --env``, the legs print that name instead (vault BACKLOG #2355).
 _UNNAMED_ENVIRONMENT = "not named in the settings check read"
 
 
@@ -3742,8 +3807,10 @@ def _retention_posture(settings: ServiceSettings) -> tuple[str, bool, str] | Non
 
     Neither leg's verdict depends on the environment name or the production tier. Both only word
     the text. So with no active environment in the settings the legs still judge, because a site
-    that names its environment only on ``serve --env`` would otherwise get no parity from them.
-    They print :data:`_UNNAMED_ENVIRONMENT` for the name. The tier is the explicit
+    that names its environment only on ``serve --env``, and runs ``check`` without the same
+    ``--env``, would otherwise get no parity from them. ``check --env`` lands in the settings as
+    ``serve --env`` does, so it is a named environment here. With none they print
+    :data:`_UNNAMED_ENVIRONMENT` for the name. The tier is the explicit
     ``[security].production_instance`` when the settings carry one; with none the word
     "production" is left out. ``note`` says which on the line, since ``serve`` would print the
     real name and tier. A leg appends it only to a line that prints the name.
@@ -3775,6 +3842,7 @@ def _check_retention(
     *,
     service_config: str | Path | None = None,
     suppress_search: bool = False,
+    env: str | None = None,
 ) -> CheckResult:
     """Report the retention start gate ``serve`` applies, at commit/CI time (vault BACKLOG #2280).
 
@@ -3807,6 +3875,7 @@ def _check_retention(
         required=True,
         service_config=service_config,
         suppress_search=suppress_search,
+        env=env,
     )
     if isinstance(settings, CheckResult):
         return settings
@@ -3852,6 +3921,7 @@ def _check_retention_overrides(
     *,
     service_config: str | Path | None = None,
     suppress_search: bool = False,
+    env: str | None = None,
 ) -> CheckResult:
     """Report the refusal ``serve`` applies to a connection's own keep-forever retention override,
     at commit/CI time (vault BACKLOG #2368).
@@ -3869,9 +3939,10 @@ def _check_retention_overrides(
     write. It writes no AUDIT line itself.
 
     Required, with the fail-safe SKIPs of :func:`_check_build`: no ``messagefoundry.toml`` and no
-    ``MEFOR_AI_ENVIRONMENT`` → SKIP; a graph that won't load → SKIP (``validate`` reports it);
-    settings that won't load → FAIL (BACKLOG #1318). :func:`_retention_posture` says what it does
-    with no active environment and with an unresolved production tier."""
+    ``check --env`` or ``MEFOR_AI_ENVIRONMENT`` → SKIP; a graph that won't load → SKIP
+    (``validate`` reports it); settings that won't load → FAIL (BACKLOG #1318).
+    :func:`_retention_posture` says what it does with no active environment and with an unresolved
+    production tier."""
     from messagefoundry.config.retention_classification import judge_keep_forever_overrides
     from messagefoundry.config.settings import SecurityEnforcement
     from messagefoundry.config.wiring import WiringError, load_config
@@ -3883,6 +3954,7 @@ def _check_retention_overrides(
         required=True,
         service_config=service_config,
         suppress_search=suppress_search,
+        env=env,
     )
     if isinstance(settings, CheckResult):
         return settings
@@ -3934,6 +4006,7 @@ def _check_reference_backend(
     *,
     service_config: str | Path | None = None,
     suppress_search: bool = False,
+    env: str | None = None,
 ) -> CheckResult:
     """Refuse a config that declares an ADR 0006 ``Reference(...)`` against a store backend with no
     reference-snapshot store — the same fail-closed gate ``serve``/``reload`` apply
@@ -3950,8 +4023,8 @@ def _check_reference_backend(
     which resolves the same class flag — one source of truth, no drift.
 
     Required, but **fail-safe SKIP** on the same convention as :func:`_check_build`: no
-    ``messagefoundry.toml`` and no ``MEFOR_AI_ENVIRONMENT`` (vault BACKLOG #2355; with one, a
-    ``MEFOR_STORE_BACKEND`` is read from the environment) → SKIP (a bare config dir declares no
+    ``messagefoundry.toml`` and no ``check --env`` or ``MEFOR_AI_ENVIRONMENT`` (vault BACKLOG #2355;
+    with one, a ``MEFOR_STORE_BACKEND`` is read from the environment) → SKIP (a bare config dir declares no
     backend, and the SQLITE default supports reference sets anyway); a config that won't load → SKIP
     (``validate`` already reports it); settings that won't load → FAIL (BACKLOG #1318). A ``serve``-time backend override can still diverge from the toml this reads — the
     engine-start gate is the backstop for that, which is why both halves exist."""
@@ -3964,6 +4037,7 @@ def _check_reference_backend(
         required=True,
         service_config=service_config,
         suppress_search=suppress_search,
+        env=env,
     )
     if isinstance(settings, CheckResult):
         return settings
