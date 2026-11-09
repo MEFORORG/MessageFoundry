@@ -349,7 +349,7 @@ jobs:
       # compares versions. The packaging copy pip carries parses each requirement, after a copy of
       # pip's line handling, and pip's own parser reads a line of options with no requirement. A
       # marker false here, an extra, a URL or path with no name, and an editable line (-e or
-      # --editable, in any spelling pip takes) are only noted: the lock records no extras, an
+      # --editable, abbreviated or attached as pip allows) are only noted: the lock records no extras, an
       # unnamed URL has no name to look up, and an editable installs a source tree or checkout that
       # no lock pin holds. A requirement it cannot parse fails, and so does a line of options with
       # no requirement that pip cannot read. An include or constraint line (-r, --requirement, -c or
@@ -547,7 +547,7 @@ for group in logical_lines("requirements.txt"):
         elif kind == "editable":
             print(f"::notice::{line} is editable, so it is not checked against requirements.lock")
         elif kind == "include":
-            # No new lock clears these two, so each names a remedy that keeps what the file does.
+            # No new lock clears these two, so each names a remedy of its own, not REGENERATE.
             errors.append(
                 (
                     f"{line} includes another requirements file, which this check does not follow",
@@ -558,9 +558,12 @@ for group in logical_lines("requirements.txt"):
             errors.append(
                 (
                     f"{line} names a constraints file, which this check does not follow",
-                    "remove the line and give that file to the command that writes"
-                    " requirements.lock instead (uv pip compile -c FILE); if the file is"
-                    " requirements.lock itself, just remove the line",
+                    "remove the line only once its limits apply elsewhere: give the file to every"
+                    " command that writes requirements.lock (uv pip compile -c FILE), keeping it in"
+                    " the README's lock commands, and make every install apply the lock, with"
+                    " PIP_CONSTRAINT=requirements.lock wherever requirements.txt is installed or"
+                    " pip install --require-hashes -r requirements.lock in its place (for"
+                    " requirements.lock itself, the install step alone)",
                 )
             )
         continue

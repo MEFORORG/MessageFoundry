@@ -221,16 +221,30 @@ that package's build code may run in CI:
     carries, so versions compare as pip compares them, and reads a line of options with no
     requirement with pip's own parser. A requirement whose marker is false on the runner, an extra
     (a lock records none), a URL or path with no package name, and an editable line (`-e` or
-    `--editable` in any spelling pip takes, which installs a source tree or checkout no lock pin
-    holds) are only noted. A requirement it cannot parse fails, and so does a line of options with
-    no requirement that pip cannot read. An include or constraint line (`-r`, `--requirement`, `-c`
-    or `--constraint`, abbreviated or attached as pip allows, with no editable on the line) fails
-    too, because the step follows no file a line names, so it cannot check an included file's pins
-    or a constraints file's limits against the lock. No new lock clears it: move the included
-    file's lines into `requirements.txt`; for a constraints file, remove the line and give the file
-    to the command that writes `requirements.lock` instead (`uv pip compile -c <file>`), or, if the
-    file is `requirements.lock` itself, just remove the line, because the lock is what gets
-    installed. The options on a line that also holds a requirement are not read.
+    `--editable`, abbreviated or attached as pip allows, which installs a source tree or checkout
+    no lock pin holds) are only noted. A requirement it cannot parse fails, and so does a line of
+    options with no requirement that pip cannot read. An include or constraint line (`-r`,
+    `--requirement`, `-c` or `--constraint`, abbreviated or attached as pip allows, with no
+    editable on the line) fails too, because the step follows no file a line names, so it cannot
+    check an included file's pins or a constraints file's limits against the lock. No new lock
+    clears it. For an included file, move its lines into `requirements.txt`. For a constraints
+    file, remove the line only once its limits apply elsewhere, in two places:
+    - The lock. While the line is in `requirements.txt`, `uv pip compile` reads it on every
+      regeneration. Once it is gone, nothing does unless you pass the file every time, so put it
+      in each command that writes `requirements.lock` (`uv pip compile -c <file>`) and keep it
+      there, for example in the README's lock commands. This check compares only the
+      requirements in `requirements.txt` with the lock, so it cannot see a limit a regeneration
+      dropped.
+    - The install. The `check` job and the README's step 1 run `pip install -r
+      requirements.txt`, which reads the line too. Once it is gone they resolve live, with none of
+      its limits, unless every install of `requirements.txt` applies the lock: set
+      `PIP_CONSTRAINT=requirements.lock` wherever `requirements.txt` is installed, or install with
+      `pip install --require-hashes -r requirements.lock` in its place. The scaffolded `check`
+      job and README do neither by default.
+
+    A `-c requirements.lock` line is refused too, and only the install step applies to it:
+    removing it is safe only once every install applies the lock in one of those two ways. The
+    options on a line that also holds a requirement are not read.
   - The job takes the engine's pin out of the lock, as pip reads the lock, and installs that pin
     alone with `--no-deps --require-hashes`. The lock must pin `messagefoundry` exactly once, or the
     job says so and fails; pip refuses the pin if it carries no hash. No other locked package is

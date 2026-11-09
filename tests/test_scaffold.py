@@ -807,12 +807,16 @@ _INCLUDE = (
 )
 _CONSTRAINT = (
     "names a constraints file, which this check does not follow;"
-    " remove the line and give that file to the command that writes requirements.lock instead"
-    " (uv pip compile -c FILE); if the file is requirements.lock itself, just remove the line"
+    " remove the line only once its limits apply elsewhere: give the file to every command that"
+    " writes requirements.lock (uv pip compile -c FILE), keeping it in the README's lock commands,"
+    " and make every install apply the lock, with PIP_CONSTRAINT=requirements.lock wherever"
+    " requirements.txt is installed or pip install --require-hashes -r requirements.lock in its"
+    " place (for requirements.lock itself, the install step alone)"
 )
 
 #: (the line after ``foo==1.0``, the ::error:: it raises, whether the pins audit's grep also sees it).
-#: pip reads each as an include or a constraint, by its own parser, so every spelling it takes counts.
+#: pip's own parser reads each as an include or a constraint, abbreviated or attached as pip allows.
+#: Not every spelling: a line that becomes one only through a ${VAR} nested in another's value passes.
 _INCLUDE_CASES = [
     ("--requirem extra.txt", f"--requirem extra.txt {_INCLUDE}", False),
     ("-\\\nr extra.txt", f"-r extra.txt {_INCLUDE}", False),
@@ -858,6 +862,22 @@ def test_an_include_or_constraint_line_fails_the_stale_check(
         if not (grepped and c.startswith("pip-audit -r requirements.txt"))
     ]
     assert audited.exists()
+
+
+def test_a_constraint_on_the_lock_itself_stays_refused_and_keeps_the_lock_applied(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
+) -> None:
+    """Lander hold 12 on PR 2840: removing ``-c requirements.lock`` leaves the ``check`` job's and
+    the README's ``pip install -r requirements.txt`` unconstrained unless every install applies the
+    lock, so the line is refused and its remedy says how to keep the lock applied first."""
+    lock = _STALE_LOCK + "foo==1.0 \\\n    --hash=sha256:ffff\n"
+    _, _, output, failed = _run_audit_job(
+        scaffolded_ci, tmp_path, lock, requirements="foo==1.0\n-c requirements.lock\n"
+    )
+    assert failed == [_STALE], output
+    errors = [ln for ln in output.splitlines() if ln.startswith("::error::")]
+    assert errors == [f"::error::-c requirements.lock {_CONSTRAINT}"]
+    assert "just remove the line" not in output
 
 
 def test_each_error_keeps_its_own_remedy_in_file_order(
