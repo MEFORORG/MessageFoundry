@@ -9614,7 +9614,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"interval also delays the page about a directory outage, which comes after "
                     f"{floor}, and the page about one account the directory keeps failing for, "
                     f"which comes after at least {run} of that account's own probes running "
-                    f"fail, no sooner than {(run - 1) * interval} s after the first of them",
+                    f"fail, at least {(run - 1) * interval} s after its first such probe",
                 )
             )
         if run > _auth_default("ad_reconcile_outage_passes"):

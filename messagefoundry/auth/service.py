@@ -8604,10 +8604,9 @@ class AuthService:
 
         It logs one WARNING naming each account whose row was written, or one WARNING with the
         count on a rolled-up pass; a refused row has the soft write's ERROR instead. A write that
-        raises ends the pass with no page, so each account written before it gets its own
-        WARNING."""
+        raises ends the pass with no page, so the accounts written before it are logged the same
+        way, decided on them."""
         written: list[tuple[str, str, int]] = []
-        rollup = False
         try:
             for entry in plan.unreached:
                 _user_id, username, probes = entry
@@ -8624,13 +8623,13 @@ class AuthService:
                     ),
                 ):
                     written.append(entry)
+        finally:
             # A rollup only with something written: one with nothing would page nothing, and the
             # lifespan task reads the run's length off the entries (final-round finding 1).
             rollup = (
                 bool(written)
                 and len(self._reconcile_unreached_paged) + len(written) > _UNREACHED_ROLLUP_ABOVE
             )
-        finally:
             if rollup:
                 _log.warning(
                     "directory reconcile: %d accounts entered a run of unreachable probes, so "

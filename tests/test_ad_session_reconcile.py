@@ -3068,9 +3068,8 @@ async def test_refused_unreached_rows_log_no_per_account_warning(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #3709, review round 3. Seven accounts entering would roll up, but six rows are
-    refused, so the pass does not roll up. Only the written account gets its WARNING; each
-    refused row has the soft write's ERROR. Logging every entry would turn the one rollup line
-    into a WARNING per account per pass for as long as the store refuses.
+    refused, so the pass does not roll up. Only the written account gets its WARNING; a refused
+    one is left to the soft write's own ERROR line.
 
     RED when: a refused account still gets the per-account WARNING."""
     store = await MessageStore.open(":memory:")
@@ -3109,7 +3108,7 @@ async def test_an_unreached_row_write_that_raises_keeps_the_earlier_warnings(
     """BACKLOG #3709, review round 3. A later write that raises ends the pass with no page, so
     every account whose row was written before it still gets its WARNING.
 
-    RED when: the WARNINGs wait for the whole write loop, so a raise leaves none."""
+    RED when: a raise leaves no WARNING for an account written before it."""
     store = await MessageStore.open(":memory:")
     try:
         names = ["ok", "flapA", "flapB"]
@@ -3142,6 +3141,51 @@ async def test_an_unreached_row_write_that_raises_keeps_the_earlier_warnings(
         assert len(written) == 1
         warned = _unreached_warnings(caplog)
         assert len(warned) == 1 and written[0] in warned[0]
+    finally:
+        await store.close()
+
+
+async def test_a_raise_after_more_than_five_written_rows_logs_one_count_line(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3709, review round 3. Where the rows written before a raising write are more than
+    the rollup bound, they are logged as the rollup's one count line, not one WARNING each, so a
+    raise that recurs every pass does not bring back the per-account flood the rollup prevents.
+
+    RED when: a raise after six written rows logs a WARNING per account."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ["ok"] + [f"flap{i}" for i in range(7)]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        real = service._audit_reconciler_row
+        written: list[str] = []
+
+        async def raise_on_seventh(action: str, **kwargs: Any) -> bool:
+            if action == "auth.ad_reconcile_unreached":
+                if len(written) == 6:
+                    raise RuntimeError("store gone")
+                written.append(str(kwargs["actor"]))
+            return await real(action, **kwargs)
+
+        monkeypatch.setattr(service, "_audit_reconciler_row", raise_on_seventh)
+        sink = _InverseSink()
+        ldap.unreachable = set(names[1:])
+        for _ in range(2):
+            await _pass(service, sink)
+        caplog.clear()
+        with (
+            caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"),
+            pytest.raises(RuntimeError, match="store gone"),
+        ):
+            await _pass(service, sink)
+        assert len(written) == 6
+        assert _unreached_warnings(caplog) == []
+        counted = [r.getMessage() for r in caplog.records if "6 accounts entered" in r.getMessage()]
+        assert len(counted) == 1
     finally:
         await store.close()
 
