@@ -110,7 +110,7 @@ def test_a_null_read_cannot_judge_and_is_never_clean() -> None:
 
 
 def test_a_held_write_role_beside_a_null_is_still_over_granted() -> None:
-    """What was read as held is reported, whatever another role read."""
+    """What was read as held is still reported when another role reads NULL."""
     reading = classify_login_roles(_row(("db_datawriter",), null=("sysadmin",)))
     assert reading.verdict is LoginRoleVerdict.OVER_GRANTED
     assert reading.held == ("database role db_datawriter",)
@@ -138,10 +138,10 @@ def test_a_value_other_than_an_int_0_or_1_cannot_judge_and_is_never_clean(value:
     assert reading.unread == ("database role db_owner",) and reading.held == ()
 
 
-@pytest.mark.parametrize("value", [1.0, Decimal(1), "1"])
+@pytest.mark.parametrize("value", [None, 1.0, Decimal(1), "1"])
 def test_an_odd_typed_deny_does_not_take_a_writer_finding_away(value: object) -> None:
-    """A ``db_denydatawriter`` read as held clears ``db_datawriter``, so one answered in another
-    type must not: the writer stays a finding."""
+    """A ``db_denydatawriter`` read as held clears ``db_datawriter``, so an unread one, NULL or
+    answered in another type, must not: the writer stays a finding."""
     row = tuple(
         1 if r == "db_datawriter" else value if r == "db_denydatawriter" else 0 for r in _ROLES
     )
