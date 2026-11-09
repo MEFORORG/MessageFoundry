@@ -253,6 +253,14 @@ _REGISTERED: dict[Site, tuple[int, str]] = {
     ),
     Site(_FLOOR, "refuse_websocket", "ws-close"): (1, "The same fallback, for routes."),
     Site(
+        "messagefoundry/api/security.py", "WebSocketAcceptGate.__call__.guarded_send", "ws-close"
+    ): (
+        1,
+        "The accept gate's refusal, sent in place of a pre-accept accept or denial response (vault "
+        "BACKLOG #2955). Registered inside the floor, which turns the close into its own 403 when "
+        "the server offers websocket.http.response; tests/test_ws_accept_gate.py pins both.",
+    ),
+    Site(
         _FLOOR,
         "SecurityHeaderFloorMiddleware._serve_websocket.send_websocket",
         "asgi-response-start",

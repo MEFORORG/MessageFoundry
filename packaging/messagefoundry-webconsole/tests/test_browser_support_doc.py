@@ -252,6 +252,8 @@ def _fake_websocket(headers: dict[str, str]) -> Any:
         app=SimpleNamespace(state=state),
         url=SimpleNamespace(scheme="wss", path="/ws/stats"),
         cookies=_RecordingCookies(),
+        # authorize_ui_ws records its answer on the handshake's scope (vault BACKLOG #2955).
+        scope={},
     )
 
 
