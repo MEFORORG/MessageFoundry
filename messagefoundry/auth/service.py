@@ -14040,7 +14040,7 @@ class AuthService:
     async def _refuse_rotation_without_way_past(self, user: VerifiedUser) -> None:
         """The rotation's early refusal, before the argon2 hash: raise
         :class:`FactorEnrolmentRequired` where ``user`` holds no factor with a way past, except that
-        a TOTP that is on beside a passkey set that reads is left to the write's own judgement
+        a TOTP that is on beside a passkey set that verifies is left to the write's own judgement
         (BACKLOG #3948 finding 13), which refuses a KNOWN refusal only after the hash. Where no
         TOTP is on and no passkey can count (no configured relying party, or no ``[webauthn]``
         extra), it refuses before reading anything, since no read could change the answer.
@@ -14080,6 +14080,8 @@ class AuthService:
             return
         if user.totp_enabled:
             return
+        # The [webauthn] extra check is the guard at the top's (finding 3): it refused here where the
+        # extra is missing, so only each passkey's own count is judged below.
         if not any(self._gate_counts(c) for c in held):
             raise FactorEnrolmentRequired()
 

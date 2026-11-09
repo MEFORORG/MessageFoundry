@@ -2473,8 +2473,9 @@ async def test_the_rotation_survives_only_a_decode_failure_of_the_passkey_set(
     """The rotation's early refusal counts the set for nothing only where the driver could not
     decode a cell (pyodbc's ``UnicodeDecodeError`` here; sqlite3's is the test above): a covered
     account with no TOTP on gets the enrolment refusal before the hash. The control: any other
-    driver error still raises, before the hash, rather than telling an account that holds a
-    passkey to enrol a factor. RED when: the catch drops ``UnicodeDecodeError``, or widens to every
+    driver error raises from the read, before the hash. The service here has a relying party
+    configured and the extra installed, so a passkey can count and the early refusal reads the
+    set; where none can, it refuses without reading. RED when: the catch drops ``UnicodeDecodeError``, or widens to every
     ``OperationalError``."""
     store = await MessageStore.open(":memory:")
     try:
@@ -2496,7 +2497,8 @@ async def test_a_passkey_set_that_fails_its_seal_is_reported_by_the_rotation(
     tampered: bool, tmp_path: Path
 ) -> None:
     """A passkey set that fails the digest its account's seal covers counts for nothing, and the
-    rotation reports it, as every verified passkey read does: a refused TOTP beside it is the
+    rotation reports it through ``_verified_passkeys``, which it reads here because a passkey can
+    count (relying party configured, extra installed): a refused TOTP beside it is the
     enrolment refusal, with an integrity audit row naming the passkey set. The control: an intact
     set writes no such row and the rotation lands. RED when: the set is judged only in the store's
     write, which refuses without a report."""
