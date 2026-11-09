@@ -3091,8 +3091,9 @@ def _naming_the_ca_setting(anchor: TrustAnchor) -> Iterator[None]:
     try:
         yield
     except OSError as exc:
-        # No path in the text, as the bare FileNotFoundError this replaces carried none: a connection
-        # test returns this text to the caller and audits it. The setting tells the operator where.
+        # No path in the text, as the bare FileNotFoundError this replaces carried none: a
+        # connection test returns this text to the caller and audits it. The setting tells the
+        # operator where.
         #
         # A [tls].crl_file refusal on the same hop still names its file, and the two shapes are
         # kept by Manager decision (BACKLOG #3096 item 11). This CA setting is per connection. The
@@ -3120,7 +3121,11 @@ def build_verifying_client_context(
     ``cafile=`` argument cannot express. Verification stays ON (``CERT_REQUIRED`` + ``check_hostname``,
     the ``create_default_context`` secure defaults) — the caller layers the TLS floor / KEX / strict
     flags / optional mTLS client cert exactly as before. Purpose is a parameter only so a future
-    client-auth context could reuse it; every current caller verifies a *server* cert."""
+    client-auth context could reuse it.
+
+    The ``tls_verify=false`` arms of the SMTP, MLLP and FTPS contexts build here too, with the empty
+    policy, and turn verification off afterwards (vault BACKLOG #2370). So a step added here must
+    not assume the hop it builds verifies its peer."""
     ctx: ssl.SSLContext
     if anchor.load_system_roots:
         ctx = ssl.create_default_context(purpose)
@@ -3346,17 +3351,18 @@ def build_smtp_tls_context(
     the connection names no ``ca_file`` of its own. It only chooses WHICH roots verify the peer — it
     never turns verification off.
     """
-    if verify:
-        anchor = resolve_trust_anchor(
-            connection_ca_file=ca_file,
-            host=host,
-            policy=trust_anchor_policy if trust_anchor_policy is not None else TrustAnchorPolicy(),
-            connection=name or None,
-            setting=ca_setting,
-        )
-        ctx = build_verifying_client_context(anchor)
-    else:
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_file)
+    # The verify-off arm takes the empty policy: it verifies nothing, so an instance CA or CRL could
+    # only add a way to refuse. It loads ca_file through the anchor for the named refusal (vault #2370).
+    anchor = resolve_trust_anchor(
+        connection_ca_file=ca_file,
+        host=host,
+        policy=trust_anchor_policy
+        if verify and trust_anchor_policy is not None
+        else TrustAnchorPolicy(),
+        connection=name or None,
+        setting=ca_setting,
+    )
+    ctx = build_verifying_client_context(anchor)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if verify:
         ctx.check_hostname = check_hostname

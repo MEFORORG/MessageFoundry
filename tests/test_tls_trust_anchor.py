@@ -172,8 +172,11 @@ def test_default_policy_context_is_byte_identical_to_no_policy(tmp_path: Path) -
     none_ctx = _mllp_ssl_context(s, server=False, trust_anchor_policy=None)
     sys_ctx = _mllp_ssl_context(s, server=False, trust_anchor_policy=TrustAnchorPolicy())
     assert none_ctx is not None and sys_ctx is not None
-    # Connection's own CA wins under both → exactly that one anchor, no OS roots.
-    assert len(none_ctx.get_ca_certs()) == 1 == len(sys_ctx.get_ca_certs())
+    # Both now build through the anchor (vault BACKLOG #2370), so the reference is the stdlib call
+    # itself: the connection's own CA, exactly that one anchor, no OS roots.
+    historical = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca).get_ca_certs()
+    assert len(historical) == 1
+    assert none_ctx.get_ca_certs() == historical == sys_ctx.get_ca_certs()
 
 
 # --- compose with the existing no-CA / verify-off refusals --------------------
