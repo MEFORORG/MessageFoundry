@@ -18,9 +18,9 @@ the vetted network call.
 * **No new dependency.** The POST reuses rest.py's TLS-verifying, no-redirect shared opener +
   ``_redact_url`` (stdlib :mod:`urllib`) — exactly as smart.py does. A vendor SDK would be a separate
   DEP-1 vet, so it is intentionally avoided.
-* **Off the event loop.** :meth:`AiBroker.chat` blocks (a provider POST); the API route awaits
-  :meth:`AiBroker.chat_async`, which runs it via :func:`asyncio.to_thread`, so the engine loop never
-  blocks.
+* **Off the event loop.** :meth:`AiBroker.chat` blocks (a provider POST), and so can construction,
+  which builds rest.py's shared opener on first use (BACKLOG #2484). The API route runs the build
+  and :meth:`AiBroker.chat` each through :func:`asyncio.to_thread`.
 * **Revocation (BACKLOG #2193 slice (e)).** The endpoint's certificate is verified, but stdlib ssl
   checks no CRL and no OCSP, and the shared opener carries no CRL. So an off-box endpoint is refused
   under an enforcing or unknown posture unless ``[ai].endpoint_revocation_attested`` is set with its

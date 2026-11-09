@@ -14,6 +14,7 @@ from __future__ import annotations
 import http.client
 import json
 import urllib.error
+import urllib.request
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
@@ -252,18 +253,22 @@ async def test_ai_chat_builds_the_broker_off_the_event_loop(
     engine: Engine, stub_broker: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # BACKLOG #2484: the broker's constructor builds rest.py's shared opener on first use, so the
-    # route must not run it on the loop's thread.
+    # route must not run that build on the loop's thread. The cached opener is cleared so the cold
+    # build runs here, whatever earlier tests built.
     import threading
+
+    from messagefoundry.transports import rest
 
     loop_thread = threading.get_ident()
     build_threads: list[int] = []
-    real = ai_broker_mod.ai_broker_from_settings
+    real_build = rest._no_redirect_opener
 
-    def recording(*args: object, **kwargs: object) -> AiBroker:
+    def recording() -> urllib.request.OpenerDirector:
         build_threads.append(threading.get_ident())
-        return real(*args, **kwargs)  # type: ignore[arg-type]
+        return real_build()
 
-    monkeypatch.setattr("messagefoundry.api.app.ai_broker_from_settings", recording)
+    monkeypatch.setattr(rest, "_shared_opener", None)
+    monkeypatch.setattr(rest, "_no_redirect_opener", recording)
     app = create_app(engine, ai_settings=_managed_ai(), allow_no_auth=True)
     async with _client(app) as c:
         r = await c.post("/ai/chat", json={"prompt": "hi"})
