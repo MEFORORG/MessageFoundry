@@ -375,6 +375,39 @@ def test_a_copy_the_declared_codec_cannot_write_is_refused_without_its_text(
     assert "label empty" not in err and "\\x2e" not in err, err
 
 
+def test_a_declared_codec_never_hands_pip_audit_a_truncated_copy(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Lander hold on PR 2840: a text-mode copy write never finalized its encoder, and the idna codec
+    holds back the last label, so everything after the lock's last ``.`` was dropped. pip-audit got
+    one of three pins and the run exited 0. Encoding the copy in one call makes the codec see all of
+    it, and this lock has a label too long to encode, so it is refused."""
+    digest = "a" * 64
+    src = tmp_path / "x.lock"
+    src.write_text(
+        "# coding: idna\n"
+        f"idna==3.10 --hash=sha256:x.y --hash=sha256:{digest}\n"
+        f"evil==1 --hash=sha256:{digest}\n"
+        f"worse==2 --hash=sha256:{digest}\n",
+        encoding="ascii",
+        newline="\n",
+    )
+    copies: list[bytes] = []
+
+    def run(cmd: list[str]) -> int:
+        if "pip_audit" in cmd:
+            copies.append(Path(cmd[cmd.index("-r") + 1]).read_bytes())
+        return 0
+
+    status = main([str(src)], run=run)
+    assert copies == [], copies  # was one copy holding only "idna==3.10 --hash=sha256:x."
+    assert status == 2
+    err = capsys.readouterr().err
+    assert "its copy is not writable as idna: UnicodeEncodeError: 'idna' codec cannot encode" in err
+    assert "label too long" in err, err
+    assert "evil" not in err and "worse" not in err, err
+
+
 def test_utf8_failing_falls_back_to_the_locale_as_pip_does(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -482,7 +482,11 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP") or None) as tmp:
         copy = Path(tmp) / args.lock.name
         try:
-            copy.write_text("".join(kept), encoding=copy_encoding)
+            # One complete encode call, not write_text: a text stream never finalizes its encoder,
+            # and the idna codec holds back the last label until it is final, so a text-mode write
+            # dropped everything after the copy's last "." and pip-audit audited only what came
+            # before it. Bytes also skip newline translation; pip-audit reads "\n" on every host.
+            copy.write_bytes("".join(kept).encode(copy_encoding))
         except UnicodeError as exc:
             print(
                 f"::error::{args.lock}: its copy is not writable as {copy_encoding}: "
