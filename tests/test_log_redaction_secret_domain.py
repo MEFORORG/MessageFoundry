@@ -2538,8 +2538,7 @@ def test_a_placeholder_and_a_line_break_in_a_braced_value_survive() -> None:
 
 def test_the_bundle_copy_of_the_braced_tail_is_the_write_time_one() -> None:
     """The bundle restates the braced fragments so the regex scanner can read them. Its tail and its
-    braced head are the write-time ones, and its braced label takes the same credential words, so a
-    change to one copy alone goes red here."""
+    braced head are the write-time ones, and its braced label takes the same credential words."""
     assert redact_mod._SPACED_BRACED_HEAD == scrub_mod._SPACED_BRACED_HEAD
     assert redact_mod._SPACED_BRACED_TAIL == scrub_mod._SPACED_BRACED_TAIL
     heads = [re.compile(module._BRACED_HEAD) for module in (scrub_mod, redact_mod)]
