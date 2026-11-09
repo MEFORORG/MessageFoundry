@@ -405,8 +405,8 @@ Two limits, stated so nobody reads more into a green than it carries:
   every event, the engine suite's `test` and `test-shard2` included. Until BACKLOG #5247 item 9 the
   engine legs only warned in `merge_group`, under the owner ruling of 2026-10-29, and from
   2026-10-30, decided under the owner's delegation, warned on `pull_request` down to 1.20x. The
-  test shard pools of 2026-11-09 in `scripts/ci/step_margin_baseline.toml` ended both. The ruling of 2026-10-29 also moved the recurring timing tests listed in
-  `tests/timing_quarantine.txt` off the engine legs into the advisory `timing-quarantine` job
+  test shard pools of 2026-11-09 in `scripts/ci/step_margin_baseline.toml` ended both. The ruling
+  of 2026-10-29 also moved the recurring timing tests listed in `tests/timing_quarantine.txt` off the engine legs into the advisory `timing-quarantine` job
   (BACKLOG #4773). Each gated step in `test` carries its own `timeout-minutes`, and `scripts/ci/step_margin.py` runs after
   them: it times the **step** (not the job — the job runs minutes longer under its own cap, and
   misreading one for the other has produced published-then-retracted numbers here more than once),
@@ -421,10 +421,10 @@ Two limits, stated so nobody reads more into a green than it carries:
   that warning, are defined once in `record_escalation` in `scripts/ci/step_margin.py`.
   **The engine suite now runs as two test shards, in `test` and `test-shard2`, and each shard keeps
   the whole-suite cap and the whole-suite baseline row.** A shard does about half the work, so until
-  the caps and rows are re-sized from test shard pools (that re-size is unfiled), the 1.30x floor is
-  met against a cap sized for twice a shard's work: the margin gate is about half as sensitive to a
-  shard slowing down. The test shard pools were measured on 2026-11-09 and are recorded beside the
-  rows; no row or cap moved with them. The `RE-DERIVE` and `RE-SIZE` warning stays inert
+  the caps and rows are re-sized from test shard pools (deferred to BACKLOG #5247), the 1.30x floor
+  is met against a cap sized for twice a test shard's work: the margin gate is about half as
+  sensitive to a test shard slowing down. The test shard pools were measured on 2026-11-09 and are
+  recorded beside the rows; no row or cap moved with them. The `RE-DERIVE` and `RE-SIZE` warning stays inert
   on both shards for the same reason, since a shard run is not expected to reach a whole-suite row.
   **A red here is not a request to raise the cap:** the cap is sized against the work in `ci.yml`,
   and the underlying Windows slowness is its own backlog item.

@@ -952,8 +952,8 @@ def test_the_engine_margin_check_reds_a_low_margin_on_every_event(
     passes no second floor, and raises no warning of its own. The event is set as the step's old
     `EVENT_NAME`, as the runner's own `GITHUB_EVENT_NAME`, and as the `GITHUB_REF` that event
     carries (a merge queue ref for merge_group), so a branch on any of them differs by event; the
-    static test below refuses all three by name. `test-shard2` is not run separately: tests/test_ci_engine_suite_shards.py holds its body
-    identical to this one.
+    static test below refuses all three by name. `test-shard2` is not run separately:
+    tests/test_ci_engine_suite_shards.py holds its body identical to this one.
 
     Red first, against the softened body: merge_group with the script at 1 exited 0, pull_request
     with the script at 1 then 0 (a margin between 1.20x and 1.30x) exited 0 after a second call at
@@ -967,7 +967,9 @@ def test_the_engine_margin_check_reds_a_low_margin_on_every_event(
     env = probe_env(
         bash,
         dict(
-            os.environ,
+            # The host's own GITHUB_* (a tooling job's pull_request GITHUB_BASE_REF, say) would
+            # otherwise leak into every parametrized event.
+            {k: v for k, v in os.environ.items() if not k.upper().startswith("GITHUB_")},
             EVENT_NAME=event,
             GITHUB_EVENT_NAME=event,
             GITHUB_REF=_EVENT_REFS.get(event, "refs/heads/main"),
@@ -1018,13 +1020,22 @@ def test_every_margin_check_stays_blocking_on_every_event(job_name: str) -> None
     check = _margin_check(job_name)
     assert "continue-on-error" not in check, check.get("continue-on-error")
     run = str(check.get("run", ""))
-    env = str(check.get("env") or {})
-    # The run body and the env's keys AND values, so an event read passed in under another name
-    # (`FOO: ${{ github.event_name }}`) is refused as well as one read in the body.
-    for needle in ("merge_group", "pull_request", "EVENT_NAME", "GITHUB_REF", "gh-readonly-queue"):
+    # The step's and the job's env, keys AND values: no margin check reads anything from the
+    # `github` context, so an event read passed in under another name (`SOFT: ${{
+    # github.event.pull_request != null }}`) is refused as well as one read in the body.
+    env = f"{check.get('env') or {}} {_job(job_name).get('env') or {}}"
+    assert "github" not in env.lower(), f"{job_name}'s margin check reads the github context: {env}"
+    for needle in (
+        "merge_group",
+        "pull_request",
+        "EVENT_NAME",
+        "GITHUB_REF",
+        "GITHUB_HEAD_REF",
+        "GITHUB_BASE_REF",
+        "GITHUB_EVENT_PATH",
+        "gh-readonly-queue",
+    ):
         assert needle not in run, f"{job_name}'s margin check names {needle!r} in its run body"
-    for needle in ("event_name", "github.ref", "EVENT_NAME", "GITHUB_REF"):
-        assert needle not in env, f"{job_name}'s margin check names {needle!r} in its env: {env}"
     assert "--min-margin" not in run
     assert "pr_floor" not in run
 

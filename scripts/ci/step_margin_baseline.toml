@@ -26,9 +26,9 @@
 # below. Those pools hold whole-suite runs, so each row is an upper bound on a shard and not a
 # measurement of one; the test shard pools measured 2026-11-09 are recorded below, beside the rows
 # and not in them. What that does to the margin gate and to the record warning is stated once, in
-# docs/CI.md beside the step-margin gate. One row per shard is not possible as the file stands: rows are keyed by step and leg, and the two shard steps share both, so a
-# re-measure from shard pools also needs a key that tells the shards apart, such as distinct step
-# names.
+# docs/CI.md beside the step-margin gate. One row per test shard is not possible as the file stands:
+# rows are keyed by step and leg, and the two test shard steps share both, so a re-measure from test
+# shard pools also needs a key that tells the test shards apart, such as distinct step names.
 #
 # THE TWO LEGS NAME DIFFERENT KINDS OF NUMBER, AND THAT ASYMMETRY IS THE POINT OF THIS PARAGRAPH.
 # On the web console leg the gate's cap and the step's `timeout-minutes` were SPLIT: the kill is
@@ -51,36 +51,37 @@
 # THE ENGINE SUITE'S TEST SHARD POOLS WERE MEASURED 2026-11-09 UTC (BACKLOG #5247 items 8 and 9),
 # AND NO ROW BELOW MOVED WITH THEM. One key per (step, leg): both test shards' `Tests (pytest)` steps
 # pooled, one row per run, the worse of its success rows across the two test shard jobs and their
-# attempts. Pool: every ci.yml
-# run with event merge_group, pull_request, push or workflow_dispatch created
-# 2026-11-06T16:29:06Z..2026-11-09T00:17:02Z UTC, opening at the second after engine PR 2812 merged
-# and closing at the second before the one run still in progress when listed (no run was created on
-# 2026-11-08). Jobs fetched with ?filter=all, read 2026-11-09 about 00:40Z UTC; a row is a step that
-# concluded success, executions under 60s dropped, re-run copies with identical stamps dropped. Every
-# run in it has a `test-shard2` job. 220 runs gave an engine step.
+# attempts. Pool: every ci.yml run with event merge_group, pull_request, push or workflow_dispatch
+# created 2026-11-06T16:29:06Z..2026-11-09T00:17:02Z UTC, opening at the second after engine PR 2812
+# merged (16:29:05Z) and closing at the second before the one run still in progress when listed (no
+# run with those events was created on 2026-11-08; one schedule run was). Jobs fetched with
+# ?filter=all, read 2026-11-09 about 00:40Z UTC; a row is a step that concluded success, executions
+# under 60s dropped, re-run copies with identical stamps dropped. Every run in it has a
+# `test-shard2` job. 220 runs gave an engine step.
 #
 #   leg             n     merge_group  pull_request  push   median   p95     max     worst run      max at cap
 #   ubuntu-latest   157   36           94            27     21:56    23:32   24:21   42326526726    46:00 / 24:21 = 1.889x
 #   windows-2022    152   36           89            27     27:48    29:13   32:13   42361254132    71:00 / 32:13 = 2.204x
 #   windows-2025    148   36           85            27     27:25    29:18   31:25   42370426615    71:00 / 31:25 = 2.260x
 #
-# The worst runs are pull_request runs of 2026-11-07, each test shard 1. Evidence the pool is uncensored:
-# no execution on any leg came within 10 minutes of its cap; the longest step failures stopped at
-# 23:39 (ubuntu), 29:06 (windows-2022) and 29:35 (windows-2025), and the longest cancellations at
-# 21:59, 26:12 and 26:12. Test shard balance, test shard 1 over test shard 2 per run: median 1.04 / 1.02 / 1.01.
-# The same reading from the split's own merge (engine PR 2721, 2026-11-03T20:30:24Z) to the same close,
-# 638 runs, straddles PR 2812: maxima 24:43 / 32:13 / 31:25. It leaves out six pull_request runs of
-# 2026-11-03 and 2026-11-04 whose trees predate the split. One of them, run 41744892989 (started
-# 2026-11-04T00:15:28Z), is a whole-suite ubuntu step that concluded success at 38:00: over the
-# ubuntu row's 33:33, so that row is no longer the whole-suite maximum, though it is still above
-# every test shard step in either pool. Its margin step passed only under the pull_request floor
-# this change removes (46:00 / 38:00 = 1.211x).
+# The worst runs are pull_request runs of 2026-11-07, each test shard 1. Evidence the pool is
+# uncensored: no execution on any leg came within 10 minutes of its cap; the longest step failures
+# stopped at 23:39 (ubuntu), 29:06 (windows-2022) and 29:35 (windows-2025), and the longest
+# cancellations at 21:59, 26:12 and 26:12. Test shard balance, test shard 1 over test shard 2 per
+# run: median 1.04 / 1.02 / 1.01. The same reading from the second after the split's own merge
+# (engine PR 2721, merged 2026-11-03T20:30:23Z) to the same close, 638 runs, straddles PR 2812:
+# maxima 24:43 / 32:13 / 31:25. It leaves out six pull_request runs of 2026-11-03 and 2026-11-04
+# whose trees predate the split. One of them, run 41744892989 (created 2026-11-04T00:10:59Z; its
+# ubuntu step started 00:15:28Z), is a whole-suite ubuntu step that concluded success at 38:00:
+# over the ubuntu row's 33:33, so that row is no longer the whole-suite maximum, though it is still
+# above every test shard step in either pool. Its margin step passed only under the pull_request
+# floor this change removes (46:00 / 38:00 = 1.211x).
 #
 # WHY NO ROW MOVED. The ubuntu row would move its cap: tests/test_ci_step_margin.py holds ubuntu's
 # `step_timeout` equal to ceil_minute(1.35x its row), and 24:21 sizes 33:00, not the 46:00 in force.
 # The windows-2025 row is the one the 71:00 Windows cap is sized from (owner ruling of 2026-11-02).
-# Re-sizing a row and its cap is its own change, unfiled. What the unmoved rows do to the gate is
-# stated in docs/CI.md beside the step-margin gate.
+# Re-sizing a row and its cap is its own change, deferred to BACKLOG #5247. What the unmoved rows
+# do to the gate is stated in docs/CI.md beside the step-margin gate.
 
 # THE UBUNTU ENGINE ROW WAS RE-MEASURED 2026-10-18 UTC (BACKLOG #3456), after the gate reddened this
 # leg with every test passing on PR 2409's pull-request run 39110039682 at 29:15 and on merge-group
