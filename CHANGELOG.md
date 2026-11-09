@@ -25,7 +25,10 @@ All notable changes to MessageFoundry are documented here. The format follows
   such a connection marked possibly, and so does the posture route for a value it cannot resolve.
   `FHIR()` now leaves an `env()` `update_url_form`, `interaction` or `conditional` to the build when
   it checks the path form and the Bundle entry lists, so it no longer refuses an `env()` interaction
-  beside a literal path form or beside entry lists; it still checks the lists' literal items. See
+  beside a literal path form or beside entry lists; it still checks the lists' literal items, and
+  still refuses an `env()` interaction beside entry lists and a literal path form or conditional,
+  which no interaction builds with. A literal conditional beside a literal `transaction` or `batch`
+  interaction is now refused at load, with the build's reason, rather than only at build. See
   [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md). (`BACKLOG #2571`)
 
 ## [0.5.2] — 2026-10-20 — Early Access

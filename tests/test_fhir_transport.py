@@ -1984,6 +1984,40 @@ def test_literal_entry_items_are_checked_beside_an_env_interaction() -> None:
     FHIR(url=BASE, interaction=env("kind"), allowed_entry_methods=["POST"])
 
 
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"update_url_form": "path"},
+        {"conditional": "if-match"},
+        {"conditional": "if-none-exist", "conditional_query": "a=b"},
+    ],
+    ids=["path-form", "if-match", "if-none-exist"],
+)
+def test_entry_lists_beside_an_env_interaction_refuse_what_no_interaction_builds(
+    over: dict[str, str],
+) -> None:
+    """The entry lists need a Bundle interaction, which takes neither a conditional nor the path
+    form, so no value of the env() interaction builds beside both: refused at load. The same
+    settings without the lists are the control."""
+    with pytest.raises(ValueError, match="apply only to interaction='transaction' or 'batch'"):
+        FHIR(url=BASE, interaction=env("kind"), allowed_entry_methods=["POST"], **over)  # type: ignore[arg-type]
+    FHIR(url=BASE, interaction=env("kind"), **over)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("form", ["path", "transaction"])
+def test_a_conditional_beside_a_bundle_is_refused_at_load_with_its_own_reason(form: str) -> None:
+    """A literal conditional beside a literal Bundle interaction is refused for that cause, never
+    with the path-form text, which would tell the operator to set the if-match they already set."""
+    with pytest.raises(ValueError, match="incompatible with interaction='transaction'"):
+        FHIR(
+            url=BASE,
+            interaction="transaction",
+            conditional="if-match",
+            update_url_form=form,  # type: ignore[arg-type]
+            allowed_entry_methods=["POST"],
+        )
+
+
 def test_unknown_update_url_form_is_refused() -> None:
     with pytest.raises(ValueError, match="update_url_form must be one of"):
         _dest(interaction="update", update_url_form="query")
@@ -2028,6 +2062,29 @@ def test_check_names_an_env_path_form_connection_as_possibly(tmp_path: Any) -> N
     [r] = [r for r in run_checks(cfg, run_lint=False).results if r.name == "fhir-update-path-form"]
     assert "OB_ENV (possibly: an env() value" in r.detail
     assert "OB_CREATE" not in r.detail
+
+
+def test_the_reader_leaves_off_a_connection_whose_entry_lists_rule_the_path_form_out(
+    tmp_path: Any,
+) -> None:
+    """Set entry lists need a Bundle interaction, which the build refuses the path form on, so the
+    reader does not name such a connection even with the form and interaction unresolved, nor once
+    they resolve to the path form on an update. The same connection without the lists is the
+    control."""
+    from messagefoundry.config.wiring import load_config, path_form_fhir_updates
+
+    cfg = _write_feed(
+        tmp_path,
+        "from messagefoundry import env\n"
+        f'outbound("OB_LISTS", FHIR(url="{BASE}", interaction=env("kind"), '
+        'update_url_form=env("form"), allowed_entry_methods=["POST"]))\n'
+        f'outbound("OB_BARE", FHIR(url="{BASE}", interaction=env("kind"), '
+        'update_url_form=env("form")))\n',
+    )
+    reg = load_config(cfg)
+    assert [name for name, _ in path_form_fhir_updates(reg)] == ["OB_BARE"]
+    values = {"kind": "update", "form": "path"}
+    assert path_form_fhir_updates(reg, env_values=values) == [("OB_BARE", "")]
 
 
 def test_check_says_none_when_no_connection_takes_the_path_form(tmp_path: Any) -> None:

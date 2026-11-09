@@ -1923,17 +1923,18 @@ count is above `0` (vault BACKLOG #2613).
   `fhir-update-path-form` line in `messagefoundry check` naming every connection that sets it, and
   an `update_url_form` entry in `security_loosenings()`, which `GET /security/posture` shows with
   the same connection names (vault BACKLOG #2571). The last two apply one reader. A value of
-  `update_url_form`, `interaction` or `conditional` supplied through `env()` is read too. The
-  posture route resolves it against the engine's current environment values, and names the
-  connection plainly only if it resolves to the path form on an update. `check` resolves none, so
-  the two can name different sets. A connection with a value the reading cannot resolve is named and
-  marked possibly, except in the two cases this sentence lists. The first is a connection whose
+  `update_url_form`, `interaction`, `conditional` or a Bundle entry list supplied through `env()` is
+  read too. The posture route resolves it against the engine's current environment values, and
+  names the connection plainly only if it resolves to the path form on an update. `check` resolves
+  none, so the two can name different sets. A connection with a value the reading cannot resolve is
+  named and marked possibly. At least two kinds are left off instead. One is a connection whose
   known values rule the path form out, because the build refuses the path form there: a form other
-  than `"path"`, a `transaction` or `batch` interaction, a conditional other than `if-match`, or an
-  interaction other than `update` with no conditional. The second is a `deployed=False` connection
-  whose `update_url_form` is an `env()` value, because it is never built and that value is never
-  read. A `deployed=False` connection with a literal `"path"` is named, marked possibly where its
-  interaction or conditional is an `env()` value.
+  than `"path"`, a `transaction` or `batch` interaction, a conditional other than `if-match`, an
+  interaction other than `update` with no conditional, or Bundle entry lists that are set. The
+  other is a `deployed=False` connection whose `update_url_form` is an `env()` value, because it is
+  never built and that value is never read. A `deployed=False` connection with a literal `"path"`
+  is named, marked possibly where its interaction, conditional or an entry list is an `env()`
+  value.
 - **What it cannot do, and where it is NOT reported:** it is **advisory only**, on the precedent of
   `tls_allow_expired`, the other per-connection interoperability relaxation. No posture gate keys on it,
   and `[security].enforcement = enforce` does not refuse it. It is not in the
