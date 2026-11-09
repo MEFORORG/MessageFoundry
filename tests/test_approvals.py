@@ -1478,7 +1478,9 @@ async def test_a_failed_approved_write_still_writes_the_audit_row(
     # BACKLOG #2087 limb 4: the row's way out. The same engine process, restarted, reads the
     # approval.approved row already in the trail and settles the row to 'approved' with an
     # approval.reconciled row naming it (BACKLOG #1562), rather than 'interrupted'.
-    restarted = ApprovalGate(engine.store, ON, resolve_identity=_resolve)
+    from tests._pending_approval_store_contract import _KeyedTrail
+
+    restarted = ApprovalGate(_KeyedTrail(engine.store), ON, resolve_identity=_resolve)
     found = await restarted.reconcile_after_restart()
     assert found.settled == (approval_id,) and found.interrupted == ()
     assert await _status_of(engine, approval_id) == "approved"

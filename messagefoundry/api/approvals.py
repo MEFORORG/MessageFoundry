@@ -15,7 +15,8 @@ unknown, never retried). BACKLOG #1562; :meth:`ApprovalGate.approve` carries the
 operator later records an ``interrupted`` row's effects as applied or not applied
 (:meth:`ApprovalGate.resolve_interrupted`), which never re-runs the operation. The claim records
 which engine process owns the release, and at that process's next start
-:meth:`ApprovalGate.reconcile_after_restart` moves any row it left ``executing`` to ``interrupted``.
+:meth:`ApprovalGate.reconcile_after_restart` moves any row it left ``executing`` to the outcome the
+audit trail records for it, or to ``interrupted`` when the trail records none.
 
 A request YOUNGER than ``[approvals].min_dwell_seconds`` cannot be approved yet (ASVS 2.4.2). The expiry
 is a ceiling; this is the floor. The refusal is a 409 with a ``Retry-After`` header naming the
@@ -508,9 +509,8 @@ class ApprovalGate:
         # Read by interrupt_stranded on a release a cluster node claimed (BACKLOG #1562). With none,
         # every such release reads owner_heartbeat_unavailable and is refused.
         self._node_liveness = node_liveness
-        # The releases this gate is running, from before the claim until the outcome is written:
-        # interrupt_stranded refuses each, because this process records that outcome itself. The
-        # outcome write shows in _inflight.
+        # The releases this gate is running, from before the claim until the outcome write ends:
+        # interrupt_stranded refuses each, because this process records that outcome itself.
         self._releasing: Counter[str] = Counter()
         self._ops: dict[str, _Operation] = {}
         # Wall-clock seconds, injectable so a test can drive the expiry ceiling and the dwell floor.
@@ -546,16 +546,20 @@ class ApprovalGate:
         approval_id: str,
         *,
         orphaned: Callable[[asyncio.Future[Any], str], None] = _log_orphaned_write,
+        on_done: Callable[[], None] | None = None,
     ) -> T:
         """Await ``coro`` so that cancelling the CALLER does not cancel it (BACKLOG #1562).
 
         A cancellation delivered while this awaits reaches the caller at once, and the write finishes
         on its own. Once the caller is gone nothing would read the write's error, so ``orphaned``
         reads it when the write ends, and logs it once, with the approval id. :meth:`drain` waits
-        for a write still running at shutdown."""
+        for a write still running at shutdown. ``on_done`` runs when the write ends, however it
+        ends, even when the caller has gone."""
         task = asyncio.ensure_future(coro)
         self._inflight[task] = approval_id
         task.add_done_callback(self._forget)
+        if on_done is not None:
+            task.add_done_callback(lambda _t: on_done())
         try:
             return await _outlive_caller(task)
         except asyncio.CancelledError:
@@ -711,6 +715,8 @@ class ApprovalGate:
         interrupted: list[str] = []
         settled: list[str] = []
         unsettled: list[str] = []
+        # Read once, and only when a trail outcome is found: whether the audit chain verifies.
+        trail_ok: bool | None = None
         # Filtered in SQL, so other owners' stranded rows cannot push ours past the read's cap.
         # A row that fails its seal is reported and left as it is: the store would refuse the move
         # anyway, and nothing re-seals it (BACKLOG #2592).
@@ -724,6 +730,14 @@ class ApprovalGate:
             # then the trail knows what the status does not. Only an unknown outcome is
             # 'interrupted'; a known one is settled to what the trail says.
             known = await self._recorded_outcome(row)
+            if known is not None:
+                # list_audit checks no row MAC, so an outcome row is trusted only while the keyed
+                # chain verifies: a row written by someone without the key must not become a
+                # sealed status.
+                if trail_ok is None:
+                    trail_ok = await self._audit_chain_verifies()
+                if not trail_ok:
+                    known = None
             if known is None:
                 status, audit = "interrupted", "approval.interrupted"
                 fields = _stranded_fields(row, "engine_restart")
@@ -802,6 +816,31 @@ class ApprovalGate:
             tuple(interrupted), tuple(unsettled), tuple(foreign), tuple(settled)
         )
 
+    async def _audit_chain_verifies(self) -> bool:
+        """Whether the audit chain verifies under a key this process holds (BACKLOG #1562), the
+        condition the restart puts on trusting an outcome row. ``False`` on a break, on a keyless
+        walk (anyone who can write the log can recompute it), on a keyed chain this process cannot
+        check, and on a failed walk, each logged."""
+        try:
+            verdict = await self._store.verify_audit_chain()
+        except _READ_DEFECTS:
+            raise
+        except Exception:  # noqa: BLE001 - an unchecked trail leaves every outcome unknown
+            log.exception(
+                "approvals: the audit chain could not be verified, so no outcome row in it is "
+                "trusted and each leftover release counts as unknown"
+            )
+            return False
+        ok, message = verdict
+        if ok and not verdict.keyless_walk:
+            return True
+        log.warning(
+            "approvals: the audit chain is not verified under a held key (%s), so no outcome row "
+            "in it is trusted and each leftover release counts as unknown",
+            scrub_log_argument(str(message)) if not ok else "a keyless walk",
+        )
+        return False
+
     async def _recorded_outcome(self, row: ApprovalRow) -> tuple[str, int] | None:
         """The status the audit trail records for release ``row``, with the id of the outcome row
         that records it, or ``None`` when the outcome is unknown (BACKLOG #1562).
@@ -836,6 +875,8 @@ class ApprovalGate:
                     detail = str(entry["detail"])
                     if row.id in detail and _audited_id(detail) == row.id:
                         found.setdefault(status, int(entry["id"]))
+        except _READ_DEFECTS:
+            raise  # a defect, not an outage, as _read treats it
         except Exception:  # noqa: BLE001 - an unread trail leaves the outcome unknown, not an error
             log.exception(
                 "approval %s: the audit trail could not be read for its outcome, so it counts as "
@@ -1669,11 +1710,11 @@ class ApprovalGate:
                 claim_owner=self._owner_for_claim(),
             )
         )
-        # Live from before the claim lands, so the row never reads 'executing' here untracked; a
-        # claim that did not land is untracked again in the `finally`, an executed one in the
-        # `finally` of the run below (BACKLOG #1562).
+        # Live from before the claim lands, so the row never reads 'executing' here untracked
+        # (BACKLOG #1562). A claim that did not land is untracked in the `finally`; a write handed
+        # the release (handed_off) untracks it when that write ends, even after the caller has gone.
         self._releasing[approval_id] += 1
-        claimed = False
+        claimed = handed_off = False
         try:
             claimed = await _outlive_caller(claim)
         except RowSealError as exc:
@@ -1688,6 +1729,7 @@ class ApprovalGate:
             # approve waits for that settle before it re-raises, on purpose, like the interrupted
             # record below: the record lands before the caller answers. A second cancel stops the
             # wait, not the settle.
+            handed_off = True
             await self._shielded(
                 self._settle_cancelled_claim(
                     claim,
@@ -1698,6 +1740,7 @@ class ApprovalGate:
                     client=client,
                 ),
                 approval_id,
+                on_done=lambda: self._release_done(approval_id),
             )
             raise
         except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
@@ -1714,10 +1757,11 @@ class ApprovalGate:
                 ),
             ) from exc
         finally:
-            if not claimed:
+            if not claimed and not handed_off:
                 self._release_done(approval_id)
         if not claimed:
             raise ApprovalError(409, "request was already decided")
+        handed_off = False
         try:
             # Encodable once, here, so the audit row and the caller's answer carry one form, and
             # an unencodable result cannot turn a release that ran into a 500 (vault BACKLOG #3193).
@@ -1729,6 +1773,7 @@ class ApprovalGate:
             # (which says the operation did not happen) and never 'approved'. Nothing retries it; a
             # blind re-run of an operation that may already have run is worse than the stuck row.
             # Shielded, so a cancellation re-delivered here cannot cancel the record of the first one.
+            handed_off = True
             await self._shielded(
                 self._record_interrupted_execution(
                     approval_id,
@@ -1738,6 +1783,7 @@ class ApprovalGate:
                     client=client,
                 ),
                 approval_id,
+                on_done=lambda: self._release_done(approval_id),
             )
             raise
         except Exception as exc:
@@ -1751,6 +1797,7 @@ class ApprovalGate:
             # compensate, and the original is re-raised below. CancelledError is handled above,
             # because a cancelled approve has an unknown outcome and must not be recorded as a failure.
             # Shielded for the same reason as the interrupted record above.
+            handed_off = True
             await self._shielded(
                 self._compensate_failed_execution(
                     approval_id,
@@ -1761,6 +1808,7 @@ class ApprovalGate:
                     client=client,
                 ),
                 approval_id,
+                on_done=lambda: self._release_done(approval_id),
             )
             raise
         else:
@@ -1769,6 +1817,7 @@ class ApprovalGate:
             # skip it. Shielded (BACKLOG #1562): a cancellation that lands while the outcome is being
             # written must not leave the row in 'executing' for an operation that completed. The
             # caller still sees the cancellation; the record completes.
+            handed_off = True
             await self._shielded(
                 self._record_approved_execution(
                     approval_id,
@@ -1779,10 +1828,12 @@ class ApprovalGate:
                     client=client,
                 ),
                 approval_id,
+                on_done=lambda: self._release_done(approval_id),
             )
         finally:
-            # The outcome is written, or its write is still running in _inflight.
-            self._release_done(approval_id)
+            # An outcome write untracks the release when it ends; nothing else will.
+            if not handed_off:
+                self._release_done(approval_id)
             # After the transition, so only a release that really happened is flagged, and in a
             # `finally`, so the flag lands whether the executor succeeded, failed or was cancelled.
             # On success it now lands AFTER approval.approved (the settle is in `else`), so a
@@ -1868,12 +1919,14 @@ class ApprovalGate:
         The write is guarded on ``executing``, so it can only move the row this release claimed.
 
         **When the combined write fails**, the status is written alone, so an audit outage never
-        leaves the row ``executing``. If that status write finds the row already moved, the method
-        stops there. The combined write most likely committed. No second row is written, and
-        nothing pages. Otherwise the audit row is written alone. If that fails as well, the loss is
-        logged at ERROR with the detail and pages ``audit_write_failed``. If the status
-        write fails too, the row may still read ``executing`` until this process restarts, when
-        :meth:`reconcile_after_restart` moves it to ``interrupted`` (BACKLOG #2087 limb 4).
+        leaves the row ``executing``. If that status write finds the row already at ``status``,
+        the combined write most likely committed, so no second row is written; the possible gap is
+        logged at ERROR and paged. If it finds the row at another status, which an operator
+        interrupt from another process can leave (BACKLOG #1562), or the read fails, the audit row
+        is written alone. If that fails as well, the loss is logged at ERROR with the detail and
+        pages ``audit_write_failed``. If the status write fails too, the row may still read
+        ``executing`` until this process restarts, when :meth:`reconcile_after_restart` reconciles
+        it (BACKLOG #2087 limb 4).
 
         ``flag`` names a detail field that records whether the row moved: ``True`` when it moved
         with this row, ``False`` when another caller had already moved it, and ``None`` when the
@@ -1911,11 +1964,12 @@ class ApprovalGate:
                 action,
             )
             moved = await self._settle_status_only(approval_id, status=status, approver=approver)
-            if moved is False:
-                # Nothing else should move a row out of 'executing' while this process runs (the
-                # restart reconcile moves only claims older than this process), so the likeliest cause:
-                # the combined write COMMITTED and only its reply was lost: its row is then already
-                # in the log, and writing another would duplicate the outcome with a false flag.
+            if moved is False and await self._reads_status(approval_id, status):
+                # The row is already at this outcome, so the likeliest cause: the combined write
+                # COMMITTED and only its reply was lost: its row is then already in the log, and
+                # writing another would duplicate the outcome with a false flag. A row at any other
+                # status was moved by someone else, at least an operator interrupt from another
+                # process (BACKLOG #1562), and falls through to the audit row written alone.
                 log.error(
                     "approval %s: %s; the combined write most likely committed, so no second %s "
                     "row is written. Check the audit log for it. Its off-box copy was not written",
@@ -1947,6 +2001,18 @@ class ApprovalGate:
             context=context,
         )
 
+    async def _reads_status(self, approval_id: str, status: str) -> bool:
+        """Whether request ``approval_id`` reads ``status`` now (BACKLOG #1562). ``False`` when it
+        reads another status, is gone, fails its seal, or cannot be read, each logged: the caller
+        then writes its outcome row alone, and a duplicate outcome row is a smaller loss than none."""
+        try:
+            found = await self._store.get_pending_approval(approval_id)
+            row = None if found is None else await self._verified(found)
+        except Exception:  # noqa: BLE001 - every store backend raises its own type
+            log.exception("approval %s: reading back its status failed", approval_id)
+            return False
+        return row is not None and row.status == status
+
     async def _settle_status_only(
         self, approval_id: str, *, status: str, approver: str
     ) -> bool | None:
@@ -1966,7 +2032,7 @@ class ApprovalGate:
         except Exception:  # noqa: BLE001 - the caller's outcome stands either way
             log.exception(
                 "approval %s: writing the '%s' status alone failed too; the row may still read "
-                "'executing' until this engine restarts and marks it interrupted",
+                "'executing' until this engine restarts and reconciles it",
                 approval_id,
                 status,
             )
@@ -1997,12 +2063,13 @@ class ApprovalGate:
         except Exception:  # noqa: BLE001 - the caller's cancellation is re-raised either way
             # "Most likely": a COMMIT can land with its reply lost, and then the row and its
             # approval.release_attempted row are both in the store, with nothing run. That row
-            # reads 'executing', and reconcile_after_restart marks it interrupted (vault BACKLOG #3193).
+            # reads 'executing', and reconcile_after_restart moves it at the next start (vault
+            # BACKLOG #3193).
             log.exception(
                 "approval %s: the approve was cancelled and its claim failed, so most likely its "
                 "approval.release_attempted row was not written and nothing ran. If the COMMIT "
                 "landed anyway, the request reads 'executing' until this engine restarts and "
-                "marks it interrupted",
+                "reconciles it",
                 approval_id,
             )
             # The claim carries its audit row, so a failed claim lost that row too; page it, as
@@ -2431,8 +2498,9 @@ class ApprovalGate:
         resolver who loses a race to another moves nothing and writes no row; the row's status, and
         the winner's ``approval.resolved``, say what won.
 
-        The status write replaces ``decided_at``, so the audit row carries the cut-off time as
-        ``interrupted_at``.
+        The status write replaces ``decided_at``, so the audit row carries its earlier value as
+        ``interrupted_at``: the cut-off time for a cancel, the claim time for a restart or an
+        operator interrupt.
 
         The write runs shielded, so a cancel cannot leave it half done."""
         status = RESOLVE_OUTCOMES.get(outcome)
@@ -2677,7 +2745,7 @@ class ApprovalGate:
     ) -> OwnerLiveness:
         """What :meth:`interrupt_stranded` judges of ``row``'s owner (its docstring has the
         tiers). ``heartbeats`` caches each node's verdict across one listing."""
-        if row.id in self._releasing or row.id in self._inflight.values():
+        if row.id in self._releasing:
             return "releasing_here"
         prefix, _, node_id = (row.claim_owner or "").partition(":")
         if prefix != "node" or not node_id:

@@ -28,12 +28,13 @@ from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth import Permission, Role
 from messagefoundry.config.settings import ApprovalsSettings, EgressSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.store.store import ANY_CLAIM_OWNER, AuditAppend
+from messagefoundry.store.store import ANY_CLAIM_OWNER, AuditAppend, AuditVerdict
 from tests._bound_proof import reproving_transport
 from tests._pending_approval_store_contract import _APPROVER as APPROVER
 from tests._pending_approval_store_contract import (
     _audit_rows_for,
     _claimed_directly,
+    _KeyedTrail,
     _resolve,
     _StandingStore,
 )
@@ -69,7 +70,7 @@ def _liveness(fresh: bool | None = None, *, fails: bool = False) -> Any:
 
 def _gate(engine: Engine, *, owner: str = "engine", liveness: Any = None) -> ApprovalGate:
     return ApprovalGate(
-        _StandingStore(engine.store),
+        _KeyedTrail(engine.store),
         ON,
         resolve_identity=_resolve,
         claim_owner=owner,
@@ -234,6 +235,53 @@ async def test_an_unknown_outcome_is_still_interrupted(
     assert await _audit(engine, "approval.reconciled", approval_id) == []
 
 
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        AuditVerdict(
+            True, "clean", keyless_walk=True
+        ),  # anyone who can write the log recomputes it
+        AuditVerdict(False, "row 3: MAC mismatch"),
+        AuditVerdict(False, "keyed chain", key_unavailable=True),
+        None,  # the walk itself fails
+    ],
+)
+async def test_an_outcome_row_on_an_unverified_chain_is_not_trusted(
+    engine: Engine, verdict: AuditVerdict | None
+) -> None:
+    """An outcome row read through list_audit, whose MAC nobody checked, settles a row only while
+    the keyed chain verifies, so a row written without the key cannot become a sealed status."""
+    approval_id = await _stranded(engine, "engine")
+    await _outcome_row(engine, "approval.failed", approval_id, actor=APPROVER)
+
+    class _Chain(_StandingStore):
+        async def verify_audit_chain(self, **_kw: Any) -> Any:
+            if verdict is None:
+                raise OSError("PROBE: audit log unreachable")
+            return verdict
+
+    gate = ApprovalGate(_Chain(engine.store), ON, resolve_identity=_resolve)
+    found = await gate.reconcile_after_restart()
+    assert found.interrupted == (approval_id,) and found.settled == ()
+    assert str((await _row(engine, approval_id))["status"]) == "interrupted"
+    # Control: the same trail under a keyed verdict settles it.
+    other = await _stranded(engine, "engine")
+    await _outcome_row(engine, "approval.failed", other, actor=APPROVER)
+    assert (await _gate(engine).reconcile_after_restart()).settled == (other,)
+
+
+async def test_a_defect_in_the_trail_read_is_raised(engine: Engine) -> None:
+    await _stranded(engine, "engine")
+
+    class _Defect(_StandingStore):
+        async def list_audit(self, **_kw: Any) -> Any:
+            raise NotImplementedError("PROBE: a code defect, not an outage")
+
+    gate = ApprovalGate(_Defect(engine.store), ON, resolve_identity=_resolve)
+    with pytest.raises(NotImplementedError):
+        await gate.reconcile_after_restart()
+
+
 async def test_another_requests_outcome_row_is_not_read_as_this_ones(engine: Engine) -> None:
     approval_id = await _stranded(engine, "engine")
     await _outcome_row(engine, "approval.approved", "some-other-request", actor=APPROVER)
@@ -366,15 +414,152 @@ async def test_a_release_running_in_this_process_is_refused(engine: Engine) -> N
 
 
 async def test_a_lost_claim_does_not_untrack_the_release_that_won(engine: Engine) -> None:
-    gate = _gate(engine)
-    approval_id, winner, leave = await _running_release(gate)
+    """A second approve that reads the row as pending, then loses the claim to the running one,
+    leaves that one tracked."""
+
+    class _StaleRead(_KeyedTrail):
+        stale: Any = None
+
+        async def get_pending_approval(self, approval_id: str) -> Any:
+            if self.stale is not None:
+                return self.stale
+            return await self._store.get_pending_approval(approval_id)
+
+    store = _StaleRead(engine.store)
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve, claim_owner="engine")
+    entered, leave = asyncio.Event(), asyncio.Event()
+
+    async def _blocks(_p: Mapping[str, Any]) -> dict[str, Any]:
+        entered.set()
+        await leave.wait()
+        return {"ran": True}
+
+    gate.register("dead_letter_replay", "op", _blocks, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    store.stale = await engine.store.get_pending_approval(approval_id)  # read while pending
+    winner = asyncio.create_task(
+        gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    )
+    await entered.wait()
     try:
-        with pytest.raises(ApprovalError):
+        with pytest.raises(ApprovalError) as lost:
             await gate.approve(approval_id, approver="other", approver_user_id="other-id")
+        assert lost.value.detail == "request was already decided", "it reached the claim"
         assert gate._releasing[approval_id] == 1
     finally:
+        store.stale = None
         leave.set()
         await winner
+    assert approval_id not in gate._releasing
+
+
+async def test_a_release_stays_tracked_until_its_outcome_write_ends(engine: Engine) -> None:
+    """A cancelled approve leaves its outcome write running, and the release counts as running
+    here until that write ends; an interrupt's own write never does."""
+    entered, leave, write_held, write_go = (asyncio.Event() for _ in range(4))
+
+    class _SlowOutcome(_KeyedTrail):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            if kw.get("status") == "approved":
+                write_held.set()
+                await write_go.wait()
+            return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+    gate = ApprovalGate(_SlowOutcome(engine.store), ON, resolve_identity=_resolve)
+
+    async def _blocks(_p: Mapping[str, Any]) -> dict[str, Any]:
+        entered.set()
+        await leave.wait()
+        return {"ran": True}
+
+    gate.register("dead_letter_replay", "op", _blocks, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    release = asyncio.create_task(
+        gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    )
+    await entered.wait()
+    leave.set()
+    await write_held.wait()
+    release.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await release
+    assert approval_id in gate._releasing, "the outcome write is still running"
+    with pytest.raises(ApprovalError) as refused:
+        await gate.interrupt_stranded(approval_id, actor="operator", attest_owner_stopped=True)
+    assert refused.value.status == 409
+    write_go.set()
+    await gate.drain()
+    assert approval_id not in gate._releasing
+    assert str((await _row(engine, approval_id))["status"]) == "approved"
+
+
+async def test_an_interrupt_in_flight_does_not_read_as_a_release(engine: Engine) -> None:
+    held, go = asyncio.Event(), asyncio.Event()
+
+    class _SlowMove(_KeyedTrail):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            if kw.get("status") == "interrupted":
+                held.set()
+                await go.wait()
+            return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+    approval_id = await _stranded(engine, "shard:b")
+    gate = ApprovalGate(_SlowMove(engine.store), ON, resolve_identity=_resolve)
+    first = asyncio.create_task(
+        gate.interrupt_stranded(approval_id, actor="operator", attest_owner_stopped=True)
+    )
+    await held.wait()
+    try:
+        [listed] = [r for r in await gate.list_executing() if r["id"] == approval_id]
+        assert listed["liveness"] == "attestation_required"
+    finally:
+        go.set()
+        await first
+
+
+async def test_an_outcome_whose_row_was_interrupted_elsewhere_is_still_written(
+    engine: Engine,
+) -> None:
+    """The combined outcome write fails, and the status alone finds the row moved by an operator
+    interrupt from another process: the outcome row is then written alone, not skipped."""
+    entered, leave = asyncio.Event(), asyncio.Event()
+
+    class _InterruptedMeanwhile(_KeyedTrail):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            if kw.get("status") == "approved" and kw.get("audit") is not None:
+                raise OSError("PROBE: combined write failed")
+            return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+    gate = ApprovalGate(_InterruptedMeanwhile(engine.store), ON, resolve_identity=_resolve)
+
+    async def _blocks(_p: Mapping[str, Any]) -> dict[str, Any]:
+        entered.set()
+        await leave.wait()
+        return {"ran": True}
+
+    gate.register("dead_letter_replay", "op", _blocks, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    release = asyncio.create_task(
+        gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    )
+    await entered.wait()
+    # Another process's operator interrupts it.
+    elsewhere = _gate(engine, owner="shard:other")
+    await elsewhere.interrupt_stranded(approval_id, actor="operator", attest_owner_stopped=True)
+    leave.set()
+    await release
+    assert str((await _row(engine, approval_id))["status"]) == "interrupted"
+    [approved] = await _audit(engine, "approval.approved", approval_id)
+    assert str(approved["actor"]) == "checker"
 
 
 async def test_an_interrupt_of_a_row_not_executing_answers_409(engine: Engine) -> None:

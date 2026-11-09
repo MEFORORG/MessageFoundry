@@ -535,7 +535,8 @@ ReleaseBlocked = Literal[
 class PendingApprovalInfo(BaseModel):
     """One open request in the approver's queue: ``pending`` (awaiting a second approver, unexpired)
     or ``interrupted`` (released, cut off mid-run, awaiting a resolve; BACKLOG #1562). For an
-    interrupted row, ``approver`` released it and ``decided_at`` is when it was cut off.
+    interrupted row, ``approver`` released it, and ``decided_at`` is when it was cut off by a
+    cancel, or its claim time when a restart or an operator interrupt moved it.
 
     ``params`` are the parameters the hold captured, which a release re-runs (BACKLOG #2458), so an
     approver sees what it releases. They are operation metadata, never a message body; ``None``

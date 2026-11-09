@@ -134,7 +134,7 @@ Four more facts:
 ## Enforcement model
 
 Authentication is **required** for the running service. The engine `serve` command always attaches an
-auth layer, and no setting turns it off (vault BACKLOG #2719). Of the **119** engine route objects, **100 demand a
+auth layer, and no setting turns it off (vault BACKLOG #2719). Of the **121** engine route objects, **102 demand a
 specific permission** and 19 do not — 3 are deliberately unauthenticated (`GET /auth/providers`, an
 unbounded capability advertisement that carries no account state and charges **no** limiter;
 `POST /auth/login` and `POST /auth/negotiate`, bounded by the per-IP **and** global login sliding
@@ -1770,7 +1770,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/logs/tail` | `logs:view` | `require_phi_read` | best-effort-redacted; writes a `logs_view` audit row |
 | `POST` | `/ai/chat` | `ai:assist` | `require` | **not** paced; bounded by the central AI policy |
 
-**PHI-egress route set.** Of the 119 route objects a default `create_app()` serves, **at least twenty-one**
+**PHI-egress route set.** Of the 121 route objects a default `create_app()` serves, **at least twenty-one**
 can put PHI on the wire: the thirteen message/search rows above marked PHI (`/messages`, `/messages/{id}`,
 `/messages/{id}/raw`, `/responses`, `/outbound`, `/attachments/{id}`, `/messages/search`, `/messages/export`,
 `/search/layered`, the three `/search/presets` rows, `/dead-letters`), plus
@@ -2963,11 +2963,12 @@ trail sometimes can, and the restart reads it.
 The claim records which engine process owns the release, in the row's `claim_owner` column. At its
 next start, before the API serves an approval, that process settles each `executing` row it owns.
 It first reads the trail for the row's outcome row, written by the releasing approver. Where it
-finds exactly one `approval.approved` or `approval.failed`, and no `approval.interrupted`, it moves
-the row to that status, `approved` or `failed`, with an `approval.reconciled` row naming the
-outcome row it read. Every other row moves to `interrupted`, with an `approval.interrupted` row:
-no outcome row, an `approval.interrupted` one, two that disagree, or a trail it cannot read in
-full. Each row is in the same write as its move, written against `system`, and carries `reason`
+finds exactly one `approval.approved` or `approval.failed`, and no `approval.interrupted`, and the
+audit chain verifies under a key the engine holds, it moves the row to that status, `approved` or
+`failed`, with an `approval.reconciled` row naming the outcome row it read. Every other row moves
+to `interrupted`, with an `approval.interrupted` row: no outcome row, an `approval.interrupted`
+one, two that disagree, a trail it cannot read in full, or a chain that does not verify that way,
+a keyless walk included. Each row is in the same write as its move, written against `system`, and carries `reason`
 `engine_restart`, the claim owner and the claim time. The move keeps the row's `decided_at` as the
 claim time, so an `interrupted` row a restart settled shows when it was claimed, not when the
 engine restarted. Nothing re-runs. The operator checks the effects of an `interrupted` row and
@@ -3009,7 +3010,7 @@ a slow one. An operator settles it instead, through two routes (owner-delegated 
 A cluster node whose `[cluster].node_id` is not pinned comes back under a new id, so its old claims
 read as a lapsed heartbeat here and can be interrupted without an attestation. The heartbeat is the
 `fresh` reading `/cluster/nodes` shows. A fresh heartbeat on this process's own node id refuses too,
-even for a row this process is not running; its next start settles that row.
+even for a row this process is not running.
 
 The move is guarded on `executing` and on the claim owner it judged, so a row that moved or changed
 owner since answers **409** and moves nothing. Its `approval.interrupted` row is in the same write,
