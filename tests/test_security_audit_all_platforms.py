@@ -491,7 +491,9 @@ def test_a_copy_pip_audit_would_read_by_its_own_locale_is_refused(
     """A lone CR keeps the declaration on pip's second byte-line, but the copy's newline puts it on
     the third, where pip-audit does not look, so pip-audit decodes the copy by its own locale. That
     is a child process whose UTF-8 mode need not be the auditor's: an auditor started with -X utf8
-    read U+2028 back and passed, while a cp1252 pip-audit kept evil inside the comment."""
+    read U+2028 back and passed, while a cp1252 pip-audit kept evil inside the comment. The patch
+    stands in for that auditor; the reader no longer consults the locale, so it changes nothing
+    now, and without it the earlier reader refused this lock only where the locale was not UTF-8."""
     monkeypatch.setattr("locale.getpreferredencoding", lambda do_setlocale=True: "utf-8")
     src = tmp_path / "x.lock"
     src.write_bytes(

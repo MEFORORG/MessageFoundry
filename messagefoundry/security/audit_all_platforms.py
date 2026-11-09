@@ -527,11 +527,12 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
                 file=sys.stderr,
             )
             return 2
-        # The count above is of `audited`, so pip-audit must read exactly that back. A codec whose
+        # The count above is of `audited`, so pip-audit must decode exactly that. A codec whose
         # encode does not round-trip (unicode_escape escapes every newline, raw_unicode_escape a
         # line separator after a backslash) folds pins into a comment, and pip-audit audits fewer
-        # than were counted. Comparing the whole text holds for every codec, with no list of them.
-        # The line names neither the codec, which is the lock's own text of any length, nor the
+        # than were counted. Comparing the whole text rules that out for every codec, with no list
+        # of them. It proves only that both read the same text: that the count reads that text's
+        # lines as pip-audit does is _kinds's job, not this check's. The line names neither the codec, which is the lock's own text of any length, nor the
         # error, which quotes what it failed on.
         try:
             faithful = _read_as_pip_audit(copy.read_bytes()) == audited
