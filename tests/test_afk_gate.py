@@ -279,8 +279,8 @@ def test_a_rate_of_zero_or_below_counts_as_no_rate(sb: Sandbox, rate: float) -> 
 
 
 def test_the_rate_governs_over_a_high_level(sb: Sandbox) -> None:
-    """korus roles/retired/STEWARD.md 9.6a: a window that resets before it runs out does not stop
-    new work."""
+    """korus roles/COMMON.md, The three usage states (record: roles/retired/STEWARD.md 9.6a): a
+    window that resets before it runs out does not stop new work."""
     seed_vault(sb, calibrated("manager"))
     write_fake_usage(
         _usage_path(sb),

@@ -841,10 +841,11 @@ function Get-DecisionCostRung {
       It reads usage.ps1 -Json, the one reader of the statusLine's published files, in a child pwsh:
       usage.ps1 runs without strict mode, and an in-process call would inherit the caller's.
       THE WEEKLY WINDOW, the only one (owner ruling 2026-10-31; Get-DecisionRungLevels holds the
-      numbers). RATE GOVERNS (korus roles/retired/STEWARD.md 9.6a, owner-ratified 2026-08-14): with
-      a burn rate, the rung is hit when the window is projected to run out within HoldMin minutes and
-      before it resets, whatever the level. Only with no rate is the level the backstop. A rate of zero or below counts
-      as no rate, because usage inside one reset period does not fall, and such a rate must not lift
+      numbers). RATE GOVERNS (korus roles/COMMON.md, The three usage states; the record is
+      roles/retired/STEWARD.md 9.6a, owner-ratified 2026-08-14): with a burn rate, the rung is hit
+      when the window is projected to run out within HoldMin minutes and before it resets, whatever
+      the level. Only with no rate is the level the backstop. A rate of zero or below counts as no
+      rate, because usage inside one reset period does not fall, and such a rate must not lift
       the backstop. In the Steward's watch.py the rate helper likewise returns nothing unless the rate
       is positive. Its _burn projects again since the owner lifted its suppression on 2026-11-02, from
       its own reads over its own window, and a pool it measures flat counts as room there. This gate
