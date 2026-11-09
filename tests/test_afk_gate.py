@@ -277,6 +277,23 @@ def test_an_alias_shares_its_seats_calibration(sb: Sandbox) -> None:
         "messagefoundry/api/phi_gate.py",
         "messagefoundry/secretscrub.py",
         "security/locks/x.lock",
+        "scripts",
+        "docs",
+        "tests/test_claim_check.py",
+        "tests/test_push_guard.py",
+        "messagefoundry/redaction.py",
+        "messagefoundry/credential.py",
+        "messagefoundry_webconsole/_auth.py",
+        "messagefoundry/config/ai_policy.py",
+        "LICENSE",
+        "CLA.md",
+        ".gitignore",
+        ".worktreeinclude",
+        "scripts/release/tag.ps1",
+        "CLAUDE.local.md",
+        "docs/ARCHITECTURE.md",
+        ":/scripts/hooks/x.py",
+        "CLAUDE.md::$DATA",
     ],
 )
 def test_a_class_c_or_unclassifiable_path_reviews(sb: Sandbox, path: str) -> None:
@@ -337,6 +354,33 @@ def test_a_signal_logged_after_a_reversal_does_not_hide_it(sb: Sandbox) -> None:
     seed_vault(sb, [theirs, undone, _signal(theirs, "red-after-merge")])
     code, doc = gate(sb)
     assert code == REVIEW and f"decision {theirs['id']} on item 4242 was reversed" in why(doc)
+
+
+def test_a_directory_in_the_checkout_reviews(sb: Sandbox) -> None:
+    """A directory may hold any file, so it is not one path, whatever the list says."""
+    (sb.repo / "plain" / "sub").mkdir(parents=True)
+    seed_vault(sb, calibrated("manager"))
+    code, doc = gate_touching(sb, ("-Touches", "plain/sub"))
+    assert code == REVIEW and "is a directory in this checkout" in why(doc), why(doc)
+
+
+def test_a_reversal_logged_with_a_hash_item_closes_the_item(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    theirs = rec(at=ago(days=6), seat="builder", item="#4242")
+    seed_vault(sb, [theirs, reversal(theirs, ago(days=5))])
+    code, doc = gate(sb)
+    assert code == REVIEW and "on item 4242 was reversed" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize("near", ["hold", "Lander-hold", "red", "red after merge", "reverted"])
+def test_a_near_miss_signal_spelling_is_refused_at_write(sb: Sandbox, near: str) -> None:
+    """It would be the decision's latest outcome and hide a reversal, so it is never written."""
+    ref = rec()["id"]
+    proc = sb.run(
+        DECISION, "-Log", "-Kind", "outcome", "-Seat", "lander", "-Ref", ref, "-Outcome", near
+    )
+    assert proc.returncode == 2 and "reads like a calibration signal" in proc.stderr
+    assert sb.spool() == []
 
 
 def test_a_signal_is_read_whatever_its_case(sb: Sandbox) -> None:

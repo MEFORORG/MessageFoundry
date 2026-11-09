@@ -694,7 +694,7 @@ function Get-DecisionCalibration {
     elseif ($n -lt 60) { $blindOk = $true; "optional, $n/60 samples" }
     else { $blindOk = $true; 'calibrated' }
     $recent = @($Decisions | Where-Object { [string]$_.gate -ne 'HALT' -and $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) })
-    $revd = @($recent | Where-Object { (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed' }).Count
+    $revd = @($recent | Where-Object { (Get-DecisionOutcome $_ $Outcomes).Trim() -eq 'reversed' }).Count
     $red = @($recent | Where-Object { $Signals.ContainsKey([string]$_.id) -and $Signals[[string]$_.id].Contains('red-after-merge') }).Count
     $held = @($recent | Where-Object { $Signals.ContainsKey([string]$_.id) -and $Signals[[string]$_.id].Contains('held') }).Count
     $of = $recent.Count
@@ -709,49 +709,61 @@ function Get-DecisionCalibration {
 function Get-DecisionClassCPath([string]$Path) {
     <#
       Why a path the act touches keeps it off the T1 fast path, or '' when this list does not name
-      it. It names at least these: the rule files plan R3 lists, the coordination, hook and gate
-      scripts and their tests, the security, PHI, de-identification and API code, the scan and lint
-      configuration, the ADRs (T4 reads their direction), and dependency manifests and locks. It is
-      a denylist and does not name every security path, so a path it does not name is not thereby
-      safe: the session still judges that the act is not a security control.
+      it. It names at least these: the rule and instruction files plan R3 lists, the coordination,
+      hook, gate, release and dev-setup scripts and the tests that pin them, any file whose name
+      reads as security, PHI, credential, TLS or policy code, the API code, the scan and lint
+      configuration, the ADRs (T4 reads their direction), the legal files, the ignore and worktree
+      copy lists, and dependency manifests and locks. It is THE ENGINE'S list: a path in the vault
+      or korus is not classified by it. It is a denylist and does not name every security path, so
+      a path it does not name is not thereby safe: the session still judges that the act is not a
+      security control.
 
       IT FAILS CLOSED on a path it cannot classify: empty, absolute, climbing out with `..`, the
-      tree itself (`.`), or carrying a glob, a list separator or whitespace. A directory matches
-      with or without its trailing slash, a doubled slash or a `.` segment is folded away, and a
-      trailing dot is dropped as Windows drops it.
+      tree itself (`.`), a directory that holds a listed path, or one carrying a glob, a list
+      separator, whitespace, a colon or a dollar sign (a git pathspec or an NTFS stream). A
+      doubled slash or a `.` segment is folded away, and a trailing dot is dropped as Windows drops
+      it. decision.ps1 -Gate also refuses a path that is a directory in the checkout.
     #>
     $p = ([string]$Path).Trim() -replace '\\', '/'
     if (-not $p) { return 'an empty path cannot be classified' }
-    if ($p -match '[\s,;*?\[\]{}|<>"]') { return "'$Path' carries a glob, a list separator or whitespace, so it cannot be classified; name each path on its own line" }
-    if ($p -match '^(/|~|[A-Za-z]:)') { return "'$Path' is not a path relative to the repository, so it cannot be classified" }
+    if ($p -match '[\s,;:$*?\[\]{}|<>"]') { return "'$Path' carries a glob, a list separator, whitespace, a colon or a dollar sign, so it cannot be classified; name each path on its own line" }
+    if ($p -match '^(/|~)') { return "'$Path' is not a path relative to the repository, so it cannot be classified" }
     $segs = @($p -split '/' | Where-Object { $_ -and $_ -ne '.' } | ForEach-Object { $_.TrimEnd('.') })
     if ($segs -contains '' -or $segs -contains '..') { return "'$Path' climbs out with '..' or names a dot-only segment, so it cannot be classified" }
     if (-not $segs.Count) { return "'$Path' names the whole tree, so it cannot be classified" }
     $l = ($segs -join '/').ToLowerInvariant()
     $leaf = $segs[-1].ToLowerInvariant()
-    if ($leaf -in @('claude.md', 'agents.md')) { return "'$Path' is a CLAUDE.md or AGENTS.md, a rule file (Class C)" }
+    if ($leaf -in @('claude.md', 'claude.local.md', 'agents.md', 'agents.override.md')) { return "'$Path' is an agent instruction file, a rule file (Class C)" }
     if ($leaf -like '.env*') { return "'$Path' is an environment file, which holds secrets (Class C)" }
     if ($leaf -in @('pyproject.toml', 'package.json', 'package-lock.json') -or $leaf -like '*.lock') {
         return "'$Path' is a dependency manifest or lock (Class C)"
     }
+    if ($leaf -match '^(license|notice|cla|governance|commercial-license)(\..*)?$' -or $leaf -in @('.gitignore', '.gitattributes', '.worktreeinclude')) {
+        return "'$Path' is a legal file or decides what git ignores or copies (Class C)"
+    }
+    $words = 'redact|secret|credential|tls|auth|keywrap|pki|dpapi|crypt|cert|password|mfa|webauthn|token|security|policy|phi|guard|gate|smart'
+    if ($leaf -match "($words)") { return "'$Path' is named as security, PHI, credential or policy code (Class C on the fast path)" }
     $dirs = @(
         '.agents', '.claude', '.codex', '.github', '.mefor-hooks', '.semgrep', 'docker/locks', 'docs/adr', 'docs/roles',
         'docs/security', 'messagefoundry/api', 'messagefoundry/auth', 'messagefoundry/security', 'messagefoundry/support',
-        'messagefoundry_toolkit/anon', 'roles', 'scripts/asvs', 'scripts/ci', 'scripts/coord', 'scripts/hooks', 'scripts/quality',
-        'scripts/security', 'scripts/worktree', 'security', 'skills', 'tee/anon'
+        'messagefoundry_toolkit/anon', 'roles', 'scripts/asvs', 'scripts/ci', 'scripts/coord', 'scripts/dev', 'scripts/hooks',
+        'scripts/quality', 'scripts/release', 'scripts/security', 'scripts/worktree', 'security', 'skills', 'tee/anon'
+    )
+    $files = @(
+        '.gitleaks.toml', '.pre-commit-config.yaml', 'docs/ai.md', 'docs/architecture.md', 'docs/autonomy-plan.md',
+        'docs/code_quality_standards.md', 'docs/ledger-gate.md', 'docs/method.md', 'docs/phi.md', 'docs/review-standards.md',
+        'docs/secure_ai_development_standards.md', 'docs/secure_development_standards.md', 'docs/security.md', 'docs/worktrees.md'
     )
     foreach ($d in $dirs) {
         if ($l -eq $d -or $l.StartsWith("$d/")) { return "'$Path' is under $d/, a rule, gate or security path (Class C)" }
     }
-    $files = @(
-        '.gitleaks.toml', '.pre-commit-config.yaml', 'docs/autonomy-plan.md', 'docs/ledger-gate.md', 'docs/method.md', 'docs/phi.md',
-        'docs/review-standards.md', 'docs/secure_ai_development_standards.md', 'docs/secure_development_standards.md',
-        'docs/security.md', 'docs/worktrees.md', 'messagefoundry/secretscrub.py'
-    )
-    if ($files -contains $l) { return "'$Path' is a rule, scan or security file (Class C)" }
-    if ($l -like 'tests/test_afk_*' -or $l -like 'tests/test_coord_*' -or $l -like 'tests/test_worktree_*' -or $l -like 'tests/test_role_cards*') {
-        return "'$Path' is a test that pins a gate or a rule (Class C)"
+    if ($files -contains $l) { return "'$Path' is a rule, scan or policy file (Class C)" }
+    # A directory that holds a listed path cannot be classified: the act may touch anything in it.
+    foreach ($x in @($dirs) + @($files)) {
+        if ($x.StartsWith("$l/")) { return "'$Path' holds $x, so as a directory it cannot be classified; name the files" }
     }
+    $pins = 'afk|coord|worktree|role_cards|claim|push|required_contexts|dependency_boundaries|collision|glyph|ledger|installed|operator_docs|hook|seat|mail|lane|alloc'
+    if ($l -match "^tests/test_($pins)") { return "'$Path' is a test that pins a gate or a rule (Class C)" }
     return ''
 }
 
@@ -769,9 +781,9 @@ function Get-DecisionReversals($Records) {
     $latest = Get-DecisionLatest $Records 'outcome'
     $seen = [System.Collections.Generic.HashSet[string]]::new()
     $out = [System.Collections.Generic.List[object]]::new()
-    foreach ($o in @($Records | Where-Object { $_.kind -eq 'outcome' -and [string]$_.outcome -eq 'reversed' -and $_.ref } | Sort-Object { [string]$_.id })) {
+    foreach ($o in @($Records | Where-Object { $_.kind -eq 'outcome' -and ([string]$_.outcome).Trim() -eq 'reversed' -and $_.ref } | Sort-Object { [string]$_.id })) {
         $ref = [string]$o.ref
-        if ([string]$latest[$ref].outcome -ne 'reversed') { continue }
+        if (([string]$latest[$ref].outcome).Trim() -ne 'reversed') { continue }
         if (-not $seen.Add($ref)) { continue }
         $d = if ($byId.ContainsKey($ref)) { $byId[$ref] } else { $null }
         $out.Add([pscustomobject]@{

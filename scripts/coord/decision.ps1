@@ -99,13 +99,13 @@
 .EXAMPLE
     decision.ps1 -Log -Item 3905 -Class B -Recommendation 'split the fix into two PRs' `
       -Alternative 'one PR' -Predicate 'live-state=gh pr view 2460 read 17:02Z' `
-      -Undo 'close the second PR' -Confidence 80
+      -Undo 'close the second PR' -Confidence 80 -Touches "messagefoundry/parsing/peek.py`ntests/test_peek.py"
 
 .EXAMPLE
     decision.ps1 -List -Day 2026-10-21 -Seat manager
 
 .EXAMPLE
-    decision.ps1 -Gate -Item 3905 -BuildsOn d20261026T101500123-a1b2c3
+    decision.ps1 -Gate -Item 3905 -Touches messagefoundry/parsing/peek.py -BuildsOn d20261026T101500123-a1b2c3
 #>
 param(
     [switch]$Log,
@@ -370,13 +370,22 @@ function Invoke-DecisionGate {
             return (New-GateAnswer 'REVIEW' $why)
         }
         $classC = @($Touches | ForEach-Object { Get-DecisionClassCPath $_ } | Where-Object { $_ })
+        # A directory in this checkout may hold any file, so it is not classified as one path.
+        $top = & git -C (Get-Location).Path rev-parse --show-toplevel 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $top) {
+            $classC += 'the checkout could not be found, so no path can be shown not to be a directory'
+        } else {
+            foreach ($t in $Touches) {
+                if ([System.IO.Directory]::Exists((Join-Path ([string]$top).Trim() $t))) { $classC += "'$t' is a directory in this checkout, so it cannot be classified; name the files" }
+            }
+        }
         if ($classC.Count) {
             foreach ($c in $classC) { $why.Add("touches: $c, so the T1 fast path does not apply") }
             return (New-GateAnswer 'REVIEW' $why)
         }
         $canon = Get-DecisionSeatKey $Seat
         if (-not $canon) {
-            $why.Add("seat: '$Seat' is not a live seat or alias in docs/roles/seats.json, so it cannot be held to a seat's calibration and budget")
+            $why.Add("seat: '$Seat' is not a live seat or alias in docs/roles/seats.json, or that roster could not be read, so it cannot be held to a seat's calibration and budget")
             return (New-GateAnswer 'REVIEW' $why)
         }
         $kill = Get-DecisionKillSwitch
@@ -413,8 +422,10 @@ function Invoke-DecisionGate {
             $why.Add("calibration: $Seat's Class B is not calibrated (blind sample $($cal.Blind); over 14 days, reversal rate $($cal.RateText), red after merge $($cal.RedText), Lander holds $($cal.HeldText))")
             $closed = $true
         }
+        # Items compare without case, surrounding space or a leading '#', so '#3905' is 3905.
+        $itemKey = $Item.Trim().TrimStart('#').ToLowerInvariant()
         foreach ($r in $reversals) {
-            if ([string]$r.Item -eq $Item) {
+            if (([string]$r.Item).Trim().TrimStart('#').ToLowerInvariant() -eq $itemKey) {
                 $why.Add("item: decision $($r.Ref) on item $Item was reversed")
                 $closed = $true
             } elseif (-not $r.Item) {
@@ -524,6 +535,12 @@ if ($missing) {
 }
 if ($Ref -and -not (Get-DecisionIdDay $Ref)) {
     [Console]::Error.WriteLine("decision.ps1: -Ref '$Ref' is not a decision id. Nothing was written.")
+    exit 2
+}
+$normOutcome = $Outcome.Trim().ToLowerInvariant()
+if ($Kind -eq 'outcome' -and $normOutcome -ne 'reversed' -and -not (Test-DecisionSignalOutcome $normOutcome) -and
+    $normOutcome -match '^(lander[-_ ]?)?hold(s|ing)?$|^held.|^red($|[-_ ])|^revers|^revert') {
+    [Console]::Error.WriteLine("decision.ps1: -Outcome '$Outcome' reads like a calibration signal but is not one: use reversed, red-after-merge or held. A near miss would be the decision's latest outcome and hide a reversal. Nothing was written.")
     exit 2
 }
 if ($Reviewed -eq 'yes' -and -not $ReviewedBy) {

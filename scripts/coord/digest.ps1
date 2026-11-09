@@ -211,7 +211,7 @@ foreach ($r in $todayDecisions) {
         continue
     }
     $rev = if ($r.reviewed -eq 'yes') { "reviewed by $($r.reviewedBy)" } else { 'not reviewed' }
-    $md.Add("- ``$($r.id)`` class $($r.class), $($r.seat), item $($r.item): $(Get-Short ([string]$r.recommendation)); $rev; outcome $(Get-Outcome $r)")
+    $md.Add("- ``$($r.id)`` class $($r.class), $($r.seat), item $($r.item): $(Get-Short ([string]$r.recommendation)); $rev; outcome $(Get-Outcome $r)$(if ($signals.ContainsKey([string]$r.id)) { "; signals " + ($signals[[string]$r.id] -join ", ") })")
 }
 $md.Add('')
 
