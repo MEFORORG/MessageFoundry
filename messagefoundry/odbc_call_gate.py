@@ -81,6 +81,59 @@ def drop_handle(conn: Any) -> Any:
     return raw
 
 
+class _Call:
+    """One call :meth:`CallGate.submit` handed to aioodbc: the future its caller awaits, once
+    ``submit`` has it. The worker thread reads that future's state; it never changes it."""
+
+    __slots__ = ("fut",)
+
+    def __init__(self) -> None:
+        self.fut: Any = None
+
+    def cancelled(self) -> bool:
+        """Whether the caller's future was cancelled. A plain read of the future's state, which
+        the loop sets in ``Future.cancel()`` itself, so it holds from the moment the awaiting task
+        is cancelled, before any callback runs. ``None`` until ``submit`` has the future: nothing
+        can have cancelled a future its caller does not hold yet."""
+        fut = self.fut
+        cancelled = getattr(fut, "cancelled", None)
+        return callable(cancelled) and cancelled() is True
+
+
+#: The pyodbc calls that can return a NEW cursor: ``Connection.cursor``, ``Connection.execute``.
+#: ``Cursor.execute`` shares the second name and returns its own cursor, which is told apart below.
+_CURSOR_MAKERS = frozenset({"cursor", "execute"})
+
+
+def _close_orphaned_cursor(func: Callable[..., Any], result: Any) -> None:
+    """Under the gate's lock, as a cancelled call returns: close the cursor it made, if it made one.
+
+    Its awaiting future was cancelled, so the result reaches nobody, and aioodbc never wraps it.
+    Left alone, the collector would free it from wherever the interpreter happens to be, possibly
+    after its connection closed: the native-abort shape ``tests/_live_scratch.py`` records. The
+    result is the key, not the call's name: of what pyodbc returns, only a cursor has ``close``, and
+    a NEW one is any but the call's own (``Cursor.execute`` returns its cursor, which is its owner's
+    to close). Only the two calls that make one are read, so a call reached through a wrapper with
+    no ``__self__`` never closes a cursor its owner still holds. Never raises."""
+    if getattr(func, "__name__", None) not in _CURSOR_MAKERS:
+        return
+    if result is None or result is getattr(func, "__self__", None):
+        return
+    close = getattr(result, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:  # noqa: BLE001 - never replace the cancelled call's outcome
+        log.debug("odbc: closing a cancelled call's new cursor failed", exc_info=True)
+
+
+def _skippable(func: Callable[..., Any]) -> bool:
+    """Whether an abandoned call that never entered the gate may be skipped: any but a close
+    (``Connection.close``, ``Cursor.close``), which frees a handle and must still run in the gate."""
+    return getattr(func, "__name__", None) != "close"
+
+
 class CallGate:
     """Runs one connection's pyodbc calls one at a time, and frees its handles only between calls.
 
@@ -97,6 +150,21 @@ class CallGate:
     On the normal path each call waits for the previous one anyway, so the lock is never contended.
     A quarantine that arrives while a call runs is handed to that call, which closes the connection
     on its own thread as it returns: no extra thread waits, and the event loop never does.
+
+    **A call aioodbc submits is tracked from its submission, not from when it starts** (BACKLOG
+    #2394). A cancellation can land after aioodbc handed a call to its executor and before that
+    call took the lock: queued for a worker, picked up, or waiting behind another call. That call
+    was not running, so a cleanup's close was not handed to it, and the two raced for the lock: the
+    close could win, and the call then ran on the handle it had freed, or on a connection already
+    lent to its next borrower. Now a call whose awaiting future was cancelled before it entered
+    never runs, as an executor already skips one it cancels before a worker takes it: nothing
+    awaits its result. The worker reads the future's own state, which ``Future.cancel()`` sets at
+    once, and reads it under ``_state``, where a cleanup reads whether a call is running, so the
+    two always agree (:class:`_Call`). A ``close`` is the exception: it still runs, inside the gate,
+    because skipping it would leave its handle for aioodbc's ``__del__`` or the collector, outside
+    the gate; a close of a handle a cleanup already closed only fails, and nobody awaits that. One
+    that had entered runs to its end, and a cursor it makes is closed as it returns, since nobody
+    else ever holds it.
     """
 
     __slots__ = ("_abandoned", "_after", "_deferred", "_lock", "_running", "_state")
@@ -113,18 +181,51 @@ class CallGate:
         self._abandoned: list[Any] = []
 
     def run(self, func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        """Run ``func`` inside the gate, on the calling thread. Never skipped: the engine's own
+        jobs (a hand-off's close, a settled cursor close) call this, and nothing cancels them."""
+        return self._run(None, func, *args, **kwargs)
+
+    def submit(
+        self, execute: Callable[..., Any], func: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> Any:
+        """aioodbc's ``Connection._execute``, through the gate: ``execute`` is the connection's own
+        bound ``_execute``, which hands the call to its executor. :func:`install_call_gate` installs
+        this in its place.
+
+        The call counts as abandoned once the future ``execute`` returns is cancelled, which is
+        what a cancellation of the task awaiting it does (:class:`_Call`). A future with no
+        ``cancelled`` (a stand-in's) is never abandoned, and its calls run as :meth:`run`'s do.
+        """
+        call = _Call()
+        call.fut = fut = execute(self._run, call, func, *args, **kwargs)
+        return fut
+
+    def _run(
+        self, call: _Call | None, func: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> Any:
+        skip = call if call is not None and _skippable(func) else None
+        if skip is not None and skip.cancelled():
+            return None  # before the lock too, so a skip never parks a worker behind a long call
         with self._lock:
             with self._state:
+                if skip is not None and skip.cancelled():
+                    # Cancelled before it entered: nobody awaits it, so it never runs.
+                    return None
                 self._running = True
+            result = None
             try:
-                return func(*args, **kwargs)
+                result = func(*args, **kwargs)
+                return result
             finally:
                 with self._state:
                     self._running = False
+                    orphaned = call is not None and call.cancelled()
                     after = self._after
                     if after:  # a new list only after a hand-off, not on every call
                         self._after = []
                     deferred, self._deferred = self._deferred, None
+                if orphaned:  # first: a cursor closes before any connection close below
+                    _close_orphaned_cursor(func, result)
                 for job in after:  # still under the lock, so before the next call and the close
                     try:
                         job()
@@ -210,7 +311,7 @@ def install_call_gate(conn: Any) -> None:
             )
         return
     gate = CallGate()
-    conn._execute = partial(execute, gate.run)
+    conn._execute = partial(gate.submit, execute)
     conn._mefor_call_gate = gate
 
 
@@ -241,7 +342,8 @@ def abandon_one_shot(conn: Any, cur: Any) -> bool:
     A connection with no gate (a stand-in, or one :func:`install_call_gate` could not wrap and
     logged at ERROR) or no handle is not taken. The caller then runs :func:`close_one_shot`, which
     closes it beside the running statement: the hazard the gate exists to remove. A cursor still
-    being created is not held here, so the collector frees it."""
+    being created when the cancellation landed is not held here; the gate closes it as its
+    ``cursor()`` call returns, before the connection close handed to that call (BACKLOG #2394)."""
     gate = call_gate(conn)
     raw = getattr(conn, "_conn", None)
     if gate is None or raw is None:

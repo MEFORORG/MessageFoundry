@@ -20,9 +20,10 @@ the readers of those settings go through. The design is ADR 0214.
   the store key file already gets); a file whose name is not a setting the directory supplies, so a
   mistyped name does not silently fall back to the environment; an empty file, one that is not
   UTF-8, or one over :data:`MAX_FILE_BYTES`.
-* **The store key is not read from here.** Its protected channel on Windows is the DPAPI key file,
-  ``[store].encryption_key_file``, and the key-custody design keeps it there. A file named for the
-  store key, or for its retired keys, is refused.
+* **The store key is not read from here as a setting.** A file named for the store key, or for its
+  retired keys, is refused. The key custody host blob and its handoff (:data:`CUSTODY_FILE_NAMES`)
+  may sit here, and the listing passes over them: the ``host`` key provider reads them itself
+  (:mod:`messagefoundry.store.custody_host`, vault BACKLOG #3411), checking each as a key file.
 
 **What this slice does not do**, at least: refuse a secret found in the environment (the NSSM
 reading in :mod:`messagefoundry.serviceenv` still names a non-key secret and does not refuse it);
@@ -47,6 +48,7 @@ from pathlib import Path
 from typing import Final
 
 __all__ = [
+    "CUSTODY_FILE_NAMES",
     "DIRECTORY_SETTING_NAMES",
     "KEY_CLASS_NAMES",
     "MAX_FILE_BYTES",
@@ -93,6 +95,11 @@ DIRECTORY_SETTING_NAMES: Final[tuple[str, ...]] = (
 #: operator's; the directory supplies those under :data:`VALUE_PREFIX`.
 SECRET_SETTING_NAMES: Final[tuple[str, ...]] = (*KEY_CLASS_NAMES, *DIRECTORY_SETTING_NAMES)
 
+#: The key custody host blob and the handoff an administrator writes for the service's first start
+#: (vault BACKLOG #3411). They are not settings: the ``host`` key provider reads them by these names,
+#: in this directory when it is set, so the listing passes over them.
+CUSTODY_FILE_NAMES: Final[tuple[str, str]] = ("master.key", "handoff.key")
+
 #: The prefix of an ``env()`` value's variable, ``MEFOR_VALUE_<KEY>``. A file in the directory with
 #: this prefix supplies that value. ``config.environments.VALUE_ENV_PREFIX`` is this constant.
 VALUE_PREFIX: Final = "MEFOR_VALUE_"
@@ -136,6 +143,7 @@ def _is_value_name(key: str) -> bool:
 #: The file names the directory may hold, as the platform compares them, and the store key's.
 _ALLOWED_KEYS: Final = frozenset(_name_key(name) for name in DIRECTORY_SETTING_NAMES)
 _STORE_KEY_KEYS: Final = frozenset(_name_key(name) for name in KEY_CLASS_NAMES)
+_CUSTODY_KEYS: Final = frozenset(_name_key(name) for name in CUSTODY_FILE_NAMES)
 
 
 def _check(path: Path, what: str, *, directory: bool = False) -> None:
@@ -309,6 +317,8 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
     for position, entry in enumerate(entries, start=1):
         if entry.startswith("."):
             continue  # a hidden file, such as an editor's swap file, names no setting
+        if _name_key(entry) in _CUSTODY_KEYS:
+            continue  # the host provider's own files, read and checked by that provider
         if _FILE_NAME.fullmatch(entry) is None:
             refused.append(_cite(entry, position, len(entries)))
             continue

@@ -15,9 +15,11 @@ Two tiers, by design (do not route the hot path through this):
   is called — a Handler invokes it **on demand** against a
   :class:`~messagefoundry.parsing.message.RawMessage`, never the engine pipeline.
 
-**Free acknowledgment generation.** pyx12's validator emits a conforming **999** (005010) or **997**
-(004010) Functional Acknowledgment as a by-product of the walk, so :attr:`X12ValidationResult.ack`
-carries a ready-to-return negative ack — no separate ack builder needed.
+**Free acknowledgment generation.** pyx12's validator emits a **999** (005010) or **997** (004010)
+Functional Acknowledgment as a by-product of the walk, so :attr:`X12ValidationResult.ack` carries the
+negative ack — no separate ack builder needed. An ack pyx12 did not finish is not returned (``ack`` is
+then ``None``). A returned ack echoes sender values unescaped, so it is complete but not thereby
+well-formed; see :class:`X12ValidationResult`.
 
 **PHI rule (do not break).** A failing X12 element error from pyx12 embeds the *offending data value*
 (potential PHI) in its raw error string. This module **never** surfaces that: each
@@ -34,10 +36,11 @@ from __future__ import annotations
 
 import io
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from messagefoundry.parsing.x12._deps import load_x12_validator
+from messagefoundry.parsing.x12._deps import load_x12_code_resolver, load_x12_validator
 from messagefoundry.parsing.x12.errors import X12ValidationError
 from messagefoundry.redaction import json_loads_or_refusal
 
@@ -48,7 +51,10 @@ __all__ = ["X12SegmentError", "X12ValidationResult", "validate"]
 class X12SegmentError:
     """One conformance violation, reduced to **PHI-safe structural locators only**.
 
-    ``code`` is pyx12's numeric error code; ``message`` is a synthesized, value-free description;
+    ``code`` is the X12 error code pyx12 maps it to in one code list, chosen by the last group's GS08:
+    the 997 AK list for 004010, also when no ack is generated, and the 999 IK list otherwise (e.g.
+    ``"8"``). pyx12's own error name stands in where that list has no code for it;
+    ``message`` is a synthesized, value-free description;
     ``segment_id`` / ``element_position`` / ``line`` / ``loop`` locate it; ``element_name`` is the
     *schema* data-element label (e.g. ``"Transaction Set Creation Date"``), never the input value."""
 
@@ -65,14 +71,19 @@ class X12SegmentError:
 class X12ValidationResult:
     """The outcome of a strict pass. ``valid`` is True iff pyx12 found no errors. ``errors`` is the
     flattened, PHI-safe violation list (empty when valid). ``ack`` is the generated 997/999
-    Functional Acknowledgment ready to return to the sender (``None`` only if pyx12 emitted none, e.g.
-    for an already-FA transaction); ``ack_transaction`` names which (``"997"``/``"999"``/``None``)."""
+    Functional Acknowledgment, complete to its closing IEA, or ``None`` when pyx12 emitted none (e.g.
+    for an already-FA transaction) or its ack writer failed before the closing IEA. A fragment such a
+    writer left is dropped, with a WARNING; a writer that failed before writing anything leaves no
+    fragment and no WARNING. ``ack_transaction`` names which (``"997"``/``"999"``), ``None``
+    with no ack. A complete ack echoes sender values unescaped, so it is not thereby well-formed."""
 
     valid: bool
     errors: tuple[X12SegmentError, ...] = ()
     ack: str | None = None
     ack_transaction: str | None = None
 
+
+_log = logging.getLogger(__name__)
 
 #: The one handler the ``pyx12`` logger tree ends at. A single module-level instance, because
 #: ``Logger.addHandler`` skips a handler already attached, under logging's own lock.
@@ -127,12 +138,39 @@ def _mute_pyx12_logger() -> None:
             logger.setLevel(_MUTED)
 
 
-def _ack_transaction(ack_text: str) -> str | None:
-    """Identify a generated ack as ``"999"`` or ``"997"`` by its ST01, structurally (no value parse)."""
-    for token in ("ST*999", "ST*997"):
-        if token in ack_text:
-            return token.split("*", 1)[1]
-    return None
+class _AckBuffer(io.StringIO):
+    """The ack sink, which also keeps the last chunk written. Both of pyx12's ack writers write one
+    whole segment per ``write`` call, so a finished ack's last chunk is its IEA. The ack's text cannot
+    show that: a fragment echoes sender values, and with other separators a GS06 of
+    ``1~IEA*1*000000001`` makes a fragment's text end in an IEA that pyx12 never wrote."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_write = ""
+
+    def write(self, s: str, /) -> int:
+        if s.strip():
+            self.last_write = s
+        return super().write(s)
+
+    def complete(self) -> bool:
+        return self.last_write.lstrip().startswith("IEA*")
+
+
+# pyx12's ack choice by the last GS08's first six characters; any other version gets no ack.
+_ACK_FOR_VERSION = {"004010": "997", "005010": "999"}
+
+
+def _last_group_version(report: dict[str, Any]) -> str:
+    """The GS08 of the last group pyx12 walked, from its report. pyx12 picks the ack from exactly that
+    value (a 997 when it starts ``004010``, a 999 when ``005010``, none for a GS01 of ``FA``), so the
+    ack type and the code list are read here, never from the ack text: the ack echoes sender fields,
+    and with other separators those can forge a segment boundary or shift the ISA's fixed offsets."""
+    vriic = ""
+    for interchange in report.get("interchanges", []):
+        for group in interchange.get("groups", []):
+            vriic = str(group.get("vriic") or "")
+    return vriic
 
 
 def _segment_error(code: str, seg: dict[str, Any], err: dict[str, Any]) -> X12SegmentError:
@@ -167,31 +205,49 @@ def _element_error(code: str, seg: dict[str, Any], ele: dict[str, Any]) -> X12Se
     )
 
 
-def _flatten_errors(report: dict[str, Any]) -> list[X12SegmentError]:
+def _error_code(err: dict[str, Any], resolve: Callable[..., str | None], prefer_5010: bool) -> str:
+    """The X12 error code for one pyx12 JSON error dict. Since pyx12 4.0.1, ``err_cde`` holds pyx12's
+    own error name (e.g. ``"ELE_8_invalid_date"``) at segment, element and interchange level, while
+    group and transaction level still emit raw X12 numbers, which ``resolve`` passes through. The
+    report's ``x12_code`` field is not read: pyx12 fills it 999-first whatever the version, so a 997
+    pass would report 999-only codes (``"I4"`` for a not-used segment where the 997 says ``"2"``).
+    The name stands in where pyx12 maps it to no X12 code (e.g. ``SEG_8_hl_count_mismatch``), and on a
+    997 pass where pyx12's table has no AK code for it (e.g. ``ELE_I10_NOT_USED``, whose only code is
+    the 999's ``"I10"``), an error pyx12's 997 omits."""
+    err_cde = str(err.get("err_cde", ""))
+    x12_code = resolve(err_cde, prefer_5010=prefer_5010)
+    return err_cde if x12_code is None else x12_code
+
+
+def _flatten_errors(
+    report: dict[str, Any], resolve: Callable[..., str | None], prefer_5010: bool
+) -> list[X12SegmentError]:
     """Walk pyx12's nested JSON error report (interchange → group → transaction → segment → element),
-    flattening every recorded error into a PHI-safe :class:`X12SegmentError`."""
+    flattening every recorded error into a PHI-safe :class:`X12SegmentError`. ``prefer_5010`` is False
+    when the last group is ``004010``: pyx12 picks one ack per document (from the last GS08), so the
+    codes follow that ack rather than each group's own version."""
     out: list[X12SegmentError] = []
     for interchange in report.get("interchanges", []):
+        # ISA-level codes are the same in the 997 and the 999 (TA1 note codes), so no version is needed.
         for err in interchange.get("errors", []):
-            out.append(
-                X12SegmentError(code=str(err.get("err_cde", "")), message="interchange error")
-            )
+            code = _error_code(err, resolve, True)
+            out.append(X12SegmentError(code=code, message="interchange error"))
         for group in interchange.get("groups", []):
             for err in group.get("errors", []):
-                out.append(X12SegmentError(code=str(err.get("err_cde", "")), message="group error"))
+                code = _error_code(err, resolve, prefer_5010)
+                out.append(X12SegmentError(code=code, message="group error"))
             for txn in group.get("transactions", []):
                 for err in txn.get("errors", []):
-                    out.append(
-                        X12SegmentError(
-                            code=str(err.get("err_cde", "")), message="transaction error"
-                        )
-                    )
+                    code = _error_code(err, resolve, prefer_5010)
+                    out.append(X12SegmentError(code=code, message="transaction error"))
                 for seg in txn.get("segments", []):
                     for err in seg.get("errors", []):
-                        out.append(_segment_error(str(err.get("err_cde", "")), seg, err))
+                        out.append(_segment_error(_error_code(err, resolve, prefer_5010), seg, err))
                     for ele in seg.get("elements", []):
                         for err in ele.get("errors", []):
-                            out.append(_element_error(str(err.get("err_cde", "")), seg, ele))
+                            out.append(
+                                _element_error(_error_code(err, resolve, prefer_5010), seg, ele)
+                            )
     return out
 
 
@@ -213,8 +269,9 @@ def validate(raw: str | bytes) -> X12ValidationResult:
         text = raw
 
     x12n_document, make_params = load_x12_validator()
+    resolve = load_x12_code_resolver()  # before the walk, so a pyx12 older than 4.0.1 fails first
     params = make_params()
-    fd_ack = io.StringIO()
+    fd_ack = _AckBuffer()
     fd_json = io.StringIO()
 
     _mute_pyx12_logger()
@@ -237,12 +294,21 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     if refused is not None:  # pragma: no cover - pyx12 emits well-formed JSON
         raise X12ValidationError("strict X12 validation produced an unreadable error report")
 
-    errors = tuple(_flatten_errors(report))
     ack_text = fd_ack.getvalue().strip()
-    ack = ack_text or None
+    version = _last_group_version(report)
+    ack_for_version = _ACK_FOR_VERSION.get(version[:6])
+    # A writer that raises partway is caught and logged by pyx12 (muted here), leaving a fragment;
+    # only an ack whose last write was its closing IEA is returned and labelled.
+    complete = fd_ack.complete()
+    ack = ack_text if ack_text and complete else None
+    ack_transaction = ack_for_version if ack else None
+    if ack_text and not complete:
+        _log.warning("pyx12's ack writer stopped before the closing IEA; no ack is returned")
+    prefer_5010 = ack_for_version != "997"
+    errors = tuple(_flatten_errors(report, resolve, prefer_5010=prefer_5010))
     return X12ValidationResult(
         valid=valid and not errors,
         errors=errors,
         ack=ack,
-        ack_transaction=_ack_transaction(ack_text) if ack else None,
+        ack_transaction=ack_transaction,
     )

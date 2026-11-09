@@ -156,8 +156,9 @@ async def _assert_failed_closed(
 
 
 #: The begin's answers once TOTP is on. Neither text has a constant to import: the MFA-required
-#: detail is inline at each raise site in ``api/security.py``, and the already-enabled one is a
-#: local in ``AuthService.begin_mfa_enrollment``. So both are spelled here.
+#: detail is a literal inside ``_mfa_refusal`` in ``api/security.py``, and the already-enabled one
+#: is a local in ``AuthService.begin_mfa_enrollment``. So both are spelled here, which also pins
+#: the wire text a client reads.
 _MFA_REQUIRED = {"detail": "multi-factor verification required; POST /auth/mfa-verify then retry"}
 _ALREADY_ENABLED = {"detail": "MFA is already enabled; disable it before re-enrolling"}
 
