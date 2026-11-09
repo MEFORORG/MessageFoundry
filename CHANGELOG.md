@@ -27,7 +27,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   it checks the path form and the Bundle entry lists, so it no longer refuses an `env()` interaction
   beside a literal path form or beside entry lists; it still checks the lists' literal items, and
   still refuses an `env()` interaction beside entry lists and a literal path form or conditional,
-  which no interaction builds with. A literal conditional beside a literal `transaction` or `batch`
+  or beside `allowed_entry_types` with no `allowed_entry_methods`, which no interaction builds with. A literal conditional beside a literal `transaction` or `batch`
   interaction is now refused at load, with the build's reason, rather than only at build. See
   [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md). (`BACKLOG #2571`)
 

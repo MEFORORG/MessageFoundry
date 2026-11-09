@@ -182,7 +182,7 @@ def test_check_says_there_is_nothing_to_read_when_no_update_takes_the_path_form(
     r = _line(_config(tmp_path, 'outbound("OB", FHIR(url=_BASE, interaction="update"))\n'))
     assert r.ok and not r.skipped
     assert r.detail == (
-        "no FHIR connection sets update_url_form='path', so there is no update to read"
+        "no FHIR connection sends updates in the path form, or may, so there is no update to read"
     )
 
 

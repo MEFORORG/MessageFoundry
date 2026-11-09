@@ -10915,13 +10915,12 @@ def security_loosenings(
         out.append(
             (
                 "update_url_form",
-                f"{len(path_form_fhir_hops)} FHIR connection(s) send updates in the PATH form "
-                f"({named}) — each update puts the message's resource id in the request URL, "
-                "so the receiving server's access log, and any proxy log on the path, holds "
-                "it; an id can be a medical record number or another identifier. The shipped "
-                "transaction form keeps the id out of the URL. A name marked possibly has an "
-                "env() value this reading could not resolve, and the above holds of it only if "
-                "it resolves to the path form on an update",
+                f"{len(path_form_fhir_hops)} FHIR connection(s) send updates in the PATH form, "
+                f"or may where marked possibly ({named}) — each such update puts the message's "
+                "resource id in the request URL, so the receiving server's access log, and any "
+                "proxy log on the path, holds it; an id can be a medical record number or "
+                "another identifier. The shipped transaction form keeps the id out of the URL. "
+                "A name marked possibly has an env() value this reading could not resolve",
             )
         )
     # ADR 0139: the engine-to-sidecar hop of an ECH connection. docs/SECURITY-LOOSENING.md,

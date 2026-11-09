@@ -2892,7 +2892,7 @@ def test_the_path_form_reader_resolves_an_env_form_with_the_values(
 @pytest.mark.parametrize(
     ("values", "risk"),
     [
-        ({"epic_form": "path"}, "OB_ENV) — each update"),
+        ({"epic_form": "path"}, "OB_ENV) — each such update"),
         ({}, "OB_ENV (possibly: an env() value"),
         ({"epic_form": "transaction"}, None),
     ],

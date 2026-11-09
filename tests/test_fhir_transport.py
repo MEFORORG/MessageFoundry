@@ -1980,7 +1980,12 @@ def test_literal_entry_items_are_checked_beside_an_env_interaction() -> None:
     with pytest.raises(ValueError, match="allowed_entry_methods items must each be"):
         FHIR(url=BASE, interaction=env("kind"), allowed_entry_methods=["BOGUS"])
     with pytest.raises(ValueError, match="allowed_entry_types items must each be"):
-        FHIR(url=BASE, interaction=env("kind"), allowed_entry_types=["$expunge"])
+        FHIR(
+            url=BASE,
+            interaction=env("kind"),
+            allowed_entry_methods=["POST"],
+            allowed_entry_types=["$expunge"],
+        )
     FHIR(url=BASE, interaction=env("kind"), allowed_entry_methods=["POST"])
 
 
@@ -2002,6 +2007,27 @@ def test_entry_lists_beside_an_env_interaction_refuse_what_no_interaction_builds
     with pytest.raises(ValueError, match="apply only to interaction='transaction' or 'batch'"):
         FHIR(url=BASE, interaction=env("kind"), allowed_entry_methods=["POST"], **over)  # type: ignore[arg-type]
     FHIR(url=BASE, interaction=env("kind"), **over)  # type: ignore[arg-type]
+
+
+def test_entry_types_alone_beside_an_env_interaction_are_refused_at_load() -> None:
+    """A Bundle requires allowed_entry_methods and any other interaction refuses
+    allowed_entry_types, so no value of the env() interaction builds with the types alone. The
+    types beside the methods are the control, and so is a methods env() whose default is unset,
+    which a set key may still supply."""
+    with pytest.raises(ValueError, match="which also require allowed_entry_methods"):
+        FHIR(url=BASE, interaction=env("kind"), allowed_entry_types=["Patient"])
+    FHIR(
+        url=BASE,
+        interaction=env("kind"),
+        allowed_entry_methods=["POST"],
+        allowed_entry_types=["Patient"],
+    )
+    FHIR(
+        url=BASE,
+        interaction=env("kind"),
+        allowed_entry_methods=env("m", default=None),  # type: ignore[arg-type]
+        allowed_entry_types=["Patient"],
+    )
 
 
 @pytest.mark.parametrize("form", ["path", "transaction"])
@@ -2092,7 +2118,7 @@ def test_check_says_none_when_no_connection_takes_the_path_form(tmp_path: Any) -
 
     cfg = _write_feed(tmp_path, f'outbound("OB", FHIR(url="{BASE}", interaction="update"))\n')
     [r] = [r for r in run_checks(cfg, run_lint=False).results if r.name == "fhir-update-path-form"]
-    assert "no FHIR connection sets update_url_form='path'" in r.detail
+    assert "no FHIR connection sends updates in the path form" in r.detail
 
 
 # --- the Bundle entry screen on transaction/batch (vault BACKLOG #2804) ---------------------------

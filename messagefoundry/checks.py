@@ -2824,7 +2824,7 @@ def _check_fhir_update_path_form(config_dir: str | Path) -> CheckResult:
             name,
             ok=True,
             required=False,
-            detail="no FHIR connection sets update_url_form='path'",
+            detail="no FHIR connection sends updates in the path form (update_url_form='path'), or may",
         )
     listed = ", ".join(f"{conn} ({note})" if note else conn for conn, note in path_form)
     return CheckResult(
@@ -2873,7 +2873,8 @@ def _check_fhir_update_if_match(config_dir: str | Path) -> CheckResult:
         clean = (
             "every path-form FHIR update declares an If-Match that check can read"
             if path_form_fhir_updates(registry)
-            else "no FHIR connection sets update_url_form='path', so there is no update to read"
+            else "no FHIR connection sends updates in the path form, or may, so there is no update "
+            "to read"
         )
         return CheckResult(name, ok=True, required=False, detail=clean)
     listed = "; ".join(f"{conn} ({note})" for conn, note in plain)

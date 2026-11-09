@@ -3983,8 +3983,8 @@ def FHIR(
     has_cond = cond is not _UNRESOLVED and bool(cond)
     # Refused here as well as in FhirDestination, so the loaded graph cannot hold a connection whose
     # literal settings would never build (#2550, #2804). An env() is the build's, unless the literal
-    # settings beside it refuse every value it could take. Each check names its real cause, in the
-    # build's order: a conditional beside a Bundle first.
+    # settings beside it refuse every value it could take. Each check names a cause the build also
+    # refuses, though where several apply the build may name another one first.
     if has_cond and kind is not _UNRESOLVED and str(kind) in _BUNDLE_INTERACTIONS:
         raise ValueError(
             f"FHIR conditional={cond!r} is incompatible with interaction={kind!r}; set per-entry "
@@ -4006,7 +4006,14 @@ def FHIR(
         )
     if kind is not _UNRESOLVED:
         entry_screen_settings(str(kind), methods, types)
-    elif methods is not None or types is not None:
+    elif lists_set:
+        if allowed_entry_methods is None:
+            # A Bundle requires the methods and any other interaction refuses the types, so no value
+            # of the env() interaction builds with the types alone.
+            raise ValueError(
+                "FHIR allowed_entry_types applies only to interaction='transaction' or 'batch', "
+                "which also require allowed_entry_methods"
+            )
         # The interaction is known only at build, which checks whether the lists apply to it. Their
         # items are checked now, as on a Bundle interaction.
         entry_screen_settings(
