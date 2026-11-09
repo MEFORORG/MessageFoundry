@@ -433,7 +433,6 @@ def test_out_help_states_what_the_writer_does_to_the_file(command: str) -> None:
         "a symbolic link at FILE is replaced",
         "On Windows an existing FILE is written in place",
         "keeps its access list and owner",
-        "On POSIX, a target that resolves, through any link, to a character device, or to anything else that is neither a regular file nor a directory and that this account owns, such as a pipe, is opened for writing in place instead of replaced.",
     ):
         assert consequence in text, f"{command} --out help lacks {consequence!r}: {text}"
 
@@ -452,13 +451,30 @@ def test_compare_out_help_states_that_an_existing_file_is_replaced() -> None:
         in text
     )
     assert (
-        "On POSIX, a target that resolves, through any link, to a character device, or to anything else that is neither a regular file nor a directory and that this account owns, such as a pipe, is opened for writing in place instead of replaced."
+        "On Windows compare opens a target that resolves, through any link, to anything that is neither a regular file nor a directory, such as NUL or CON, for writing in place instead of replacing it; the open can be refused, for example for a named pipe."
         in text
     )
+
+
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
+def test_out_help_states_the_posix_open_in_place_rule(command: str) -> None:
+    # One sentence, shared by all three commands, says which targets are opened rather than replaced.
     assert (
-        "On Windows compare opens a target that resolves, through any link, to anything that is neither a regular file nor a directory, such as NUL or CON, for writing in place instead of replacing it."
-        in text
+        "On POSIX, a target that resolves, through any link, to a character device, or to anything else that is neither a regular file nor a directory and that this account owns, such as a pipe, is opened for writing in place instead of replaced; the open can be refused, for example for a socket."
+        in _out_help(command)
     )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows device names")
+def test_compare_out_writes_to_nul_in_place_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The compare help says a device such as NUL is opened in place, not replaced: no temp file is
+    # made beside it and the command succeeds.
+    db = _seed_compare(tmp_path, monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    assert _compare_to(db, "NUL") == 0
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_compare_out_replaces_a_second_hard_link(
