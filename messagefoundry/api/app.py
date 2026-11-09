@@ -8471,8 +8471,10 @@ def create_app(
                     raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
                 # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
                 # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling). They
-                # run BEFORE the registry checks below and read nothing from the target, so a body
-                # built to fail them learns nothing about it (ADR 0197 Amendment D gives the order).
+                # read nothing from the target and run BEFORE the registry checks below, so their
+                # refusal does not say whether the target is registered, deployed, on this engine
+                # shard or running. They run AFTER the scope check above, so it says the target is in
+                # the caller's scope (ADR 0197 Amendment D, "The order of the checks").
                 admitted = await _guard_resubmission(
                     engine,
                     identity,

@@ -1577,9 +1577,11 @@ taken after an adversarial review, set the direct-mode order (a request that nam
 
 1. the scoped read of the message, 404 when it is unknown or outside the caller's scope;
 2. the scope check on the target, 403, with its `auth.channel_denied` audit row;
-3. the engine-wide ingress guard, 413 or 422, which gives the proof back;
+3. the engine-wide ingress guard (the NUL rule and the 16 MiB ceiling), whose refusal gives the
+   proof back;
 4. the registry checks on the target: 404 when it is not registered, 409 when it is not deployed,
-   is owned by another engine shard or is not running.
+   is owned by another engine shard or is not running;
+5. the 409 for a refused body stored only as its head, the last check before the store write.
 
 The direct-mode guard reads nothing from the target, so a body built to fail it gives the proof
 back without saying whether the target is registered, deployed, on this engine shard or running.
@@ -1592,4 +1594,6 @@ origin inbound is registered here.
 proof back, at least the 400 for a request with neither a target nor a re-route and the ingress
 guards' 413, 415 and 422. A refusal from the store call on keeps the spend, as before.
 `tests/test_bound_step_up_injection.py` pins one case per spending status and a 400 and a 422
-still refunding, and the direct-mode order of the checks.
+still refunding, and steps 2 to 4 of the direct-mode order: a body the guard refuses gets the
+same answer for a running target and for one that fails step 4, and the scope check stays ahead
+of the guard.

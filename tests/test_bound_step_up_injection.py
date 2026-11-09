@@ -363,7 +363,7 @@ def test_the_bound_route_suites_run_with_the_proof_on() -> None:
 # except a 403, 404 or 409, which spends it (owner ruling 2026-11-07, #3241 added item 1).
 
 
-async def _edit_resend_engine(tmp_path: Path) -> Engine:
+async def _edit_resend_engine(tmp_path: Path, *, undeployed: bool = False) -> Engine:
     from tests.test_edit_resend import _registry
 
     engine = await Engine.create(
@@ -372,15 +372,16 @@ async def _edit_resend_engine(tmp_path: Path) -> Engine:
         egress_settings=EgressSettings(deny_by_default=False),
     )
     registry = _registry(tmp_path)
-    # Present in the config but not deployed (ADR 0111), for the direct-mode order test below.
-    (tmp_path / "o3").mkdir(exist_ok=True)
-    registry.add_outbound(
-        OutboundConnection(
-            "OB_UNDEPLOYED",
-            ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "o3")}),
-            deployed=False,
+    if undeployed:
+        # Present in the config but not deployed (ADR 0111), for the direct-mode order test below.
+        (tmp_path / "o3").mkdir(exist_ok=True)
+        registry.add_outbound(
+            OutboundConnection(
+                "OB_UNDEPLOYED",
+                ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "o3")}),
+                deployed=False,
+            )
         )
-    )
     engine.add_registry(registry)
     await engine.start()
     return engine
@@ -514,18 +515,16 @@ async def test_a_direct_edit_resend_with_a_bad_body_does_not_reveal_its_target(
     status: int,
     patch: tuple[str, object] | None,
 ) -> None:
-    """A body the guard refuses gets the guard's 422 and its proof back, whatever state the target
-    is in, so a run of such bodies cannot map which outbounds are registered, deployed, on this
-    engine shard or running. The same proof then sends a good body, which meets the target's own
-    404 or 409 and spends it: the guard did refund, and the target checks still hold."""
+    """A body the guard refuses gets the same answer, the guard's 422 with its proof back, as it
+    gets for a registered, deployed, running target on this engine shard, so a run of such bodies
+    cannot map which outbounds are in which state. The same proof then sends a good body, which
+    meets the target's own 404 or 409 and spends it: the guard did refund, and the target checks
+    still hold."""
     pytest.importorskip("psutil")
-    engine = await _edit_resend_engine(tmp_path)
+    engine = await _edit_resend_engine(tmp_path, undeployed=True)
     try:
         rr = engine.registry_runner
         assert rr is not None
-        if patch is not None:
-            method, answer = patch
-            monkeypatch.setattr(rr, method, lambda _name: answer)
         service = await _service(engine)
         await _add(service, "adm", [Role.ADMINISTRATOR.value])
         mid = await engine.store.enqueue_message(
@@ -533,11 +532,18 @@ async def test_a_direct_edit_resend_with_a_bad_body_does_not_reveal_its_target(
         )
         async with _client(engine, service, tmp_path) as c:
             token = await _reauth(c, await _login(c, "adm"), STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
+            # The baseline: a bad body to OB1, which passes every target check.
+            baseline = await _edit_resend(c, token, mid, raw=NUL_BODY, to="OB1", key="k0")
+            assert baseline.status_code == 422 and _past_the_step_up(baseline), baseline.text
+            if patch is not None:
+                method, answer = patch
+                monkeypatch.setattr(rr, method, lambda _name: answer)
             bad = await _edit_resend(c, token, mid, raw=NUL_BODY, to=to)
             assert bad.status_code == 422 and _past_the_step_up(bad), (bad.status_code, bad.text)
-            assert to not in bad.text, bad.text
+            assert bad.json() == baseline.json(), (bad.text, baseline.text)
             audit = await engine.store.list_audit()
-            assert [a for a in audit if a["action"] == "message_edit_resend_reject"]
+            rejects = [a for a in audit if a["action"] == "message_edit_resend_reject"]
+            assert len(rejects) == 2, rejects  # the baseline and this one
             good = await _edit_resend(c, token, mid, to=to, key="k2")
             assert good.status_code == status and _past_the_step_up(good), (
                 good.status_code,
@@ -546,6 +552,7 @@ async def test_a_direct_edit_resend_with_a_bad_body_does_not_reveal_its_target(
             again = await _edit_resend(c, token, mid, to=to, key="k3")
             assert _refused_for(again, STEP_UP_ACTION_MESSAGE_EDIT_RESEND), again.status_code
     finally:
+        monkeypatch.undo()  # the engine stops with its own runner methods
         await engine.stop()
 
 
