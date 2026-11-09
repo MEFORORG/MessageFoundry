@@ -354,7 +354,7 @@ jobs:
       # no lock pin holds. A requirement it cannot parse fails, and so does a line of options with
       # no requirement that pip cannot read. An include or constraint line (-r, --requirement, -c or
       # --constraint, in any spelling pip takes, with no editable on the line) fails too: this step
-      # reads no file a line names.
+      # reads no file a line names, and no new lock clears such a line.
       - name: Check requirements.lock is not stale against requirements.txt
         if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
         run: |
@@ -534,7 +534,7 @@ for group in logical_lines("requirements.lock"):
     if isinstance(req, Requirement) and (req.marker is None or req.marker.evaluate()):
         exact = [s.version for s in req.specifier if s.operator in ("==", "===")]
         locked.setdefault(canonicalize_name(req.name), set()).update(exact)
-stale = []
+stale, refused = [], []
 for group in logical_lines("requirements.txt"):
     text, options, line = split_line(group)
     req = requirement(text)
@@ -545,9 +545,16 @@ for group in logical_lines("requirements.txt"):
         elif kind == "editable":
             print(f"::notice::{line} is editable, so it is not checked against requirements.lock")
         elif kind == "include":
-            stale.append(f"{line} includes another requirements file, which this check does not read")
+            # No new lock clears these two, so each carries its own remedy.
+            refused.append(
+                f"{line} includes another requirements file, which this check does not read;"
+                " list its pins in requirements.txt"
+            )
         elif kind == "constraint":
-            stale.append(f"{line} names a constraints file, which this check does not read")
+            refused.append(
+                f"{line} names a constraints file, which this check does not read;"
+                " take it out of requirements.txt"
+            )
         continue
     if isinstance(req, str):
         if unnamed(req):
@@ -571,7 +578,9 @@ for group in logical_lines("requirements.txt"):
         stale.append(f"requirements.txt asks for {name}{req.specifier}, requirements.lock pins {have}")
 for problem in stale:
     print(f"::error::{problem}; regenerate requirements.lock from requirements.txt")
-sys.exit(1 if stale else 0)
+for problem in refused:
+    print(f"::error::{problem}")
+sys.exit(1 if stale or refused else 0)
 """
 
 

@@ -401,20 +401,16 @@ def _run_audit_job(
     fail_env: dict[str, str] | None = None,
     requirements: str = "messagefoundry==0.5.1\n",
     lock_encoding: str = "utf-8",
-    files: dict[str, str] | None = None,
 ) -> tuple[list[str], Path, str, list[str]]:
     """Run the audit job's ``run`` steps in order, as GitHub decides which run.
 
     Returns the stub log, the copy pip-audit was handed, the output, and the steps that failed.
     ``$RUNNER_TEMP`` is ``tmp_path / "runner-temp"``. ``lock`` as bytes is written as given.
-    ``files`` are more files in the checkout, by name.
     """
     bash, root, jobs = scaffolded_ci
     work = tmp_path / "work"
     work.mkdir()
     (work / "requirements.txt").write_text(requirements, encoding="utf-8")
-    for name, text in (files or {}).items():
-        (work / name).write_text(text, encoding="utf-8")
     # The scaffolded repo's own file, as the job's checkout has it.
     audit_lock = (root / "repo" / "requirements-audit.lock").read_bytes()
     (work / "requirements-audit.lock").write_bytes(audit_lock)
@@ -611,6 +607,7 @@ def test_an_included_requirements_file_is_refused_and_the_lock_still_audited(
     )
     # The stale-lock check reads no included file either, so it fails too.
     assert failed == [_STALE, _AUDIT_TXT_PINS]
+    assert "::error::-r handlers.txt includes another requirements file" in output
     assert "::error::requirements.txt includes another file" in output
     assert calls == [
         c for c in _lock_calls(tmp_path) if not c.startswith("pip-audit -r requirements.txt")
@@ -752,6 +749,7 @@ _STALE_CASES = [
     ("messagefoundry==0.5.1\n--ed\t./acme\n", None, "--ed\t./acme is editable"),
     # pip takes the editable as the line's requirement and follows no file named beside it.
     ("messagefoundry==0.5.1\n-e ./acme -r extra.txt\n", None, "-e ./acme -r extra.txt is editable"),
+    ("messagefoundry==0.5.1\n-e ./acme -c extra.txt\n", None, "-e ./acme -c extra.txt is editable"),
     ("messagefoundry==0.5.1\n--extra-index-url https://host.invalid/simple\n", None, None),
     # A line is printed as written, before ${VAR} expansion, and in any script the runner's
     # console cannot encode.
@@ -803,18 +801,30 @@ def test_a_stale_lock_fails_its_own_step_and_hides_no_audit(
     assert calls == _lock_calls(tmp_path) and audited.exists()
 
 
+_INCLUDE = (
+    "includes another requirements file, which this check does not read;"
+    " list its pins in requirements.txt"
+)
+_CONSTRAINT = (
+    "names a constraints file, which this check does not read; take it out of requirements.txt"
+)
+
 #: (the line after ``foo==1.0``, the ::error:: it raises, whether the pins audit's grep also sees it).
 #: pip reads each as an include or a constraint, by its own parser, so every spelling it takes counts.
 _INCLUDE_CASES = [
-    ("--requirem extra.txt", "--requirem extra.txt includes another requirements file", False),
-    ("-\\\nr extra.txt", "-r extra.txt includes another requirements file", False),
-    ("--constr extra.txt", "--constr extra.txt names a constraints file", False),
-    ("-r extra.txt", "-r extra.txt includes another requirements file", True),
-    ("--requirement=extra.txt", "--requirement=extra.txt includes another requirements file", True),
+    ("--requirem extra.txt", f"--requirem extra.txt {_INCLUDE}", False),
+    ("-\\\nr extra.txt", f"-r extra.txt {_INCLUDE}", False),
+    ("--constr extra.txt", f"--constr extra.txt {_CONSTRAINT}", False),
+    ("-r extra.txt", f"-r extra.txt {_INCLUDE}", True),
+    ("--requirement=extra.txt", f"--requirement=extra.txt {_INCLUDE}", True),
+    ("-c extra.txt", f"-c extra.txt {_CONSTRAINT}", False),
+    ("--constraint=extra.txt", f"--constraint=extra.txt {_CONSTRAINT}", False),
+    # pip follows the include when a line names both.
+    ("-c other.txt -r extra.txt", f"-c other.txt -r extra.txt {_INCLUDE}", False),
     # Printed as written, before ${VAR} expansion.
     (
         "--constr ${MF_SET_8171}/extra.txt",
-        "--constr ${MF_SET_8171}/extra.txt names a constraints file",
+        f"--constr ${{MF_SET_8171}}/extra.txt {_CONSTRAINT}",
         False,
     ),
 ]
@@ -828,20 +838,16 @@ def test_an_include_or_constraint_line_fails_the_stale_check(
     error: str,
     grepped: bool,
 ) -> None:
-    """Vault BACKLOG #8171: the check reads no file a line names, so a pin there, here bar==9.9
-    which the lock does not hold, would pass unread. pip installs it, so the line fails instead."""
+    """Vault BACKLOG #8171: the check opens no file a line names. An included file's pins reach
+    the install and a constraints file limits the versions pip picks, so neither can be checked
+    against the lock, and the line fails with a remedy of its own: no new lock would clear it."""
     lock = _STALE_LOCK + "foo==1.0 \\\n    --hash=sha256:ffff\n"
     calls, audited, output, failed = _run_audit_job(
-        scaffolded_ci,
-        tmp_path,
-        lock,
-        {"MF_SET_8171": "s3cr3t-8171"},
-        f"foo==1.0\n{line}\n",
-        files={"extra.txt": "bar==9.9\n"},
+        scaffolded_ci, tmp_path, lock, {"MF_SET_8171": "s3cr3t-8171"}, f"foo==1.0\n{line}\n"
     )
     assert "s3cr3t-8171" not in output
     assert failed == [_STALE, *([_AUDIT_TXT_PINS] if grepped else [])], output
-    assert f"::error::{error}, which this check does not read;" in output
+    assert f"::error::{error}" in output and "regenerate requirements.lock" not in output
     assert calls == [
         c
         for c in _lock_calls(tmp_path)
