@@ -31,7 +31,8 @@
   does not run. (`BACKLOG #4882`, `BACKLOG #3471`)
 - **Every other error from the store cipher build or the store key resolution is replaced by a new
   refusal with a fixed text the site chooses, raised after the handler has exited, and nothing is
-  passed through at either site. The store open's own key custody step differs, as the end of
+  passed through at either site but the key check's own refusals, which `resolve_active_key`
+  raises as the engine built them. The store open's own key custody step differs, as the end of
   this bullet says.** The class of every refusal at these sites, the previous bullet's included,
   depends on the codec judgement. An error the judgement refuses, one with a codec error on it, one
   whose chain cannot be read whole or one whose judgement raised, takes the previous bullet's two
@@ -58,9 +59,11 @@
   error itself. The class of a replaced error the engine did not build, and of its cause, is logged
   as a WARNING by name alone. Before, a `ValueError` from the build was refused with its own text,
   and an error of any other class passed through as it was. The store open reads the key custody
-  in a step of its own under every key provider: under `[store].key_provider = 'host'` it reads
-  the host blob and derives the store key from it, so the store key resolution does not run, and
-  under any other provider it looks for a host blob or a handoff in the custody directory. There a
+  in a step of its own under every key provider. Under `[store].key_provider = 'host'` it reads
+  the host blob, converting a handoff into it first where only a handoff is there and the open may
+  write, or, for a blob a minting caller passes, checks the settings instead of reading one, and
+  derives the store key from that blob, so the store key resolution does not run. Under any other
+  provider it looks for a host blob or a handoff in the custody directory. There a
   `KeyProviderError` the engine built and recorded passes through as it is: it was raised with no
   chain, and its text is the one the engine built it with, which reads no text from an error.
   Any other `Exception` from that step, a `ValueError` included, is replaced by a
@@ -68,9 +71,11 @@
   names `[store].key_provider` and the custody directory, then the recorded text of an error the
   engine built, or else a fixed reason chosen by the error's class, and it is raised after the
   handler has exited, with no cause and no context. The codec judgement does not run there, so a
-  codec error is replaced as any other error is, and its byte is not read. Only the replaced
-  error's own class is logged, as a WARNING by name alone, and only for one the engine did not
-  build; its cause's class is not logged there. A `BaseException` that is not an `Exception` is not
+  codec error is replaced as any other error is, and its byte is not read. Where the step replaces
+  an error, only that error's own class is logged, as a WARNING by name alone, and only for one the
+  engine did not build; its cause's class is not logged there. The custody reads inside the step
+  log the class of an error they replaced the same way, so a refusal that passes through, or an
+  open that goes on, can follow such a WARNING. A `BaseException` that is not an `Exception` is not
   caught there, and a caller that passes a minted blob or a recovery wrap under another provider
   gets a `ValueError` with a fixed text before the step runs. (`BACKLOG #4882`)
 - **The PostgreSQL store's TLS context refusal at the open, `StoreTlsRefused`, carries a fixed text
