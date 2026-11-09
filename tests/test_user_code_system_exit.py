@@ -13,7 +13,8 @@ with the ``SystemExit`` itself.
 The sites, at least: the router hop and the inline transform (``_process_ingress_item``), the split
 transform (``_process_routed_item``), both fused bodies (``_run_fused_route``,
 ``_run_fused_transform``) and the config loader's ``_exec_module``, which a reload runs.
-``mode=subprocess`` is not covered here: the Handler runs in a worker process there.
+``mode=subprocess``, where the Handler runs in a worker process, is
+``tests/test_user_code_system_exit_sandbox.py``.
 """
 
 from __future__ import annotations

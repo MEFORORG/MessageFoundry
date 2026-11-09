@@ -24,6 +24,7 @@ from messagefoundry.auth.service import STEP_UP_ACTION_CONNECTION_PURGE
 
 from .. import pages
 from .._auth import (
+    _new_address_continuation,
     assert_same_origin,
     register_ui_action,
     require_ui,
@@ -83,12 +84,27 @@ async def _audit_refused_name(core: Any, engine: Any, identity: Identity, reques
 # to it -- the console purges through the confirm page below -- so the re-auth auto-submit had become
 # its only browser entry point. Its stale-window refusal now lands on that confirm page instead.
 # The bulk purge CONFIRM page is a step-up-UNLOCK GET form (like content-search / create-user): a
-# stale step-up 303s to /ui/reauth and, after re-verification, 303-GET-redirects BACK to it (the
-# ?dest/?scope query is deliberately NOT carried across — the operator re-selects on the fresh
-# page; fail-safe for a destructive op). auto_retry=False so it is never re-POSTed body-less.
-# The re-auth mints the purge grant (vault BACKLOG #2625), which the purge POST then spends.
+# stale step-up 303s to /ui/reauth and, after re-verification, 303-GET-redirects BACK to it. Since
+# vault BACKLOG #3241 (step 1, the purge-selection item) the ?dest/?scope selection rides the
+# re-auth, so the operator does not re-select: the pattern is query-tolerant, and the GET's refusal
+# carries its query (:func:`_purge_confirm_continuation`). Nothing is pre-armed by it: the page
+# re-derives eligibility from live quiescence and the operator must still submit the confirm form,
+# and a GET carrying any selection reaches the page within a fresh window anyway. auto_retry=False
+# so it is never re-POSTed body-less. The re-auth mints the purge grant (vault BACKLOG #2625), which
+# the purge POST then spends.
+_PURGE_CONFIRM = "/ui/connections/purge-confirm"
+
+
+def _purge_confirm_continuation(request: Request) -> str:
+    """The confirm page with the selection the refused GET carried, or the bare page when the
+    query would not survive the re-auth. The rule a refused GET's continuation follows for a new
+    address (``_new_address_continuation``): within ``GET /ui/reauth``'s cap on ``next``, ASCII,
+    and a registered unlock page."""
+    return _new_address_continuation(request, landing=_PURGE_CONFIRM)
+
+
 register_ui_action(
-    r"^/ui/connections/purge-confirm$",
+    r"^/ui/connections/purge-confirm(\?[^#]*)?$",
     Permission.MESSAGES_PURGE,
     auto_retry=False,
     unlock=True,
@@ -223,7 +239,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # spends it.
         identity: Identity = Depends(
             require_ui_step_up_action(
-                STEP_UP_ACTION_CONNECTION_PURGE, Permission.MESSAGES_PURGE, spend=False
+                STEP_UP_ACTION_CONNECTION_PURGE,
+                Permission.MESSAGES_PURGE,
+                spend=False,
+                reauth_next=_purge_confirm_continuation,
             )
         ),
         # NOT annotated, unlike every other name on this surface, and the reason is an audit
@@ -242,8 +261,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # the per-name route); then RE-DERIVE eligibility from LIVE quiescence — intersect the
         # requested ?dest with rr.outbound_quiesced(d), dropping anything since-started / not-yet-
         # quiesced. With no held proof, the gate already 303'd to /ui/reauth and the
-        # unlock flow GET-redirects back here WITHOUT the query, so dest is empty → nothing pre-
-        # armed (the operator re-selects). The confirm form POSTs to /ui/connections/purge-bulk.
+        # unlock flow GET-redirects back here WITH the query (vault BACKLOG #3241), so the
+        # selection survives the re-auth and is re-derived here like any other. The confirm form
+        # POSTs to /ui/connections/purge-bulk.
         if identity.allowed_channels is not None:
             # ADR 0150: a console RBAC denial is a security event from a specific host, so it
             # carries the browser's address exactly as the JSON API's denials do. `request` here is

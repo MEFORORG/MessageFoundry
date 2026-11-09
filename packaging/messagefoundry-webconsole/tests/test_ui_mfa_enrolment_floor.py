@@ -33,6 +33,7 @@ from _ui_clients import (
     SAME_ORIGIN,
     PresentDirectory,
     cookie_login,
+    enrolment_code_for,
     held_totp_code,
     hold_auth_wall_clock,
     mint_bound_proof,
@@ -166,7 +167,9 @@ async def test_a_console_passkey_registration_inside_the_floor_is_a_failed_verif
         c.cookies.set("mf_session", out.token)
         key = SoftAuthenticator(rp_id="t", origin="http://t")
         response = json.loads(key.create_response(base64url_to_bytes(options["challenge"])))
-        body = {"label": "key", "response": response}
+        # ADR 0207: a directory account's first factor binds only with an issued code.
+        issued = await enrolment_code_for(service, out.identity.user_id)
+        body = {"label": "key", "response": response, "enrolment_code": issued}
 
         early = await c.post("/ui/account/webauthn/verify", json=body, headers=SAME_ORIGIN)
         assert (early.status_code, early.json()) == (

@@ -371,6 +371,15 @@ a Desktop session at the rung gets REVIEW, not HALT; that gap is open. The Lande
 HALT and from the rung entirely, as STEWARD.md 3e exempts it from all three states, and so is a
 roster alias of the Lander.
 
+> **Corrected 2026-11-08: korus moved `roles/STEWARD.md`, so this section's citations of it no
+> longer resolve.** The file is now korus `roles/retired/STEWARD.md`, a record, and its live usage
+> rules moved to korus `roles/COMMON.md`, *The three usage states*. The text above is kept as
+> written. Where each cited rule is now: the 2026-08-14 rule cited as 3a is under COMMON's *The
+> weekly window sets the STATE and carries the STOP*, in *What it replaced*; section 3's 20 minutes
+> and 80 percent are in COMMON's line on the levels *"Until 2026-10-31"*; the Lander's exemption,
+> cited as 3e, is COMMON's table row *The Lander*; and 9.6a stays in `roles/retired/STEWARD.md`
+> as 9.6a, with COMMON's *Burn rate governs HOLD NEW WORK* the live statement.
+
 > **Amendment (2026-10-31): the rung moves to the weekly window.** Anthropic removed the five-hour
 > limit, and the owner ruled the same day that the weekly window now carries the stop. That replaces
 > the 2026-08-14 ruling the section above leans on, that a weekly rung stops nobody. Where this note

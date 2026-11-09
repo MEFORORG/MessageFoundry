@@ -266,29 +266,41 @@ jobs:
 
           - The install failed: a declared floor no longer installs on Python 3.14, for example no
             wheel and an sdist that does not build. Raise that floor in \`pyproject.toml\`.
-          - The floor check failed: a runtime dependency landed off its floor. A yanked >= floor
-            usually lands here, because the resolver skips it. Raise that floor in \`pyproject.toml\`.
+          - The floor check failed: a runtime or [dev] dependency landed off its floor. A yanked >=
+            floor usually lands here, because the resolver skips it. Raise that floor in
+            \`pyproject.toml\`.
           - The floor check said a dependency \`declares no floor this check can read\`: give it a
             \`>=X\` lower bound that no specifier for the same name excludes.
-          - The run concluded cancelled or timed out, so no step shows red and this issue still says
-            failed: the job hit its \`timeout-minutes\`, most likely
-            an install that hung or a build from source, unless someone stopped it by hand. Read the
-            install step.
+          - The floor check said an extra \`is not declared\`: restore that extra in
+            \`pyproject.toml\`, or change the check's default extras and this workflow's install line
+            together.
+          - The run concluded cancelled or timed out, so no step shows red: the job hit its
+            \`timeout-minutes\`, most likely an install that hung or a build from source, unless
+            someone stopped it by hand. Read the install step.
           - A guard failed: the engine does not work at its declared floors. Fix the code or raise
             the floor; the failure names the missing FastAPI symbol when that is the cause."
               ;;
           esac
 
-          BODY="Nightly (scheduled) $WF_NAME failed.
+          # Prose only: the gate above already decided this run is reported. A cancelled or timed-out
+          # run (only `dependency floors` reaches here with one) did not fail, so its body must not
+          # open by saying it did (vault BACKLOG #3177).
+          OUTCOME="failed"
+          case "$CONCLUSION" in
+            cancelled) OUTCOME="was cancelled" ;;
+            timed_out) OUTCOME="timed out" ;;
+          esac
+
+          BODY="Nightly (scheduled) $WF_NAME $OUTCOME.
 
           - run: $RUN_URL
           - commit: \`$HEAD_SHA\`
           - started: $RUN_STARTED
 
-          A scheduled run is not a PR context, so this failure appears nowhere else.
+          A scheduled run is not a PR context, so this result appears nowhere else.
           $DETAIL
 
-          This issue is opened once and commented on each subsequent failure; it closes itself when a
+          This issue is opened once and commented on each later run reported here; it closes itself when a
           nightly goes green again."
 
           if [ -n "$existing" ]; then

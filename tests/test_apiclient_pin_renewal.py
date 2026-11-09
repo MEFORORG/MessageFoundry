@@ -27,6 +27,7 @@ import pytest
 from messagefoundry import pki
 from messagefoundry.apiclient import ApiError, EngineClient
 from messagefoundry.apiclient import client as client_module
+from tests._log_absence import assert_capture_sees
 
 
 class _RenewableEngine:
@@ -234,6 +235,7 @@ def test_the_revoke_of_a_replaced_session_follows_a_renewal_with_the_replaced_to
         assert engine.answered == ["POST /auth/logout"]
         assert engine.bearers == ["Bearer tok-old"]
         assert client.token == "tok-new"
+        assert_capture_sees(caplog, "messagefoundry.apiclient.client")
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         _assert_pinned(client)
 

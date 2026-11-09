@@ -498,7 +498,7 @@ def test_the_cleartext_webhook_refusal_never_echoes_the_url(
 def test_the_webhook_scheme_and_allowlist_refusals_name_their_settings() -> None:
     """Neither of these echoed a credential before, since a scheme cannot hold one and the host is
     screened at construction. They name the setting so every refusal in the sink reads the same way."""
-    with pytest.raises(ValueError, match=r"\[alerts\]\.webhook_url must be http or https"):
+    with pytest.raises(ValueError, match=r"\[alerts\]\.webhook_url must be https"):
         WebhookTransport(f"ftp://hooks.example.invalid/{SECRET}")
     # The allowlist refusal fires at the build since BACKLOG #5088, and again at every POST.
     with pytest.raises(ValueError) as exc:
