@@ -3171,10 +3171,10 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 | `url` | — (required) | the FHIR service **base** URL (e.g. `https://host/fhir`); `http`/`https` only. Use `env()`. |
 | `fhir_version` | `R4B` | `R4B` (default) / `R5` / `STU3` — explicit (no plain-R4 on pydantic-v2 wheels) |
 | `format` | `json` | `json` only; FHIR-XML is deferred to a hardened-`lxml` path |
-| `interaction` | `create` | `create` (`POST {base}/{ResourceType}`) / `update` (`POST {base}` with a one-entry `transaction` `Bundle` whose entry is `PUT {ResourceType}/{id}`; see [the id stays out of the URL](#an-update-keeps-the-resource-id-out-of-the-url)) / `transaction` / `batch` (`POST {base}` with a `Bundle`). Takes an `env()`. The build resolves it, and `GET /security/posture` resolves it against the running graph's values, to tell whether the connection sends updates in the path form |
-| `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware update, sent like `update` with the ETag in the entry, or in an `If-Match` header with `update_url_form="path"`). Takes an `env()`, checked when the connection is built |
+| `interaction` | `create` | `create` (`POST {base}/{ResourceType}`) / `update` (`POST {base}` with a one-entry `transaction` `Bundle` whose entry is `PUT {ResourceType}/{id}`; see [the id stays out of the URL](#an-update-keeps-the-resource-id-out-of-the-url)) / `transaction` / `batch` (`POST {base}` with a `Bundle`) |
+| `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware update, sent like `update` with the ETag in the entry, or in an `If-Match` header with `update_url_form="path"`) |
 | `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`) |
-| `update_url_form` | `transaction` | how an `update` or `if-match` is sent. `transaction` keeps the id out of the URL. `path` is the plain `PUT {base}/{ResourceType}/{id}` with the ETag in an `If-Match` header, for a server with no `transaction` interaction. `path` is a **listed loosening**; see [vendor compatibility](#vendor-compatibility-and-the-path-form-opt-in). Takes an `env()`, checked when the connection is built |
+| `update_url_form` | `transaction` | how an `update` or `if-match` is sent. `transaction` keeps the id out of the URL. `path` is the plain `PUT {base}/{ResourceType}/{id}` with the ETag in an `If-Match` header, for a server with no `transaction` interaction. `path` is a **listed loosening**; see [vendor compatibility](#vendor-compatibility-and-the-path-form-opt-in) An `env()` value is read by `check` and `GET /security/posture` as [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#update_url_form--path-on-a-fhir-connection--the-resource-id-in-the-request-url) says |
 | `allowed_entry_methods` | — (**required** on `transaction`/`batch`) | (vault BACKLOG #2804) the verbs a Bundle entry may carry, from `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, spelled in upper case. There is no default: a `transaction` or `batch` connection without it does not load, or, where `interaction` is an `env()`, does not build. Refused on any other interaction. Both lists take an `env()` for the whole list: its default is checked at load, and the value it resolves to when the connection is built. A bad item is named by position, never quoted. See [A Bundle connection screens every entry](#a-bundle-connection-screens-every-entry) |
 | `allowed_entry_types` | — (any type) | (vault BACKLOG #2804) `transaction`/`batch` only: the resource types an entry's `request.url` may name, such as `["Patient", "Encounter"]`. Unset means any type. Refused on any other interaction |
 | `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
@@ -3347,16 +3347,14 @@ With `update_url_form="path"`, an `update` or `if-match` is sent as `PUT {base}/
 - The `if-match` ETag goes in the `If-Match` header, and a static `If-Match` in `headers` stays on the
   request.
 - The reply is the plain resource, so capture and `capture_response_headers` work as on any `PUT`.
-- The setting applies only to `update` and `if-match`. Set on any other connection, it is refused when the
-  connection is built, because it would do nothing. It is refused at load too when the literal values beside
-  it already rule out an update. An `env()` `interaction` or `conditional` that could still be an update
-  leaves the check to the build.
+- The setting applies only to `update` and `if-match`. Set on any other connection, it is refused,
+  because it would do nothing.
 
 **It puts each message's resource id back in the request URL**, and so in the receiving server's access
 logs. That relaxes owner ruling R3 (ASVS 14.2.1), so it is a listed loosening in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#update_url_form--path-on-a-fhir-connection--the-resource-id-in-the-request-url).
-The engine logs a WARNING naming the connection at every construction, and `messagefoundry check` names
-every connection that sets it. Set it only on the connection that needs it. FHIR is not a
+The engine logs a WARNING naming the connection at every construction, and `messagefoundry check` and
+`GET /security/posture` name it. Set it only on the connection that needs it. FHIR is not a
 `connections.toml` transport, so the setting is a `FHIR()` keyword only. This is vault BACKLOG #2550.
 
 **OperationOutcome & delivery semantics.** A 2xx is **delivered** (a returned `OperationOutcome` is captured,

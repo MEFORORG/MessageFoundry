@@ -1920,7 +1920,7 @@ count is above `0` (vault BACKLOG #2613).
 - **Compensating controls:** treat the server's access logs as PHI-bearing, with the access control and
   retention that implies, and confirm who can read any proxy log on the path.
 - **It is never silent:** a WARNING at every construction naming the connection, never an id, a
-  `fhir-update-path-form` line in `messagefoundry check` naming every connection that sets it, and
+  `fhir-update-path-form` line in `messagefoundry check` naming the connections listed below, and
   an `update_url_form` entry in `security_loosenings()`, which `GET /security/posture` shows with
   the same connection names (vault BACKLOG #2571). The last two apply one reader. A value of
   `update_url_form`, `interaction`, `conditional` or a Bundle entry list supplied through `env()` is
