@@ -2425,8 +2425,8 @@ class AuthStore(Protocol):
     # ADR 0197 Amendment A: ``password_generated`` is REQUIRED, with no default, for the reason
     # ``create_user`` gives: the generated paths pass True and every holder-chosen path passes False.
     # ``require_way_past`` makes the write CONDITIONAL on a way past the sign-in lock: a TOTP as
-    # ``judge_totp`` and the ``delete_webauthn_credential`` note say, or (wave 2) a passkey recorded
-    # as discoverable, read from the set the account's seal covers.
+    # ``judge_totp``'s ``TotpJudgement`` counts it, or (wave 2) a passkey recorded as discoverable,
+    # read in the same transaction as the write from the set the account's seal covers.
     # Returns whether a row was written; a conditional caller refuses on False.
     async def set_password(
         self,
