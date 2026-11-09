@@ -732,6 +732,17 @@ _STALE_CASES = [
         None,
         "https://host.invalid/acme-1.0-py3-none-any.whl names no package",
     ),
+    # An editable line installs a source tree or a checkout, which no lock pin holds.
+    (
+        "messagefoundry==0.5.1\n-e git+https://host.invalid/acme.git#egg=acme\n",
+        None,
+        "-e git+https://host.invalid/acme.git#egg=acme is editable, so it is not checked",
+    ),
+    (
+        "messagefoundry==0.5.1\n--editable ./acme\n",
+        None,
+        "--editable ./acme is editable, so it is not checked",
+    ),
 ]
 
 

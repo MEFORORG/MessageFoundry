@@ -347,9 +347,10 @@ jobs:
       # requirement in requirements.txt whose marker holds on this Windows runner must be in the
       # lock, under a marker that holds here too, at a version its specifier allows, compared as pip
       # compares versions. The packaging copy pip carries parses each requirement, after a copy of
-      # pip's line handling. A marker false here, an extra, and a URL or path with no name are only
-      # noted: the lock records no extras, and an unnamed URL has no name to look up. Any other line
-      # it cannot parse fails.
+      # pip's line handling. A marker false here, an extra, a URL or path with no name, and an
+      # editable line (-e or --editable) are only noted: the lock records no extras, an unnamed URL
+      # has no name to look up, and an editable installs a source tree or checkout that no lock pin
+      # holds. Any other line it cannot parse fails.
       - name: Check requirements.lock is not stale against requirements.txt
         if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
         run: |
@@ -439,13 +440,11 @@ def logical_lines(path):
     return groups + [group] * bool(group)
 
 
-def parsed(group):
-    # The requirement on a logical line, parsed by the packaging copy pip carries, after this
-    # script's copy of pip 26's line handling: join_lines (a continued line loses its backslashes
-    # and joins with nothing, a file's last line included, and a comment joins after a space), the
-    # comment strip, ${VAR} expansion and break_args_options (options start at the first word
-    # beginning with "-"). None for a line with no requirement; its text when packaging cannot read
-    # it.
+def split_line(group):
+    # A logical line's requirement text and its options, after this script's copy of pip 26's line
+    # handling: join_lines (a continued line loses its backslashes and joins with nothing, a file's
+    # last line included, and a comment joins after a space), the comment strip, ${VAR} expansion
+    # and break_args_options (options start at the first word beginning with "-").
     joined = "".join(
         ln.strip("\\") if continued(ln) else f" {ln}" if comment(ln) else ln for ln in group
     )
@@ -453,7 +452,13 @@ def parsed(group):
     code = re.sub(r"\$\{([A-Z0-9_]+)\}", lambda m: os.environ.get(m[1], m[0]), code)
     words = code.split(" ")
     first = next((n for n, word in enumerate(words) if word.startswith("-")), len(words))
-    text = " ".join(words[:first]).strip()
+    return " ".join(words[:first]).strip(), words[first:]
+
+
+def parsed(group):
+    # The requirement on a logical line, parsed by the packaging copy pip carries. None for a line
+    # with no requirement; its text when packaging cannot read it.
+    text = split_line(group)[0]
     try:
         return Requirement(text) if text else None
     except InvalidRequirement:
@@ -483,6 +488,13 @@ def unnamed(text):
     return "/" in text or "\\" in text or text.startswith(".") or scheme.isalpha() or "+" in scheme
 
 
+def editable(word):
+    # pip's -e or --editable in each spelling its option parser takes: "-e ./foo", "-e./foo",
+    # "--editable=./foo", and the long name cut to "--ed" or longer, which no other option shares.
+    name = word.split("=", 1)[0]
+    return word.startswith("-e") or (len(name) >= 4 and "--editable".startswith(name))
+
+
 locked = {}
 for group in logical_lines("requirements.lock"):
     req = parsed(group)
@@ -494,6 +506,11 @@ stale = []
 for group in logical_lines("requirements.txt"):
     req = parsed(group)
     if req is None:
+        # pip installs an editable when a line holds options and no requirement.
+        options = split_line(group)[1]
+        if any(map(editable, options)):
+            line = " ".join(options).strip()
+            print(f"::notice::{line} is editable, so it is not checked against requirements.lock")
         continue
     if isinstance(req, str):
         if unnamed(req):

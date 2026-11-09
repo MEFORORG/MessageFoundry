@@ -219,8 +219,9 @@ that package's build code may run in CI:
     specifier does not allow. The step copies pip 26's line handling (continuation lines, comments,
     `${VAR}` expansion, options), then parses each requirement with the `packaging` copy pip
     carries, so versions compare as pip compares them. A requirement whose marker is false on the
-    runner, an extra (a lock records none), and a URL or path with no package name are only noted;
-    any other line it cannot parse fails.
+    runner, an extra (a lock records none), a URL or path with no package name, and an editable
+    line (`-e` or `--editable`, which installs a source tree or checkout no lock pin holds) are
+    only noted; any other line it cannot parse fails.
   - The job takes the engine's pin out of the lock, as pip reads the lock, and installs that pin
     alone with `--no-deps --require-hashes`. The lock must pin `messagefoundry` exactly once, or the
     job says so and fails; pip refuses the pin if it carries no hash. No other locked package is
