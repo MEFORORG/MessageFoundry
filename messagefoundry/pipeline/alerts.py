@@ -737,7 +737,7 @@ class AlertSink(Protocol):
         unreachable for ``[auth].ad_reconcile_outage_passes`` passes running
         (``directory_unavailable``, BACKLOG #3709, the ``auth.ad_reconcile_skipped`` row whose
         ``passes`` the page names), raised once per run; or that many of one account's probes running
-        have failed to reach the directory while other probes got an answer
+        have failed to reach the directory, an outage pass's probes included
         (``account_unreachable``, BACKLOG #3100, the ``auth.ad_reconcile_unreached`` row), raised
         once as the account enters that state. The type's name predates every case but the first.
         Read ``reason`` before naming the cause.

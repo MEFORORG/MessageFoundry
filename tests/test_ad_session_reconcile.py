@@ -3021,8 +3021,8 @@ async def test_a_refused_entrant_after_a_rollup_pages_nothing_and_does_not_raise
 ) -> None:
     """BACKLOG #3709, review round 2. With seven accounts already paged by a rollup, one more
     account entering whose row is refused leaves nothing to page. The rollup must not be set on
-    the paged accounts alone: set with no entry, the lifespan task took the run's length from an
-    empty list and raised, which cost that pass's later pages and inverses.
+    the paged accounts alone: set with no entry, the lifespan task would take the run's length
+    from an empty list and raise, costing that pass's later pages and inverses.
 
     RED when: such a pass carries ``unreached_rollup`` with no entry, so alerting it raises."""
     store = await MessageStore.open(":memory:")
@@ -3048,9 +3048,101 @@ async def test_a_refused_entrant_after_a_rollup_pages_nothing_and_does_not_raise
         monkeypatch.setattr(service, "_audit_reconciler_row", refuse_late)
         ldap.unreachable = set(names[1:])
         for _ in range(3):
-            plan = await _pass(service, sink)  # raised ValueError on the third pass before the fix
+            plan = await _pass(service, sink)
         assert plan.unreached == () and not plan.unreached_rollup
         assert len([e for e in sink.events if e[1] == _UNREACHED_ALERT_SOURCE]) == 1
+    finally:
+        await store.close()
+
+
+def _unreached_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The per-account WARNING lines for accounts entering the lasting unreachable state."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "probes running of" in r.getMessage()
+    ]
+
+
+async def test_refused_unreached_rows_log_no_per_account_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3709, review round 3. Seven accounts entering would roll up, but six rows are
+    refused, so the pass does not roll up. Only the written account gets its WARNING; each
+    refused row has the soft write's ERROR. Logging every entry would turn the one rollup line
+    into a WARNING per account per pass for as long as the store refuses.
+
+    RED when: a refused account still gets the per-account WARNING."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ["ok"] + [f"flap{i}" for i in range(7)]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        real = service._audit_reconciler_row
+
+        async def only_flap0(action: str, **kwargs: Any) -> bool:
+            if action == "auth.ad_reconcile_unreached" and kwargs.get("actor") != "flap0":
+                return False
+            return await real(action, **kwargs)
+
+        monkeypatch.setattr(service, "_audit_reconciler_row", only_flap0)
+        sink = _InverseSink()
+        ldap.unreachable = set(names[1:])
+        for _ in range(2):
+            await _pass(service, sink)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            plan = await _pass(service, sink)
+        assert len(plan.unreached) == 1 and not plan.unreached_rollup
+        warned = _unreached_warnings(caplog)
+        assert len(warned) == 1 and "flap0" in warned[0]
+    finally:
+        await store.close()
+
+
+async def test_an_unreached_row_write_that_raises_keeps_the_earlier_warnings(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3709, review round 3. Where the entries cannot roll up, each account's WARNING
+    follows its own row, so a later write that raises, ending the pass, still leaves the WARNING
+    for every account whose row was written before it.
+
+    RED when: the WARNINGs wait for the whole write loop, so a raise leaves none."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ["ok", "flapA", "flapB"]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        real = service._audit_reconciler_row
+        written: list[str] = []
+
+        async def raise_on_second(action: str, **kwargs: Any) -> bool:
+            if action == "auth.ad_reconcile_unreached":
+                if written:
+                    raise RuntimeError("store gone")
+                written.append(str(kwargs["actor"]))
+            return await real(action, **kwargs)
+
+        monkeypatch.setattr(service, "_audit_reconciler_row", raise_on_second)
+        sink = _InverseSink()
+        ldap.unreachable = set(names[1:])
+        for _ in range(2):
+            await _pass(service, sink)
+        caplog.clear()
+        with (
+            caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"),
+            pytest.raises(RuntimeError, match="store gone"),
+        ):
+            await _pass(service, sink)
+        assert len(written) == 1
+        warned = _unreached_warnings(caplog)
+        assert len(warned) == 1 and written[0] in warned[0]
     finally:
         await store.close()
 

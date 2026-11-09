@@ -662,10 +662,23 @@ _FORFEIT_NOBODY_ELSE: Final[str] = (
     ", because a restarted process does not resolve one it finds open, and a [cluster] node or "
     "an engine of more than one engine shard resolves none itself"
 )
-#: More accounts than this standing unreachable at once page as one (BACKLOG #3100 closing step
-#: 2; `AuthService._note_unreached_accounts`). A fixed number, not a setting, so tuning the
+#: Where the accounts already paged unreachable plus those whose row this pass wrote are more than
+#: this, those entering page as one (BACKLOG #3100 closing step 2, #3709;
+#: `AuthService._record_unreached_accounts`). A fixed number, not a setting, so tuning the
 #: mass-revoke breaker does not change how these page.
 _UNREACHED_ROLLUP_ABOVE: Final[int] = 5
+
+
+def _log_unreached_account(username: str, probes: int) -> None:
+    """The WARNING for one account entering the lasting unreachable state (BACKLOG #3100)."""
+    _log.warning(
+        "directory reconcile: %d probes running of %s failed to reach the directory, so its "
+        "sessions are not revoked while this lasts",
+        probes,
+        scrub_log_argument(username),
+    )
+
+
 #: What a forfeited standing logs when a new condition of its kind opens (BACKLOG #3083).
 _FORFEITED_EPISODE_WARNINGS: Final[dict[_EpisodeKind, str]] = {
     "breaker": (
@@ -8599,8 +8612,14 @@ class AuthService:
         :data:`_UNREACHED_ROLLUP_ABOVE`. Nothing is latched before the pass ends, so the paged set
         holds only earlier passes' accounts. Decided on the entries instead, a pass whose refusals
         left five or fewer standing paged its written ones under the bare source, naming none, and
-        one whose every row was refused carried a rollup with nothing in it. It logs one WARNING
-        naming each entry, or one WARNING with the count on a rolled-up pass."""
+        one whose every row was refused carried a rollup with nothing in it.
+
+        It logs one WARNING naming each account whose row was written, or one WARNING with the
+        count on a rolled-up pass; a refused row has the soft write's ERROR instead. Where the
+        entries cannot make a rollup, each account's WARNING follows its own row, so a write that
+        raises leaves one for every account written before it."""
+        paged = self._reconcile_unreached_paged
+        may_roll_up = len(paged) + len(plan.unreached) > _UNREACHED_ROLLUP_ABOVE
         written: list[tuple[str, str, int]] = []
         for entry in plan.unreached:
             _user_id, username, probes = entry
@@ -8617,12 +8636,11 @@ class AuthService:
                 ),
             ):
                 written.append(entry)
+                if not may_roll_up:
+                    _log_unreached_account(username, probes)
         # A rollup only with something written: one with nothing would page nothing, and the
         # lifespan task reads the run's length off the entries (final-round finding 1).
-        rollup = (
-            bool(written)
-            and len(self._reconcile_unreached_paged) + len(written) > _UNREACHED_ROLLUP_ABOVE
-        )
+        rollup = bool(written) and len(paged) + len(written) > _UNREACHED_ROLLUP_ABOVE
         if rollup:
             _log.warning(
                 "directory reconcile: %d accounts entered a run of unreachable probes, so their "
@@ -8630,14 +8648,9 @@ class AuthService:
                 "names each",
                 len(written),
             )
-        else:
-            for _user_id, username, probes in plan.unreached:
-                _log.warning(
-                    "directory reconcile: %d probes running of %s failed to reach the directory, "
-                    "so its sessions are not revoked while this lasts",
-                    probes,
-                    scrub_log_argument(username),
-                )
+        elif may_roll_up:
+            for _user_id, username, probes in written:
+                _log_unreached_account(username, probes)
         return replace(plan, unreached=tuple(written), unreached_rollup=rollup)
 
     def _latch_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:

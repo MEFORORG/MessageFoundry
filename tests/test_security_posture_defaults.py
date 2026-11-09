@@ -786,7 +786,11 @@ def test_a_reconciler_knob_is_named_only_in_its_looser_direction(
 @pytest.mark.parametrize(
     ("field", "value", "words"),
     [
-        ("ad_session_recheck_seconds", 600, "which waits for 3 of that account's own probes"),
+        (
+            "ad_session_recheck_seconds",
+            600,
+            "probes running fail, no sooner than 1200 s after the first of them",
+        ),
         ("ad_session_recheck_max_users", 6, "the page about one account the directory keeps"),
     ],
 )

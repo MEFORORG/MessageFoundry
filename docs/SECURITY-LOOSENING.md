@@ -939,8 +939,8 @@ count is above `0` (vault BACKLOG #2613).
   `auth.ad_reconcile_skipped` audit row; only the page waits. The table row above gives the load's
   bound.
 - **What you lose, the unreachable-account page:** the page about one account the directory keeps
-  failing for while it answers others (vault BACKLOG #3100) counts that account's own probes, not
-  outage passes, so the least delay above does not describe it. A value above `3`, a longer
+  failing for (vault BACKLOG #3100) counts that account's own probes, not outage passes, so the
+  least delay above does not describe it. An `ad_reconcile_outage_passes` above `3`, a longer
   `ad_session_recheck_seconds`, or an `ad_session_recheck_max_users` below `200` in an estate larger
   than the budget delays it. The `ad_reconcile_outage_passes` row of
   [CONFIGURATION.md](CONFIGURATION.md) states when it comes, including that no account pages while
