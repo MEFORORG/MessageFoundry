@@ -14046,17 +14046,16 @@ class AuthService:
         extra), it refuses before reading anything, since no read could change the answer.
 
         Otherwise the passkeys are read wherever the account's sealed record names one, even where
-        a TOTP is on and no passkey can count: the store's write reads them too, and would raise on
-        a row that does not parse after the hash. They are read through
-        :meth:`_verified_passkeys`, as :meth:`_has_way_past` reads them, so a row that does not
-        parse is no exception and a set that fails its seal is reported. Such a set counts for
-        nothing, and so does one with a cell the driver cannot decode while fetching
-        (:func:`passkey_cell_undecodable`), as the census counts it; then only the TOTP can pass,
-        and it is judged here, a second open of the cell. Where its TOTP counts beside an
-        undecodable cell, the store's write still reads the set after the hash and raises the
-        driver's error."""
+        a TOTP is on and no passkey can count. They are read through :meth:`_verified_passkeys`, as
+        :meth:`_has_way_past` reads them, so a row that does not parse is no exception and a set
+        that fails its seal is reported. Such a set counts for nothing, and so does one with a cell
+        the driver cannot decode while fetching (:func:`passkey_cell_undecodable`), as the census
+        counts it; then only the TOTP can pass, and it is judged here. A KNOWN-refused TOTP is
+        therefore refused before the hash. Where the TOTP counts beside a row that does not parse
+        or a cell that cannot be decoded, the store's write still reads the set after the hash and
+        raises."""
         if not user.totp_enabled and not (
-            webauthn.available() and self.passkeys_count_as_way_past()
+            self.passkeys_count_as_way_past() and webauthn.available()
         ):
             raise FactorEnrolmentRequired()
         held: list[WebAuthnCredential] | None = []
@@ -14174,9 +14173,9 @@ class AuthService:
     def passkeys_count_as_way_past(self) -> bool:
         """Whether any passkey can count as a way past the sign-in lock at the factor-drop gates:
         only where the configuration names a relying party (:meth:`_gate_counts`, BACKLOG #3937).
-        The console's enrol-first notice asks it, so it offers a passkey only where one would
-        discharge the requirement, and the first-factor refusal of a passkey that is not
-        discoverable asks it too."""
+        It does not ask whether the ``[webauthn]`` extra is present. Its askers include at least
+        the console's enrol-first notice, the first-factor refusal of a passkey that is not
+        discoverable, the lock escalation and the rotation's early refusal."""
         return self._way_past_rp_id is not None
 
     async def _holds_gate_passkey(self, user: VerifiedUser) -> bool:

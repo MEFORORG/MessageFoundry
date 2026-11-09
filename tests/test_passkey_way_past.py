@@ -2295,23 +2295,28 @@ async def test_without_the_webauthn_extra_a_passkey_does_not_open_the_rotation(
 
 
 @pytest.mark.parametrize(
-    ("corrupt", "rp_id"),
-    [(True, RP), (True, None), (False, RP)],
-    ids=["malformed", "malformed-no-rp-id", "control"],
+    ("corrupt", "rp_id", "available"),
+    [(True, RP, True), (True, None, True), (True, RP, False), (False, RP, True)],
+    ids=["malformed", "malformed-no-rp-id", "malformed-no-extra", "control"],
 )
 async def test_a_passkey_row_that_does_not_parse_refuses_the_rotation_before_the_hash(
-    corrupt: bool, rp_id: str | None
+    corrupt: bool, rp_id: str | None, available: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The rotation reads the passkey set through the service's verified read, so a row that does
     not parse counts for nothing and is never an exception: beside a refused TOTP the change is
-    the enrolment refusal, before any argon2 hash, and so where no relying party is configured
-    and no passkey could count anyway. The control: the same account with its row intact
-    rotates. RED when: the set is read only in the store's write, which raises after the hash."""
+    the enrolment refusal, before any argon2 hash, and so where no relying party is configured,
+    or the ``[webauthn]`` extra is absent, and no passkey could count anyway. The control: the
+    same account with its row intact rotates. RED when: the set is read only in the store's
+    write, which raises after the hash, or the early refusal skips the read for a TOTP that is
+    on."""
+    from messagefoundry.auth import webauthn as wa
+
     store = await MessageStore.open(":memory:")
     try:
         service, identity, hashes = await _passkey_owner_counting_hashes(
             store, way_past_rp_id=rp_id
         )
+        monkeypatch.setattr(wa, "available", lambda: available)
         if not corrupt:
             assert await service.change_password(identity, _NEW_PASSWORD) == []
             assert hashes == [1]
@@ -2381,15 +2386,16 @@ async def test_a_passkey_cell_the_driver_cannot_decode_refuses_the_rotation_befo
     [(None, True, True), (RP, False, True), (RP, True, False)],
     ids=["no-rp-id", "no-extra", "control-a-passkey-can-count"],
 )
-async def test_a_store_error_cannot_turn_the_rotation_refusal_into_an_exception(
+async def test_with_no_totp_on_a_store_error_cannot_turn_the_rotation_refusal_into_an_exception(
     monkeypatch: pytest.MonkeyPatch, rp_id: str | None, available: bool, refused: bool
 ) -> None:
     """A covered account with no TOTP on, where no passkey can count (no configured relying party,
     or no ``[webauthn]`` extra): no passkey read could change the answer, so the rotation is the
     enrolment refusal before any read and before the hash, and a passkey read that would fail with
     ``database is locked`` never runs. The control: where a passkey can count the set is read, and
-    the error raises, before the hash. RED when: the early refusal reads the set where nothing it
-    holds can count."""
+    the error raises, before the hash. With a TOTP on the set is still read, so there the error
+    still raises; no arm here covers that. RED when: the early refusal reads the set where no TOTP
+    is on and no passkey can count."""
     from messagefoundry.auth import webauthn as wa
 
     store = await MessageStore.open(":memory:")
