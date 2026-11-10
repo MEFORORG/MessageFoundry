@@ -1649,7 +1649,8 @@ def resolve_env_settings(
     the failure is loud and actionable, not a raw traceback that names nothing and aborts on the
     first bad value (fail loud, never blank; review M-22). A cast is an arbitrary callable, so
     **every** exception it raises is caught and redacted, not just ``ValueError``/``TypeError``
-    (BACKLOG #1656; see the handler)."""
+    (BACKLOG #1656), and so is a ``SystemExit`` from ``sys.exit()`` in it (vault BACKLOG #5105; see
+    the handler)."""
     resolved: dict[str, Any] = {}
     missing: list[str] = []
     bad: list[str] = []
@@ -1679,7 +1680,7 @@ def resolve_env_settings(
                 if name in bool_defaults:
                     want = "bool"
                     got = _read_bool_setting(got, bool_defaults[name])
-            except Exception as exc:
+            except (Exception, SystemExit) as exc:
                 # BACKLOG #1656 limb 2: `Exception`, not `(ValueError, TypeError)`. A cast is
                 # an arbitrary callable, so it can raise anything -- a `KeyError` from a
                 # lookup-table cast was the measured case -- and a non-(ValueError, TypeError)
@@ -1687,8 +1688,14 @@ def resolve_env_settings(
                 # text. That re-opened, for every other exception type, exactly the leak
                 # BACKLOG #1183 closed for the ValueError arm. The redaction below is the
                 # whole point of catching it, so it has to cover every way a cast can fail.
-                # NEVER `BaseException`: a KeyboardInterrupt or SystemExit is not a cast
-                # failure and must keep propagating.
+                #
+                # `SystemExit` too (vault BACKLOG #5105): a cast that calls `sys.exit()` is a
+                # script habit in a setting reader, not a request to stop. Uncaught, it left a
+                # reload, and `messagefoundry check` ended with the cast's code, 0 included,
+                # which reads as a pass; `sys.exit("...")` can also carry the value it was
+                # handed. It is refused here like any other cast failure, its code and text
+                # withheld. NEVER `BaseException`: a KeyboardInterrupt is an operator stopping
+                # the work, not a cast failure, and must keep propagating.
                 #
                 # NEVER the raw value: a MEFOR_VALUE_* env() setting carries store passwords
                 # and connector keys, and this string is raised at startup into the operator
@@ -5851,7 +5858,11 @@ def _resolve_port(raw: Any, env_values: Mapping[str, Any]) -> int | None:
         if raw.cast is not None:
             try:
                 value = raw.cast(value)
-            except (ValueError, TypeError):
+            except (Exception, SystemExit):  # noqa: BLE001
+                # Any cast failure, a sys.exit() in it included (vault BACKLOG #5105), is skipped
+                # here unread: its text can carry the value, and resolve_env_settings refuses the
+                # same ref loud and redacted when the connector is built. Not BaseException: a
+                # KeyboardInterrupt is not the cast's failure.
                 return None
         raw = value
     try:
@@ -5981,7 +5992,9 @@ def _resolve_one_env_value(ref: EnvRef, values: Mapping[str, Any]) -> Any:
             return raw
         try:
             return ref.cast(raw)
-        except Exception as exc:  # noqa: BLE001 - BACKLOG #1656: any cast error can quote the value
+        # BACKLOG #1656: any cast error can quote the value; a sys.exit() in the cast is a cast
+        # failure too (vault BACKLOG #5105), as resolve_env_settings treats it.
+        except (Exception, SystemExit) as exc:  # noqa: BLE001
             _logger.debug(
                 "env() value %r: its cast raised %s; skipped by this probe",
                 ref.key,
@@ -10917,8 +10930,9 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     leave the loader with its text (vault BACKLOG #3765 item 4).
 
     A module that calls ``sys.exit()`` at import is a bad config, not a request to end the process
-    (vault BACKLOG #3134). The setting cast and the config diagnostics elsewhere in this module leave
-    ``SystemExit`` alone because it is not their kind of failure; this runs the author's module: on a
+    (vault BACKLOG #3134). The config diagnostics elsewhere in this module leave ``SystemExit``
+    alone because it is not their kind of failure, though the ``env()`` cast readers refuse it since
+    vault BACKLOG #5105, a cast being the author's code too; this runs the author's module: on a
     serving engine (at least a reload) it would leave the event loop and stop every connection, and
     at ``check`` it would end the run as if it had passed. So it is refused like any
     failing module, by its real type, because ``isinstance`` would run a ``__class__`` of the

@@ -163,6 +163,9 @@ from messagefoundry.parsing.sniff import (
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
+from messagefoundry.pipeline.dryrun import (
+    UserCodeCalledSysExit as UserCodeCalledSysExit,  # re-exported, one definition (BACKLOG #5105)
+)
 from messagefoundry.pipeline.ingress_guards import (
     STRICT_VALIDATE_TIMEOUT_SECONDS,
     IngressBodyRejected,
@@ -12250,39 +12253,6 @@ class RegistryRunner:
 class _RedactedFault(Exception):
     """An exception whose message is already redacted with :func:`safe_exc`, so a log line or a
     ``last_error`` built from it carries no raw driver text, which can quote a cell (section 9)."""
-
-
-class UserCodeCalledSysExit(_RedactedFault):
-    """A Router or a Handler raised ``SystemExit``, ``sys.exit()`` called at run time (vault BACKLOG
-    #3134). Converted at least where the engine runs that code in-process, so the message takes the
-    internal-error policy as for any other raise. At ``[sandbox].mode`` subprocess or isolated, the
-    worker's ``_run_one`` converts at least a ``sys.exit()`` raised while the Router, predicate or
-    Handler runs, a generator Router's body included, and reports this class's text as an error;
-    the parent then raises ``SandboxError`` carrying it, and the worker serves the next message.
-    At least one case is not converted: at ``mode=off``, a ``sys.exit()`` in the ``__str__`` of an
-    exception user code raised, which the internal-error path renders on the event loop.
-
-    **Why this differs from the config-code rule in ``config/wiring.py``**, whose comments say never
-    to catch ``BaseException`` because ``SystemExit`` must keep propagating. That rule is about code
-    the operator runs: a setting cast or a diagnostic, during a load the operator started. A Router
-    or Handler runs once per message, after the ACK, in a worker thread, and a ``SystemExit`` there
-    is a script habit in one piece of logic, not a request to stop the engine. Left alone, asyncio
-    re-raises it out of the event loop and every connection stops. Only ``SystemExit`` is converted.
-    The catch is no wider, so a ``KeyboardInterrupt`` or ``CancelledError`` that Router or Handler
-    code raises itself still escapes, as it did before this class existed. In a worker thread a
-    ``KeyboardInterrupt`` is no signal to the engine, since Python delivers Ctrl+C to the main
-    thread, so one Router or Handler code raises would still be re-raised out of the event loop and
-    stop every connection. Converting it too is not done here.
-
-    Redacted by construction: the text names an integer exit code and nothing else, since
-    ``sys.exit("...")`` carries the author's text, which could quote a field. Named without a leading
-    underscore because the name reaches operators, in a dead-letter reason and an alert detail."""
-
-    @classmethod
-    def from_exit(cls, exc: SystemExit) -> UserCodeCalledSysExit:
-        code = exc.code
-        named = f" with code {code}" if isinstance(code, int) and not isinstance(code, bool) else ""
-        return cls(f"Router or Handler code raised SystemExit{named} (sys.exit() at run time)")
 
 
 def _as_content_fault(exc: Exception | SystemExit) -> Exception:
