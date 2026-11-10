@@ -431,9 +431,8 @@ target, no `pickle` import left to mis-suppress:
   > - On Linux, a forged answer from a same-UID process that opened the worker's `/proc/<pid>/fd/0`.
   > - A forged lookup at `mode=isolated`, read after a call's check before its request and ahead of
   >   its answer.
-  > - A forged `denied` or `error` answer.
-  > - A forged `memory` answer.
-  > - The desync of the next message after a partial read of fd 0 and a forged answer.
+  > - The desync of the next message after a partial read of fd 0 and a forged answer that keeps
+  >   the worker.
   >
   > A forged answer from code running in the worker is not in this list: it falls under the residual
   > *One Handler is not confined from another inside a worker*.
