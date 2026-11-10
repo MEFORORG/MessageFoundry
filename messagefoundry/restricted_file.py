@@ -415,8 +415,10 @@ def _is_package_sid(sid: str) -> bool:
 
 def _screened_principal(sid: str) -> str | None:
     """What ``sid`` is, when a key file may name it neither as a read grant nor as its owner: an
-    application package, or a broad group. ``None`` when it may be named. One screen for both, so
-    a later screen reaches grants and owners alike."""
+    application package, or a broad group. ``None`` when it may be named. One screen for both on
+    the create, so a later screen reaches grants and owners alike there. The check before a key file
+    is used, :func:`_windows_access_problem`, calls the two predicates itself and judges entries,
+    not the owner."""
     if _is_package_sid(sid):
         return "an application package"
     if _is_broad_group(sid):
@@ -1245,7 +1247,8 @@ class OwnerRefused(RestrictedFileError):
 def _sid_libraries() -> tuple[Any, Any]:
     """``advapi32`` and ``kernel32``, loaded once, with the prototypes of the SID calls this
     module's account helpers share declared once: converting a SID to and from its string form,
-    looking one up, checking a token's membership, and freeing what those return. Windows only."""
+    looking up a SID's account, checking a token's membership, and freeing what those return. At
+    least the name lookup and the create still declare their own. Windows only."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise RestrictedFileError("a SID is converted on Windows only")
     import ctypes
@@ -1332,11 +1335,13 @@ def write_restricted_file(
 
     ``owner`` (Windows only) is the account the file is created owned by, in the call that creates
     it, and read back through the creating handle before a byte is written. It is a SID, with or
-    without a leading ``*``, or the name of ONE account: a name that resolves to a group or an
-    alias is refused, as for a read grant, so a group such as Administrators is named by its SID.
-    An application package or a broad group is refused as an owner, as it is as a read grant. A
-    token that may not make that account an owner, or a file that reads back owned by anyone else,
-    raises :class:`RestrictedFileError`. Left out, the owner is the creating token's default.
+    without a leading ``*``, or a name: a name Windows reports as a group, an alias or a domain is
+    refused, as for a read grant, so a group such as Administrators is named by its SID. A name it
+    reports as a well-known account passes that gate, and a SID is taken as given. Then an
+    application package, and at least the broad groups :func:`_is_broad_group` knows, are refused
+    as an owner, as they are as a read grant; other groups are not screened here. A token that may
+    not make that account an owner, or a file that reads back owned by anyone else, raises
+    :class:`RestrictedFileError`. Left out, the owner is the creating token's default.
 
     ``creator_access`` (Windows only to turn off) gives the creating account full control. With it
     off the list is SYSTEM and Administrators with full control and each read grant with read, and
@@ -1451,7 +1456,7 @@ def _create_restricted(
     if not creator_access:
         raise RestrictedFileError("a file without its creator's access is made on Windows only")
     if owner is not None:
-        # Refused even when it names this account: POSIX takes no owner at create (#6674 item 6).
+        # Refused even when it names this account: POSIX takes no owner at create (vault BACKLOG #6674).
         raise RestrictedFileError(
             "an owner is named for a new file on Windows only; on POSIX the account that creates "
             "a file owns it"
@@ -1548,7 +1553,7 @@ def _create_restricted_windows(
     read_sids = [_resolve_sid(name) for name in read_grants]
     # Resolved as a grant is, so only a SID Windows itself rendered reaches the descriptor, and the
     # read-back compares like with like.
-    owner_sid = None if owner is None else _resolve_sid(owner)
+    owner_sid = None if owner is None else _resolve_sid(owner, as_owner=True)
     for name, sid in zip(read_grants, read_sids, strict=True):
         # A grant that would make the file broadly readable is not a restricted create.
         if (what := _screened_principal(sid)) is not None:
@@ -1674,7 +1679,7 @@ def _create_restricted_windows(
         raise
 
 
-def _resolve_sid(principal: str) -> str:
+def _resolve_sid(principal: str, *, as_owner: bool = False) -> str:
     """The string SID of ``principal``: an account name, or a SID with or without a leading ``*``.
 
     A NAME must resolve to one account: a group, an alias or a domain is refused. A SID literal is
@@ -1711,6 +1716,9 @@ def _resolve_sid(principal: str) -> str:
             raise RestrictedFileError(
                 f"{principal!r} names a group or a domain, not one account, so a key file cannot "
                 "be granted to it. Name the one account the engine runs as"
+                if not as_owner
+                else f"{principal!r} names a group or a domain, not one account; an owner is "
+                "named by one account's name or by a SID"
             )
     if rendered is None:
         raise refusal

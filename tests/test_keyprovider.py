@@ -221,8 +221,9 @@ def test_an_external_provider_whose_backend_import_breaks_fails_closed(
     monkeypatch: pytest.MonkeyPatch, error: ImportError
 ) -> None:
     # Vault BACKLOG #6709: an SDK that is installed but broken raises a plain ImportError, not
-    # ModuleNotFoundError. It must leave as the KeyProviderError every caller words a refusal
-    # around, chained to the original, never as a raw ImportError.
+    # ModuleNotFoundError. The seam itself must raise the KeyProviderError its contract names,
+    # chained to the original, never a raw ImportError. The resolve_active_key half is a control:
+    # it already refused any provider error as a KeyProviderError before this fix.
     def _import(_name: str) -> ModuleType:
         raise error
 

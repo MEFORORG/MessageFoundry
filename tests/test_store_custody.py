@@ -995,7 +995,12 @@ def _engine_sid() -> str:
 def _is_elevated() -> bool:
     # The production pre-check itself, so a test skips exactly where write_handoff_file refuses
     # up front (vault BACKLOG #6674 item 5), never on a second API's answer to a nearby question.
-    return sys.platform == "win32" and restricted_file.administrators_enabled()
+    if sys.platform != "win32":
+        return False
+    try:
+        return restricted_file.administrators_enabled()
+    except RestrictedFileError:
+        return False  # a token that cannot be read is not elevated; never fail collection
 
 
 #: The handoff is written owned by Administrators, which a token may make a file's owner where it

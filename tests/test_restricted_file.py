@@ -577,7 +577,12 @@ def test_windows_creates_the_drafts_descriptor_without_the_creators_entry(tmp_pa
 
 def _is_elevated() -> bool:
     # The production pre-check, not a second API (vault BACKLOG #6674 item 5).
-    return sys.platform == "win32" and restricted_file.administrators_enabled()
+    if sys.platform != "win32":
+        return False
+    try:
+        return restricted_file.administrators_enabled()
+    except RestrictedFileError:
+        return False  # a token that cannot be read is not elevated; never fail collection
 
 
 @windows_only

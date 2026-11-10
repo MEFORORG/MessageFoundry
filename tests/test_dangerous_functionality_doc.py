@@ -493,9 +493,10 @@ def test_every_library_load_names_its_library_with_a_literal() -> None:
     assert not unnamed, f"reviewed computed loads not named under 'What holds them': {unnamed}"
 
 
-#: The modules that reach the process's own symbols with ``CDLL(None)``, which section 5's "What
-#: holds them" paragraph names one by one (vault BACKLOG #6674 item 8).
-_REVIEWED_PROCESS_SYMBOL_LOADS = frozenset({"restricted_file.py", "store/crypto.py"})
+#: The modules that reach the process's own symbols with ``CDLL(None)``, and how many such calls
+#: each makes, so a new call in a listed module is reviewed too. Section 5's "What holds them"
+#: paragraph names each module (vault BACKLOG #6674 item 8).
+_REVIEWED_PROCESS_SYMBOL_LOADS: dict[str, int] = {"restricted_file.py": 1, "store/crypto.py": 2}
 
 
 def _process_symbol_loads(source: str) -> int:
@@ -511,11 +512,13 @@ def _process_symbol_loads(source: str) -> int:
 def test_every_process_symbol_load_is_reviewed_and_named() -> None:
     """``CDLL(None)`` passes the literal-name check above, yet it resolves from the process's global
     symbol scope, so each site is pinned here and named under "What holds them"."""
-    found = frozenset(
-        rel for rel, source in _package_sources().items() if _process_symbol_loads(source)
-    )
+    found = {
+        rel: count
+        for rel, source in _package_sources().items()
+        if (count := _process_symbol_loads(source))
+    }
     assert found == _REVIEWED_PROCESS_SYMBOL_LOADS, (
-        f"modules that call CDLL(None) changed: {sorted(found)}. Review each, register it in "
+        f"CDLL(None) calls by module changed: {found}. Review each, register it in "
         "_REVIEWED_PROCESS_SYMBOL_LOADS and name it in docs/DANGEROUS-FUNCTIONALITY.md section 5."
     )
     holds = _section(_doc_text(), 5).partition("**What holds them.**")[2]
