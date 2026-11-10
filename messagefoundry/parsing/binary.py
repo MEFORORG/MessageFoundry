@@ -308,7 +308,14 @@ def extract_obx_document(message: Message, *, occurrence: int = 1) -> bytes:
     §7). Reads the ``Encoding`` component (``OBX-5.4``), requires it to be ``"Base64"``
     (case-insensitive), then decodes the data component (``OBX-5.5``). Raises
     :class:`BinaryCarriageError` if ``OBX-2`` is not ``ED``, the encoding is not ``Base64``, or the
-    data is corrupt — so a Handler can dead-letter rather than mis-decode."""
+    data is corrupt — so a Handler can dead-letter rather than mis-decode. It raises
+    :class:`BinaryCarriageError` too when ``Message._encoding_chars`` cannot read the message's
+    delimiters, such as an MSH-2 shorter than four characters or no MSH at all (BACKLOG #2873)."""
+    if not _delimiters_readable(message):
+        # Every read below would raise the bare ValueError, whose text quotes MSH-1 and MSH-2.
+        raise BinaryCarriageError(
+            f"{_unreadable_delimiters_cause(message)}, so no OBX can be read; refusing the extract"
+        )
     obx2 = message.field("OBX-2", occurrence=occurrence)
     if (obx2 or "").upper() != "ED":
         raise BinaryCarriageError(f"OBX-2 is {obx2!r}, not 'ED' — not an embedded document")
@@ -613,13 +620,9 @@ def iter_obx_documents(
         # Every OBX-5.5 read below would raise a plain ValueError, which no listener records;
         # named here, it is a refusal both of them answer (BACKLOG #5099). The text names the one
         # cause the body has, since the listeners store it: only a short MSH-2 reaches them.
-        if not message.count_segments("MSH"):
-            cause = "the body has no MSH"
-        elif len(message._raw_field("MSH", 2)) < 4:
-            cause = "its first MSH's MSH-2 is shorter than four characters"
-        else:
-            cause = "its first MSH's MSH-1 is not one character"
-        raise UnreadableDelimitersError(f"{cause}, so no OBX-5.5 can be read; refusing the detach")
+        raise UnreadableDelimitersError(
+            f"{_unreadable_delimiters_cause(message)}, so no OBX-5.5 can be read; refusing the detach"
+        )
     occurrences: list[int] = []
     documents: list[int] = []
     value_holds_marker = False
@@ -680,6 +683,16 @@ def _delimiters_readable(message: Message) -> bool:
             raise
         return False
     return True
+
+
+def _unreadable_delimiters_cause(message: Message) -> str:
+    """Name, without quoting either field, why :func:`_delimiters_readable` answered False for
+    ``message``: it has no MSH, its first MSH's MSH-2 is short, or its MSH-1 is not one character."""
+    if not message.count_segments("MSH"):
+        return "the body has no MSH"
+    if len(message._raw_field("MSH", 2)) < 4:
+        return "its first MSH's MSH-2 is shorter than four characters"
+    return "its first MSH's MSH-1 is not one character"
 
 
 def _scan_obx(message: Message, occ: int, min_b64_len: int) -> tuple[bool, bool, bool, bool]:
