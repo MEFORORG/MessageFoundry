@@ -565,6 +565,33 @@ def test_a_snapshot_that_could_not_read_a_value_file_names_none_for_it(tmp_path:
     assert other.environment_file(cfg / "environments" / "dev.toml") == b'host = "dev"\n'
 
 
+def test_an_unlisted_config_directory_covers_its_environments_folder_but_not_the_value_file(
+    tmp_path: Path,
+) -> None:
+    """Vault BACKLOG #5120 step 2. A snapshot that could not list the config directory itself
+    (``.`` unreadable) cannot say what its ``environments`` folder held. Before, a lookup there
+    answered no file. Defence in depth: the shipped reload reads strictly and never hands this
+    lookup a lax snapshot, so a constructed one stands in."""
+    cfg = tmp_path / "cfg"
+    (cfg / "environments").mkdir(parents=True)
+    in_folder = cfg / "environments" / "dev.toml"  # absent, as an unlisted folder can look
+    held = tmp_path / "values" / "dev.toml"
+    held.parent.mkdir()
+    held.write_bytes(b'host = "held"\n')
+    # The control: with nothing unreadable, the same lookup answers no file.
+    assert ConfigSnapshot(directory=cfg, files={}).environment_file(in_folder) is None
+    snapshot = ConfigSnapshot(
+        directory=cfg,
+        files={"@value-file/dev.toml": b'host = "held"\n'},
+        unreadable=(".",),
+        value_file=held,
+    )
+    with pytest.raises(OSError, match="could not read this value file"):
+        snapshot.environment_file(in_folder)
+    # The value file is read by its own path wherever it sits, so "." says nothing about it.
+    assert snapshot.environment_file(held) == b'host = "held"\n'
+
+
 def test_serve_s_value_reader_parses_the_snapshot_or_answers_none(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

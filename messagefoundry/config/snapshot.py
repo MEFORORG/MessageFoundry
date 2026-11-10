@@ -294,7 +294,11 @@ class ConfigSnapshot:
             raise NotInSnapshot(f"{value_file} is not a value file the config snapshot read")
         prefix = f"{folder}/"
         want = os.path.normcase(prefix + value_file.name)
-        if any(rel == folder or os.path.normcase(rel) == want for rel in self.unreadable):
+        # A config directory the snapshot could not list ("." unreadable) holds the environments
+        # folder too, so it covers that folder's files (vault BACKLOG #5120). Never the value file
+        # held as @value-file, which is read by its own path wherever it sits.
+        covering = (folder, ".") if folder == _ENVIRONMENTS_DIR else (folder,)
+        if any(rel in covering or os.path.normcase(rel) == want for rel in self.unreadable):
             raise OSError(errno.EACCES, "the config snapshot could not read this value file")
         # A regular file, following links, as a start judges it and as the snapshot read it
         # (is_regular_file): a folder or a dangling link by that name is no value file to either,
