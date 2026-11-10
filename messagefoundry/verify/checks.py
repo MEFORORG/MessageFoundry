@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 from messagefoundry import __version__
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import codec_safe_str
+from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER
 from messagefoundry.verify import cipher_policy
 from messagefoundry.verify.model import FAILING, CheckResult, Status
 
@@ -103,6 +104,8 @@ class OdbcHops:
     needs: tuple[tuple[str, str], ...] = ()
     #: For ``host.odbc``: each hop that names the Microsoft driver library by a path, and the path.
     paths: tuple[tuple[str, str], ...] = ()
+    #: For ``host.odbc``: why the store backend, a Driver 18 hop where it is SQL Server, is not known.
+    store_unknown: str | None = None
 
     @property
     def takes_none(self) -> bool:
@@ -155,26 +158,28 @@ def _as_the_hops_make_it(
     )
 
 
-_DRIVER_18 = "ODBC Driver 18 for SQL Server"
+def _shown(value: str) -> str:
+    """A configured driver name or path for a detail: printable anywhere, and cut to 200."""
+    return ascii(value[:200])
 
 
 def check_sqlserver_odbc_driver(driver_hops: Callable[[], OdbcHops]) -> CheckResult:
     """Every SQL Server driver the configuration's ODBC hops need, installed (BACKLOG #3803 R6).
 
     ``driver_hops`` reads every hop with the driver it needs. A hop naming a registered driver
-    needs pyodbc to list it, in any case; a hop naming the library by a path needs that file. Any
-    one missing FAILs, naming the hop and the driver. A driver list that cannot be read is ERROR
-    where the configuration takes any ODBC hop. With no hop, the row SKIPs, or PASSes where Driver
-    18 is listed. Where part of the configuration could not be read, a host whose checked hops all
-    have their driver PASSes if Driver 18 is listed and is otherwise MANUAL, since an unread hop may
-    need a driver that is not there. ``driver_hops`` runs only where pyodbc is importable, because
+    needs pyodbc to list it, in any case; a hop naming the library by an absolute path needs that
+    file. Any one missing FAILs, naming the hop and the driver. A driver list that cannot be read
+    is ERROR where the configuration takes any ODBC hop, SKIP where it takes none, and MANUAL where
+    that is not known. With every driver checked there, the row PASSes, unless a graph hop could not
+    be read or its driver told, which is MANUAL, or the store backend is not known and Driver 18,
+    which a SQL Server store needs, is not listed, which is MANUAL too. With no hop, it SKIPs, or
+    PASSes where Driver 18 is listed. ``driver_hops`` runs only where pyodbc is importable, because
     it can load the configuration."""
     rid, title = "host.odbc", "SQL Server ODBC drivers"
     if not _can_import("pyodbc"):
         return CheckResult(
             rid, title, Status.SKIP, "pyodbc not importable (install the [sqlserver] extra)"
         )
-    listed: list[str] | None = None
     try:
         # Dynamic import keeps mypy --strict clean (pyodbc ships no type stubs).
         pyodbc = importlib.import_module("pyodbc")
@@ -182,30 +187,19 @@ def check_sqlserver_odbc_driver(driver_hops: Callable[[], OdbcHops]) -> CheckRes
         disable_driver_manager_pooling()  # BACKLOG #2049; why is in messagefoundry/odbc_env.py
         listed = [str(d) for d in pyodbc.drivers()]
     except Exception as exc:  # pyodbc surfaces driver-manager errors as bare Exception
-        failure = f"pyodbc.drivers() failed: {codec_safe_str(exc)}"
-    hops = _census(driver_hops, rid)
-    if listed is None:
-        reading = CheckResult(rid, title, Status.ERROR, failure)
-        if hops.takes_none:
-            return CheckResult(
-                rid,
-                title,
-                Status.SKIP,
-                f"{_no_hop_detail(hops, 'ODBC hop', 'on any driver')}, so none needs a driver; "
-                f"it reads ERROR: {failure}",
-            )
-        return _as_the_hops_make_it(
-            reading, hops, "the driver list", "whether this host takes an ODBC hop"
+        return _unreadable_driver_list(
+            f"pyodbc.drivers() failed: {codec_safe_str(exc)}", _census(driver_hops, rid)
         )
+    hops = _census(driver_hops, rid)
     evidence = ", ".join(listed)
     registered = {d.lower() for d in listed}
     missing = [
-        f"{label} needs {name!r}, which pyodbc does not list"
+        f"{label} needs {_shown(name)}, which pyodbc does not list"
         for label, name in hops.needs
         if name.lower() not in registered
     ]
     missing += [
-        f"{label} loads {path!r}, which is not a file"
+        f"{label} loads {_shown(path)}, which is not a file"
         for label, path in hops.paths
         if not Path(path).is_file()
     ]
@@ -218,35 +212,52 @@ def check_sqlserver_odbc_driver(driver_hops: Callable[[], OdbcHops]) -> CheckRes
             f"{'; '.join(missing)}; SQL Server drivers seen: {seen or 'none'}",
             evidence=evidence,
         )
-    checked = [
-        *(f"{label} ({name})" for label, name in hops.needs),
-        *(f"{label} ({path})" for label, path in hops.paths),
-    ]
-    has_18 = _DRIVER_18.lower() in registered
-    if hops.unknown is not None:
-        done = f"every driver checked is there: {', '.join(checked)}; " if checked else ""
-        status = Status.PASS if has_18 else Status.MANUAL
-        lead = f"{_DRIVER_18} present; " if has_18 else ""
+    has_18 = SQLSERVER_DEFAULT_DRIVER.lower() in registered
+    checked = [f"{label} ({_shown(name)})" for label, name in (*hops.needs, *hops.paths)]
+    done = f"every driver checked is there: {', '.join(checked)}" if checked else ""
+    unread = [hops.unknown] if hops.unknown is not None else []
+    if hops.store_unknown is not None and not has_18:
+        unread.append(hops.store_unknown)
+    if unread:
+        lead = f"{done}; " if done else ""
         return CheckResult(
-            rid,
-            title,
-            status,
-            f"{lead}{done}not read: {hops.unknown}",
-            evidence=evidence,
+            rid, title, Status.MANUAL, f"{lead}not read: {'; '.join(unread)}", evidence=evidence
         )
     if checked:
-        return CheckResult(
-            rid, title, Status.PASS, f"every hop's driver is there: {', '.join(checked)}", evidence
-        )
+        return CheckResult(rid, title, Status.PASS, done, evidence=evidence)
     if has_18:
-        return CheckResult(rid, title, Status.PASS, f"{_DRIVER_18} present", evidence=evidence)
+        return CheckResult(
+            rid, title, Status.PASS, f"{SQLSERVER_DEFAULT_DRIVER} present", evidence=evidence
+        )
     return CheckResult(
         rid,
         title,
         Status.SKIP,
         f"{_no_hop_detail(hops, 'hop naming a SQL Server driver', 'on one')}, so none needs one; "
-        f"{_DRIVER_18!r} not found; SQL Server drivers seen: {seen or 'none'}",
+        f"{SQLSERVER_DEFAULT_DRIVER!r} not found; SQL Server drivers seen: {seen or 'none'}",
         evidence=evidence,
+    )
+
+
+def _unreadable_driver_list(failure: str, hops: OdbcHops) -> CheckResult:
+    """``host.odbc`` where pyodbc's driver list could not be read: ERROR on any ODBC hop, the store
+    one included, SKIP with none, MANUAL where that is not known."""
+    rid, title = "host.odbc", "SQL Server ODBC drivers"
+    if hops.takes_none and hops.store_unknown is None:
+        return CheckResult(
+            rid,
+            title,
+            Status.SKIP,
+            f"{_no_hop_detail(hops, 'ODBC hop', 'on any driver')}, so none needs a driver; "
+            f"it reads ERROR: {failure}",
+        )
+    if not hops.found and hops.unknown is None:
+        hops = OdbcHops(unknown=hops.store_unknown)
+    return _as_the_hops_make_it(
+        CheckResult(rid, title, Status.ERROR, failure),
+        hops,
+        "the driver list",
+        "whether this host takes an ODBC hop",
     )
 
 

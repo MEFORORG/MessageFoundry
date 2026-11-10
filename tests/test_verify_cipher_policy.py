@@ -1686,9 +1686,22 @@ def _needing(*needs: tuple[str, str], unknown: str | None = None) -> checks.Odbc
         ),
         ((RuntimeError("no driver manager"),), checks.OdbcHops(unknown="x"), Status.MANUAL),
         ((RuntimeError("no driver manager"),), checks.OdbcHops(), Status.SKIP),
-        # Part of the configuration unread: MANUAL unless Driver 18 is listed.
+        # A graph hop unread, or its driver not told, is MANUAL even with Driver 18 listed, since
+        # the hop may need another driver (code review round 6, finding 2).
         (("SQL Server",), checks.OdbcHops(unknown="no config dir"), Status.MANUAL),
-        ((_DRIVER_18,), checks.OdbcHops(unknown="no config dir"), Status.PASS),
+        ((_DRIVER_18,), checks.OdbcHops(unknown="no config dir"), Status.MANUAL),
+        # The store backend not known: a listed Driver 18 answers it, since the store needs that.
+        (
+            ("SQL Server",),
+            checks.OdbcHops(store_unknown="MEFOR_STORE_BACKEND unset"),
+            Status.MANUAL,
+        ),
+        ((_DRIVER_18,), checks.OdbcHops(store_unknown="MEFOR_STORE_BACKEND unset"), Status.PASS),
+        (
+            (RuntimeError("no driver manager"),),
+            checks.OdbcHops(store_unknown="MEFOR_STORE_BACKEND unset"),
+            Status.MANUAL,
+        ),
         # A hop on another vendor's driver only: nothing for this row to check.
         (("SQL Server",), checks.OdbcHops(found=("DATABASE connection OB_PG",)), Status.SKIP),
     ],
@@ -1708,7 +1721,8 @@ def test_each_hops_driver_is_checked(
     if expect is Status.ERROR:
         assert r.evidence.startswith("ODBC hops: ") and "no driver manager" in r.detail
     if expect is Status.MANUAL:
-        assert f"({hops.unknown})" in r.detail or f"not read: {hops.unknown}" in r.detail
+        reason = hops.unknown or hops.store_unknown
+        assert f"({reason})" in r.detail or f"not read: {reason}" in r.detail
 
 
 def test_a_driver_library_path_is_judged_by_the_file(
@@ -1866,8 +1880,10 @@ def test_the_wiring_reader_names_each_odbc_entry_and_its_driver() -> None:
         (None, "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.3.so.3.1", "found", "path"),
         (None, r"C:\Windows\System32\msodbcsql18.dll", "found", "path"),
         (None, "/opt/microsoft/msodbcsql17/lib64/libmsodbcsql-17.10.so.6.1", "found", "path"),
-        # A bare library file name is searched for by the loader, so it is not judged here.
+        # A bare library file name is searched for by the loader, and a relative path is read from
+        # the service's working directory, so neither is judged here (round 6, finding 3).
         (None, "msodbcsql18.dll", "found", "unknown"),
+        (None, "lib/libmsodbcsql-18.3.so.3.1", "found", "unknown"),
         # The preset sends the name as written and refuses a padded one at build, so it is no hop.
         (None, " ODBC Driver 18 for SQL Server ", "none", "none"),
         # An env() dialect naming the library by path can only be on the preset, which alone takes
@@ -1911,6 +1927,8 @@ def test_each_row_counts_the_hops_its_driver_question_reaches(
             "path" if hops.paths else "needs" if hops.needs else "other" if hops.found else "none"
         )
 
+    if odbc == "path" and not Path(str(driver)).is_absolute():
+        odbc = "unknown"  # a path absolute on another platform only is not judged here
     settings = ServiceSettings()
     assert outcome(_hops(tmp_path, settings=settings)) == ciphers
     hops = _hops(tmp_path, settings=settings, drivers=True)
@@ -1939,6 +1957,51 @@ def test_the_driver_census_reads_the_graph_beside_a_sql_server_store(
         ("DATABASE connection OB_X", _DRIVER_17),
     )
     assert hops.unknown is None
+
+
+def test_the_stores_need_survives_a_graph_read_that_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A SQL Server store still needs Driver 18 when the graph read raises what the census did not
+    foresee, so a host without it FAILs (code review round 6, finding 1: MANUAL at 335205b3f0)."""
+    from types import SimpleNamespace
+
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.verify.runner import _driver_hops
+
+    def broken() -> Any:
+        raise LookupError("unforeseen")
+
+    (tmp_path / "config").mkdir()
+    settings = SimpleNamespace(store=SimpleNamespace(backend=StoreBackend.SQLSERVER))
+    hops = _driver_hops(settings, "service.toml", str(tmp_path / "config"), broken)  # type: ignore[arg-type]
+    assert hops.needs == (("the [store] backend is sqlserver", _DRIVER_18),)
+    assert hops.unknown is not None and "LookupError" in hops.unknown
+    _odbc_drivers(monkeypatch, "SQL Server")
+    assert checks.check_sqlserver_odbc_driver(lambda: hops).status is Status.FAIL
+
+
+def test_a_kept_load_failure_holds_no_traceback_in_its_chain() -> None:
+    """Round 6, finding 4: the cause and the context are both cleared, and a group's members."""
+    from messagefoundry.verify.runner import _without_tracebacks
+
+    try:
+        try:
+            raise KeyError("context")
+        except KeyError:
+            raise ValueError("top") from TypeError("cause")
+    except ValueError as exc:
+        kept = exc
+    context, cause = kept.__context__, kept.__cause__
+    assert context is not None and cause is not None
+    try:
+        raise ExceptionGroup("g", [OSError("member")])
+    except ExceptionGroup as group:
+        held = group
+    cause.__context__ = held
+    _without_tracebacks(kept)
+    chain = [kept, context, cause, cause.__context__, *held.exceptions]
+    assert all(e is not None and e.__traceback__ is None for e in chain)
 
 
 def _host_ciphers_row(results: list[CheckResult]) -> CheckResult:

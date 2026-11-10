@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from messagefoundry.config.settings import ServiceSettings, StoreBackend
+from messagefoundry.redaction import codec_safe_str
 from messagefoundry.transports.db_endpoint import (
     SQLSERVER_DEFAULT_DRIVER,
     _preset_driver,  # the preset's own driver test, so the census cannot drift from the build
@@ -160,11 +161,16 @@ def _without_tracebacks(exc: BaseException) -> BaseException:
     """``exc`` with its traceback, and those of its cause and context chain, cleared, so a kept
     failure does not hold the failed load's frames, a config module's among them, for the run."""
     seen: set[int] = set()
-    link: BaseException | None = exc
-    while link is not None and id(link) not in seen:
+    pending: list[BaseException] = [exc]
+    while pending:
+        link = pending.pop()
+        if id(link) in seen:
+            continue
         seen.add(id(link))
         link.__traceback__ = None
-        link = link.__cause__ or link.__context__
+        pending += [e for e in (link.__cause__, link.__context__) if e is not None]
+        if isinstance(link, BaseExceptionGroup):
+            pending += list(link.exceptions)
     return exc
 
 
@@ -205,7 +211,7 @@ def _buildable_entries(
 def _store_unknown(settings: ServiceSettings | None, service_config: str | None) -> str | None:
     """Why the store backend the service opens is not known from this shell, or ``None``.
 
-    That variable overrides the settings file, and an operator's shell need not carry the
+    ``MEFOR_STORE_BACKEND`` overrides the settings file, and an operator's shell need not carry the
     service's own environment, so without it even a file that says sqlite does not show the
     service's store (BACKLOG #3803 R1)."""
     from messagefoundry.config.settings import settings_file_path
@@ -289,15 +295,22 @@ def _driver_hops(
     Server store names Driver 18. ``paths`` holds each preset hop that names the Microsoft library
     by a path, which the driver manager loads from that path, not from pyodbc's list. A hop on
     another vendor's driver is in ``found`` alone: it is an ODBC hop, but this row checks no driver
-    of it. ``unknown`` joins every reason a hop could be missed or its driver not told: the
-    graph or the settings not read, ``MEFOR_STORE_BACKEND`` unset, an ``env()`` driver, and a
-    library named by a bare file name, which the loader searches for."""
+    of it. ``unknown`` joins every reason a graph hop could be missed or its driver not told: the
+    graph not read, an ``env()`` driver, and a library named other than by an absolute path.
+    ``store_unknown`` says why the store, which would need Driver 18, is not known, apart, since a
+    listed Driver 18 answers it and nothing else."""
     store = settings is not None and settings.store.backend is StoreBackend.SQLSERVER
     needs = [("the [store] backend is sqlserver", SQLSERVER_DEFAULT_DRIVER)] if store else []
     paths: list[tuple[str, str]] = []
     others: list[str] = []
     unknowns: list[str] = []
-    entries, unread = _buildable_entries(config_dir, graph)
+    try:
+        entries, unread = _buildable_entries(config_dir, graph)
+    except Exception as exc:  # a read failure not foreseen: the store's need must survive it
+        entries, unread = (
+            [],
+            f"the graph read raised {type(exc).__name__}: {codec_safe_str(exc)[:200]}",
+        )
     if unread is not None:
         unknowns.append(unread)
     for label, dialect, driver in entries:
@@ -307,27 +320,27 @@ def _driver_hops(
         elif dialect != "generic" and _DRIVER_LIBRARY.fullmatch(
             re.split(r"[\\/]", driver.lower())[-1]
         ):
-            if re.search(r"[\\/]", driver):
+            if Path(driver).is_absolute():
                 paths.append((label, driver))
             else:
+                # A bare name is searched for, and a relative one is read from the service's
+                # working directory, which need not be this shell's.
                 unknowns.append(
-                    f"{label} names the library {ascii(driver[:200])} by a bare file name, which "
-                    "the loader searches for"
+                    f"{label} names the library {ascii(driver[:200])} by a name that is not an "
+                    "absolute path, which the service resolves where this shell cannot see"
                 )
         elif _microsoft_driver(driver):
             needs.append((label, driver.strip()))
         else:
             others.append(label)
-    if not store:
-        why = _store_unknown(settings, service_config)
-        if why is not None:
-            unknowns.append(why)
+    store_unknown = None if store else _store_unknown(settings, service_config)
     return OdbcHops(
         found=(*(label for label, _ in needs), *(label for label, _ in paths), *others),
         unknown="; ".join(unknowns) or None,
         judged=f"the service settings and the graph in {config_dir!r}",
         needs=tuple(needs),
         paths=tuple(paths),
+        store_unknown=store_unknown,
     )
 
 
