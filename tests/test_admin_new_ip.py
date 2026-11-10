@@ -47,6 +47,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
+    _address_log_field,
     _bounded_address_text,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -272,8 +273,9 @@ async def test_each_refused_request_writes_its_own_warning(
         assert sum("already flagged" in line for line in warnings) == repeats
         over = [line for line in warnings if "past the per-session" in line]
         assert [line.split("seen_ip=", 1)[1].split(" path=", 1)[0] for line in over] == [
-            redacted_log_field(seen, _NEW_IP_LOG_FIELD_MAX) for seen in past_cap
-        ]
+            f'"{seen}"' for seen in past_cap[:-1]
+        ] + [_address_log_field(forged)]
+        assert _address_log_field(forged).startswith('"unparsed-sha256-')
         assert not any("\n" in line for line in over)
         assert await _new_ip_rows(store) == reported
         assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == len(
@@ -283,26 +285,17 @@ async def test_each_refused_request_writes_its_own_warning(
         await store.close()
 
 
-#: One ``key="value"`` field; :func:`~messagefoundry.controlchars.log_field_token` writes no quote
-#: inside a value.
+#: One ``key="value"`` field; neither field writer puts a quote inside a value.
 _FIELD = r'([a-z_]+)="([^"]*)"'
-
-#: What the HL7 field-run redaction leaves of a whitespace-delimited run holding two or more
-#: separators, encoded ones included (``%7C`` and the like). It replaces the run whole, label and
-#: all, so a path such as ``/a|b c|d`` logs as this in place of its field.
-_ERASED = "[redacted]"
 
 
 def _logged_fields(line: str) -> list[tuple[str, str]]:
     """The ``key="value"`` fields after the colon of a new-address WARNING, in order, read as a
-    log reader would. Refuses a line that is anything but such fields joined by single spaces,
-    except that the LAST field may be one a filter erased whole, read as ``("", _ERASED)``."""
+    log reader would. Refuses a line that is anything but such fields joined by single spaces, so
+    a field a filter erased, merged or ran past fails here."""
     rest = line.split(": ", 1)[1]
-    erased = rest == _ERASED or rest.endswith(" " + _ERASED)
-    if erased:
-        rest = rest[: -len(_ERASED)].rstrip(" ")
-    assert rest == "" or re.fullmatch(f"{_FIELD}(?: {_FIELD})*", rest), line
-    return re.findall(_FIELD, rest) + ([("", _ERASED)] if erased else [])
+    assert re.fullmatch(f"{_FIELD}(?: {_FIELD})*", rest), line
+    return re.findall(_FIELD, rest)
 
 
 #: Paths that tried to write a field of their own (BACKLOG #3770). The second is the one the review
@@ -310,7 +303,9 @@ def _logged_fields(line: str) -> list[tuple[str, str]]:
 #: the token's value, so ``quote_log_text`` closed early on a configured sink. The rest end on a
 #: label a credential scrub reads as the start of a quoted value, open a quoted value, or start a
 #: PHI or credential pattern that runs to the end of the line (an HL7 segment, an XML element, an
-#: ODBC brace, a ``MEFOR_`` name). One is a plain path, which must log unchanged.
+#: ODBC brace, a ``MEFOR_`` name), or hold an HL7 separator on each side of a space, which the
+#: ``%XX`` escape joined into one run the HL7 pass erased, key and all. One is a plain path, which
+#: must log unchanged.
 _FORGING_PATHS = (
     '/users seen_ip=10.6.6.6 held_back=99 "x\\',
     '/users token=a" seen_ip=10.6.6.6 z="',
@@ -325,14 +320,46 @@ _FORGING_PATHS = (
     "/x;pwd={abc",
     "/x/password={a",
     "/MEFOR_X=abc",
-    "/plain/path-with.dots_and:colon",
+    "/plain/path-with.dots_and_underscores",
+    "/x:colon",
+    "/x%20password:",
     "/a&" + "b" * 300,
     "/a~b c~d",
     "/a|b c|d",
+    "/a%7Cb c%7Cd",
     "/x 19-01-01",
     "/u" + "\U0001f600" * 300,
     "/u" + "x" * 5000,
 )
+
+#: Seen addresses a forwarded header could carry, each with what the past-cap line must log for
+#: it: an address in its canonical form, or a fixed token and a digest, never the text (BACKLOG
+#: #3770). The first two are the review's: ``%20`` read as a label start by the credential scrub,
+#: which took the closing quote and the ``path=`` key, and ``a|b c|d``, which the ``%XX`` escape
+#: joined into one HL7 run that erased ``seen_ip=`` with its value.
+_FORGING_SEEN = (
+    ("x%20password=<redacted>/users", None),
+    ("a|b c|d", None),
+    ("x password:", None),
+    ('10.6.6.6" path="/forged', None),
+    ("10.6.6.6 held_back=99", None),
+    ("fe80::1%eth0 path=x", "fe80::1-zone-sha256-"),
+    ("2001:DB8:0:0:0:0:0:1", "2001:db8::1"),
+    ("10.7.7.7", "10.7.7.7"),
+)
+
+
+def _two_shipped_handlers() -> tuple[list[io.StringIO], list[logging.Handler]]:
+    """Two handlers, each with the shipped filter chain, so the second reads what the first
+    rewrote: the filters rewrite the record in place."""
+    streams = [io.StringIO(), io.StringIO()]
+    handlers: list[logging.Handler] = []
+    for stream in streams:
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        _install_phi_filters(handler)
+        handlers.append(handler)
+    return streams, handlers
 
 
 def test_a_bounded_address_is_always_longer_than_its_bound() -> None:
@@ -345,51 +372,65 @@ def test_a_bounded_address_is_always_longer_than_its_bound() -> None:
 async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings() -> None:
     """RED when: the request path or the seen address can close its field on the line a shipped
     handler writes, so a path holding a space, a quote or a credential label writes a field of its
-    own; or a field is longer than its bound after its escape (BACKLOG #3770). The lines are read
-    through a handler carrying the shipped filter chain (``_install_phi_filters``), not from the
-    record, which no filter has touched."""
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    _install_phi_filters(handler)
+    own; or the seen address carries its own text into the line, so it can merge with or erase the
+    path; or a field is longer than its bound after its escape; or a redaction placeholder is
+    escaped out of its searchable spelling (BACKLOG #3770). The lines are read through two handlers,
+    each carrying the shipped filter chain (``_install_phi_filters``), not from the record."""
+    streams, handlers = _two_shipped_handlers()
     logger = logging.getLogger("messagefoundry.auth.service")
     level = logger.level
-    logger.addHandler(handler)
+    for handler in handlers:
+        logger.addHandler(handler)
     logger.setLevel(logging.WARNING)
     store = await MessageStore.open(":memory:")
+    cases: list[tuple[str, str | None, str]] = [
+        (f"10.9.9.{i}", f"10.9.9.{i}", path) for i, path in enumerate(_FORGING_PATHS)
+    ]
+    cases += [(seen, want, path) for seen, want in _FORGING_SEEN for path in ("/users", "/a b")]
     try:
         service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
         await service.initialize()
         token, _ = await _enabled_admin(service, client="10.1.1.1")
         for i in range(_NEW_IP_PER_SESSION_MAX + 1):
             assert await service.flag_new_client_ip(token, f"10.3.3.{i}", path="/users") is True
-        stream.truncate(0)
-        stream.seek(0)
-        for i, path in enumerate(_FORGING_PATHS):
+        for stream in streams:
+            stream.truncate(0)
+            stream.seek(0)
+        for seen, _, path in cases:
             assert await service.flag_new_client_ip(token, "10.3.3.0", path=path) is True
-            assert await service.flag_new_client_ip(token, f"10.9.9.{i}", path=path) is True
+            assert await service.flag_new_client_ip(token, seen, path=path) is True
     finally:
-        logger.removeHandler(handler)
+        for handler in handlers:
+            logger.removeHandler(handler)
         logger.setLevel(level)
         await store.close()
-    lines = [ln for ln in stream.getvalue().splitlines() if ln]
-    assert len(lines) == 2 * len(_FORGING_PATHS)
-    for i in range(len(_FORGING_PATHS)):
+    first, second = ([ln for ln in s.getvalue().splitlines() if ln] for s in streams)
+    # The second handler re-filters what the first wrote, and changes nothing.
+    assert first == second
+    lines = first
+    assert len(lines) == 2 * len(cases)
+    for i, (_, want, _) in enumerate(cases):
         repeat, over = (_logged_fields(line) for line in lines[2 * i : 2 * i + 2])
-        # The seen address comes first and is exactly the real one; the caller-supplied path
-        # comes last, so a filter that rewrites or erases it cannot reach another field.
-        assert [key for key, _ in over] in (["seen_ip", "path"], ["seen_ip", ""]), lines[2 * i + 1]
-        assert over[0][1] == f"10.9.9.{i}"
-        assert lines[2 * i + 1].count("seen_ip=") == 1, lines[2 * i + 1]
-        assert [key for key, _ in repeat] in (["path"], [""]), lines[2 * i]
-        for _, value in (*repeat, *over):
-            assert len(value) <= _NEW_IP_LOG_FIELD_MAX
-    assert "SECRETVALUE" not in stream.getvalue()
-    plain = _FORGING_PATHS.index("/plain/path-with.dots_and:colon")
+        assert [key for key, _ in over] == ["seen_ip", "path"], lines[2 * i + 1]
+        assert [key for key, _ in repeat] == ["path"], lines[2 * i]
+        assert over[1] == repeat[0], lines[2 * i : 2 * i + 2]
+        logged_ip = over[0][1]
+        if want is None:
+            assert re.fullmatch("unparsed-sha256-[0-9a-f]{16}", logged_ip), lines[2 * i + 1]
+        else:
+            assert logged_ip.startswith(want), lines[2 * i + 1]
+        assert len(over[1][1]) <= _NEW_IP_LOG_FIELD_MAX
+    assert "SECRETVALUE" not in "\n".join(lines)
+    plain = _FORGING_PATHS.index("/plain/path-with.dots_and_underscores")
     assert _logged_fields(lines[2 * plain + 1]) == [
         ("seen_ip", f"10.9.9.{plain}"),
         ("path", _FORGING_PATHS[plain]),
     ]
+    # Placeholders keep their spelling, so a search for them finds the line.
+    token_line = lines[2 * _FORGING_PATHS.index("/x code=SECRETVALUE") + 1]
+    assert _logged_fields(token_line)[1][1] == "/x%u0020code%u003D<redacted>"
+    hl7_line = lines[2 * _FORGING_PATHS.index("/a|b|c") + 1]
+    assert _logged_fields(hl7_line)[1][1] == "[redacted]"
     longest = _FORGING_PATHS.index("/u" + "x" * 5000)
     assert "%%crc32-" in _logged_fields(lines[2 * longest + 1])[1][1]
 
@@ -672,7 +713,7 @@ async def test_long_address_text_is_bounded_in_the_dedupe_and_the_past_cap_recor
             if r.levelno == logging.WARNING and "past the per-session" in r.getMessage()
         ]
         assert [line.split("seen_ip=", 1)[1].split(" path=", 1)[0] for line in over] == [
-            redacted_log_field(_bounded_address_text(texts[-1]), _NEW_IP_LOG_FIELD_MAX)
+            _address_log_field(texts[-1])
         ]
     finally:
         await store.close()

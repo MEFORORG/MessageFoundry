@@ -509,9 +509,8 @@ _NEW_IP_DEDUP_MAX = 4096
 _NEW_IP_PER_SESSION_MAX = 8
 
 # BACKLOG #3772: the longest client-address text the new-address signal keeps as it is, in its dedupe
-# keys, the seen_ip, known_ip and client of its audit row, its notice, and the text its past-cap log
-# line escapes (``_NEW_IP_LOG_FIELD_MAX`` below; a ``%`` in an address logs as ``%25`` there).
-# Every
+# keys, and the seen_ip, known_ip and client of its audit row and its notice. Its past-cap log line
+# carries no address text at all (``_address_log_field``). Every
 # IPv4 or IPv6 address without a zone id fits, the longest being 45 characters; only text that does
 # not parse, or an IPv6 address with a long zone id, is longer. That text is caller-supplied on a
 # proxied hop, and without a bound each session could hold nine copies of it. Longer text keeps a
@@ -520,10 +519,9 @@ _NEW_IP_PER_SESSION_MAX = 8
 # Other sinks of the same text, such as sessions.client and other audit rows, are not bounded here.
 _NEW_IP_TEXT_MAX = 64
 _NEW_IP_TEXT_PREFIX = 24
-# BACKLOG #3770: the longest value, counted after its escape, that each request field of the
-# new-address WARNINGs logs (``logging_setup.redacted_log_field``). The path is caller-supplied and
-# bounded only by the HTTP server's request-line limit, and the seen address is caller-supplied text
-# on a proxied hop.
+# BACKLOG #3770: the longest path value, counted after its escape, that the new-address WARNINGs log
+# (``logging_setup.redacted_log_field``). The path is caller-supplied and bounded only by the HTTP
+# server's request-line limit. The seen address logs as ``_address_log_field``, which is short.
 _NEW_IP_LOG_FIELD_MAX = 256
 
 # The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). Its baseline is the store's
@@ -619,6 +617,28 @@ def _bounded_address_text(address: str) -> str:
     # and the result can be stored. Text within the bound is returned as it is, as on main.
     prefix = address[:_NEW_IP_TEXT_PREFIX].encode("utf-8", "replace").decode("utf-8")
     return f"{prefix}...sha256:{digest}"
+
+
+def _address_log_field(address: str) -> str:
+    """``address`` as a quoted log field value that carries none of its caller-supplied text
+    (BACKLOG #3770): the canonical form of an IP address, or ``unparsed-sha256-`` and 16 hex digits
+    of the SHA-256 of the whole text when it does not parse. A zone id is text, so an address with
+    one logs its canonical address, ``-zone-sha256-`` and the digest of the whole text.
+
+    The canonical form holds only hex digits, ``.`` and ``:``, which spell no credential label, HL7
+    separator, date or name a handler filter reads, so the field cannot close, merge or erase
+    another, and the address still reads and greps as itself. The address is caller-supplied on a
+    proxied hop, so its text is never logged as it is."""
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        parsed = None
+    if parsed is not None and not getattr(parsed, "scope_id", None):
+        return f'"{parsed}"'
+    digest = hashlib.sha256(address.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    if parsed is None:
+        return f'"unparsed-sha256-{digest}"'
+    return f'"{ipaddress.IPv6Address(int(parsed))}-zone-sha256-{digest}"'
 
 
 #: The refusals on an IdP step-up's return that draw :meth:`AuthService.allow_step_up_return_audit`
@@ -13952,9 +13972,9 @@ class AuthService:
         # addresses, so a replayed token cannot amplify the audit log / notifications even when it
         # alternates between addresses (BACKLOG #2159).
         flag = self._first_new_ip_flag(token_hash, seen_key)
-        # Each logged request field is redacted, escaped and bounded (BACKLOG #3770), and the
-        # path comes last, so even a handler filter that rewrites it cannot reach a field after it.
-        # Only when the line will be written: this branch is the one a replayed token loops on.
+        # No logged request field can close, merge with or erase another (BACKLOG #3770): the path
+        # is redacted, escaped and bounded, and the address logs only as an address. The path still
+        # comes last, a second guard. Only when the line will be written: this branch is the one a replayed token loops on.
         if flag == "repeat":
             if _log.isEnabledFor(logging.WARNING):
                 _log.warning(
@@ -13971,13 +13991,14 @@ class AuthService:
         seen_text = seen_key if host_key == client_ip else _bounded_address_text(client_ip)
         if flag == "over_cap":
             # Past the cap no new-address row is written, so this line carries the address. The
-            # address is attacker-supplied text on a proxied hop.
+            # address is attacker-supplied text on a proxied hop, so only its parsed form or a
+            # digest is logged.
             if _log.isEnabledFor(logging.WARNING):
                 _log.warning(
                     "a request from a new client address must re-verify; the address is past the "
                     "per-session cap of %d (audit suppressed): seen_ip=%s path=%s",
                     _NEW_IP_PER_SESSION_MAX,
-                    redacted_log_field(seen_text, _NEW_IP_LOG_FIELD_MAX),
+                    _address_log_field(client_ip),
                     redacted_log_field(path, _NEW_IP_LOG_FIELD_MAX),
                 )
             return True

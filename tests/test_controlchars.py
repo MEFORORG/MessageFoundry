@@ -17,7 +17,6 @@ import json
 import re
 import warnings
 from pathlib import Path
-from urllib.parse import unquote
 
 import pytest
 
@@ -451,24 +450,49 @@ def test_escape_lone_surrogates_escapes_only_surrogates() -> None:
 )
 def test_log_field_token_is_quote_free_ascii_and_reverses(text: str) -> None:
     """RED when: the token holds a space, a quote or a backslash, which the credential scrub
-    filters read as a value's edges, or does not percent-decode back to the text."""
+    filters read as a value's edges, or does not decode back to the text."""
     token = log_field_token(text, 256)
     body = token[1:-1]
     assert token == f'"{body}"'
     assert body.isascii() and body.isprintable()
-    assert re.fullmatch(r"(?:[A-Za-z0-9._/:-]|%[0-9A-F]{2})*", body)
-    assert unquote(body, errors="surrogatepass") == text
+    assert re.fullmatch(r"(?:[A-Za-z0-9._/-]|%u[0-9A-F]{4})*", body)
+    assert _unit_unescape(body) == text
+
+
+def _unit_unescape(body: str) -> str:
+    """The ``%uXXXX`` decode, as JavaScript's ``unescape`` reads it."""
+    units = re.sub(r"%u([0-9A-F]{4})", lambda m: chr(int(m.group(1), 16)), body)
+    return units.encode("utf-16-be", "surrogatepass").decode("utf-16-be", "surrogatepass")
 
 
 @pytest.mark.parametrize(
-    "text", ["/x token=", "/x password:", "/PID|x", "/x<g>", "/x;pwd={a", "/a~b^c&d"]
+    "text",
+    ["/x token=", "/x password:", "/PID|x", "/x<g>", "/x;pwd={a", "/a~b^c&d", "a|b c|d", "%7C%20"],
 )
 def test_log_field_token_escapes_every_mark_a_filter_anchors_on(text: str) -> None:
-    """RED when: a token keeps ``=``, ``|``, ``<``, ``{``, ``;``, ``~``, ``^`` or ``&``, so a handler
-    filter pattern can start inside the field and run past its closing quote."""
+    """RED when: a token keeps ``=``, ``:``, ``|``, ``<``, ``{``, ``;``, ``~``, ``^``, ``&`` or a
+    space, so a handler filter pattern can complete inside the field and run past its closing quote;
+    or it writes a ``%`` and two hex digits, where the credential scrub starts a label and the HL7
+    pass reads an encoded separator (BACKLOG #3770)."""
     body = log_field_token(text, 256)[1:-1]
-    assert not set(body) & set("=|<{;~^&")
-    assert unquote(body) == text
+    assert not set(body) & set("=:|<{;~^& ")
+    assert not re.search(r"%[0-9A-Fa-f]{2}", body)
+    assert _unit_unescape(body) == text
+
+
+def test_log_field_token_keeps_a_literal_whole_and_refuses_an_unsafe_one() -> None:
+    """RED when: a placeholder comes out escaped, so a search for ``<redacted>`` misses the line,
+    or a cut splits one; or a literal holding a quote or a space is accepted (BACKLOG #3770)."""
+    literals = ("<redacted>", "[redacted]")
+    assert log_field_token("/a b<redacted>[redacted]", 256, literals=literals) == (
+        '"/a%u0020b<redacted>[redacted]"'
+    )
+    cut = log_field_token("x" * 230 + "<redacted>" * 3, 256, literals=literals)[1:-1]
+    assert len(cut) <= 256
+    assert cut.partition("%%crc32-")[0] == "x" * 230 + "<redacted>"
+    for bad in ('"', "a b", "a:b", ""):
+        with pytest.raises(ValueError):
+            log_field_token("x", 256, literals=(bad,))
 
 
 @pytest.mark.parametrize("text", ["/u" + "\U0001f600" * 300, "x" * 5000, "%" * 300])
@@ -479,9 +503,9 @@ def test_log_field_token_is_bounded_after_its_escape(text: str) -> None:
     assert len(body) <= 256
     head, _, checksum = body.partition("%%crc32-")
     assert re.fullmatch(r"[0-9a-f]{8}", checksum)
-    assert re.fullmatch(r"(?:[^%]|%[0-9A-F]{2})*", head)
-    # Whole characters only, so the head decodes strictly.
-    unquote(head, errors="strict")
+    assert re.fullmatch(r"(?:[^%]|%u[0-9A-F]{4})*", head)
+    # Whole characters only, so the head holds no half of a surrogate pair.
+    _unit_unescape(head).encode("utf-8", "strict")
     assert len(log_field_token("a" * 255 + "=", 256)) - 2 <= 256
 
 

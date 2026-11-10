@@ -48,10 +48,10 @@ escape, not on the predicate:
     between tokens, an indented one for example, does not, because ``\\n`` is not JSON there.
   * QUOTE -- one ``key=value`` field of a log line, :func:`log_field_token`. ESCAPE keeps a
     value on one line but leaves its spaces, quotes and ``=`` alone, so a value logged before
-    another field can still write a field of its own. QUOTE percent-escapes everything but a safe
-    alphabet and wraps the result in quotes, so the value holds no space, quote or ``=`` with which
-    to end its field or write another (BACKLOG #3770). A handler filter may still rewrite the
-    field, so a caller puts it last on its line. :func:`quote_log_text` is a separate JSON-quoted
+    another field can still write a field of its own. QUOTE writes everything but a safe alphabet
+    as ``%uXXXX`` and wraps the result in quotes, so the value holds no space, quote, ``:`` or ``=``
+    with which to end its field or write another, nor anything a handler filter completes a match
+    on (BACKLOG #3770). A filter may still rewrite a run inside the field, never past it. :func:`quote_log_text` is a separate JSON-quoted
     form for text printed to a terminal, such as a check line, which no handler filter reads; a
     credential scrub can close it early, so it is not for a logged field. QUOTE changes the
     value's spelling, so it does not replace ESCAPE on a whole line.
@@ -348,11 +348,14 @@ def quote_log_text(text: str) -> str:
     return scrub_log_argument(json.dumps(text))
 
 
-#: The characters :func:`log_field_token` writes as they are: letters, digits and ``-._/:``. At
-#: least the space, both quotes, the backslash, ``=``, ``|``, ``^``, ``&``, ``~``, ``<``, ``{`` and
-#: ``;`` are escaped, so the value cannot end its field or start a field of its own (BACKLOG #3770).
-#: ``:`` stays, so an IPv6 address still reads and greps as itself.
-_LOG_FIELD_KEPT = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._/:")
+#: The characters :func:`log_field_token` writes as they are: letters, digits and ``-._/``
+#: (BACKLOG #3770). Every other character is escaped, at least the space and every other
+#: whitespace, both quotes, the backslash, ``:``, ``=``, ``;``, ``,``, ``#``, ``%``, ``|``, ``^``,
+#: ``&``, ``~``, ``<``, ``{``, ``(`` and ``[``. So the value holds nothing with which to end its field
+#: or start one, and nothing a shipped handler filter needs to complete a match: no credential label
+#: can reach its ``:`` or ``=``, no HL7 run its separator, no name run its space. ``:`` goes too,
+#: because a kept ``password:`` let the credential scrub take the closing quote and the next key.
+_LOG_FIELD_KEPT = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._/")
 
 #: What :func:`log_field_token` puts in place of the cut tail of a token over its bound. It starts
 #: with "%%", which the escape never writes, so a bounded token cannot read as a kept one, and it
@@ -360,45 +363,70 @@ _LOG_FIELD_KEPT = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxy
 _LOG_FIELD_CUT_MARK = "%%crc32-"
 _LOG_FIELD_CUT_LENGTH = len(_LOG_FIELD_CUT_MARK) + 8
 
+#: What a literal :func:`log_field_token` keeps whole may hold: the kept alphabet and the
+#: placeholder brackets. Nothing in it closes a field or completes a filter's match.
+_LOG_FIELD_LITERAL = _LOG_FIELD_KEPT | frozenset("<>[]")
 
-def _percent_escape(ch: str) -> str:
+
+def _unit_escape(ch: str) -> str:
+    """``ch`` itself when kept, else one ``%uXXXX`` per UTF-16 code unit, the form JavaScript's
+    ``unescape`` reads. Not ``%XX``: a ``%`` and two hex digits is where the credential scrub starts
+    a label (``secretscrub._LABEL_START``) and how the HL7 pass spells an encoded separator
+    (``redaction._ENCODED_SEPARATOR``), so ``%20password`` read as a label and ``%7C`` as a
+    separator. After ``%`` this always writes ``u``, which is not a hex digit."""
     if ch in _LOG_FIELD_KEPT:
         return ch
-    return "".join(f"%{byte:02X}" for byte in ch.encode("utf-8", "surrogatepass"))
+    units = ch.encode("utf-16-be", "surrogatepass")
+    return "".join(f"%u{units[i]:02X}{units[i + 1]:02X}" for i in range(0, len(units), 2))
 
 
-def log_field_token(text: str, limit: int) -> str:
+def log_field_token(text: str, limit: int, *, literals: tuple[str, ...] = ()) -> str:
     """``text`` as one double-quoted ``key=value`` field value of a log line, which no part of
-    ``text`` can close or extend, before or after the shipped handler filters (BACKLOG #3770).
+    ``text`` can close, extend or join to another field, before or after the shipped handler
+    filters, however many handlers run them in turn (BACKLOG #3770).
 
-    Every character outside :data:`_LOG_FIELD_KEPT` is written as the ``%XX`` escapes of its UTF-8
-    bytes, a lone surrogate by ``surrogatepass``, so the token holds no space, quote or backslash
-    and a percent-decode gives ``text`` back. The handler filters still run over the line and may
-    rewrite or erase the field, so that holds only for a field they leave alone. The escape also
-    hides most of what they anchor on, so a caller does not call this directly: it calls
-    ``logging_setup.redacted_log_field``, which redacts first.
+    Every character outside :data:`_LOG_FIELD_KEPT` is written by :func:`_unit_escape`, so the token
+    holds no space, quote, backslash or separator, and a ``%uXXXX`` decode gives ``text`` back. Each
+    occurrence of a string in ``literals`` is kept whole instead, which is how the redaction
+    placeholders stay searchable as themselves; a literal may hold only :data:`_LOG_FIELD_LITERAL`.
+    A text that already holds a placeholder's spelling therefore logs it as it is, so a value can
+    claim of itself that something was redacted, though never of another field. The handler filters
+    still read the token, and one may rewrite a run inside it, a date for example, as
+    ``[redacted]``, which holds no space or quote. They anchor on less than they would in raw text,
+    so a caller does not call this directly: it calls ``logging_setup.redacted_log_field``, which
+    redacts first.
 
     The escaped text is at most ``limit`` characters, counted after the escape, so the field is at
-    most ``limit`` plus its two quotes whatever ``text`` holds. Longer text keeps the escapes of
-    whole leading characters and :data:`_LOG_FIELD_CUT_MARK` with the CRC-32 of all of ``text``,
-    so two honest long texts that share the head almost never read alike. A checksum, not a
-    digest, as in ``pipeline.intake_bound.shorten_with_checksum``: the field is read by a person
-    and is never a key, so it has no forged collision to resist, and this leaf module stays out of
-    the crypto inventory. ``limit`` must leave room for the mark, 16 characters."""
+    most ``limit`` plus its two quotes whatever ``text`` holds. Longer text keeps whole leading
+    pieces, a character's escapes or a literal, and :data:`_LOG_FIELD_CUT_MARK` with the CRC-32 of
+    all of ``text``, so two honest long texts that share the head almost never read alike. A
+    checksum, not a digest, as in ``pipeline.intake_bound.shorten_with_checksum``: the field is read
+    by a person and is never a key, so it has no forged collision to resist, and this leaf module
+    stays out of the crypto inventory. ``limit`` must leave room for the mark, 16 characters."""
     if limit < _LOG_FIELD_CUT_LENGTH:
         raise ValueError(
             f"limit {limit} leaves no room for the {_LOG_FIELD_CUT_LENGTH}-character cut mark"
         )
-    # Each character escapes to at least one, so at most the first `limit` can be kept, and the
-    # head is built a whole character at a time, so a cut never splits a character's escapes.
+    for literal in literals:
+        if not literal or not set(literal) <= _LOG_FIELD_LITERAL:
+            raise ValueError(f"literal {literal!r} holds a character a field must not")
+    # Each piece is at least one character, so pieces past `limit + 1` characters are never needed,
+    # and the head is built a whole piece at a time, so a cut never splits an escape or a literal.
+    starts = {literal[0] for literal in literals}
     pieces: list[str] = []
     length = 0
-    for ch in text[: limit + 1]:
-        piece = _percent_escape(ch)
+    i = 0
+    while i < len(text) and length <= limit:
+        piece = None
+        if text[i] in starts:
+            piece = next((lit for lit in literals if text.startswith(lit, i)), None)
+        if piece is None:
+            piece = _unit_escape(text[i])
+            i += 1
+        else:
+            i += len(piece)
         length += len(piece)
         pieces.append(piece)
-        if length > limit:
-            break
     if length <= limit:
         return scrub_log_argument(f'"{"".join(pieces)}"')
     import binascii  # lazily, for the reason quote_log_text imports json lazily

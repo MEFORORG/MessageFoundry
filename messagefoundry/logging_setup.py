@@ -70,6 +70,7 @@ from messagefoundry.logging_guard import (
     LogWriteGuard,
     set_active_guard,
 )
+from messagefoundry.redaction import _REDACTED as PHI_PLACEHOLDER
 from messagefoundry.redaction import (
     ExcInfo,
     prepare_log_record,
@@ -414,13 +415,16 @@ def redacted_log_field(text: str, limit: int) -> str:
 
     The escape hides most of what the handler filters anchor on, so they read less inside the
     field than in raw text; redacting first means a PHI or credential value they would have hidden
-    is hidden anyway. The filters still run on the whole line afterwards, and may rewrite the field
-    further, so put a caller-supplied field last on its line, where a rewrite cannot reach another.
+    is hidden anyway. The placeholders the passes write are kept as they are, not escaped, so a
+    search for ``<redacted>`` or ``[redacted]`` still finds the line. The filters still run on the
+    whole line afterwards and may rewrite a run inside the field, never past its quotes.
 
     A log argument must never raise, as in :class:`RedactionFilter`: a failing pass gives a fixed
     placeholder rather than the value."""
     try:
-        return log_field_token(redact_log_value(text), limit)
+        return log_field_token(
+            redact_log_value(text), limit, literals=(CREDENTIAL_PLACEHOLDER, PHI_PLACEHOLDER)
+        )
     except Exception as exc:  # noqa: BLE001 -- a log argument must never raise
         return f'"[unloggable: {type(exc).__name__}]"'
 
