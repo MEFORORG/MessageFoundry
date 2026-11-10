@@ -424,10 +424,18 @@ def test_xmlschema_refuses_a_schema_its_siblings_would_refuse() -> None:
 
 
 def test_xmlschema_still_disables_remote_schema_resolution() -> None:
-    # The SSRF half of the fourth parser's lockdown, kept as a source pin because allow="local" has no
-    # observable effect without a network. Narrow and honest about being a pin.
-    source = (__import__("pathlib").Path(__file__).resolve().parent.parent).joinpath(
-        "messagefoundry", "parsing", "xml", "schema.py"
+    # The SSRF half of the fourth parser's lockdown. It was a source pin on allow="local" until
+    # BACKLOG #5537 replaced that mode; xmlschema's access check runs before it opens anything, so the
+    # refusal is observable without a network. tests/test_xml_schema_lockdown.py covers local files.
+    if not _lxml_available():
+        pytest.skip("xmlschema/lxml (the [xml] extra) are not installed")
+    from messagefoundry.parsing.xml.errors import XmlValidationError
+    from messagefoundry.parsing.xml.schema import validate_against
+
+    remote = (
+        '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">'
+        '<xs:include schemaLocation="http://127.0.0.1:9/x.xsd"/></xs:schema>'
     )
-    text = source.read_text(encoding="utf-8")
-    assert 'allow="local"' in text and "base_url=None" in text
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against("<patient>x</patient>", remote)
+    assert type(ei.value.__cause__).__name__ == "XMLResourceBlocked"
