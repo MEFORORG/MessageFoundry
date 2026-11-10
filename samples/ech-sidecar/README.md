@@ -135,6 +135,12 @@ connection uses OAuth2 client-credentials or SMART Backend Services — the **to
 each re-addressed to it, so the authorization server's hostname is not left in a cleartext outer
 ClientHello while the payload hop is routed (BACKLOG #1176).
 
+**List the sidecar's address in `[egress].allowed_ech_sidecar`, port included** (BACKLOG #5528):
+for the example above, `allowed_ech_sidecar = ["127.0.0.1:1080"]`. The list is deny-by-default even
+under `[security].block_unlisted_outbound = false`, so an `ech_egress` connection whose sidecar is not
+on it is refused at config load. The upstream `url` still goes in `allowed_http`. See the key's row
+under `[egress]` in [CONFIGURATION.md](../../docs/CONFIGURATION.md).
+
 **An `http://` sidecar leaves the hop to it cleartext on this host.** The engine logs a WARNING for
 each such connection and lists it as a loosening. What crosses that hop, and how it is reported, is
 stated once in
