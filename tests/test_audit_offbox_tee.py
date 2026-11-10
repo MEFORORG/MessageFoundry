@@ -714,6 +714,60 @@ def test_a_reading_that_hides_one_of_two_equal_words_is_seen() -> None:
     assert f"DOE{chr(0x01)}JANE" not in audit_tee._scrub_field(value)
 
 
+def test_a_deeply_nested_detail_does_not_fail_the_tee(audit_capture) -> None:
+    """``json.loads`` raises ``RecursionError`` on a deep nest, which is not a ``ValueError``. The
+    tee must still ship, and never raise into the committed audit write (review round 1)."""
+    deep = "[" * 20000 + '"x\\n"' + "]" * 20000
+    emit_audit_tee(
+        action="x",
+        actor=None,
+        channel_id=None,
+        detail=deep,
+        ts=1.0,
+        row_id=1,
+        seq=1,
+        row_hash=_HASH,
+    )
+    assert len(audit_capture.messages) == 1
+
+
+def test_a_json_detail_with_an_escape_and_nothing_to_redact_ships_unchanged(
+    capsys, monkeypatch
+) -> None:
+    """A multi-line JSON detail with nothing to redact is not re-encoded, so ``safe_text`` cuts
+    it no sooner than before and it still parses (review round 1: ``\\n`` grew to ``\\u000a``
+    and pushed a 191-character detail past the 200-character bound). Synthetic values."""
+    detail = json.dumps({"error": "\n".join(["step ok"] * 20)})
+    cases: list[dict[str, str | None]] = [{"detail": detail}]
+    before, after = _before_and_after(cases, capsys, monkeypatch)
+    assert after == before
+    json.loads(json.loads(after[0].split("messagefoundry.audit: ", 1)[1])["detail"])
+
+
+def test_a_long_value_with_no_control_is_not_touched() -> None:
+    """The window's own cut ends its note with a newline of its own, which is not the value's
+    control (review round 1)."""
+    value = "word " * 20000
+    assert audit_tee._scrub_field(value) is value
+
+
+class _MixedReadingLeak(Exception):
+    """The one failure the xfail below expects."""
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=_MixedReadingLeak,
+    reason="KNOWN RESIDUAL of BACKLOG #3045: every control in a value is read the same way, so "
+    "text that needs one control as a space and another as nothing is missed by every reading. "
+    "See emit_audit_tee's docstring.",
+)
+def test_text_that_needs_two_controls_read_differently_is_redacted() -> None:
+    value = f"on{chr(0x01)}05/05/19{chr(0x02)}80"
+    if "80" in audit_tee._scrub_field(value):
+        raise _MixedReadingLeak(ascii(value))
+
+
 def test_a_control_with_nothing_to_redact_keeps_the_actor() -> None:
     """Attribution survives: a typed name holding a control, with nothing a reading redacts, ships
     as typed, and the handler chain escapes the control. Synthetic values."""
