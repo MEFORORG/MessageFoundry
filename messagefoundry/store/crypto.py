@@ -644,25 +644,19 @@ class AuditKeyVersionRefusedError(CipherError):
 
 
 class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
-    """Transit answered an audit MAC pinned to one key version with HTTP 400 that is not a version
-    refusal, and still answers under the latest (BACKLOG #6707).
+    """Transit answered an audit MAC pinned to one key version with HTTP 400 whose reply gives no
+    reason naming the version, and still answers under the latest (BACKLOG #6707).
 
-    A subclass, so every handler of its parent treats the row exactly as it treats a refused
-    version: a break reported at that row, the walk going on, the tamper alert raised. Only the
-    label differs, because the reply did not say the version was refused: it carried no Vault error
-    list (a proxy's own page, say) or named a reason that is not the version. Its text names the
-    version and the key only, never the reply."""
-
-    def __init__(self, version: int, key: str) -> None:
-        super().__init__(version)
-        # Both in ``args``, so a copy or pickle rebuilds the same exception.
-        self.args = (version, key)
-        self.key = key
+    The 400 may still be a refusal of the version: a proxy can replace Vault's reply with its own
+    page, and that cannot be told apart from a tamper behind it. So this is a subclass, and a
+    handler of its parent handles it as it handles a refused version; the chain walk, for one,
+    reports a break at that row and goes on. Only the text differs. It names the version only,
+    never the key or the reply, because the walk puts it in the tamper alert."""
 
     def __str__(self) -> str:
         return (
-            f"Transit could not verify audit key version {self.version} (key={self.key!r}): it "
-            "answered HTTP 400 that is not a version refusal"
+            "Transit answered HTTP 400 without a reason that names the version; audit key version "
+            f"{self.version} could not be confirmed"
         )
 
 

@@ -118,15 +118,13 @@ _VERSION_REFUSAL_TEXTS = (
 _NOT_VERSION_TEXTS = frozenset({"missing input for hmac", "encryption key not found"})
 
 
-def _not_a_version_refusal(exc: Exception) -> bool:
-    """Whether a pinned ``hmac`` 400 is affirmatively NOT Transit refusing the version (BACKLOG
-    #6707). It changes only the label: such a 400 raises
-    :class:`~messagefoundry.store.crypto.AuditKeyVersionUnverifiedError`, which every handler treats
-    as its parent, so the walk, the alert and the open run as for a refused version. Only two
-    things say so: no Vault JSON ``errors`` list at all (a proxy or WAF page, or text that is not
-    JSON), or a list every entry of which is a whole text in :data:`_NOT_VERSION_TEXTS` and none of
-    which names a refused version. Anything else, unknown Vault wording included, is labelled a
-    refused version.
+def _names_no_version_reason(exc: Exception) -> bool:
+    """Whether a pinned ``hmac`` 400 gives no reason that names the version (BACKLOG #6707): no
+    Vault JSON ``errors`` list at all (a proxy or WAF page, or text that is not JSON), or a list
+    every entry of which is a whole text in :data:`_NOT_VERSION_TEXTS` and none of which names a
+    refused version. Such a 400 may still be a refusal of the version, so this chooses only the
+    error's text: :class:`~messagefoundry.store.crypto.AuditKeyVersionUnverifiedError` rather than
+    its parent. Anything else, unknown Vault wording included, keeps the parent.
 
     hvac fills ``exc.errors`` only when the reply's Content-Type is exactly ``application/json``,
     so a proxy that adds a charset leaves the same JSON in ``exc.text``; that is read the same way."""
@@ -137,7 +135,7 @@ def _not_a_version_refusal(exc: Exception) -> bool:
         if refused is None and isinstance(parsed, dict):
             errors = parsed.get("errors")
     if not isinstance(errors, list):
-        return True  # no Vault error list: this 400 did not come from Transit's version check
+        return True  # no Vault error list, so no reason at all
     texts = [text.strip().lower() for text in errors if isinstance(text, str)]
     if any(known in text for text in texts for known in _VERSION_REFUSAL_TEXTS):
         return False
@@ -273,8 +271,8 @@ class TransitCipher(_UnmarkedPolicy):
         stored MAC passes the version that MAC names (BACKLOG #2337), so a key rotation does not make
         an older row read as forged. A pinned call Transit refuses for its version alone raises
         :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`), or its subclass
-        :class:`AuditKeyVersionUnverifiedError` when the 400 is affirmatively not a version refusal
-        (:func:`_not_a_version_refusal`, BACKLOG #6707)."""
+        :class:`AuditKeyVersionUnverifiedError` when the 400 gives no reason that names the version
+        (:func:`_names_no_version_reason`, BACKLOG #6707)."""
         inp = base64.b64encode(data).decode("ascii")
         kwargs: dict[str, Any] = {
             "name": self._audit_key,
@@ -288,8 +286,8 @@ class TransitCipher(_UnmarkedPolicy):
             mac = response["data"]["hmac"]  # "vault:v1:…" — no key, no plaintext
         except Exception as exc:
             if key_version is not None and self._refuses_only_version(exc, key_version):
-                if _not_a_version_refusal(exc):  # the same flow, labelled apart (BACKLOG #6707)
-                    raise AuditKeyVersionUnverifiedError(key_version, self._audit_key) from exc
+                if _names_no_version_reason(exc):  # the same flow, labelled apart (BACKLOG #6707)
+                    raise AuditKeyVersionUnverifiedError(key_version) from exc
                 raise AuditKeyVersionRefusedError(key_version) from exc
             raise CipherError(
                 f"Transit audit HMAC failed (key={self._audit_key!r}): {vault_failure_text(exc)}"

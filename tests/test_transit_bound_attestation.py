@@ -551,12 +551,12 @@ def test_a_pinned_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: A
         pytest.param(None, '{"errors": ["reworded refusal"]}', id="unknown-wording-in-text-only"),
     ],
 )
-def test_a_pinned_vault_400_not_affirmatively_about_something_else_is_a_refused_version(
+def test_a_pinned_vault_400_with_a_possible_version_reason_is_a_refused_version(
     errors: Any, text: str | None
 ) -> None:
     """BACKLOG #6707: a 400 carrying Vault's JSON error list is labelled a refused version unless
-    it is affirmatively not one. Unknown Vault wording keeps that label, so a reworded refusal on
-    an upgraded Vault is labelled as before. hvac fills ``errors`` only for a Content-Type of
+    no entry could name the version. Unknown Vault wording keeps that label, so a reworded refusal
+    on an upgraded Vault is labelled as before. hvac fills ``errors`` only for a Content-Type of
     exactly ``application/json``, so the same JSON in the body (a charset-tagged reply) must read
     the same way."""
     from messagefoundry.store.crypto import (
@@ -580,21 +580,22 @@ def test_a_pinned_vault_400_not_affirmatively_about_something_else_is_a_refused_
         pytest.param(["  Encryption key not found "], None, id="known-non-version-any-case"),
     ],
 )
-def test_a_pinned_400_affirmatively_not_about_the_version_is_labelled_unverified(
+def test_a_pinned_400_without_a_version_reason_is_labelled_unverified(
     errors: Any, text: str | None
 ) -> None:
     """BACKLOG #6707: after a rotation the probe answers under a newer version, so the probe alone
-    labelled ANY pinned 400 a refused version. A 400 that did not come from Transit's version check
-    (no Vault error list), or that Vault says is about something else, is labelled unverified
-    instead. It stays a subclass, so the row is handled exactly as on main."""
+    labelled ANY pinned 400 a refused version. A 400 with no Vault error list, or whose Vault
+    reason is something else, is labelled unconfirmed instead. It stays a subclass, so its
+    handlers handle the row as on main."""
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
     refused = _pinned_refusal("vault:v2:AAAA", errors, text=text)
     assert isinstance(refused, AuditKeyVersionUnverifiedError)
     assert str(refused) == (
-        f"Transit could not verify audit key version 3 (key={_KEY_NAME!r}): it answered HTTP 400 "
-        "that is not a version refusal"
+        "Transit answered HTTP 400 without a reason that names the version; audit key version 3 "
+        "could not be confirmed"
     )
+    assert _KEY_NAME not in str(refused)  # the walk puts this text in the tamper alert
 
 
 def test_a_proxy_400_the_probe_does_not_clear_is_a_plain_cipher_error() -> None:
@@ -606,16 +607,16 @@ def test_a_proxy_400_the_probe_does_not_clear_is_a_plain_cipher_error() -> None:
 
 
 def test_a_non_text_entry_in_vault_errors_is_labelled_a_refused_version() -> None:
-    """A Vault error list holding an entry that is not text is not affirmatively about something
-    else (BACKLOG #6707)."""
+    """A Vault error list holding an entry that is not text could name the version, so it keeps
+    the refused-version label (BACKLOG #6707)."""
     _needs_hvac()
     from hvac.exceptions import InvalidRequest
 
-    from messagefoundry.store.crypto_transit import _not_a_version_refusal
+    from messagefoundry.store.crypto_transit import _names_no_version_reason
 
     exc = InvalidRequest(errors=["missing input for HMAC"])
     exc.errors = ["missing input for HMAC", 7]  # hvac's constructor joins entries, so set it after
-    assert not _not_a_version_refusal(exc)
+    assert not _names_no_version_reason(exc)
 
 
 class _ProxiedRotatingTransit(_RotatingTransit):
@@ -646,7 +647,7 @@ async def test_a_planted_version_behind_a_proxy_is_a_chain_break_on_the_startup_
     finally:
         await store.close()
     assert not ok and f"seq={seq}," in str(msg), msg
-    assert f"could not verify audit key version {_UNHELD_VERSION}" in str(msg), msg
+    assert f"audit key version {_UNHELD_VERSION} could not be confirmed" in str(msg), msg
     assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
     assert not any("could not run" in line for line in lines), lines
 
@@ -680,10 +681,10 @@ def test_a_refused_key_version_survives_a_pickle_with_its_text() -> None:
     again = pickle.loads(pickle.dumps(exc))
     assert isinstance(again, AuditKeyVersionRefusedError) and isinstance(again, CipherError)
     assert again.version == 7 and str(again) == str(exc)
-    unverified = AuditKeyVersionUnverifiedError(7, "audit-key")
+    unverified = AuditKeyVersionUnverifiedError(7)
     back = pickle.loads(pickle.dumps(unverified))
     assert isinstance(back, AuditKeyVersionUnverifiedError)
-    assert back.version == 7 and back.key == "audit-key" and str(back) == str(unverified)
+    assert back.version == 7 and str(back) == str(unverified)
 
 
 def test_cli_audit_verify_exits_1_on_a_planted_unheld_key_version(
