@@ -37,7 +37,8 @@ without explicit, reviewed configuration."* A secret that unlocks PHI is held to
 ## Decision
 
 **A secret-class setting may come from a file in a secrets directory, read through one module.** This is slice A of four. It adds a source and moves the readers; it refuses
-nothing that starts today.
+nothing that starts today. Slices C and D were built later; the *Amendments* section at the end
+says what they changed, and the *Out of scope* paragraph below records this slice's own scope.
 
 1. **One list.** `messagefoundry/engine_secrets.py` holds `SECRET_SETTING_NAMES`, every
    secret-class setting by its environment name. `serviceenv` takes its two lists from it, so the
@@ -145,6 +146,31 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 
 ## To resolve on acceptance
 
-- [ ] Whether the directory's location becomes a fixed path under the data directory once the
-      installer creates it (slice C), or stays operator-named.
+- [x] Whether the directory's location becomes a fixed path under the data directory once the
+      installer creates it (slice C), or stays operator-named. **Operator-named** (2026-11-05,
+      slice C): see the amendment below.
 - [ ] Whether a Windows file is also DPAPI-wrapped, after the user-scope DPAPI spike.
+
+## Amendments
+
+- **2026-11-05, slice D built.** `[store].key_provider` no longer accepts the four external names
+  ADR 0019 declared and nobody built, `aws_kms`, `azure_kv`, `gcp_kms` and `pkcs11`; each is now
+  refused as an unknown name. Question 12 of the maintainer-internal decisions index answered yes
+  (Manager decision 2026-10-01, under the owner's driver rule). ADR 0019 carries the matching
+  amendment.
+- **2026-11-05, slice C built: the location stays operator-named.** The engine keeps reading only
+  the path `MEFOR_SECRETS_DIRECTORY` names, with no default. `install-service.ps1` creates the
+  directory `-SecretsDir` names, else the one the service already names, else `<DataDir>-secrets`,
+  restricted to SYSTEM and Administrators (full control) and the service account (read), and adds
+  the variable to the service's NSSM environment, merging it into the entries already there. The
+  default sits beside the data directory rather than in it, because the *Negative / risks*
+  paragraph above keeps the plain files out of a data-directory backup. The Linux and container locations are
+  documented, not built: a read-only bind mount in `docker/compose.yaml`, commented out, and a
+  systemd credentials directory, which is not measured. **Why not a fixed path:** the engine is
+  not told the data directory (it is given `--db`), so a fixed path would need a new engine rule
+  that every platform then has to meet, where a container mounts its secrets wherever its runtime
+  puts them. An operator-named path needs no engine change, the variable holds a path and not a
+  secret, and each platform's installer or manifest supplies the one value that fits it. **What it
+  costs:** the variable is one more entry in the service's registry key, so a local user can read
+  where the directory is, though not what it holds; and an engine started without the variable
+  reads every secret from the environment, as before slice A.

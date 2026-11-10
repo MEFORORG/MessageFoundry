@@ -79,6 +79,7 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.row_seal import AnyRowSealer
 from messagefoundry.store.store import (
+    ANY_CLAIM_OWNER,
     OPEN_STORE_PIN,
     UPLOAD_RESERVATION_STALE_AFTER,
     AdMap,
@@ -93,6 +94,7 @@ from messagefoundry.store.store import (
     CapturedResponse,
     ChannelScopeSource,
     ClaimedHeads,
+    ClaimOwnerGuard,
     ClaimProcStatus,
     ConnectionEvent,
     ConnectionEventWrite,
@@ -2133,7 +2135,7 @@ class AuditStore(Protocol):
         ...
 
     async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
-        """Released requests whose operation was cut off mid-run (status ``interrupted``), OLDEST
+        """Released requests at status ``interrupted``, OLDEST
         first (BACKLOG #1562). Kept apart from :meth:`list_pending_approvals` so "pending" keeps its
         one meaning: awaiting a second approver. An interrupted row is awaiting an operator's record
         of what happened, so no expiry applies to it; it stays listed until it is resolved.
@@ -2142,8 +2144,7 @@ class AuditStore(Protocol):
         hide the rows that have waited longest, and nothing would ever bring them back. Oldest first,
         a row past the cap appears as the ones before it are resolved.
 
-        Projects the same columns as the pending queue, so ``approver`` and ``decided_at`` say who
-        released it and when it was cut off."""
+        Projects the same columns as the pending queue."""
         ...
 
     async def decide_pending_approval(
@@ -2156,6 +2157,7 @@ class AuditStore(Protocol):
         from_status: str = "pending",
         audit: AuditAppend | None = None,
         claim_owner: str | None = None,
+        from_claim_owner: ClaimOwnerGuard = ANY_CLAIM_OWNER,
     ) -> bool:
         """Move a request from ``from_status`` to ``status`` in one guarded UPDATE. ``True`` iff
         this call moved it, which is what guards a double decision.
@@ -2172,6 +2174,11 @@ class AuditStore(Protocol):
         operation, so that process can recognise its own claims after a restart
         (``ApprovalGate.reconcile_after_restart``). Engine shards and cluster nodes share one store,
         and the owner is what keeps one process from settling a sibling's live release.
+
+        ``from_claim_owner``, when not :data:`~messagefoundry.store.store.ANY_CLAIM_OWNER`, also
+        guards the move on the row's ``claim_owner`` reading exactly that value, ``None`` meaning
+        no owner, checked on the row read in the write (BACKLOG #1562). An operator's settle of a
+        stranded release passes the owner it judged, so the move lands only on the row it judged.
 
         **The move checks the row's seal first (BACKLOG #2592).** It reads the row, and raises
         :class:`~messagefoundry.store.row_seal.RowSealError`, writing nothing, when the seal does
@@ -2210,12 +2217,19 @@ class AuditStore(Protocol):
         ...
 
     async def list_executing_approvals(
-        self, *, claim_owner: str | None = None, limit: int = 1000
+        self,
+        *,
+        claim_owner: str | None = None,
+        not_claimed_by: str | None = None,
+        limit: int = 1000,
     ) -> Sequence[Row]:
         """Released requests still claimed as ``executing``, OLDEST claim first (BACKLOG #1562).
 
         ``claim_owner``, when given, keeps only the rows that owner claimed and the rows with no
         owner, filtered in SQL so other owners' rows cannot push them past ``limit``.
+        ``not_claimed_by`` is its complement for a sibling scan: only rows some OTHER owner
+        claimed, never an unowned row, so the caller's own rows cannot push a sibling's past
+        ``limit`` either. Passing both raises :class:`ValueError`.
 
         Projects every column, as :meth:`list_pending_approvals` does; ``decided_at`` is when it
         was claimed. Read at startup by ``ApprovalGate.reconcile_after_restart``,
@@ -5044,7 +5058,13 @@ DEFAULT_STORE_ACQUIRE_TIMEOUT = 30.0
 
 
 class StoreAcquireTimeout(RuntimeError):
-    """A store pooled-connection borrow exceeded ``[store].acquire_timeout``.
+    """A store pooled-connection borrow exceeded its limit: at least ``[store].acquire_timeout``,
+    a shorter cluster clamp, or the longer post-commit limit. The message ends with the advice its
+    caller passed, ``[store].acquire_timeout`` unless the caller says otherwise. A SQL Server
+    cluster coordinator's clamped borrow whose clamp, floored at 1 s, is no longer than
+    ``[store].acquire_timeout`` advises one fixed text that points to the docs/CONFIGURATION.md
+    [cluster] paragraph instead
+    (``SqlServerStore._acquire_clamped``, BACKLOG #5064).
 
     An ordinary ``Exception`` on purpose, so it lands in the store callers' existing ``except
     Exception`` handling and is treated as a transient stage failure (retry / dead-letter) — never a
@@ -5086,8 +5106,12 @@ def _salvage_late_borrow(pool: Any, backend: str, borrow: asyncio.Future[Any]) -
 _LATE_RELEASES: set[asyncio.Future[None]] = set()
 
 
-async def acquire_pooled(pool: Any, *, timeout: float, backend: str) -> Any:
+async def acquire_pooled(
+    pool: Any, *, timeout: float, backend: str, retune: str = "[store].acquire_timeout"
+) -> Any:
     """Borrow a pooled connection within ``timeout`` seconds, or raise :class:`StoreAcquireTimeout`.
+    ``retune`` is the advice the error ends with, after "retune with": a setting name, or for a
+    caller whose limit is not ``[store].acquire_timeout`` alone, the text that caller passes.
 
     The single bounded chokepoint both server backends' ``_acquire`` helpers go through, so there is
     one place that decides what happens at the limit and the two cannot drift. The caller releases the
@@ -5110,7 +5134,7 @@ async def acquire_pooled(pool: Any, *, timeout: float, backend: str) -> Any:
         borrow.add_done_callback(partial(_salvage_late_borrow, pool, backend))
         raise StoreAcquireTimeout(
             f"{backend}: store pool acquire timed out after {timeout:g}s "
-            f"(pool exhausted or database unresponsive); retune with [store].acquire_timeout"
+            f"(pool exhausted or database unresponsive); retune with {retune}"
         ) from exc
     except asyncio.CancelledError:
         borrow.cancel()

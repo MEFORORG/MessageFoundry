@@ -249,66 +249,21 @@ class KnownFinding:
 #: :func:`_hl7_peek` came out with it. Its reproducer stays on as the :data:`BLANK_SEGMENT_HL7` seed,
 #: and ``tests/test_fuzz_targets.py`` drives it, so the fix cannot quietly regress.
 #:
-#: Both entries below were produced by the ``binary_carriage`` target under vault BACKLOG #2683: the
-#: first within its first 299 executions on the run that introduced it, the second by the review of
-#: that change. They share one engine message and one root -- ``Message`` reads its separators from
-#: an MSH it cannot always find -- but they are two shapes with two different consequences, so each
-#: is registered and pinned on its own. Neither is filed under a number of its own here: a ledger
-#: number is allocated in the maintainer-internal repository, not cited before it is.
-#:
-#: Both carve-outs live in :func:`_binary_carriage`, and BOTH halves must hold before anything is
-#: swallowed: the exception is a bare ``ValueError`` whose message starts with
-#: :data:`_SEPARATORS_MESSAGE`, and the input has the registered structural shape. Either half alone
-#: is too wide -- the first draft checked only the input, and swallowed any ``ValueError`` at all.
+#: The two binary-carriage findings the ``binary_carriage`` target produced under vault BACKLOG #2683
+#: were fixed under BACKLOG #2873, and their entries and the carve-out in :func:`_binary_carriage`
+#: came out with them. Both were a bare ``ValueError`` ('cannot determine HL7 separators') out of
+#: ``extract_obx_document``, on an MSH-led body whose MSH-2 carries fewer than four encoding
+#: characters and on an FHS- or BHS-led body with no MSH; it now refuses both as
+#: ``UnreadableDelimitersError``, which is not a ``BinaryCarriageError``. What each body still
+#: meets at the listener is in ``fuzz/README.md``,
+#: *Known findings*. Both reproducers stay on as ``binary_carriage`` seeds, and
+#: ``tests/test_fuzz_targets.py`` drives them, so the fix cannot quietly regress.
 SHORT_MSH2_REPRODUCER = (
     b"MSH|^~|A|B|C|D|20260101||ORU^R01|X1|P|2.5\rOBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r"
 )
 BATCH_HEADER_REPRODUCER = b"FHS|^~\\&|A|B\rOBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r"
 
-KNOWN_FINDINGS: tuple[KnownFinding, ...] = (
-    KnownFinding(
-        target="binary_carriage",
-        summary=(
-            "extract_obx_document raises a bare ValueError ('cannot determine HL7 separators') on "
-            "an MSH-led HL7 body whose MSH-2 carries fewer than four encoding characters. "
-            "Peek.parse and Message.parse both accept such a body, and build_ack answers it AA; "
-            "Message.field then raises on the first read. On first deployment a Handler that "
-            "called extract_obx_document on such a body would get a bare ValueError, not the "
-            "BinaryCarriageError that function documents. strip_documents no longer raises on it: "
-            "it returns such a body unchanged, so the retention document-strip pass skips the row "
-            "rather than aborting. iter_obx_documents refuses such a body as "
-            "UnreadableDelimitersError, which the over-threshold ingress detach records "
-            "(BACKLOG #5099)."
-        ),
-        discriminator=(
-            "the exception is a bare ValueError whose message starts 'cannot determine HL7 "
-            "separators', AND Peek.parse accepts the text (so it is MSH-led) AND "
-            "Message._encoding_chars() raises ValueError on the parsed message"
-        ),
-        reproducer=SHORT_MSH2_REPRODUCER,
-    ),
-    KnownFinding(
-        target="binary_carriage",
-        summary=(
-            "extract_obx_document raises a bare ValueError ('cannot determine HL7 separators', "
-            "with MSH-1 and MSH-2 both empty) on a body that leads with an FHS or BHS batch header "
-            "and carries no MSH; iter_obx_documents refuses it as UnreadableDelimitersError "
-            "(BACKLOG #5099). Peek.parse refuses such a body but "
-            "Message.parse accepts it, so the two HL7 parsers disagree about it. On first "
-            "deployment a Handler that parsed such a body with Message.parse and called "
-            "extract_obx_document would get a bare ValueError, not the BinaryCarriageError that "
-            "function documents. strip_documents is not affected: it returns a body with no MSH "
-            "unchanged, including one that passes its 'MSH' in the first eight characters gate "
-            "(BACKLOG #5099)."
-        ),
-        discriminator=(
-            "the exception is a bare ValueError whose message starts 'cannot determine HL7 "
-            "separators', AND Peek.parse refuses the text AND Message.parse accepts it AND the "
-            "parsed message has an FHS or BHS segment and no MSH segment"
-        ),
-        reproducer=BATCH_HEADER_REPRODUCER,
-    ),
-)
+KNOWN_FINDINGS: tuple[KnownFinding, ...] = ()
 
 
 def _hl7_peek(data: bytes) -> None:
@@ -670,10 +625,11 @@ def _binary_carriage(data: bytes) -> None:
       wrote into ``OBX-5.5`` ``InboundDocRefError``, for a value the splice would not set back
       verbatim ``NonVerbatimDocumentError``, and for a body with an OBX and no MSH, or an MSH-2
       shorter than four characters, ``UnreadableDelimitersError`` (BACKLOG #5099) -- and
-      ``extract_obx_document`` on every OBX, whose refusal is ``BinaryCarriageError``.
+      ``extract_obx_document`` on every OBX, whose refusals are ``BinaryCarriageError`` for an OBX
+      that is not a Base64 ED document and, for a body whose delimiters cannot be read,
+      ``UnreadableDelimitersError`` (BACKLOG #2873), which is not a ``BinaryCarriageError``.
 
-    The HL7 half carries the only carve-outs in this file, one per registered known finding: see
-    :data:`KNOWN_FINDINGS` and :func:`_is_known_binary_carriage_finding`.
+    There is no carve-out.
     """
     text = data.decode("utf-8", "replace")
     with contextlib.suppress(BinaryCarriageError):
@@ -681,16 +637,11 @@ def _binary_carriage(data: bytes) -> None:
     if is_doc_ref(text):
         with contextlib.suppress(DocRefError):
             parse_doc_ref(text)
-    # A carriage value never reaches the HL7 path, so this call needs no carve-out. Nor does the
-    # bare call: strip_documents returns a body whose separators cannot be read unchanged
-    # (BACKLOG #5099), so no known finding covers it and any raise escapes.
+    # The retention pass calls strip_documents bare, so no raise is allowed; it returns a body
+    # whose separators cannot be read unchanged (BACKLOG #5099).
     strip_documents(CARRIAGE_MARKER + text, pruned_at=0.0)
     strip_documents(text, pruned_at=0.0)
-    try:
-        _strip_and_scan_hl7(text)
-    except ValueError as exc:
-        if not _is_known_binary_carriage_finding(text, exc):
-            raise
+    _strip_and_scan_hl7(text)
 
 
 def _strip_and_scan_hl7(text: str) -> None:
@@ -699,73 +650,33 @@ def _strip_and_scan_hl7(text: str) -> None:
         message = Message.parse(text)
     except HL7PeekError:
         return
-    with contextlib.suppress(
-        EscapedDocumentError,
-        InboundDocRefError,
-        NonVerbatimDocumentError,
-        UnreadableDelimitersError,
-    ):
-        list(iter_obx_documents(message, received=text))
-    for occurrence in range(1, message.count_segments("OBX") + 1):
-        with contextlib.suppress(BinaryCarriageError):
-            extract_obx_document(message, occurrence=occurrence)
-
-
-#: The start of the engine's message for the one exception both known findings raise
-#: (``Message._encoding_chars``, ``parsing/message.py``).
-_SEPARATORS_MESSAGE = "cannot determine HL7 separators"
-
-
-def _is_known_binary_carriage_finding(text: str, exc: ValueError) -> bool:
-    """Whether ``exc``, raised on ``text``, is one of the two registered :data:`KNOWN_FINDINGS`.
-
-    BOTH halves are required. The EXCEPTION must be a bare ``ValueError`` (not a subclass, so no
-    codec error is taken for it) carrying the engine's separators message, and the INPUT must have
-    one of the two registered shapes. The first draft checked only the input, so on a matching body
-    it swallowed any ``ValueError`` at all -- a planted one included, and an FHS-led body that is a
-    different defect from the one then registered.
-    """
-    if type(exc) is not ValueError or not str(exc).startswith(_SEPARATORS_MESSAGE):
-        return False
-    return _is_short_msh2_shape(text) or _is_batch_header_shape(text)
-
-
-def _is_short_msh2_shape(text: str) -> bool:
-    """The first finding's shape: an MSH-led body ``Peek.parse`` accepts, whose own separators
-    ``Message`` cannot read back.
-
-    ``Peek.parse`` accepting is what makes it MSH-led, and what makes the shape reach the store at
-    all. The separator check calls ``Message._encoding_chars`` rather than restating its rule (MSH-1
-    one character, MSH-2 at least four), deliberately: a copy here would drift from the engine's and
-    widen or narrow the carve-out without anyone noticing.
-    """
     try:
-        Peek.parse(text)
-        message = Message.parse(text)
-    except HL7PeekError:
-        return False
+        list(iter_obx_documents(message, received=text))
+    except UnreadableDelimitersError:
+        _require_unreadable(message, "iter_obx_documents")
+    except (EscapedDocumentError, InboundDocRefError, NonVerbatimDocumentError):
+        pass
+    for occurrence in range(1, message.count_segments("OBX") + 1):
+        # UnreadableDelimitersError first, so the check still runs were it ever made a subclass.
+        try:
+            extract_obx_document(message, occurrence=occurrence)
+        except UnreadableDelimitersError:
+            _require_unreadable(message, "extract_obx_document")
+            break  # the header is the cause, so every later OBX is refused the same way
+        except BinaryCarriageError:
+            pass
+
+
+def _require_unreadable(message: Message, refuser: str) -> None:
+    """An ``UnreadableDelimitersError`` is the header's refusal, so the header must be one the
+    engine cannot read; a refusal of a readable body is a defect, not a refusal (BACKLOG #2873).
+    The oracle is ``Message._encoding_chars``, the engine's own read, so it catches a guard that
+    over-refuses but not a regression in that read itself."""
     try:
         message._encoding_chars()
     except ValueError:
-        return True
-    return False
-
-
-def _is_batch_header_shape(text: str) -> bool:
-    """The second finding's shape: ``Peek.parse`` refuses the body, ``Message.parse`` accepts it, and
-    it carries an FHS or BHS batch header and no MSH segment at all."""
-    try:
-        Peek.parse(text)
-    except HL7PeekError:
-        pass
-    else:
-        return False
-    try:
-        message = Message.parse(text)
-    except HL7PeekError:
-        return False
-    has_batch_header = message.count_segments("FHS") + message.count_segments("BHS") > 0
-    return has_batch_header and message.count_segments("MSH") == 0
+        return
+    raise AssertionError(f"{refuser} refused readable delimiters as unreadable")
 
 
 @dataclass(frozen=True)
@@ -839,11 +750,14 @@ _COMPRESSION_SEEDS = (
 )
 
 #: Binary-carriage seeds: an HL7 message with one OBX-5 ED Base64 document (a PDF header, synthetic),
-#: a bare base64 value, and a live document handle with a 64-hex content address.
+#: a bare base64 value, a live document handle with a 64-hex content address, and the two retired
+#: findings' reproducers (:data:`SHORT_MSH2_REPRODUCER`, :data:`BATCH_HEADER_REPRODUCER`).
 _BINARY_SEEDS = (
     _MINIMAL_HL7 + b"OBX|1|ED|DOC^Document||^Application^pdf^Base64^JVBERi0xLjQKJQ==\r",
     b"JVBERi0xLjQKJQ==",
     b"mfdoc:v1:ref:" + b"0" * 64 + b":application/pdf",
+    SHORT_MSH2_REPRODUCER,
+    BATCH_HEADER_REPRODUCER,
 )
 
 
