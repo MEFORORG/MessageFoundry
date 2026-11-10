@@ -315,9 +315,9 @@ class SqlServerCoordinator:
     async def config_version(self) -> int:
         """Read (seeding to 0 if absent) and cache the cluster-wide config-reload version, with the
         initiator's digest from the same statement (vault BACKLOG #3109). Under
-        ``[store].command_timeout``, not the renew clamp: the engine's start-up seed calls this,
-        before the first load and, when that read failed, again in :meth:`Engine.start` while
-        the maintenance loop already runs. The loop refreshes through
+        ``[store].command_timeout``, not the renew clamp: at least the engine's start-up seed
+        calls this, and :meth:`Engine.start` seeds again, while the maintenance loop already
+        runs, whenever no earlier seed stands. The loop refreshes through
         :meth:`_refresh_config_version` instead."""
         return await self._read_config_version(None)
 
