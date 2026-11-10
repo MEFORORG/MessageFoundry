@@ -12,6 +12,7 @@ the on-open seal pass, rotation and the restore-verify cell list.
 from __future__ import annotations
 
 import ast
+import asyncio
 import base64
 import pathlib
 import sqlite3
@@ -32,6 +33,7 @@ from messagefoundry.store.cell_tag import (
     dead_letters_on_cell_tag,
     message_cell_aad,
     open_message_cell,
+    open_tagged_cell,
     preset_criteria_aad,
     report_cell_tag_failure,
     row_tag_aad,
@@ -188,6 +190,13 @@ async def test_a_corrupt_cell_writes_no_tag_failed_audit_and_drift_does() -> Non
     assert rows == [MESSAGE_TAG_FAILED_ACTION]
 
 
+@pytest.fixture
+def fresh_audit_memo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An earlier report of the same cell, in this run or a re-run, must not mute these tests."""
+    monkeypatch.setattr(cell_tag, "_reported_audit", {})
+
+
+@pytest.mark.usefixtures("fresh_audit_memo")
 async def test_a_failed_audit_write_does_not_mute_the_cells_next_report(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -218,6 +227,41 @@ async def test_a_failed_audit_write_does_not_mute_the_cells_next_report(
     assert rows == [MESSAGE_TAG_FAILED_ACTION]  # written, so muted for the interval
 
 
+@pytest.mark.usefixtures("fresh_audit_memo")
+async def test_a_report_in_flight_skips_a_concurrent_one_and_a_cancel_releases_the_cell() -> None:
+    """BACKLOG #6697: while one report of a cell is writing, a concurrent one writes no duplicate;
+    a write that is cancelled leaves the cell unmuted for its next refusal."""
+    rows: list[str] = []
+    gate = asyncio.Event()
+
+    class _Sink:
+        async def record_audit(self, action: str, **_kwargs: object) -> None:
+            await gate.wait()
+            rows.append(action)
+
+    first = asyncio.create_task(
+        report_cell_tag_failure(_Sink(), CellTagError("messages", "raw", "au-flight", "A"))
+    )
+    await asyncio.sleep(0)
+    await report_cell_tag_failure(_Sink(), CellTagError("messages", "raw", "au-flight", "A"))
+    gate.set()
+    await first
+    assert rows == [MESSAGE_TAG_FAILED_ACTION]
+
+    gate.clear()
+    cancelled = asyncio.create_task(
+        report_cell_tag_failure(_Sink(), CellTagError("messages", "raw", "au-cancel", "A"))
+    )
+    await asyncio.sleep(0)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    gate.set()
+    await report_cell_tag_failure(_Sink(), CellTagError("messages", "raw", "au-cancel", "A"))
+    assert rows == [MESSAGE_TAG_FAILED_ACTION] * 2
+
+
+@pytest.mark.usefixtures("fresh_audit_memo")
 async def test_each_table_is_audited_under_its_own_action() -> None:
     """BACKLOG #6697: a preset failure is audited as a preset's, and no other table can be named, so
     no failure falls through to another table's action."""
@@ -231,6 +275,11 @@ async def test_each_table_is_audited_under_its_own_action() -> None:
     assert rows == [PRESET_TAG_FAILED_ACTION]
     with pytest.raises(ValueError):
         CellTagError("queue", "payload", "au-q", None)
+    cipher = make_cipher(generate_key(), write_v2=True)
+    with pytest.raises(ValueError):  # refused on every open, not only when one fails its tag
+        open_tagged_cell(cipher, None, b"", table="queue", column="payload", row_id="au-q")
+    # Every table this module tags has an audit action, so no tag failure meets the ValueError.
+    assert {table for table, _ in cell_tag._ROW_TAGGED} == set(cell_tag._TAG_FAILED_ACTION)
 
 
 class _DeadLetterSink:
@@ -248,18 +297,23 @@ class _DeadLetterSink:
         self.dead.append(outbox_id)
 
 
+@pytest.mark.usefixtures("fresh_audit_memo")
 async def test_a_failed_dead_letter_still_writes_the_audit_row() -> None:
     """BACKLOG #6698: the dead-letter's error propagates, so the row is re-run and dead-lettered
-    then, and the audit row is written regardless."""
+    then, and the audit row is written regardless, once."""
     sink = _DeadLetterSink(fail=True)
     with pytest.raises(sqlite3.OperationalError):
         await dead_letter_on_cell_tag(sink, "dl-1", CellTagError("messages", "raw", "dl-fail", "A"))
-    assert sink.audits == [MESSAGE_TAG_FAILED_ACTION]
+    assert sink.audits == [MESSAGE_TAG_FAILED_ACTION] and sink.dead == []
+    sink.fail = False  # the re-run meets the same cell: dead-lettered, and not audited twice
+    await dead_letter_on_cell_tag(sink, "dl-1", CellTagError("messages", "raw", "dl-fail", "A"))
+    assert sink.dead == ["dl-1"] and sink.audits == [MESSAGE_TAG_FAILED_ACTION]
     ok = _DeadLetterSink()  # control: the ordinary path dead-letters and audits
     await dead_letter_on_cell_tag(ok, "dl-2", CellTagError("messages", "raw", "dl-ok", "A"))
     assert ok.dead == ["dl-2"] and ok.audits == [MESSAGE_TAG_FAILED_ACTION]
 
 
+@pytest.mark.usefixtures("fresh_audit_memo")
 async def test_the_handoff_wrapper_requires_a_keyword_only_routed_id() -> None:
     """BACKLOG #6698: a handoff that could take ``routed_id`` positionally is refused at decoration,
     so the wrapper never meets a call whose ``kwargs`` lack it."""
@@ -269,6 +323,11 @@ async def test_the_handoff_wrapper_requires_a_keyword_only_routed_id() -> None:
 
     with pytest.raises(TypeError, match="keyword-only"):
         dead_letters_on_cell_tag(positional)
+    # An annotation naming a TYPE_CHECKING-only type, in a module without the future import, is not
+    # evaluated at decoration.
+    namespace: dict[str, Any] = {}
+    exec("async def lazy(self, *, routed_id: NotDefinedHere) -> bool: ...", namespace)  # noqa: S102
+    dead_letters_on_cell_tag(namespace["lazy"])
 
     async def keyword(self: _DeadLetterSink, *, routed_id: str) -> bool:
         raise CellTagError("messages", "raw", "kw-1", "A")
