@@ -52,7 +52,6 @@ from messagefoundry.store.gcm_bound import (
     SETTLE_WAIT_SECONDS,
     bounded_cipher,
     checkpoint_invocations,
-    overspend_deadline,
     settle_at_close,
 )
 from messagefoundry.store.store import _writer_guard
@@ -721,49 +720,27 @@ async def _overspent(db: Path) -> tuple[MessageStore, AesGcmCipher, int]:
     return store, cipher, reserved
 
 
-async def test_an_overspend_is_charged_once_a_busy_writer_frees_within_the_deadline(
+async def test_an_overspent_close_waits_for_a_busy_writer_and_charges_the_overspend(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Past the settle's own wait, an overspent reserve keeps waiting for the writer, to the stop's
-    deadline; a writer that frees within it lets the close charge the overspend, with no ERROR."""
+    """Past the settle's own wait an overspent reserve closes the bound, so nothing more is spent,
+    and keeps waiting for the writer with no bound; once it frees the overspend is charged, with no
+    ERROR, so the close does not under-count."""
     db = tmp_path / "frees.db"
     store, cipher, reserved = await _overspent(db)
-    loop = asyncio.get_running_loop()
     await store._lock.acquire()
     with caplog.at_level(logging.ERROR, logger="messagefoundry.store.gcm_bound"):
-        with overspend_deadline(loop.time() + 5.0):
-            close = asyncio.ensure_future(store.close())
+        close = asyncio.ensure_future(store.close())
         try:
-            await asyncio.sleep(SETTLE_WAIT_SECONDS * 3)
+            await asyncio.sleep(SETTLE_WAIT_SECONDS * 5)
             assert not close.done(), "the control: the close is still waiting for the writer"
+            assert cipher.invocation_bound_closed, "nothing more is spent while it waits"
         finally:
             store._lock.release()
             await asyncio.wait_for(close, 10)
-    assert not [r for r in caplog.records if "not charged" in r.getMessage()]
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not errors, errors
     assert await _persisted(db, cipher.invocation_key_id) == reserved + 5
-
-
-async def test_an_overspend_a_writer_never_frees_for_is_named_at_the_deadline(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A writer still busy at the stop's deadline: the close returns at that deadline, and the ERROR
-    names the amount not charged."""
-    db = tmp_path / "never.db"
-    store, cipher, reserved = await _overspent(db)
-    loop = asyncio.get_running_loop()
-    await store._lock.acquire()
-    try:
-        with caplog.at_level(logging.ERROR, logger="messagefoundry.store.gcm_bound"):
-            with overspend_deadline(loop.time() + 0.5):
-                close = asyncio.ensure_future(store.close())
-            await asyncio.wait_for(close, 10)
-    finally:
-        store._lock.release()
-    assert cipher.invocation_bound_closed
-    assert any("overspend of 5 was not charged" in r.getMessage() for r in caplog.records), [
-        r.getMessage() for r in caplog.records
-    ]
-    assert await _persisted(db, cipher.invocation_key_id) == reserved
 
 
 async def test_a_close_that_times_out_with_an_unspent_reserve_keeps_the_block(

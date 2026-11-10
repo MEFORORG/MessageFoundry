@@ -9450,9 +9450,10 @@ CREATE INDEX IF NOT EXISTS ix_audit_actor_id ON audit_log(actor, id);
 -- fingerprint of the AES key values are SEALED under: the store data sub-key for the cell-bound writer,
 -- the DEK for the frozen v1 writer (ADR 0196). Each row holds the cumulative count of invocations
 -- RESERVED under that key across every process that has ever opened this store. Reserve-then-spend: a
--- process durably adds a block BEFORE spending it, so an UNCLEAN exit forfeits its unspent reserve; a
--- clean close settles the spend, and a long burst tops up per batch. A close that times out with an
--- overspent reserve leaves uncharged the amount its ERROR line names (BACKLOG #3191). A NEW key has no row and starts at zero for free, and because the sub-key is derived
+-- process durably adds a block BEFORE spending it, so an UNCLEAN exit over-counts (it forfeits its
+-- unspent reserve) and never under-counts; a clean close settles the exact spend, and a long burst tops
+-- up per batch. A close whose writer stays busy past its wait leaves an unspent reserve persisted, an
+-- over-count of at most a block (BACKLOG #3191). A NEW key has no row and starts at zero for free, and because the sub-key is derived
 -- from this store's own salt, a recreated or restored store is a new key rather than a reset one.
 -- Zeroing an EXISTING key_id is deliberately not offered (it would refresh the birthday budget of a key
 -- that never changed). Non-secret: a fingerprint plus a counter.
