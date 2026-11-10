@@ -18,6 +18,7 @@ subcommand process that never calls ``configure_logging``.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import json
 import logging
@@ -25,6 +26,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -656,16 +658,36 @@ def test_a_control_reading_never_exposes_what_another_reading_hides(
     assert not [needle for needle in needles if needle in line], line
 
 
-def _multi_control_keys() -> list[tuple[str, tuple[str, str]]]:
-    """Two sweep templates in one value, each with its own control, and the control case first:
-    the same pair with a space or nothing in each control's place."""
+def _shown_words(text: str) -> collections.Counter[str]:
+    """The runs of letters and digits ``text`` shows outside redaction markers, a C0 control
+    counted as a break, and, as well, those it shows with its controls removed."""
+    bare = re.sub(r"\[redacted\]|<redacted>", " ", text)
+    joined = re.sub(r"[\x00-\x1f]", "", bare)
+    return collections.Counter(re.findall(r"[^\W_]+", bare)) | collections.Counter(
+        re.findall(r"[^\W_]+", joined)
+    )
+
+
+def _multi_control_keys() -> list[tuple[str, tuple[str, ...]]]:
+    """Two sweep templates in one value, each with its own control, and the needles to check.
+    A needle is checked only where the control case hides it: the same pair with a space or
+    nothing in each control's place. Some pairs defeat a pattern on their own, as two
+    ``SMITH, JOHN`` in a row do, and that is the pattern's residual, not the control's. Nor is
+    one checked where the control case shows a word the plain passes hide in the value itself:
+    there the ship rule, that the field scrub shows nothing they hide, wins."""
+    from messagefoundry.logging_setup import _scrub_text_passes
+
     keys = []
     for first, needle_1, stand_1 in _C0_SWEEP_TEMPLATES:
         for second, needle_2, stand_2 in _C0_SWEEP_TEMPLATES:
-            for code_1, code_2 in ((-1, -1), (0x01, 0x01), (0x00, 0x1F), (0x1B, 0x08)):
-                one = first.format(c=chr(code_1) if code_1 >= 0 else stand_1)
-                two = second.format(c=chr(code_2) if code_2 >= 0 else stand_2)
-                keys.append((f"{one} {two}", (needle_1, needle_2)))
+            bar = _scrub_text_passes(f"{first.format(c=stand_1)} {second.format(c=stand_2)}")
+            for code_1, code_2 in ((0x01, 0x01), (0x00, 0x1F), (0x1B, 0x08)):
+                value = f"{first.format(c=chr(code_1))} {second.format(c=chr(code_2))}"
+                conflict = _shown_words(bar) - _shown_words(_scrub_text_passes(value))
+                needles = tuple(
+                    needle for needle in (needle_1, needle_2) if needle not in bar and not conflict
+                )
+                keys.append((value, needles))
     return keys
 
 
@@ -746,6 +768,91 @@ def test_a_serialised_detail_with_whitespace_escapes_still_parses(value: str, ca
     detail = _line_record(line)["detail"]
     assert "JANE" not in detail
     assert set(json.loads(detail)) == {"error"}
+
+
+@pytest.mark.parametrize(
+    ("detail", "needles"),
+    [
+        ({"MRN\x01": 12345678, "n": 1.50, "t": True, "z": None}, ()),
+        ({"a": "pass\x01word: hunter2", "b": "keep me"}, ("hunter2",)),
+        ({"e": ["DOE\x01JANE", {"k": "05\x01/05/1980"}]}, ("DOE", "1980")),
+    ],
+)
+def test_a_serialised_detail_keeps_its_structure(
+    detail: dict[str, Any], needles: tuple[str, ...]
+) -> None:
+    """Each string of a ``detail`` that parses is scrubbed on its own and encoded again, and
+    every number, constant and key order is kept as written, so the detail still parses and
+    nothing but a string changes (BACKLOG #3045, review round 4: a redacted number, or a label a
+    reading rewrote, broke it). Synthetic values."""
+    text = json.dumps(detail)
+    scrubbed = scrub_log_field(text, json_escapes=True)
+    parsed = json.loads(scrubbed)
+    assert list(parsed) == list(detail)
+    assert all(parsed[k] == v for k, v in detail.items() if not isinstance(v, (str, list)))
+    assert not [needle for needle in needles if needle in scrubbed], scrubbed
+
+
+@pytest.mark.parametrize(
+    ("value", "needle"),
+    [
+        ("Authorization:\x01Bearer abcdefgh IB_ACME_ADT", "abcdefgh"),
+        ("password: hunter2 MRN 1234\x015678", "5678"),
+    ],
+)
+def test_a_control_the_plain_passes_swallowed_is_still_read(value: str, needle: str) -> None:
+    """The plain passes can rewrite a span holding a control, so the control is gone from their
+    result while the text beside it still shows. The raw value is read too, and its try is kept
+    because it shows no word the plain result hides (BACKLOG #3045, review round 4). Synthetic."""
+    assert needle in _scrub_text_passes_of(value)  # the plain passes show it
+    assert needle not in scrub_log_field(value)
+
+
+def _scrub_text_passes_of(value: str) -> str:
+    from messagefoundry.logging_setup import _scrub_text_passes
+
+    return _scrub_text_passes(value)
+
+
+def test_a_long_value_keeps_its_redaction_bound_note() -> None:
+    """The plain passes clamp a long value and note what they did not scan; the tries run over
+    their result without clamping it again, so the note survives (BACKLOG #3045, review round
+    4). Synthetic."""
+    value = "MRN 1234\x015678 " + "word " * 26000
+    plain = _scrub_text_passes_of(value)
+    scrubbed = scrub_log_field(value)
+    assert "[redaction bound: dropped" in plain
+    assert scrubbed.endswith(plain[plain.rindex("\n") :])
+    assert "5678" not in scrubbed
+
+
+def test_a_field_scrub_fault_is_logged_once_by_its_type(audit_capture, monkeypatch, caplog) -> None:
+    """A fault in the field scrub is logged once per process at WARNING, naming its type and
+    never the value or the exception's message (BACKLOG #3045, review finding 11)."""
+
+    def scrub(text: str, **_kw: object) -> str:
+        raise RuntimeError(f"pattern blew up on {text}")
+
+    monkeypatch.setattr(audit_tee, "scrub_log_field", scrub)
+    monkeypatch.setattr(audit_tee, "_SCRUB_FAILURE_LOGGED", False)
+    with caplog.at_level(logging.WARNING, logger=audit_tee.log.name):
+        for row in (1, 2):
+            emit_audit_tee(
+                action="auth.login_failed",
+                actor="password=hunter2",
+                channel_id=None,
+                detail="ok",
+                ts=1.0,
+                row_id=row,
+                seq=row,
+                row_hash=_HASH,
+            )
+    warnings = [r for r in caplog.records if r.name == audit_tee.log.name]
+    assert len(warnings) == 1, warnings
+    assert warnings[0].levelno == logging.WARNING
+    assert "RuntimeError" in warnings[0].getMessage()
+    assert "hunter2" not in warnings[0].getMessage()
+    assert "blew up" not in warnings[0].getMessage()
 
 
 def test_a_raw_field_keeps_a_backslash_escape_as_text(capsys) -> None:

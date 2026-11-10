@@ -2043,12 +2043,12 @@ docstring in [`store/audit_tee.py`](../messagefoundry/store/audit_tee.py) names 
 residuals that cause these.
 
 **A C0 control beside text in a tee field is narrowed, not closed (BACKLOG #3045).** Each text
-field is scrubbed before the record is serialised, and a field holding a C0 control is read with
-each control as a space and as nothing as well, which can only add redaction to the plain scrub.
-At least two cases can still let text beside a control through, on a first deployment: text that
-needs two controls in it read two different ways, and a span the scrub maps to the wrong copy of a
-repeated stretch. `scrub_log_field` in
-[`logging_setup.py`](../messagefoundry/logging_setup.py) names both.
+field is scrubbed before the record is serialised, and a field holding a C0 control is also tried
+with each control as a space and as nothing. A try is kept only when it shows no word the plain
+scrub hides. At least four cases can still let text beside a control through on a first
+deployment, among them a value with more controls than the tries' bound covers, and DEL or a
+format character in place of a C0 control. `scrub_log_field` in
+[`logging_setup.py`](../messagefoundry/logging_setup.py) names them.
 
 ### Logging inventory (16.1.1 / 16.2.3)
 

@@ -24,13 +24,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   character, so on a first deployment a name, a date, a bearer token, an MRN or a `password=`
   value beside one would have reached the tee line unredacted. The tee now scrubs each text field
   before it serialises the record, and the handler filters still run over the whole line after.
-  A field holding a C0 control is also read with each control as a space and as nothing, and in
-  `detail` an escape its writer's own `json.dumps` left counts as a control. Those readings only
-  add redaction to the plain scrub, never remove one, and a serialised `detail` that parsed still
-  parses. A field whose scrub fails ships as a fixed marker, the fault is logged once by its type,
-  and the record still ships. The C0 residual 0.5.2 named for the tee is narrowed, not closed:
-  `scrub_log_field` names at least two cases left, and the `emit_audit_tee` docstring names the
-  tee's other two residuals. (`BACKLOG #3045`)
+  A field holding a C0 control is also tried with each control as a space and as nothing, and
+  in `detail` an escape its writer's own `json.dumps` left counts as a control. A try is kept only
+  when it shows no word the plain scrub hides. A serialised `detail` is scrubbed string by
+  string, so one the plain scrub leaves parsing still parses. A field whose scrub fails ships as
+  a fixed marker, the fault is logged once by its type, and the record still ships. The C0
+  residual 0.5.2 named for the tee is narrowed, not closed: `scrub_log_field` names at least four
+  cases left, and the `emit_audit_tee` docstring names the tee's other two residuals.
+  (`BACKLOG #3045`)
 - **The `supervise` process's own TLS log forwarder now picks up a replaced CRL without a
   restart.** An engine process applied a replaced `[logging].forward_tls_crl_file` to its running
   forwarder, but the supervisor builds no engine, so nothing in it did. On a first deployment a
