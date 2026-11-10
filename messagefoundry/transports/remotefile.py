@@ -1071,12 +1071,14 @@ class _SessionReusingFtpTls(ftplib.FTP_TLS):
     The stdlib wraps each data socket with a fresh handshake. A server that requires the data channel
     to reuse the control session, at least vsftpd at its default ``require_ssl_reuse=YES`` and
     FileZilla Server with its session-resumption requirement on, would refuse every transfer (BACKLOG
-    #5530). Reuse also binds the data connection to the session that carried the login.
+    #5530). Such a server uses reuse to bind the data connection to the session that carried the
+    login. This client only offers the session; it does not check that the server resumed it.
 
     Under TLS 1.3 the control session can be absent, or not yet resumable, until the server's ticket
     has been read. It is passed as it is: ``session=None``, or a ticket the server will not resume,
-    falls back to a full handshake, so reuse is best-effort there. The protocol is never forced down
-    to TLS 1.2 to make it work.
+    falls back to a full handshake, so reuse is best-effort there. Every data connection in one FTP
+    session offers the same control ticket, so a server whose TLS 1.3 tickets are single-use would
+    decline the second. The protocol is never forced down to TLS 1.2 to make reuse work.
 
     A failed data handshake does not leak the socket. ``ssl.SSLSocket._create`` (CPython 3.14)
     detaches the raw socket before the handshake and closes the descriptor if the handshake raises,
