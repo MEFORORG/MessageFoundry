@@ -139,9 +139,9 @@ class SqlServerCoordinator:
         self._on_demote: Callable[[], None] | None = None
         self._fence_timeout = leader_fence_timeout_seconds
         # ADR 0157 Inc 0: the clamp on at least the maintenance loop's heartbeat, claim/renew and
-        # config-version refresh (which the engine's start-up seed also calls), and on the
-        # stepdown's release write, as DbCoordinator._call_tick bounds them (BACKLOG
-        # #5064, #6472): each runs in series with the renew or under _leadership_lock, so
+        # config-version refresh (not the engine's start-up seed, which keeps
+        # [store].command_timeout), and on the stepdown's release write, as
+        # DbCoordinator._call_tick bounds them (BACKLOG #5064, #6472): each runs in series with the renew or under _leadership_lock, so
         # [store].command_timeout there would delay the renew. SqlServerStore._fetchone_clamped
         # says how it is applied, why one costs up to about twice the clamp, three times when its
         # rollback runs, and why the COMMIT is outside it. The clamp bounds each statement, not
@@ -301,24 +301,34 @@ class SqlServerCoordinator:
 
     # --- config version (cross-node convergence token) ----------------------
 
+    _CONFIG_VERSION_UPSERT = (
+        "SET NOCOUNT ON;"
+        " MERGE cluster_config WITH (HOLDLOCK) AS t USING (SELECT 1 AS id) AS s ON t.id = s.id"
+        " WHEN MATCHED THEN UPDATE SET id = t.id"  # no-op update so OUTPUT yields the current row
+        " WHEN NOT MATCHED THEN INSERT (id, config_version, updated_at) VALUES (1, 0, ?)"
+        " OUTPUT inserted.config_version AS config_version,"
+        " inserted.config_digest AS config_digest,"
+        " inserted.config_digest_version AS config_digest_version;"
+    )
+
     async def config_version(self) -> int:
         """Read (seeding to 0 if absent) and cache the cluster-wide config-reload version, with the
-        initiator's digest from the same statement (vault BACKLOG #3109). Under the renew clamp,
-        because the maintenance loop runs it (BACKLOG #6472); the engine's start-up seed calls it
-        too and gets the same clamp. The clamp is not the same bound as on Postgres: there the
-        borrow and statement share one deadline, while here each gets the clamp, so the call can
-        take about twice it, three times when a rollback runs, plus a COMMIT nothing is known to
-        bound (SqlServerStore._fetchone_clamped)."""
+        initiator's digest from the same statement (vault BACKLOG #3109). Under
+        ``[store].command_timeout``: the engine's start-up seed calls this, and a seed runs once,
+        off the renew path, so it keeps the bound it had before the renew clamp. The maintenance
+        loop refreshes through :meth:`_refresh_config_version` instead."""
+        row = await self._store._fetchone(self._CONFIG_VERSION_UPSERT, (time.time(),))
+        assert row is not None, "cluster_config upsert returned no row"
+        return self._cache_config_row(row)
+
+    async def _refresh_config_version(self) -> int:
+        """:meth:`config_version` under the renew clamp, for the maintenance loop, which runs it in
+        series with the renew (BACKLOG #6472). The clamp is not the same bound as on Postgres:
+        there the borrow and statement share one deadline, while here each gets the clamp, so the
+        call can take about twice it, three times when a rollback runs, plus a COMMIT nothing is
+        known to bound (SqlServerStore._fetchone_clamped)."""
         row = await self._store._fetchone_clamped(
-            "SET NOCOUNT ON;"
-            " MERGE cluster_config WITH (HOLDLOCK) AS t USING (SELECT 1 AS id) AS s ON t.id = s.id"
-            " WHEN MATCHED THEN UPDATE SET id = t.id"  # no-op update so OUTPUT yields the current row
-            " WHEN NOT MATCHED THEN INSERT (id, config_version, updated_at) VALUES (1, 0, ?)"
-            " OUTPUT inserted.config_version AS config_version,"
-            " inserted.config_digest AS config_digest,"
-            " inserted.config_digest_version AS config_digest_version;",
-            (time.time(),),
-            timeout_clamp=self._renew_timeout,
+            self._CONFIG_VERSION_UPSERT, (time.time(),), timeout_clamp=self._renew_timeout
         )
         assert row is not None, "cluster_config upsert returned no row"
         return self._cache_config_row(row)
@@ -460,7 +470,11 @@ class SqlServerCoordinator:
 
     async def _heartbeat_loop(self) -> None:
         while not self._stop.is_set():
-            for step in (self.heartbeat_once, self._maintain_leadership, self.config_version):
+            for step in (
+                self.heartbeat_once,
+                self._maintain_leadership,
+                self._refresh_config_version,
+            ):
                 try:
                     await step()
                 except asyncio.CancelledError:

@@ -741,14 +741,55 @@ async def test_a_stalled_heartbeat_ends_at_the_clamp_not_at_command_timeout() ->
 
 
 async def test_the_config_version_refresh_runs_under_the_renew_clamp() -> None:
-    """The loop's third statement (BACKLOG #6472)."""
+    """The loop's third statement (BACKLOG #6472), and the loop runs this method, not the seed."""
     conn = _Conn()
     conn.columns = ("config_version",)
     conn.row = (4,)
     coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=3.25)
-    assert await coord.config_version() == 4
+    assert await coord._refresh_config_version() == 4
+    assert coord.config_version_cached() == 4
     assert conn.statement_timeouts == [3]
     assert conn.raw.timeout == 30
+
+
+async def test_the_maintenance_loop_refreshes_through_the_clamped_method() -> None:
+    """The loop calls _refresh_config_version, never the unclamped config_version the seed uses."""
+    coord = SqlServerCoordinator(_store(_Conn()), "A", lease_renew_timeout_seconds=3.25)
+    calls: list[str] = []
+
+    async def noop() -> None:
+        pass
+
+    async def refresh() -> int:
+        calls.append("refresh")
+        coord._stop.set()
+        return 0
+
+    async def seed() -> int:
+        calls.append("seed")
+        return 0
+
+    coord.heartbeat_once = noop  # type: ignore[method-assign]
+    coord._maintain_leadership = noop  # type: ignore[method-assign]
+    coord._refresh_config_version = refresh  # type: ignore[method-assign]
+    coord.config_version = seed  # type: ignore[method-assign]
+    await asyncio.wait_for(coord._heartbeat_loop(), timeout=5.0)
+    assert calls == ["refresh"]
+
+
+async def test_the_start_up_seed_runs_under_command_timeout_not_the_renew_clamp() -> None:
+    """The engine's start-up seed calls config_version(), which keeps main's bound,
+    [store].command_timeout, rather than the renew clamp the tick refresh takes. Under the clamp
+    the fake below would record [3]."""
+    conn = _Conn()
+    conn.columns = ("config_version",)
+    conn.row = (6,)
+    coord = SqlServerCoordinator(
+        _store(conn, command_timeout=17), "A", lease_renew_timeout_seconds=3.25
+    )
+    assert await coord.config_version() == 6
+    assert coord.config_version_cached() == 6
+    assert conn.statement_timeouts == [17]
 
 
 @pytest.mark.parametrize(("stop_bound", "expected"), [(None, 3), (10.0, 10)])
