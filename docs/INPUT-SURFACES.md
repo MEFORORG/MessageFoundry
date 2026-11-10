@@ -22,7 +22,7 @@ and the code disagree, the code is right.
 | Surface | Where its structure is defined |
 |---|---|
 | [Inbound listeners and sources](#most-inbound-bodies-pass-the-same-ingress-checks) | This page for the shared checks; [CONNECTIONS.md](CONNECTIONS.md) for each connector |
-| [HL7 v2 messages and field content](#hl7-v2-the-engine-checks-the-envelope-and-your-code-checks-the-fields) | [HL7-VALIDATION.md](HL7-VALIDATION.md), and this page for a field's own structure |
+| [HL7 v2 messages and field content](#hl7-v2) | [HL7-VALIDATION.md](HL7-VALIDATION.md), and this page for a field's own structure |
 | [Non-HL7 payloads](#non-hl7-payloads-are-checked-for-type-then-parsed-on-demand) | This page, with one owner document per type |
 | [Rules over two or more items in a payload](#rules-over-two-or-more-items-in-a-payload) | This page |
 | [`connections.toml`](#connectionstoml-is-held-to-the-connector-factories) | [CONNECTIONS.md](CONNECTIONS.md) |
@@ -173,7 +173,7 @@ does its section on resource limits, for the connection and rate caps on every l
 
 ---
 
-## HL7 v2: the engine checks the envelope, and your code checks the fields
+## HL7 v2
 
 [HL7-VALIDATION.md](HL7-VALIDATION.md) owns this subject. It defines three tiers. The first two run
 at ingress. The third runs in a Router or Handler. The HL7 conventions for engine code are in
@@ -184,12 +184,11 @@ at ingress. The third runs in a Router or Handler. The HL7 conventions for engin
 expects:
 
 - a body that opens with an `MSH` segment, after any leading whitespace;
-- a header long enough to read its field separator and encoding characters;
+- a header long enough to read its field separator;
 - a size and a segment count inside the caps `enforce_size_limits` applies;
 - escape sequences that cannot expand past the budget `enforce_expansion_budget` applies.
 
-The separators come from the message's own `MSH` segment. A body that fails
-gets an `ERROR` row and, on a replying inbound, a negative acknowledgment.
+A body that fails gets an `ERROR` row and, on a replying inbound, a negative acknowledgment.
 
 **Tier 2 is opt-in per inbound.** It checks the message structure against the HL7 version.
 HL7-VALIDATION.md lists what that covers.
@@ -197,13 +196,11 @@ HL7-VALIDATION.md lists what that covers.
 - The separators are the message's own, read from `MSH-1` and `MSH-2` by `_extract_separators` in
   [`parsing/_builtin_hl7.py`](../messagefoundry/parsing/_builtin_hl7.py). A missing encoding
   character takes its default: `^`, `~`, `\` and `&`.
-- A field splits into repetitions, each repetition into components, and each component into
-  subcomponents (`_split_reps`, same module).
-- When your code reads a value, `unescape` decodes it. `\F\`, `\S\`, `\R\`, `\T\` and `\E\` become
+- `unescape` decodes a value. `\F\`, `\S\`, `\R\`, `\T\` and `\E\` become
   the message's own delimiters, and `\Xhh\` is read as hex. A sequence it cannot map is dropped from
   the value, not refused.
 
-Two tools exist for checking a field's value in your Router or Handler:
+Tools for checking a field's value in your Router or Handler:
 
 - the consistency primitives in
   [`parsing/consistency.py`](../messagefoundry/parsing/consistency.py), described under Tier 3 in
@@ -280,7 +277,7 @@ need and the engine does not enforce is written in your Handler, as
 
 | Payload | Rules the engine checks over two or more items | Where |
 |---|---|---|
-| HL7 v2 | At ingress, both listeners refuse a body that holds the document handle marker where a delimiter is a base64 character or the delimiters cannot be read. On a streaming inbound, the detach refuses what `_DETACH_REFUSALS` lists. | `doc_ref_marker_refusal` in `pipeline/ingress_guards.py`; `_DETACH_REFUSALS` in `pipeline/wiring_runner.py` |
+| HL7 v2 | At ingress, both listeners refuse a body that holds the document handle marker where a delimiter is a base64 character or the delimiters cannot be read. | `doc_ref_marker_refusal` in `pipeline/ingress_guards.py` |
 | `json` | None. | |
 | `text` | None. | |
 | `binary` | None. | |
