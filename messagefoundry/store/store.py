@@ -1850,10 +1850,12 @@ async def deferred_revoke_reports() -> AsyncIterator[None]:
     for a caller that retries a failed revoke (decision d20261110T063908944-857965, item 4).
 
     A retry that commits reports its own refusals with the committed wording, and this scope drops
-    those from the failed attempts it holds, so one refusal is audited and paged once and the last
-    page an operator sees for it is accurate. What only a failed attempt met is reported when the
-    scope ends: as having failed, or, when a later attempt committed, as an attempt whose retry
-    committed. The report runs on every exit and never raises out of a failing scope; on a clean
+    those from the failed attempts it holds, so a refusal the committing attempt met is audited and
+    paged once and the last page an operator sees for it is accurate. What only failed attempts met
+    is reported when the scope ends, by every held attempt that met it: the held attempts are not
+    deduplicated against each other, so a caller retrying up to
+    ``_POST_COMMIT_REVOKE_ATTEMPTS`` times can report one refusal that many times. Each is reported
+    as having failed, or, when a later attempt committed, as an attempt whose retry committed. The report runs on every exit and never raises out of a failing scope; on a clean
     exit a failure of the report is re-raised, as :meth:`RevokeSealOutcome.report` does. A nested
     scope joins the outer one. A revoke that fails after the scope has reported, in a task that
     inherited it, reports for itself."""

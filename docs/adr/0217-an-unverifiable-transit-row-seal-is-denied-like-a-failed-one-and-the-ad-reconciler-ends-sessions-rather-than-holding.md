@@ -696,6 +696,14 @@ it supersedes, and only where it disagrees; the earlier text is kept as it was.
   the last page an operator sees for a row is accurate. What only a failed attempt met is reported
   when the scope ends, as failed, or with `retry_committed: true` and text saying a retry then
   committed.
+- **Correction, recorded 2026-11-10: "A retried revoke reports each refusal once" is false.** Only
+  an attempt that commits deduplicates: `_RevokeCarry.covered_by` drops from the held attempts what
+  the committing attempt reports. The held attempts are not deduplicated against each other, and
+  `_RevokeCarry._report` reports every held failed attempt in full. So a refusal that only failed
+  attempts met is audited, logged and paged once per failed attempt that met it: up to
+  `_POST_COMMIT_REVOKE_ATTEMPTS` (3) times from `_revoke_after_commit`, and up to twice from
+  `revoke_other_sessions` and `revoke_every_session`, which retry once. A refusal that an attempt
+  which committed also met is reported once, by that attempt.
 - **The held `refused()` log.** `RevokeSealOutcome.refused` no longer logs at refusal time, inside
   the writer transaction. Its line is held and written once the outcome is known, with the
   committed or the failed wording, as the skipped-raise count is, which is logged after a commit

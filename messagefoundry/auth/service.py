@@ -11289,8 +11289,8 @@ class AuthService:
         loop = asyncio.get_running_loop()
         give_up_at = loop.time() + _POST_COMMIT_REVOKE_BUDGET_SECONDS
         attempt = 0
-        # Each attempt's seal refusals are reported once, by the attempt that committed if one
-        # did (decision d20261110T063908944-857965, item 4).
+        # A seal refusal the committing attempt met is reported once, by it; one only failed
+        # attempts met is reported by each of them (decision d20261110T063908944-857965, item 4).
         async with deferred_revoke_reports():
             while True:
                 attempt += 1
@@ -12926,8 +12926,8 @@ class AuthService:
         the caller's own when it ends it, and that one is taken off (``ended_kept``), and on the
         seal-failure path the handler ends it before the counted sweep.
         :meth:`revoke_every_session` counts it in both cases instead."""
-        # The retry below reports each seal refusal once (decision d20261110T063908944-857965,
-        # item 4).
+        # A seal refusal the retry below also met is reported once, by the attempt that commits
+        # (decision d20261110T063908944-857965, item 4).
         async with deferred_revoke_reports():
             try:
                 result = await self._store.revoke_user_sessions(
@@ -13013,8 +13013,8 @@ class AuthService:
         path. The count is the rows this call revoked: where the store or the seal-failure path
         ended the caller's own, that one is in it, which :meth:`revoke_other_sessions` leaves out
         of its count."""
-        # The retry below reports each seal refusal once (decision d20261110T063908944-857965,
-        # item 4).
+        # A seal refusal the retry below also met is reported once, by the attempt that commits
+        # (decision d20261110T063908944-857965, item 4).
         async with deferred_revoke_reports():
             try:
                 result = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
