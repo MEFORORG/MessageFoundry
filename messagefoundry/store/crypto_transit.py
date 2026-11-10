@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import json
 import logging
 import os
 from collections.abc import Mapping, Sequence
@@ -98,11 +99,12 @@ _ENV_TRANSIT_KEY = "MEFOR_STORE_TRANSIT_KEY"
 #: is held to the narrower data-key set, because it has to do both jobs.
 _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
 #: The texts Transit's ``hmac`` endpoint answers a refused key VERSION with, lower-cased (BACKLOG
-#: #6707). Read on 2026-11-10 from ``main`` of Vault (``builtin/logical/transit/path_hmac.go``,
-#: ``sdk/helper/keysutil/policy.go`` ``HMACKey`` and ``safeGetKeyEntry``) and of OpenBao, which says the
-#: same: a version above the latest or below zero, one the key no longer holds, one below
-#: ``min_encryption_version``, and one with no HMAC key. Every other 400 on that path, such as an
-#: input that is not base64, is about the request. A reworded text fails closed to CipherError.
+#: #6707). Read on 2026-11-10 from Vault ``builtin/logical/transit/path_hmac.go`` and
+#: ``sdk/helper/keysutil/policy.go`` (``HMACKey``, ``safeGetKeyEntry``) at commit cbc874e2358f, and
+#: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59: a version above the latest or
+#: below zero, one the key no longer holds, one below ``min_encryption_version``, and one with no HMAC
+#: key. Every other 400 on that path, such as an input that is not base64, is about the request. A
+#: reworded text fails closed to CipherError: the walk reports a check that could not run.
 _VERSION_REFUSAL_TEXTS = (
     "key version does not exist",
     "no such key version",
@@ -114,8 +116,17 @@ _VERSION_REFUSAL_TEXTS = (
 def _names_a_version_refusal(exc: Exception) -> bool:
     """Whether Vault's own error list on ``exc``, which hvac carries on ``exc.errors``, names only a
     refused key version (BACKLOG #6707). A missing or empty list, or any entry that is not text or
-    not a version refusal, is not evidence, so the caller fails closed to :class:`CipherError`."""
+    not a version refusal, is not evidence, so the caller fails closed to :class:`CipherError`.
+
+    hvac parses the reply into ``errors`` only when its Content-Type is exactly ``application/json``,
+    so a proxy that adds a charset leaves the same JSON in ``exc.text``; that is read the same way."""
     errors: object = getattr(exc, "errors", None)
+    body: object = getattr(exc, "text", None)
+    if errors is None and isinstance(body, str):
+        with contextlib.suppress(ValueError, RecursionError):
+            parsed: object = json.loads(body)
+            if isinstance(parsed, dict):
+                errors = parsed.get("errors")
     if not isinstance(errors, list) or not errors:
         return False
     for text in errors:
@@ -290,7 +301,16 @@ class TransitCipher(_UnmarkedPolicy):
 
         This infers the cause from the reply; it does not read the key's version range. So a node
         whose copy of the key lags a rotation can refuse a real, newer version and still pass."""
-        if not is_vault_bad_request(exc) or not _names_a_version_refusal(exc):
+        if not is_vault_bad_request(exc):
+            return False
+        if not _names_a_version_refusal(exc):
+            # Vault's own text stays out of the log, as it stays out of the error.
+            log.warning(
+                "Transit refused audit key version %d with HTTP 400, and its reply does not name a "
+                "refused version, so the check could not run (key=%r)",
+                key_version,
+                self._audit_key,
+            )
             return False
         try:
             probe: Any = self._client.secrets.transit.generate_hmac(

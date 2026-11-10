@@ -478,7 +478,7 @@ async def test_a_transient_failure_of_a_pinned_call_is_not_a_planted_version(
 
 
 #: Vault's own text for a pinned ``hmac`` call refused for its version, as hvac carries it.
-_VERSION_400 = ["key version does not exist; latest key version is 2"]
+_VERSION_400 = ("key version does not exist; latest key version is 2",)
 
 
 def _pinned_refusal(answer: Any, errors: Any = _VERSION_400) -> CipherError:
@@ -493,7 +493,9 @@ def _pinned_refusal(answer: Any, errors: Any = _VERSION_400) -> CipherError:
     class _Transit(_FakeTransit):
         def generate_hmac(self, **kw: Any) -> dict[str, Any]:
             if kw.get("key_version") is not None:
-                raise InvalidRequest("bad request", errors=errors)
+                raise InvalidRequest(
+                    "bad request", errors=list(errors) if errors is not None else None
+                )
             if isinstance(answer, Exception):
                 raise answer
             return {"data": {"hmac": answer}}
@@ -565,6 +567,65 @@ def test_a_pinned_400_vault_does_not_name_as_a_version_refusal_is_a_plain_cipher
     refused = _pinned_refusal("vault:v2:AAAA", errors)
     assert not isinstance(refused, AuditKeyVersionRefusedError)
     assert "Transit audit HMAC failed" in str(refused)
+
+
+def test_vault_text_is_read_from_the_body_when_hvac_did_not_parse_it() -> None:
+    """hvac fills ``errors`` only for a Content-Type of exactly ``application/json``; behind a proxy
+    that adds a charset the same JSON sits in ``text``, and must still be read (BACKLOG #6707)."""
+    _needs_hvac()
+    from hvac.exceptions import InvalidRequest
+
+    from messagefoundry.store.crypto_transit import _names_a_version_refusal
+
+    def bad_request(text: str) -> Exception:
+        return InvalidRequest(text, text=text)
+
+    assert _names_a_version_refusal(bad_request('{"errors": ["no such key version"]}'))
+    assert not _names_a_version_refusal(bad_request('{"errors": ["missing input for HMAC"]}'))
+    assert not _names_a_version_refusal(bad_request("no such key version"))  # not Vault's JSON
+    assert not _names_a_version_refusal(bad_request('["no such key version"]'))
+
+
+def test_a_non_text_entry_in_vault_errors_is_not_a_version_refusal() -> None:
+    _needs_hvac()
+    from hvac.exceptions import InvalidRequest
+
+    from messagefoundry.store.crypto_transit import _names_a_version_refusal
+
+    exc = InvalidRequest(errors=["no such key version"])
+    exc.errors = ["no such key version", 7]  # hvac's constructor joins entries, so set it after
+    assert not _names_a_version_refusal(exc)
+
+
+async def test_a_request_400_on_a_pinned_call_after_a_rotation_is_not_a_planted_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6707 at the walk: after a rotation the probe answers under a newer version, so a
+    400 about the request on a pinned call must still read as a check that could not run, never as
+    a tampered row."""
+    _needs_hvac()
+    from hvac.exceptions import InvalidRequest
+
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "request-400.db"
+    store = await _transit_store(db)
+    await store.record_audit("test.clean", actor="cli:tester")
+    transit.latest = 2  # rows stay under v1; the probe now answers vault:v2:
+    real = transit.generate_hmac
+
+    def refuse_pinned(**kw: Any) -> dict[str, Any]:
+        if kw.get("key_version") is not None:
+            raise InvalidRequest(errors=["unable to decode input as base64: illegal base64 data"])
+        return real(**kw)
+
+    monkeypatch.setattr(transit, "generate_hmac", refuse_pinned)
+    try:
+        sink, lines = await _walk_on_start(store, caplog)
+    finally:
+        await store.close()
+    assert sink.events == []
+    assert any("could not run" in line for line in lines), lines
 
 
 def test_a_refused_key_version_survives_a_pickle_with_its_text() -> None:
