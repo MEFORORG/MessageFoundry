@@ -1546,20 +1546,38 @@ class RevokeSealOutcome:
     tripped: bool = False
     skipped: int = 0
     refusals: list[_RevokeSealRefusal] = field(default_factory=list)
+    outages: list[str] = field(default_factory=list)
+
+    @asynccontextmanager
+    async def committing(self) -> AsyncIterator[None]:
+        """Wrap a revoke's transaction. If it raises, a held Outage is paged with text saying the
+        revoke failed before its commit was confirmed, rather than that it went ahead (decision
+        d20261110T004916856-814db8, Q5), and the exception propagates. The text does not claim
+        the revoke rolled back: an error after a commit landed reaches here too."""
+        try:
+            yield
+        except BaseException:
+            outages, self.outages = self.outages, []
+            if self.pager is not None:
+                for what in outages:
+                    self.pager.outage(
+                        f"{what} met a Vault transit outage, and the revoke then failed before its"
+                        " commit was confirmed; its sessions may not have been ended"
+                    )
+            raise
 
     def refused(self, exc: Exception, *, what: str, kind: str, ident: str) -> None:
         """Take one refusal :func:`revoke_seal_refusals` names, which the revoke goes ahead without.
-        Logs its class only. An Outage pages ``authority-seal-transit`` at once, as before, and
-        trips the outcome; a Forged or Unverifiable answer is held for :meth:`report`."""
+        Logs its class only. An Outage trips the outcome and is held too: :meth:`report` pages
+        ``authority-seal-transit`` once the revoke has committed, and :meth:`committing` sends a
+        page of its own if it never does (decision d20261110T004916856-814db8, Q5). A Forged or
+        Unverifiable answer is held for :meth:`report`."""
         log.warning(
             "%s was refused (%s); the revoke ends the sessions anyway", what, type(exc).__name__
         )
         if isinstance(exc, TransitSealUnavailableError):
             self.tripped = True
-            if self.pager is not None:
-                self.pager.outage(
-                    f"{what} met a Vault transit outage; the revoke went ahead without it"
-                )
+            self.outages.append(what)
             return
         if isinstance(exc, RowSealError):
             self.refusals.append(_RevokeSealRefusal(False, kind, ident))
@@ -1593,7 +1611,16 @@ class RevokeSealOutcome:
         report it as failed and drop the pages after it.
 
         The detail keys match ``AuthService``'s rows of the same actions: a user by its whole id
-        (``user_id``), a session by its 12-character ref (``session``), never a token hash."""
+        (``user_id``), a session by its 12-character ref (``session``), never a token hash.
+
+        A held Outage is paged here first, after the commit, with its own text (decision
+        d20261110T004916856-814db8, Q5); it writes no audit row, as before."""
+        outages, self.outages = self.outages, []
+        if self.pager is not None:
+            for what in outages:
+                self.pager.outage(
+                    f"{what} met a Vault transit outage; the revoke went ahead without it"
+                )
         if not self.refusals:
             return
         from messagefoundry.audit_write import write_audit_soft
@@ -19080,7 +19107,7 @@ class MessageStore:
         revokes included, rolls back."""
         now = time.time() if now is None else now
         outcome = RevokeSealOutcome(self._seal_pager)
-        async with _writer_txn(self._db, self._lock):
+        async with outcome.committing(), _writer_txn(self._db, self._lock):
             raised = await self._bump_session_epoch(user_id, outcome)
             if except_token_hash is None:
                 cur = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
@@ -19155,7 +19182,7 @@ class MessageStore:
         :meth:`AuthStore.revoke_all_sessions`."""
         now = time.time() if now is None else now
         outcome = RevokeSealOutcome(self._seal_pager)
-        async with _writer_txn(self._db, self._lock):
+        async with outcome.committing(), _writer_txn(self._db, self._lock):
             result = await self._revoke_all_sessions_in_txn(except_token_hash, now, outcome)
             await self._commit()
         # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
@@ -19229,7 +19256,7 @@ class MessageStore:
         both reading it and one failing its upgrade from a stale snapshot."""
         now = time.time() if now is None else now
         outcome = RevokeSealOutcome(self._seal_pager)
-        async with _writer_txn(self._db, self._lock):
+        async with outcome.committing(), _writer_txn(self._db, self._lock):
             await self._db.execute("UPDATE restore_marker SET id = id WHERE id = 1")
             cur = await self._db.execute(
                 "SELECT archive_sha256, archive_created_at, last_audit_at, restored_at,"

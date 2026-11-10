@@ -643,6 +643,16 @@ token hash.
 A refused row is logged at ERROR and the page still goes. An Outage is still paged at once and is
 not audited, as the table says.
 
+**A revoke's Outage page goes after the commit, decided 2026-11-10 (decision
+d20261110T004916856-814db8, Q5).** This replaces "paged at once" in the paragraph above.
+`RevokeSealOutcome` holds the Outage, as it holds the other answers, and `report` pages
+`authority-seal-transit` once the revoke has committed, with the text that says the revoke went
+ahead. Each revoke runs its transaction inside `RevokeSealOutcome.committing`, on all three
+backends: if the transaction raises, a held Outage is paged with its own text, that the revoke
+failed before its commit was confirmed and its sessions may not have been ended, and the error
+propagates. That text does not say the revoke rolled back, because an error after a commit landed
+reaches it too. The Outage is still not audited.
+
 **Slice 1b-iv builds the quiet end at the callers (build ruling 3 of 2026-11-07).** Every
 backend's session writer now raises `RowSealKeyRetiredError` itself, writing nothing. The store's
 `write_kept_session`, which `_keep_or_end_session` runs on all three backends, reads it as

@@ -15826,7 +15826,11 @@ class SqlServerStore:
         :meth:`_acquire_after_commit`'s, for the reason it gives (BACKLOG #3023)."""
         now = time.time() if now is None else now
         outcome = RevokeSealOutcome(self._seal_pager)
-        async with self._acquire_after_commit() as conn, self._cursor(conn) as cur:
+        async with (
+            outcome.committing(),
+            self._acquire_after_commit() as conn,
+            self._cursor(conn) as cur,
+        ):
             try:
                 raised = await self._bump_session_epoch(cur, user_id, outcome)
                 if except_token_hash is None:
@@ -15940,7 +15944,7 @@ class SqlServerStore:
         READ_COMMITTED_SNAPSHOT off."""
         now = time.time() if now is None else now
         outcome = RevokeSealOutcome(self._seal_pager)
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with outcome.committing(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("SELECT id FROM users ORDER BY id")
                 raised = {

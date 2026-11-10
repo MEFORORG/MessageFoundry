@@ -223,6 +223,14 @@ async def test_a_server_epoch_raise_goes_without_on_every_refusal(
     store._write_user = refused
     outcome = RevokeSealOutcome(store.seal_pager())
     assert await store._bump_session_epoch(object(), "u-1", outcome) is None
+    # Decision d20261110T004916856-814db8, Q5: nothing pages until the revoke has committed.
+    assert pages == []
+    outcome.refusals.clear()  # the Forged and Unverifiable rows' report is item 4's test
+
+    async def no_audit(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    await outcome.report(no_audit)
     assert len(pages) == (1 if kind is TransitSealUnavailableError else 0)
 
 
@@ -377,7 +385,7 @@ async def test_a_server_outage_trips_the_revoke_and_skips_the_rest(
     outcome = RevokeSealOutcome(store.seal_pager())
     for user in ("u-1", "u-2", "u-3"):
         assert await store._bump_session_epoch(object(), user, outcome) is None
-    assert attempts == ["u-1"] and outcome.skipped == 2 and len(pages) == 1
+    assert attempts == ["u-1"] and outcome.skipped == 2 and pages == []  # paged after commit
     # Each skipped account's row is still locked before the sweep, with no Transit call.
     assert locked == ["u-2", "u-3"]
     conn: Any = _PgConn() if backend == "postgres" else _MssqlCur()
@@ -786,3 +794,58 @@ def test_a_held_refusal_keeps_its_whole_id_out_of_the_repr() -> None:
     assert refusal.ident == whole
     assert whole not in repr(refusal)
     assert whole not in repr(outcome)
+
+
+# --- decision d20261110T004916856-814db8, Q5: the Outage page goes after the commit ---------------
+
+
+async def test_an_outage_revoke_pages_after_it_commits(tmp_path: Path) -> None:
+    """The Outage page of a revoke that commits is sent once the writer transaction has closed,
+    with the text that says the revoke went ahead."""
+    store = await MessageStore.open(
+        tmp_path / "outage.db", cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    backend = FakeBackend()
+    try:
+        store._row_sealer = TransitRowSealer(backend)
+        await _user(store, "u-1")
+        await _session(store, "u-1")
+        seen: list[tuple[bool, str]] = []
+        store.seal_pager().arm(
+            lambda subject, reason: seen.append((bool(store._db.in_transaction), reason))
+        )
+        await _outage_revoke(store, backend, "u-1")
+        assert [in_txn for in_txn, _ in seen] == [False]
+        assert seen[0][1].endswith("the revoke went ahead without it")
+    finally:
+        await store.close()
+
+
+async def test_an_outage_revoke_that_fails_before_its_commit_pages_its_own_text(
+    tmp_path: Path,
+) -> None:
+    """A revoke that met an Outage and then failed before its commit pages text that says so,
+    never that it went ahead; the failure still propagates."""
+    store = await MessageStore.open(
+        tmp_path / "outage-rollback.db", cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    backend = FakeBackend()
+    try:
+        store._row_sealer = TransitRowSealer(backend)
+        await _user(store, "u-1")
+        await _session(store, "u-1")
+        seen: list[str] = []
+        _arm(store, seen)
+
+        async def commit_fails() -> None:
+            raise sqlite3.OperationalError("synthetic: disk I/O error at commit")
+
+        store._commit = commit_fails  # type: ignore[method-assign]
+        with pytest.raises(sqlite3.OperationalError):
+            await _outage_revoke(store, backend, "u-1")
+        assert len(seen) == 1
+        assert "failed before its commit was confirmed" in seen[0]
+        assert "went ahead" not in seen[0]
+    finally:
+        del store._commit
+        await store.close()
