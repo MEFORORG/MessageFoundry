@@ -1872,9 +1872,36 @@ limit. This clears a pause that an earlier run of the same process left open whe
 That relies on the process keeping its name across a restart. An engine shard does. A cluster node
 does only when `[cluster].node_id` is pinned; otherwise its id is new on every start. An unpinned
 node therefore clears its own open pause alerts when it stops, since its next start reports under a
-new name. The stop waits up to 5 seconds for that write before it closes the store. An unpinned node
-that crashes while paused, or whose clear does not land in time, leaves its alert open; resolve it
-in the alert list, or pin `[cluster].node_id`.
+new name. The stop waits up to 5 seconds for that write before it closes the store.
+
+A subject whose process never comes back under its name can expire instead (BACKLOG #3269). At
+least these leave one: an unpinned node that crashed while paused or whose clear did not land, a
+lone engine that became several engine shards, an engine shard dropped from the count, and a
+renamed or retired `[cluster].node_id`.
+Every engine process with an alert sink checks the open `intake_paused` alerts of the OTHER
+processes once a minute, and resolves one whose occurrence count has not moved for 20 minutes, four
+reminder intervals, of its own clock. A check whose read fails stretches that: none of the time
+from the last good read to the next one counts, and at that next good read what was already
+counted is held to at most 13 minutes 40 seconds, so at least 6 minutes 20 seconds more must be
+counted before the alert can expire. That 6 minutes 20 seconds is `GAP_GRACE_SECONDS`: one reminder
+interval, one check interval and twice the 10-second read timeout, which gives a live process's
+next reminder time to land. A second failed read inside it holds the count to the same bound
+again. With checks a minute apart, a failed read in every 8 checks, or more often, keeps the
+alert open for good. A paused process that is alive raises a reminder every 5
+minutes, so its alert stays open while those writes reach the store. **The expiry reads only
+whether a reminder landed, by design: a process that is still paused but whose reminders stop
+reaching the store has its alert resolved while its intake stays paused.** At least a process cut
+off from the store, one whose reminder writes keep failing, and one whose intake check keeps
+raising do that. Its first reminder that lands again opens a new alert. A process whose alert
+the sweep resolved keeps the in-memory suspend, occurrence count and notification cooldown it
+held for that subject, so its later notifications for the subject can be muted until the suspend
+ends, held back by the cooldown, or escalate (vault BACKLOG #8190). Since no process expires its
+own alert, an alert expires only while some other engine process with an alert sink runs on the
+same store. A process stopped for longer than 20
+minutes, plus any stretch failed checks add, while another runs finds its pause resolved, and a pause that still holds when it starts
+opens a new alert. An operator's acknowledgement on the old alert goes with it, as it does on any
+other auto-resolve. An alert that nothing expires, such as a lone engine's whose own clear did not
+land, stays open: resolve it in the alert list.
 
 **`config_changed` says a start's config differs from the store's baseline: the bytes it loaded, or
 the directory just after the load** (vault BACKLOG #2597, #3765). At each start the engine compares
@@ -1958,7 +1985,8 @@ started together, can each raise it; the alert list folds them into one instance
 - A convergence reload writes its own `config_reload` row, in the shape an operator reload writes
   (vault BACKLOG #3076). Its actor is `system:cluster-convergence` and its `initiator` is
   `cluster_convergence`. So the store's newest baseline names the graph the node converged on,
-  whether the reload lands before or after the start's row. A convergence row that could not take
+  whether the reload lands before or after the start's row. What its `loosenings` key holds is in
+  [SECURITY.md](SECURITY.md#audit-1). A convergence row that could not take
   a fingerprint is marked `baseline_unchecked`, so a later start passes over it. One that took a
   partial fingerprint is a baseline like any other. The row names the fingerprint that reload
   took, and is marked `superseded` when a later reload moved the engine on first.
@@ -2369,7 +2397,12 @@ store. After `crl_max_reloads` reloads of one file, a hop refuses the next and a
 engine also alerts when it refuses a replaced file. Until the file is applied, a revocation added to
 it is not enforced on the hops that hold the old copy. Match the alert in a `[[alerts.rules]]` rule
 with `event_type = "crl_reload_refused"`. It does not depend on `warn_days`. With no `[alerts]`
-transport it is a WARNING in the log, beside the reload's ERROR.
+transport it is a WARNING in the log, beside the reload's ERROR. The `supervise` process reloads
+its own forwarder's CRL too, and never raises this alert, whatever `[alerts]` says: a refusal there
+is only a WARNING line in the supervise process's own log, whose subject ends `@supervisor`. That
+line says its "engine" means the supervise process; the reload's ERROR line beside it, which gives
+the reason, still says "Restart the engine", and there that also means the supervise process
+(BACKLOG #3314).
 
 | Event field | What it holds |
 |---|---|

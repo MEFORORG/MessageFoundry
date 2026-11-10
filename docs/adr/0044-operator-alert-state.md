@@ -367,3 +367,46 @@ three backends (the ADR 0064 `_schema_hash` bumps automatically on the server ba
 in-memory map per sink. Deliberately **notification-only**: suspend/mute never hides the open condition
 (that is what `resolve` is for) and — matching "gates notification only" — a suspended alert's #144
 control action still fires (a windowed mute is not a control-action mute; disable the rule for that).
+
+## Amendment (2026-11-09) -- one staleness sweep, for `intake_paused` only (BACKLOG #3269)
+
+The generic "has not re-fired in N cooldowns, so it is stale" sweep this ADR defers (D2, and under
+*Consequences*) is still deferred. One narrow case is built. An `intake_paused` subject names its
+engine process (`intake:<reason>@<process>`), so one whose process never returns under that name had
+no inverse that could ever fire. Every `IntakeBoundMonitor` with a sink now resolves an open
+`intake_paused` instance of another process whose `count` has not moved for four reminder intervals
+of its own monotonic clock. That rule reads only whether a reminder landed, by design: a process
+still paused whose reminders stop reaching the store (cut off, failing writes, or a check that keeps
+raising) has its alert resolved while its intake stays paused, a false clear accepted as the cost of
+a time-to-live. What such a process keeps in memory is stated in
+[CONFIGURATION.md](../CONFIGURATION.md#alerts) (vault BACKLOG #8190). A failed sweep read counts none of the time from the
+last good read to the next, and holds what was counted to `STALE_SECONDS` minus
+`GAP_GRACE_SECONDS`, so a live process whose reminder an outage ate has time to land its next one;
+the graces do not stack. The resolve is bounded by the `(id, count)` it read
+(`resolve_alert_generation`, all three backends), so a raise that lands first keeps the row open, and
+no clock is compared across processes. It closes an acknowledged instance too, as every auto-resolve
+does; retention then treats it as any other resolved row. Other subjects that name a process, or a
+node that may not return, are not swept by it: at least `crl_reload_refused`, `posture_loosened`,
+`log_forward_failed`, `remote_debug_refused`, `leadership_acquired` and `dr_activated`.
+
+## Amendment (2026-11-09) -- an auto-resolve is fenced to the raises it speaks for (BACKLOG #4916)
+
+D2's auto-resolve closed every live instance of its key when it landed. It waits behind the key's
+FIFO lock (#2272 defect 8) and its retries (BACKLOG #3756), so another engine shard or node on the
+same store could raise the key in that window, and the late resolve closed the newer raise.
+
+Each raise now stamps the instance with its writer's id: `alert_instance.raised_by`, a nullable
+column on all three backends holding a random id each notifier draws once per process run.
+
+A fenced auto-resolve (`resolve_alert_instances_fenced`) closes the key's live instance only when
+it is the instance the resolve's snapshot saw with no raise past the snapshot's count, or its
+newest raise is this run's own raise, so an earlier run's raise is matched only through the
+snapshot. So a raise another process lands after the snapshot keeps
+the instance open, unless this run's own raise is newer. No clock is compared:
+the `last_seen <= now` guard the PR for #3756 declined (decision d20261030T211551515-1de84e) would
+leave an alert open for good under cross-node clock skew. The code is the authority: for the
+close rule, `resolve_alert_instances_fenced` in `messagefoundry/store/store.py`, `postgres.py` and
+`sqlserver.py`; for the rest, `messagefoundry/pipeline/alert_sinks.py` (`_ResolveFence`,
+`NotifierAlertSink._run_state`, `_record_state`, `_resolve_settled` and
+`NotifierAlertSink.connection_started`) and the store's `upsert_alert_instance` and
+`open_alert_generations`.
