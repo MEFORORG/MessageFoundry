@@ -2623,14 +2623,14 @@ def test_a_worker_reaped_elsewhere_has_its_group_signalled_only_while_its_pid_is
         caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
         session.close()
         assert unread == []
-        refused = [r for r in caplog.records if "not be signalled safely" in r.getMessage()]
-        if pid_now == "reused":
-            assert killpg_calls == []
-            assert len(refused) == 1
-            assert refused[0].args == ("IB_T", proc.pid)
-        else:
-            assert killpg_calls == [proc.pid]
-            assert refused == []
+        # One scan, one capture setup, for both arms: the "reused" arm finds the refusal through
+        # this exact filter, so it is the positive control that makes the "free" arm's empty result
+        # mean "not logged" rather than "not captured" or "the wording moved".
+        refused = [r.args for r in caplog.records if "not be signalled safely" in r.getMessage()]
+        expected_refused = [("IB_T", proc.pid)] if pid_now == "reused" else []
+        assert killpg_calls == ([] if pid_now == "reused" else [proc.pid])
+        assert sandbox_mod.log.isEnabledFor(logging.WARNING)
+        assert refused == expected_refused
     finally:
         monkeypatch.undo()
         session.close()
