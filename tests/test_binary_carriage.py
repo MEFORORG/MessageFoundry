@@ -32,6 +32,7 @@ from messagefoundry.parsing.binary import (
     encode,
     extract_obx_document,
     is_marked,
+    iter_obx_documents,
     strip_documents_in_hl7,
 )
 from messagefoundry.pipeline.dryrun import route_only, transform_one
@@ -216,6 +217,34 @@ def test_extract_refuses_a_segment_group_of_an_unreadable_message() -> None:
     ) as caught:
         extract_obx_document(group)  # type: ignore[arg-type]
     assert "MSH-1=" not in str(caught.value) and "MSH-2=" not in str(caught.value)
+
+
+def test_extract_of_an_obx_less_group_on_an_unreadable_message_stays_the_obx_2_refusal() -> None:
+    """A group reads an OBX it does not hold as None without reading a delimiter, so the extract
+    still refuses it as ``BinaryCarriageError``, as on a readable message: a Handler skipping an
+    OBX-less group on that class keeps skipping it. A whole Message reads the delimiters for any
+    occurrence, so there an absent OBX is the named refusal, not the bare quoting one."""
+    msg = Message.parse(
+        "MSH|^~|A|B|C|D|20260101||ORU^R01|1|P|2.5\r"
+        "OBR|1\rOBR|2\rOBX|1|ED|X||^Application^pdf^Base64^QUFB\r"
+    )
+    first, second = msg.groups("OBR")
+    with pytest.raises(BinaryCarriageError, match="^OBX-2 is None") as caught:
+        extract_obx_document(first)  # type: ignore[arg-type]
+    assert not isinstance(caught.value, UnreadableDelimitersError)
+    with pytest.raises(UnreadableDelimitersError):
+        extract_obx_document(second)  # type: ignore[arg-type]
+    with pytest.raises(UnreadableDelimitersError):
+        extract_obx_document(msg, occurrence=2)
+
+
+def test_iter_obx_documents_names_a_handler_written_msh_1_as_the_cause() -> None:
+    """The detach scan shares the cause text: a two-character MSH-1 is named, not blamed on MSH-2."""
+    msg = Message.parse(OBX_HL7)
+    embed_obx_document(msg, b"data", data_subtype="PDF")
+    msg.set("MSH-1", "##")
+    with pytest.raises(UnreadableDelimitersError, match="^its first MSH's MSH-1 is not one"):
+        list(iter_obx_documents(msg, received=OBX_HL7))
 
 
 @pytest.mark.parametrize("op", sorted(_DELIMITER_GUARDED))

@@ -714,11 +714,11 @@ def test_the_binary_carriage_target_catches_an_unreadable_refusal_of_a_readable_
     body would otherwise pass every input silently."""
     TARGETS_BY_NAME["binary_carriage"].run(_OBX_ED_ADT)  # control: the real extract runs clean
     TARGETS_BY_NAME["binary_carriage"].run(SHORT_MSH2_REPRODUCER)  # control: a real refusal
-    monkeypatch.setattr(
-        fuzz_targets, "extract_obx_document", _boom(UnreadableDelimitersError("planted"))
-    )
-    with pytest.raises(AssertionError, match="refused readable delimiters"):
-        TARGETS_BY_NAME["binary_carriage"].run(_OBX_ED_ADT)
+    for name in ("iter_obx_documents", "extract_obx_document"):
+        with monkeypatch.context() as patch:
+            patch.setattr(fuzz_targets, name, _boom(UnreadableDelimitersError("planted")))
+            with pytest.raises(AssertionError, match=f"^{name} refused readable delimiters"):
+                TARGETS_BY_NAME["binary_carriage"].run(_OBX_ED_ADT)
 
 
 def test_write_seed_corpus_materialises_every_seed(tmp_path: Path) -> None:

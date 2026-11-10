@@ -187,9 +187,8 @@ entry call itself, which shows less, and the table's comment says so. Further te
 split-invariance, cap, ceiling and deflate-tail properties on purpose and assert the target says so,
 and others assert that a separators `ValueError` planted on either retired binary-carriage
 reproducer escapes, whether planted in the detach scan or in the extract, and that the target
-refuses an `UnreadableDelimitersError` out of the extract on a body whose delimiters are readable.
-A fuzz harness nobody has seen catch
-anything measures nothing.
+refuses an `UnreadableDelimitersError` out of the extract or the detach scan on a body whose
+delimiters are readable. A fuzz harness nobody has seen catch anything measures nothing.
 
 ## Where the files go
 

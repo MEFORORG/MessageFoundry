@@ -650,28 +650,33 @@ def _strip_and_scan_hl7(text: str) -> None:
         message = Message.parse(text)
     except HL7PeekError:
         return
-    with contextlib.suppress(
-        EscapedDocumentError,
-        InboundDocRefError,
-        NonVerbatimDocumentError,
-        UnreadableDelimitersError,
-    ):
+    try:
         list(iter_obx_documents(message, received=text))
+    except UnreadableDelimitersError:
+        _require_unreadable(message, "iter_obx_documents")
+    except (EscapedDocumentError, InboundDocRefError, NonVerbatimDocumentError):
+        pass
     for occurrence in range(1, message.count_segments("OBX") + 1):
+        # UnreadableDelimitersError first, so the check still runs were it ever made a subclass.
         try:
             extract_obx_document(message, occurrence=occurrence)
+        except UnreadableDelimitersError:
+            _require_unreadable(message, "extract_obx_document")
+            break  # the header is the cause, so every later OBX is refused the same way
         except BinaryCarriageError:
             pass
-        except UnreadableDelimitersError:
-            # The refusal is the header's, so the header must be one the engine cannot read: an
-            # extract that refused a readable body is a defect, not a refusal (BACKLOG #2873).
-            try:
-                message._encoding_chars()
-            except ValueError:
-                continue
-            raise AssertionError(
-                "extract_obx_document refused readable delimiters as unreadable"
-            ) from None
+
+
+def _require_unreadable(message: Message, refuser: str) -> None:
+    """An ``UnreadableDelimitersError`` is the header's refusal, so the header must be one the
+    engine cannot read; a refusal of a readable body is a defect, not a refusal (BACKLOG #2873).
+    The oracle is ``Message._encoding_chars``, the engine's own read, so it catches a guard that
+    over-refuses but not a regression in that read itself."""
+    try:
+        message._encoding_chars()
+    except ValueError:
+        return
+    raise AssertionError(f"{refuser} refused readable delimiters as unreadable")
 
 
 @dataclass(frozen=True)
