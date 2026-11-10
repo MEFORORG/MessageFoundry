@@ -356,8 +356,8 @@ target, no `pickle` import left to mis-suppress:
   > waiting **before** a request still drops that worker and is still never consumed as an answer,
   > but the call is no longer failed: its message never reached the worker, so it is retried once on
   > a fresh worker, and fails closed only if that worker has a stray frame waiting too. A frame left
-  > **after** an answer still fails the call closed. Every kill records a cause and writes a WARNING
-  > (ADR 0187 *Amendment B*).
+  > **after** an answer, or a length header over the frame cap in that slot, still fails the call
+  > closed. Every kill records a cause; ADR 0187 *Amendment B* says which kills write a WARNING.
   → `tests/test_sandbox.py::test_a_desynced_or_forged_response_is_rejected`,
   `tests/test_sandbox.py::test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`,
   `tests/test_sandbox.py::test_a_dead_peer_is_not_treated_as_a_forged_frame`,

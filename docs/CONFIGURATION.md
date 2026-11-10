@@ -1506,8 +1506,9 @@ spawns inherits the response pipe and can stage a frame while the worker is aliv
 now reaps its whole process tree (a Windows kill-on-close job object / a POSIX process group), so such
 a grandchild no longer outlives the kill (BACKLOG #342). That reap is best-effort process hygiene: what
 makes a stray frame *harmless* is still the codec plus the request-answer binding (a live grandchild can
-force a respawn and dead-letter the message whose answer its frame follows; a frame waiting before a
-request costs that message one retry on a fresh worker; nothing more), not the process teardown.
+at least force a respawn and dead-letter the message in flight or the one whose answer its frame
+follows, and a frame waiting before a request costs that message a retry on a fresh worker; it cannot
+make its frame answer a request), not the process teardown.
 The child's **stderr is captured by the engine, not inherited** (ADR 0176): a Handler that prints is
 relayed into the engine's log attributed to the inbound, the child pid and the worker generation, with
 **the content itself only at `DEBUG`**. At `INFO` and above you get a rate-limited `WARNING` naming the

@@ -1054,6 +1054,10 @@ def test_a_dead_peer_is_not_treated_as_a_forged_frame(graph: tuple[Registry, str
         assert proc is not None
 
         # A dead peer: the worker is dropped (it is gone), but the answer in hand still stands.
+        # Dead for real first: an EOF queued from a RUNNING worker is a recorded kill instead (see
+        # test_a_queued_eof_from_a_running_worker_is_a_recorded_kill).
+        proc.kill()
+        proc.wait(timeout=10)
         session._responses.put(_EOF)
         session._reject_unsolicited(proc, "after", "transform")  # must NOT raise
         assert session._proc is None
@@ -2223,8 +2227,8 @@ def test_a_queued_over_cap_header_kills_as_an_unsolicited_write(
     graph: tuple[Registry, str], when: str
 ) -> None:
     """Between dispatches the same header is a stray write from a worker that may be alive, so it
-    kills the worker as an unsolicited write. The reader stopped at the header, so it can answer
-    nothing: the call carries on, an answer in hand stands, as it did when it read as EOF."""
+    is treated as a stray frame: the worker is killed as an unsolicited write, and one left after
+    an answer fails that call closed, where a queued EOF only reaps a dead peer."""
     registry, config_dir = graph
     session = _session(config_dir)
     try:
@@ -2232,7 +2236,8 @@ def test_a_queued_over_cap_header_kills_as_an_unsolicited_write(
         proc = session._proc
         assert proc is not None
         session._responses.put(_OVERSIZE)
-        session._reject_unsolicited(proc, when, "transform")  # must NOT raise
+        with pytest.raises(SandboxError, match="unsolicited"):
+            session._reject_unsolicited(proc, when, "transform")
         assert session._proc is None
         assert proc.poll() is not None
         assert session.last_kill_cause is sandbox_mod._UNSOLICITED[when]
