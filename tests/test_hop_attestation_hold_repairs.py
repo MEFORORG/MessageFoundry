@@ -457,6 +457,28 @@ def test_control_a_set_flag_with_its_reason_still_mirrors(flag: str, value: obje
     assert dest.settings[_MIRRORED_PAIRS[flag]] == "SYNTH reason"
 
 
+@pytest.mark.parametrize(
+    ("value", "listed"), [("off", False), (b"no", False), ("SYNTHMAYBE", True)]
+)
+def test_the_declared_hop_reports_read_a_flag_as_the_build_does(value: Any, listed: bool) -> None:
+    """The ``check`` and posture readers list a declaration only when the build honours it, so a
+    lax-false spelling is not reported as a loosening; a value the build refuses is still listed,
+    toward listing (vault BACKLOG #5286)."""
+    from messagefoundry.config.wiring import accepted_cleartext_hops, revocation_attested_hops
+
+    reg = Registry()
+    reg.add_outbound(OutboundConnection("OB_C", File(directory="."), cleartext_accepted=value))
+    reg.add_outbound(OutboundConnection("OB_R", File(directory="."), tls_revocation_attested=value))
+    reg.add_inbound(
+        InboundConnection("IB_R", File(directory="."), "R", tls_revocation_attested=value)
+    )
+    from messagefoundry.connection_names import inbound_record_name
+
+    assert [n for n, _ in accepted_cleartext_hops(reg)] == (["OB_C"] if listed else [])
+    revoked = [n for n, _ in revocation_attested_hops(reg)]
+    assert revoked == (sorted(["OB_R", inbound_record_name("IB_R")]) if listed else [])
+
+
 def test_a_plain_attested_hop_beside_refused_siblings_is_not_marked_refused() -> None:
     """A baseline with no extra declaration, in one registry with refused entries, so a refusal
     cannot taint a sibling."""

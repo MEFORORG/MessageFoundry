@@ -10279,7 +10279,9 @@ class RegistryRunner:
         # no send and no disposition. Members are carried VERBATIM (the head too — never re-encoded); only
         # the head is PARSED, for the BHS separators + the BHS-11 control id.
         refused: list[_RefusedMember] = []
-        faulted_member: str | None = None  # the member whose hydration raised an internal error
+        # The member whose re-attach or frame check raised an internal error, which only the
+        # internal-error arm reads (vault BACKLOG #5100). A list, so the frame split can set it.
+        faulted: list[str] = []
         try:
             # #149 (ADR 0105 Phase 1b): re-attach each member's detached document VERBATIM before framing
             # the envelope, so a batched streaming feed delivers full inline documents (never a raw
@@ -10292,7 +10294,8 @@ class RegistryRunner:
             # that member with it rather than leaving it in two dispositions. A refusal that is not
             # permanent, or one that must stop the lane, is the whole batch's, as in the frame split.
             # Any other fault, such as a stored CR (ADR 0105), takes the whole batch to the
-            # internal-error arm, which names the member by its outbox id (vault BACKLOG #5100).
+            # internal-error arm, which names the member by its outbox id (vault BACKLOG #5100); a
+            # frame check's internal error does the same.
             hydrated_items: list[OutboxItem] = []
             hydrated: list[str] = []
             unhydratable: list[_RefusedMember] = []
@@ -10300,11 +10303,11 @@ class RegistryRunner:
                 try:
                     hydrated.append(await self._hydrate_payload(it.payload, it.message_id))
                 except NegativeAckError as exc:
-                    unhydratable.append(self._refused_member(it.id, exc))
+                    unhydratable.append(self._refuse_alone_or_raise(it.id, exc))
                 except Exception:
-                    # Re-raised as it is. Only the internal-error arm reads this; a DeliveryError
-                    # or a _StoreReadFault goes to its own arm, which re-pends the whole batch.
-                    faulted_member = it.id
+                    # Re-raised as it is. A DeliveryError or a _StoreReadFault goes to its own
+                    # arm, which re-pends the whole batch and does not read this.
+                    faulted.append(it.id)
                     raise
                 else:
                     hydrated_items.append(it)
@@ -10315,17 +10318,14 @@ class RegistryRunner:
             # refused members are dead-lettered after this try, on every path.
             if _frames(connector):
                 kept, members, unframeable = self._split_unframeable_members(
-                    connector, hydrated_items, hydrated
+                    connector, hydrated_items, hydrated, faulted=faulted
                 )
             else:
                 kept, members, unframeable = hydrated_items, list[Message | str](hydrated), []
             # Assigned only once both loops are done, so a fault in either leaves it empty and its
-            # arm takes every member. In claim order, so the refusal lines follow the lane's FIFO:
-            # each list already is, so only a merge of two non-empty ones needs the sort.
-            refused = unhydratable + unframeable
-            if unhydratable and unframeable:
-                position = {it.id: i for i, it in enumerate(items)}
-                refused.sort(key=lambda r: position[r[0]])
+            # arm takes every member. In claim order, so the refusal lines follow the lane's FIFO.
+            by_id = {r[0]: r for r in unhydratable + unframeable}
+            refused = [by_id[it.id] for it in items if it.id in by_id]
             ids = [it.id for it in kept]
             if kept:
                 first = kept[0]  # the envelope's head is the first member that survived
@@ -10394,10 +10394,11 @@ class RegistryRunner:
             # vanished member, and on the retry branch a terminal one); CONTINUE (default)
             # dead-letters the members still present (bad data can never frame/deliver —
             # replayable from the DLQ) so a code bug or a mis-typed feed can't wedge the lane.
-            # A fault one member's re-attach raised names that member by its outbox id, never its
-            # content, in the log, the stored error and the alert (vault BACKLOG #5100).
-            # The refusal lines' own form, "batch member <outbox id>", so one search finds both.
-            member = "" if faulted_member is None else f"; batch member {faulted_member}"
+            # A fault one member's re-attach or frame check raised names that member by its outbox
+            # id, never its content, in the log, the stored error and the alert (vault BACKLOG
+            # #5100), in the refusal lines' own form, "batch member <outbox id>", so one search
+            # finds both.
+            member = f"; batch member {faulted[-1]}" if faulted else ""
             if (
                 self._internal_error.get(name, self._internal_error_default)
                 is InternalErrorPolicy.STOP
@@ -10442,6 +10443,8 @@ class RegistryRunner:
         connector: DestinationConnector,
         items: Sequence[OutboxItem],
         payloads: Sequence[str],
+        *,
+        faulted: list[str],
     ) -> tuple[list[OutboxItem], list[Message | str], list[_RefusedMember]]:
         """Split the batch into the members ``connector``'s frame can carry, with their hydrated
         payloads, and the ``(id, error, refusal)`` of each member it refuses permanently (ADR 0205
@@ -10452,7 +10455,9 @@ class RegistryRunner:
         member the frame cannot carry is named by the frame byte and its offset, one its charset
         cannot encode by the position of its first offending character, and a
         ``multiple-messages`` member (ADR 0209) by the rule it breaks. Another connector's own
-        refusal text is its own, stored through ``safe_exc``."""
+        refusal text is its own, stored through ``safe_exc``. Any other fault a member's check
+        raises is re-raised as it is, its outbox id first appended to ``faulted`` so the caller's
+        internal-error arm names the member (vault BACKLOG #5100)."""
         kept: list[OutboxItem] = []
         kept_payloads: list[Message | str] = []
         refused: list[_RefusedMember] = []
@@ -10460,13 +10465,16 @@ class RegistryRunner:
             try:
                 connector.check_frame(payload, rewrite=False)
             except NegativeAckError as exc:
-                refused.append(self._refused_member(item.id, exc))
+                refused.append(self._refuse_alone_or_raise(item.id, exc))
+            except Exception:
+                faulted.append(item.id)
+                raise
             else:
                 kept.append(item)
                 kept_payloads.append(payload)
         return kept, kept_payloads, refused
 
-    def _refused_member(self, outbox_id: str, exc: NegativeAckError) -> _RefusedMember:
+    def _refuse_alone_or_raise(self, outbox_id: str, exc: NegativeAckError) -> _RefusedMember:
         """The ``(id, error, refusal)`` of a batch member refused alone, by the re-attach or the
         frame split, which share this one rule (vault BACKLOG #5100). A refusal that is not
         permanent, or one that must stop the lane, is the whole batch's, so it is re-raised for

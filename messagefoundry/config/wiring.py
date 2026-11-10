@@ -6575,7 +6575,7 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
     out = [
         (oc.name, oc.cleartext_reason or "(none recorded)")
         for oc in registry.outbound.values()
-        if oc.cleartext_accepted
+        if _declares(oc.cleartext_accepted)
     ]
     # A lookup's typed fields, not its settings: the read executor trusts only the typed declaration
     # (wiring_runner._fhir_lookup_settings strips a raw key), so this reports exactly what crosses.
@@ -6618,6 +6618,17 @@ def read_lax_flag(value: object, where: str, key: str) -> bool:
         return _LAX_BOOL.validate_python(value)
     except ValidationError:
         raise WiringError(f"{where}: {key} must be a boolean") from None
+
+
+def _declares(flag: object) -> bool:
+    """Whether a connection's typed declaration flag is set, read as :func:`read_lax_flag` reads
+    it, so a report lists only what the build and the settings mirror honour (vault BACKLOG #5286).
+    A value lax ``bool`` refuses is listed: the build refuses it, and a report fails toward
+    listing (vault BACKLOG #2232)."""
+    try:
+        return read_lax_flag(flag, "", "")
+    except WiringError:
+        return True
 
 
 def _attested_reason_text(value: object) -> str | None:
@@ -7150,12 +7161,12 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = [
         (oc.name, oc.tls_revocation_attested_reason or "(none recorded)")
         for oc in registry.outbound.values()
-        if oc.tls_revocation_attested
+        if _declares(oc.tls_revocation_attested)
     ]
     out.extend(
         (inbound_record_name(ic.name), ic.tls_revocation_attested_reason or "(none recorded)")
         for ic in registry.inbound.values()
-        if ic.tls_revocation_attested
+        if _declares(ic.tls_revocation_attested)
     )
     # Typed fields, as for cleartext_accepted: the executor strips a raw key (BACKLOG #2050).
     out.extend(

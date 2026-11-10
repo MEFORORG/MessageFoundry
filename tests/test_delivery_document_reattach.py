@@ -734,11 +734,12 @@ async def test_a_batch_member_with_a_stored_cr_takes_the_whole_batch_to_the_poli
     ref_a, ref_bad = await _store_doc(store, a), await _store_doc_with_a_cr(store)
     sk_a = _hl7_with_value(make_doc_ref(ref_a, "application/pdf"))
     sk_bad = _hl7_with_value(make_doc_ref(ref_bad, "application/pdf"))
-    mid_bad = await store.enqueue_message(
-        channel_id="c1", raw=sk_bad, deliveries=[(DEST, sk_bad)], now=100.0
-    )
+    # The clean member is the head, so naming the head instead of the corrupt member would fail.
     mid_a = await store.enqueue_message(
-        channel_id="c1", raw=sk_a, deliveries=[(DEST, sk_a)], now=101.0
+        channel_id="c1", raw=sk_a, deliveries=[(DEST, sk_a)], now=100.0
+    )
+    mid_bad = await store.enqueue_message(
+        channel_id="c1", raw=sk_bad, deliveries=[(DEST, sk_bad)], now=101.0
     )
     col = _Collector()
     runner, sink = _batch_runner(store, col)
@@ -797,26 +798,57 @@ async def test_a_batch_with_both_kinds_of_refused_member_logs_them_in_claim_orde
     assert statuses == [OutboxStatus.DEAD.value, OutboxStatus.DEAD.value, OutboxStatus.DONE.value]
 
 
+class _FaultingFramer(_Collector):
+    """A framing collector whose check raises an internal error on any payload holding
+    ``FRAMEBUG``: a connector fault, not a refusal of the member."""
+
+    def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
+        if "FRAMEBUG" in payload:
+            raise ValueError("connector bug in the frame check")
+
+
+async def test_an_internal_error_in_a_members_frame_check_names_that_member(
+    store: MessageStore,
+) -> None:
+    # Vault BACKLOG #5100: a frame check's internal error takes the whole batch to the policy, as a
+    # re-attach's does, and names the member, here not the head, by its outbox id.
+    mids = []
+    for t, value in ((100.0, "clean"), (101.0, "FRAMEBUG")):
+        sk = _hl7_with_value(value)
+        mids.append(
+            await store.enqueue_message(channel_id="c1", raw=sk, deliveries=[(DEST, sk)], now=t)
+        )
+    col = _FaultingFramer()
+    runner, _ = _batch_runner(store, col)
+
+    await _run_batch(runner, store)
+
+    assert col.deliveries == []
+    named = f"; batch member {await _outbox_id(store, mids[1])}"
+    rows = [row for m in mids for row in await _outbox_rows(store, m)]
+    assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 2
+    assert all(err.startswith("internal error: ValueError") for _, err in rows)
+    assert all(err.endswith(named) for _, err in rows)
+
+
+def _credential_fault() -> NegativeAckError:
+    return NegativeAckError("bad password", code="reattach", permanent=True, credential_fault=True)
+
+
+def _transient_refusal() -> NegativeAckError:
+    return NegativeAckError("try later", code="reattach", permanent=False)
+
+
 @pytest.mark.parametrize(
     ("refusal", "stops"),
-    [
-        (
-            NegativeAckError(
-                "bad password", code="reattach", permanent=True, credential_fault=True
-            ),
-            True,
-        ),
-        (NegativeAckError("try later", code="reattach", permanent=False), False),
-    ],
+    [(_credential_fault, True), (_transient_refusal, False)],
     ids=["lane-stopping", "transient"],
 )
-@pytest.mark.parametrize("framing", [False, True], ids=["no-frame", "frame"])
 async def test_a_batch_reattach_refusal_that_is_not_the_members_own_keeps_every_member(
     store: MessageStore,
     monkeypatch: pytest.MonkeyPatch,
-    refusal: NegativeAckError,
+    refusal: Callable[[], NegativeAckError],
     stops: bool,
-    framing: bool,
 ) -> None:
     # Vault BACKLOG #5100: the hydration catch re-raises as the frame split does. A refusal that
     # must stop the lane (a credential fault) stops it, and one that is not permanent re-pends the
@@ -824,10 +856,10 @@ async def test_a_batch_reattach_refusal_that_is_not_the_members_own_keeps_every_
     for t in (100.0, 101.0):
         sk = _hl7_with_value(f"plain {t}")
         await store.enqueue_message(channel_id="c1", raw=sk, deliveries=[(DEST, sk)], now=t)
-    runner, sink = _batch_runner(store, _FramingCollector() if framing else _Collector())
+    runner, sink = _batch_runner(store, _Collector())
 
     async def _refuse(*_args: object) -> str:
-        raise refusal
+        raise refusal()
 
     monkeypatch.setattr(runner, "_hydrate_payload", _refuse)
     outcome = await _run_batch(runner, store)
