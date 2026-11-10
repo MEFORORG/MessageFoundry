@@ -439,13 +439,16 @@ async def test_upload_text_formats_pass_text_only_gate(engine: Engine, tmp_path:
             assert up.status_code == 200, (name, up.text)
 
 
-async def test_upload_parse_and_text_sniff_run_off_the_event_loop(
+async def test_upload_parse_runs_in_a_worker_thread(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #5522: the multipart parse and the text-only sniff each walk a body of up to
-    ``[store].max_upload_bytes``, so neither may run on the event-loop thread. Each is wrapped to
+    """BACKLOG #5522: the multipart parse walks a body of up to ``[store].max_upload_bytes`` part by
+    part, so it runs in a worker thread, not on the event-loop thread. The parser is wrapped to
     record the thread it ran on; the test body runs on the loop, so its thread is the one to avoid.
-    The upload must still succeed, which shows the wrappers were reached on the real path."""
+    The upload must still succeed, which shows the wrapper was reached on the real path.
+
+    This pins where the per-part Python work runs, not that the loop never stalls: each whole-body
+    ``split``, slice and ``partition`` is one C call that holds the GIL wherever it runs."""
     pytest.importorskip("psutil")
     import threading
 
@@ -453,21 +456,15 @@ async def test_upload_parse_and_text_sniff_run_off_the_event_loop(
     from messagefoundry.api import create_app
     from messagefoundry.api.multipart import FilePart
     from messagefoundry.api.multipart import parse_single_file_upload as real_parse
-    from messagefoundry.parsing.sniff import nontext_upload_reason as real_sniff
 
     loop_thread = threading.get_ident()
-    seen: dict[str, int] = {}
+    seen: list[int] = []
 
     def parse(*args: Any, **kwargs: Any) -> FilePart:
-        seen["parse"] = threading.get_ident()
+        seen.append(threading.get_ident())
         return real_parse(*args, **kwargs)
 
-    def sniff(data: bytes) -> str | None:
-        seen["sniff"] = threading.get_ident()
-        return real_sniff(data)
-
     monkeypatch.setattr(api_app, "parse_single_file_upload", parse)
-    monkeypatch.setattr(api_app, "nontext_upload_reason", sniff)
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
@@ -478,9 +475,61 @@ async def test_upload_parse_and_text_sniff_run_off_the_event_loop(
             "/uploads", files={"file": ("acme.hl7", BATCH, "application/octet-stream")}, headers=h
         )
         assert up.status_code == 200, up.text
-    assert set(seen) == {"parse", "sniff"}
-    assert seen["parse"] != loop_thread, "the multipart parse ran on the event-loop thread"
-    assert seen["sniff"] != loop_thread, "the text-only sniff ran on the event-loop thread"
+    assert len(seen) == 1
+    assert seen[0] != loop_thread, "the multipart parse ran on the event-loop thread"
+
+
+async def test_concurrent_upload_parses_hold_at_most_two_pool_threads(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5522: the parse runs on the default thread pool the pipeline's router and transform
+    workers share, and each parse holds transient copies of its body, so concurrent uploads take at
+    most two parse slots. Four uploads are sent at once and the parser is slowed so their parses
+    would overlap; the most that ever ran together must be two, and every upload must succeed."""
+    pytest.importorskip("psutil")
+    import threading
+    import time
+
+    from messagefoundry.api import app as api_app
+    from messagefoundry.api import create_app
+    from messagefoundry.api.multipart import FilePart
+    from messagefoundry.api.multipart import parse_single_file_upload as real_parse
+
+    lock = threading.Lock()
+    running = 0
+    peak = 0
+
+    def parse(*args: Any, **kwargs: Any) -> FilePart:
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        try:
+            time.sleep(0.3)
+            return real_parse(*args, **kwargs)
+        finally:
+            with lock:
+                running -= 1
+
+    monkeypatch.setattr(api_app, "parse_single_file_upload", parse)
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        ups = await asyncio.gather(
+            *(
+                c.post(
+                    "/uploads",
+                    files={"file": (f"f{i}.hl7", BATCH, "application/octet-stream")},
+                    headers=h,
+                )
+                for i in range(4)
+            )
+        )
+    assert [u.status_code for u in ups] == [200] * 4, [u.text for u in ups]
+    assert peak == 2, f"{peak} upload parses ran at once; the bound is 2"
 
 
 async def test_upload_over_quota_rejected_409_and_audited(engine: Engine, tmp_path: Path) -> None:

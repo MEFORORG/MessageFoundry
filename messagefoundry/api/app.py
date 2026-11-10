@@ -8901,6 +8901,8 @@ def create_app(
             message_count=meta.message_count,
         )
 
+    upload_parse_slots = asyncio.Semaphore(2)
+
     @app.post("/uploads", response_model=UploadedFileInfo)
     async def upload_file(
         request: Request,
@@ -8928,15 +8930,18 @@ def create_app(
         the name while the file exists. A refused file has no id, so its row carries the reason only."""
         us = _require_upload_store(request)
         body = await request.body()
-        # BACKLOG #5522: the parse walks a body of up to [store].max_upload_bytes, and the text-only
-        # sniff below can copy all of it, so both run in a worker thread rather than on the event loop.
+        # BACKLOG #5522: the parse walks a body of up to [store].max_upload_bytes part by part, so
+        # it runs in a worker thread rather than on the event loop. The pipeline's router and
+        # transform workers share that pool, and each parse holds several transient copies of its
+        # body, so two slots bound the threads and the memory concurrent uploads can take.
         try:
-            part = await asyncio.to_thread(
-                parse_single_file_upload,
-                request.headers.get("content-type"),
-                body,
-                max_file_bytes=us.max_bytes,
-            )
+            async with upload_parse_slots:
+                part = await asyncio.to_thread(
+                    parse_single_file_upload,
+                    request.headers.get("content-type"),
+                    body,
+                    max_file_bytes=us.max_bytes,
+                )
         except MultipartTooLargeError as exc:
             raise HTTPException(413, str(exc)) from None
         except MultipartError as exc:
@@ -8946,7 +8951,7 @@ def create_app(
         # 415 + a metadata-only upload.reject audit — nothing is written, so no embedded-metadata container
         # can reach the store (closes "no metadata stripping" without a stripping engine). Covers both
         # POST /uploads and POST /ui/uploaded-logs/upload (this handler backs both).
-        nontext = await asyncio.to_thread(nontext_upload_reason, part.data)
+        nontext = nontext_upload_reason(part.data)
         if nontext is not None:
             await engine.store.record_audit(
                 "upload.reject",

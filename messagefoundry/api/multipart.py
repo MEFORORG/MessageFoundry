@@ -43,8 +43,8 @@ _DISPOSITION_PARAM = re.compile(r'(?<!\w)(\w+)="([^"]*)"')
 #: but it ran synchronously on the asyncio event loop that also drives every listener and worker, and
 #: linear is not free at that size: a single request would block the engine for ~0.35 s at 25 MiB and
 #: ~7 s at the ceiling (the worker thread since BACKLOG #5522 does not help a single scan; see the
-#: guard above). Bounding the header keeps the cost microseconds and, incidentally, gives the ReDoS analysis a length-bounded source instead
-#: of an attacker-sized one.
+#: guard above). Bounding the header keeps the cost microseconds and, incidentally, gives the ReDoS
+#: analysis a length-bounded source instead of an attacker-sized one.
 _MAX_PART_HEADER_BYTES = 16 * 1024
 
 #: Cap on the number of parts in one body. Both upload surfaces send one file part, and the console
@@ -128,23 +128,25 @@ def parse_multipart_form(
     appear inside a part body (the RFC-2046 invariant every multipart parser relies on).
 
     The function is synchronous and walks the whole body, so an async caller runs it in a worker
-    thread rather than on the event loop."""
+    thread. That keeps the per-part work off the event loop, but each whole-body ``split``, slice
+    and ``partition`` is one C call that holds the GIL, so a large part still stalls the loop while
+    it is copied."""
     boundary = parse_boundary(content_type)
     if boundary is None:
         raise MultipartError("Content-Type is not multipart/form-data with a boundary")
     delim = b"--" + boundary
-    # One delimiter opens each part and one more closes the body, so an admissible body splits into at
-    # most _MAX_PARTS + 2 segments (preamble, parts, terminator). The bounded split is one pass that
-    # never builds a long list, and a further segment means too many parts. Refuse rather than parse
-    # the first _MAX_PARTS: a body this shape is never a real upload form.
-    segments = body.split(delim, _MAX_PARTS + 2)
-    if len(segments) > _MAX_PARTS + 2:
+    # segments[0] is the (usually empty) preamble, and the closing "--boundary--" terminator is the
+    # first later segment that starts with b"--"; anything after it is the ignorable epilogue. The
+    # split is bounded so a body of many parts never builds a long list: _MAX_PARTS + 1 splits leave
+    # room for the preamble, _MAX_PARTS parts and the terminator. When no terminator turns up within
+    # them, the body holds more parts than the cap (or is unterminated past it). Refuse before any
+    # part is parsed rather than parse the first _MAX_PARTS: a body this shape is never a real form.
+    segments = body.split(delim, _MAX_PARTS + 1)
+    end = next((i for i in range(1, len(segments)) if segments[i][:2] == b"--"), len(segments))
+    if end - 1 > _MAX_PARTS:
         raise MultipartError(f"multipart body has more parts than the limit of {_MAX_PARTS}")
-    # segments[0] is the (usually empty) preamble; the terminator segment starts with b"--".
     form = MultipartForm()
-    for segment in segments[1:]:
-        if segment[:2] == b"--":  # the closing "--boundary--" terminator
-            break
+    for segment in segments[1:end]:
         # After each delimiter comes CRLF, then the part's header block.
         segment = segment[2:] if segment[:2] == b"\r\n" else segment.lstrip(b"\r\n")
         head, sep, content = segment.partition(b"\r\n\r\n")
@@ -168,8 +170,11 @@ def parse_multipart_form(
             form.files.append(FilePart(name=name or "file", filename=filename, data=content))
         elif name is not None:
             if len(content) > _MAX_FIELD_BYTES:
+                # The hint names the likeliest cause: a log sent as a plain field (no filename), as
+                # ``curl -F 'file=<log.hl7'`` does, rather than as a file part.
                 raise MultipartTooLargeError(
-                    f"multipart text field is {len(content)} bytes; the limit is {_MAX_FIELD_BYTES}"
+                    f"multipart text field is {len(content)} bytes; the limit is "
+                    f"{_MAX_FIELD_BYTES}. Send a file as a file part with a filename"
                 )
             form.fields[name] = content.decode("utf-8", "replace")
     return form
