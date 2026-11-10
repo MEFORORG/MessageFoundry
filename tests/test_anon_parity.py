@@ -166,7 +166,11 @@ _LEAK_PARITY_INPUTS = [
     "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y\rDST|1|123-45-6789",
     "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
     "\rDST|1|202-555-0188|(202) 555-0188",
-    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1|98765^^^HOSP^MR||X^Y",
+    # A Z-segment, since BACKLOG #5533 mapped PID-2, the unmapped field this used before.
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y\rZPI|1|98765^^^HOSP^MR",
+    # BACKLOG #5532: shapes and an id type written with HL7 escape sequences, decoded by both.
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
+    "\rZPI|1|123\\X2D\\45\\X2D\\6789|555\\X2D\\555\\X2D\\0188|98765^^^H^M\\X52\\|A\\T\\B\\.br\\C",
     "MSH|^~\\&|A|B|C|D|20260101120000||ADT^A01|M1|P|2.5.1"
     "\rEVN|A01|20260101120000\rOBX|1|NM|8480-6^Systolic^LN||128|mm[Hg]",
     # BACKLOG #1710: a line with no segment id (refused, never named) beside a blank one (ignored).

@@ -221,15 +221,21 @@ def _kept_tail(comps: list[str], kept: frozenset[int]) -> list[str]:
     return tail
 
 
-def _surrogate_identifier(kind: str, rep: str, keyer: Keyer, seps: Seps) -> str:
+def _surrogate_identifier(
+    kind: str,
+    rep: str,
+    keyer: Keyer,
+    seps: Seps,
+    kept: frozenset[int] = _CX_KEPT_COMPONENTS,
+) -> str:
     """Replace the **id** component (component 1) with a fabricated value of the same length and
-    alphanumeric shape, keep the authority components :data:`_CX_KEPT_COMPONENTS` names (non-PHI,
-    routing-relevant) and blank the rest — so an alphanumeric MRN keeps its width and shape, not
+    alphanumeric shape, keep the components ``kept`` names (by default the CX authority
+    components, :data:`_CX_KEPT_COMPONENTS`: non-PHI, routing-relevant) and blank the rest — so an alphanumeric MRN keeps its width and shape, not
     just its digit count, and its check digit and dates do not survive (BACKLOG #5534)."""
     rng = keyer.rng(kind, rep)
     comps = _components(rep, seps)
     fabricated = _fake_like(rng, comps[0])
-    return seps.component.join([fabricated, *_kept_tail(comps, _CX_KEPT_COMPONENTS)])
+    return seps.component.join([fabricated, *_kept_tail(comps, kept)])
 
 
 def surrogate_mrn(rep: str, keyer: Keyer, seps: Seps) -> str:
@@ -251,10 +257,7 @@ def surrogate_dln(rep: str, keyer: Keyer, seps: Seps) -> str:
     """A DLN driver's licence number (PID-20): a fabricated number of the same shape, the issuing
     state kept and the expiration date blanked. The generic identifier reads a field as a CX, so
     it would blank the state as a check digit and could not tell the expiry was a date."""
-    rng = keyer.rng("dln", rep)
-    comps = _components(rep, seps)
-    fabricated = _fake_like(rng, comps[0])
-    return seps.component.join([fabricated, *_kept_tail(comps, _DLN_KEPT_COMPONENTS)])
+    return _surrogate_identifier("dln", rep, keyer, seps, _DLN_KEPT_COMPONENTS)
 
 
 def surrogate_ssn(rep: str, keyer: Keyer, seps: Seps) -> str:
@@ -541,6 +544,87 @@ def read_message_seps(text: str) -> tuple[Seps, str] | None:
                 seps = Seps(component=enc[0], repetition=enc[1], escape=enc[2], subcomponent=enc[3])
                 return seps, field
     return None
+
+
+#: A ``\Xhh...\`` body: an ``X`` and then hex digits in pairs.
+_HEX_ESCAPE: re.Pattern[str] = re.compile(r"X((?:[0-9A-Fa-f]{2})+)")
+#: The first letters of the escape sequences that change how text looks, not what it says:
+#: highlighting on and off (``H``, ``N``) and the character-set and local escapes (``C``, ``M``,
+#: ``Z``). They decode to nothing.
+_FORMAT_ESCAPES = frozenset("HNCMZ")
+
+
+def _decode_escape(body: str, seps: Seps, field_sep: str) -> str | None:
+    """What one escape sequence decodes to, given the text between its two escape characters.
+    ``None`` when ``body`` is no escape sequence HL7 defines, so the caller keeps it as written.
+
+    A hex escape decodes each pair to the character with that code, so an ASCII shape written in
+    hex reads as itself. A formatting command (``.br``, ``.sp`` and the like) decodes to one space,
+    so two runs of digits on either side of a line break never join into one number."""
+    # A delimiter escape names its delimiter by letter: F field, S component, T subcomponent,
+    # R repetition and E the escape character itself.
+    delimiter = {
+        "F": field_sep,
+        "S": seps.component,
+        "T": seps.subcomponent,
+        "R": seps.repetition,
+        "E": seps.escape,
+    }.get(body)
+    if delimiter is not None:
+        return delimiter
+    if (hexed := _HEX_ESCAPE.fullmatch(body)) is not None:
+        return bytes.fromhex(hexed.group(1)).decode("latin-1")
+    if body.startswith("."):
+        return " "
+    if body and body[0] in _FORMAT_ESCAPES:
+        return ""
+    return None
+
+
+def unescape(value: str, seps: Seps, field_sep: str) -> str:
+    """``value`` with every HL7 escape sequence decoded, by the message's own escape character and
+    separators (BACKLOG #5532). The tee cannot import the engine's parser, so the leak-check of
+    both copies decodes here, in this byte-identical file. The anonymizer never calls it. An escape character with no closing one, or a body HL7 does not
+    define, is kept as written. Never raises."""
+    escape = seps.escape
+    if not escape or escape not in value:
+        return value
+    out: list[str] = []
+    at = 0
+    while (start := value.find(escape, at)) != -1:
+        end = value.find(escape, start + 1)
+        if end == -1:
+            break
+        decoded = _decode_escape(value[start + 1 : end], seps, field_sep)
+        if decoded is None:
+            out.append(value[at : start + 1])
+            at = start + 1
+            continue
+        out.append(value[at:start])
+        out.append(decoded)
+        at = end + 1
+    out.append(value[at:])
+    return "".join(out)
+
+
+def unescaped_message(text: str) -> str:
+    """``text`` with the escape sequences in every field decoded, for the token scan (BACKLOG
+    #5532). The encoding characters of a header line are left as written, since they hold the
+    escape character itself. ``text`` is returned as it is when it has no parseable MSH or no field
+    holds an escape sequence that decodes."""
+    parsed = read_message_seps(text)
+    if parsed is None:
+        return text
+    seps, field_sep = parsed
+    changed = False
+    lines: list[str] = []
+    for line in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
+        fields = line.split(field_sep)
+        kept = 2 if fields[0].upper() in HEADER_SEGMENTS else 1
+        decoded = [unescape(field, seps, field_sep) for field in fields[kept:]]
+        changed = changed or decoded != fields[kept:]
+        lines.append(field_sep.join(fields[:kept] + decoded))
+    return "\r".join(lines) if changed else text
 
 
 def _date_output_test(rules: tuple[FieldRule, ...], seps: Seps) -> Callable[[list[str], int], bool]:

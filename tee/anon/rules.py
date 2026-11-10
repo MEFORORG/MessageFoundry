@@ -392,8 +392,8 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     the retargets this covers. A different kind can leave part of the field as captured: ``id``,
     ``mrn`` and ``ssn`` rewrite the first component and keep the components a CX names its issuer
     in, so on ``PID-5`` they leave the middle name, and ``dln`` keeps the second, so it leaves the
-    given name (BACKLOG #5534). A retarget to the same kind changes nothing, and ``drop`` and ``freetext`` write a
-    constant, so none of those needs the list. A path on the list that is not such a retarget is
+    given name (BACKLOG #5534). A retarget to the same kind changes nothing, and ``drop`` and
+    ``freetext`` write a constant, so none of those needs the list. A path on the list that is not such a retarget is
     refused too, so a misspelt entry cannot sit there doing nothing. Each acknowledged retarget is
     logged at WARNING, by field address, default kind and new kind (BACKLOG #3000).
 

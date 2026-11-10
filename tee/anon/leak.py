@@ -38,7 +38,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .rules import HEADER_SEGMENTS, AnonError, FieldRule, SurrogateKind, retargeted_defaults
-from .surrogates import Seps, message_has_site_code, read_message_seps
+from .surrogates import (
+    Seps,
+    message_has_site_code,
+    read_message_seps,
+    unescape,
+    unescaped_message,
+)
 
 
 def _load_publish_guard(_start: Path | None = None) -> object | None:
@@ -71,13 +77,15 @@ def forbidden_names() -> list[tuple[re.Pattern[str], str]]:
     Read at call time: a copy taken at import kept the tables of that moment while the report read
     the guard's liveness live, so after a ``reload_tokens()`` it could scan with empty tables and
     still call the denylist live (BACKLOG #5541)."""
-    return list(_GUARD.FORBIDDEN) if _GUARD else []  # type: ignore[attr-defined]
+    names: list[tuple[re.Pattern[str], str]] = _GUARD.FORBIDDEN if _GUARD else []  # type: ignore[attr-defined]
+    return names
 
 
 def estate_tokens() -> tuple[str, ...]:
     """The estate-vendor substring tokens, read from the publish guard now, as
     :func:`forbidden_names` reads the names."""
-    return tuple(_GUARD.ESTATE_TOKENS) if _GUARD else ()  # type: ignore[attr-defined]
+    tokens: tuple[str, ...] = _GUARD.ESTATE_TOKENS if _GUARD else ()  # type: ignore[attr-defined]
+    return tokens
 
 
 # Generic structural detectors (NOT customer data): loaded from the guard when present (parity), with a
@@ -587,64 +595,6 @@ def _split_shape_hits(line: str, field_sep: str, addresses: Sequence[str | None]
     return hits
 
 
-#: What an HL7 escape sequence that names a delimiter decodes to, by the letter between the two
-#: escape characters: ``F`` the field separator, ``S`` component, ``T`` subcomponent, ``R``
-#: repetition and ``E`` the escape character itself.
-_DELIMITER_ESCAPES = ("F", "S", "T", "R", "E")
-#: A ``\Xhh...\`` body: an ``X`` and then hex digits in pairs.
-_HEX_ESCAPE: re.Pattern[str] = re.compile(r"X((?:[0-9A-Fa-f]{2})+)")
-#: The first letters of the escape sequences that change how text looks, not what it says:
-#: highlighting on and off (``H``, ``N``) and the character-set and local escapes (``C``, ``M``,
-#: ``Z``). They decode to nothing.
-_FORMAT_ESCAPES = frozenset("HNCMZ")
-
-
-def _decode_escape(body: str, seps: Seps, field_sep: str) -> str | None:
-    """What one escape sequence decodes to, given the text between its two escape characters.
-    ``None`` when ``body`` is no escape sequence HL7 defines, so the caller keeps it as written.
-
-    A hex escape decodes each pair to the character with that code, so an ASCII shape written in
-    hex reads as itself. A formatting command (``.br``, ``.sp`` and the like) decodes to one space,
-    so two runs of digits on either side of a line break never join into one number."""
-    if body in _DELIMITER_ESCAPES:
-        return (field_sep, seps.component, seps.subcomponent, seps.repetition, seps.escape)[
-            _DELIMITER_ESCAPES.index(body)
-        ]
-    if (hexed := _HEX_ESCAPE.fullmatch(body)) is not None:
-        return bytes.fromhex(hexed.group(1)).decode("latin-1")
-    if body.startswith("."):
-        return " "
-    if body and body[0] in _FORMAT_ESCAPES:
-        return ""
-    return None
-
-
-def _unescape(value: str, seps: Seps, field_sep: str) -> str:
-    """``value`` with every HL7 escape sequence decoded, by the message's own escape character and
-    separators (BACKLOG #5532). The tee cannot import the engine's parser, so this is the one
-    decoder both copies share. An escape character with no closing one, or a body HL7 does not
-    define, is kept as written. Never raises."""
-    escape = seps.escape
-    if not escape or escape not in value:
-        return value
-    out: list[str] = []
-    at = 0
-    while (start := value.find(escape, at)) != -1:
-        end = value.find(escape, start + 1)
-        if end == -1:
-            break
-        decoded = _decode_escape(value[start + 1 : end], seps, field_sep)
-        if decoded is None:
-            out.append(value[at : start + 1])
-            at = start + 1
-            continue
-        out.append(value[at:start])
-        out.append(decoded)
-        at = end + 1
-    out.append(value[at:])
-    return "".join(out)
-
-
 def _escaped_leaves(value: str, seps: Seps, field_sep: str) -> Iterator[str]:
     """Each subcomponent of ``value`` that holds the escape character, decoded. A leaf is decoded
     on its own, after the split, so an escaped separator inside it never makes a new component.
@@ -655,27 +605,7 @@ def _escaped_leaves(value: str, seps: Seps, field_sep: str) -> Iterator[str]:
         for comp in rep.split(seps.component):
             for leaf in comp.split(seps.subcomponent):
                 if seps.escape in leaf:
-                    yield _unescape(leaf, seps, field_sep)
-
-
-def unescaped_message(text: str) -> str:
-    """``text`` with the escape sequences in every field decoded, for the token scan (BACKLOG
-    #5532). The encoding characters of a header line are left as written, since they hold the
-    escape character itself. ``text`` is returned as it is when it has no parseable MSH or no field
-    holds an escape sequence that decodes."""
-    parsed = read_message_seps(text)
-    if parsed is None:
-        return text
-    seps, field_sep = parsed
-    changed = False
-    lines: list[str] = []
-    for line in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
-        fields = line.split(field_sep)
-        kept = 2 if fields[0].upper() in HEADER_SEGMENTS else 1
-        decoded = [_unescape(field, seps, field_sep) for field in fields[kept:]]
-        changed = changed or decoded != fields[kept:]
-        lines.append(field_sep.join(fields[:kept] + decoded))
-    return "\r".join(lines) if changed else text
+                    yield unescape(leaf, seps, field_sep)
 
 
 def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]:
@@ -685,7 +615,7 @@ def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]
     hits = scan(text)
     decoded = unescaped_message(text)
     if decoded != text:
-        hits.extend(hit for hit in dict.fromkeys(scan(decoded)) if hit not in hits)
+        hits.extend(hit for hit in scan(decoded) if hit not in hits)
     return hits
 
 
@@ -696,9 +626,9 @@ def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
     so an id type written with an escape sequence, such as ``M\\X52\\``, counts (BACKLOG #5532)."""
     for rep in value.split(seps.repetition):
         comps = rep.split(seps.component)
+        # A component with no escape character comes back from unescape as it was.
         if comps[0] and any(
-            comp.upper() in _MRN_TYPES or _unescape(comp, seps, field_sep).upper() in _MRN_TYPES
-            for comp in comps
+            unescape(comp, seps, field_sep).upper() in _MRN_TYPES for comp in comps
         ):
             return True
     return False
@@ -763,8 +693,7 @@ def retarget_residue_hits(
     A rule that points a default field at a different kind (:func:`.rules.retargeted_defaults`)
     maps the field, so :func:`structural_phi_hits` never scans it. ``id``, ``mrn``, ``ssn`` and
     ``dln`` rewrite component 1 and keep some components after it as captured (BACKLOG #5534).
-    So each repetition of
-    such a field is scanned here with its component 1 left out, for the dashed SSN and the
+    So each repetition of such a field is scanned here with its component 1 left out, for the dashed SSN and the
     punctuated phone. The MRN-typed shape needs a component 1, so it never fires here, which is
     right: the id there is the surrogate. The other kinds add no hit: ``name``, ``address`` and
     ``provider`` write values from fixed pools, and ``tests/test_anon_overlay_retarget_warning.py``

@@ -184,7 +184,7 @@ def test_an_escaped_token_is_found(
     hits: list[str] = leak.leak_report(text).hits
     assert hits.count(reason) == 1, hits
     # Control: written plainly, the same token is found once, not twice.
-    plain = leak._unescape(value, leak.Seps(), "|")
+    plain = leak.unescape(value, leak.Seps(), "|")
     plain_hits: list[str] = leak.leak_report(f"{_HEAD}\rZPD|1|{plain}").hits
     assert plain_hits.count(reason) == 1, plain_hits
 
