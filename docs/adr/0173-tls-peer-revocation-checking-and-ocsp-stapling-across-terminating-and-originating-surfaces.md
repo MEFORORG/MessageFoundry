@@ -1128,13 +1128,17 @@ body is not PHI-free in the shipped code (BACKLOG #5021).** The decline in the 2
 slices (c) and (d) rests on no credential crossing the hop. What a body carries is in the [PHI.md
 logging inventory](../PHI.md#logging-inventory-1611--1623): its row for the `[alerts]` SMTP
 transport (row 11) and its row for the security-event notifier (row 12). The owner ruled on
-2026-11-09 (decision record `d20261110T081839838-3120c4`) that the
-decline stands, and that the fix for the body is one key allowlist that every off-box alert
-passes through. That allowlist is not built in the shipped
-code; it is the off-box alert key allowlist row, unallocated. By the same ruling, an alert
-exemption stated beside, or justified by, a PHI-free body is to be re-checked against that
-allowlist once it is built, at least [ADR 0029](0029-email-smtp-destination.md)'s ungated alert
-sender domain and the `[alerts]` sinks sitting outside `[egress]` ([DEPLOYMENT.md](../DEPLOYMENT.md)).
+2026-11-09 (decision record `d20261110T081839838-3120c4`, stamped in UTC on 2026-11-10) that the
+decline stands, and that alerts are to be made PHI-free by routing every off-box alert through
+one key allowlist. That allowlist is not built in the shipped code; it is the off-box alert key
+allowlist row, unallocated. The same ruling holds that the PHI-free alert claims in
+[ADR 0133](0133-alert-escalation-tiers-schedule-aware-thresholds-and-content-triggered-alerts-the-56-remainder.md)
+and [ADR 0044](0044-operator-alert-state.md), false in the shipped code, become true again once
+that allowlist is built. Separately, a Manager decision (class B, Manager 30df8519, decision
+record `d20261110T082816880-1913c6`), not the owner ruling, holds that two exemptions justified
+by a PHI-free alert body are to be re-checked against that allowlist once it is built:
+[ADR 0029](0029-email-smtp-destination.md)'s ungated alert sender domain, and the `[alerts]`
+sinks sitting outside `[egress]` deny-by-default ([DEPLOYMENT.md](../DEPLOYMENT.md)).
 
 **Note 2026-10-04: the hops outside the reads, graded by name (BACKLOG #2194).** Read at engine
 `76355472a`. This note grades the hops the list above left ungraded. It builds no guard, documents

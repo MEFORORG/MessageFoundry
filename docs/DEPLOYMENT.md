@@ -938,9 +938,9 @@ and SMTP transports, rows 10 and 11), and keep their **own** host allow-lists â€
 `[egress].allowed_http` entry does nothing for a webhook alert. *(Note 2026-11-10, BACKLOG #5021:
 this exemption was stated beside "carry no PHI bodies", read as the alert sinks carrying no PHI.
 That reading is false in the shipped code, and the exemption is to be re-checked against the
-off-box alert key allowlist once it is built, by the owner ruling recorded in [ADR
+off-box alert key allowlist once it is built, by a Manager decision, not the owner ruling; [ADR
 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s
-note of 2026-11-10.)*
+note of 2026-11-10 records both and which part each holds.)*
 
 **What `[egress]` does and does not bound â€” read this before you book it as the exfiltration control.**
 The check validates **declared connector settings** at config load / reload / start. It bounds the

@@ -942,8 +942,8 @@ class EmailTransport:
         self.tls_ca_file = tls_ca_file
         self.trust_anchor_policy = trust_anchor_policy
         # Optional egress allowlist (lower-cased) for the SMTP host; empty = any (WP-11c, parity with
-        # the webhook allowlist). The alert payload carries no message body, but it can carry
-        # free-text detail (docs/PHI.md row 10); this allowlist is the egress control for that hop.
+        # the webhook allowlist). The alert payload has no message-body field, but it can carry
+        # free-text detail (docs/PHI.md row 11); this allowlist is the egress control for that hop.
         self.allowed_hosts = tuple(h.lower() for h in allowed_hosts)
         # #138: operator-editable templates (None = fixed subject/body). Validated at config-load.
         self.subject_template = subject_template

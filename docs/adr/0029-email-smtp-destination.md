@@ -81,9 +81,9 @@ standing rule for such decisions, after an adversarial review upheld it. The own
   `[alerts]` transports; corrected 2026-11-10, BACKLOG #5021: this read *"limits alert mail to
   fields with no PHI"*). *(Note 2026-11-10: that retired claim was the reason given for this
   decline, and it is false in the shipped code. The decline is to be re-checked against the
-  off-box alert key allowlist once that is built, by the owner ruling recorded in
+  off-box alert key allowlist once that is built, by a Manager decision, not the owner ruling;
   [ADR 0173](0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s
-  note of 2026-11-10.)* DIRECT stays out too: its bounces carry ciphertext
+  note of 2026-11-10 records both and which part each holds.)* DIRECT stays out too: its bounces carry ciphertext
   ([ADR 0085](0085-direct-hisp-smime-connector.md)).
 - **If the sender becomes per-message.** Today it is a connection setting, so the check runs at
   load, reload and start. A sender chosen per message would need the check at send time.

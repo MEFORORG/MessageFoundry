@@ -107,7 +107,9 @@ Two invariants bound the design and **must not** be relaxed:
   message body*, so it must carry **only** the connection + a rule id + a boolean/label — **never the
   matched field value**. *(Note 2026-11-10, BACKLOG #5021: the quoted premise was false; some events
   carry free-text detail, as the [PHI.md logging inventory](../PHI.md#logging-inventory-1611--1623)
-  rows for the `[alerts]` transports say.)*
+  rows for the `[alerts]` transports say. When this premise becomes true again is in
+  [ADR 0173](0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s
+  note of 2026-11-10.)*
 - **Routers and transforms must be pure (ADR 0001).** A Handler that emits a content-triggered alert
   performs a **side effect**; under at-least-once a stage re-run **re-emits** it. This must be reconciled
   (below), not silently broken. **CORRECTED 2026-09-30:** it was not reconciled, and D3 is retracted
