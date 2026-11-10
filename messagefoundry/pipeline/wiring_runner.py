@@ -113,6 +113,7 @@ from messagefoundry.config.wiring import (
     apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
+    read_lax_flag,
     refuse_capture_conflicts,
     refuse_resolved_verify_off,
     refuse_unresolved_hop_flags,
@@ -12525,17 +12526,23 @@ def _mirror_declarations(
 
     The NAME is written always. A refusal needs it as much as an audit record does, and a refusal is
     exactly the case where nothing was declared. The two declarations are written only when set.
+    Each flag is read as the typed model reads it (:func:`read_lax_flag`), so a false spelling such
+    as ``"off"``, which the model holds as ``False``, is not mirrored as set with no reason (vault
+    BACKLOG #5286); a value the model would refuse is refused here, before the model is built.
 
     The one writer for both ``_dest_config`` and ``_fhir_lookup_settings`` (BACKLOG #2050): the
     lookup path once stripped only the revocation keys, so a hand-set ``cleartext_accepted`` crossed
     the read hop without the audited declaration."""
+    where = f"connection {connection!r}"
+    accepted = read_lax_flag(cleartext_accepted, where, "cleartext_accepted")
+    attested = read_lax_flag(tls_revocation_attested, where, "tls_revocation_attested")
     for key in _DECLARATION_MIRROR_KEYS:
         settings.pop(key, None)
     settings[MIRRORED_CONNECTION_SETTING] = connection
-    if cleartext_accepted:
+    if accepted:
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = cleartext_reason
-    if tls_revocation_attested:
+    if attested:
         settings["tls_revocation_attested"] = True
         settings["tls_revocation_attested_reason"] = tls_revocation_attested_reason
 

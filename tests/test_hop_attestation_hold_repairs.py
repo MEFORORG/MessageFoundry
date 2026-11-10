@@ -7,8 +7,8 @@ anonymous-FTP guard's inbound read of the settings pair, a settings secret in a 
 ``OutboundSigning`` or ``WindowsCredential`` validation error, and the ``check`` report marking an
 outbound hop the build refuses for its reason as one the engine crosses. A later repair added a
 test that a refused ``[egress].proxy_url`` credential leaves no urlsplit cache key (vault BACKLOG
-#3454). One strict xfail is not a repair: it holds a gap that was on ``main`` before this PR, and
-fails until that gap is fixed. Every value is synthetic.
+#3454). A later fix made the settings mirror read each declaration flag as the typed model does,
+so a lax-false spelling is not mirrored as set (vault BACKLOG #5286). Every value is synthetic.
 """
 
 from __future__ import annotations
@@ -364,9 +364,9 @@ def test_control_the_cases_cover_both_build_outcomes() -> None:
     """Without this the agreement tests could pass with every case on one side, outbound or
     inbound. It pins the build as it is today: a build that refused a non-bool flag outright would
     move the lax cases to the refused side, and this control, not the agreement tests, would need
-    updating. A lax-false string flag such as ``"false"`` is left out on purpose: it builds, which
-    is right, but the settings mirror reads it as set. That known gap is held by
-    :func:`test_a_lax_false_string_flag_is_not_mirrored_as_set`, not pinned here."""
+    updating. The lax-false string cases, such as ``"false"``, build too; what the settings mirror
+    holds for them is pinned by :func:`test_a_lax_false_flag_is_not_mirrored_as_set` (vault
+    BACKLOG #5286)."""
     from messagefoundry.config.settings import EgressSettings
     from messagefoundry.pipeline.wiring_runner import _dest_config, _source_config
 
@@ -396,44 +396,65 @@ def test_control_the_cases_cover_both_build_outcomes() -> None:
     assert outbound["cleartext-int-reason"]
 
 
-_LAX_FALSE_GAP = (
-    "pre-existing on main, its row not yet filed: a lax-false string flag ('false', 'no', "
-    "'off', '0') builds as False, but the settings mirror reads it as set, because "
-    "_mirror_declarations tests the raw value by truthiness"
+# Each flag and the reason key the mirror writes beside it.
+_MIRRORED_PAIRS = {
+    "tls_revocation_attested": "tls_revocation_attested_reason",
+    "cleartext_accepted": "cleartext_reason",
+}
+# pydantic's lax-bool false set: its six words in any case, their bytes forms, and a numeric zero.
+_LAX_FALSE_SPELLINGS: tuple[object, ...] = (
+    *("false", "no", "off", "0", "f", "n"),
+    *("FALSE", "Off", "No", "oFf", "N", "F"),
+    *(b"false", b"0", b"no", b"OFF"),
+    *(0, 0.0),
 )
-_LAX_FALSE_CASES = [
-    {flag: text}
-    for flag in ("tls_revocation_attested", "cleartext_accepted")
-    for text in ("false", "no", "off", "0")
-]
+_EACH_FLAG = pytest.mark.parametrize("flag", list(_MIRRORED_PAIRS))
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=_LAX_FALSE_GAP)
-@pytest.mark.parametrize(
-    "extra",
-    _LAX_FALSE_CASES,
-    ids=[f"{k}-{v}" for case in _LAX_FALSE_CASES for k, v in case.items()],
-)
-def test_a_lax_false_string_flag_is_not_mirrored_as_set(extra: dict[str, Any]) -> None:
-    """Known gap, not the behaviour wanted: ``Destination`` reads the string as ``False`` while the
-    settings mirror the token seams read holds ``True``. Strict, and only an ``AssertionError``
-    counts, so a fix -- mirroring the typed value, or refusing the string anywhere from the
-    connection's construction to its build -- turns this into a pass that must drop the mark, and
-    an unrelated crash is an error rather than the expected failure."""
+def _build_outbound(**extra: Any) -> Destination:
     from messagefoundry.config.settings import EgressSettings
     from messagefoundry.pipeline.wiring_runner import _dest_config
 
-    try:
-        dest = _dest_config(
-            OutboundConnection("OB_CASE", File(directory="."), **extra, **_ATTEST),
-            {},
-            None,
-            EgressSettings(),
-        )
-    except (ValueError, TypeError):
-        return  # the string is refused, at construction or build: the gap is closed that way
-    (key,) = extra
-    assert not dest.settings.get(key)
+    return _dest_config(
+        OutboundConnection("OB_CASE", File(directory="."), **extra), {}, None, EgressSettings()
+    )
+
+
+@_EACH_FLAG
+@pytest.mark.parametrize("value", _LAX_FALSE_SPELLINGS, ids=repr)
+def test_a_lax_false_flag_is_not_mirrored_as_set(flag: str, value: object) -> None:
+    """Every spelling the typed ``Destination`` reads as ``False`` is mirrored as unset, so the
+    token seams that read the settings copy see no declaration with no reason (vault BACKLOG
+    #5286). Red under: ``_mirror_declarations`` testing the raw value by truthiness."""
+    dest = _build_outbound(**{flag: value}, **_ATTEST)
+    assert getattr(dest, flag) is False
+    assert flag not in dest.settings
+    assert _MIRRORED_PAIRS[flag] not in dest.settings
+
+
+@_EACH_FLAG
+def test_a_flag_lax_bool_refuses_is_refused_without_its_value(flag: str) -> None:
+    """A value lax ``bool`` refuses is refused before the model is built, as a ``WiringError``
+    naming the connection and the key, never the value that pydantic's own error quotes, and
+    with no chained pydantic error that would quote it."""
+    from messagefoundry.config.wiring import WiringError
+
+    with pytest.raises(WiringError, match=f"'OB_CASE': {flag} must be a boolean") as info:
+        _build_outbound(**{flag: "SYNTHMAYBE"}, **_ATTEST)
+    assert "SYNTHMAYBE" not in str(info.value)
+    assert info.value.__cause__ is None and info.value.__suppress_context__
+
+
+@_EACH_FLAG
+@pytest.mark.parametrize("value", [True, "true", "On", 1])
+def test_control_a_set_flag_with_its_reason_still_mirrors(flag: str, value: object) -> None:
+    """Control for the lax-false test: a set flag with its reason still mirrors as ``True``,
+    beside its reason, and builds. No hop attestation: an attested hop that also accepts
+    cleartext is refused."""
+    dest = _build_outbound(**{flag: value, _MIRRORED_PAIRS[flag]: "SYNTH reason"})
+    assert getattr(dest, flag) is True
+    assert dest.settings[flag] is True
+    assert dest.settings[_MIRRORED_PAIRS[flag]] == "SYNTH reason"
 
 
 def test_a_plain_attested_hop_beside_refused_siblings_is_not_marked_refused() -> None:
