@@ -60,6 +60,7 @@ from messagefoundry.pipeline import Engine, ReloadOutcome
 from messagefoundry.store import MessageStore
 from messagefoundry.transports.base import SourceStartupError
 from tests._admin_account import create_local_user_chosen
+from tests._approval_queue import release_blocked
 from tests._bound_proof import reproving_transport
 from tests._share_fault import _share_fault
 from tests.test_config_fingerprint import INVALID_DIR_NAMES, _unreadable
@@ -1404,19 +1405,61 @@ async def test_an_edit_made_while_the_release_loads_neither_runs_nor_is_recorded
 async def test_a_hold_that_captured_no_digest_is_refused_at_release(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Fail closed: an approval that names no bytes cannot release any."""
+    """Fail closed: an approval that names no bytes cannot release any. Since vault BACKLOG #3192
+    the gate refuses it before its claim, so the queue shows ``params_no_fingerprint`` rather than
+    offering Approve, and the request stays pending for a reject."""
 
     async def _none(_config_dir: object) -> None:
         return None
 
     monkeypatch.setattr(engine, "reload_target_approval", _none)
     service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, GATED) as c:
+        op, admin = await _token(c, "op"), await _token(c, "approver")
+        held_r = await c.post("/config/reload", json={}, headers=op)
+        assert held_r.status_code == 202, held_r.text
+        approval_id = held_r.json()["approval_id"]
+        assert await release_blocked(c, approval_id, admin) == "params_no_fingerprint"
+        r = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+    assert r.status_code == 409, r.text
+    assert "no config digest" in r.json()["detail"]
+    held = await engine.store.get_pending_approval(approval_id)
+    assert held is not None and str(held["status"]) == "pending"
+    assert _held_params(held)["fingerprint"] is None
+    [row] = [
+        json.loads(r["detail"])
+        for r in await engine.store.list_audit(action="approval.params_no_fingerprint")
+    ]
+    assert row["approval_id"] == approval_id
+    assert await engine.store.list_audit(action="approval.release_attempted") == []
+    assert await engine.store.list_audit(action="config_reload_failed") == []
+    assert await engine.store.list_audit(action="config_reload") == []
+
+
+@pytest.mark.parametrize("held", [None, "A" * 64], ids=["none", "malformed"])
+async def test_a_no_digest_hold_past_the_gate_is_still_refused_by_the_executor(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, held: str | None
+) -> None:
+    """The defence behind the gate's check (vault BACKLOG #3192): with that check made to pass, a
+    release bound to no digest, or to one not of the form the engine writes, reaches the executor,
+    which still refuses every config, 422 and ``no_approved_digest``, and loads nothing. The
+    executor reads its own reference to the test, so only the gate's copy is patched."""
+    from messagefoundry.pipeline import ApprovedConfig
+
+    async def _held(_config_dir: object) -> ApprovedConfig | None:
+        return None if held is None else ApprovedConfig(held)
+
+    monkeypatch.setattr(engine, "reload_target_approval", _held)
+    monkeypatch.setattr("messagefoundry.api.approvals.held_fingerprint", lambda _p: "bypassed")
+    service = await _service(engine)
     approval_id, r = await _hold_then_release(engine, service, {})
     assert r.status_code == 422, r.text
     assert r.json()["detail"] == (
         "this request named no config digest, so it cannot be released; request the reload again"
     )
-    assert _held_params(await engine.store.get_pending_approval(approval_id))["fingerprint"] is None
+    assert _held_params(await engine.store.get_pending_approval(approval_id))["fingerprint"] == held
     [row] = [
         json.loads(r["detail"])
         for r in await engine.store.list_audit(action="config_reload_failed")

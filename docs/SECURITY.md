@@ -2500,16 +2500,18 @@ before the change is refused at release with **409** and an `approval.no_longer_
 the approver, whose `reason` says which (`approvals_disabled` or `operation_not_gated`). Nothing
 runs. The request stays pending until an approver rejects it or it expires. The refusal's wording
 tells the approver to reject it and, if the operation is still needed, to run it again, which now
-runs it without a second approver. `GET /approvals` marks such a request `gated: false`, read from
-the same settings test at listing time, and gives it a `release_blocked` reason, below, which the
-console's Approvals page keys on.
+runs it without a second approver. `GET /approvals` marks such a request `release_blocked:
+"not_gated"`, below, read from the same settings test at listing time, which the console's
+Approvals page keys on.
 
 **`GET /approvals` names at least some of the releases the gate refuses whoever approves them
 (vault BACKLOG #3192).** Each pending request carries `release_blocked`, which the release refuses
 on directly, so where it names a reason the two cannot disagree. It names at least a request with
 no requester id, an operation no longer registered, one dual control no longer gates, unreadable
 parameters, parameters naming no requester for an operation whose executor needs one (a purge or a
-reload, `params_no_requester`), and a requester who no longer holds the authority the operation needs, such as a held
+reload, `params_no_requester`), a held reload whose parameters carry no config digest, or one not
+of the form the engine writes, which its release could only refuse whatever the directory holds
+(`params_no_fingerprint`), and a requester who no longer holds the authority the operation needs, such as a held
 reload or purge whose requester has since been channel-scoped (`requester_not_authorized`, BACKLOG
 #3189). The requester's standing is read when the queue is listed, by the rule the release
 applies, so a change after the listing, or a standing the listing could not read, is met only at
@@ -2519,7 +2521,8 @@ the expiry, the dwell floor, the row's seal and the operation's own refusals are
 page keys on it, and offers a blocked request only Reject, or Withdraw on the requester's own row,
 with a note saying why. A release refused for unreadable parameters writes an
 `approval.params_unreadable` row against the approver, which carries no parameters, and one refused
-as `params_no_requester` writes an `approval.params_no_requester` row against the approver. A
+as `params_no_requester` or `params_no_fingerprint` writes an `approval.params_no_requester` or
+`approval.params_no_fingerprint` row against the approver. A
 release refused on the requester's standing writes `approval.stale_requester`, above. A refusal for
 a request with no requester id, or for an operation no longer registered, still writes no row.
 
@@ -2590,7 +2593,8 @@ row may have committed after all.
 
 **A reload's `config_reload_failed` row names why in `reason`.** At least these values are
 written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
-`no_approved_digest`, `digest_unavailable`, `store_unavailable` and `reload_fault`. **An operator
+`no_approved_digest` (reached only past the gate's own check, below), `digest_unavailable`,
+`store_unavailable` and `reload_fault`. **An operator
 reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline, a dry run
 included, and released, any error the reload raises that none of the other reasons names is
 `reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
@@ -2692,7 +2696,12 @@ the environment values it had. A reload applies the values it re-read only with 
 rolled-back swap puts the old ones back. A dry run checks the values and never applies them. The
 approve answers **422**, the request moves to `failed`, and a `config_reload_failed` row records
 reason `digest_mismatch` with `approved_fingerprint` and `current_fingerprint`. A hold whose
-params carry no digest is refused the same way, with reason `no_approved_digest`. A release that
+params carry no digest, or one not of the form the engine writes, is refused before its claim
+instead (vault BACKLOG #3192): the queue marks
+it `release_blocked: "params_no_fingerprint"`, the approve answers **409** and writes an
+`approval.params_no_fingerprint` row, nothing runs, and the request stays pending for a reject.
+A hold with no usable digest whose release skipped the gate's check is still refused by the
+executor, with reason `no_approved_digest` where it reaches the digest check. A release that
 cannot take the digest now is refused with reason `digest_unavailable`, and the engine logs the
 cause at WARNING. The requester asks again, and a second approver reviews the new bytes.
 
@@ -2829,7 +2838,8 @@ in the local audit log for a `dead_letter_replay` or `connection_purge` row writ
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
 answers **409**: that is at least `approval.too_early`, `approval.stale_requester`,
-`approval.no_longer_gated`, `approval.params_unreadable` and `approval.params_no_requester`. A claim, a rejection or a resolution that the store cannot write with
+`approval.no_longer_gated`, `approval.params_unreadable`, `approval.params_no_requester` and
+`approval.params_no_fingerprint`. A claim, a rejection or a resolution that the store cannot write with
 its audit row answers **503**. The request does not move, except where a COMMIT lands despite the
 error, as stated for the claim above.
 
@@ -2846,19 +2856,30 @@ than to one request.
   caller and their address;
 - the `approval.approver_provenance` row a release or a resolution writes after it has gone ahead.
   The log line carries the row's detail;
-- the request or repeat write, including one that reads back as held, as below. The log line names
-  the actor and the operation, or is a WARNING for a held one;
+- the request or repeat write, except one that reads back as held, as below. The log line names
+  the actor and the operation;
 - a claim, a rejection or a resolution that answers 503, and a claim whose approve was cancelled.
-  The log line carries the exception, not the row's detail.
+  The log line carries the exception, not the row's detail;
+- an outcome whose status write found the row moved, where the read-back does not find this
+  write's row at its status and decision time, as below. The log line carries the row's detail;
+  on an interrupted or failed outcome its `recorded` or `compensated` field reads `false` where
+  another caller moved the row, and `unknown` where the read-back cannot tell.
 
 For some failed writes the gate logs at ERROR and pages nothing. At least this one: a restart
 cannot move a leftover `executing` row to `interrupted`. The row stays `executing`, and the next
 start tries again.
 
 An outcome's combined write can fail while the status write that follows finds the row already
-moved. The combined write most likely committed, and only its reply was lost, so the gate writes
-no second row. It logs at ERROR and pages, because the store writes a row's off-box copy only
-after a commit it saw succeed (vault BACKLOG #3193).
+moved. The gate then writes no row alone, and reads the row back (vault BACKLOG #3193 N1). If it
+reads at the outcome's status with that write's decision time, the combined write committed and only its reply
+was lost, so its row is in the local audit log but not the off-box copy, which the store writes
+only after a commit it saw succeed. The gate logs at ERROR and pages `audit_offbox_copy_missing`,
+keyed `approval:<id>` with the row's action name. If the row reads otherwise, or cannot be read, it
+logs at ERROR and pages `audit_write_failed`.
+
+The `audit_write_failed` alert's reason says the row was not written or its write's outcome is
+unknown: a COMMIT can land despite the error, as stated for the claim above, and a row the step-up
+return audit budget sheds is never written.
 
 A call can be cancelled mid-write, for example by the request timeout. The gate then writes no
 ERROR line and no alert for at least two writes: a rejection, and a refusal's row. The gate
@@ -2885,8 +2906,9 @@ on a programming defect, rather than a store fault, is raised as it is.
 The request and its `approval.requested` row are one write, as above. When that write reports an
 error, the gate reads the request back by its id. If it is held and its seal holds, the COMMIT
 landed and only its reply was lost. The gate then answers the same **202** with that id, logs a
-WARNING, and still pages. Its row reaches the local audit log but not the off-box copy, which is
-written only after a commit the store saw succeed, and the page is what reports that gap. A cancel reaches the caller at once, while
+WARNING, and still pages, as `audit_offbox_copy_missing` (vault BACKLOG #3193 N1). Its row reaches
+the local audit log but not the off-box copy, which is written only after a commit the store saw
+succeed, and the page is what reports that gap. A cancel reaches the caller at once, while
 the write finishes on its own, and the shutdown drain waits for it.
 
 A retry can still file a second request. At least these cases leave the request held while the
@@ -2932,7 +2954,7 @@ that write never fails the call. If the move and its row cannot be written toget
 writes the status alone, so an audit outage never leaves the row at `executing`. It then writes the
 audit row alone. If that fails too, the loss is logged at ERROR and pages `audit_write_failed`.
 One case skips the row: the combined write fails, and the status write that follows finds the row
-already moved. The gate then writes no second row and pages nothing, as above.
+already moved. The gate then writes no row alone and pages, as above.
 
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
 worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`
