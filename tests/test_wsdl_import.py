@@ -231,10 +231,12 @@ _SCHEMA_LOADERS = {
 
 
 def _with_schema_child(child: str) -> str:
-    return WSDL.replace(
+    wsdl = WSDL.replace(
         '                xmlns:xsd="http://www.w3.org/2001/XMLSchema">',
         f'                xmlns:xsd="http://www.w3.org/2001/XMLSchema">\n        {child}',
     )
+    assert child in wsdl  # the anchor is whitespace-exact; a miss would test the plain fixture
+    return wsdl
 
 
 @pytest.mark.parametrize("form", sorted(_LOCATIONS))
@@ -268,3 +270,40 @@ def test_namespace_only_schema_import_stays_legal() -> None:
     # not refused, and the operations still validate.
     d = parse_wsdl(_with_schema_child('<xsd:import namespace="urn:other"/>'))
     assert d.validate_request(_REQUEST_OK, "CheckEligibility").valid
+
+
+def test_namespace_only_import_of_a_well_known_namespace_still_validates() -> None:
+    # The realistic case: WS-Security style schemas import XML-DSig with no location. It resolves to
+    # xmlschema's bundled copy, which the XSD lockdown (BACKLOG #5537) must keep reachable.
+    ds = "http://www.w3.org/2000/09/xmldsig#"
+    wsdl = _with_schema_child(f'<xsd:import namespace="{ds}"/>').replace(
+        '<xsd:element name="memberId" type="xsd:string"/>',
+        f'<xsd:element name="memberId" type="xsd:string"/>'
+        f'<xsd:element xmlns:ds="{ds}" ref="ds:Signature" minOccurs="0"/>',
+    )
+    assert "ds:Signature" in wsdl
+    d = parse_wsdl(wsdl)
+    assert d.validate_request(_REQUEST_OK, "CheckEligibility").valid
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("C:\\schemas\\x.xsd", "a local path"),
+        ("\\\\fileserver\\share\\x.xsd", "a network path"),
+        ("//fileserver/share/x.xsd", "a network path"),
+        ("https://example.invalid/x.xsd", "scheme 'https'"),
+        ("JohnSmith:MRN12345", "an unrecognised scheme"),
+        ("http://[JohnSmith-MRN12345]/x.xsd", "an unparseable location"),
+    ],
+)
+def test_refusal_names_the_kind_of_location_and_nothing_from_it(
+    location: str, expected: str
+) -> None:
+    wsdl = _with_schema_child(f'<xsd:include schemaLocation="{location}"/>')
+    with pytest.raises(WsdlSecurityError) as ei:
+        parse_wsdl(wsdl)
+    message = str(ei.value)
+    assert expected in message
+    for fragment in ("schemas", "fileserver", "example", "JohnSmith", "MRN12345"):
+        assert fragment.lower() not in message.lower()

@@ -127,8 +127,8 @@ def test_inline_schema_still_resolves_a_namespace_xmlschema_already_holds() -> N
     assert validate_against('<t:e xmlns:t="urn:t" xml:lang="en"/>', schema).valid
 
 
-# The remote-include refusal is pinned once, in tests/test_xml_parser_consistency.py
-# (test_xmlschema_still_disables_remote_schema_resolution).
+# The inline remote-include refusal is pinned in tests/test_xml_parser_consistency.py
+# (test_xmlschema_still_disables_remote_schema_resolution); the path one is below.
 
 
 def _write_path_schema(directory: Path, include: str) -> Path:
@@ -161,6 +161,69 @@ def test_relative_path_schema_resolves_its_include_beside_itself(
     assert validate_against("<patient>x</patient>", "schemas/main.xsd").valid
 
 
+def test_path_schema_nested_include_may_climb_back_inside_its_directory(tmp_path: Path) -> None:
+    # main.xsd includes sub/inc.xsd, which includes ../common.xsd: still inside schemas/. xmlschema's
+    # allow="sandbox" narrows to each includer's own directory and refused this.
+    (tmp_path / "schemas" / "sub").mkdir(parents=True)
+    (tmp_path / "schemas" / "common.xsd").write_text(_CLEAN, encoding="utf-8")
+    (tmp_path / "schemas" / "sub" / "inc.xsd").write_text(
+        f'<xs:schema {_XS}><xs:include schemaLocation="../common.xsd"/></xs:schema>',
+        encoding="utf-8",
+    )
+    main = _write_path_schema(tmp_path / "schemas", "sub/inc.xsd")
+    assert validate_against("<patient>x</patient>", str(main)).valid
+
+
+def test_path_schema_may_be_a_file_url(tmp_path: Path) -> None:
+    (tmp_path / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    main = _write_path_schema(tmp_path, "inc.xsd")
+    assert validate_against("<patient>x</patient>", main.as_uri()).valid
+
+
+def test_path_schema_include_of_a_prefix_sharing_sibling_is_refused(tmp_path: Path) -> None:
+    # schemas-old/ shares the name prefix of schemas/; a string-prefix sandbox lets it through.
+    (tmp_path / "schemas-old").mkdir()
+    (tmp_path / "schemas-old" / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    main = _write_path_schema(tmp_path / "schemas", "../schemas-old/inc.xsd")
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against("<patient>x</patient>", str(main))
+    assert "XMLResourceBlocked" in _causes(ei.value)
+
+
+def test_path_schema_remote_include_is_refused(tmp_path: Path) -> None:
+    main = _write_path_schema(tmp_path, "http://127.0.0.1:9/x.xsd")
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against("<patient>x</patient>", str(main))
+    assert "XMLResourceBlocked" in _causes(ei.value)
+
+
+#: Well-known namespaces whose location-free import resolves to xmlschema's bundled copy.
+_WELL_KNOWN = {
+    "xmldsig": (
+        "http://www.w3.org/2000/09/xmldsig#",
+        '<xs:element name="patient"><xs:complexType><xs:sequence>'
+        '<xs:element ref="w:Signature" minOccurs="0"/></xs:sequence></xs:complexType></xs:element>',
+    ),
+    "soap-encoding": (
+        "http://schemas.xmlsoap.org/soap/encoding/",
+        '<xs:element name="patient" type="w:string"/>',
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_WELL_KNOWN))
+def test_location_free_import_of_a_well_known_namespace_still_resolves(
+    name: str, tmp_path: Path
+) -> None:
+    ns, body = _WELL_KNOWN[name]
+    schema = f'<xs:schema {_XS} xmlns:w="{ns}"><xs:import namespace="{ns}"/>{body}</xs:schema>'
+    main = tmp_path / "main.xsd"
+    main.write_text(schema, encoding="utf-8")
+    for source in (schema, str(main)):
+        assert validate_against("<patient/>", source).valid
+        assert not validate_against("<other/>", source).valid
+
+
 def test_path_schema_include_outside_its_directory_is_refused(tmp_path: Path) -> None:
     (tmp_path / "outside").mkdir()
     (tmp_path / "outside" / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
@@ -177,7 +240,19 @@ def test_path_schema_with_a_doctype_entity_is_refused(tmp_path: Path) -> None:
     # On origin/main the default defuse="remote" left a local file undefused: &nm; expanded, valid.
     with pytest.raises(XmlValidationError) as ei:
         validate_against("<patient>x</patient>", str(main))
-    assert "XMLResourceForbidden" in _causes(ei.value)
+    assert "XmlSecurityError" in _causes(ei.value)
+
+
+def test_path_schema_with_an_empty_doctype_is_refused_like_inline_text(tmp_path: Path) -> None:
+    # No entity at all, so xmlschema's own defusing passes it; parse_bytes refuses any DOCTYPE, and
+    # the path route must not accept what the inline route refuses.
+    text = f"<!DOCTYPE xs:schema []>{_CLEAN}"
+    main = tmp_path / "empty-doctype.xsd"
+    main.write_text(text, encoding="utf-8")
+    for source in (text, str(main)):
+        with pytest.raises(XmlValidationError) as ei:
+            validate_against("<patient>x</patient>", source)
+        assert "XmlSecurityError" in _causes(ei.value)
 
 
 def test_path_schema_include_with_a_doctype_entity_is_refused(tmp_path: Path) -> None:

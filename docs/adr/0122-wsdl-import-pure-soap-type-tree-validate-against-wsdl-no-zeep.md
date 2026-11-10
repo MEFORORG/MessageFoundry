@@ -185,13 +185,18 @@ Two statements above were false in the shipped code, and both are corrected here
   process's working directory and opened it. `xsd:override` was never inspected at all, even with an
   `http:` URL. `parse_wsdl` now refuses **any** non-empty `location`/`schemaLocation` on `wsdl:import`,
   `xsd:import`, `xsd:include`, `xsd:redefine` and `xsd:override` with `WsdlSecurityError`, naming the
-  element and the scheme (or "a local path" / "a network path"), never the location. An `xsd:import`
-  that names only a `namespace` stays legal: it loads nothing. This is the end state the decision above
-  already asked for, a contract inlined into the one WSDL document.
-- *"`schema.py` builds `xmlschema.XMLSchema(..., allow="local", base_url=None)`."* It now builds an
-  inline schema, which is how every embedded WSDL schema arrives, with `allow="none"` and
-  `defuse="always"`, so no include, import, redefine or override location is opened; and a schema given
-  as a path with `allow="sandbox"`, `defuse="always"` and `base_url` set to its own directory.
+  element and a well-known scheme, or the kind of reference ("a local path", "a network path"), never
+  text from the location. An `xsd:import` that names only a `namespace` stays legal: it loads nothing
+  of the author's, and a well-known namespace such as XML-DSig resolves to `xmlschema`'s bundled copy.
+  This is the end state the decision above already asked for, a contract inlined into the one WSDL
+  document.
+- *"`schema.py` builds `xmlschema.XMLSchema(..., allow="local", base_url=None)`."* It still passes
+  `allow="local"`, now with `defuse="always"` and an `opener` whose only handler reads `file:` URLs
+  under two roots: `xmlschema`'s bundled schemas, and, for a schema given as a path, that schema's own
+  directory, where each file is first checked by `parse_bytes`. An inline schema, which is how every
+  embedded WSDL schema arrives, has no directory root, so none of its own include, import, redefine or
+  override locations is opened. `xmlschema`'s `allow="sandbox"` was tried and not used: it compares URL
+  string prefixes, narrows to each includer's directory, and blocks the bundled schemas.
 
 No SMB fetch through the backslash UNC form was shown with `xmlschema` 4.3.2; it rewrote that form to a
 drive-rooted local path. The guard refuses the form either way.

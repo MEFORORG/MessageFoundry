@@ -18,8 +18,8 @@ consulted to *check* an envelope, never to *drive* one (BACKLOG #70's synchronou
 * The untrusted WSDL is parsed through :func:`~messagefoundry.parsing.xml.harden.parse_bytes`, so it gets
   the identical XXE / entity-expansion / external-DTD lockdown as every other body in the codec.
 * Envelope validation rides :func:`~messagefoundry.parsing.xml.schema.validate_against`. Each embedded
-  schema reaches it as text, so ``xmlschema`` builds it with ``allow="none"``: it opens no other
-  resource, local or remote (BACKLOG #5537).
+  schema reaches it as text, so ``xmlschema`` opens no file of its own for it, local or remote, beyond
+  its bundled copies of well-known namespaces (BACKLOG #5537).
 * The **distinct** ``wsdl:import`` resolution path is not ``xmlschema``'s to govern, because a
   ``wsdl:import`` is read by *this* code before any schema is built. :func:`parse_wsdl` refuses a
   non-empty ``location``/``schemaLocation`` on a ``wsdl:import`` / ``xsd:import`` / ``xsd:include`` /
@@ -235,12 +235,25 @@ def _refuse_imports(root: Any) -> None:
                 )
 
 
+#: Schemes an error may name. Any other "scheme" is the text before a colon, which can be anything.
+_NAMEABLE_SCHEMES = frozenset({"http", "https", "ftp", "ftps", "file"})
+
+
 def _locator(location: str) -> str:
-    """A PHI-safe description of a location for an error: its URI scheme, or the kind of reference."""
-    parts = urlsplit(location.strip())
-    if parts.scheme:
-        return f"scheme {parts.scheme!r}"
-    return "a network path" if parts.netloc else "a local path"
+    """A PHI-safe description of a location for an error: a well-known URI scheme, or the kind of
+    reference. Never any other text from the location."""
+    text = location.strip()
+    if text.startswith(("//", "\\\\")):
+        return "a network path"
+    if text[1:2] == ":" and text[:1].isalpha():  # a Windows drive, which urlsplit reads as a scheme
+        return "a local path"
+    try:
+        scheme = urlsplit(text).scheme
+    except ValueError:  # e.g. a bracketed host that is not an IP address
+        return "an unparseable location"
+    if not scheme:
+        return "a local path"
+    return f"scheme {scheme!r}" if scheme in _NAMEABLE_SCHEMES else "an unrecognised scheme"
 
 
 def _embedded_schemas(root: Any) -> dict[str, bytes]:
