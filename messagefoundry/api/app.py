@@ -3849,12 +3849,13 @@ def _compose_preset_layers(
                     )
                 meta[key] = value
         # A lone field_value counts, so make_spec refuses it rather than the compose dropping it.
-        # Only a str field_value is read here: a malformed stored one on a preset that is not the
-        # needle must not turn this read into a 500.
-        fv = crit.get("field_value")
-        if sends_a_needle(
-            crit.get("content"), crit.get("field_path"), fv if isinstance(fv, str) else None
-        ):
+        # Counted on stripped values, as before: a blank stored content or field_path on a preset
+        # that is not the needle is not a second needle.
+        content, path = (
+            v.strip() if isinstance(v, str) else v
+            for v in (crit.get("content"), crit.get("field_path"))
+        )
+        if sends_a_needle(content, path, crit.get("field_value")):
             if needle is not None:
                 raise HTTPException(
                     400, "layered search allows at most one content predicate across presets"

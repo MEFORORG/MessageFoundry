@@ -557,3 +557,49 @@ async def test_a_non_str_stored_field_value_beside_the_needle_is_not_a_500(engin
         await engine.store._db.commit()
         r = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
         assert r.status_code == 200, r.text
+        # On the NEEDLE preset the same malformed field_value is read by make_spec, which refuses a
+        # non-text needle value: a 400, never an AttributeError's 500.
+        await engine.store._db.execute(
+            "UPDATE search_presets SET criteria=? WHERE id=?",
+            (json.dumps({"content": "MRN999", "field_value": 5}), ids[0]),
+        )
+        await engine.store._db.commit()
+        r = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
+        assert r.status_code == 400, r.text
+        assert "field_value must be text" in r.json()["detail"]
+
+
+async def test_a_blank_stored_content_on_a_non_needle_preset_is_not_a_second_needle(
+    engine: Engine,
+) -> None:
+    """The compose counts needles on stripped values, as on origin/main: a stored content of only
+    spaces beside a channel filter is not a second content predicate, so the layered search runs
+    the other preset's DOE search inside IB_A (BACKLOG #6700)."""
+    pytest.importorskip("psutil")
+    import json
+
+    from messagefoundry.api import create_app
+
+    await engine.store.enqueue_message(
+        channel_id="IB_A", raw=ADT, deliveries=[("o", ADT)], control_id="MSG1"
+    )
+    service = await _user(engine, Role.OPERATOR, "op")
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        ids = []
+        for name, criteria in (("doe", {"content": "DOE"}), ("ch", {"channel_id": "IB_A"})):
+            r = await c.post(
+                "/search/presets", json={"name": name, "criteria": criteria}, headers=h
+            )
+            assert r.status_code == 200, r.text
+            ids.append(r.json()["id"])
+        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
+        await engine.store._db.execute(
+            "UPDATE search_presets SET criteria=? WHERE id=?",
+            (json.dumps({"content": "   ", "channel_id": "IB_A"}), ids[1]),
+        )
+        await engine.store._db.commit()
+        r = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
+        assert r.status_code == 200, r.text
+        assert r.json()["matched"] == 1

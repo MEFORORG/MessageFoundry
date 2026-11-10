@@ -98,13 +98,24 @@ def _sent(value: str | None) -> str | None:
     return value if value and not value.isspace() else None
 
 
+def _text(name: str, value: object) -> str | None:
+    """``value`` when it is a ``str`` or ``None``; anything else, such as a number from a stored
+    preset, is refused here so it is a 400 rather than an ``AttributeError`` (BACKLOG #6700)."""
+    if value is None or isinstance(value, str):
+        return value
+    raise ContentSearchError(f"{name} must be text, not {type(value).__name__}")
+
+
 def sends_a_needle(content: str | None, field_path: str | None, field_value: str | None) -> bool:
     """Whether a request on a route where a needle is optional sent any needle term. A route calls
     :func:`make_spec` exactly when this is true, so a lone ``field_value`` is refused there rather
     than dropped (BACKLOG #6700). Any non-empty ``content`` or ``field_path`` counts, spaces only
     included, so :func:`make_spec` refuses a blank pair with a 400 rather than the route treating it
-    as no needle; a ``field_value`` of only spaces does not count, as it is not sent."""
-    return bool(content or field_path) or _sent(field_value) is not None
+    as no needle; a ``field_value`` of only spaces does not count, as it is not sent. A non-str
+    ``field_value`` does not count either, so a malformed one on a preset that carries no needle is
+    left unread, as before; beside a needle, :func:`make_spec` refuses it."""
+    has_value = isinstance(field_value, str) and _sent(field_value) is not None
+    return bool(content or field_path) or has_value
 
 
 def _require_int(scan_limit: object) -> int:
@@ -126,7 +137,7 @@ def make_spec(
 
     Raises :class:`ContentSearchError` on an empty needle, supplying both a substring and a field path,
     a ``field_value`` beside a substring or with no field path (it would otherwise be dropped unread),
-    a malformed HL7 field path, a ``target`` outside :class:`SearchTarget`, or a ``scan_limit`` that
+    a needle value that is not text, a malformed HL7 field path, a ``target`` outside :class:`SearchTarget`, or a ``scan_limit`` that
     is not an ``int`` (a ``bool`` is refused too). A value of only whitespace counts as not sent; any
     other needle is kept exactly as given, because leading or trailing spaces narrow a contains-match.
     ``target`` may be the enum or its string value. ``scan_limit`` is clamped into
@@ -136,9 +147,9 @@ def make_spec(
         target = SearchTarget(target)
     except ValueError as exc:
         raise ContentSearchError("target must be raw, summary or both") from exc
-    needle = _sent(content)
-    path = field_path.strip() if field_path else ""  # a locator, not a needle: padding is noise
-    fv = _sent(field_value)
+    needle = _sent(_text("content", content))
+    path = (_text("field_path", field_path) or "").strip()  # a locator: its padding is noise
+    fv = _sent(_text("field_value", field_value))
     if needle is None and not path and fv is not None:
         raise ContentSearchError("field_value needs an HL7 field path")
     if (needle is None) == (not path):

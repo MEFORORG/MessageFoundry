@@ -87,11 +87,25 @@ def test_a_field_value_alone_is_refused_by_name() -> None:
 
 def test_a_target_outside_the_enum_is_a_content_search_error() -> None:
     raw = make_spec(content="x", field_path=None, field_value=None, target="raw")
-    assert (
-        raw.target is SearchTarget.RAW
-    )  # a plain string is normalized, so .value works downstream
+    # A plain string is normalized, so .value works downstream.
+    assert raw.target is SearchTarget.RAW
     with pytest.raises(ContentSearchError, match="target"):
         make_spec(content="x", field_path=None, field_value=None, target="nope")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "name"),
+    [
+        ({"content": 5, "field_path": None, "field_value": None}, "content"),
+        ({"content": None, "field_path": 5, "field_value": None}, "field_path"),
+        ({"content": "MRN999", "field_path": None, "field_value": 5}, "field_value"),
+        ({"content": None, "field_path": "PID-3", "field_value": ["x"]}, "field_value"),
+    ],
+)
+def test_a_non_text_needle_value_is_a_content_search_error(kwargs: Any, name: str) -> None:
+    """A stored preset can hand make_spec a number; it is a 400, never an AttributeError's 500."""
+    with pytest.raises(ContentSearchError, match=f"{name} must be text"):
+        make_spec(**kwargs)
 
 
 def test_a_blank_field_value_beside_content_is_still_accepted() -> None:
