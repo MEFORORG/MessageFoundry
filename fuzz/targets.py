@@ -254,7 +254,7 @@ class KnownFinding:
 #: came out with them. Both were a bare ``ValueError`` ('cannot determine HL7 separators') out of
 #: ``extract_obx_document``, on an MSH-led body whose MSH-2 carries fewer than four encoding
 #: characters and on an FHS- or BHS-led body with no MSH; it now refuses both as
-#: ``BinaryCarriageError``. What each body still meets at the listener is in ``fuzz/README.md``,
+#: ``UnreadableDelimitersError``, which is not a ``BinaryCarriageError``. What each body still meets at the listener is in ``fuzz/README.md``,
 #: *Known findings*. Both reproducers stay on as ``binary_carriage`` seeds, and
 #: ``tests/test_fuzz_targets.py`` drives them, so the fix cannot quietly regress.
 SHORT_MSH2_REPRODUCER = (
@@ -624,7 +624,9 @@ def _binary_carriage(data: bytes) -> None:
       wrote into ``OBX-5.5`` ``InboundDocRefError``, for a value the splice would not set back
       verbatim ``NonVerbatimDocumentError``, and for a body with an OBX and no MSH, or an MSH-2
       shorter than four characters, ``UnreadableDelimitersError`` (BACKLOG #5099) -- and
-      ``extract_obx_document`` on every OBX, whose refusal is ``BinaryCarriageError``.
+      ``extract_obx_document`` on every OBX, whose refusals are ``BinaryCarriageError`` for an OBX
+      that is not a Base64 ED document and, for a body whose delimiters cannot be read,
+      ``UnreadableDelimitersError`` (BACKLOG #2873), which is not a ``BinaryCarriageError``.
 
     There is no carve-out.
     """
@@ -655,7 +657,7 @@ def _strip_and_scan_hl7(text: str) -> None:
     ):
         list(iter_obx_documents(message, received=text))
     for occurrence in range(1, message.count_segments("OBX") + 1):
-        with contextlib.suppress(BinaryCarriageError):
+        with contextlib.suppress(BinaryCarriageError, UnreadableDelimitersError):
             extract_obx_document(message, occurrence=occurrence)
 
 

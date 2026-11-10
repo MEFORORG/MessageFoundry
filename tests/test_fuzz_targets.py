@@ -633,16 +633,17 @@ def test_the_short_msh2_reproducer_is_refused_by_name_through_the_raw_helpers() 
     """BACKLOG #2873 regression: the first retired binary-carriage finding stays fixed.
 
     ``Peek.parse`` still accepts the body (see ``fuzz/README.md``, *Known findings*).
-    ``extract_obx_document`` refuses it as ``BinaryCarriageError`` with nothing chained and neither
-    MSH-1 nor MSH-2 quoted; ``strip_documents`` returns it unchanged and ``iter_obx_documents``
+    ``extract_obx_document`` refuses it as ``UnreadableDelimitersError``, not a
+    ``BinaryCarriageError``, with nothing chained and neither MSH-1 nor MSH-2 quoted; ``strip_documents`` returns it unchanged and ``iter_obx_documents``
     refuses it as ``UnreadableDelimitersError`` (BACKLOG #5099).
     """
     assert SHORT_MSH2_REPRODUCER in TARGETS_BY_NAME["binary_carriage"].seeds
     text = SHORT_MSH2_REPRODUCER.decode("ascii")
     assert Peek.parse(text).control_id == "X1", "the listener-side parse no longer accepts it"
     message = Message.parse(text)
-    with pytest.raises(BinaryCarriageError) as caught:
+    with pytest.raises(UnreadableDelimitersError) as caught:
         extract_obx_document(message)
+    assert not isinstance(caught.value, BinaryCarriageError)
     assert caught.value.__cause__ is None and caught.value.__context__ is None
     assert "MSH-1=" not in str(caught.value) and "MSH-2=" not in str(caught.value)
     assert strip_documents(text, pruned_at=0.0) == (text, 0, 0)
@@ -654,7 +655,7 @@ def test_the_batch_header_reproducer_is_refused_by_name_through_the_raw_helpers(
     """BACKLOG #2873 regression: the second retired binary-carriage finding stays fixed.
 
     ``Peek.parse`` still refuses the body and ``Message.parse`` still accepts it (BACKLOG #2874).
-    ``extract_obx_document`` refuses it as ``BinaryCarriageError``, naming the missing MSH.
+    ``extract_obx_document`` refuses it as ``UnreadableDelimitersError``, naming the missing MSH.
     """
     assert BATCH_HEADER_REPRODUCER in TARGETS_BY_NAME["binary_carriage"].seeds
     text = BATCH_HEADER_REPRODUCER.decode("ascii")
@@ -663,8 +664,9 @@ def test_the_batch_header_reproducer_is_refused_by_name_through_the_raw_helpers(
     message = Message.parse(text)
     with pytest.raises(UnreadableDelimitersError):
         list(iter_obx_documents(message, received=text))
-    with pytest.raises(BinaryCarriageError, match="^the body has no MSH,") as caught:
+    with pytest.raises(UnreadableDelimitersError, match="^the body has no MSH,") as caught:
         extract_obx_document(message)
+    assert not isinstance(caught.value, BinaryCarriageError)
     assert caught.value.__cause__ is None and caught.value.__context__ is None
     assert "MSH-1=" not in str(caught.value) and "MSH-2=" not in str(caught.value)
 

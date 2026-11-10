@@ -26,6 +26,7 @@ from messagefoundry.parsing import Message, RawMessage
 from messagefoundry.parsing.binary import (
     MARKER,
     BinaryCarriageError,
+    UnreadableDelimitersError,
     decode,
     embed_obx_document,
     encode,
@@ -138,7 +139,7 @@ _UNREADABLE_DELIMITER_BODIES = [
     ),
 ]
 
-#: The three Handler-facing OBX readers and writers that refuse unreadable delimiters (BACKLOG #2873).
+#: The three OBX readers and writers that refuse unreadable delimiters (BACKLOG #2873).
 _DELIMITER_GUARDED: dict[str, Any] = {
     "extract": lambda msg: extract_obx_document(msg),
     "embed": lambda msg: embed_obx_document(msg, b"data", data_subtype="PDF"),
@@ -148,15 +149,16 @@ _DELIMITER_GUARDED: dict[str, Any] = {
 
 @pytest.mark.parametrize("op", sorted(_DELIMITER_GUARDED))
 @pytest.mark.parametrize(("raw", "cause"), _UNREADABLE_DELIMITER_BODIES)
-def test_obx_helpers_refuse_unreadable_delimiters_as_binary_carriage_error(
-    op: str, raw: str, cause: str
-) -> None:
-    """BACKLOG #2873: a message whose delimiters cannot be read is refused by name, not with the
-    bare ``ValueError`` that quotes MSH-1 and MSH-2, and the message is left as it was."""
+def test_obx_helpers_refuse_unreadable_delimiters_by_name(op: str, raw: str, cause: str) -> None:
+    """BACKLOG #2873: a message whose delimiters cannot be read is refused as
+    ``UnreadableDelimitersError``, not with the bare ``ValueError`` that quotes MSH-1 and MSH-2, and
+    not as a ``BinaryCarriageError``, which a Handler may skip an OBX on. The message is left as it
+    was."""
     msg = Message.parse(raw)
     before = msg.encode()
-    with pytest.raises(BinaryCarriageError) as caught:
+    with pytest.raises(UnreadableDelimitersError) as caught:
         _DELIMITER_GUARDED[op](msg)
+    assert not isinstance(caught.value, BinaryCarriageError)
     assert str(caught.value).startswith(cause + ",")
     assert caught.value.__cause__ is None and caught.value.__context__ is None
     # The bare refusal's text carries both labels on either body, so this holds on both rows.
@@ -171,10 +173,10 @@ def test_unreadable_delimiters_leave_the_callers_own_errors_alone(raw: str) -> N
     msg = Message.parse(raw)
     with pytest.raises(ValueError, match="1-based") as wrong:
         extract_obx_document(msg, occurrence=0)
-    assert not isinstance(wrong.value, BinaryCarriageError)
+    assert not isinstance(wrong.value, (BinaryCarriageError, UnreadableDelimitersError))
     with pytest.raises(ValueError, match="1-based") as wrong:
         embed_obx_document(msg, b"data", data_subtype="PDF", occurrence=0)
-    assert not isinstance(wrong.value, BinaryCarriageError)
+    assert not isinstance(wrong.value, (BinaryCarriageError, UnreadableDelimitersError))
     with pytest.raises(KeyError):
         embed_obx_document(msg, b"data", data_subtype="PDF", occurrence=2)
 
@@ -209,7 +211,9 @@ def test_extract_refuses_a_segment_group_of_an_unreadable_message() -> None:
         "MSH|^~|A|B|C|D|20260101||ORU^R01|1|P|2.5\rOBR|1\rOBX|1|ED|X||^Application^pdf^Base64^QUFB\r"
     )
     (group,) = msg.groups("OBR")
-    with pytest.raises(BinaryCarriageError, match="^its first MSH's MSH-2 is shorter") as caught:
+    with pytest.raises(
+        UnreadableDelimitersError, match="^its first MSH's MSH-2 is short"
+    ) as caught:
         extract_obx_document(group)  # type: ignore[arg-type]
     assert "MSH-1=" not in str(caught.value) and "MSH-2=" not in str(caught.value)
 
@@ -220,8 +224,51 @@ def test_obx_helpers_name_a_handler_written_msh_1_as_the_cause(op: str) -> None:
     msg = Message.parse(OBX_HL7)
     embed_obx_document(msg, b"data", data_subtype="PDF")
     msg.set("MSH-1", "##")
-    with pytest.raises(BinaryCarriageError, match="^its first MSH's MSH-1 is not one character,"):
+    with pytest.raises(
+        UnreadableDelimitersError, match="^its first MSH's MSH-1 is not one character,"
+    ):
         _DELIMITER_GUARDED[op](msg)
+
+
+def _skip_non_documents_registry() -> Registry:
+    """A Handler that extracts every OBX document and skips, on ``BinaryCarriageError``, each OBX
+    that is not one: the loop the unreadable-delimiter refusal must not be swallowed by."""
+    reg = Registry()
+    reg.add_outbound(OutboundConnection(name="OUT", spec=ConnectionSpec(ConnectorType.FILE, {})))
+
+    def handle(msg: Any) -> list[Send]:
+        sends: list[Send] = []
+        for occ in range(1, msg.count_segments("OBX") + 1):
+            try:
+                doc = extract_obx_document(msg, occurrence=occ)
+            except BinaryCarriageError:
+                continue
+            sends.append(Send("OUT", str(len(doc))))
+        return sends
+
+    reg.add_handler("h", handle)
+    return reg
+
+
+def test_a_skip_on_binary_carriage_error_loop_still_skips_a_non_document_obx() -> None:
+    """The control: on a readable message the loop skips the non-ED OBX and sends the ED one."""
+    raw = (
+        "MSH|^~\\&|A|B|C|D|20260101||ORU^R01|1|P|2.5.1\r"
+        "OBX|1|TX|X||plain text\rOBX|2|ED|X||^Application^pdf^Base64^QUFB\r"
+    )
+    previews, _state, _meta, _ = transform_one(_skip_non_documents_registry(), "h", raw)
+    assert [p.payload for p in previews] == ["3"]
+
+
+@pytest.mark.parametrize(("raw", "cause"), _UNREADABLE_DELIMITER_BODIES)
+def test_a_skip_on_binary_carriage_error_loop_does_not_swallow_unreadable_delimiters(
+    raw: str, cause: str
+) -> None:
+    """BACKLOG #2873: the unreadable-header refusal escapes a Handler's ``except
+    BinaryCarriageError: continue`` loop, so the transform fails (the message ends ``ERROR``)
+    rather than returning no Send and ending ``FILTERED`` with every document lost."""
+    with pytest.raises(UnreadableDelimitersError, match="^" + cause):
+        transform_one(_skip_non_documents_registry(), "h", raw)
 
 
 def test_extract_rejects_wrong_encoding() -> None:
