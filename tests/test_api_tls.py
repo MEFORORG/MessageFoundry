@@ -5481,6 +5481,9 @@ def test_supervise_renews_once_before_it_spawns_any_shard(
         # Not handed to the engine shards: the supervisor calls it on the graph it loads (vault
         # BACKLOG #2368), and build_shard_specs never sees it.
         "registry_guard",
+        # Not handed to the engine shards either: the cap for the supervisor's own CRL reload
+        # (BACKLOG #3314); each engine shard reads its own from its settings.
+        "crl_max_reloads",
     }  # nothing new handed to the shards
     _load_pair(cert, tmp_path / "api-generated-key.pem")
 
