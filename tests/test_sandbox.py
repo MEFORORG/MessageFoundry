@@ -1057,7 +1057,7 @@ def test_a_dead_peer_is_not_treated_as_a_forged_frame(graph: tuple[Registry, str
         # Dead for real first: an EOF queued from a RUNNING worker is a recorded kill instead (see
         # test_a_queued_eof_from_a_running_worker_is_a_recorded_kill).
         proc.kill()
-        proc.wait(timeout=10)
+        _wait_exited(proc)
         session._responses.put(_EOF)
         session._reject_unsolicited(proc, "after", "transform")  # must NOT raise
         assert session._proc is None
@@ -1443,6 +1443,15 @@ def _best_effort_kill_pid(pid: int) -> None:
             os.kill(pid, signal.SIGKILL)
     except OSError:
         pass
+
+
+def _wait_exited(proc: Any) -> None:
+    """Wait for ``proc`` to exit WITHOUT reaping it on POSIX, as the session's own check reads it.
+    A reaped pid can be reused, and the session's reap then signals that pid's group."""
+    deadline = time.monotonic() + 10.0
+    while not sandbox_mod._has_exited(proc):
+        assert time.monotonic() < deadline, "the worker did not exit"
+        time.sleep(0.01)
 
 
 def test_worker_kill_reaps_the_whole_process_tree(tmp_path: Path) -> None:
@@ -2078,7 +2087,7 @@ def test_a_reap_that_is_not_a_kill_records_nothing_and_does_not_warn(
         # Dead for real, as a crash leaves it: a queued EOF from a RUNNING worker is a kill (see
         # test_a_queued_eof_from_a_running_worker_is_a_recorded_kill).
         proc.kill()
-        proc.wait(timeout=10)
+        _wait_exited(proc)
         session._responses.put(_EOF)
         session._reject_unsolicited(proc, "before", "transform")
         assert session._proc is None
@@ -2117,7 +2126,7 @@ def test_closing_a_session_whose_worker_died_records_no_kill(
         proc = session._proc
         assert proc is not None
         proc.kill()
-        proc.wait(timeout=10)
+        _wait_exited(proc)
     finally:
         session.close()
     assert session.last_kill_cause is None
@@ -2486,7 +2495,7 @@ def test_the_eof_grace_is_one_budget_per_dispatch(monkeypatch: pytest.MonkeyPatc
     assert session._eof_cause(proc, KillCause.CRASH) is KillCause.STDOUT_CLOSED
     assert session._eof_cause(proc, KillCause.CRASH) is KillCause.STDOUT_CLOSED
     assert session._eof_cause(proc, KillCause.CRASH) is KillCause.STDOUT_CLOSED
-    # Three graces would be 1.5 s. The margin is for a slow host, and stays under two graces.
+    # Three graces would be 1.5 s; one grace and two floors are 0.7 s. The margin is for a slow host.
     assert time.monotonic() - started < 2 * sandbox_mod._EOF_EXIT_GRACE_SECONDS
     assert session._eof_grace_left == 0.0
 
@@ -2508,9 +2517,7 @@ def test_a_fresh_worker_that_keeps_exiting_records_a_cause_and_says_so(
         proc = session._proc
         assert proc is not None
         proc.kill()
-        deadline = time.monotonic() + 10.0
-        while not sandbox_mod._has_exited(proc) and time.monotonic() < deadline:
-            time.sleep(0.01)
+        _wait_exited(proc)
         session._responses.put(_EOF)
 
     try:

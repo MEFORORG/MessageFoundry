@@ -196,9 +196,10 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     dispatch running when the kill happened, which for :attr:`UNSOLICITED_BEFORE` is not
     necessarily the code that wrote the frame.
 
-    A reap that is not a kill records nothing: closing a session with no live worker, the prior
-    generation's reap at the top of a spawn (a worker that died between dispatches on its own), and
-    the reap after a queued EOF from a reused worker, which only says the peer died. A worker that
+    A reap that is not a kill records nothing. At least these are such reaps: closing a session
+    whose worker is gone, the prior generation's reap at the top of a spawn (a worker that died
+    between dispatches on its own), and the reap after a queued EOF from a worker that has exited,
+    which only says the peer died, the check after an answer included. A worker that
     exits right after its boot is the exception, recorded as :attr:`EXITED_AFTER_BOOT`, because a
     feed whose workers keep doing so is a crash loop, not a peer that happened to die.
 
@@ -247,7 +248,7 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     #: A frame no request asked for was waiting after a dispatch's answer.
     UNSOLICITED_AFTER = "unsolicited_after"
     #: The worker closed its response pipe and was still running: EOF on fd 1 says every holder
-    #: closed it, not that the worker exited (see :func:`_eof_cause`).
+    #: closed it, not that the worker exited (see :func:`_eof_cause_within`).
     STDOUT_CLOSED = "stdout_closed"
     #: The session was closed with a live worker, at engine stop or when a reload replaced it. An
     #: orderly stop, not a fault, so it logs at INFO rather than WARNING.
@@ -614,9 +615,13 @@ class _StderrRelay:
 #: A BUDGET per dispatch, shared by every EOF the dispatch meets, not a wait per EOF: the wait runs
 #: under the session lock, and a dispatch can meet several EOFs (see
 #: :data:`_LIVE_WORKER_EOF_RESPAWNS`). Once it is spent, a worker not already exited counts as
-#: still running.
+#: still running, but for :data:`_EOF_EXIT_FLOOR_SECONDS`.
 _EOF_EXIT_GRACE_SECONDS: Final = 0.5
 _EOF_EXIT_POLL_SECONDS: Final = 0.02
+#: The wait every EOF gets even once the budget is spent: a dying worker closes its fds before it
+#: is a zombie, so a lone instant check can land in that tail and read a crash as a closed pipe. A
+#: dispatch meets at most a handful of EOFs, so its total wait stays bounded.
+_EOF_EXIT_FLOOR_SECONDS: Final = 0.1
 
 #: How many times :meth:`SandboxSession._live_worker` respawns after a leftover EOF before it
 #: fails the call.
@@ -639,7 +644,7 @@ def _has_exited(proc: subprocess.Popen[bytes]) -> bool:
         return True  # already reaped elsewhere
 
 
-def _eof_cause(
+def _eof_cause_within(
     proc: subprocess.Popen[bytes], exited: KillCause | None, grace: float
 ) -> KillCause | None:
     """The cause for a worker whose response pipe reached EOF: ``exited`` if it exits within
@@ -647,8 +652,8 @@ def _eof_cause(
 
     EOF says every holder of fd 1 closed it, which a crash does and a running worker that closed
     its own fd 1 also does. Only the exit tells the two apart, and a crashing worker's exit may
-    trail its pipe's close by a moment, hence the grace (vault BACKLOG #3135). With no grace left
-    the exit is still checked once. The check never reaps the worker (see :func:`_has_exited`)."""
+    trail its pipe's close by a moment, hence the grace (vault BACKLOG #3135). The check never
+    reaps the worker (see :func:`_has_exited`)."""
     deadline = time.monotonic() + grace
     while not _has_exited(proc):
         if time.monotonic() >= deadline:
@@ -1143,11 +1148,12 @@ class SandboxSession:
     def _eof_cause(
         self, proc: subprocess.Popen[bytes], exited: KillCause | None
     ) -> KillCause | None:
-        """:func:`_eof_cause`, waiting at most what is left of this dispatch's grace, and spending
-        what it waits from it."""
+        """:func:`_eof_cause_within`, waiting what is left of this dispatch's grace, or the floor
+        once that is spent, and spending what it waits from the grace."""
         started = time.monotonic()
         try:
-            return _eof_cause(proc, exited, self._eof_grace_left)
+            grace = max(self._eof_grace_left, _EOF_EXIT_FLOOR_SECONDS)
+            return _eof_cause_within(proc, exited, grace)
         finally:
             spent = time.monotonic() - started
             self._eof_grace_left = max(0.0, self._eof_grace_left - spent)
@@ -1204,7 +1210,7 @@ class SandboxSession:
         phase: str,
         *,
         exited: KillCause | None = None,
-        exiting: bool = False,
+        announced_exit: KillCause | None = None,
     ) -> None:
         """Drop the worker if anything is pending that no outstanding request asked for.
 
@@ -1246,8 +1252,8 @@ class SandboxSession:
         a child that died between dispatches would lose the next one instead of respawning
         transparently. Reap it and let the caller carry on.
 
-        ``exited`` and ``exiting`` are :meth:`_drop_unsolicited`'s."""
-        if self._drop_unsolicited(proc, when, phase, exited=exited, exiting=exiting):
+        ``exited`` and ``announced_exit`` are :meth:`_drop_unsolicited`'s."""
+        if self._drop_unsolicited(proc, when, phase, exited=exited, announced_exit=announced_exit):
             raise _unsolicited_error(when)
 
     def _drop_unsolicited(
@@ -1257,7 +1263,7 @@ class SandboxSession:
         phase: str,
         *,
         exited: KillCause | None = None,
-        exiting: bool = False,
+        announced_exit: KillCause | None = None,
     ) -> bool:
         """:meth:`_reject_unsolicited`'s check without the raise: True when a stray FRAME, or an
         over-cap length header, killed the worker. False when nothing was waiting or a queued EOF
@@ -1265,8 +1271,8 @@ class SandboxSession:
 
         A queued EOF is a kill as :attr:`KillCause.STDOUT_CLOSED` if the worker is still running
         once the grace is spent. If it has exited, it is recorded as ``exited``, or not at all when
-        that is ``None``. ``exiting`` says the worker announced its own exit, so its EOF is
-        recorded as ``exited`` with no grace: a slow exit then cannot hide that cause behind
+        that is ``None``. ``announced_exit`` is for a worker that announced its own exit: its EOF
+        is recorded as that cause with no grace, so a slow exit cannot hide it behind
         :attr:`KillCause.STDOUT_CLOSED`."""
         try:
             stray = self._responses.get_nowait()
@@ -1275,8 +1281,8 @@ class SandboxSession:
         if stray is _EOF:
             if proc is None:
                 cause = None
-            elif exiting:
-                cause = exited
+            elif announced_exit is not None:
+                cause = announced_exit
             else:
                 cause = self._eof_cause(proc, exited)
             if cause is None:
@@ -1293,8 +1299,8 @@ class SandboxSession:
 
         The unsolicited check runs **after** the liveness check, not before: a killed worker's queue is
         discarded wholesale by :meth:`_spawn`, so its leftovers are neither reachable nor evidence
-        about the *new* child. Only a REUSED worker can hand us a leftover, and only there is one worth
-        judging. A leftover EOF reaps it (see :meth:`_reject_unsolicited`), so spawn once more rather
+        about the *new* child. The check runs on every worker, a fresh one included, which can have
+        written a stray frame or exited between its boot reply and this check. A leftover EOF reaps it (see :meth:`_reject_unsolicited`), so spawn once more rather
         than dead-letter this message on a peer that merely died.
 
         A leftover FRAME kills the worker, and this message, which never reached it, is retried
@@ -1693,11 +1699,7 @@ class SandboxSession:
             # whenever it lands, never a closed pipe (vault BACKLOG #3135).
             memory = not resp.ok and resp.kind == codec.FAIL_MEMORY
             self._reject_unsolicited(
-                proc,
-                "after",
-                phase,
-                exited=KillCause.MEMORY_CAP if memory else None,
-                exiting=memory,
+                proc, "after", phase, announced_exit=KillCause.MEMORY_CAP if memory else None
             )
             if not resp.ok:
                 if memory:
