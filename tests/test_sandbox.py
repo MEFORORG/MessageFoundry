@@ -28,6 +28,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry import proctree
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.response import CapturedResponse
 from messagefoundry.config.run_context import RunContext, run_contexts
@@ -1975,9 +1976,7 @@ def test_the_sandbox_mode_default_is_off_and_lives_in_exactly_one_place() -> Non
 
 def _kill_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     return [
-        r
-        for r in caplog.records
-        if r.name == sandbox_mod.log.name and "sandbox worker killed" in r.getMessage()
+        r for r in caplog.records if r.name == sandbox_mod.log.name and "(cause=" in r.getMessage()
     ]
 
 
@@ -2393,6 +2392,7 @@ def h_spawn_then_exit(msg):
     import subprocess
     import sys
     import threading
+    import time
 
     child = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],
@@ -2402,7 +2402,15 @@ def h_spawn_then_exit(msg):
     )
     with open(__PIDFILE__, "w", encoding="utf-8") as fh:
         fh.write(str(child.pid))
-    threading.Timer(0.3, os._exit, (0,)).start()
+
+    def _exit_on_go():
+        # The test creates the go file only after this dispatch has returned, so the exit can
+        # never race the after-answer check.
+        while not os.path.exists(__GOFILE__):
+            time.sleep(0.01)
+        os._exit(0)
+
+    threading.Thread(target=_exit_on_go, daemon=True).start()
     return Send("OB_X", "SPAWNED")
 
 
@@ -2424,9 +2432,15 @@ def test_a_worker_that_died_on_its_own_still_has_its_group_reaped(
     FALSIFICATION, not run on the Windows host this was written on: make :func:`_has_exited` return
     ``proc.poll() is not None`` on POSIX again. The poll reaps the zombie, ``kill_process_group``
     can no longer read its group and falls back to a single kill of a dead pid, and the grandchild
-    is still sleeping when the assert below reads it."""
+    is still sleeping when the assert below reads it.
+
+    The worker exits only once the test creates a go file, after the dispatch has returned, so
+    its exit cannot race the after-answer check."""
     pidfile = tmp_path / "grandchild.pid"
-    source = _SELF_EXIT_GRAPH.replace("__PIDFILE__", repr(str(pidfile)))
+    gofile = tmp_path / "exit.go"
+    source = _SELF_EXIT_GRAPH.replace("__PIDFILE__", repr(str(pidfile))).replace(
+        "__GOFILE__", repr(str(gofile))
+    )
     (tmp_path / "graph.py").write_text(source, encoding="utf-8")
     registry = load_config(tmp_path)
     session = _session(str(tmp_path), inbound="IB_X")
@@ -2438,6 +2452,7 @@ def test_a_worker_that_died_on_its_own_still_has_its_group_reaped(
         grandchild_pid = int(pidfile.read_text())
         proc = session._proc
         assert proc is not None
+        gofile.write_text("go", encoding="utf-8")  # only now may the worker exit
         # The worker exits on its own; it is a zombie now, which nothing has reaped.
         assert _wait_until_not_running(proc.pid, timeout=10.0) is not True
         assert _pid_running(grandchild_pid) is True  # the control: the grandchild outlived it
@@ -2549,4 +2564,83 @@ def test_a_second_spawn_over_a_live_worker_is_refused(graph: tuple[Registry, str
         assert session._generation == 1
         assert not session.kill_counts
     finally:
+        session.close()
+
+
+# --- vault BACKLOG #3135, repair round 4 -------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX process-group reap")
+def test_a_worker_reaped_elsewhere_never_has_its_pid_group_signalled(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A worker that something else reaped may have its pid reused, so the reap must not signal
+    that pid's group: it skips the group kill and says so at WARNING.
+
+    POSIX-only, so NOT RUN on the Windows host this was written on. FALSIFICATION: drop the
+    ``_posix_child_state`` check from :func:`_reap_process_tree`, and ``kill_process_group`` is
+    called with the reaped pid."""
+    _, config_dir = graph
+    session = _session(config_dir)
+    signalled: list[int] = []
+    real_kill_group = proctree.kill_process_group
+
+    def _spy(pid: int, **kwargs: Any) -> bool:
+        signalled.append(pid)
+        return real_kill_group(pid, **kwargs)
+
+    try:
+        session._spawn("transform")
+        proc = session._proc
+        assert proc is not None
+        os.kill(proc.pid, signal.SIGKILL)
+        os.waitpid(proc.pid, 0)  # reaped behind the session's back; Popen does not know
+        monkeypatch.setattr(proctree, "kill_process_group", _spy)
+        caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+        session.close()
+        assert signalled == []
+        assert any("is not signalled" in r.getMessage() for r in caplog.records)
+    finally:
+        monkeypatch.undo()
+        session.close()
+
+
+def test_a_fresh_worker_exited_before_its_eof_is_queued_is_respawned(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A fresh worker that exits after its boot reply, with its EOF not yet in the queue, is
+    found by the exit probe, recorded as ``exited_after_boot`` and replaced, so the message is
+    served rather than dead-lettered as a write failure or a crash.
+
+    FALSIFICATION: return the fresh worker from ``_live_worker`` without probing its exit, and the
+    request goes to a dead worker: the dispatch raises, recorded as ``request_write`` or ``crash``."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    real_spawn = session._spawn
+    spawns = 0
+
+    def _first_spawn_dies_quietly(phase: str = "spawn") -> None:
+        nonlocal spawns
+        real_spawn(phase)
+        spawns += 1
+        if spawns > 1:
+            return
+        proc = session._proc
+        assert proc is not None
+        proc.kill()
+        _wait_exited(proc)
+        # Stand in for a reader thread that has not queued the EOF yet.
+        session._responses = queue.Queue()
+
+    try:
+        monkeypatch.setattr(session, "_spawn", _first_spawn_dies_quietly)
+        caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert spawns == 2
+        assert session.kill_counts == {KillCause.EXITED_AFTER_BOOT: 1}
+        # A self-exit, so its line does not say the engine killed it.
+        [line] = _kill_warnings(caplog)
+        assert "exited on its own" in line.getMessage()
+    finally:
+        monkeypatch.undo()
         session.close()
