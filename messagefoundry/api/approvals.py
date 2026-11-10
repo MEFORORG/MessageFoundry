@@ -270,7 +270,8 @@ class RestartReconciliation:
 
     #: Rows this process had claimed in its previous life, now ``interrupted``.
     interrupted: tuple[str, ...]
-    #: Rows this process owns whose move raised. The next start tries them again.
+    #: Rows this process owns whose move raised anything but a seal refusal. The next start
+    #: tries them again.
     unsettled: tuple[str, ...]
     #: Rows another claim owner holds. Left alone: the owner may be alive and running them.
     foreign: tuple[str, ...]
@@ -1887,7 +1888,7 @@ class ApprovalGate:
             return _audit_detail(fields if flag is None else {**fields, flag: moved})
 
         combined = AuditAppend(action, actor=approver, detail=detail(True), client=client)
-        # Kept to recognise this write on a read-back: every other move stamps its own clock.
+        # Kept so a read-back can match this write by its status and this exact value.
         decided_at: float | None = None
         moved: bool | None
         try:
