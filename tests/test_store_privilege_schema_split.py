@@ -71,6 +71,7 @@ from messagefoundry.store.privilege import (
     audit_write_grant,
     postgres_excess,
     sqlserver_excess,
+    view_definition_grant,
 )
 from tests._live_scratch import (
     SqlServerAdmin,
@@ -334,7 +335,7 @@ def _ss_excess(**kwargs: Any) -> tuple[str, ...]:
 
 
 @pytest.mark.parametrize(
-    ("external", "expected"), [(True, ("view definition on schema dbo",)), (False, ())]
+    ("external", "expected"), [(True, (view_definition_grant("dbo"),)), (False, ())]
 )
 def test_sqlserver_schema_view_definition_is_excess_under_external(
     external: bool, expected: tuple[str, ...]
@@ -350,7 +351,7 @@ def test_sqlserver_db_ddladmin_does_not_hide_a_schema_view_definition() -> None:
         database_roles=("db_datareader", "db_datawriter", "db_ddladmin"),
         view_definition=("app",),
     )
-    assert excess == ("database role db_ddladmin", "view definition on schema app")
+    assert excess == ("database role db_ddladmin", view_definition_grant("app"))
 
 
 @pytest.mark.parametrize(
@@ -394,7 +395,7 @@ def test_sqlserver_a_server_role_with_no_schema_right_does_not_hide_the_direct_d
         "server role bulkadmin",
         "create table on database MessageFoundry",
         "ALTER on schema dbo",
-        "view definition on schema dbo",
+        view_definition_grant("dbo"),
     )
 
 

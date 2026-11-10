@@ -4746,15 +4746,18 @@ class SqlServerStore:
                 unread.append(f"create table on database {database}")
             if alter_schema is None:
                 unread.append("ALTER on the default schema")
-        # One column per distinct schema: when the default schema is dbo the two name one schema.
-        view_def_columns = {str(row["default_schema"] or ""): "view_def_default"}
+        # #6714: one column per distinct schema; when the default schema is dbo the two name one.
+        # An unread one is handled as an unread audit-table grant is, below, so it never turns an
+        # over-grant that WAS read into an unobserved report.
+        default_schema = str(row["default_schema"] or "") or "(unresolved default schema)"
+        view_def_columns = {default_schema: "view_def_default"}
         view_def_columns.setdefault("dbo", "view_def_dbo")
         view_definition: list[str] = []
+        view_unread: list[str] = []
         for schema, column in view_def_columns.items():
             grant = _probed_grant(row[column])
             if grant is None:
-                if external:  # counted under external only, like the direct DDL rights
-                    unread.append(view_definition_grant(schema))
+                view_unread.append(view_definition_grant(schema))
             elif grant:
                 view_definition.append(schema)
         audit_writes, audit_unread = classify_audit_writes(row, SQLSERVER_AUDIT_WRITE_PRIVILEGES)
@@ -4777,8 +4780,9 @@ class SqlServerStore:
                 server_roles=server_roles,
                 database_roles=database_roles,
                 detail=(
-                    f"the privilege query returned NULL for {len(unread)} of {probed} probed grant(s),"
-                    f" so they were not read and must not be reported as absent: {', '.join(unread)}"
+                    f"the privilege query returned NULL, or a value that is not 0 or 1, for"
+                    f" {len(unread)} of {probed} probed grant(s), so they were not read and must not"
+                    f" be reported as absent: {', '.join(unread)}"
                     " (IS_SRVROLEMEMBER / IS_ROLEMEMBER / HAS_PERMS_BY_NAME answer NULL when the name"
                     " does not resolve for this caller); what DID read as held:"
                     f" {', '.join(held_labels) or 'nothing'}"
@@ -4816,17 +4820,20 @@ class SqlServerStore:
             create_table=bool(create_table),
             alter_schema=(str(row["default_schema"] or "") if alter_schema else None),
             audit_writes=audit_writes,
-            view_definition=view_definition,
+            view_definition=tuple(view_definition),
         )
-        if external and audit_unread:
-            # Owner ruling R16 counts these under external only, so only external needs them READ. A
-            # NULL is a table this login cannot resolve. With nothing else found the read is
-            # unobserved rather than clean; with an over-grant already found it stays OBSERVED, so the
-            # start still refuses on what WAS read.
-            note += (
-                f"; the audit-table grants read NULL for {', '.join(audit_unread)}, so whether this"
-                " login can change audit rows was not read"
-            )
+        if external and (audit_unread or view_unread):
+            # Owner ruling R16 and #6714 count these under external only, so only external needs
+            # them READ. A NULL is a table or schema this login cannot resolve. With nothing else
+            # found the read is unobserved rather than clean; with an over-grant already found it
+            # stays OBSERVED, so the start still refuses on what WAS read.
+            if audit_unread:
+                note += (
+                    f"; the audit-table grants were not read for {', '.join(audit_unread)}, so"
+                    " whether this login can change audit rows was not read"
+                )
+            if view_unread:
+                note += f"; not read: {', '.join(view_unread)}"
             if not excess:
                 return StorePrivilegeReport(
                     backend=self.backend,
@@ -4837,7 +4844,7 @@ class SqlServerStore:
                     database_roles=database_roles,
                     detail=(
                         f"{note}; [store].schema_management is 'external', which requires INSERT and"
-                        " SELECT only on audit_log"
+                        " SELECT only on audit_log, and no view definition on the store's schemas"
                     ),
                 )
         return StorePrivilegeReport(
@@ -4851,8 +4858,9 @@ class SqlServerStore:
             detail=(
                 f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
                 + (
-                    "runtime (schema_management=external: no db_ddladmin, and no UPDATE/DELETE/"
-                    "ALTER/CONTROL or take ownership on audit_log)"
+                    "runtime (schema_management=external: no db_ddladmin, no view definition on the"
+                    " default schema or dbo, and no UPDATE/DELETE/ALTER/CONTROL or take ownership"
+                    " on audit_log)"
                     if external
                     else "auto-mode"
                 )

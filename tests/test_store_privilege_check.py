@@ -194,27 +194,8 @@ async def test_a_clean_login_raises_no_alert() -> None:
         _store(_clean_report()), require_least_privilege=False, enforcing=True, alert_sink=sink
     )
     assert sink.events == []
-    # ...and it clears an open warning from an earlier start, so a fixed grant clears the dashboard,
-    # under its own subject and under the bare one an unread principal opens (BACKLOG #6715).
-    assert sink.cleared == ["store:CORP\\mefor-svc$@MessageFoundry", "store"]
-
-
-async def test_a_clean_start_resolves_the_bare_warning_an_unread_principal_opened() -> None:
-    """BACKLOG #6715: a probe that names no principal opens its warning under the bare ``store``
-    subject. A later clean OBSERVED start must clear that subject too, or it stays open for ever."""
-    sink = _RecordingSink()
-    await run_store_privilege_preflight(
-        _store(_unobservable_report()),
-        require_least_privilege=False,
-        enforcing=True,
-        alert_sink=sink,
-    )
-    opened = sink.events[0]["name"]
-    assert opened == "store"
-    await run_store_privilege_preflight(
-        _store(_clean_report()), require_least_privilege=False, enforcing=True, alert_sink=sink
-    )
-    assert opened in sink.cleared
+    # ...and it clears an open warning from an earlier start, so a fixed grant clears the dashboard.
+    assert sink.cleared == ["store:CORP\\mefor-svc$@MessageFoundry"]
 
 
 @pytest.mark.parametrize(
@@ -236,8 +217,8 @@ async def test_a_clean_start_resolves_the_bare_warning_an_unread_principal_opene
 async def test_only_a_clean_observed_start_clears_any_warning(
     report: StorePrivilegeReport,
 ) -> None:
-    """The other direction for #6715: a start that did not observe a clean principal clears nothing,
-    neither its own subject nor the bare one."""
+    """Only a clean OBSERVED read resolves a warning: a start that did not observe a clean principal
+    clears nothing."""
     sink = _RecordingSink()
     await run_store_privilege_preflight(
         _store(report),

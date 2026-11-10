@@ -176,10 +176,12 @@ messagefoundry check-privileges --service-config <instance dir>\messagefoundry.t
 - It **exits 3** when the probe sees a grant beyond that set. Under the `external` default the gMSA
   must never hold `db_ddladmin`, `db_owner` or `sysadmin`, and each one it holds is named. So is
   `UPDATE`, `DELETE`, `ALTER`, `CONTROL` or `TAKE OWNERSHIP` on `audit_log`,
-  and an `UPDATE` granted on one column, which outranks the table-level `DENY`. Remove it and run the check
-  again.
+  and an `UPDATE` granted on one column, which outranks the table-level `DENY`. So is
+  `VIEW DEFINITION` reaching its default schema or `dbo`, from a grant on the schema, the database or
+  the server. Remove it and run the check again.
 - It **exits 4** when the probe could not read the login at all, for example on a failed connection
-  or a permission read that came back NULL. That is not a clean result.
+  or a permission read that came back NULL, or as a value that is not 0 or 1. That is not a clean
+  result.
 - It exits 1 when the service settings do not load.
 
 It also probes each Vault token the engine uses and the AD bind account, when they are
@@ -228,9 +230,7 @@ Vault and LDAP*.
 > `GRANT VIEW DEFINITION ON SCHEMA::[dbo] TO [CORP\some-operator];` when that schema is `dbo`.
 > Under `auth = "integrated"` that login is the Windows account that runs the command, which is
 > not the gMSA unless the command runs as it. Where that login is the runtime login (`auth = "sql"`),
-> revoke the grant once the mint is done. Under `schema_management = "external"` the startup probe
-> (§1.3) reports the grant as excess on the runtime login's default schema or on `dbo`; under `auto`
-> it does not report it.
+> revoke the grant once the mint is done; §1.3 says when the startup probe reports it as excess.
 >
 > **`[store].schema_management = "auto"` puts the DDL back on the runtime login.** The engine then
 > builds and upgrades its own schema at open, and the gMSA also needs `db_ddladmin` as a standing

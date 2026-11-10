@@ -86,6 +86,7 @@ from messagefoundry.store.privilege import (
     probed_grant,
     run_store_privilege_preflight,
     sqlserver_excess,
+    view_definition_grant,
 )
 from tests._live_scratch import (
     SqlServerAdmin,
@@ -843,7 +844,7 @@ async def test_external_mode_runtime_grant_observes_clean(
 
 @pytest.mark.parametrize(
     ("mode", "expected"),
-    [(None, ("view definition on schema dbo",)), (SchemaManagement.AUTO, ())],
+    [(None, (view_definition_grant("dbo"),)), (SchemaManagement.AUTO, ())],
     ids=["external", "auto"],
 )
 async def test_sqlserver_probe_names_a_schema_view_definition_under_external(
@@ -878,7 +879,52 @@ async def test_sqlserver_a_null_view_definition_is_unread_only_where_it_counts(
     report = await store.probe_principal_privileges()
     assert report.status is status
     if mode is None:
-        assert "view definition on schema app" in report.detail
+        assert view_definition_grant("app") in report.detail
+
+
+@pytest.mark.parametrize(
+    ("default_held", "dbo_held", "expected"),
+    [(1, 1, ("app", "dbo")), (0, 1, ("dbo",)), (1, 0, ("app",))],
+    ids=["both", "dbo-only", "default-only"],
+)
+async def test_sqlserver_probe_reads_both_schemas_when_the_default_is_not_dbo(
+    monkeypatch: pytest.MonkeyPatch, default_held: int, dbo_held: int, expected: tuple[str, ...]
+) -> None:
+    """The two columns are two schemas when the default is not dbo, and each is named by its own."""
+    row = _probe_row(database_roles=tuple(sorted(SQLSERVER_RUNTIME_DATABASE_ROLES)))
+    row["default_schema"] = "app"
+    row["view_def_default"] = default_held
+    row["view_def_dbo"] = dbo_held
+    report = await _sqlserver_probe(monkeypatch, row).probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.excess == tuple(view_definition_grant(s) for s in expected)
+
+
+async def test_sqlserver_an_unread_dbo_view_definition_is_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _probe_row(database_roles=tuple(sorted(SQLSERVER_RUNTIME_DATABASE_ROLES)))
+    row["default_schema"] = "app"
+    row["view_def_dbo"] = None
+    report = await _sqlserver_probe(monkeypatch, row).probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.UNOBSERVABLE
+    assert view_definition_grant("dbo") in report.detail
+    assert view_definition_grant("app") not in report.detail
+
+
+async def test_sqlserver_an_unread_view_definition_never_softens_a_found_over_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held db_owner was READ, so the report stays OBSERVED and the start still refuses under
+    enforce: an unread VIEW DEFINITION must not turn the refusal into a warning."""
+    row = _probe_row(database_roles=("db_datareader", "db_datawriter", "db_owner"))
+    row["view_def_default"] = None
+    store = _sqlserver_probe(monkeypatch, row)
+    report = await store.probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert "database role db_owner" in report.excess
+    with pytest.raises(StorePrivilegeError):
+        await run_store_privilege_preflight(store, require_least_privilege=False, enforcing=True)
 
 
 async def test_a_zero_read_is_a_real_negative_and_is_not_confused_with_a_null(

@@ -199,8 +199,10 @@ def audit_write_grant(privilege: str, table: str) -> str:
 
 def view_definition_grant(schema: str) -> str:
     """The one wording for ``VIEW DEFINITION`` held on ``schema`` (BACKLOG #6714), lower-cased for
-    the log redaction as :func:`audit_write_grant` says."""
-    return f"view definition on schema {schema}"
+    the log redaction as :func:`audit_write_grant` says. ``HAS_PERMS_BY_NAME`` answers the EFFECTIVE
+    right, so the grant that gives it may sit on the schema, the database or the server; the
+    wording says so, or an operator would revoke a schema grant that is not there."""
+    return f"view definition on schema {schema} (granted on it, the database or the server)"
 
 
 def audit_write_alias(table: str, privilege: str) -> str:
@@ -273,7 +275,7 @@ def sqlserver_excess(
     create_table: bool = False,
     alter_schema: str | None = None,
     audit_writes: Sequence[str] = (),
-    view_definition: Sequence[str] = (),
+    view_definition: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     """What an observed SQL Server principal holds BEYOND the documented least-privilege grant.
 
@@ -574,13 +576,7 @@ def store_privilege_alert_subject(report: StorePrivilegeReport) -> str:
 
     Keyed by principal, not fixed, because several processes share one store (HA nodes, engine
     shards) and may log in as different principals: a clean start by one must not resolve the open
-    warning another still earns. A re-alert from the same principal folds into the same instance.
-
-    The bare ``store`` names no principal, so no start can show the warning there is its own. A
-    clean OBSERVED start clears it as well as its own subject (BACKLOG #6715), or nothing would.
-    So on a shared store, one process's clean start also clears a bare warning another process
-    opened and may still earn. That process opens it again only at its next start, and the log
-    line and audit row of the start that opened it are kept."""
+    warning another still earns. A re-alert from the same principal folds into the same instance."""
     if not report.principal:
         return STORE_PRIVILEGE_ALERT_SUBJECT
     return f"{STORE_PRIVILEGE_ALERT_SUBJECT}:{report.principal}@{report.database}"
@@ -681,16 +677,10 @@ async def run_store_privilege_preflight(
         if alert_sink is not None and report.status is StorePrivilegeStatus.OBSERVED:
             # The inverse: a clean OBSERVED read resolves an open warning from an earlier start, so a
             # fixed grant clears GET /alerts/active without a hand resolve. SQLite has nothing to clear.
-            # The bare subject is cleared too (BACKLOG #6715): an earlier start whose probe named no
-            # principal opened its warning there, and nothing else ever resolves it.
-            subjects = dict.fromkeys(
-                (store_privilege_alert_subject(report), STORE_PRIVILEGE_ALERT_SUBJECT)
-            )
-            for subject in subjects:
-                try:
-                    alert_sink.store_privilege_clean(subject)
-                except Exception:  # noqa: BLE001 — best-effort, like the warning
-                    log.exception("store privilege preflight: the alert sink raised")
+            try:
+                alert_sink.store_privilege_clean(store_privilege_alert_subject(report))
+            except Exception:  # noqa: BLE001 — best-effort, like the warning
+                log.exception("store privilege preflight: the alert sink raised")
     else:
         log.warning(
             "%s — [store].require_least_privilege=%s, enforcing=%s%s",
