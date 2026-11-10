@@ -66,7 +66,10 @@ from messagefoundry.api.models import ReleaseBlocked
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
-from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
+from messagefoundry.auth.service import (
+    AUTHORITY_SEAL_FAILED_ACTION,
+    AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
+)
 from messagefoundry.config.fingerprint import is_config_digest
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.controlchars import scrub_log_argument
@@ -82,6 +85,8 @@ from messagefoundry.store.row_seal import (
     APPROVAL_KIND,
     RowSealError,
     SealFailureThrottle,
+    TransitSealUnavailableError,
+    TransitSealUnverifiableError,
 )
 from messagefoundry.store.store import (
     ANY_CLAIM_OWNER,
@@ -222,6 +227,10 @@ _INTERRUPT_REFUSED: Mapping[str, tuple[int, str]] = {
 #: repeat matched only through ``requester_name="any"`` or ``"renamed"`` is not joined there, and
 #: files a second request.
 REJOIN_SCAN_LIMIT = 1000
+
+#: The ``Retry-After`` seconds on the 503 :meth:`ApprovalGate._verified` raises when a Vault transit
+#: Outage leaves a request's seal unchecked (ADR 0217: an Outage answers 503 with ``Retry-After``).
+_TRANSIT_OUTAGE_RETRY_AFTER_SECONDS = 5
 
 #: Faults :meth:`ApprovalGate._read` raises as they are, because they name a defect in the read
 #: path, not a store that is down: a 503 inviting a retry would never clear (BACKLOG #3157).
@@ -560,6 +569,8 @@ class ApprovalGate:
         self._inflight: dict[asyncio.Future[Any], str] = {}
         # When each failing request is reported again (BACKLOG #2592).
         self._seal_failures_reported = SealFailureThrottle()
+        # When each request whose seal Vault transit cannot verify is reported again (ADR 0217).
+        self._seal_unverifiable_reported = SealFailureThrottle()
         # When the queue warns again about a request whose params are unreadable (BACKLOG #3252).
         self._unreadable_params_reported = SealFailureThrottle()
         # When a failed store read of each kind is logged again (BACKLOG #3157): the queue page
@@ -2983,11 +2994,80 @@ class ApprovalGate:
             if report:
                 await self._approval_seal_failed(str(found["id"]))
             return None
-        if await approval_seal_ok_async(self._store.row_sealer(), row):
+        try:
+            held = await approval_seal_ok_async(self._store.row_sealer(), row)
+        except TransitSealUnverifiableError as exc:
+            # ADR 0217 (a): Unverifiable denies like Forged, under its own audit action and page.
+            if report:
+                await self._approval_seal_unverifiable(row.id, exc)
+            return None
+        except TransitSealUnavailableError as exc:
+            # ADR 0217, the Outage row: refuse the request, record no seal failure, page.
+            self._approval_seal_outage()
+            raise ApprovalError(
+                503,
+                "Vault transit could not check this approval request's integrity seal, so "
+                "nothing was done; try again once it answers",
+                headers={"Retry-After": str(_TRANSIT_OUTAGE_RETRY_AFTER_SECONDS)},
+            ) from exc
+        if held:
             return row
         if report:
             await self._approval_seal_failed(row.id)
         return None
+
+    async def _approval_seal_unverifiable(
+        self, approval_id: str, exc: TransitSealUnverifiableError
+    ) -> None:
+        """Report a request whose seal Vault transit could not verify (ADR 0217 (a)), as
+        :meth:`_approval_seal_failed` reports a Forged one: a WARNING, an
+        :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION` audit row carrying the triage versions, and a
+        page through the store's :class:`~messagefoundry.store.row_seal.SealPager` under the row's
+        capped Unverifiable subject. Throttled per request, on a throttle of its own so a report of
+        one cause never holds back the other's (ADR 0217, *The four answers*). A failed audit
+        write is logged and paged, not raised."""
+        if not self._seal_unverifiable_reported.due(approval_id):
+            return
+        ref = scrub_log_argument(approval_id)
+        reason = (
+            f"an {APPROVAL_KIND} request's integrity seal could not be verified by Vault transit"
+            f" and it acts on nothing (approval {ref})"
+        )
+        log.warning("%s", reason)
+        # The page first, so an audit write that raises a defect cannot skip it.
+        pager = getattr(self._store, "seal_pager", None)
+        if callable(pager):
+            pager().unverifiable(APPROVAL_KIND, approval_id, reason)
+        await self._record_audit_soft(
+            ref,
+            AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
+            actor="system",
+            detail=json.dumps(
+                {
+                    "kind": APPROVAL_KIND,
+                    "approval_id": approval_id,
+                    "stored_version": exc.stored_version,
+                    "probe_version": exc.probe_version,
+                }
+            ),
+            client=None,
+            context="a request's integrity seal could not be verified",
+        )
+
+    def _approval_seal_outage(self) -> None:
+        """Page a Vault transit Outage met checking a request's seal under the shared
+        ``authority-seal-transit`` subject (ADR 0217, *The four answers*), with no audit row: an
+        Outage records no seal failure. The WARNING is throttled, as :meth:`_read` throttles a
+        store fault's, since the queue reads on every page load."""
+        reason = (
+            f"an {APPROVAL_KIND} request's integrity seal could not be checked because Vault"
+            " transit was unavailable; the request was refused and nothing was done"
+        )
+        if self._read_faults_reported.due("transit-outage"):
+            log.warning("%s", reason)
+        pager = getattr(self._store, "seal_pager", None)
+        if callable(pager):
+            pager().outage(reason)
 
     async def _approval_seal_failed(self, approval_id: str) -> None:
         """Report a request whose row failed its integrity seal (BACKLOG #2592): a WARNING, an
