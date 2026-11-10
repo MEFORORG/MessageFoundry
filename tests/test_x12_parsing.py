@@ -86,12 +86,24 @@ def interchange(
     version: str = "00501",
     control: str = "000000001",
     usage: str = "P",
+    sender: str = "SENDERID",
+    receiver: str = "RECEIVERID",
     groups: list[tuple[str, str, list[str]]] | None = None,
 ) -> str:
     """A complete interchange. ``groups`` = list of (GS01 functional id, GS08 version, [ST01 ids])."""
     if groups is None:
         groups = [("HS", "005010X279A1", ["270"])]
-    head = isa(el=el, comp=comp, term=term, rep=rep, version=version, control=control, usage=usage)
+    head = isa(
+        el=el,
+        comp=comp,
+        term=term,
+        rep=rep,
+        version=version,
+        control=control,
+        usage=usage,
+        sender=sender,
+        receiver=receiver,
+    )
     body = ""
     for gi, (fid, gver, txs) in enumerate(groups, 1):
         body += el.join(["GS", fid, "SAPP", "RAPP", "20240101", "1200", str(gi), "X", gver]) + term
@@ -254,6 +266,87 @@ def test_frame_reader_iea_in_data_does_not_truncate() -> None:
     )
     data = raw.encode("utf-8")
     assert list(X12FrameReader().feed(data)) == [data]
+
+
+# --- a delimiter inside ISA element data (BACKLOG #5536) ---------------------
+# The ISA is fixed-width, but every tokenizer used to split it on the delimiters, so a terminator in
+# ISA06 could forge an ST, GS or IEA ahead of the real body and an element separator could shift every
+# ISA element after it. The str surfaces now refuse such an ISA; the frame reader frames it whole, so
+# the real body is not dropped, and the parse after it refuses.
+
+
+_REFUSE_STR_SURFACES = [
+    pytest.param(discover_delimiters, id="discover_delimiters"),
+    pytest.param(X12Peek.parse, id="X12Peek"),
+    pytest.param(X12Message.parse, id="X12Message"),
+    pytest.param(split, id="split"),
+    pytest.param(check_integrity, id="check_integrity"),
+]
+
+
+@pytest.mark.parametrize("surface", _REFUSE_STR_SURFACES)
+@pytest.mark.parametrize(
+    ("element", "kwargs"),
+    [
+        pytest.param("ISA-06", {"sender": "A~ST*270~IEA"}, id="ISA06-forged-ST-and-IEA"),
+        pytest.param("ISA-06", {"sender": "A~GS*HC~ST*999"}, id="ISA06-forged-GS"),
+        pytest.param("ISA-06", {"sender": "A~IEA*1"}, id="ISA06-forged-IEA"),
+        pytest.param("ISA-08", {"receiver": "B*SHIFT"}, id="ISA08-element-separator"),
+        pytest.param("ISA-08", {"receiver": "B:C"}, id="ISA08-component-separator"),
+        pytest.param("ISA-06", {"sender": "A^B"}, id="ISA06-repetition-separator"),
+        pytest.param("ISA-06", {"sender": "A\nB", "term": "\r\n"}, id="ISA06-LF-of-CRLF"),
+        pytest.param("ISA-08", {"receiver": "B\rC", "term": "\r\n"}, id="ISA08-CR-of-CRLF"),
+    ],
+)
+def test_a_delimiter_in_isa_element_data_is_refused(
+    surface: Any, element: str, kwargs: dict[str, str]
+) -> None:
+    with pytest.raises(X12PeekError, match=f"{element} holds a delimiter character") as caught:
+        surface(interchange(**kwargs))
+    # The refusal names the element, never its value.
+    assert "SHIFT" not in str(caught.value) and "IEA" not in str(caught.value)
+
+
+@pytest.mark.parametrize("surface", _REFUSE_STR_SURFACES)
+def test_isa11_is_data_before_00501_so_a_delimiter_there_is_refused(surface: Any) -> None:
+    # Before 00501 ISA11 is the standards identifier ("U"), not the repetition separator, so a
+    # terminator there is data that would end the ISA at +82.
+    with pytest.raises(X12PeekError, match="ISA-11 holds a delimiter character"):
+        surface(interchange(version="00401", rep="~"))
+
+
+def test_a_clean_isa_still_parses_on_every_surface() -> None:
+    # Positive control: space padding and non-delimiter punctuation are ordinary ISA data.
+    raw = interchange(sender="ACME-CLAIMS.01", receiver="PAYER #7")
+    peek = X12Peek.parse(raw)
+    assert peek.sender_id == "ACME-CLAIMS.01" and peek.receiver_id == "PAYER #7"
+    assert peek.segment_ids() == ["ISA", "GS", "ST", "SE", "GE", "IEA"]
+    assert peek.transaction_ids() == ["270"]
+    msg = X12Message.parse(raw)
+    assert msg["ISA-08"] == "PAYER #7       " and msg.segment_ids() == peek.segment_ids()
+    assert split(raw) == [raw] and check_integrity(raw) == []
+    old = interchange(version="00401", rep="U")
+    assert X12Peek.parse(old).transaction_ids() == ["270"] and check_integrity(old) == []
+
+
+@pytest.mark.parametrize(
+    ("sender", "term"),
+    [("A~IEA*1", "~"), ("A~ST*270~IEA", "~"), ("A\r\nIEA*1", "\r\n")],
+)
+@pytest.mark.parametrize("chunk", [4096, 1])
+def test_frame_reader_frames_a_forged_iea_in_the_isa_whole(
+    sender: str, term: str, chunk: int
+) -> None:
+    # The reader cut the frame at the forged IEA, then dropped the real body as noise. It now frames
+    # through the real IEA, and the parse after it refuses, so the interchange reaches the error path.
+    data = interchange(sender=sender, term=term).encode("utf-8")
+    reader = X12FrameReader()
+    frames: list[bytes] = []
+    for i in range(0, len(data), chunk):
+        frames.extend(reader.feed(data[i : i + chunk]))
+    assert frames == [data] and not reader.in_frame
+    with pytest.raises(X12PeekError, match="ISA-06 holds a delimiter character"):
+        X12Message.parse(frames[0])
 
 
 # --- streaming byte frame reader: the two oversize caps ----------------------

@@ -21,6 +21,7 @@ error/dead-letter path. This module is **pure** (no I/O, no engine imports): it 
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from messagefoundry.parsing.x12.errors import X12PeekError
@@ -29,6 +30,8 @@ __all__ = [
     "Delimiters",
     "discover_delimiters",
     "find_isa_start",
+    "isa_end",
+    "iter_segments",
     "ISA_SEGMENT_LEN",
     "ELEMENT_SEP_OFFSETS",
     "DEFAULT_MAX_INTERCHANGE_BYTES",
@@ -59,11 +62,23 @@ def _element_separator_offsets() -> tuple[int, ...]:
 
 
 ELEMENT_SEP_OFFSETS = _element_separator_offsets()
+# (element number, start, end) of each ISA element's data relative to the ISA start, from the same
+# widths: ISA01 is (1, 4, 6) and ISA16 is (16, 104, 105).
+_ISA_ELEMENT_SPANS = tuple(
+    (number, offset + 1, offset + 1 + width)
+    for number, (offset, width) in enumerate(
+        zip(ELEMENT_SEP_OFFSETS, _ISA_ELEMENT_WIDTHS, strict=True), 1
+    )
+)
 _COMPONENT_SEP_OFFSET = 104  # ISA16
 _SEGMENT_TERM_OFFSET = 105
 _REPETITION_SEP_OFFSET = 82  # ISA11
 _VERSION_START, _VERSION_END = 84, 89  # ISA12 (5 chars), e.g. "00501"
 _REPETITION_MIN_VERSION = "00501"  # ISA11 is a repetition separator from 005010 onward
+_ISA_REPETITION = 11
+_ISA_COMPONENT = 16
+# Cosmetic whitespace tolerated before a segment (a pretty-printed feed puts a newline after each one).
+_SEGMENT_WHITESPACE = " \t\r\n\x0b\x0c"
 
 # Leading characters tolerated before the ISA: whitespace + the UTF-8 BOM (U+FEFF) — pretty-printed or
 # BOM-prefixed feeds.
@@ -137,4 +152,52 @@ def discover_delimiters(raw: str, isa_start: int | None = None) -> Delimiters:
     if len(set(distinct)) != len(distinct):
         raise X12PeekError(f"X12 delimiters are not mutually distinct: {distinct!r}")
 
+    # A delimiter may not appear in element data (the X12 standard's own rule). The ISA is read by
+    # offset, but anything that tokenizes on the delimiters would otherwise let a terminator inside
+    # ISA06 open a segment there, so a sender id could forge an ST or an IEA, or an element separator
+    # shift every ISA element after it (BACKLOG #5536). ISA16 and, from 00501, ISA11 hold delimiters
+    # and are skipped; before 00501 ISA11 is data and is checked. For a CR+LF terminator both
+    # characters are forbidden. The message names the element only, never its value.
+    forbidden = set(distinct) | set(segment)
+    for number, lo, hi in _ISA_ELEMENT_SPANS:
+        if number == _ISA_COMPONENT or (number == _ISA_REPETITION and repetition is not None):
+            continue
+        if not forbidden.isdisjoint(raw[start + lo : start + hi]):
+            raise X12PeekError(
+                f"X12 ISA header malformed: ISA-{number:02d} holds a delimiter character; "
+                "delimiters may not appear in element data"
+            )
+
     return Delimiters(element=element, component=component, segment=segment, repetition=repetition)
+
+
+def isa_end(isa_start: int, delimiters: Delimiters) -> int:
+    """Index just past the ISA's own segment terminator, where the first body segment begins
+    (``isa_start + 106``, or ``+ 107`` for a ``CR``+``LF`` terminator)."""
+    return isa_start + _SEGMENT_TERM_OFFSET + len(delimiters.segment)
+
+
+def iter_segments(raw: str, isa_start: int, delimiters: Delimiters) -> Iterator[list[str]]:
+    """Yield each segment of the interchange at ``isa_start`` as its element list (``[tag, e1, …]``),
+    stopping after ``IEA``. Tolerates cosmetic whitespace before a segment.
+
+    The ISA comes from its fixed 105 characters and the body is tokenized only from :func:`isa_end`
+    on, so the fixed-width header is never read as more than one segment (BACKLOG #5536).
+    ``delimiters`` must come from :func:`discover_delimiters` on this ISA, which has refused a delimiter
+    in its element data, so the ISA's list is always ``ISA`` and its 16 elements."""
+    element, terminator = delimiters.element, delimiters.segment
+    yield raw[isa_start : isa_start + _SEGMENT_TERM_OFFSET].split(element)
+    # Walk with find rather than split the remainder, so the body is neither copied whole nor split
+    # past the IEA (X12Peek runs this walk on the routing path).
+    pos, n = isa_end(isa_start, delimiters), len(raw)
+    while pos < n:
+        idx = raw.find(terminator, pos)
+        end = n if idx == -1 else idx
+        stripped = raw[pos:end].lstrip(_SEGMENT_WHITESPACE)
+        pos = end + len(terminator)
+        if not stripped:
+            continue
+        fields = stripped.split(element)
+        yield fields
+        if fields[0] == "IEA":
+            return

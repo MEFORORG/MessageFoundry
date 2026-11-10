@@ -8,6 +8,10 @@ engine's own codec reads as TA1-04 ``R``: a sink configured to ACCEPT made the e
 destination dead-letter the delivery as a permanent reject. The sink now answers nothing for such
 an interchange, as it already did for one with no readable ISA13, and ``ta1()`` refuses the value.
 
+Since BACKLOG #5536 the engine's codec refuses an ISA whose element data holds a delimiter, so that
+value no longer peeks at all and the sink withholds its TA1 on the no-readable-ISA13 arm. The
+nine-digit check still guards a value that peeks but is not nine digits, pinned with its own value.
+
 Each case pairs with a clean control on the same path, so a pass is not a check that cannot fail.
 Synthetic data only: the interchange is the harness's own synthetic 837 envelope.
 """
@@ -34,6 +38,8 @@ from messagefoundry.transports.x12 import X12Destination
 #: Nine characters, so it sits exactly in ISA13's fixed slot, and it holds the element separator
 #: and the segment terminator: echoed into a TA1 it adds TA1-02..04 = 0, 0, R and a stray segment.
 _HOSTILE_ISA13 = "1*0*0*R~Z"
+#: Nine characters with no delimiter, so it peeks, but not nine digits.
+_NON_DIGIT_ISA13 = "00000000A"
 
 
 def _interchange_with_isa13(isa13: str) -> bytes:
@@ -51,12 +57,16 @@ def _interchange_with_isa13(isa13: str) -> bytes:
     return (rebuilt + rest).encode("ascii")
 
 
-def test_the_hostile_interchange_frames_and_peeks_its_isa13_by_offset() -> None:
-    # Preconditions: the hostile value reaches the sink's echo, so the tests below exercise it.
+def test_the_hostile_interchanges_frame_whole_and_only_the_non_digit_one_peeks() -> None:
+    # Preconditions: both values reach the sink whole, so the tests below exercise each arm.
     wire = _interchange_with_isa13(_HOSTILE_ISA13)
     assert list(X12FrameReader().feed(wire)) == [wire]
-    assert isa13_of(wire) == _HOSTILE_ISA13
+    assert isa13_of(wire) is None  # a delimiter in ISA13 is refused by the peek (BACKLOG #5536)
     assert not is_control_number(_HOSTILE_ISA13)
+    non_digit = _interchange_with_isa13(_NON_DIGIT_ISA13)
+    assert list(X12FrameReader().feed(non_digit)) == [non_digit]
+    assert isa13_of(non_digit) == _NON_DIGIT_ISA13
+    assert not is_control_number(_NON_DIGIT_ISA13)
     assert is_control_number("000000001")
     assert not is_control_number("00000000\u0661")  # a non-ASCII digit is not an X12 digit
 
@@ -69,16 +79,25 @@ def test_ta1_refuses_an_acknowledged_value_that_is_not_nine_digits() -> None:
     assert (reply.get("TA1-01"), reply.get("TA1-04")) == ("000000123", "A")
 
 
-def test_an_accepting_sink_does_not_answer_a_hostile_isa13() -> None:
-    wire = _interchange_with_isa13(_HOSTILE_ISA13)
+@pytest.mark.parametrize(
+    ("isa13", "recorded", "withheld"),
+    [
+        (_HOSTILE_ISA13, "", "withheld: no readable ISA13"),
+        (_NON_DIGIT_ISA13, _NON_DIGIT_ISA13, "withheld: ISA13 is not nine digits"),
+    ],
+)
+def test_an_accepting_sink_does_not_answer_a_hostile_isa13(
+    isa13: str, recorded: str, withheld: str
+) -> None:
+    wire = _interchange_with_isa13(isa13)
     with X12Sink(ta1="A") as sink:
         (out,) = X12Driver("127.0.0.1", sink.port, timeout=5.0).inject([wire])
         records = sink.wait_for(bool, 5.0)
     assert out.error == ""
     assert out.reply is None  # before the fix: a TA1 whose TA1-04 parsed as "R"
     assert [r.payload for r in records] == [wire]  # still recorded, as everything received is
-    assert records[0].meta["isa13"] == _HOSTILE_ISA13
-    assert records[0].meta["ta1"] == "withheld: ISA13 is not nine digits"
+    assert records[0].meta["isa13"] == recorded
+    assert records[0].meta["ta1"] == withheld
 
 
 def _dest(port: int) -> X12Destination:
