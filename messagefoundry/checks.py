@@ -1843,7 +1843,7 @@ def _expected_disposition(fixture_path: str | Path, *, cap: int) -> _Expectation
     raw = word.upper()
     normalized = _DISPOSITION_ALIASES.get(raw, raw)
     if normalized not in _DRYRUN_DISPOSITIONS:
-        valid = ", ".join(sorted(_DRYRUN_DISPOSITIONS))
+        valid = "/".join(sorted(_DRYRUN_DISPOSITIONS))
         # Echoed only when it is a plain word: ``ERROR:DOE^JOHN`` is a reason joined to ERROR
         # without the space, and a reason can quote the message.
         shown = repr(raw) if raw.replace("_", "").isalpha() else "(not a plain word, not shown)"

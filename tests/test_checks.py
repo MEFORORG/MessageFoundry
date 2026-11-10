@@ -794,6 +794,21 @@ def test_expect_reason_joined_without_a_space_is_not_echoed(tmp_path: Path) -> N
     assert "DOE" not in dr.detail, dr.detail
 
 
+def test_invalid_expect_disposition_text_survives_redaction(tmp_path: Path) -> None:
+    # BACKLOG #5107: a comma-joined run of upper-case names ("ERROR, FILTERED") reads to the PHI
+    # redaction as a family-comma-given name, so the advice would reach the operator as [redacted].
+    from messagefoundry.redaction import redact, safe_text
+
+    fixture = tmp_path / "m.hl7"
+    Path(f"{fixture}.expect").write_text("FOO\n", encoding="utf-8")
+    with pytest.raises(ValueError) as excinfo:
+        checks._expected_disposition(fixture, cap=4096)
+    msg = str(excinfo.value)
+    assert "NOT_DEPLOYED" in msg and "alias RECEIVED" in msg, msg
+    assert redact(msg) == msg
+    assert safe_text(msg) == msg
+
+
 def test_expect_sidecar_with_a_utf8_bom_is_read(tmp_path: Path) -> None:
     cfg = _strict_config(tmp_path)
     msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "\ufeffERROR PV1")
