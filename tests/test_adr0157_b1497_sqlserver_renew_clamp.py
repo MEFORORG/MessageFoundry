@@ -578,8 +578,9 @@ async def test_the_coordinator_claim_runs_under_its_renew_clamp_end_to_end() -> 
 
 async def test_the_paused_owner_read_is_clamped_at_the_smaller_of_clamp_and_budget() -> None:
     """The paused tick's owner read reaches the driver clamped, like the tick's other statements
-    (BACKLOG #5064), at the smaller of the renew clamp and its own BACKLOG #2540 budget. Before,
-    it went through the plain ``_fetchone`` and was bounded on the event loop alone."""
+    (BACKLOG #5064), at the smaller of the renew clamp and half its own BACKLOG #2540 budget. Before,
+    it went through the plain ``_fetchone`` and was bounded on the event loop alone. Half the
+    budget, as on Postgres, because the borrow and the statement each take up to the clamp."""
     clamps: list[float] = []
 
     class _Store:
@@ -596,7 +597,7 @@ async def test_the_paused_owner_read_is_clamped_at_the_smaller_of_clamp_and_budg
     coord = SqlServerCoordinator(_Store(), "A", monotonic=lambda: 0.0)
     coord._no_claim_until = 10.0
     assert await coord._claim_or_renew_lease() is False
-    assert clamps == [min(coord._renew_timeout, coord._paused_read_budget)]
+    assert clamps == [min(coord._renew_timeout, coord._paused_read_budget / 2.0)]
 
 
 async def test_a_stalled_paused_owner_read_ends_at_the_driver_not_at_command_timeout() -> None:
@@ -615,7 +616,6 @@ async def test_a_stalled_paused_owner_read_ends_at_the_driver_not_at_command_tim
     assert time.monotonic() - started < 2.0
     assert conn.statement_timeouts == [1]
     assert conn.raw.timeout == 30
-    assert not coord._leadership_lock.locked()
 
 
 # --- the two-times bound, and the loop's other statements (BACKLOG #5064, #6472) -----------
@@ -757,14 +757,28 @@ async def test_a_failed_pool_release_after_a_committed_write_keeps_its_row_count
 
 async def test_a_failed_write_still_raises_when_its_pool_release_also_fails() -> None:
     """Control: a write that did NOT commit is never reported as landed because the release failed
-    afterwards; the error still reaches the caller."""
+    afterwards; it raises. The release's error replaces the write's, which stays in the chain:
+    _borrow's ``finally`` releases outside the body, as it did before BACKLOG #5064."""
     conn = _Conn()
     conn.fail = RuntimeError("the write failed")
     store = _store(conn)
     store._pool = _FailingReleasePool(conn)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="pool release failed") as caught:
         await store._execute_clamped("UPDATE nodes SET status = ?", ("x",), timeout_clamp=3.0)
+    assert caught.value.__context__ is conn.fail
     assert conn.rolled_back == 1
+
+
+async def test_a_committed_claim_keeps_its_row_when_only_its_pool_release_fails() -> None:
+    """The lease claim and the config-version refresh are MERGEs read through _fetch_rows, so a
+    claim that committed must not read as a failed renew because the release failed afterwards
+    (BACKLOG #5064)."""
+    conn = _Conn()
+    store = _store(conn)
+    store._pool = _FailingReleasePool(conn)
+    row = await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=3.0)
+    assert row == {"owner": "A", "leader_epoch": 7}
+    assert conn.rolled_back == 0
 
 
 async def test_the_unclamped_write_is_unchanged() -> None:

@@ -145,7 +145,7 @@ class SqlServerCoordinator:
         # rollback runs, and why the COMMIT is outside it. The clamp bounds each statement, not
         # the tick: nothing checks that the heartbeat interval plus the loop's statements fit
         # inside the fence, on either backend. The paused tick's owner read takes the smaller of
-        # the clamp and its own budget (_paused_read_budget), and stop()'s release its own bound.
+        # the clamp and half its own budget (_paused_read_budget), and stop()'s release its own bound.
         self._renew_timeout = lease_renew_timeout_seconds
         if lease_renew_timeout_seconds < 1.0:
             # ServiceSettings refuses this at config load; a coordinator built another way is told.
@@ -154,9 +154,9 @@ class SqlServerCoordinator:
                 " timeout counts whole seconds",
                 lease_renew_timeout_seconds,
             )
-        # BACKLOG #2540: the whole-call budget for the paused tick's owner read. The store's own
-        # [store].command_timeout still ends the statement first when it is the shorter of the two;
-        # paused_read_budget_seconds says why that matters here.
+        # BACKLOG #2540: the whole-call budget for the paused tick's owner read, applied on the event
+        # loop. The read's driver clamp is the smaller of the renew clamp and half this budget
+        # (BACKLOG #5064); paused_read_budget_seconds says why.
         self._paused_read_budget = paused_read_budget_seconds(leader_fence_timeout_seconds)
         # Small relative to the fence timeout so a fence fires promptly (well before the lease TTL).
         self._fence_tick = max(0.05, min(1.0, leader_fence_timeout_seconds / 5.0))
@@ -515,13 +515,14 @@ class SqlServerCoordinator:
             # retried stepdown waits on, and [store].command_timeout (30 s by default) is longer
             # than the 20 s fence. See paused_read_budget_seconds. Clamped at the driver too, like
             # the tick's other statements, so a read the loop's bound abandoned does not keep its
-            # executor thread for [store].command_timeout (BACKLOG #5064); the loop's bound stays,
-            # because the clamped borrow and statement each take up to the clamp.
+            # executor thread for [store].command_timeout (BACKLOG #5064). Half the budget, as on
+            # Postgres, because the clamped borrow and statement each take up to the clamp; the
+            # loop's bound stays as the backstop for the rollback and the 1 s floor.
             async with asyncio.timeout(self._paused_read_budget):
                 current = await self._store._fetchone_clamped(
                     "SELECT owner FROM leader_lease WHERE lease_key = ?",
                     (self._lease_key,),
-                    timeout_clamp=min(self._renew_timeout, self._paused_read_budget),
+                    timeout_clamp=min(self._renew_timeout, self._paused_read_budget / 2.0),
                 )
             if current is not None and current["owner"] != self.node_id:
                 self._no_claim_until = 0.0

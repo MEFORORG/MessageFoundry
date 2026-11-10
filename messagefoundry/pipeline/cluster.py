@@ -650,10 +650,12 @@ def paused_read_budget_seconds(fence_timeout_seconds: float) -> float:
     * Postgres: :func:`_call_within` at ``min(renew clamp, budget / 2)``, because that helper costs
       at most twice its timeout. The halving applies only when the clamp is the larger term.
     * SQL Server: an ``asyncio.timeout`` of the whole budget around a store read clamped at
-      ``min(renew clamp, budget)`` (BACKLOG #5064). The driver's statement timeout, the smaller of
-      that clamp rounded down to whole seconds and the store's ``command_timeout``, ends the
-      statement cleanly, so the client-side cancel, which quarantines a pooled connection, fires
-      only when the borrow and the statement together overrun the budget. A cancel that lands during the stalled statement unwinds at once:
+      ``min(renew clamp, budget / 2)`` (BACKLOG #5064), halved because the clamped borrow and
+      statement each take up to the clamp. The driver's statement timeout, the smaller of that
+      clamp rounded down to whole seconds and the store's ``command_timeout``, ends the statement
+      cleanly, so the client-side cancel, which quarantines a pooled connection, fires only when
+      the borrow, the statement and a rollback after it together overrun the budget, or when the
+      1 s floor on the clamp exceeds half a short budget. A cancel that lands during the stalled statement unwinds at once:
       the store hands the close to that statement rather than waiting on it. One that lands between
       two driver calls can wait up to the store's ``_DIRTY_CLOSE_TIMEOUT`` (5 s) for the close, and
       at the shipped 20 s fence that is enough to reach the fence. The quarter of the fence this

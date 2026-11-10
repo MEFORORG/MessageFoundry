@@ -5865,31 +5865,47 @@ class SqlServerStore:
         self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
     ) -> list[dict[str, Any]]:
         """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`; :meth:`_clamp_bounds`
-        says what ``timeout_clamp`` sets."""
+        says what ``timeout_clamp`` sets. A failure of the pool release alone, after the commit,
+        keeps the result, as :meth:`_write_rows` does: the lease claim and the config-version
+        refresh are MERGEs that come through here, so a claim that committed must not read as a
+        failed renew (BACKLOG #5064)."""
         borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp)
-        async with borrow as conn:
-            try:
-                async with (
-                    self._statement_timeout(conn, statement_timeout),
-                    self._cursor(conn) as cur,
-                ):
-                    await cur.execute(sql, params) if params else await cur.execute(sql)
-                    columns = [c[0] for c in cur.description]
-                    rows = await cur.fetchall()
-                    # Read-snapshot release, NOT a durable write — commit without counting (A1). This is
-                    # the single read helper (_fetchall, _fetchone and _fetchone_clamped delegate here);
-                    # routing every read through _commit was what made committed_txns a superset of the
-                    # write cost model on a live SQL Server.
-                    await self._commit_read(conn)
-            except Exception:
-                # autocommit=False: a failed read otherwise leaves the pooled connection mid-txn (and
-                # under RCSI an open snapshot pins the version store / bloats tempdb). Roll back before
-                # it returns to the pool so the next borrower starts clean (M-6). After the cursor has
-                # closed and the timeout is restored, so a discard races neither; _rollback_or_discard
-                # says why it is bounded and discards (BACKLOG #5066).
-                await self._rollback_or_discard(conn, within=floored_clamp)
+        result: list[dict[str, Any]] | None = None
+        try:
+            async with borrow as conn:
+                try:
+                    async with (
+                        self._statement_timeout(conn, statement_timeout),
+                        self._cursor(conn) as cur,
+                    ):
+                        await cur.execute(sql, params) if params else await cur.execute(sql)
+                        columns = [c[0] for c in cur.description]
+                        rows = await cur.fetchall()
+                        # Read-snapshot release, NOT a durable write — commit without counting (A1).
+                        # This is the single read helper (_fetchall, _fetchone and _fetchone_clamped
+                        # delegate here); routing every read through _commit was what made
+                        # committed_txns a superset of the write cost model on a live SQL Server.
+                        await self._commit_read(conn)
+                except Exception:
+                    # autocommit=False: a failed read otherwise leaves the pooled connection mid-txn
+                    # (and under RCSI an open snapshot pins the version store / bloats tempdb). Roll
+                    # back before it returns to the pool so the next borrower starts clean (M-6).
+                    # After the cursor has closed and the timeout is restored, so a discard races
+                    # neither; _rollback_or_discard says why it is bounded and discards (BACKLOG
+                    # #5066).
+                    await self._rollback_or_discard(conn, within=floored_clamp)
+                    raise
+                # Set only once the body finished cleanly, as in _write_rows.
+                result = [dict(zip(columns, row)) for row in rows]  # noqa: B905
+                return result
+        except Exception as exc:
+            if result is None:
                 raise
-        return [dict(zip(columns, row)) for row in rows]  # noqa: B905
+            log.warning(
+                "sqlserver store: a statement committed, then its pool release failed: %s",
+                safe_exc(exc),
+            )
+            return result
 
     async def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
         rows = await self._fetchall(sql, params)
