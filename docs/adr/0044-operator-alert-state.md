@@ -386,7 +386,6 @@ it is the instance the resolve's snapshot saw with no raise past the snapshot's 
 newest raise is the resolving process's own. So a raise another process lands after the snapshot
 keeps the instance open, unless the resolving process's own raise is newer. No clock is compared:
 the `last_seen <= now` guard the PR for #3756 declined (decision d20261030T211551515-1de84e) would
-leave an alert open for good under cross-node clock skew. When the snapshot is read, the locking,
-the retries and the log lines are the code's: `_ResolveFence` in
-`messagefoundry/pipeline/alert_sinks.py`, and `resolve_alert_instances_fenced` in
-`messagefoundry/store/base.py` and the three stores.
+leave an alert open for good under cross-node clock skew. The code is the authority for the
+rest: `_ResolveFence` and `NotifierAlertSink._run_state` in
+`messagefoundry/pipeline/alert_sinks.py`.

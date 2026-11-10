@@ -1255,12 +1255,8 @@ open ([ADR 0044, the vault BACKLOG #4916 amendment](adr/0044-operator-alert-stat
 Treat an open warning as live until every engine process that probes that hop has started clean
 since its token was fixed, and its start was handled by a resolving notifier, meaning an
 `[alerts]` transport such as a webhook or email. With no transport configured, a start gets the
-logging sink, which resolves nothing. To check, at least:
-
-- Each start logs a line starting `vault privilege preflight: <hop> <state>` for each hop it
-  judged, at WARNING when the hop is over-granted or could not be read.
-- The check runs only at start, so a token fixed since a process started is judged only at that
-  process's next start.
+logging sink, which resolves nothing. The check runs only at start, so a token fixed since a
+process started is judged only at that process's next start.
 
 The log line and the audit row of every start stay the record.
 
