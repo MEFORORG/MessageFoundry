@@ -430,9 +430,17 @@ class _Trickle(io.BytesIO):
 
 
 class _Gush(io.BytesIO):
-    """A source that breaks the read contract by returning more than it was asked for."""
+    """A source that breaks the read contract by returning more than it was asked for, after
+    ``honest`` well-behaved short reads of one byte each."""
+
+    def __init__(self, data: bytes, *, honest: int = 0) -> None:
+        super().__init__(data)
+        self._honest = honest
 
     def read(self, size: int | None = -1, /) -> bytes:
+        if self._honest > 0:
+            self._honest -= 1
+            return super().read(1)
         return super().read()
 
 
@@ -537,9 +545,39 @@ def test_a_reader_source_with_no_data_ready_is_refused_not_read_as_eof(where: st
 def test_a_source_that_returns_more_than_asked_is_refused() -> None:
     # An over-long read would let the writer seal a frame past its declared chunk_size, which this
     # build's own reader then rejects at restore time.
+    # Both on the first read and inside the fill loop, after a short read.
     key = os.urandom(32)
-    with pytest.raises(bc.BackupCodecError, match="returned"):
-        bc.encrypt_stream(_Gush(b"x" * 3000), io.BytesIO(), key, chunk_size=1024)
     blob, _, _ = _archive(b"x" * 3000, key)
-    with pytest.raises(bc.BackupCodecError, match="returned"):
-        bc.decrypt_stream(_Gush(blob), io.BytesIO(), key)
+    for honest in (0, 1):
+        with pytest.raises(bc.BackupCodecError, match="returned"):
+            bc.encrypt_stream(_Gush(b"x" * 3000, honest=honest), io.BytesIO(), key, chunk_size=1024)
+        with pytest.raises(bc.BackupCodecError, match="returned"):
+            bc.decrypt_stream(_Gush(blob, honest=honest), io.BytesIO(), key)
+
+
+class _OneEof(io.BytesIO):
+    """A source that refuses to be read again once it has returned end of stream."""
+
+    def __init__(self, data: bytes) -> None:
+        super().__init__(data)
+        self.eofs = 0
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        if self.eofs:
+            raise AssertionError("read again past an end of stream already returned")
+        data = super().read(size)
+        if not data:
+            self.eofs += 1
+        return data
+
+
+@pytest.mark.parametrize("length", [0, 1000, 1024, 5000])
+def test_encrypt_reads_the_source_past_eof_at_most_once(length: int) -> None:
+    # A TTY or similar source may block, or raise, when read again after it reported EOF.
+    key = os.urandom(32)
+    payload = os.urandom(length)
+    enc = io.BytesIO()
+    bc.encrypt_stream(_OneEof(payload), enc, key, chunk_size=1024)
+    out = io.BytesIO()
+    bc.decrypt_stream(io.BytesIO(enc.getvalue()), out, key)
+    assert out.getvalue() == payload

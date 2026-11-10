@@ -202,8 +202,9 @@ def encrypt_stream(
 ) -> str:
     """Encrypt the byte stream ``src`` into the ``.mfbak`` stream ``dst`` under ``key`` (the resolved
     32-byte store DEK), returning the key's ``key_id`` fingerprint (recorded in the manifest by the
-    caller). Streaming: at most two chunks of plaintext are in memory at once (the one-ahead read
-    below) — never the whole archive. Synchronous; the BackupRunner calls it off the event loop (``asyncio.to_thread``).
+    caller). Streaming: two chunks of plaintext are held between reads (the one-ahead read below),
+    plus a transient copy while a short-reading source fills one — never the whole archive.
+    Synchronous; the BackupRunner calls it off the event loop (``asyncio.to_thread``).
 
     ``on_frames`` receives the number of AES-GCM invocations this run performed — one per frame, each
     drawing its own 96-bit nonce under the SAME key the store cipher seals with (the store's data
@@ -223,12 +224,12 @@ def encrypt_stream(
         raise BackupCodecError(f"a store salt must be {STORE_SALT_BYTES} bytes (got {len(salt)})")
     # `is None`, not truthiness: 0 must reach the guard below rather than silently become 1 MiB.
     size = DEFAULT_CHUNK_SIZE if chunk_size is None else chunk_size
-    # The upper half is not defensive, it is a closure check: read_header refuses a chunk_size over
-    # MAX_CHUNK_SIZE, so a writer allowed to exceed it would produce an archive THIS BUILD'S OWN
-    # READER rejects -- an unreadable backup discovered at restore time, which is the worst moment.
     # A bool is an int to Python but never a chunk size, so True does not pass as 1.
     if not isinstance(size, int) or isinstance(size, bool):
         raise BackupCodecError(f"chunk_size must be an int (got {type(size).__name__})")
+    # The upper half is not defensive, it is a closure check: read_header refuses a chunk_size over
+    # MAX_CHUNK_SIZE, so a writer allowed to exceed it would produce an archive THIS BUILD'S OWN
+    # READER rejects -- an unreadable backup discovered at restore time, which is the worst moment.
     if not 0 < size <= MAX_CHUNK_SIZE:
         raise BackupCodecError(f"chunk_size must be in 1..{MAX_CHUNK_SIZE} bytes (got {size})")
     kid = key_fingerprint(key)
@@ -257,7 +258,8 @@ def encrypt_stream(
     current = _read_up_to(src, size)
     try:
         while True:
-            nxt = _read_up_to(src, size)
+            # A short chunk means _read_up_to already saw EOF; do not read the source past it again.
+            nxt = _read_up_to(src, size) if len(current) == size else b""
             final = not nxt  # this is the last frame iff there is no more plaintext after it
             nonce = os.urandom(_NONCE_BYTES)
             ct = aes.encrypt(nonce, current, _aad(header_digest, frame_index, final=final))
