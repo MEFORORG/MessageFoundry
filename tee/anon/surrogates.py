@@ -647,9 +647,11 @@ def _unescape_field(field: str, seps: Seps, field_sep: str) -> str:
 
 def unescaped_message(text: str) -> str:
     """``text`` with the escape sequences in every field decoded, a subcomponent at a time, for the
-    token scan (BACKLOG #5532). The encoding characters of a header line are left as written, since
-    they hold the escape character itself. ``text`` is returned as it is when it has no parseable
-    MSH or no field holds an escape sequence."""
+    token scan (BACKLOG #5532). The segment id and encoding characters of a header line are left as
+    written, since they hold the escape character itself. Every other line is decoded from its
+    first field, so a line with no field separator, which is all one field, is decoded too.
+    ``text`` is returned as it is when it has no parseable MSH or no field holds an escape
+    sequence."""
     parsed = read_message_seps(text)
     if parsed is None:
         return text
@@ -658,7 +660,7 @@ def unescaped_message(text: str) -> str:
     lines: list[str] = []
     for line in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
         fields = line.split(field_sep)
-        kept = 2 if fields[0].upper() in HEADER_SEGMENTS else 1
+        kept = 2 if fields[0].upper() in HEADER_SEGMENTS else 0
         decoded = [_unescape_field(field, seps, field_sep) for field in fields[kept:]]
         changed = changed or decoded != fields[kept:]
         lines.append(field_sep.join(fields[:kept] + decoded))

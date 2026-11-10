@@ -636,14 +636,12 @@ def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
 
 
 def _is_mrn_type(comp: str, seps: Seps, field_sep: str) -> bool:
-    """True if ``comp`` is a whole ``MR``/``MRN`` id type as written, or decoded a subcomponent at
-    a time with the subcomponent separators kept."""
-    if comp.upper() in _MRN_TYPES:
-        return True
-    if not seps.escape or seps.escape not in comp:
-        return False
-    leaves = (unescape(leaf, seps, field_sep) for leaf in comp.split(seps.subcomponent))
-    return seps.subcomponent.join(leaves).upper() in _MRN_TYPES
+    """True if ``comp`` is a whole ``MR``/``MRN`` id type as written or decoded. A component that
+    holds a subcomponent separator is never a whole id type, so only a single-leaf component is
+    decoded, which is decoding it a subcomponent at a time."""
+    return comp.upper() in _MRN_TYPES or (
+        seps.subcomponent not in comp and unescape(comp, seps, field_sep).upper() in _MRN_TYPES
+    )
 
 
 def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:

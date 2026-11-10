@@ -182,20 +182,22 @@ def _guard(leak: ModuleType) -> object:
     ],
     ids=["name-with-delimiter", "estate-hex"],
 )
+# A line with no field separator is all one field, and is decoded too.
+@pytest.mark.parametrize("line", ["ZPD|1|", "note "], ids=["in-a-field", "line-with-no-field"])
 def test_an_escaped_token_is_found(
-    leak: ModuleType, value: str, reason: str, monkeypatch: pytest.MonkeyPatch
+    leak: ModuleType, value: str, reason: str, line: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     guard = _guard(leak)
     monkeypatch.setattr(
         guard, "FORBIDDEN", [(re.compile(re.escape(_NAME), re.IGNORECASE), "synthetic partner")]
     )
     monkeypatch.setattr(guard, "ESTATE_TOKENS", (_ESTATE,))
-    text = f"{_HEAD}\rZPD|1|{value}"
+    text = f"{_HEAD}\r{line}{value}"
     hits: list[str] = leak.leak_report(text).hits
     assert hits.count(reason) == 1, hits
     # Control: written plainly, the same token is found once, not twice.
     plain = leak.unescape(value, leak.Seps(), "|")
-    plain_hits: list[str] = leak.leak_report(f"{_HEAD}\rZPD|1|{plain}").hits
+    plain_hits: list[str] = leak.leak_report(f"{_HEAD}\r{line}{plain}").hits
     assert plain_hits.count(reason) == 1, plain_hits
 
 
@@ -281,3 +283,11 @@ def test_the_id_type_decodes_a_subcomponent_at_a_time(leak: ModuleType, value: s
     escape that would pair only across the subcomponent separator decodes nothing, and the false
     positive budget holds."""
     assert _hits(leak, value) == []
+
+
+@_LEAKS
+def test_a_subcomponent_separator_never_joins_an_id_type(leak: ModuleType) -> None:
+    """Under an MSH-2 whose subcomponent separator is ``R``, the id type below is the two
+    subcomponents ``M`` and an empty one, not ``MR``."""
+    head = _HEAD.replace("^~\\&", "^~\\R", 1)
+    assert _hits(leak, "1^^^H^M\\.fi\\R", head=head) == []
