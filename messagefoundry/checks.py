@@ -1849,7 +1849,7 @@ def _expected_disposition(fixture_path: str | Path, *, cap: int) -> _Expectation
         shown = repr(raw) if raw.replace("_", "").isalpha() else "(not a plain word, not shown)"
         raise ValueError(
             f"invalid .expect disposition {shown} (use one of {valid}, or ERROR <reason>; "
-            "PROCESSED, ROUTED, DELIVERED and DELIVERS alias RECEIVED)"
+            "PROCESSED/ROUTED/DELIVERED/DELIVERS alias RECEIVED)"
         )
     if not sep:
         return _Expectation(normalized)
