@@ -379,8 +379,10 @@ only when its newest raise is the resolver's own, or it is the instance that rea
 no raise past that count. The first case keeps defect 8: a raise emitted before the clear is
 closed by it, even when it lands after the read. A raise from another process that lands after the
 read, and is still the newest, keeps the instance open; that process's own clear closes it later.
-So when two processes raise and clear one key at once, the one whose raise landed last clears it,
-and neither leaves it open for good. The read runs a little after the emit, not at it, so a raise
+So when two processes raise and clear one key at once, the one whose raise landed last clears it.
+If that process dies or never clears, the instance stays open for an operator (or, for another
+process's `intake_paused`, for the sweep above): a false open, where the unfenced resolve gave a
+false clear. The read runs a little after the emit, not at it, so a raise
 from another process in that gap is still closed, as before the fence.
 
 No clock is compared: the `last_seen <= now` guard the PR for #3756 declined (decision

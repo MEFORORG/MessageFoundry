@@ -144,6 +144,18 @@ class _FencedStore(_AlertStateStore, Protocol):
     """The read and the write a fenced resolve needs (BACKLOG #4916). Every shipped store has
     them; a store without them resolves unfenced, as before."""
 
+    async def upsert_alert_instance(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        severity: str,
+        reason: str | None = ...,
+        escalation_tier: int = ...,
+        now: float | None = ...,
+        raised_by: str | None = ...,
+    ) -> None: ...
+
     async def open_alert_generations(
         self, *, event_type: str, connection: str | None = ...
     ) -> Sequence[_Generation]: ...
@@ -180,12 +192,18 @@ class _ResolveFence:
     if it has taken no raise past the snapshot. A raise from another process that landed after the
     snapshot read, and is still the newest, keeps the instance open. That raise's own process
     clears it later through its own id, so two processes that raise and clear the same key at once
-    cannot both leave it open. The snapshot is taken when the read runs, which can be a little
-    after the clear was emitted; a raise from another process in that gap is closed, as before.
+    cannot both leave it open. If that process dies, or never clears, the instance stays open
+    for an operator to resolve (an ``intake_paused`` one of another process is also expired by
+    that monitor's sweep): a false open is the safe side, where the unfenced resolve gave a false
+    clear. The snapshot is taken when the read runs, which can be a little after the clear was
+    emitted; a raise from another process in that gap is closed, as before.
 
-    When the resolve closes nothing while a live instance remains, the clear was superseded:
-    :attr:`superseded` is set and the write is settled as not landed, with no retry, since a retry
-    cannot help. If the snapshot read fails, the resolve runs unfenced, as before."""
+    With ``verdict`` set, a resolve that closes nothing re-reads the key, and if a live instance
+    remains, :attr:`superseded` is set and the write is settled as not landed, with no retry, since
+    a retry cannot help. The re-read is a second statement, so a raise landing between the two can
+    mark a clear that had nothing to close as superseded; its caller then keeps what it would
+    have cleared, which is the safe side. If the snapshot read fails, the resolve runs unfenced,
+    as before."""
 
     def __init__(
         self,
@@ -194,8 +212,10 @@ class _ResolveFence:
         event_type: str,
         connection: str,
         writer_id: str,
+        verdict: bool,
     ) -> None:
         self._store = store
+        self._verdict = verdict
         self._event_type = event_type
         self._connection = connection
         self._writer_id = writer_id
@@ -239,8 +259,12 @@ class _ResolveFence:
             seen=seen[0] if seen else None,
             now=now,
         )
-        if not closed and await self._store.open_alert_generations(
-            event_type=self._event_type, connection=self._connection
+        if (
+            not closed
+            and self._verdict
+            and await self._store.open_alert_generations(
+                event_type=self._event_type, connection=self._connection
+            )
         ):
             self.superseded = True
             log.info(
@@ -2191,12 +2215,14 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             self._suspended.pop(key, None)
             self._occurrences.pop(key, None)
 
+            # Only a settle callback reads the superseded verdict, so only then is it paid for.
             fence = (
                 _ResolveFence(
                     cast(_FencedStore, store),
                     event_type=inverse_of,
                     connection=connection,
                     writer_id=self._writer_id,
+                    verdict=on_settled is not None,
                 )
                 if _fences(store)
                 else None
@@ -2218,17 +2244,26 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             reason = str(raw_reason) if raw_reason is not None else None
 
             # Only a store that fences takes the writer id; a test double without it still works.
-            stamp = {"raised_by": self._writer_id} if _fences(store) else {}
+            raised_by = self._writer_id if _fences(store) else None
 
             def write() -> Awaitable[Any]:
-                return store.upsert_alert_instance(
+                if raised_by is None:
+                    return store.upsert_alert_instance(
+                        event_type=etype,
+                        connection=connection,
+                        severity=severity,
+                        reason=reason,
+                        escalation_tier=escalation_tier,
+                        now=now,
+                    )
+                return cast(_FencedStore, store).upsert_alert_instance(
                     event_type=etype,
                     connection=connection,
                     severity=severity,
                     reason=reason,
                     escalation_tier=escalation_tier,
                     now=now,
-                    **stamp,
+                    raised_by=raised_by,
                 )
 
         settle: Callable[[bool], None] | None = None

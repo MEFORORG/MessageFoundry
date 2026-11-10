@@ -12,6 +12,7 @@ that keeps reminding and stays open.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import cast
 
@@ -338,5 +339,64 @@ async def test_a_check_that_raises_does_not_end_measuring(
         finally:
             await monitor.stop()
         assert calls >= 2
+    finally:
+        await store.close()
+
+
+async def test_a_cancel_taken_before_stop_is_not_raised_again(tmp_path: Path) -> None:
+    """Review round 2: a caller that already took a cancel and goes on to stop the monitor in its
+    cleanup does not get a second, spurious CancelledError from the tasks' own expected cancels."""
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        monitor = IntakeBoundMonitor(cast(Store, store), IntakeGate(), max_staged_depth=10)
+
+        async def forever() -> None:
+            await asyncio.Event().wait()
+
+        async def cleanup_after_a_cancel() -> str:
+            try:
+                await forever()
+            except asyncio.CancelledError:
+                monitor._task = asyncio.ensure_future(forever())
+                await asyncio.sleep(0)
+                await monitor.stop()
+                return "stopped"
+            return "not reached"
+
+        caller = asyncio.ensure_future(cleanup_after_a_cancel())
+        await asyncio.sleep(0)
+        caller.cancel()
+        assert await caller == "stopped"
+    finally:
+        await store.close()
+
+
+async def test_a_check_that_keeps_raising_logs_once_per_streak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        monitor = IntakeBoundMonitor(
+            cast(Store, store), IntakeGate(), max_staged_depth=10, check_seconds=0.01
+        )
+        calls = 0
+
+        async def broken() -> None:
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("synthetic check defect")
+
+        monkeypatch.setattr(monitor, "check_once", broken)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.intake_bound"):
+            monitor.start()
+            try:
+                for _ in range(200):
+                    if calls >= 4:
+                        break
+                    await asyncio.sleep(0.01)
+            finally:
+                await monitor.stop()
+        assert calls >= 4
+        assert sum("intake bound check raised" in r.getMessage() for r in caplog.records) == 1
     finally:
         await store.close()

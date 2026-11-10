@@ -32,15 +32,17 @@ house pattern of ``queue_buildup``: ``intake_paused`` when a pause starts, and a
 condition that persists. ``intake_resumed``, its auto-resolving inverse, fires once when it ends.
 
 **A subject nobody reminds about expires (BACKLOG #3269).** Each process names itself in its
-subjects, so a subject whose process never comes back under that name has nobody left to clear it:
-an unpinned cluster node that crashed while paused, a lone engine that became several engine
-shards, an engine shard dropped from a shrinking engine shard count, or a renamed
-``[cluster].node_id``. Every
+subjects, so a subject whose process never comes back under that name has nobody left to clear it.
+At least these do that: an unpinned cluster node that crashed while paused, a lone engine that
+became several engine shards, an engine shard dropped from a shrinking engine shard count, and a
+renamed or retired ``[cluster].node_id``. Every
 monitor with a sink therefore sweeps the store's open ``intake_paused`` instances for subjects that
 are not its own. One whose occurrence count has not moved for :data:`STALE_SECONDS` of this
 monitor's own clock is resolved, bounded by the count it saw. A live paused process raises a
-reminder every :data:`REALERT_SECONDS`, which moves the count, so its alert stays open. No clock is
-compared across processes.
+reminder every :data:`REALERT_SECONDS`, which moves the count, so its alert stays open while those
+writes land. A paused process cut off from the store cannot remind, so another process's sweep
+expires its alert while it is still paused; its first reminder that lands again opens a new
+instance. Nothing sweeps on a store only one process uses. No clock is compared across processes.
 """
 
 from __future__ import annotations
@@ -259,6 +261,7 @@ class IntakeBoundMonitor:
         # One WARNING per failing streak per probe, not one per interval.
         self._depth_failing = False
         self._disk_failing = False
+        self._check_failing = False
         # Whether check_once has run, so the loop does not repeat Engine.start's first measurement.
         self._measured = False
         # BACKLOG #3269, the expiry sweep: per instance id, the count it last saw and the monotonic
@@ -323,6 +326,9 @@ class IntakeBoundMonitor:
         tasks = (self._task, self._sweep_task)
         self._task = self._sweep_task = None
         me = asyncio.current_task()
+        # A count, not a flag: a caller that already took a cancel before calling stop() must not
+        # make the tasks' own expected cancels read as a new one.
+        baseline = me.cancelling() if me is not None else 0
         cancelled = False
         for task in tasks:
             if task is None:
@@ -333,8 +339,9 @@ class IntakeBoundMonitor:
             except asyncio.CancelledError:
                 # The task's own cancel is expected; a cancel of the caller is passed on once the
                 # gate below has opened.
-                cancelled = cancelled or (me is not None and me.cancelling() > 0)
+                cancelled = cancelled or (me is not None and me.cancelling() > baseline)
             except Exception:
+                cancelled = cancelled or (me is not None and me.cancelling() > baseline)
                 # A task that died must not stop the stop: the gate below still opens.
                 log.warning("intake monitor task %s had failed", task.get_name(), exc_info=True)
         held = set(self._gate.reasons)
@@ -380,9 +387,14 @@ class IntakeBoundMonitor:
                 try:
                     await self.check_once()
                 except Exception:
-                    # As in _sweep_loop: a defect in one check must not end measuring, and with it
-                    # the gate's release, for the life of the process. Logged every time.
-                    log.exception("intake bound check raised; it runs again next interval")
+                    # A defect in one check must not end measuring, and with it the gate's
+                    # release, for the life of the process. Once per failing streak, as the
+                    # class's other failure paths log, with the traceback.
+                    if not self._check_failing:
+                        self._check_failing = True
+                        log.exception("intake bound check raised; it runs again each interval")
+                else:
+                    self._check_failing = False
             skip_first = False
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), self._check_seconds)

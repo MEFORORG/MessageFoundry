@@ -297,3 +297,18 @@ async def test_a_failed_snapshot_resolves_unfenced_and_says_so(
         assert any("resolving unfenced" in r.getMessage() for r in caplog.records)
     finally:
         await store.close()
+
+
+async def test_a_clear_nobody_settles_pays_for_no_re_read(tmp_path: Path) -> None:
+    """Review round 2: only a settle callback reads the superseded verdict, so an unsettled clear
+    that closes nothing makes one read (the snapshot) and no second one."""
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        view_a = _Gated(store)
+        a = NotifierAlertSink([], store=view_a)
+        _clear(a)
+        await _drain(a)
+        assert view_a.calls.get("open_alert_generations") == 1
+        assert view_a.calls.get(_FENCED) == 1
+    finally:
+        await store.close()

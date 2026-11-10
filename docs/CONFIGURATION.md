@@ -1871,13 +1871,16 @@ does only when `[cluster].node_id` is pinned; otherwise its id is new on every s
 node therefore clears its own open pause alerts when it stops, since its next start reports under a
 new name. The stop waits up to 5 seconds for that write before it closes the store.
 
-A subject whose process never comes back under its name can expire instead (BACKLOG #3269): an
-unpinned node that crashed while paused or whose clear did not land, a lone engine that became
-several engine shards, an engine shard dropped from the count, or a renamed `[cluster].node_id`.
+A subject whose process never comes back under its name can expire instead (BACKLOG #3269). At
+least these leave one: an unpinned node that crashed while paused or whose clear did not land, a
+lone engine that became several engine shards, an engine shard dropped from the count, and a
+renamed or retired `[cluster].node_id`.
 Every engine process with an alert sink checks the open `intake_paused` alerts of the OTHER
 processes once a minute, and resolves one whose occurrence count has not moved for 20 minutes, four
 reminder intervals, of its own clock. A paused process that is alive raises a reminder every 5
-minutes, so its alert stays open. So an alert expires only while some other engine process with an
+minutes, so its alert stays open while those writes reach the store. One that is paused and cannot
+reach the store has its alert expired while it is still paused, and its first reminder that lands
+again opens a new alert. So an alert expires only while some other engine process with an
 alert sink runs on the same store; no process expires its own. A process stopped for longer than 20
 minutes while another runs finds its pause resolved, and a pause that still holds when it starts
 opens a new alert. An operator's acknowledgement on the old alert goes with it, as it does on any
