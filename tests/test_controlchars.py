@@ -17,6 +17,7 @@ import json
 import re
 import warnings
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
@@ -24,6 +25,7 @@ from messagefoundry.controlchars import (
     _is_control_char,
     has_control_char,
     has_lone_surrogate,
+    log_field_token,
     scrub_control_chars,
     scrub_log_argument,
     strip_control_chars,
@@ -438,3 +440,51 @@ def test_escape_lone_surrogates_escapes_only_surrogates() -> None:
     escaped.encode("utf-8")  # strict UTF-8 accepts it now
     # The same spelling the full log scrub gives a surrogate.
     assert scrub_control_chars(chr(0xDC80)) == escape_lone_surrogates(chr(0xDC80))
+
+
+# --- log_field_token: one key=value value that no content can close (BACKLOG #3770) -----------
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["/a b", 'x"y', "x'y", "a\\b", "50%", "tab\there", "line\nbreak", "é‮", "\ud800", ""],
+)
+def test_log_field_token_is_quote_free_ascii_and_reverses(text: str) -> None:
+    """RED when: the token holds a space, a quote or a backslash, which the credential scrub
+    filters read as a value's edges, or does not percent-decode back to the text."""
+    token = log_field_token(text, 256)
+    body = token[1:-1]
+    assert token == f'"{body}"'
+    assert body.isascii() and body.isprintable()
+    assert not set(body) & set(" \"'\\")
+    assert unquote(body, errors="surrogatepass") == text
+
+
+@pytest.mark.parametrize("text", ["/x token=", "/x password:"])
+def test_log_field_token_escapes_a_final_label_mark(text: str) -> None:
+    """RED when: a token ends ``=`` or ``:``, so its closing quote reads to a credential scrub as
+    the start of a quoted value that runs on into the next field."""
+    body = log_field_token(text, 256)[1:-1]
+    assert body[-1] not in "=:"
+    assert unquote(body) == text
+
+
+@pytest.mark.parametrize("text", ["/u" + "\U0001f600" * 300, "x" * 5000, "%" * 300])
+def test_log_field_token_is_bounded_after_its_escape(text: str) -> None:
+    """RED when: the bound counts characters before the escape, so an astral path logs about
+    twelve times the limit, or a cut lands inside an escape."""
+    body = log_field_token(text, 256)[1:-1]
+    assert len(body) <= 256
+    head, _, checksum = body.partition("%~crc32:")
+    assert re.fullmatch(r"[0-9a-f]{8}", checksum)
+    assert re.fullmatch(r"(?:[^%]|%[0-9A-F]{2})*", head)
+
+
+def test_log_field_token_keeps_two_long_texts_with_one_head_apart() -> None:
+    assert log_field_token("a" * 300 + "1", 256) != log_field_token("a" * 300 + "2", 256)
+    assert "%~" not in log_field_token("a" * 256, 256)
+
+
+def test_log_field_token_refuses_a_limit_with_no_room_for_its_mark() -> None:
+    with pytest.raises(ValueError):
+        log_field_token("x", 15)

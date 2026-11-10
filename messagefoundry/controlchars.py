@@ -323,17 +323,82 @@ def scrub_log_argument(text: str) -> str:
 def quote_log_text(text: str) -> str:
     """``text`` as one double-quoted token that its own content cannot close or extend.
 
-    JSON string quoting escapes every quote, backslash and C0 control, so a value cannot end its
-    token and write a separator, a second field or a mark after it. ``ensure_ascii`` also writes
-    every character outside printable ASCII as ``\\uXXXX``, DEL included, so a lookalike quote
-    such as U+02BA or U+FF02, or a right-to-left letter, cannot fake that end for a human reader.
-    The output is therefore printable ASCII, and :func:`scrub_log_argument` changes nothing in it.
-    It stays as a guard should the ``json.dumps`` call ever drop ``ensure_ascii``, and because
-    CodeQL's ``py/log-injection`` accepts its line-break ``replace`` as the neutraliser and does
-    not see ``json.dumps`` (see :func:`scrub_log_argument`). For a caller-supplied
-    value logged beside other ``key=value`` fields, such as a request path (BACKLOG #3770)."""
+    JSON string quoting escapes every quote and backslash, writes ``\\n``, ``\\r``, ``\\t``,
+    ``\\b`` and ``\\f`` for those controls, and every other character outside printable ASCII,
+    DEL included, as ``\\uXXXX``, a character past U+FFFF as a surrogate pair of them. So a value
+    cannot end its token and write a separator, a second entry or a mark after it, and a lookalike
+    quote such as U+02BA or U+FF02, or a right-to-left letter, cannot fake that end for a human
+    reader (vault BACKLOG #3139). The output is printable ASCII, and :func:`scrub_log_argument`
+    changes nothing in it. It stays as a guard should the ``json.dumps`` call ever drop
+    ``ensure_ascii``, and because CodeQL's ``py/log-injection`` accepts its line-break ``replace``
+    as the neutraliser and does not see ``json.dumps``.
+
+    NOT FOR A FIELD THAT OTHER FIELDS FOLLOW ON A CONFIGURED HANDLER. The credential scrub filters
+    read the backslash before an escaped quote as part of a credential value and replace it, so the
+    token can close early there (BACKLOG #3770). :func:`log_field_token` carries no backslash and no
+    double quote, so it survives them."""
     # Imported here, not at the top: the remote-debug guard imports this module before its hook
     # goes in, and json, with re and enum under it, would lengthen that window.
     import json
 
     return scrub_log_argument(json.dumps(text))
+
+
+#: The characters :func:`log_field_token` writes as they are: printable ASCII but the percent sign
+#: its escape starts with, the two quotes and the backslash, which the credential scrub filters read
+#: as the edges of a value. A space is not printable here, so it is escaped too.
+_LOG_FIELD_KEPT = frozenset(chr(code) for code in range(0x21, 0x7F)) - frozenset("%\"'\\")
+
+#: What :func:`log_field_token` puts in place of the cut tail of a token over its bound. It starts
+#: with "%~", which the escape never writes, so a bounded token cannot read as a kept one.
+_LOG_FIELD_CUT_MARK = "%~crc32:"
+_LOG_FIELD_CUT_LENGTH = len(_LOG_FIELD_CUT_MARK) + 8
+
+
+def _percent_escaped(text: str) -> str:
+    return "".join(
+        ch
+        if ch in _LOG_FIELD_KEPT
+        else "".join(f"%{byte:02X}" for byte in ch.encode("utf-8", "surrogatepass"))
+        for ch in text
+    )
+
+
+def log_field_token(text: str, limit: int) -> str:
+    """``text`` as one double-quoted ``key=value`` field value of a log line, which no part of
+    ``text`` can close or extend, before or after the shipped handler filters (BACKLOG #3770).
+
+    Every character outside :data:`_LOG_FIELD_KEPT` is written as the ``%XX`` escapes of its UTF-8
+    bytes, a lone surrogate by ``surrogatepass``, so the token holds no space, quote or backslash
+    and is reversible by a percent-decode. A final ``=`` or ``:`` is escaped too: the credential
+    scrub filters read a label's ``="`` or ``:"`` as the start of a quoted value, and the closing
+    quote would otherwise be that start. So a credential scrub can shorten the token but never end
+    it early, and a later field on the line stays as the engine wrote it.
+
+    The escaped text is at most ``limit`` characters, counted after the escape, so the field is at
+    most ``limit`` plus its two quotes whatever ``text`` holds. Longer text keeps an escaped head,
+    never cut inside an escape, and :data:`_LOG_FIELD_CUT_MARK` with the CRC-32 of all of
+    ``text``, so two honest long texts that share the head almost never read alike. A checksum,
+    not a digest, as in ``pipeline.intake_bound.shorten_with_checksum``: the field is read by a
+    person and is never a key, so it has no forged collision to resist, and this leaf module
+    stays out of the crypto inventory. ``limit`` must leave room for the mark, 16 characters."""
+    if limit < _LOG_FIELD_CUT_LENGTH:
+        raise ValueError(
+            f"limit {limit} leaves no room for the {_LOG_FIELD_CUT_LENGTH}-character cut mark"
+        )
+    # Each character escapes to at least one, so only the first `limit` can ever be kept whole.
+    escaped = _percent_escaped(text[: limit + 1])
+    if len(text) > limit or len(escaped) > limit:
+        import binascii  # lazily, for the reason quote_log_text imports json lazily
+
+        head = escaped[: limit - _LOG_FIELD_CUT_LENGTH]
+        partial = head.rfind("%", len(head) - 2)
+        if partial != -1:
+            head = head[:partial]
+        checksum = binascii.crc32(text.encode("utf-8", "surrogatepass"))
+        escaped = f"{head}{_LOG_FIELD_CUT_MARK}{checksum:08x}"
+    elif escaped[-1:] in ("=", ":"):
+        escaped = escaped[:-1] + f"%{ord(escaped[-1]):02X}"
+    # Printable ASCII already, so the scrub changes nothing; it is here for CodeQL, as in
+    # quote_log_text.
+    return scrub_log_argument(f'"{escaped}"')

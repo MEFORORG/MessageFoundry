@@ -5412,12 +5412,11 @@ and what ran at the start differs by response (BACKLOG #3469). The client-networ
 handshake. The bulk message export's gate, `require_step_up_action` with the export's action, also
 ran the new-address check, and the route spends a fresh step-up bound to the export before it
 streams. With `[auth].require_action_step_up = false` that spend reads the session's step-up window
-instead; what opens that window is the table under
-[With no strength or recency from the identity provider, the engine assumes the minimum](#with-no-strength-or-recency-from-the-identity-provider-the-engine-assumes-the-minimum-asvs-684).
-The `/ws/stats` gate
+instead; [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)
+says what opens that window. The `/ws/stats` gate
 (`authorize_ws`, or the console's cookie twin) and the audit export's gate
 (`require(Permission.AUDIT_EXPORT)`, or the console's `require_ui(Permission.AUDIT_EXPORT)`) run
-no step-up and no new-address check, so neither response is step-up gated at any point. Each resolves the token it started with, so a session rotation (a step-up
+no step-up and no new-address check, so neither response is step-up gated at any point. Each of the three responses resolves the token it started with, so a session rotation (a step-up
 on that session, for example) ends it as a revocation would.
 
 - The `/ws/stats` live feed asks before every frame, about one a second. A refusal closes the socket
@@ -5487,9 +5486,10 @@ on that session, for example) ends it as a revocation would.
   does it stop with the reason `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
   the reason, then raises to abort the transfer, which reaches the client as a failed download,
   as the bulk export bullet above says. The idle clock moves at most every quarter of the window,
-  as the bulk export's does, but the count starts when the stream starts, because the gate has
-  just moved the clock. So the first page does not move it, where the bulk export's first row
-  does.
+  as the bulk export's does, but the quarter is counted from when the stream starts sending, not
+  from the gate's own move. The row count, the first page's read and the `audit.export` row run
+  between the two, so on a large trail the first move can come more than a quarter window after
+  the gate's. The first page never moves it, where the bulk export's first row does.
 
 **At least these paths do not see a change on the next request.** The table is not a complete list.
 On a first deployment, each would let a caller keep acting on a withdrawn grant for the time shown.

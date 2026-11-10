@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import ast
 import inspect
+import io
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
+from urllib.parse import unquote
 
 import httpx
 import pytest
@@ -38,8 +41,7 @@ from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.notifications import NEW_ADDRESS_REVERIFY, SecurityEvent
 from messagefoundry.auth.service import (
-    _NEW_IP_LOG_PATH_MAX,
-    _NEW_IP_LOG_PATH_PREFIX,
+    _NEW_IP_LOG_FIELD_MAX,
     _NEW_IP_PER_SESSION_MAX,
     _NEW_IP_TEXT_MAX,
     _NEW_IP_TEXT_PREFIX,
@@ -47,11 +49,11 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
     _bounded_address_text,
-    _bounded_text,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
-from messagefoundry.controlchars import quote_log_text
+from messagefoundry.controlchars import log_field_token
+from messagefoundry.logging_setup import _install_phi_filters
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
@@ -272,7 +274,7 @@ async def test_each_refused_request_writes_its_own_warning(
         assert sum("already flagged" in line for line in warnings) == repeats
         over = [line for line in warnings if "past the per-session" in line]
         assert [line.rsplit("seen_ip=", 1)[1] for line in over] == [
-            quote_log_text(seen) for seen in past_cap
+            log_field_token(seen, _NEW_IP_LOG_FIELD_MAX) for seen in past_cap
         ]
         assert not any("\n" in line for line in over)
         assert await _new_ip_rows(store) == reported
@@ -283,63 +285,83 @@ async def test_each_refused_request_writes_its_own_warning(
         await store.close()
 
 
-def _logged_fields(line: str) -> dict[str, str]:
-    """The ``key=value`` fields after the colon of a new-address WARNING, each value one JSON
-    string, read as a log reader would: the key up to ``=``, then one JSON string as its value."""
-    fields: dict[str, str] = {}
+#: One ``key="value"`` field; :func:`~messagefoundry.controlchars.log_field_token` writes no quote
+#: inside a value.
+_FIELD = r'([a-z_]+)="([^"]*)"'
+
+
+def _logged_fields(line: str) -> list[tuple[str, str]]:
+    """The ``key="value"`` fields after the colon of a new-address WARNING, in order, read as a
+    log reader would. Refuses a line that is anything but such fields joined by single spaces."""
     rest = line.split(": ", 1)[1]
-    while rest:
-        key, rest = rest.split("=", 1)
-        value, end = json.JSONDecoder().raw_decode(rest)
-        fields[key] = value
-        rest = rest[end:].removeprefix(" ")
-    return fields
+    assert re.fullmatch(f"{_FIELD}(?: {_FIELD})*", rest), line
+    return re.findall(_FIELD, rest)
 
 
-def test_a_bounded_form_is_always_longer_than_its_bound() -> None:
-    """RED when: a bound and its prefix are edited so the replacement fits under the bound, so a
-    short text spelled like ``<prefix>...sha256:<hex>`` could read as the bounded form of a longer
-    one (BACKLOG #3772, #3770)."""
-    marker = len("...sha256:") + 64
-    assert _NEW_IP_TEXT_PREFIX + marker > _NEW_IP_TEXT_MAX
-    assert _NEW_IP_LOG_PATH_PREFIX + marker > _NEW_IP_LOG_PATH_MAX
+#: Paths that tried to write a field of their own (BACKLOG #3770). The second is the one the review
+#: measured: the credential scrub filters read the backslash before a JSON-escaped quote as part of
+#: the token's value, so ``quote_log_text`` closed early on a configured sink. The rest end on a
+#: label a credential scrub reads as the start of a quoted value, or open a quoted value.
+_FORGING_PATHS = (
+    '/users seen_ip=10.6.6.6 held_back=99 "x\\',
+    '/users token=a" seen_ip=10.6.6.6 z="',
+    "/x token=",
+    "/x password:",
+    "/x password='a seen_ip=10.6.6.6 '",
+    "/x code=a&state=b seen_ip=10.6.6.6",
+    "/u" + "\U0001f600" * 300,
+    "/u" + "x" * 5000,
+)
 
 
-async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """RED when: the request path is logged unquoted, so a path holding a space and ``seen_ip=``
-    or ``held_back=`` writes a field of its own, or unbounded (BACKLOG #3770)."""
+def test_a_bounded_address_is_always_longer_than_its_bound() -> None:
+    """RED when: the bound and its prefix are edited so the replacement fits under the bound, so a
+    short address text spelled like ``<prefix>...sha256:<hex>`` could read as the bounded form of a
+    longer one (BACKLOG #3772)."""
+    assert _NEW_IP_TEXT_PREFIX + len("...sha256:") + 64 > _NEW_IP_TEXT_MAX
+
+
+async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings() -> None:
+    """RED when: the request path or the seen address can close its field on the line a shipped
+    handler writes, so a path holding a space, a quote or a credential label writes a field of its
+    own; or a field is longer than its bound after its escape (BACKLOG #3770). The lines are read
+    through a handler carrying the shipped filter chain (``_install_phi_filters``), not from the
+    record, which no filter has touched."""
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    _install_phi_filters(handler)
+    logger = logging.getLogger("messagefoundry.auth.service")
+    level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
         await service.initialize()
         token, _ = await _enabled_admin(service, client="10.1.1.1")
-        forged = '/users seen_ip=10.6.6.6 held_back=99 "x\\'
         for i in range(_NEW_IP_PER_SESSION_MAX + 1):
             assert await service.flag_new_client_ip(token, f"10.3.3.{i}", path="/users") is True
-        long_path = "/u" + "x" * 5000
-        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
-            assert await service.flag_new_client_ip(token, "10.3.3.0", path=forged) is True
-            assert await service.flag_new_client_ip(token, "10.9.9.9", path=forged) is True
-            assert await service.flag_new_client_ip(token, "10.9.9.8", path=long_path) is True
-        lines = [
-            r.getMessage()
-            for r in caplog.records
-            if r.levelno == logging.WARNING
-            and r.getMessage().startswith("a request from a new client address must re-verify")
-        ]
-        assert len(lines) == 3
-        repeat, over, over_long = (_logged_fields(line) for line in lines)
-        assert repeat == {"path": forged}
-        assert over == {"path": forged, "seen_ip": "10.9.9.9"}
-        assert over_long["seen_ip"] == "10.9.9.8"
-        assert over_long["path"] == _bounded_text(
-            long_path, _NEW_IP_LOG_PATH_MAX, _NEW_IP_LOG_PATH_PREFIX
-        )
-        assert len(over_long["path"]) <= 300  # an independent ceiling: 192 + 74 for this path
+        stream.truncate(0)
+        stream.seek(0)
+        for i, path in enumerate(_FORGING_PATHS):
+            assert await service.flag_new_client_ip(token, "10.3.3.0", path=path) is True
+            assert await service.flag_new_client_ip(token, f"10.9.9.{i}", path=path) is True
     finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
         await store.close()
+    lines = [ln for ln in stream.getvalue().splitlines() if ln]
+    assert len(lines) == 2 * len(_FORGING_PATHS)
+    for i, path in enumerate(_FORGING_PATHS):
+        repeat, over = (_logged_fields(line) for line in lines[2 * i : 2 * i + 2])
+        assert [key for key, _ in repeat] == ["path"], lines[2 * i]
+        assert [key for key, _ in over] == ["path", "seen_ip"], lines[2 * i + 1]
+        assert over[1][1] == f"10.9.9.{i}"
+        for _, value in (*repeat, *over):
+            assert len(value) <= _NEW_IP_LOG_FIELD_MAX
+        if len(path) < 100 and "=" not in path and ":" not in path:
+            assert unquote(over[0][1], errors="surrogatepass") == path
 
 
 async def test_alternating_new_addresses_audit_once_each() -> None:
@@ -620,7 +642,7 @@ async def test_long_address_text_is_bounded_in_the_dedupe_and_the_past_cap_recor
             if r.levelno == logging.WARNING and "past the per-session" in r.getMessage()
         ]
         assert [line.rsplit("seen_ip=", 1)[1] for line in over] == [
-            quote_log_text(_bounded_address_text(texts[-1]))
+            log_field_token(_bounded_address_text(texts[-1]), _NEW_IP_LOG_FIELD_MAX)
         ]
     finally:
         await store.close()
