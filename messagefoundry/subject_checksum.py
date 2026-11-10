@@ -10,8 +10,10 @@ import binascii
 
 #: Hex digits of the CRC-32 that stands in for the part of a text :func:`shorten_with_checksum`
 #: cuts. A checksum, not a cryptographic digest: it only has to tell two texts apart in a subject a
-#: reader sees. Where a forged text must not collide with a genuine one (a row's ref under ADR
-#: 0217), the subject also carries a SHA-256 suffix of the whole value.
+#: reader sees. A CRC-32 is easy to forge, so two texts with one head can be made to shorten
+#: alike. Under ADR 0217 only the Unverifiable subject also carries a SHA-256 suffix of the whole
+#: value, which keys its throttle and cap. A Forged page's reason carries the shortened ref alone,
+#: so a planted id can be made to read like a genuine one there.
 _CHECKSUM_HEX = 8
 
 

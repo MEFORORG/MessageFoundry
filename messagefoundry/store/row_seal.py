@@ -970,8 +970,9 @@ UNVERIFIABLE_SUBJECT_CAP: Final = 5
 #: The readable part of a subject's ref, as a session's 12-character ref (*A ref is for reading*).
 _SUBJECT_REF_LEN: Final = 12
 
-#: A store's seal page: called with an ``integrity_drift`` subject and a reason naming no row value,
-#: token or Vault reply.
+#: A store's seal page: called with an ``integrity_drift`` subject and a reason naming no token or
+#: Vault reply. The reason may name a row by its ref (:func:`seal_row_ref`), which for a row other
+#: than a session is its stored id, scrubbed and bounded, so a short id appears whole.
 SealPageHook = Callable[[str, str], None]
 
 

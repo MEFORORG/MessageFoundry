@@ -10408,7 +10408,9 @@ class AuthService:
         except _RotationStoreError:
             return None
 
-    async def _rotate_session_hash(self, old_hash: str) -> str | None:
+    async def _rotate_session_hash(
+        self, old_hash: str, *, unverifiable: list[bool] | None = None
+    ) -> str | None:
         """:meth:`_rotate_session_token` keyed on the session's HASH, for the one ceremony that holds
         no token: the federated step-up callback, which the SameSite=Strict cookie never reaches
         (BACKLOG #296). Same contract, same lock, same re-key.
@@ -10431,7 +10433,10 @@ class AuthService:
         usually leaves this load a cache hit. An Unverifiable answer, ``TransitSealUnverifiableError``
         at the load or ``RowSealUnverifiableError`` at the re-key, revokes the old hash, best effort
         and shielded from a cancel, then propagates (decision d20261110T004916856-814db8 on ADR
-        0217, Q3). A session under a retired key at the re-key is ended quietly (build ruling 3).
+        0217, Q3). Before it propagates, whether that revoke landed is appended to
+        ``unverifiable``, when given, so :meth:`_elevated_hash` can audit it (decision
+        d20261110T042322305-2ffc60). A session under a retired key at the re-key is ended quietly
+        (build ruling 3).
 
         A cancellation is not an ``Exception``, so it skips this branch and propagates with the old
         hash unrotated and unrevoked. The longer post-commit wait widens the window for one."""
@@ -10445,7 +10450,9 @@ class AuthService:
         except TransitSealUnverifiableError as exc:
             # Decision d20261110T004916856-814db8 on ADR 0217, Q3: the stamp is on this hash, so it
             # is revoked, best effort and shielded, then the Unverifiable answer propagates.
-            await self._revoke_stamped_shielded(old_hash, exc)
+            landed = await self._revoke_stamped_shielded(old_hash, exc)
+            if unverifiable is not None:
+                unverifiable.append(landed)
             raise
         if session is None:
             return None
@@ -10475,7 +10482,9 @@ class AuthService:
             except RowSealUnverifiableError as exc:
                 # Decision d20261110T004916856-814db8, Q3: the re-key's write check could not
                 # verify the row and wrote nothing, so only the stamped old hash exists to revoke.
-                await self._revoke_stamped_shielded(old_hash, exc)
+                landed = await self._revoke_stamped_shielded(old_hash, exc)
+                if unverifiable is not None:
+                    unverifiable.append(landed)
                 raise
             if not rotated:
                 return None
@@ -10488,7 +10497,7 @@ class AuthService:
         new_hash: str | None,
         cause: BaseException,
         *,
-        window: bool = False,
+        stamped: bool = False,
     ) -> bool:
         """Revoke a session whose rotation the store refused, or a Transit Outage refused (owner
         ruling 2026-11-08), under ``old_hash`` and, when a re-key was attempted, ``new_hash``;
@@ -10500,10 +10509,14 @@ class AuthService:
         follow a committed write, so it is not moved onto a store's longer post-commit borrow
         here, and at the acquire limit it can be refused while the pool is still short.
 
-        ``window`` is the stamp window's revoke (:meth:`_revoke_stamped_shielded`), which takes
-        every exception, code defects and cancels included, so a cause's message may carry a row
-        value (CLAUDE.md section 9). There the WARNING names the cause's class and the session's
-        12-character ref only, with no message and no traceback; the traceback goes at DEBUG."""
+        ``stamped`` is :meth:`_revoke_stamped_shielded`'s revoke of a stamped hash, whose callers
+        are the stamp window, for any exception, code defects and cancels included, and the
+        rotation's own load and re-key, for an Unverifiable answer. A cause's message may carry a
+        row value there (CLAUDE.md section 9), so the WARNING names the cause's class and the
+        session's 12-character ref only, with no message and no traceback; the traceback goes at
+        DEBUG. Its wording says the rotation did not complete, which holds for every such caller,
+        and names no window, since the rotation's own revoke happens after the window closed and a
+        ceremony may have none."""
         refused: list[str] = []
         for token_hash in (old_hash, new_hash):
             if token_hash is None:
@@ -10515,14 +10528,14 @@ class AuthService:
         outcome = (
             f"a revoke was refused too ({', '.join(refused)})" if refused else "it was revoked"
         )
-        if window:
+        if stamped:
             _log.warning(
-                "auth: a stamp window ended on %s (session %s); %s",
+                "auth: a stamped session's rotation did not complete, on %s (session %s); %s",
                 type(cause).__name__,
                 old_hash[:_SESSION_REF_LEN],
                 outcome,
             )
-            _log.debug("auth: the stamp window's cause", exc_info=cause)
+            _log.debug("auth: the stamped session's revoke cause", exc_info=cause)
             return not refused
         _log.warning(
             "auth: a session rotation, or a step before it, was refused by %s (%s); %s",
@@ -10619,13 +10632,17 @@ class AuthService:
         the Owner's standing instruction of 2026-10-22). This method closes that window once the
         lapse check has passed, so a refusal from the re-key on is this method's, and an exception
         from the lapse check that this method's handlers do not take still reaches the window,
-        which revokes the stamped hash (decision d20261109T200352805-599b24, item 1). The lapse
+        which revokes the stamped hash (decision d20261109T200352805-599b24, item 1). An
+        Unverifiable answer at the rotation's load or re-key, which the rotation revokes, is
+        written as ``auth.session_rotation_failed`` with reason ``transit_unverifiable``, softly,
+        and then propagates (decision d20261110T042322305-2ffc60). The lapse
         check's reads are the session's
         and the account's: an Outage on the account record's check revokes the session too, though
         the session's own seal held."""
         window = _STAMP_WINDOW.get()
         rotated: str | None = None
         failure: dict[str, object] = {"reason": "session_gone"}
+        unverifiable: list[bool] = []
         try:
             if await self._rotation_lapsed(token_hash, ceremony=ceremony, client=client):
                 if window is not None:
@@ -10637,7 +10654,20 @@ class AuthService:
                 # Forged, Unverifiable or a code defect) still reaches the window, which revokes
                 # the stamped hash and re-raises (decision d20261109T200352805-599b24, item 1).
                 window.closed = True
-            rotated = await self._rotate_session_hash(token_hash)
+            rotated = await self._rotate_session_hash(token_hash, unverifiable=unverifiable)
+        except (TransitSealUnverifiableError, RowSealUnverifiableError):
+            if not unverifiable:
+                # Not the rotation's load or re-key: the lapse check's, which the window answers.
+                raise
+            # Decision d20261110T042322305-2ffc60: the rotation revoked the stamped hash, so the
+            # row records it, softly, before the Unverifiable answer propagates.
+            await self._audit_rotation_failed(
+                ceremony=ceremony,
+                actor=actor,
+                client=client,
+                failure={"reason": "transit_unverifiable", "revokes_landed": unverifiable[0]},
+            )
+            raise
         except _RotationStoreError as refused:
             # BACKLOG #3023: the store refused the re-key. The session was revoked, best effort,
             # and this fails closed exactly as a session gone underneath the ceremony does.
@@ -10912,19 +10942,20 @@ class AuthService:
             _STAMP_WINDOW.reset(reset)
 
     async def _revoke_stamped_shielded(self, token_hash: str, cause: BaseException) -> bool:
-        """:meth:`_revoke_unrotated` for a stamp window's hash, run to completion through a cancel
-        the way :func:`_write_through_cancellation` runs a refused sign-in's rows; a cancel that
-        lands meanwhile is re-raised after it, so that cancel then replaces the window's exception,
-        as it does for :func:`_write_through_cancellation`'s own callers. ``True`` when the revoke
+        """:meth:`_revoke_unrotated` for a stamped hash, from a stamp window or from the rotation's
+        own Unverifiable branches, run to completion through a cancel the way
+        :func:`_write_through_cancellation` runs a refused sign-in's rows; a cancel that lands
+        meanwhile is re-raised after it, so that cancel then replaces the caller's exception, as it
+        does for :func:`_write_through_cancellation`'s own callers. ``True`` when the revoke
         landed. A revoke that fails outside the errors :meth:`_revoke_unrotated` takes is logged
-        and reads as not landed, so that failure never replaces the window's exception."""
+        and reads as not landed, so that failure never replaces the caller's exception."""
         landed: list[bool] = []
 
         async def revoke() -> None:
             try:
-                landed.append(await self._revoke_unrotated(token_hash, None, cause, window=True))
-            except Exception:  # noqa: BLE001 -- best effort: the window's exception stands
-                _log.exception("auth: the stamp window's revoke failed; the window's error stands")
+                landed.append(await self._revoke_unrotated(token_hash, None, cause, stamped=True))
+            except Exception:  # noqa: BLE001 -- best effort: the caller's exception stands
+                _log.exception("auth: a stamped session's revoke failed; the original error stands")
 
         await _write_through_cancellation([revoke])
         return bool(landed and landed[0])
@@ -14039,16 +14070,23 @@ class AuthService:
         # always a plain one (vault BACKLOG #3113): it needs a code from a later step, since this one
         # is spent, and where the enable matched no row (#2224, below) a reset may have cleared the
         # staged secret, so the user starts the enrolment again.
-        # Stamp against the OLD hash, then rotate — never the other way round.
-        async with self._sealed_stamp(hash_token(token)):
-            await self._store.mark_session_mfa_verified(hash_token(token))
-        elevation = await self._elevated(
-            token,
-            ceremony="mfa_enroll_confirm",
-            actor=identity.username,
-            client=client,
-            recovery_codes=tuple(plain),
-        )
+        # Stamp against the OLD hash, then rotate — never the other way round. The stamp-to-
+        # rotation window, as in verify_mfa (_stamp_to_rotation; decision
+        # d20261110T042322305-2ffc60): an exception from the stamp's write to the rotation revokes
+        # the stamped hash, and a refusal it answers is session_lost, so MFA stays off.
+        elevation = Elevation(session_lost=True)
+        async with self._stamp_to_rotation(
+            ceremony="mfa_enroll_confirm", actor=identity.username, client=client
+        ):
+            async with self._sealed_stamp(hash_token(token)):
+                await self._store.mark_session_mfa_verified(hash_token(token))
+            elevation = await self._elevated(
+                token,
+                ceremony="mfa_enroll_confirm",
+                actor=identity.username,
+                client=client,
+                recovery_codes=tuple(plain),
+            )
         if elevation.token is None:  # not ``ok``, spelled so mypy narrows the token below
             return elevation
         if not await self._store.enable_totp(
@@ -15485,12 +15523,17 @@ class AuthService:
             raise ValueError(self._FACTOR_PRESENT)
         # Parity with confirm_mfa_enrollment: the enrolling session is now MFA-verified (it just
         # proved possession of the freshly-bound authenticator). Stamped against the OLD hash, then
-        # rotated — the reverse order writes nothing and still reports success.
-        async with self._sealed_stamp(hash_token(token)):
-            await self._store.mark_session_mfa_verified(hash_token(token))
-        elevation = await self._elevated(
-            token, ceremony="webauthn_enroll", actor=identity.username, client=client
-        )
+        # rotated — the reverse order writes nothing and still reports success. The stamp-to-
+        # rotation window, as in confirm_mfa_enrollment (decision d20261110T042322305-2ffc60).
+        elevation = Elevation(session_lost=True)
+        async with self._stamp_to_rotation(
+            ceremony="webauthn_enroll", actor=identity.username, client=client
+        ):
+            async with self._sealed_stamp(hash_token(token)):
+                await self._store.mark_session_mfa_verified(hash_token(token))
+            elevation = await self._elevated(
+                token, ceremony="webauthn_enroll", actor=identity.username, client=client
+            )
         await self._audit(
             "auth.webauthn_enrolled",
             actor=identity.username,

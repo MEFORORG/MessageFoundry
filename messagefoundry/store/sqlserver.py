@@ -15828,7 +15828,7 @@ class SqlServerStore:
         now = time.time() if now is None else now
         outcome = RevokeSealOutcome(self._seal_pager)
         async with (
-            outcome.committing(),
+            outcome.committing(self.record_audit),
             self._acquire_after_commit() as conn,
             self._cursor(conn) as cur,
         ):
@@ -15945,7 +15945,11 @@ class SqlServerStore:
         READ_COMMITTED_SNAPSHOT off."""
         now = time.time() if now is None else now
         outcome = RevokeSealOutcome(self._seal_pager)
-        async with outcome.committing(), self._acquire() as conn, self._cursor(conn) as cur:
+        async with (
+            outcome.committing(self.record_audit),
+            self._acquire() as conn,
+            self._cursor(conn) as cur,
+        ):
             try:
                 await cur.execute("SELECT id FROM users ORDER BY id")
                 raised = {

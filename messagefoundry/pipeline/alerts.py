@@ -1618,8 +1618,11 @@ def authority_seal_page(sink: AlertSink) -> Callable[[str, str], None]:
     """A store's seal page hook, armed on its
     :class:`~messagefoundry.store.row_seal.SealPager` (decision d20261109T200352805-599b24 on ADR
     0217, item 5): each call, with a subject and a reason, raises ``integrity_drift`` on ``sink``.
-    The store builds the subject, at least ``authority-seal-transit`` for an Outage, and the reason
-    names no row value, token or Vault reply.
+    The store builds the subject, at least ``authority-seal-transit`` for an Outage. The reason
+    names no token or Vault reply. It may name a row by its ref
+    (:func:`~messagefoundry.store.row_seal.seal_row_ref`): a session by 12 characters of its token
+    hash, any other row by its stored id, control characters scrubbed and bounded with a checksum,
+    so a short user id appears whole.
 
     A sink failure propagates to the pager, whose ``page`` logs it and never raises, so a revoke is
     unchanged and a capped Unverifiable subject spends no slot on a page no sink took."""

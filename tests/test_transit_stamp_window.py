@@ -563,18 +563,23 @@ async def test_a_reproof_budget_exhaustion_row_stays_hard(
 # --- decision d20261110T004916856-814db8, Q3: an Unverifiable answer at the rotation revokes -----
 
 
+@pytest.mark.parametrize("audit_up", [True, False], ids=["audit_up", "audit_refused"])
 @pytest.mark.parametrize("site", ["load", "rekey"])
 async def test_an_unverifiable_answer_at_the_rotation_revokes_the_stamped_hash(
-    monkeypatch: pytest.MonkeyPatch, site: str
+    monkeypatch: pytest.MonkeyPatch, site: str, audit_up: bool
 ) -> None:
     """``TransitSealUnverifiableError`` at the rotation's load, or ``RowSealUnverifiableError`` at
     its re-key, arrives after the window has closed; the rotation itself revokes the stamped old
-    hash, then re-raises."""
+    hash, writes ``auth.session_rotation_failed`` softly (decision d20261110T042322305-2ffc60),
+    then re-raises the Unverifiable answer, even when that row is refused."""
     from messagefoundry.store.row_seal import TransitSealUnverifiableError
 
     store, service = await _service()
     try:
         token, secret, t1 = await _pre_mfa(service, monkeypatch)
+        refusals: list[str] = []
+        if not audit_up:
+            refusals = _refuse_audit(monkeypatch, store, "auth.session_rotation_failed")
         exc: Exception
         if site == "rekey":
             exc = RowSealUnverifiableError("session", "")
@@ -598,7 +603,138 @@ async def test_an_unverifiable_answer_at_the_rotation_revokes_the_stamped_hash(
         with pytest.raises(type(exc)):
             await service.verify_mfa(token, totp.totp(secret, now=t1))
         monkeypatch.undo()
+        if audit_up:
+            await _assert_lost(
+                store, service, token, ceremony="mfa_verify", reason="transit_unverifiable"
+            )
+        else:
+            assert refusals == ["auth.session_rotation_failed"]
+            await _revoked_unanswered(store, service, token)
+    finally:
+        await store.close()
+
+
+# --- decision d20261110T042322305-2ffc60: the two enrolment ceremonies arm the window too -------
+
+
+async def _enrolling(
+    service: AuthService, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, str, str, float]:
+    """An admin's enrolling session with a TOTP enrolment begun: ``(identity, token, secret, the
+    TOTP time to confirm at)``."""
+    identity, token, _password = await login_admin(service)
+    t0 = 1_000_000.0
+    pin_totp_clock(monkeypatch, t0)
+    enroll = await service.begin_mfa_enrollment(identity)
+    return identity, token, enroll.secret, t0
+
+
+def _lapse_check_unverifiable(monkeypatch: pytest.MonkeyPatch, service: AuthService) -> Exception:
+    from messagefoundry.store.row_seal import TransitSealUnverifiableError
+
+    exc = TransitSealUnverifiableError("session", 2, 3)
+    monkeypatch.setattr(service, "_rotation_lapsed", _raising(exc))
+    return exc
+
+
+def _ambiguous_stamp(monkeypatch: pytest.MonkeyPatch, store: MessageStore) -> None:
+    """The stamp's write lands, then its connection drops before the commit's ack."""
+    stamp = store.mark_session_mfa_verified
+
+    async def ambiguous(*args: Any, **kwargs: Any) -> Any:
+        await stamp(*args, **kwargs)
+        raise OSError("synthetic: the connection dropped before the commit's ack")
+
+    monkeypatch.setattr(store, "mark_session_mfa_verified", ambiguous)
+
+
+async def test_an_unverifiable_lapse_check_at_enrolment_revokes_the_stamped_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Unverifiable answer at the lapse check of a TOTP enrolment's confirm reaches the window,
+    which revokes the MFA-stamped hash and re-raises; MFA stays off."""
+    store, service = await _service()
+    try:
+        identity, token, secret, t0 = await _enrolling(service, monkeypatch)
+        exc = _lapse_check_unverifiable(monkeypatch, service)
+        with pytest.raises(type(exc)):
+            await service.confirm_mfa_enrollment(identity, totp.totp(secret, now=t0), token=token)
+        monkeypatch.undo()
         await _revoked_unanswered(store, service, token)
+        assert await store.list_audit(action="auth.mfa_enrolled") == []
+    finally:
+        await store.close()
+
+
+async def test_a_refused_stamp_at_enrolment_answers_session_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A store refusal of the enrolment's stamp, after its write landed, revokes the stamped hash
+    and answers session_lost with the refused-rotation row; MFA stays off."""
+    store, service = await _service()
+    try:
+        identity, token, secret, t0 = await _enrolling(service, monkeypatch)
+        _ambiguous_stamp(monkeypatch, store)
+        lost = await service.confirm_mfa_enrollment(
+            identity, totp.totp(secret, now=t0), token=token
+        )
+        assert lost.session_lost and lost.token is None and not lost.recovery_codes
+        monkeypatch.undo()
+        await _assert_lost(
+            store, service, token, ceremony="mfa_enroll_confirm", reason="store_error"
+        )
+        assert await store.list_audit(action="auth.mfa_enrolled") == []
+    finally:
+        await store.close()
+
+
+async def _register(service: AuthService, identity: Any, token: str) -> Any:
+    """A passkey registration ceremony's answer, which may raise."""
+    from webauthn.helpers import base64url_to_bytes
+
+    from tests._soft_webauthn import SoftAuthenticator
+    from tests.test_session_token_at_elevation_sites import ORIGIN, RP
+
+    soft = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+    options = await service.begin_webauthn_registration(
+        identity, token=token, rp_id=RP, rp_name="MessageFoundry"
+    )
+    challenge = base64url_to_bytes(json.loads(options)["challenge"])
+    return await service.finish_webauthn_registration(
+        identity,
+        soft.create_response(challenge, transports=["usb"]),
+        label="test key",
+        token=token,
+        rp_id=RP,
+        origin=ORIGIN,
+    )
+
+
+@requires_webauthn
+@pytest.mark.parametrize("fault", ["lapse_unverifiable", "ambiguous_stamp"])
+async def test_a_passkey_registration_revokes_its_stamped_hash(
+    monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    """A passkey registration arms the window as a TOTP enrolment does: an Unverifiable lapse
+    check revokes and re-raises, and a refused stamp answers session_lost with the row."""
+    store, service = await _service()
+    try:
+        identity, enrolling, _password = await login_admin(service)
+        _, token = await _enroll_totp(service, identity, enrolling)
+        if fault == "lapse_unverifiable":
+            exc = _lapse_check_unverifiable(monkeypatch, service)
+            with pytest.raises(type(exc)):
+                await _register(service, identity, token)
+            monkeypatch.undo()
+            await _revoked_unanswered(store, service, token)
+        else:
+            _ambiguous_stamp(monkeypatch, store)
+            lost = await _register(service, identity, token)
+            assert lost.session_lost and lost.token is None
+            monkeypatch.undo()
+            await _assert_lost(
+                store, service, token, ceremony="webauthn_enroll", reason="store_error"
+            )
     finally:
         await store.close()
 
@@ -623,7 +759,7 @@ async def test_the_window_revoke_logs_the_class_and_ref_only(
         with pytest.raises(KeyError):
             await service.verify_mfa(token, totp.totp(secret, now=t1))
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        window = [r for r in warnings if "stamp window ended" in r.getMessage()]
+        window = [r for r in warnings if "rotation did not complete" in r.getMessage()]
         assert len(window) == 1
         assert "KeyError" in window[0].getMessage()
         assert hash_token(token)[:12] in window[0].getMessage()

@@ -974,3 +974,86 @@ async def test_the_skipped_raise_count_is_logged_after_the_commit(tmp_path: Path
         assert in_txn == [False]
     finally:
         await store.close()
+
+
+# --- decision d20261110T042322305-2ffc60: a failed revoke still reports what it held ------------
+
+
+def _forged_kept_session(monkeypatch: pytest.MonkeyPatch, store: MessageStore) -> None:
+    """The kept session's re-stamp meets a Forged seal, which raises and rolls the revoke back."""
+
+    async def forged(*_args: Any, **_kwargs: Any) -> Any:
+        raise RowSealError("session", "")
+
+    monkeypatch.setattr(store, "_write_session", forged)
+
+
+@pytest.mark.parametrize("audit_up", [True, False], ids=["audit_up", "audit_refused"])
+async def test_a_revoke_that_fails_audits_and_pages_its_held_refusals(
+    transit: tuple[MessageStore, FakeBackend, Path],
+    pages: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    audit_up: bool,
+) -> None:
+    """An Unverifiable account the revoke held, then a Forged kept session that rolls the revoke
+    back: the held refusal is still audited and paged, with text that says the revoke failed, and
+    the revoke's own exception propagates, whether or not the audit write is refused."""
+    store, _, path = transit
+    await _user(store, "u-1")
+    kept = await _session(store, "u-1")
+    await _session(store, "u-1")
+    _plant(path, "users", "authz_seal", "id", "u-1")
+    _forged_kept_session(monkeypatch, store)
+    if not audit_up:
+
+        async def refused(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("synthetic audit refusal")
+
+        monkeypatch.setattr(store, "record_audit", refused)
+    with pytest.raises(RowSealError):
+        await store.revoke_user_sessions("u-1", except_token_hash=hash_token(kept))
+    assert _live(path, "u-1") == 2  # rolled back
+    assert len(pages) == 1
+    assert "failed before its commit was confirmed" in pages[0]
+    assert "ended the sessions anyway" not in pages[0]
+    monkeypatch.undo()
+    rows = await _audits(store, "integrity.authority_seal_unverifiable")
+    if audit_up:
+        (detail,) = rows
+        assert detail["user_id"] == "u-1" and detail["committed"] is False
+    else:
+        assert rows == []
+
+
+async def test_a_refusal_is_logged_only_after_the_outcome_is_known(
+    transit: tuple[MessageStore, FakeBackend, Path], pages: list[str]
+) -> None:
+    """``refused``'s line is written after the commit, with the committed wording; while the
+    writer transaction is open, nothing claims the revoke ended the sessions."""
+    import logging
+
+    store, _, path = transit
+    await _user(store, "u-1")
+    await _session(store, "u-1")
+    _plant(path, "users", "authz_seal", "id", "u-1")
+    seen: list[tuple[bool, str]] = []
+
+    class _Watch(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            seen.append((bool(store._db.in_transaction), record.getMessage()))
+
+    logger = logging.getLogger("messagefoundry.store.store")
+    handler = _Watch(level=logging.WARNING)
+    logger.addHandler(handler)
+    try:
+        await store.revoke_user_sessions("u-1")
+    finally:
+        logger.removeHandler(handler)
+    refused = [(in_txn, m) for in_txn, m in seen if "was refused" in m]
+    assert refused == [
+        (
+            False,
+            "an account's session epoch raise was refused (RowSealUnverifiableError); the"
+            " revoke ended the sessions anyway",
+        )
+    ]
