@@ -110,7 +110,6 @@ from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.crypto import Cipher
 from messagefoundry.store.store import (
-    AUDIT_PREFIX_BREAK_MARKER,
     REINGRESS_TARGET_PREFIX,
     AuditAnchorError,
     AuditAppend,
@@ -1892,9 +1891,9 @@ class Engine:
         **THEY ARE NOT INDEPENDENT, AND A ``"audit-chain"`` ALERT DOES NOT MEAN THE TAIL IS INTACT.**
         ``verify_audit_chain`` returns on the chain break BEFORE the prefix comparator runs, so when a
         row is edited AND the tail is cut — the likeliest real shape, an edit plus its cover-up — only
-        the break is reported and the truncation is never named. Lifting that needs the store to return a
-        structured verdict carrying both instead of one ``(ok, message)`` pair, across all three
-        backends; it is not done here. Read a break as *"at least* a break"."""
+        the break is reported and the truncation is never named. The verdict's ``prefix_break`` flag
+        separates the two, but lifting this needs the walk to run the comparator past a break too;
+        it is not done here. Read a break as *"at least* a break"."""
         expected_prefix = await self._load_audit_anchor()
         try:
             verdict = await self.store.verify_audit_chain(expected_prefix=expected_prefix)
@@ -1926,9 +1925,9 @@ class Engine:
                 "An engine runs with no key only under the audited keyless opt-out, where a chain "
                 "never names one: either the chain was altered, or the engine lost its key"
             )
-        # verify_audit_chain folds both verdicts into one (ok, message) and reports a chain break FIRST,
-        # so the marker is the only thing that separates them without walking the log a second time.
-        truncated = AUDIT_PREFIX_BREAK_MARKER in reason
+        # The flag, never the message text (vault BACKLOG #3054, item 11). Read as `key_unavailable`
+        # is, so a store returning a plain (ok, message) pair files a chain break, never fails start.
+        truncated = bool(getattr(verdict, "prefix_break", False))
         subject = "audit-chain-truncated" if truncated else "audit-chain"
         log.warning(
             "startup audit-chain verification FAILED (alert-only, %s): %s",
