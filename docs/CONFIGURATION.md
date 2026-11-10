@@ -1357,11 +1357,12 @@ with zero overhead**. `mode="subprocess"` runs each inbound's Router/Handler in 
 per-inbound worker child** (never a per-message fork), enforcing a forbidden-import guard
 (socket/store/crypto) and the resource caps below. An isolation denial (forbidden op, cap overrun,
 worker crash, an invalid or forged answer) routes the message to `ERROR`/dead-letter **post-ACK** (no
-NAK, never dropped). At least two cases differ (vault BACKLOG #3135). A request the codec refuses, or one over
-the frame cap, dead-letters only that message and keeps the worker, since no byte of it was written. A
-stray frame found waiting **before** a request kills the worker and retries the message once on a fresh
-one (owner ruling 2026-11-09). It dead-letters if the fresh worker has a stray frame waiting too, or
-if the respawn itself fails, as any respawn failure does.
+NAK, never dropped). At least two cases differ (vault BACKLOG #3135). A request the engine cannot
+encode, or one over the frame cap, dead-letters only that message and keeps the worker, since no byte
+of it was written; a worker answer the codec rejects still kills the worker. A stray frame found
+waiting **before** a request kills the worker and retries the message once on a fresh one (owner
+ruling 2026-11-09); [ADR 0187](adr/0187-bound-the-subprocess-sandbox-worker-count-a-shared-pool-or-router-phase-only-isolation.md)
+*Amendment B* lists at least the cases in which that message still dead-letters.
 Each worker kill writes one `WARNING` naming the inbound, the phase and a cause token, and no message
 content, except a graph refusal, which writes none, and a shutdown, logged at `INFO`. The runner alerts
 on a graph refusal against the graph the engine serves; one against a graph a reload has replaced

@@ -97,8 +97,10 @@ Two consequences follow, and both cut toward pooling:
 dispatch at a time**. Inside that body, every isolation fault ends in `self._kill(proc)` — a marshal
 rejection, a `wall_seconds` timeout, an EOF from a crashed child, a codec rejection, and a frame no
 outstanding request asked for. There is no wire-level cancel: killing the process *is* how a runaway
-call is stopped, and `_kill` reaps the whole tree. (*Amendment B* records that a marshal rejection
-and a codec refusal of a request no longer kill the worker, and that the kill records its cause.)
+call is stopped, and `_kill` reaps the whole tree. (*Amendment B* records that the first item, a
+marshal rejection of the engine's own request, which is refused before a byte is written, no longer
+kills the worker. The codec rejection of the worker's answer in the same list still does, recorded
+as an invalid frame. *Amendment B* also records that every kill records its cause.)
 
 Against one inbound, the blast radius of a kill is that inbound. Against a shared worker it is every
 lane that worker serves, and that is the design work this memo exists to price.
@@ -350,12 +352,18 @@ The Context section above describes `main` before vault BACKLOG #3135, and is ke
 from one added pointer to this amendment, at the end of its paragraph on what a fault kills. Since
 #3135:
 
-- **A request the codec refuses, or one over the frame cap, no longer kills the worker.** It is
-  refused before a byte is written, so the worker is still in step; only that message fails. A
-  failure while writing the request still kills it, since the worker may hold part of a frame.
+- **A request the engine cannot encode, or one over the frame cap, no longer kills the worker.**
+  This is the engine's own request, refused before a byte is written, so the worker is still in
+  step; only that message fails. A failure while writing the request still kills the worker, since
+  it may hold part of a frame. The worker's answer is a different case: a codec rejection of an
+  answer still kills the worker, recorded as an invalid frame.
 - **A frame waiting before a request kills the worker and retries the message once on a fresh one**
-  (owner ruling 2026-11-09, #3135 step 4). The message never reached the worker. It dead-letters
-  only if the fresh worker has a stray frame waiting too. A frame left after an answer still
+  (owner ruling 2026-11-09, #3135 step 4). The message never reached the worker. This is the one
+  statement of when the retried message still dead-letters; the other documents link here. It
+  dead-letters in at least these cases: the fresh worker has a stray frame waiting too; a respawn
+  fails; the workers spawned for it keep exiting, or closing their pipe, before its request is
+  written; and any fault the request itself meets on the fresh worker, as for any other message,
+  such as a worker that exits as its request is written. A frame left after an answer still
   dead-letters the message it follows.
 - **Every kill records a cause from a closed set**, `KillCause` in `messagefoundry/pipeline/sandbox.py`,
   and writes one `WARNING` naming the inbound, the phase and the cause token, never message content.
@@ -404,8 +412,8 @@ argument above stands for every fault that does kill.
   → the existing ADR 0087 sandbox suites, which must continue to pass unchanged
   > **Amended 2026-11-09 (vault BACKLOG #3135 step 4, owner ruling 2026-11-09).** One refusal
   > changed by ruling, not by degradation: an unsolicited frame found **before** a request still
-  > kills the worker and is never consumed, but its message is retried once on a fresh worker and
-  > raises only if that worker has one waiting too. `test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`
+  > kills the worker and is never consumed, but its message is retried once on a fresh worker, and
+  > raises in at least the cases *Amendment B* lists. `test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`
   > was changed to pin that. A request outside the codec grammar still raises, and keeps the worker.
 
 ## Consequences

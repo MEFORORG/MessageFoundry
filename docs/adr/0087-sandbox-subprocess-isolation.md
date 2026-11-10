@@ -354,8 +354,10 @@ target, no `pickle` import left to mis-suppress:
   failing a call that already has a correlation-proven answer.
   > **Amended 2026-11-09 (vault BACKLOG #3135 step 4, owner ruling 2026-11-09).** A frame found
   > waiting **before** a request still drops that worker and is still never consumed as an answer,
-  > but the call is no longer failed: its message never reached the worker, so it is retried once on
-  > a fresh worker, and fails closed only if that worker has a stray frame waiting too. A frame left
+  > but that frame no longer fails the call: its message never reached the worker, so it is retried
+  > once on a fresh worker. It still fails closed in at least the cases
+  > [ADR 0187](0187-bound-the-subprocess-sandbox-worker-count-a-shared-pool-or-router-phase-only-isolation.md)
+  > *Amendment B* lists, the fresh worker having a stray frame waiting too among them. A frame left
   > **after** an answer, or a length header over the frame cap in that slot, still fails the call
   > closed. Every kill records a cause; ADR 0187 *Amendment B* says which kills write a WARNING.
   → `tests/test_sandbox.py::test_a_desynced_or_forged_response_is_rejected`,
@@ -561,8 +563,8 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   `/proc/<pid>/fd/1` is additionally openable by any same-UID process subject to
   `ptrace_scope`/`hidepid`. What it **can** still do is force a kill-and-respawn, i.e. dead-letter
   messages on that inbound: a compromised worker can deny its own feed. (Since 2026-11-09 a frame
-  staged before a request costs that message one retry on a fresh worker rather than its dead-letter;
-  see AC-10.)
+  staged before a request costs that message a retry on a fresh worker, and in the cases AC-10's
+  amendment points to, its dead-letter too.)
 - **One Handler is not confined from another inside a worker.** All of an inbound's Routers/Handlers
   share one child and one `Registry`, so admin code can rebind a sibling in-process. This seam does
   not change that — `mode=off` shares an address space too — and any claim that the pipe protects
