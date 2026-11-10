@@ -358,12 +358,13 @@ from one added pointer to this amendment, at the end of its paragraph on what a 
   it may hold part of a frame. The worker's answer is a different case: a codec rejection of an
   answer still kills the worker, recorded as an invalid frame.
 - **A frame waiting before a request kills the worker and retries the message once on a fresh one**
-  (owner ruling 2026-11-09, #3135 step 4). The message never reached the worker. It
-  dead-letters in at least these cases: the fresh worker has a stray frame waiting too; a respawn
+  (owner ruling 2026-11-09, #3135 step 4). The message never reached the worker. Its
+  call fails, which the `[delivery] internal_error` policy then handles, in at least these cases:
+  the fresh worker has a stray frame waiting too; a respawn
   fails; the workers spawned for it keep exiting, or closing their pipe, before its request is
   written; and any fault the request itself meets on the fresh worker, as for any other message,
   such as a worker that exits as its request is written. A frame left after an answer can still
-  dead-letter the message it follows. [ADR 0087](0087-sandbox-subprocess-isolation.md) AC-10's
+  fail the call of the message it follows. [ADR 0087](0087-sandbox-subprocess-isolation.md) AC-10's
   2026-11-09 amendment says when each check runs, what a frame arriving later costs, and how the
   handling of a length header over the frame cap changed.
 - **Every kill records a cause from a closed set**, `KillCause` in `messagefoundry/pipeline/sandbox.py`,
@@ -419,7 +420,7 @@ argument above stands for every fault that does kill.
   > raises in at least the cases *Amendment B* lists. `test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`
   > was changed to pin that. A request outside the codec grammar still raises, and keeps the worker.
   >
-  > *Added 2026-11-10, not part of the ruling:* at least two forged frames that carry the request's id can fail to raise: a forged `ok` answer, and at `mode=isolated` a forged lookup. See [ADR 0087](0087-sandbox-subprocess-isolation.md) AC-10's 2026-11-09 amendment. Neither owner record cited there names this AC. A fix is to be added as a step on vault BACKLOG #3135.
+  > *Added 2026-11-10, not part of the ruling:* at least two forged frames that carry the request's id can fail to raise: a forged `ok` answer, and at `mode=isolated` a forged lookup. See [ADR 0087](0087-sandbox-subprocess-isolation.md) AC-10's 2026-11-09 amendment and `dispatch` in `messagefoundry/pipeline/sandbox.py`. Neither owner record cited there names this AC. A fix is to be added as a step on vault BACKLOG #3135.
 
 ## Consequences
 
