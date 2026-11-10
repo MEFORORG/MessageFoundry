@@ -216,7 +216,8 @@ def test_the_phi_passes_see_the_text_they_saw_before(line: str) -> None:
 #: (``state=``, ``?code=``, ``Token=``, ``MEFOR_X=``), a segment ID, a DICOM element, the userinfo
 #: opener, or the length of a base64 run. The word mask keeps each, so none may print.
 #:
-#: A key in these shapes and the mask-rule shapes below is spelled with no camelCase capital on its
+#: A key in these shapes, the mask-rule shapes and the seeded differential's member keys below is
+#: spelled with no camelCase capital on its
 #: credential word (``;Accesstoken=``, ``;KeyStorepwd=``). Since BACKLOG #5545 the label patterns
 #: read ``;AccessToken=`` and ``;KeyStorePwd=`` at the capital and hide the value before the member
 #: pass runs, so that spelling no longer reaches the word mask these shapes exist to exercise. The
@@ -425,7 +426,7 @@ _RULE_CONTROLS = (
 _DIFFERENTIAL_PIECES = (
     "mfb64:v1:", "amfb64:v1:", "x_mfb64:v1:", "mfb64:", ":v1:", "mfb64:v2:", "MFB64:v1:", "key=",
     '"family": ',
-    ";PWD=", ";sslpassword=", ";xpass=", ";AccessToken=", ";Token=", "password=", "password'=",
+    ";PWD=", ";sslpassword=", ";xpass=", ";Accesstoken=", ";Token=", "password=", "password'=",
     'password":', "secret=", "secret: ", "api_token=", "token=", "private_key=", "encryption_key={",
     "MEFOR_X=", "postgres://svc:", "@db", "%2Cpassword=", "Bearer ", "?code=", "&state=",
     "nonnumeric port: '", "PID|1||", "(0010,1000)", "MRN", "DOE^JOHN", "Jane Doe", "19800505",
@@ -440,7 +441,7 @@ _DIFFERENTIAL_PIECES = (
 #: end a base64 run or a line. The random block above holds the marker too rarely to find a defect
 #: in it: with each of the marker unit, the glued-word stop, the run end and the JSON key words
 #: switched off in turn, its 1,500 lines found none, and these 400 found 33, 30, 2 and 2 lines.
-_MEMBER_LED_KEYS = (";PWD=", ";sslpassword=", ";xpass=", ";AccessToken=")
+_MEMBER_LED_KEYS = (";PWD=", ";sslpassword=", ";xpass=", ";Accesstoken=")
 _MEMBER_LED_OPENERS = ("", "", "", '"family": ')
 _MEMBER_LED_PIECES = (
     "mfb64:v1:", "amfb64:v1:", "x_mfb64:v1:", "a1qkey=", "b2qtoken=", "c3q", "_", ".", "+", "/",

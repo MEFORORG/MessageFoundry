@@ -1106,7 +1106,13 @@ def test_every_applied_credential_pattern_has_a_contained_scan_prefix() -> None:
         "a lookbehind that fires inside a word run is not the label start, and is not containment"
     )
     # THE CAMELCASE START (BACKLOG #5545), both ways: shipped, it is contained; the same capital
-    # start without the lookahead that makes the label word end the run is flagged.
+    # start without the lookahead that makes the label word end the run is flagged. The exemption is
+    # by spelling, so the shipped constant is held to carrying that lookahead here, or an edit that
+    # dropped it would carry the exemption with it.
+    assert scrub_mod._CAMEL_START.endswith(
+        r"(?=(?i:" + scrub_mod._alternation(scrub_mod._CAMEL_WORDS) + r")\b)"
+    )
+    assert scrub_mod._LABEL_OR_CAMEL_START.endswith(r"|" + scrub_mod._CAMEL_START + r")")
     assert not _unbounded_scan_repeats(
         r"(?i)" + scrub_mod._LABEL_OR_CAMEL_START + r"[A-Za-z0-9]+[:=]"
     )

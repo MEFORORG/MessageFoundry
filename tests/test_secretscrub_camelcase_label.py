@@ -195,6 +195,8 @@ _COMPOUND_KEY_LINES = (
     f"storage init failed: storageAccountKey={_VALUE}",
     f'{{"accessKey": "zqid", "secretKey": "{_VALUE}"}}',
     f"cfg AUTHKEY={_VALUE}",
+    f'jwk load failed {{"privateKey": "{_VALUE}"}}',
+    f"smart: smartPrivateKey={_VALUE} encryptionKey=zq",
 )
 
 
@@ -251,6 +253,40 @@ def test_every_compound_key_word_is_a_stop_label() -> None:
             assert quoted.match(f'{spelling}="v w"'), spelling
             assert run_on.match(f"{spelling}= "), spelling
         line = f"token=x;{word}='{_VALUE} {_VALUE}'"
+        assert _VALUE not in scrub_credentials(line), line
+
+
+# --- Found by code review: the split walk must keep what the whole-run walk kept ------------------
+
+
+def test_the_walk_unit_takes_every_gate_fold_letter() -> None:
+    """``(?i)[A-Za-z0-9]`` takes the four fold letters, so the case-sensitive unit names them. Held to
+    ``_GATE_FOLDS``, the module's measured set, so the two cannot drift."""
+    unit = re.compile(secretscrub._RUN_UNIT)
+    for char, _letter in secretscrub._GATE_FOLDS:
+        assert unit.fullmatch(f"ab{char}cd"), hex(ord(char))
+
+
+#: Values opening on, or holding, a fold letter, each hidden on ``origin/main``. Built with ``chr``.
+_FOLD_LINES = (
+    (f"ValueError('login failed password={chr(0x131)}lk{_VALUE}')", _VALUE),
+    (f'error: "api_key={chr(0x130)}st{_VALUE}"', _VALUE),
+    (f'token=abc{chr(0x17F)}{_VALUE};password="v w"', _VALUE),
+    (f"password='pw1 s{chr(0x131)}{_VALUE} pw3, private_key='p w q'", _VALUE),
+)
+
+
+@pytest.mark.parametrize(("line", "value"), _FOLD_LINES, ids=ascii)
+def test_a_value_holding_a_fold_letter_is_still_walked_whole(line: str, value: str) -> None:
+    for name, apply in _SURFACES[:2]:
+        assert value not in apply(line), (name, ascii(apply(line)))
+
+
+def test_a_later_quoted_value_holding_a_camelcase_label_is_hidden_whole() -> None:
+    """The inner run-on walk keeps its whole ASCII run: split at a camelCase label inside the later
+    value, it refused the run-on, and the later value's head printed."""
+    for inner in ("userPwd= ", "isPass:"):
+        line = f"password='a, private_key='{_VALUE} {inner}zq2'"
         assert _VALUE not in scrub_credentials(line), line
 
 
