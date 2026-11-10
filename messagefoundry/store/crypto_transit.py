@@ -112,7 +112,7 @@ def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
     The audit HMAC keeps plain :class:`CipherError`; this split is for the data key alone.
 
     The outage's text is the key id and ``exc``'s type name only, a reply refusal's fixed text
-    included, because the upload routes log it; a refusal keeps :func:`vault_failure_text`.
+    left out, because the upload routes log it; a refusal keeps :func:`vault_failure_text`.
 
     Runs inside the caller's ``except``, so a classifier fault must not replace the type-only
     error: anything it raises reads as a refusal, the side the split keeps when it cannot tell."""

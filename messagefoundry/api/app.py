@@ -8730,6 +8730,11 @@ def create_app(
         "rotate-key reports it as unsealable, an operator can only delete it"
     )
 
+    _UPLOAD_UNAVAILABLE = (
+        "the store's key service could not complete the request, so nothing was read, stored or "
+        "removed. Try again shortly"
+    )
+
     class _UploadUnavailable(HTTPException):
         """BACKLOG #3734: the store cipher's key service (Vault Transit) gave no verdict on the
         file, so nothing was read, stored or removed and a later try may succeed. 503 with the
@@ -8737,22 +8742,27 @@ def create_app(
         to rotate-key or a delete for a file that is fine. Like the 423, the body names no file
         and no cipher detail.
 
-        Built from the TEXT of the store's error, never the error itself, so the 503 holds no link
-        to the Transit chain, whose request can carry a body. The text is logged at WARNING with
-        the operation, so an outage that blocks every upload is on the record. It is the cipher's
-        outage text, the key id and an exception type name (``crypto_transit._transit_failure``).
+        Built by :func:`_upload_unavailable`, which logs the store's error TEXT and keeps it off
+        the 503, so the 503 holds no link to the Transit chain, whose request can carry a body.
         Every caller raises it after its ``except`` clause has ended, so ``__context__`` is empty
-        too."""
+        too. ``args`` is set to ``(503, detail)`` here, because Starlette's ``__init__`` leaves it
+        as the call's own arguments; a copy or unpickle rebuilds it through ``cls(*args)``, which
+        logs nothing."""
 
-        def __init__(self, cause: str, op: str) -> None:
-            _log.warning("upload %s answered 503: %s", op, cause)
+        def __init__(self, *_rebuilt: object) -> None:
             super().__init__(
                 503,
-                "the store's key service could not complete the request, so nothing was read, "
-                "stored or removed. "
-                "Try again shortly",
+                _UPLOAD_UNAVAILABLE,
                 headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
             )
+            self.args = (503, _UPLOAD_UNAVAILABLE)
+
+    def _upload_unavailable(cause: str, op: str) -> _UploadUnavailable:
+        """The outage 503, logged once at WARNING with the operation, so an outage that blocks
+        every upload is on the record. ``cause`` is the cipher's outage text, the key id and an
+        exception type name (``crypto_transit._transit_failure``); it goes to the log only."""
+        _log.warning("upload %s answered 503: %s", op, cause)
+        return _UploadUnavailable()
 
     class _UploadSidecarRefused(HTTPException):
         """The 423 an override holder gets when an upload's sidecar is refused. Every other route
@@ -8789,7 +8799,7 @@ def create_app(
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
             # BACKLOG #3734: an outage, not the 423. Only its text is kept past this clause.
-            override_answer = partial(_UploadUnavailable, str(exc), op)
+            override_answer = partial(_upload_unavailable, str(exc), op)
         except UploadUnreadableError:
             override_answer = _UploadSidecarRefused
         if override_answer is not None:
@@ -8926,7 +8936,7 @@ def create_app(
             # BACKLOG #3734: nothing was written, so a retry stores the file once. Not audited as a
             # reject, because the file was not refused. Raised after the handler, from the text
             # alone, so no chain link reaches the Transit request (see _UploadUnavailable).
-            raise _UploadUnavailable(outage, "save")
+            raise _upload_unavailable(outage, "save")
         # Vault BACKLOG #3178: the creation row outlives the request, so a deadline that fires now
         # still leaves the stored file with its row. A row that cannot be written removes the file.
         #
@@ -9088,7 +9098,7 @@ def create_app(
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         if outage is not None:
-            raise _UploadUnavailable(outage, "browse")  # after the handler: no chain link
+            raise _upload_unavailable(outage, "browse")  # after the handler: no chain link
         result = await asyncio.to_thread(
             browse_messages,
             data,
@@ -9249,7 +9259,7 @@ def create_app(
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         if outage is not None:
-            raise _UploadUnavailable(outage, "resend")  # after the handler: no chain link
+            raise _upload_unavailable(outage, "resend")  # after the handler: no chain link
         parts = await asyncio.to_thread(split_uploaded, data)
         if body.index >= len(parts):
             raise HTTPException(
@@ -9381,7 +9391,7 @@ def create_app(
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         if outage is not None:
-            raise _UploadUnavailable(outage, "delete")  # after the handler: no chain link
+            raise _upload_unavailable(outage, "delete")  # after the handler: no chain link
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)
 
     # --- saved / layered Log-Search filter presets (BACKLOG #151, ADR 0136) --

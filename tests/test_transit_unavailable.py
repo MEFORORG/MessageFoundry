@@ -10,6 +10,7 @@ into the app, as ``tests/test_upload_api.py`` swaps a keyed one in. Synthetic HL
 from __future__ import annotations
 
 import base64
+import copy
 import logging
 import os
 import ssl
@@ -410,7 +411,7 @@ def _exceptions_held_by(raised: BaseException) -> list[BaseException]:
 
 
 async def test_the_outage_503_holds_no_link_to_the_transit_chain(
-    engine: Engine, tmp_path: Path
+    engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The 503 is built from the cause's text and raised after the handler, so its args, its
     ``__cause__`` and ``__context__`` and its traceback's frame locals hold no exception, and none
@@ -490,7 +491,15 @@ async def test_the_outage_503_holds_no_link_to_the_transit_chain(
         held = _exceptions_held_by(raised)
         assert not [e for e in held if _CHAIN_MARKER in repr(e)]
         assert held == [], [type(e).__name__ for e in held]
-        assert all(isinstance(a, str | int) for a in raised.args), raised.args
+        # The args are the status and the fixed detail, never the cause's text, and a copy, which
+        # rebuilds through cls(*args), logs nothing.
+        assert isinstance(raised, StarletteHTTPException)
+        assert raised.args == (503, raised.detail), raised.args
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+            copied = copy.copy(raised)
+        assert isinstance(copied, StarletteHTTPException) and copied.status_code == 503
+        assert copied.args == raised.args and not caplog.records
 
 
 # --- the web console --------------------------------------------------------------------------
