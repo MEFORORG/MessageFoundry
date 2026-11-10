@@ -767,8 +767,9 @@ def test_sqlserver_longer_post_commit_borrow_has_exactly_its_two_writes() -> Non
     """BACKLOG #3023: the SQL Server counterpart of the Postgres pin above. The longer post-commit
     borrow is reached from ``revoke_user_sessions`` directly and from ``rotate_session`` through
     ``_write_session_txn(after_commit=True)``, the only call passing that keyword; nothing else.
-    ``_borrow`` is called only by ``_acquire``, ``_acquire_after_commit`` and, for the cluster lease
-    claim's SHORTER limit (BACKLOG #1497), ``_acquire_clamped``; strict mypy keeps
+    ``_borrow`` is called only by ``_acquire``, ``_acquire_after_commit`` and, for the SHORTER limit
+    of the cluster coordinator's clamped statements (the lease claim since BACKLOG #1497, the
+    loop's other statements and the release writes since #5064), ``_acquire_clamped``; strict mypy keeps
     ``None`` out of its ``float`` limit. A third write moved onto the longer limit would pass every offline test, so
     its callers are pinned by name."""
     assert _sqlserver_functions_referencing("_acquire_after_commit") == [
@@ -779,7 +780,8 @@ def test_sqlserver_longer_post_commit_borrow_has_exactly_its_two_writes() -> Non
         " it too follows a committed write nothing retries, then update this pin"
     )
     assert _sqlserver_functions_referencing("after_commit") == ["rotate_session"]
-    # BACKLOG #1497 added a SHORTER borrow for the cluster lease claim; pinned the same way.
+    # BACKLOG #1497 added a SHORTER borrow for the cluster lease claim, which #5064 widened to the
+    # coordinator's other clamped statements; pinned the same way.
     assert _sqlserver_functions_referencing("_borrow") == [
         "_acquire",
         "_acquire_after_commit",
