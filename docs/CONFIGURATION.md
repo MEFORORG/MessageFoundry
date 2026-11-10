@@ -1890,10 +1890,11 @@ whether a reminder landed, by design: a process that is still paused but whose r
 reaching the store has its alert resolved while its intake stays paused.** At least a process cut
 off from the store, one whose reminder writes keep failing, and one whose intake check keeps
 raising do that. Its first reminder that lands again opens a new alert. A process whose alert
-the sweep resolved keeps the in-memory suspend and occurrence count it held for that subject, so
-its later notifications for the subject can be muted until the suspend ends, or escalate (vault
-BACKLOG #8190). So an alert expires only while some other engine process with an
-alert sink runs on the same store; no process expires its own. A process stopped for longer than 20
+the sweep resolved keeps the in-memory suspend, occurrence count and notification cooldown it
+held for that subject, so its later notifications for the subject can be muted until the suspend
+ends, held back by the cooldown, or escalate (vault BACKLOG #8190). Since no process expires its
+own alert, an alert expires only while some other engine process with an alert sink runs on the
+same store. A process stopped for longer than 20
 minutes, plus any stretch failed checks add, while another runs finds its pause resolved, and a pause that still holds when it starts
 opens a new alert. An operator's acknowledgement on the old alert goes with it, as it does on any
 other auto-resolve. An alert that nothing expires, such as a lone engine's whose own clear did not

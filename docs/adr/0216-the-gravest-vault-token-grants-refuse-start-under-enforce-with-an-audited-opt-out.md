@@ -165,7 +165,7 @@ it the notifier, or the logging sink when no notifier is configured.
   map, fenced as the
   [ADR 0044 vault BACKLOG #4916 amendment](0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916)
   states; [SECURITY.md](../SECURITY.md#each-backend-hops-least-privilege-the-engine-probes-the-store-vault-and-ldap),
-  *When a clean start resolves the warning*, says what to do with a warning still open.
+  *A warning still open after a clean start*, says what to do with one.
 - **The subject is the hop**, `vault:store` or `vault:secrets`. Keying it by the token's policies
   was rejected: the usual fix is a new token with other policies, and its clean start would never
   resolve the old warning. The cost, stated rather than fixed: engine processes that share one

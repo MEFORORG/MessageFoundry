@@ -383,9 +383,10 @@ column on all three backends holding a random id each notifier draws once per pr
 
 A fenced auto-resolve (`resolve_alert_instances_fenced`) closes the key's live instance only when
 it is the instance the resolve's snapshot saw with no raise past the snapshot's count, or its
-newest raise is the resolving process's own. So a raise another process lands after the snapshot
-keeps the instance open, unless the resolving process's own raise is newer. No clock is compared:
+newest raise is this run's own raise (`raised_by` is drawn once per run, so an earlier run's raise
+is matched only through the snapshot). So a raise another process lands after the snapshot keeps
+the instance open, unless this run's own raise is newer. No clock is compared:
 the `last_seen <= now` guard the PR for #3756 declined (decision d20261030T211551515-1de84e) would
 leave an alert open for good under cross-node clock skew. The code is the authority for the
-rest: `_ResolveFence` and `NotifierAlertSink._run_state` in
-`messagefoundry/pipeline/alert_sinks.py`.
+rest: `messagefoundry/pipeline/alert_sinks.py` (`_ResolveFence`, `NotifierAlertSink._run_state`,
+`_record_state`, `_resolve_settled`) and `connection_started`.

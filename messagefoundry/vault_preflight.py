@@ -26,8 +26,7 @@ the store preflight's ``store_privilege_warning`` does; a hop read clean fires
 hop. The subject is the hop alone (:func:`vault_privilege_alert_subject`), never anything about the
 token, so processes that share one store share each hop's alert: a clean start by one can resolve
 the warning another raised on a different token. ``docs/SECURITY.md`` (*Each backend hop's least
-privilege*, *When a clean start resolves the warning*) says what to do with a warning
-still open after a clean start.
+privilege*, *A warning still open after a clean start*) says what to do with one.
 
 **Nothing secret is written.** A hop's detail names policy names, paths and capabilities, never a
 token, an accessor or a digest of either; the log line escapes every control character a server

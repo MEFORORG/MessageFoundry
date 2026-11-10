@@ -1250,13 +1250,15 @@ about the token, because a fix is usually a new token: so engine processes that 
 share each hop's alert, and a clean start by one can resolve a warning another raised on a
 different token.
 
-**When a clean start resolves the warning.** A clean start can leave another process's warning
+**A warning still open after a clean start.** A clean start can leave another process's warning
 open ([ADR 0044, the vault BACKLOG #4916 amendment](adr/0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916)).
-Treat an open warning as live until every engine process that probes that hop has started clean
-since its token was fixed, and its start was handled by a resolving notifier, meaning an
-`[alerts]` transport such as a webhook or email. With no transport configured, a start gets the
-logging sink, which resolves nothing. The check runs only at start, so a token fixed since a
-process started is judged only at that process's next start.
+Treat an open warning as live until you have found and fixed its cause, which may be the token,
+reachability or the probe paths. Neither the log line nor the audit row names the process that
+raised or cleared it, and engine shards share one log, so check each process's configuration and
+restart it after the fix: the probe runs only at start. A start whose process has no `[alerts]`
+transport, such as a webhook or email, gets the logging sink, which resolves nothing. A resolve
+can also fail to land; one that gives up logs an ERROR starting `alert-instance resolve gave up`.
+If the cause is fixed and the warning is still open, resolve it in the alert list.
 
 The log line and the audit row of every start stay the record.
 
