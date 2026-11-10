@@ -294,6 +294,25 @@ async def test_a_user_summary_withholds_the_scope_unless_asked(engine: Engine) -
     assert shown.channel_scope_withheld is False
 
 
+async def test_the_console_seam_user_summary_keeps_the_disclosing_default(engine: Engine) -> None:
+    """Vault BACKLOG #3748 item 5: the console calls ``user_summary`` only on its users:manage
+    pages, and the seam digest records no parameter default, so a console from before the flip
+    still mounts. The seam's callable therefore keeps disclosing when the argument is left out."""
+    from fastapi import FastAPI
+
+    from messagefoundry.api.auth_routes import add_auth_routes
+    from messagefoundry.api.security import AuthenticatedBeforeBodyRoute
+
+    service = await _service(engine)
+    user_id = await _user(service, "other", [Role.OPERATOR.value], [THEIRS])
+    user = await service.store.get_user(user_id)
+    assert user is not None
+    app = FastAPI()
+    app.router.route_class = AuthenticatedBeforeBodyRoute
+    shown = add_auth_routes(app).user_summary(user, [])
+    assert shown.channel_scope == [THEIRS] and shown.channel_scope_withheld is False
+
+
 async def test_the_users_manage_create_routes_still_show_the_scope(engine: Engine) -> None:
     """Vault BACKLOG #3748 item 5: the ``users:manage`` routes that build a summary pass
     ``show_scope=True`` now that the default withholds, so their answer says the scope is shown."""
@@ -341,8 +360,10 @@ async def test_a_scope_change_row_withholds_its_channels_from_a_reader_without_u
     assert json.loads(whole["detail"])["channels"] == [THEIRS]
 
 
-def test_a_scope_row_detail_that_is_not_an_object_is_withheld_whole() -> None:
-    """Vault BACKLOG #3748 item 6: a detail that cannot be shown to hold no list is withheld."""
+def test_a_withheld_scope_row_has_one_shape_whatever_it_held() -> None:
+    """Vault BACKLOG #3748 item 6: a withheld row keeps only the keys known to hold no scope, so a
+    withdraw, which adds ``withdrawn``, reads as a set does, a key a later writer adds is withheld,
+    and a detail that is not an object reads as withheld, never as a stored null."""
     from messagefoundry.auth.audit_visibility import audit_detail_for
     from messagefoundry.auth.identity import AuthProvider, Identity
     from messagefoundry.auth.permissions import permissions_for_roles
@@ -354,8 +375,15 @@ def test_a_scope_row_detail_that_is_not_an_object_is_withheld_whole() -> None:
         roles=frozenset({Role.AUDITOR}),
         permissions=permissions_for_roles([Role.AUDITOR]),
     )
-    assert audit_detail_for(reader, "user.channel_scope_changed", "[1]") is None
-    assert audit_detail_for(reader, "user.channel_scope_changed", "not json") is None
+    withheld = {"channels": "withheld"}
+    withdraw = json.dumps({"channels": None, "withdrawn": [THEIRS]})
+    set_one = json.dumps({"channels": [THEIRS]})
+    for detail in (withdraw, set_one, "[1]", "not json"):
+        shown = audit_detail_for(reader, "auth.ad_scope_resynced", detail)
+        assert shown is not None and json.loads(shown) == withheld, detail
+    added = json.dumps({"user_id": "x", "channels": [THEIRS], "previous": [THEIRS]})
+    shown = audit_detail_for(reader, "user.channel_scope_changed", added)
+    assert shown is not None and json.loads(shown) == {"user_id": "x", **withheld}
     assert audit_detail_for(reader, "auth.login_failed", "not json") == "not json"
 
 

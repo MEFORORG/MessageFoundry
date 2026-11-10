@@ -153,18 +153,20 @@ HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE: Final = AuditExclusion(
 CHANNEL_LIST_ACTIONS: Final[frozenset[str]] = frozenset(
     {"user.channel_scope_changed", "auth.ad_scope_resynced"}
 )
-#: The detail keys of those rows that hold a channel list.
-_CHANNEL_LIST_KEYS: Final = ("channels", "withdrawn")
+#: The detail keys of those rows that are shown as written. An allowlist, so a key a later writer
+#: adds is withheld until someone decides it holds no scope.
+_SHOWN_KEYS: Final = ("user_id",)
 #: What a withheld list reads as. A string, so it cannot be read as a stored ``null``, which
 #: denies, or as a list.
 CHANNELS_WITHHELD: Final = "withheld"
 
 
 def audit_detail_for(identity: Identity, action: str, detail: str | None) -> str | None:
-    """``detail`` as ``identity`` may read it: a :data:`CHANNEL_LIST_ACTIONS` row's channel lists
-    read as :data:`CHANNELS_WITHHELD` for a reader without ``users:manage``, and every other row
-    is returned unchanged. A detail that is not a JSON object is withheld whole, as ``None``,
-    since it cannot be shown to hold no list."""
+    """``detail`` as ``identity`` may read it. For a reader without ``users:manage``, a
+    :data:`CHANNEL_LIST_ACTIONS` row reads as its :data:`_SHOWN_KEYS` and ``"channels"`` set to
+    :data:`CHANNELS_WITHHELD`, whatever else it held. So every such row has one shape, and a
+    withdrawn scope, which adds a ``withdrawn`` key, cannot be told from a set one. A detail that
+    is not a JSON object reads the same way, with no shown keys. Every other row is unchanged."""
     if (
         action not in CHANNEL_LIST_ACTIONS
         or detail is None
@@ -174,15 +176,13 @@ def audit_detail_for(identity: Identity, action: str, detail: str | None) -> str
     try:
         parsed = json.loads(detail)
     except ValueError:
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    return json.dumps(
-        {
-            key: CHANNELS_WITHHELD if key in _CHANNEL_LIST_KEYS else value
-            for key, value in parsed.items()
-        }
+        parsed = None
+    shown = (
+        {key: parsed[key] for key in _SHOWN_KEYS if key in parsed}
+        if isinstance(parsed, dict)
+        else {}
     )
+    return json.dumps({**shown, "channels": CHANNELS_WITHHELD})
 
 
 def audit_exclusion_for(identity: Identity) -> AuditExclusion | None:

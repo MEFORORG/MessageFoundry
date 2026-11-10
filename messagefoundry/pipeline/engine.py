@@ -3608,7 +3608,9 @@ class Engine:
             fingerprint=fingerprint,
             config_version=config_version,
             restart_required=restart_required,
-            # Not copied again: the runner already holds its own copy of these.
+            # The values this reload applied, not copied again. On a first load, or with no
+            # provider, this is the engine's own dict, which nothing changes in place: a reload
+            # rebinds it.
             env_values=env_values,
         )
 

@@ -2211,8 +2211,9 @@ class _LoadedConfig:
     directory or digest at the write. What a row does read at the write includes at least the
     cluster node id, which is fixed for the life of the process, and, for the ``superseded``
     checks, which ask about the live state on purpose, the loaded fingerprint's identity (a
-    reload's row) and the live graph's identity (the start's row). The start row also reads the
-    settings the app stashed, for its loosenings; a reload changes none of them."""
+    reload's row) and the live graph's identity (the start's row). The start row and a cluster
+    convergence reload's row also read the settings the app stashed, and the store's audit-chain
+    keying, for their loosenings (vault BACKLOG #3814); a reload changes none of the settings."""
 
     directory: str | None
     shard: str | None
@@ -2527,8 +2528,18 @@ async def _record_reload_audit(
 
     async def write() -> None:
         nonlocal detail
-        # Before the superseded check below, so no await falls between that check and the write.
-        listed = {"loosenings": await loosenings()} if loosenings is not None else {}
+        listed: dict[str, object] = {}
+        if loosenings is not None:
+            # A first build before the read, so a row the read's cancel cuts off still has its
+            # detail on the lost-row line. Rebuilt below with the list.
+            detail = build(listed)
+            # Before the superseded check in the rebuild, so no await falls between it and the
+            # write.
+            listed = {"loosenings": await loosenings()}
+        detail = build(listed)
+        await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
+
+    def build(listed: Mapping[str, object]) -> str:
         superseded = False
         config_version: int | None = None
         state: _LoadedConfig | None
@@ -2554,7 +2565,7 @@ async def _record_reload_audit(
             }
         )
         digest = (state.fingerprint or {}) if state is not None else {}
-        detail = json.dumps(
+        return json.dumps(
             {
                 **named,
                 "dry_run": False,
@@ -2566,7 +2577,6 @@ async def _record_reload_audit(
                 **digest,
             }
         )
-        await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
 
     written = await write_audit_soft(
         # A shutdown drain's cancel waits a bounded time for the row (BACKLOG #3157).

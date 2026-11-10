@@ -17,6 +17,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Sequence
+from functools import partial
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -2178,8 +2179,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ``offset`` is the numbered pager's position (BACKLOG #2438).
 
         Every filter value is passed as a keyword to the store, which binds it as a SQL parameter
-        across all three backends (BACKLOG #170) -- never string-interpolated into the query."""
-        return await service.store.list_audit(
+        across all three backends (BACKLOG #170) -- never string-interpolated into the query.
+
+        Each row's ``detail`` is the one ``identity`` may read (:func:`audit_detail_for`), so a
+        scope change's channel list is withheld here for every caller too (vault BACKLOG #3748)."""
+        rows = await service.store.list_audit(
             limit=limit,
             actor=actor,
             action=action,
@@ -2189,6 +2193,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             before_id=before_id,
             offset=offset,
         )
+        return [
+            {**row, "detail": audit_detail_for(identity, row["action"], row["detail"])}
+            for row in rows
+        ]
 
     async def _count_audit(
         service: AuthService,
@@ -2264,8 +2272,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                     action=r["action"],
                     client=r["client"],
                     channel_id=r["channel_id"],
-                    # Vault BACKLOG #3748 item 6: a scope change's channel list, by permission.
-                    detail=audit_detail_for(identity, r["action"], r["detail"]),
+                    detail=r["detail"],
                 )
                 for r in rows
             ],
@@ -2509,10 +2516,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                                 r["action"],
                                 r["channel_id"],
                                 r["client"],
-                                # As GET /audit reads it (vault BACKLOG #3748 item 6). The
-                                # starting identity's, as the rows are; a lost users:manage
-                                # stops the export above.
-                                audit_detail_for(identity, r["action"], r["detail"]),
+                                r["detail"],
                             )
                         ]
                         for r in page[:remaining]
@@ -2584,7 +2588,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         list_audit=_audit_ui_list,
         export_audit=export_audit,
         my_security_events=my_security_events,
-        user_summary=_user_summary,
+        # The console calls this only on its users:manage pages. The seam keeps the disclosing
+        # default those calls were written against (vault BACKLOG #3748 item 5): the seam digest
+        # records no parameter default, so a console from before the engine's default flipped
+        # mounts on this engine, and with the withholding default its user page would read the
+        # scope as deny-all and offer to save that over the real one.
+        user_summary=partial(_user_summary, show_scope=True),
         federated_identity_view=_federated_identity_view,
         current_user=_current_user,
     )
