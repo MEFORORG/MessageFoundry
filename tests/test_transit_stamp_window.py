@@ -601,3 +601,35 @@ async def test_an_unverifiable_answer_at_the_rotation_revokes_the_stamped_hash(
         await _revoked_unanswered(store, service, token)
     finally:
         await store.close()
+
+
+# --- CLAUDE.md section 9: the window's revoke logs no message text or traceback at WARNING --------
+
+
+async def test_the_window_revoke_logs_the_class_and_ref_only(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A defect whose message names a row value is revoked by the window; at WARNING the log names
+    the class and the session's 12-character ref, with no message and no traceback."""
+    import logging
+
+    store, service = await _service()
+    try:
+        token, secret, t1 = await _pre_mfa(service, monkeypatch)
+        monkeypatch.setattr(
+            store, "record_login_success", _raising(KeyError("synthetic-row-value-7f3a"))
+        )
+        caplog.set_level(logging.DEBUG, logger="messagefoundry.auth.service")
+        with pytest.raises(KeyError):
+            await service.verify_mfa(token, totp.totp(secret, now=t1))
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        window = [r for r in warnings if "stamp window ended" in r.getMessage()]
+        assert len(window) == 1
+        assert "KeyError" in window[0].getMessage()
+        assert hash_token(token)[:12] in window[0].getMessage()
+        for record in warnings:
+            assert "synthetic-row-value-7f3a" not in record.getMessage()
+            assert record.exc_info is None
+        assert any(r.levelno == logging.DEBUG and r.exc_info is not None for r in caplog.records)
+    finally:
+        await store.close()

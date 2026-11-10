@@ -700,7 +700,8 @@ async def test_the_restore_revoke_audits_its_refusals_after_it_commits(
 @pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
 async def test_a_server_revoke_holds_each_refusal_for_its_report(backend: str) -> None:
     """The server twins take a Forged and an Unverifiable raise into the outcome, for the report
-    each public revoke runs after its commit; an Outage is paged at once, not held."""
+    each public revoke runs after its commit. An Outage is held too, and paged by that report
+    (decision d20261110T004916856-814db8, Q5)."""
     store = _server(backend)
     answers = iter([_raise(RowSealError), _raise(TransitSealUnverifiableError)])
 
@@ -778,7 +779,7 @@ def test_a_surrogate_bearing_id_pages_rather_than_raising() -> None:
         return len(value).to_bytes(4, "big") + value
 
     strict = hashlib.sha256(part(b"user") + part("u-\u00e9".encode())).hexdigest()
-    assert seal_row_digest("user", "U-\u00c9") == strict
+    assert seal_row_digest("user", "u-\u00e9") == strict  # as stored, never case-folded
 
 
 def test_a_held_refusal_keeps_its_whole_id_out_of_the_repr() -> None:
@@ -887,3 +888,89 @@ async def test_a_cancel_after_the_commit_drops_no_page() -> None:
         await task
     assert len(written) == 2
     assert len(seen) == 3  # the Outage, then one page per held refusal
+
+
+# --- the ref rule (ADR 0217, *A ref is for reading*): as stored, scrubbed, bounded ----------------
+
+
+def test_ids_that_differ_only_by_case_key_and_page_apart() -> None:
+    """The digest is of the id as stored, so a planted ``U-1`` beside a genuine ``u-1`` on a
+    case-sensitive collation is its own cap key and its own subject."""
+    from messagefoundry.store.row_seal import seal_row_digest, seal_row_ref, unverifiable_subject
+
+    assert seal_row_digest("user", "U-1") != seal_row_digest("user", "u-1")
+    assert unverifiable_subject("user", "U-1") != unverifiable_subject("user", "u-1")
+    assert seal_row_ref("user", "U-1") == "U-1"
+
+
+@pytest.mark.parametrize("planted", ["u-\udcff", "u-\x07\u202e1"], ids=["surrogate", "control"])
+def test_a_planted_id_pages_through_a_sink_that_encodes_the_subject(planted: str) -> None:
+    """A sink that encodes its subject strictly, as a mail header or a driver insert does, takes
+    the named page of a row whose stored id carries a lone surrogate or a control character: the
+    ref is escaped, and bounded, before it reaches the subject or the reason."""
+    from messagefoundry.store.row_seal import SealPager, seal_row_ref, unverifiable_subject
+
+    seen: list[str] = []
+
+    def strict(subject: str, reason: str) -> None:
+        subject.encode("ascii")
+        reason.encode("ascii")
+        seen.append(subject)
+
+    pager = SealPager()
+    pager.arm(strict)
+    ref = seal_row_ref("user", planted)
+    pager.unverifiable("user", planted, f"synthetic ({ref})")
+    assert seen == [unverifiable_subject("user", planted)]
+    assert ref.isascii() and ref.isprintable()
+    assert len(seal_row_ref("user", "u" * 500)) <= 64
+
+
+def test_a_named_page_the_sink_refuses_falls_back_to_the_shared_subject() -> None:
+    """A named Unverifiable page the hook raises on still pages, under ``<prefix>:*``, so a planted
+    row cannot suppress its own page; no named slot is spent."""
+    from messagefoundry.store.row_seal import UNVERIFIABLE_SUBJECT_PREFIX, SealPager
+
+    seen: list[str] = []
+
+    def refuses_named(subject: str, reason: str) -> None:
+        if not subject.endswith(":*"):
+            raise UnicodeEncodeError("ascii", subject, 0, 1, "synthetic sink refusal")
+        seen.append(subject)
+
+    pager = SealPager()
+    pager.arm(refuses_named)
+    pager.unverifiable("user", "u-1", "synthetic")
+    assert seen == [f"{UNVERIFIABLE_SUBJECT_PREFIX}:*"]
+
+
+async def test_the_skipped_raise_count_is_logged_after_the_commit(tmp_path: Path) -> None:
+    """``log_skipped``'s "every session is still ended" is logged once the revoke has committed."""
+    store = await MessageStore.open(
+        tmp_path / "skipped.db", cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    backend = FakeBackend()
+    try:
+        store._row_sealer = TransitRowSealer(backend)
+        for user in ("u-1", "u-2", "u-3"):
+            await _user(store, user)
+            await _session(store, user)
+        store._row_sealer = TransitRowSealer(backend)  # nothing cached: the raises meet Transit
+        in_txn: list[bool] = []
+        log_skipped = RevokeSealOutcome.log_skipped
+
+        def watched(self: RevokeSealOutcome) -> None:
+            if self.skipped:
+                in_txn.append(bool(store._db.in_transaction))
+            log_skipped(self)
+
+        RevokeSealOutcome.log_skipped = watched  # type: ignore[method-assign]
+        backend.down = True
+        try:
+            await store.revoke_all_sessions()
+        finally:
+            backend.down = False
+            RevokeSealOutcome.log_skipped = log_skipped  # type: ignore[method-assign]
+        assert in_txn == [False]
+    finally:
+        await store.close()

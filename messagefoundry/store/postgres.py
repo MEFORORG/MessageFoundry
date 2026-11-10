@@ -11025,7 +11025,6 @@ class PostgresStore:
                 str(row["id"]): await self._bump_session_epoch(conn, str(row["id"]), outcome)
                 for row in await conn.fetch("SELECT id FROM users ORDER BY id")
             }
-            outcome.log_skipped()
             status = await conn.execute(_PG_REVOKE_ALL_SESSIONS_SQL, now, except_token_hash)
             revoked = _rowcount(status)
             if except_token_hash is None:

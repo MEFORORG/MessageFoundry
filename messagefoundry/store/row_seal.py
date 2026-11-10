@@ -49,6 +49,7 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Final, Protocol
 
+from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.store.crypto import (
     NO_STORE_ID,
     Cipher,
@@ -59,6 +60,7 @@ from messagefoundry.store.crypto import (
 from messagefoundry.store.crypto import (
     TransitSealRefused as TransitSealRefused,
 )
+from messagefoundry.subject_checksum import shorten_with_checksum
 
 log = logging.getLogger(__name__)
 
@@ -974,21 +976,38 @@ SealPageHook = Callable[[str, str], None]
 
 
 def seal_row_digest(kind: str, ident: str) -> str:
-    """The SHA-256, in hex, of ``kind`` and the WHOLE stored id, case-folded so one row has one key
-    on a case-insensitive collation (ADR 0217, *A ref is for reading*). A throttle and the cap key on
-    it; only its first 16 characters ever reach a subject, and it is never logged. The id is encoded
+    """The SHA-256, in hex, of ``kind`` and the WHOLE stored id, as stored (ADR 0217, *A ref is for
+    reading*): two rows whose ids differ only by case are two keys, so a planted ``U-1`` beside a
+    genuine ``u-1`` on a case-sensitive collation pages apart. A throttle and the cap key on it;
+    only its first 16 characters ever reach a subject, and it is never logged. The id is encoded
     with ``surrogatepass``, as :func:`seal_bytes` encodes a driver-decoded value, so a lone surrogate
     a driver let through keys a row rather than raising out of a page that must not raise; every
     well-formed id encodes to the same bytes as strict UTF-8."""
-    folded = ident.casefold().encode("utf-8", "surrogatepass")
-    return hashlib.sha256(_part(kind.encode()) + _part(folded)).hexdigest()
+    stored = ident.encode("utf-8", "surrogatepass")
+    return hashlib.sha256(_part(kind.encode()) + _part(stored)).hexdigest()
+
+
+#: The longest readable ref a non-session row's stored id becomes in a subject or reason, after
+#: control characters are escaped (ADR 0217, *A ref is for reading*).
+_ROW_REF_MAX: Final = 64
+
+
+def seal_row_ref(kind: str, ident: str) -> str:
+    """A row's readable ref, the one form every subject, reason and session audit field uses (ADR
+    0217, *A ref is for reading*): a session's is its token hash's first 12 characters; any other
+    row's is its stored id, which a database writer chooses, with control characters and lone
+    surrogates escaped (:func:`~messagefoundry.controlchars.scrub_control_chars`) and bounded with
+    :func:`~messagefoundry.subject_checksum.shorten_with_checksum`. Never case-folded."""
+    if kind == SESSION_KIND:
+        return scrub_control_chars(ident[:_SUBJECT_REF_LEN])
+    return shorten_with_checksum(scrub_control_chars(ident), _ROW_REF_MAX)
 
 
 def unverifiable_subject(kind: str, ident: str) -> str:
     """``<prefix>:<kind>:<readable ref>:<digest suffix>`` for an Unverifiable row (ADR 0217, *A ref
-    is for reading*): the ref is the id's first 12 characters, the suffix the first 16 hex
-    characters of :func:`seal_row_digest`, so a planted row copying a genuine ref pages apart."""
-    ref = ident.casefold()[:_SUBJECT_REF_LEN]
+    is for reading*): the ref is :func:`seal_row_ref`, the suffix the first 16 hex characters of
+    :func:`seal_row_digest`, so a planted row copying a genuine ref pages apart."""
+    ref = seal_row_ref(kind, ident)
     return f"{UNVERIFIABLE_SUBJECT_PREFIX}:{kind}:{ref}:{seal_row_digest(kind, ident)[:16]}"
 
 
@@ -1048,7 +1067,9 @@ class SealPager:
         """Page an Unverifiable row under its own subject while fewer than
         :data:`UNVERIFIABLE_SUBJECT_CAP` distinct rows have this window
         (:data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`), else under the shared ``<prefix>:*``. A
-        slot is spent only on a page a hook took, keyed by the whole digest."""
+        slot is spent only on a page a hook took, keyed by the whole digest. A named page the hook
+        refused (a sink that cannot encode the subject, say) falls back to the shared subject, so
+        a planted row cannot suppress its own page."""
         if not self._hooks:
             return
         now = time.monotonic()
@@ -1057,9 +1078,9 @@ class SealPager:
             if at <= cutoff:
                 del self._named[key]
         key = seal_row_digest(kind, ident)
-        if key in self._named or len(self._named) < UNVERIFIABLE_SUBJECT_CAP:
-            if self.page(unverifiable_subject(kind, ident), reason):
-                self._named[key] = now
+        named = key in self._named or len(self._named) < UNVERIFIABLE_SUBJECT_CAP
+        if named and self.page(unverifiable_subject(kind, ident), reason):
+            self._named[key] = now
             return
         self.page(f"{UNVERIFIABLE_SUBJECT_PREFIX}:*", reason)
 

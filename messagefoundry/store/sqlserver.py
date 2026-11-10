@@ -15952,7 +15952,6 @@ class SqlServerStore:
                     str(user_id): await self._bump_session_epoch(cur, str(user_id), outcome)
                     for (user_id,) in await cur.fetchall()
                 }
-                outcome.log_skipped()
                 if except_token_hash is None:
                     await cur.execute(_MSSQL_REVOKE_ALL_SESSIONS_SQL, (now,))
                 else:

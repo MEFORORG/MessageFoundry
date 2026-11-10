@@ -200,6 +200,7 @@ from messagefoundry.store.row_seal import (
     revoke_seal_refusals,
     row_sealer_for_cipher,
     seal_bytes,
+    seal_row_ref,
     transit_seal_refusals,
 )
 from messagefoundry.store.schema_verify import (
@@ -1638,7 +1639,9 @@ class RevokeSealOutcome:
         task.result()
 
     async def _report(self, record_audit: Callable[..., Awaitable[object]]) -> None:
-        """:meth:`report`'s body, run to completion under its shield."""
+        """:meth:`report`'s body, run to completion under its shield. The skipped-raise count is
+        logged here, after the commit, since its "every session is still ended" is true only then."""
+        self.log_skipped()
         outages, self.outages = self.outages, []
         if self.pager is not None:
             for what in outages:
@@ -1651,10 +1654,10 @@ class RevokeSealOutcome:
 
         refusals, self.refusals = self.refusals, []
         for refusal in refusals:
-            ref = refusal.ident.casefold()[:12]
+            ref = seal_row_ref(refusal.kind, refusal.ident)
             detail: dict[str, object] = {"kind": refusal.kind, "during": "revoke"}
             if refusal.kind == SESSION_KIND:
-                detail["session"] = refusal.ident[:12]
+                detail["session"] = ref  # the same form the page names it by
             else:
                 detail["user_id"] = refusal.ident
             if refusal.unverifiable:
@@ -19239,7 +19242,6 @@ class MessageStore:
             str(row[0]): await self._bump_session_epoch(str(row[0]), outcome)
             for row in await cur.fetchall()
         }
-        outcome.log_skipped()
         # Spelled at the call, not built from a constant, so the BEGIN guard in
         # `tests/test_writer_txn_is_the_only_begin.py` can read it.
         cur = await self._db.execute(

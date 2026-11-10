@@ -10483,7 +10483,12 @@ class AuthService:
             return new_token
 
     async def _revoke_unrotated(
-        self, old_hash: str, new_hash: str | None, cause: BaseException
+        self,
+        old_hash: str,
+        new_hash: str | None,
+        cause: BaseException,
+        *,
+        window: bool = False,
     ) -> bool:
         """Revoke a session whose rotation the store refused, or a Transit Outage refused (owner
         ruling 2026-11-08), under ``old_hash`` and, when a re-key was attempted, ``new_hash``;
@@ -10493,7 +10498,12 @@ class AuthService:
 
         Each revoke is the ordinary, bounded ``revoke_session``. It has other callers that do not
         follow a committed write, so it is not moved onto a store's longer post-commit borrow
-        here, and at the acquire limit it can be refused while the pool is still short."""
+        here, and at the acquire limit it can be refused while the pool is still short.
+
+        ``window`` is the stamp window's revoke (:meth:`_revoke_stamped_shielded`), which takes
+        every exception, code defects and cancels included, so a cause's message may carry a row
+        value (CLAUDE.md section 9). There the WARNING names the cause's class and the session's
+        12-character ref only, with no message and no traceback; the traceback goes at DEBUG."""
         refused: list[str] = []
         for token_hash in (old_hash, new_hash):
             if token_hash is None:
@@ -10505,6 +10515,15 @@ class AuthService:
         outcome = (
             f"a revoke was refused too ({', '.join(refused)})" if refused else "it was revoked"
         )
+        if window:
+            _log.warning(
+                "auth: a stamp window ended on %s (session %s); %s",
+                type(cause).__name__,
+                old_hash[:_SESSION_REF_LEN],
+                outcome,
+            )
+            _log.debug("auth: the stamp window's cause", exc_info=cause)
+            return not refused
         _log.warning(
             "auth: a session rotation, or a step before it, was refused by %s (%s); %s",
             "the Transit sealer"
@@ -10903,7 +10922,7 @@ class AuthService:
 
         async def revoke() -> None:
             try:
-                landed.append(await self._revoke_unrotated(token_hash, None, cause))
+                landed.append(await self._revoke_unrotated(token_hash, None, cause, window=True))
             except Exception:  # noqa: BLE001 -- best effort: the window's exception stands
                 _log.exception("auth: the stamp window's revoke failed; the window's error stands")
 
