@@ -753,6 +753,33 @@ def test_occupied_worktree_is_never_pruned(fx: Fixture, sleeper: int) -> None:
     assert by_leaf(res, "clean")["Outcome"] == "removed"
 
 
+@pytest.mark.parametrize("case", ["hidden", "bracketed-name"])
+def test_a_record_the_registry_skipped_or_read_as_a_pattern_still_vetoes(
+    fx: Fixture, sleeper: int, case: str
+) -> None:
+    """Vault BACKLOG #2985. The session registry listed records without -Force, so it skipped a hidden
+    one, and read each with a positional Get-Content, so [1].json was read as 1.json. At 0a7ccdca1c
+    either one pruned an occupied tree. The registry lists with -Force and reads literally now."""
+    sessions = fx.cfg / "sessions"
+    fx.write_session(pid=sleeper, cwd=fx.sibling("gone"), session_id="bbbbbbbb-2222")
+    occupant = sessions / ("2.json" if case == "hidden" else "[1].json")
+    (sessions / f"{sleeper}.json").rename(occupant)
+    live_record(fx, sleeper, fx.primary)
+    if case == "hidden":
+        subprocess.run(["attrib", "+h", str(occupant)], check=True, capture_output=True)
+    else:
+        shutil.copyfile(sessions / f"{sleeper}.json", sessions / "1.json")
+
+    res = run(fx, "-Apply", "-IdleHours", "0")
+    d = by_leaf(res, "gone")
+    assert d["Decision"] == "SKIP", d
+    assert d["Occupants"][0]["Short"] == "bbbbbbbb", d
+    assert d["Occupants"][0]["State"] == "LIVE", d
+    assert fx.sibling("gone").exists()
+    # Positive control in the same invocation: the run was capable of removing something.
+    assert by_leaf(res, "clean")["Outcome"] == "removed"
+
+
 def test_vscode_session_vetoes_exactly_like_a_desktop_one(fx: Fixture, sleeper: int) -> None:
     """The fence is path-based; the launching surface is irrelevant to it."""
     fx.write_session(
@@ -1808,6 +1835,40 @@ def test_an_orphan_under_an_unreadable_ancestor_stays_reported(
     why = later["orphansFromEarlierRuns"][0]["why"]
     # The listing step refused, not some other read on the way up.
     assert "not confirmed gone: Could not list the entries above the orphaned directory" in why, why
+    assert later["_exit"] == 3
+
+
+@pytest.mark.parametrize("where", ["claude-worktrees", "sibling"])
+def test_an_orphan_under_a_linked_ancestor(fx: Fixture, sleeper: int, where: str) -> None:
+    """The nearest item above the orphan that is there is a junction to an empty folder. A
+    .claude/worktrees entry is the nightly removal's, which reads that state as ORPHANED, so it stays
+    reported: red on engine c91761f75d, which cleared it the next run. A sibling under a linked folder
+    (a junctioned D:\\Code, say) still clears once it is gone: red on engine 7c2e9aacd2, which kept it
+    reported every run with nothing a human could clear."""
+    if os.name != "nt":
+        pytest.skip("a directory junction is a Windows construct")
+    live_record(fx, sleeper, fx.primary)
+    target = fx.root / "link-target"
+    target.mkdir()
+    linked = fx.root / "linked"
+    if where == "claude-worktrees":
+        linked = linked / ".claude" / "worktrees"
+        linked.parent.mkdir(parents=True)
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(linked), str(target)],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    gone = linked / "repo-deleted"
+    _write_orphan_ledger(fx, gone)
+    later = run(fx)
+    if where == "sibling":
+        assert later["orphansFromEarlierRuns"] == [], later
+        assert later["_exit"] == 0
+        return
+    assert [o["path"] for o in later["orphansFromEarlierRuns"]] == [str(gone)], later
+    assert "is a link" in later["orphansFromEarlierRuns"][0]["why"], later
     assert later["_exit"] == 3
 
 

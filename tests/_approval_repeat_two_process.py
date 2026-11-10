@@ -15,7 +15,8 @@ committed. The rig measures how many rounds really started together and fails wh
 The caller then checks each round holds ONE request, which both processes were answered with.
 
 Every wait is bounded well under the suite's 60 s per-test timeout, so a hung child fails here,
-with its stderr, rather than being cut off by pytest-timeout with nothing to read.
+with its stderr, rather than being cut off by pytest-timeout with nothing to read. The barrier and
+the child handling are ``tests/_process_rig.py``'s, shared with the SQL Server audit applock rig.
 
 Extra-free, like the contract it sits beside: the children import the backend they are told to,
 so the SQL Server leg can call this from inside a gated test.
@@ -24,16 +25,13 @@ so the SQL Server leg can call this from inside a gated test.
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 import sys
-import threading
 import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+from tests._process_rig import ProcessRig
 
 #: The gap between two rounds' scheduled starts. Longer than two request writes in a row, so a
 #: round that runs long does not push the next round's two starts apart: on SQL Server the losing
@@ -139,52 +137,25 @@ def race_repeat_requests(
     ``nonce`` goes into every request's params, so the caller can find and clean up what a failed
     run filed. Blocking, so an async test calls it through ``asyncio.to_thread``. A child that
     fails, or never opens its store, fails the call with its stderr."""
-    go = signal_dir / f"race-go-{nonce}"
-    argv = [sys.executable, "-c", _CHILD, target, nonce, str(rounds), str(go), str(_ROUND_PERIOD_S)]
-    procs: list[subprocess.Popen[str]] = []
-    # Each child's stderr goes to a file, never a pipe: a pipe nobody reads fills and blocks the
-    # child, and the wait for READY below would then never end.
-    errs = [signal_dir / f"race-err-{nonce}-{n}.txt" for n in range(2)]
-    try:
-        for err_path in errs:
-            with err_path.open("w", encoding="utf-8") as err_file:
-                procs.append(
-                    subprocess.Popen(
-                        argv,
-                        cwd=_REPO_ROOT,
-                        stdout=subprocess.PIPE,
-                        stderr=err_file,
-                        text=True,
-                    )
-                )
-        for proc, err_path in zip(procs, errs, strict=True):
-            ready, killed = _readline_within(proc, 20.0)
-            if ready.strip() != "READY":
-                # Said in words: a kill's exit code can match a crash's (1 on Windows).
-                try:
-                    code: int | None = proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    code = None
-                raise AssertionError(
-                    f"a child never opened its store: {ready!r}, "
-                    f"{'killed after hanging' if killed else 'exited'} with code {code}; "
-                    f"its stderr:\n{_tail(err_path)}"
-                )
+    with ProcessRig(signal_dir, f"race-{nonce}") as rig:
+        argv = [
+            sys.executable,
+            "-c",
+            _CHILD,
+            target,
+            nonce,
+            str(rounds),
+            str(rig.go),
+            str(_ROUND_PERIOD_S),
+        ]
+        rig.start([argv, argv], ready_timeout=20.0)
         # Both stores are open. The first round starts a little ahead, so both children have
-        # read the schedule by then. Written whole and renamed, so no child reads half of it.
-        staged = go.with_suffix(".tmp")
-        staged.write_text(repr(time.time() + 0.5), encoding="utf-8")
-        os.replace(staged, go)
-        outs = [proc.communicate(timeout=20)[0] for proc in procs]
-    finally:
-        for proc in procs:
-            if proc.poll() is None:
-                proc.kill()
-                proc.communicate()
+        # read the schedule by then.
+        rig.release(repr(time.time() + 0.5))
+        outs = rig.finish(timeout=20)
     answers: list[list[str]] = []
     starts: list[list[float]] = []
-    for proc, out, err_path in zip(procs, outs, errs, strict=True):
-        assert proc.returncode == 0, f"a child exited {proc.returncode}: {_tail(err_path)}"
+    for out in outs:
         [line] = [each for each in out.splitlines() if each.startswith("HELD ")]
         report = json.loads(line.removeprefix("HELD "))
         answers.append([str(each) for each in report["held"]])
@@ -196,30 +167,6 @@ def race_repeat_requests(
         f"only {together} of {rounds} rounds started within {_TOGETHER_S}s of each other"
     )
     return answers
-
-
-def _readline_within(proc: subprocess.Popen[str], timeout: float) -> tuple[str, bool]:
-    """The child's next stdout line, or ``""`` when none comes within ``timeout`` seconds, and
-    whether the child was killed for it. A child that dies first closes stdout, so the read ends;
-    one that hangs is killed, which ends it too."""
-    stdout = proc.stdout
-    assert stdout is not None
-    line: list[str] = []
-    reader = threading.Thread(target=lambda: line.append(stdout.readline()), daemon=True)
-    reader.start()
-    reader.join(timeout)
-    killed = reader.is_alive()
-    if killed:
-        proc.kill()
-        reader.join(5.0)
-    return (line[0] if line else ""), killed
-
-
-def _tail(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")[-4000:]
-    except OSError as exc:
-        return f"(stderr unreadable: {exc})"
 
 
 async def assert_one_request_per_round(store: Any, answers: list[list[str]]) -> set[str]:

@@ -167,8 +167,7 @@ async def test_a_second_delete_of_the_same_passkey_is_not_called_a_way_past_refu
             user_id: str,
             credential_id_hash: str,
             *,
-            require_way_past: bool = False,
-            totp_usable: Any = None,
+            require_way_past: Any = None,
             passkey_counts: Any = None,
         ) -> bool:
             assert await real_delete(user_id, credential_id_hash)  # the other tab wins first
@@ -176,7 +175,6 @@ async def test_a_second_delete_of_the_same_passkey_is_not_called_a_way_past_refu
                 user_id,
                 credential_id_hash,
                 require_way_past=require_way_past,
-                totp_usable=totp_usable,
             )
 
         store.delete_webauthn_credential = already_gone  # type: ignore[method-assign]
@@ -399,8 +397,7 @@ async def test_a_passkey_flipped_to_discoverable_outside_the_store_opens_nothing
             password_hash="h-chosen",
             password_generated=False,
             must_change_password=False,
-            require_way_past=True,
-            totp_usable=_opened_totp_state,
+            require_way_past=_opened_totp_state,
         )
         census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
         assert census.no_way_past == (identity.username,)
@@ -835,8 +832,7 @@ async def test_a_refused_totp_does_not_free_the_last_discoverable_passkey(
         assert not await store.delete_webauthn_credential(
             identity.user_id,
             cred.credential_id_hash,
-            require_way_past=True,
-            totp_usable=_opened_totp_state,
+            require_way_past=_opened_totp_state,
         )
         assert len(await store.list_webauthn_credentials(identity.user_id)) == 1
     finally:
@@ -864,8 +860,7 @@ async def test_a_refused_totp_does_not_open_the_rotation_gate(secret: str, rotat
             password_hash="h-chosen",
             password_generated=False,
             must_change_password=False,
-            require_way_past=True,
-            totp_usable=_opened_totp_state,
+            require_way_past=_opened_totp_state,
         )
         row = await store.get_user(identity.user_id)
         assert row is not None and row.password_hash != "h-chosen"
@@ -927,6 +922,171 @@ async def test_the_census_warns_that_a_reset_would_remove_a_working_passkey() ->
         assert census.passkey_only == (identity.username,)
         assert census.reset_would_remove_a_passkey == (identity.username,)
         assert census.no_way_past == ()
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("outside", ["require_mfa_off", "issued_password"])
+async def test_the_reset_list_names_an_account_the_requirement_does_not_lock(outside: str) -> None:
+    """BACKLOG #3948 finding 11: ``reset_would_remove_a_passkey`` names EVERY account with an
+    unusable TOTP and a working discoverable passkey, since ``reset-mfa`` removes that passkey
+    whatever the requirement covers. Here the account is outside the lockable population, by
+    ``require_mfa`` off or by a password still issued, so it is in no lockable list. RED on the
+    narrower list, which read only that population. The control: the same account once its passkey
+    is gone is still named as an unusable TOTP, and not in the reset list."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, token, _ = await login_admin(service)
+        settings = AuthSettings(require_mfa=outside != "require_mfa_off")
+        if outside == "issued_password":
+            assert await store.set_password(
+                identity.user_id, password_hash="h-issued", password_generated=True
+            )
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.password_generated == (outside == "issued_password")
+        await _register(service, identity, token)
+        await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
+        census = await lockable_account_census(store, settings, way_past_rp_id=RP)
+        assert census.undecryptable_totp == (identity.username,)
+        assert census.passkey_only == () and census.no_way_past == ()
+        assert census.reset_would_remove_a_passkey == (identity.username,)
+        await store.delete_all_webauthn_credentials(identity.user_id)
+        control = await lockable_account_census(store, settings, way_past_rp_id=RP)
+        assert control.undecryptable_totp == (identity.username,)
+        assert control.reset_would_remove_a_passkey == (), "named with no passkey to remove"
+    finally:
+        await store.close()
+
+
+async def _directory_account_with_a_passkey(
+    store: MessageStore,
+    *,
+    user_id: str = "dir-u1",
+    auth_provider: str = "ad",
+    discoverable: bool = True,
+    rp_id: str = RP,
+    id_hash: str | None = None,
+) -> str:
+    """An account with a refused TOTP and a passkey under :data:`RP`, by default a directory
+    account and a discoverable passkey: never lockable, so read by the census for the reset list
+    alone. Returns its username. A ``"local"`` provider makes a local row with no password hash."""
+    from messagefoundry.auth.tokens import credential_id_hash
+    from tests._webauthn_store_contract import _cred
+
+    username = "dir-alice" if user_id == "dir-u1" else f"{user_id}-alice"
+    await store.create_user(
+        user_id=user_id,
+        username=username,
+        auth_provider=auth_provider,
+        password_generated=False,
+        now=1.0,
+        audits=(),
+    )
+    await store.add_webauthn_credential(
+        _cred(
+            user_id,
+            "resident",
+            id_hash=id_hash or credential_id_hash(f"{user_id}-resident".encode()),
+            rp_id=rp_id,
+            discoverable=discoverable,
+        )
+    )
+    await _enable_totp(store, user_id, _REFUSED_TOTP)
+    return username
+
+
+async def test_the_reset_list_names_a_directory_account() -> None:
+    """BACKLOG #3948 finding 11: a directory account is never lockable, and ``reset-mfa`` still
+    removes its passkey, so the reset list names it and no lockable list does. A directory account
+    signs in through its directory and then any passkey, so one that is not discoverable counts
+    too. A local row with no password hash signs nobody in, so it is not named."""
+    store = await MessageStore.open(":memory:")
+    try:
+        username = await _directory_account_with_a_passkey(store)
+        plain = await _directory_account_with_a_passkey(store, user_id="dir-u2", discoverable=False)
+        hashless = await _directory_account_with_a_passkey(
+            store, user_id="nohash-u3", auth_provider="local"
+        )
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
+        assert census.undecryptable_totp == tuple(sorted((username, plain, hashless)))
+        assert census.passkey_only == () and census.no_way_past == ()
+        assert census.reset_would_remove_a_passkey == tuple(sorted((username, plain)))
+    finally:
+        await store.close()
+
+
+async def test_the_reset_list_names_a_directory_passkey_only_where_it_can_sign_in() -> None:
+    """BACKLOG #3948 finding 11: a directory account's passkey counts for the reset list only where
+    its second factor could accept it, under the configured relying party and today's credential-id
+    hash scheme. One under another rp_id, or one stored as a bare pre-scheme digest the rehash has
+    not moved, cannot sign the holder in, so a reset costs it nothing and it is not named; naming it
+    would steer the operator away from the reset that is the way out. RED on the rule that counted
+    any trusted passkey. The control: a usable passkey on the same kind of account is named."""
+    from messagefoundry.auth.tokens import hash_bytes
+
+    store = await MessageStore.open(":memory:")
+    try:
+        usable = await _directory_account_with_a_passkey(store, discoverable=False)
+        elsewhere = await _directory_account_with_a_passkey(
+            store, user_id="dir-other-rp", rp_id="old.example"
+        )
+        stale = await _directory_account_with_a_passkey(
+            store, user_id="dir-stale", id_hash=hash_bytes(b"dir-stale-resident")
+        )
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
+        assert census.undecryptable_totp == tuple(sorted((usable, elsewhere, stale)))
+        assert census.reset_would_remove_a_passkey == (usable,)
+        # With no configured relying party the rp_id rule is the sign-in's (any one), and the
+        # hash scheme still holds.
+        open_rp = await lockable_account_census(store, AuthSettings(), way_past_rp_id=None)
+        assert open_rp.reset_would_remove_a_passkey == tuple(sorted((usable, elsewhere)))
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("other_error", [False, True], ids=["undecodable", "control-other-error"])
+async def test_a_passkey_set_the_driver_cannot_decode_does_not_stop_the_census(
+    monkeypatch: pytest.MonkeyPatch, other_error: bool
+) -> None:
+    """A passkey cell the driver cannot decode while fetching (sqlite3's message-only
+    ``OperationalError``) counts that account's set for nothing, as a row that does not parse does,
+    so the census still reports every other account: here a covered local account with a chosen
+    password and no factor, read after the directory one, is still named with no way past. The
+    control: any other ``OperationalError`` still propagates, since it says nothing about that
+    set."""
+    store = await MessageStore.open(":memory:")
+    try:
+        await _directory_account_with_a_passkey(store)
+        await store.create_user(
+            user_id="zz-local",
+            username="zz-local-bob",
+            auth_provider="local",
+            password_hash="h",
+            password_generated=False,
+            now=2.0,
+            audits=(),
+        )
+        message = "disk I/O error" if other_error else "Could not decode to UTF-8 column 'label'"
+        real_list = store.list_webauthn_credentials
+        reads: list[str] = []
+
+        async def undecodable(user_id: str) -> Any:
+            reads.append(user_id)
+            if user_id == "dir-u1":
+                raise sqlite3.OperationalError(message)
+            return await real_list(user_id)
+
+        monkeypatch.setattr(store, "list_webauthn_credentials", undecodable)
+        if other_error:
+            with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+                await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
+            return
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
+        assert "dir-u1" in reads and "zz-local" in reads, reads
+        assert census.undecryptable_totp == ("dir-alice",)
+        assert census.reset_would_remove_a_passkey == ()
+        assert census.no_way_past == ("zz-local-bob",)
     finally:
         await store.close()
 
@@ -1046,8 +1206,7 @@ async def test_a_passkey_under_a_refused_hash_scheme_is_no_way_past() -> None:
             password_hash="h-chosen",
             password_generated=False,
             must_change_password=False,
-            require_way_past=True,
-            totp_usable=_opened_totp_state,
+            require_way_past=_opened_totp_state,
         )
         census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
         assert census.no_way_past == (identity.username,) and census.passkey_only == ()
@@ -1113,7 +1272,7 @@ async def test_a_refused_totp_as_the_only_factor_is_no_way_out_but_the_admin_res
             await service.change_password(identity, _NEW_PASSWORD)
         with pytest.raises(ValueError, match="last second factor"):
             await service.disable_mfa(identity)
-        issued = await service.admin_reset_mfa(identity.user_id, actor="another-admin")
+        issued = (await service.admin_reset_mfa(identity.user_id, actor="another-admin")).credential
         assert issued is not None
         row = await store.get_user(identity.user_id)
         assert row is not None and not row.totp_enabled and row.password_generated
@@ -1203,6 +1362,49 @@ async def test_a_totp_enabled_after_it_was_judged_is_not_removed() -> None:
             totp_counts=judgement,
         )
         assert rotation(record) is None, "a TOTP nobody judged opened the rotation"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("moved", [True, False], ids=["a-cell-that-moved", "control-same-cell"])
+async def test_a_usable_judgement_of_a_cell_that_moved_does_not_open_the_rotation(
+    monkeypatch: pytest.MonkeyPatch, moved: bool
+) -> None:
+    """The store's conditional rotation judges the TOTP from a read made before its lock, so a
+    re-enrolment can land between the two. A usable verdict on the old cell then counts for
+    nothing under the lock (:meth:`TotpJudgement.moved`): the account, re-enrolled onto a refused
+    marker and holding no passkey, is refused. The race is planted by handing the pre-lock read the
+    record from before the re-enrolment. The control: the same stale read of a cell the row still
+    holds lets the write land. RED when a judgement counts for a cell it did not judge."""
+    store = await MessageStore.open(":memory:")
+    try:
+        identity, _token, _ = await login_admin(_service(store))
+        await _enable_totp(store, identity.user_id, _USABLE_TOTP)
+        stale = await store.get_user(identity.user_id)
+        assert stale is not None
+        if moved:
+            assert await store.disable_totp(identity.user_id)
+            await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
+
+        before = await _password_hash(store, identity.user_id)
+        real_get_user = store.get_user
+        reads: list[str] = []
+
+        async def pre_lock_read(user_id: str) -> Any:
+            reads.append(user_id)
+            return stale
+
+        monkeypatch.setattr(store, "get_user", pre_lock_read)
+        written = await store.set_password(
+            identity.user_id,
+            password_hash="$argon2id$synthetic-not-a-real-hash",
+            password_generated=False,
+            require_way_past=_opened_totp_state,
+        )
+        assert reads == [identity.user_id], "the planted pre-lock read was not used"
+        assert written is not moved
+        monkeypatch.setattr(store, "get_user", real_get_user)
+        assert (await _password_hash(store, identity.user_id) != before) is written
     finally:
         await store.close()
 
@@ -1490,9 +1692,9 @@ async def test_an_unknown_totp_opens_the_rotation_gate(
 ) -> None:
     """The rotation gate during the outage, or on a keyless open: a covered account whose only
     factor is an enabled TOTP nobody can judge may rotate into a chosen password, as the plain
-    enabled-TOTP rule let it before BACKLOG #3422. Both halves ask: the service's gate
-    (``must_enrol_before_rotating`` and ``change_password``, through ``_has_way_past``) and the
-    store's conditional write. Its refused-marker control is
+    enabled-TOTP rule let it before BACKLOG #3422. All three ask: the service's gate
+    (``must_enrol_before_rotating``, through ``_has_way_past``), ``change_password``'s early
+    refusal and the store's conditional write (BACKLOG #3948). Its refused-marker control is
     :func:`test_a_refused_totp_does_not_open_the_rotation_gate`."""
     store = await MessageStore.open(":memory:")
     try:
@@ -1506,9 +1708,10 @@ async def test_an_unknown_totp_opens_the_rotation_gate(
         gate_opens = len(opened)
         assert gate_opens, "the rotation gate judged nothing, so the stub measured nothing"
         assert await service.change_password(identity, _NEW_PASSWORD) == []
-        # The password change judges it twice: the service's gate, then the store's conditional
-        # write, so a write that stopped asking would show here.
-        assert len(opened) >= gate_opens + 2, (gate_opens, len(opened))
+        # The password change opens it twice more: in its early refusal and in the store's
+        # conditional write (BACKLOG #3948). The count alone does not say which site opened it;
+        # test_a_password_change_currently_opens_the_totp_cell_twice does.
+        assert len(opened) == gate_opens + 2, (gate_opens, len(opened))
         row = await store.get_user(identity.user_id)
         assert row is not None and row.password_hash != before.password_hash
     finally:
@@ -1616,8 +1819,7 @@ async def test_a_passkey_under_another_rp_id_does_not_free_totp(configured: str 
         assert str(refused.value) == TOTP_REMOVAL_REFUSED
         assert not await store.disable_totp(
             identity.user_id,
-            require_way_past=True,
-            totp_usable=_opened_totp_state,
+            require_way_past=_opened_totp_state,
             passkey_counts=gate._gate_counts,
         ), "the store's write counted a passkey the gate does not"
         row = await store.get_user(identity.user_id)
@@ -2073,5 +2275,406 @@ async def test_a_passkey_row_that_does_not_parse_names_the_account_in_the_census
         census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
         assert census.no_way_past == (identity.username,)
         assert census.passkey_only == ()
+    finally:
+        await store.close()
+
+
+# --- the rotation's passkey half reads as its courtesy check does (BACKLOG #3948) ----------------
+
+
+async def _passkey_owner_counting_hashes(
+    store: MessageStore,
+    *,
+    way_past_rp_id: str | None = RP,
+    totp: str | None = _REFUSED_TOTP,
+    passkey: bool = True,
+) -> tuple[AuthService, Identity, list[int]]:
+    """A covered Administrator holding a discoverable passkey (none where ``passkey`` is false) and
+    a refused-marker TOTP (none where ``totp`` is ``None``), so only the passkey can be the way
+    past. Returns the service, the identity and a list that grows by one on every argon2 hash the
+    service runs."""
+    service = _service(store, way_past_rp_id=way_past_rp_id)
+    identity, token, _ = await login_admin(service)
+    if passkey:
+        await _register(service, identity, token)
+    if totp is not None:
+        await _enable_totp(store, identity.user_id, totp)
+    hashes: list[int] = []
+    argon2 = service._argon2
+
+    async def counted(fn: Any, *args: Any) -> Any:
+        hashes.append(1)
+        return await argon2(fn, *args)
+
+    service._argon2 = counted  # type: ignore[method-assign]
+    return service, identity, hashes
+
+
+async def _password_hash(store: MessageStore, user_id: str) -> str | None:
+    row = await store.get_user(user_id)
+    assert row is not None
+    return row.password_hash
+
+
+@pytest.mark.parametrize("available", [False, True], ids=["no-extra", "extra"])
+async def test_without_the_webauthn_extra_a_passkey_does_not_open_the_rotation(
+    available: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the extra no passkey can sign in, so the rotation's write counts none, as the
+    courtesy check counts none: a refused TOTP beside a discoverable passkey is refused. The
+    control: with the extra, the passkey is the way past and the rotation lands. RED when: the
+    write counts the passkey whatever the extra."""
+    from messagefoundry.auth import webauthn as wa
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, _ = await _passkey_owner_counting_hashes(store)
+        monkeypatch.setattr(wa, "available", lambda: available)
+        assert await service.must_enrol_before_rotating(identity) is not available
+        before = await _password_hash(store, identity.user_id)
+        if available:
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+            assert await _password_hash(store, identity.user_id) != before
+            return
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert await _password_hash(store, identity.user_id) == before
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("corrupt", "rp_id", "available"),
+    [(True, RP, True), (True, None, True), (True, RP, False), (False, RP, True)],
+    ids=["malformed", "malformed-no-rp-id", "malformed-no-extra", "control"],
+)
+async def test_a_passkey_row_that_does_not_parse_refuses_the_rotation_before_the_hash(
+    corrupt: bool, rp_id: str | None, available: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A passkey row that does not parse, beside a refused TOTP: the change is the enrolment
+    refusal before any argon2 hash, never an exception. Where a passkey can count (the malformed
+    arm) the rotation reads the set through the service's verified read, and the row counts for
+    nothing; where none can (no configured relying party, or no ``[webauthn]`` extra) it refuses
+    on the TOTP with no read. The control: the same account with its row intact rotates. RED when:
+    the set is read only in the store's write, which raises after the hash, or the early refusal
+    skips the read where the TOTP is refused and a passkey can count."""
+    from messagefoundry.auth import webauthn as wa
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, hashes = await _passkey_owner_counting_hashes(
+            store, way_past_rp_id=rp_id
+        )
+        monkeypatch.setattr(wa, "available", lambda: available)
+        if not corrupt:
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+            assert hashes == [1]
+            return
+        await _corrupt_passkey_rows(store, identity.user_id, "not json")
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert hashes == [], "the refusal came after the argon2 hash"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("corrupt", "rp_id", "available"),
+    [(True, None, True), (True, RP, False), (True, RP, True), (False, RP, True)],
+    ids=["undecodable-no-rp-id", "undecodable-no-extra", "undecodable", "control"],
+)
+async def test_a_passkey_cell_the_driver_cannot_decode_refuses_the_rotation_before_the_hash(
+    corrupt: bool,
+    rp_id: str | None,
+    available: bool,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A covered account with no TOTP on whose passkey cell sqlite3 cannot decode while fetching:
+    in ``change_password`` the change is the enrolment refusal before any argon2 hash, never an
+    exception. Where a passkey can count, the set is read and counts for nothing, and the warning
+    names the account and none of the cell. Where none can (no configured relying party, or no
+    ``[webauthn]`` extra), the refusal comes before any read, so nothing is warned. The control:
+    the same account with its cell intact rotates on its passkey. RED when: the rotation's early
+    refusal lets the driver's decode failure escape (the arm with a relying party and the
+    extra), or reads the set where no passkey can count, which only the empty warning list of the
+    other two arms catches."""
+    from messagefoundry.auth import webauthn as wa
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, hashes = await _passkey_owner_counting_hashes(
+            store, way_past_rp_id=rp_id, totp=None
+        )
+        monkeypatch.setattr(wa, "available", lambda: available)
+        if not corrupt:
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+            assert hashes == [1]
+            return
+        await _corrupt_passkey_rows(store, identity.user_id, b"\xff")
+        with (
+            caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"),
+            pytest.raises(FactorEnrolmentRequired),
+        ):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert hashes == [], "the refusal came after the argon2 hash"
+        warned = [r.getMessage() for r in caplog.records if "could not be read" in r.getMessage()]
+        # The whole message, so any trace of the cell fails it.
+        expected = (
+            [f"the passkeys of user {identity.user_id} could not be read (OperationalError)"]
+            if rp_id is not None and available
+            else []
+        )
+        assert warned == expected, warned
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("rp_id", "available", "refused"),
+    [(None, True, True), (RP, False, True), (RP, True, False)],
+    ids=["no-rp-id", "no-extra", "control-a-passkey-can-count"],
+)
+async def test_with_no_totp_on_a_store_error_cannot_turn_the_rotation_refusal_into_an_exception(
+    monkeypatch: pytest.MonkeyPatch, rp_id: str | None, available: bool, refused: bool
+) -> None:
+    """A covered account with no TOTP on, where no passkey can count (no configured relying party,
+    or no ``[webauthn]`` extra): no passkey read could change the answer, so the rotation is the
+    enrolment refusal before any read and before the hash, and a passkey read that would fail with
+    ``database is locked`` never runs. The control: where a passkey can count the set is read, and
+    the error raises, before the hash. The arms with a TOTP on are
+    :func:`test_with_a_totp_on_the_rotation_reads_the_passkey_set_only_where_it_decides`. RED
+    when: the early refusal reads the set where no TOTP is on and no passkey can count."""
+    from messagefoundry.auth import webauthn as wa
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, hashes = await _passkey_owner_counting_hashes(
+            store, way_past_rp_id=rp_id, totp=None
+        )
+        monkeypatch.setattr(wa, "available", lambda: available)
+        reads: list[str] = []
+
+        async def locked(user_id: str) -> Any:
+            reads.append(user_id)
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(store, "list_webauthn_credentials", locked)
+        before = await _password_hash(store, identity.user_id)
+        with pytest.raises(FactorEnrolmentRequired if refused else sqlite3.OperationalError):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert hashes == [], "the argon2 hash ran"
+        assert reads == ([] if refused else [identity.user_id])
+        assert await _password_hash(store, identity.user_id) == before
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("passkey", "rp_id", "secret", "rotates"),
+    [
+        (False, RP, _REFUSED_TOTP, False),
+        (True, None, _REFUSED_TOTP, False),
+        (False, RP, _USABLE_TOTP, True),
+    ],
+    ids=["refused-no-passkey", "refused-passkey-cannot-count", "control-usable"],
+)
+async def test_a_known_refused_totp_is_refused_before_the_hash(
+    passkey: bool, rp_id: str | None, secret: str, rotates: bool
+) -> None:
+    """A covered account whose TOTP is on and a KNOWN refusal, where no passkey can be the way
+    past (none held, or one held with no relying party configured): the rotation is the enrolment
+    refusal before any argon2 hash, as ``must_enrol_before_rotating`` refuses it. The control: a
+    usable TOTP rotates, with one hash. RED when: the early refusal leaves a TOTP that is on to the
+    store's write, which refuses only after the hash."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, hashes = await _passkey_owner_counting_hashes(
+            store, way_past_rp_id=rp_id, totp=secret, passkey=passkey
+        )
+        before = await _password_hash(store, identity.user_id)
+        if rotates:
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+            assert hashes == [1]
+            return
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert hashes == [], "the refusal came after the argon2 hash"
+        assert await _password_hash(store, identity.user_id) == before
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("rp_id", "available", "secret", "outcome"),
+    [
+        (None, True, _REFUSED_TOTP, "refused"),
+        (RP, False, _REFUSED_TOTP, "refused"),
+        (None, True, _USABLE_TOTP, "rotates"),
+        (RP, True, _USABLE_TOTP, "rotates"),
+        (RP, True, _REFUSED_TOTP, "raises"),
+    ],
+    ids=[
+        "refused-no-rp-id",
+        "refused-no-extra",
+        "usable-no-rp-id",
+        "usable-a-passkey-can-count",
+        "control-refused-a-passkey-can-count",
+    ],
+)
+async def test_with_a_totp_on_the_rotation_reads_the_passkey_set_only_where_it_decides(
+    monkeypatch: pytest.MonkeyPatch,
+    rp_id: str | None,
+    available: bool,
+    secret: str,
+    outcome: str,
+) -> None:
+    """A covered account with a TOTP on and a passkey, whose passkey read would fail with
+    ``database is locked``. The TOTP is judged first, with no read: a usable one is the way past,
+    and a refused one where no passkey can count (no configured relying party, or no
+    ``[webauthn]`` extra) is the enrolment refusal, both in ``_has_way_past``'s order. The set is
+    read only where a passkey can count and the TOTP is refused, and there the error raises before
+    the hash (the control, which also shows the read is measured). RED when: the early refusal
+    reads the set for a TOTP that is on wherever a passkey is held."""
+    from messagefoundry.auth import webauthn as wa
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, hashes = await _passkey_owner_counting_hashes(
+            store, way_past_rp_id=rp_id, totp=secret
+        )
+        monkeypatch.setattr(wa, "available", lambda: available)
+        reads: list[str] = []
+
+        async def locked(user_id: str) -> Any:
+            reads.append(user_id)
+            raise sqlite3.OperationalError("database is locked")
+
+        # Only the service's read: the store's write reads the rows under its own lock.
+        monkeypatch.setattr(store, "list_webauthn_credentials", locked)
+        before = await _password_hash(store, identity.user_id)
+        if outcome == "rotates":
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+            assert hashes == [1]
+            assert reads == []
+            return
+        expected = FactorEnrolmentRequired if outcome == "refused" else sqlite3.OperationalError
+        with pytest.raises(expected):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert hashes == [], "the argon2 hash ran"
+        assert reads == ([] if outcome == "refused" else [identity.user_id])
+        assert await _password_hash(store, identity.user_id) == before
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("secret", "rotates"),
+    [(_REFUSED_TOTP, False), (_USABLE_TOTP, True)],
+    ids=["refused-totp", "usable-totp"],
+)
+async def test_beside_an_undecodable_passkey_set_the_rotation_judges_the_totp(
+    monkeypatch: pytest.MonkeyPatch, secret: str, rotates: bool
+) -> None:
+    """A covered account with a TOTP on and a passkey set the driver cannot decode in the early
+    refusal's read. A refused TOTP leaves the passkey to decide, so the set is read, counts for
+    nothing, and the change is the enrolment refusal before the hash. The control: a usable TOTP
+    is the way past with no read, and the write runs. Only the service's read is made to fail
+    here; the write reads the intact rows under its own lock. RED when: an undecodable set is let
+    through to the write, which passes the refused TOTP on the intact passkey it reads."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, hashes = await _passkey_owner_counting_hashes(store, totp=secret)
+
+        reads: list[str] = []
+
+        async def undecodable(user_id: str) -> Any:
+            reads.append(user_id)
+            raise UnicodeDecodeError("utf-16-le", b"\x00\xd8", 0, 2, "unpaired surrogate")
+
+        # Only the service's read: the store's write reads the intact rows under its own lock.
+        monkeypatch.setattr(store, "list_webauthn_credentials", undecodable)
+        before = await _password_hash(store, identity.user_id)
+        if rotates:
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+            assert hashes == [1]
+            assert reads == [], "the set was read for a usable TOTP"
+            assert await _password_hash(store, identity.user_id) != before
+            return
+        with pytest.raises(FactorEnrolmentRequired):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert hashes == [], "the refusal came after the argon2 hash"
+        assert reads == [identity.user_id]
+        assert await _password_hash(store, identity.user_id) == before
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("error", "refused"),
+    [
+        (UnicodeDecodeError("utf-16-le", b"\x00\xd8", 0, 2, "unpaired surrogate"), True),
+        (sqlite3.OperationalError("database is locked"), False),
+    ],
+    ids=["driver-decode", "control-other-error"],
+)
+async def test_the_rotation_survives_only_a_decode_failure_of_the_passkey_set(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, refused: bool
+) -> None:
+    """The rotation's early refusal counts the set for nothing only where the driver could not
+    decode a cell (pyodbc's ``UnicodeDecodeError`` here; sqlite3's is
+    :func:`test_a_passkey_cell_the_driver_cannot_decode_refuses_the_rotation_before_the_hash`): a
+    covered account with no TOTP on gets the enrolment refusal before the hash. The control: any
+    other driver error raises from the read, before the hash. The service here has a relying party
+    configured and the extra installed, and no TOTP is on, so the early refusal reads the set. RED
+    when: the catch drops ``UnicodeDecodeError``, or widens to every ``OperationalError``."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, hashes = await _passkey_owner_counting_hashes(store, totp=None)
+
+        async def unreadable(user_id: str) -> Any:
+            raise error
+
+        monkeypatch.setattr(store, "list_webauthn_credentials", unreadable)
+        with pytest.raises(FactorEnrolmentRequired if refused else type(error)):
+            await service.change_password(identity, _NEW_PASSWORD)
+        assert hashes == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("tampered", [True, False], ids=["tampered", "control"])
+async def test_a_passkey_set_that_fails_its_seal_is_reported_by_the_rotation(
+    tampered: bool, tmp_path: Path
+) -> None:
+    """A passkey set that fails the digest its account's seal covers counts for nothing, and the
+    rotation reports it through ``_verified_passkeys``, which it reads here because the TOTP is a
+    KNOWN refusal and a passkey can count (relying party configured, extra installed): the change
+    is the enrolment refusal, with an integrity audit row naming the passkey set. The control: an
+    intact set writes no such row and the rotation lands. RED when: the set is judged only in the
+    store's write, which refuses without a report."""
+    from messagefoundry.store.crypto import generate_key, make_cipher
+
+    store = await MessageStore.open(
+        tmp_path / "keyed.db", cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+        assert store.row_sealer() is not None, "the arm needs a keyed store"
+        service, identity, _ = await _passkey_owner_counting_hashes(store)
+        before = len(await store.list_audit(limit=500))
+        if tampered:
+            await store._db.execute("UPDATE webauthn_credentials SET label = 'outside-the-store'")
+            await store._db.commit()
+            with pytest.raises(FactorEnrolmentRequired):
+                await service.change_password(identity, _NEW_PASSWORD)
+        else:
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
+        reported = [
+            json.loads(detail)
+            for action, detail in await _audit_rows(store, before)
+            if action == "integrity.authority_seal_failed"
+        ]
+        expected = [{"kind": "passkeys", "user_id": identity.user_id}] if tampered else []
+        assert reported == expected
     finally:
         await store.close()

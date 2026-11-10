@@ -27,6 +27,8 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
+    ENROLMENT_CODE_ISSUED,
+    ENROLMENT_CODE_SPENT,
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
     FIRST_ADMINISTRATOR_TAKEOVER,
@@ -101,6 +103,8 @@ _SUBJECTS = {
     NEW_ADDRESS_REVERIFY: "A sensitive action on your MessageFoundry account from a new location",
     LOGIN_NEW_IP: "New MessageFoundry sign-in from a new location",
     ACCOUNT_CREATED: "A MessageFoundry account was created with this address",
+    ENROLMENT_CODE_ISSUED: "An enrolment code was issued for your MessageFoundry account",
+    ENROLMENT_CODE_SPENT: "An enrolment code you issued was used",
 }
 
 _DESCRIPTIONS = {
@@ -164,6 +168,17 @@ _DESCRIPTIONS = {
     ),
     ACCOUNT_CREATED: (
         "An administrator created this account and set this address to receive its security notices."
+    ),
+    # ADR 0207. Neither names the code. The issued notice does not invite a reply: the handover is
+    # the control, and it must not run back through a mailbox the directory password opens.
+    ENROLMENT_CODE_ISSUED: (
+        "An administrator issued a one-time enrolment code for your account, which lets it add its "
+        "first two-factor authenticator. The administrator gives it to you directly. If you did not "
+        "ask for one, contact your administrator through your organization's identity check."
+    ),
+    ENROLMENT_CODE_SPENT: (
+        "An enrolment code you issued was used to add another account's first two-factor "
+        "authenticator. If that was not the person you gave it to, reset that account's MFA."
     ),
     # BACKLOG #288. States what happened and what it cost the session, and nothing about blocking:
     # the sign-in was NOT refused, so a notice implying it was would be false. "Started", because
@@ -314,6 +329,19 @@ def _shown(text: str, what: str) -> str:
     return text if text.isprintable() else f"{what} that cannot be shown safely here"
 
 
+def _holder_lines(event: SecurityEvent) -> list[str]:
+    """The ``Account:`` line naming ``detail["holder"]``, the OTHER account a notice to an issuer is
+    about (BACKLOG #2007; ADR 0207 A5), or nothing. Printed only as one printable token, as the
+    #2019 address line is: a username carrying a line break could otherwise write its own lines
+    into this notice."""
+    holder = str(event.detail.get("holder") or "")
+    if not holder:
+        return []
+    if holder.isprintable() and not any(c.isspace() for c in holder):
+        return [f"Account: {holder}"]
+    return ["Account: (a username that cannot be shown safely here)"]
+
+
 def _build_body(event: SecurityEvent) -> str:
     """A short, PHI-free notice. The recipient is the account owner, so naming their own account /
     source IP / new email is appropriate; no message data or secrets ever appear here."""
@@ -347,6 +375,9 @@ def _build_body(event: SecurityEvent) -> str:
     if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER:
         # BACKLOG #2007: sent to the ISSUER, so nothing changed on the recipient's own account.
         opening = f"A reminder for you as a MessageFoundry administrator ({event.username})."
+    elif event.event_type == ENROLMENT_CODE_SPENT:
+        # ADR 0207 A5: also to the ISSUER, but about something that has happened, not a reminder.
+        opening = f"A notice for you as a MessageFoundry administrator ({event.username})."
     elif event.event_type == TEMPORARY_CREDENTIAL_EXPIRING:
         opening = f"A reminder about your MessageFoundry account ({event.username})."
     else:
@@ -358,6 +389,9 @@ def _build_body(event: SecurityEvent) -> str:
     if event.event_type in (ACCOUNT_LOCKED, LOGIN_AFTER_FAILURES) and failed:
         lines.append(f"Failed attempts: {failed}")
     lines += lock_lines
+    if event.event_type == ENROLMENT_CODE_SPENT:
+        # ADR 0207 Amendment A, A5: the issuer's notice names the account that spent the code.
+        lines += _holder_lines(event)
     if event.event_type in (
         PASSWORD_RESET,
         TEMPORARY_CREDENTIAL_EXPIRING,
@@ -369,13 +403,7 @@ def _build_body(event: SecurityEvent) -> str:
         stamp = event.detail.get("expires_at")
         expires = deadline_utc(stamp) if isinstance(stamp, (int, float)) else None
         if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER:
-            holder = str(event.detail.get("holder") or "")
-            # Printed only as one printable token, as the #2019 address line below is: a username
-            # carrying a line break could otherwise write its own lines into this notice.
-            if holder.isprintable() and holder and not any(c.isspace() for c in holder):
-                lines.append(f"Account: {holder}")
-            elif holder:
-                lines.append("Account: (a username that cannot be shown safely here)")
+            lines += _holder_lines(event)
             if expires is not None:
                 lines.append(
                     f"The temporary password stops working at {expires}. If the holder still needs "
@@ -535,6 +563,19 @@ def _build_body(event: SecurityEvent) -> str:
         closing = (
             "You got this reminder because you issued that password. The password itself is not in "
             "this message."
+        )
+    elif event.event_type == ENROLMENT_CODE_SPENT:
+        # ADR 0207 A5: to the issuer, about another account, so "if this was you" cannot apply.
+        closing = (
+            "You got this notice because you issued that code. The code itself is not in this "
+            "message."
+        )
+    elif event.event_type == ENROLMENT_CODE_ISSUED:
+        # ADR 0207 section 4: the handover runs outside mail, so the closing must not invite a
+        # reply through a mailbox the directory password may open.
+        closing = (
+            "If you did not ask for a code, contact your MessageFoundry administrator in person or "
+            "through your organization's identity check, not by replying to this message."
         )
     elif event.event_type == FIRST_ADMINISTRATOR_TAKEOVER:
         # The takeover runs only when the install has no enabled Administrator, so "contact your

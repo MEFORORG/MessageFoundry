@@ -76,8 +76,9 @@ ENGINE_ENV_PREFIX: Final = "MEFOR_"
 #: :data:`_BOOTSTRAP`, and a script start puts the script's own directory first on the import path
 #: and never the working directory. ``-P`` drops that directory, which is this package's own, so
 #: a module in it cannot stand in for a top-level module the child imports. For ``-m`` and ``-c``
-#: starts, ``-P`` drops the working directory instead. The engine starts no child that way; the
-#: tray's short login command, from :func:`python_module_argv`, is a ``-m`` start.
+#: starts, ``-P`` drops the working directory instead. :func:`python_module_argv` builds the ``-m``
+#: starts: at least the tray's short login command, and the ``pip`` and ``pip_audit`` children of
+#: ``messagefoundry.security.audit_all_platforms``, which run in a checked-out tree.
 #: ``-X disable-remote-debug`` starts the child with the interpreter's remote debugging disabled.
 #: The option is spelled with hyphens; the interpreter accepts and ignores other spellings, which is
 #: why ``tests/test_child_process_environment.py`` reads the result off a real child.

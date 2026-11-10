@@ -17,7 +17,8 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
 
@@ -35,6 +36,7 @@ from fastapi.routing import APIRoute, RouteContext, iter_route_contexts
 from pydantic import BaseModel
 from starlette.requests import HTTPConnection
 from starlette.routing import BaseRoute
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from messagefoundry.api.auth_models import STEP_UP_VIA_HEADER, STEP_UP_VIA_IDP, CredentialReply
 from messagefoundry.api.tls_client_cert import (
@@ -379,10 +381,11 @@ def _audit_all_authz(app_state: object) -> bool:
 
     THAT IS A COMPATIBILITY ARGUMENT, NOT A SECURITY ONE, and it is weaker than the reason this
     docstring used to give. The old wording said a wider fallback would be "inventing a grant row for an
-    app whose auth wiring is unknown". It would not be: both call sites read this only AFTER
-    authorization has already succeeded — in :func:`require` the read sits below the permission loop,
-    and :func:`authorize_ws` has the same shape — so a row written here would record a grant that really
-    happened, and nothing would be invented. Revisit the argument rather than inherit it if this
+    app whose auth wiring is unknown". It would not be: every call site reads this only AFTER the
+    permission check has passed — in :func:`require` the read sits below the permission loop, a derived
+    gate's refusal row is written only after it (BACKLOG #1197), and :func:`authorize_ws` has the same
+    shape — so a row written here would record a decision that really happened, and nothing would be
+    invented. Revisit the argument rather than inherit it if this
     fallback is ever touched (BACKLOG #1421, cost 3)."""
     return bool(getattr(app_state, "audit_all_authz", False))
 
@@ -897,19 +900,36 @@ def _record_refusal(route: object, routes: Sequence[BaseRoute]) -> None:
     is the key :func:`undeclared_route_refusal_counts` reports this count under, so the log and
     ``GET /security/posture`` name a refusal alike (vault BACKLOG #2956). It is worked out only when
     a line is written; :func:`_logged_key` says what it misses."""
-    tally = getattr(route, _REFUSALS_ATTR, None) if route is not None else _UNKNOWN_ROUTE_REFUSALS
+    _count_and_log(
+        _tally_on(route, _REFUSALS_ATTR, _UNKNOWN_ROUTE_REFUSALS),
+        "refused route %s: it has no gate dependency and no public declaration",
+        lambda: _logged_key(route, routes),
+    )
+
+
+def _tally_on(route: object, attr: str, fallback: _RefusalTally) -> _RefusalTally:
+    """The :class:`_RefusalTally` ``route`` holds under ``attr``, made on first use; ``fallback``
+    when there is no route."""
+    if route is None:
+        return fallback
+    tally = getattr(route, attr, None)
     if not isinstance(tally, _RefusalTally):
         tally = _RefusalTally()
-        setattr(route, _REFUSALS_ATTR, tally)
+        setattr(route, attr, tally)
+    return tally
+
+
+def _count_and_log(tally: _RefusalTally, message: str, key: Callable[[], str]) -> None:
+    """Count one refusal on ``tally``, and log ``message`` (one ``%s``, the route's ``key``) at
+    ERROR at most once per :data:`REFUSAL_LOG_INTERVAL_SECONDS`, with the counts appended."""
     tally.total += 1
     tally.unlogged += 1
     now = time.monotonic()
     if tally.logged_at is not None and now - tally.logged_at < REFUSAL_LOG_INTERVAL_SECONDS:
         return
     log.error(
-        "refused route %s: it has no gate dependency and no public declaration "
-        "(%d refusals since the last log line, %d in all)",
-        _logged_key(route, routes),
+        message + " (%d refusals since the last log line, %d in all)",
+        key(),
         tally.unlogged,
         tally.total,
     )
@@ -939,6 +959,141 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
     raise HTTPException(status.HTTP_403_FORBIDDEN, UNDECLARED_ROUTE_DETAIL)
 
 
+# --- An in-body WebSocket is accepted only after a gate admitted it (vault BACKLOG #2955) -----------
+# ``authorizes_in_body`` says a WebSocket endpoint runs its own gate before ``accept()``, and the
+# route walk reads that gate as a call in the body. A call is not proof the body acts on it: a body
+# that ignored a refusal, or never reached its gate, would still accept. So :func:`authorize_ws`,
+# and the web console's ``authorize_ui_ws`` on a browser handshake, record on the handshake's scope
+# whether they admitted the caller, through :func:`record_ws_gate`,
+# and :class:`WebSocketAcceptGate` refuses ``websocket.accept``, and a denial response of any
+# status, on a socket whose scope does not read admitted. When the latest recorded answer is a
+# refusal, it refuses accept on every socket, whatever its route declares. A scope that records no
+# answer still passes where the route declares its authorization some other way: a gate dependency,
+# which ran before the body did, or a
+# ``public_route`` mark. An undeclared socket the refusal reaches never gets this far, because
+# :func:`refuse_undeclared_route` refuses it first; one outside the refusal, such as a socket in a
+# mount, is refused here at accept instead unless a gate it calls records an admission.
+#
+# The LATEST gate's answer stands: a refusal clears an earlier admission, so a body that ignores a
+# stricter gate's refusal after a laxer gate admitted the caller is still refused, and so is one
+# whose route a gate dependency admitted first. That holds only for a gate that records: a gate
+# that finds the handshake is not its own to judge records nothing, as the web console's cookie
+# gate does for a native client, which sends no Origin. The record is a flag, not an identity: it
+# does not say which permission the route needed. The route walk reads which permissions the body
+# asks for, and refuses an endpoint body that calls ``record_ws_gate`` by that name.
+
+#: The scope key a WebSocket gate sets to record its answer: ``True`` admitted, ``False`` refused.
+_WS_GATE_ADMITTED_KEY = "mefor.ws_gate_admitted"
+#: The route attribute that holds the :class:`_RefusalTally` of accepts :class:`WebSocketAcceptGate`
+#: refused there. Apart from the undeclared-route tally, so neither count includes the other. Unlike
+#: that tally, NOTHING reports it: ``GET /security/posture`` does not read it. Refusals after a
+#: burst's last log line reach the log only as the count on the next line for that route.
+_ACCEPT_REFUSALS_ATTR = "_mefor_accept_refusals"
+#: The tally for a refused accept whose scope named no route.
+_UNKNOWN_ROUTE_ACCEPT_REFUSALS = _RefusalTally()
+
+
+def record_ws_gate(websocket: HTTPConnection, *, admitted: bool) -> None:
+    """Record on ``websocket``'s scope whether a gate admitted its caller, replacing any earlier
+    answer. Only a gate calls this; ``scripts/security/route_gates.py`` refuses an endpoint body
+    that calls it by this name."""
+    websocket.scope[_WS_GATE_ADMITTED_KEY] = admitted
+
+
+def ws_accept_allowed(scope: Mapping[str, Any]) -> bool:
+    """Whether :class:`WebSocketAcceptGate` lets this WebSocket scope's ``accept`` through."""
+    answer = scope.get(_WS_GATE_ADMITTED_KEY)
+    if answer is not None:
+        # The latest recorded answer decides on every socket, a public or dependency-gated one
+        # included.
+        return answer is True
+    route = scope.get("route")
+    if route is not None:
+        # As the HTTP rule reads it: a gate dependency or a public mark; an in-body mark is not
+        # enough. A gate dependency that recorded nothing is trusted to have admitted the caller
+        # once it returned. On such a route, a denial response sent for any dependency's raise
+        # passes here too.
+        return route_is_declared(route, websocket=False)
+    # FastAPI's router sets no route for a plain Starlette WebSocket route: the endpoint's own public
+    # mark, when the scope names one, is the only declaration left to read.
+    declared = route_declaration_of(scope.get("endpoint"))
+    return declared is not None and declared.public
+
+
+def _record_refused_accept(scope: Scope) -> None:
+    """Count and log a refused accept as :func:`_record_refusal` does, naming the route by the
+    same key, a path template and never the request's path."""
+    route = scope.get("route")
+    routes = getattr(scope.get("app"), "routes", None) or ()
+    _count_and_log(
+        _tally_on(route, _ACCEPT_REFUSALS_ATTR, _UNKNOWN_ROUTE_ACCEPT_REFUSALS),
+        "refused accept on WebSocket route %s: the latest recorded gate answer was a refusal, or"
+        " none was recorded and the route has no gate dependency or public_route mark",
+        lambda: _logged_key(route, routes),
+    )
+
+
+class WebSocketAcceptGate:
+    """Refuse ``websocket.accept`` on a WebSocket whose latest recorded gate answer is a refusal, or
+    with none and neither a gate dependency nor a ``public_route`` mark, as the note above says.
+
+    Pure ASGI, wrapping ``send`` only. The refusal is a policy-violation close sent in place of the
+    accept, or of a denial response of any status, so the handshake fails exactly as a gate's own
+    pre-accept refusal does; the header floor outside turns it into a 403 where the server allows
+    one. The handler then gets a
+    :class:`WebSocketException`, which Starlette answers with a close this wrapper drops, because
+    the socket is already closed. A refused denial response's body is dropped instead of raising.
+    Every later message but a close raises the same exception."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "websocket":
+            await self.app(scope, receive, send)
+            return
+        accepted = refused = False
+
+        async def guarded_send(message: Message) -> None:
+            nonlocal accepted, refused
+            if accepted:
+                await send(message)
+                return
+            kind = message.get("type")
+            if refused:
+                # The refusal already closed the socket: a close, or the rest of a refused denial
+                # response, is dropped; anything else is refused again.
+                if kind in ("websocket.close", "websocket.http.response.body"):
+                    return
+                raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
+            # A denial response is an HTTP answer the body chooses, its status, headers and body
+            # alike, so it needs an admitted caller just as an accept does. Refused, it becomes the
+            # same bodyless refusal a gate's own pre-accept close gets.
+            if kind in ("websocket.accept", "websocket.http.response.start"):
+                if not ws_accept_allowed(scope):
+                    refused = True
+                    # A refusal status after a gate's recorded refusal is that gate refusing, as it
+                    # should. An accept, a denial no gate answered for, or a non-refusal status
+                    # after a refusal is a body that did not act on its gate: a defect.
+                    gate_refusing = (
+                        kind == "websocket.http.response.start"
+                        and scope.get(_WS_GATE_ADMITTED_KEY) is False
+                        and int(message.get("status", 0)) >= 400
+                    )
+                    if not gate_refusing:
+                        _record_refused_accept(scope)
+                    await send({"type": "websocket.close", "code": status.WS_1008_POLICY_VIOLATION})
+                    if kind == "websocket.accept":
+                        raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
+                    # A denial response ends the handshake anyway, and Starlette cannot answer a
+                    # raise from inside one; its body is dropped above.
+                    return
+                accepted = kind == "websocket.accept"
+            await send(message)
+
+        await self.app(scope, receive, guarded_send)
+
+
 def _gate(dependency: _Gate, authenticate: _Step) -> _Gate:
     """Mark a ``require*()`` closure as a gate, with the step that authenticates its caller.
 
@@ -946,18 +1101,10 @@ def _gate(dependency: _Gate, authenticate: _Step) -> _Gate:
     :func:`mark_route_gate` sets and reads its permissions from the closure cells (see
     :func:`require`); neither attribute changes those.
 
-    A factory whose gate refuses AHEAD of its base's sign-in check must put that refusal in its
-    step too, in the same order, as :func:`require_phi_read` does with the hop refusal."""
+    A factory whose gate refuses AHEAD of its sign-in check must put that refusal in its step too,
+    in the same order, as :func:`require_phi_read` does with the hop refusal."""
     setattr(dependency, _BEFORE_BODY_ATTR, BeforeBody(authenticate, authenticates=True))
     return mark_route_gate(dependency)
-
-
-def _authentication_of(gate: _Gate) -> _Step:
-    """The authentication step of a gate built in this module, for a factory that wraps it."""
-    found = before_body_of(gate)
-    if found is None or not found.authenticates:
-        raise TypeError(f"{gate!r} is not a gate built by a require*() factory")
-    return found.step
 
 
 def steps_before_body(dependant: Dependant) -> tuple[tuple[Callable[..., Any], _Step], ...]:
@@ -1144,7 +1291,8 @@ async def _session_caller(
 
 
 async def _authenticate_session_before_body(request: Request) -> None:
-    """The early-check step of every gate built on :func:`require`: refuse, or return nothing.
+    """The early-check step of :func:`require` and every gate built on :func:`_admit`: refuse, or
+    return nothing.
 
     It counts as no activity. The gate that runs after the body is what moves the session's idle
     clock, so a request whose body then fails to parse leaves the clock where it was, which is
@@ -1158,92 +1306,185 @@ def require(
     """Build a dependency that authenticates the caller and asserts each of ``permissions``.
 
     ``mfa_gate=False`` suppresses the ASVS 6.3.3 second-factor ACCESS gate for routes an MFA-pending
-    session must still reach. Only the ``*_reauth_only*`` factories pass it, because an un-enrolled
-    user cannot satisfy a gate standing in front of the one route that enrolls them.
+    session must still reach, because an un-enrolled user cannot satisfy a gate standing in front of
+    the one route that enrolls them. The ``*_reauth_only*`` factories pass the same flag to
+    :func:`_admit`, which holds every check this gate makes (BACKLOG #1197).
 
-    The flag lives HERE rather than on a private helper, which was tried and reverted: routing the
-    body through ``_require`` renamed the returned closure's ``__qualname__``, and the route-map drift
-    guard derives a route's gate from exactly that (``_gate_of`` ignores any qualname not starting
-    with ``require``). Every route then read as UNGATED. Widening this signature instead costs one
-    ``ENGINE_UI_SEAM`` bump — the mechanism that exists for precisely this — while ``mfa_gate`` is an
-    ordinary closure cell the drift guard already ignores."""
+    The returned closure is still built HERE, and named ``dependency`` inside ``require``: an earlier
+    attempt built it in a private ``_require``, which renamed its ``__qualname__``, and the route-map
+    drift guard derives a route's gate from exactly that (``_gate_of`` ignores any qualname not
+    starting with ``require``). Every route then read as UNGATED. Delegating the closure's BODY to
+    :func:`_admit` keeps the qualname, and ``permissions`` and ``mfa_gate`` stay closure cells."""
 
     async def dependency(request: Request) -> Identity:
-        auth, identity = await _session_caller(request)
-        if auth is None:
-            return identity
-        if identity.must_change_password and request.url.path not in _MUST_CHANGE_EXEMPT_PATHS:
-            enrol_first = await auth.must_enrol_before_rotating(identity)
-            if not (enrol_first and (request.method, request.url.path) in _ENROL_FIRST_ROUTES):
-                # BACKLOG #1141 (ASVS 6.4.5): this refusal is the renewal instruction every
-                # non-browser caller receives, so it states when the credential dies. The detail
-                # stays a string that STARTS with the old text, because clients match on it as a
-                # substring (``ide/src/engineStatusModel.ts`` ``classifyForbidden``).
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN,
-                    _password_change_required(
-                        await pending_credential_deadline_for(auth, identity.user_id),
-                        suffix=_ENROL_FIRST_SUFFIX if enrol_first else "",
-                    ),
-                )
-        # ASVS 6.3.3 — MFA is an ACCESS gate, not only a step-up gate. Ordering is load-bearing in
-        # BOTH directions. must_change stays FIRST: a fresh account (a new user) is
-        # must_change AND mfa_pending with NO factor, so leading with MFA would point it at
-        # /auth/mfa-verify with nothing to prove there — the brick. Under require_mfa it ENROLS
-        # first, through _ENROL_FIRST_ROUTES above, and only then rotates (ADR 0197 Amendment A);
-        # with the requirement off it rotates first, and /me/password lets it, because the factor
-        # refusal below skips an account with no factor.
-        # A must-change account that HAS a factor (an admin reset) is sent the other way: /me/password
-        # refuses it with X-MFA-Required, and /auth/mfa-verify is must-change-exempt so it can answer
-        # (BACKLOG #1954). And this stays ABOVE the permission loop: refusing below it would tell an
-        # unverified caller whether it holds the permission, a free authorization oracle.
-        route = (request.method, request.url.path)
-        if mfa_gate and route not in _MFA_EXEMPT_ROUTES:
-            pending = not await auth.mfa_satisfied(bearer_token(request))
-        elif mfa_gate and route == _PASSWORD_CHANGE_ROUTE:
-            pending = await auth.password_change_owes_factor(bearer_token(request))
-        else:
-            pending = False
-        if pending:
-            await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "multi-factor verification required; POST /auth/mfa-verify then retry",
-                headers={"X-MFA-Required": "1"},
-            )
-        # BACKLOG #1139 (ASVS 6.3.7): an account with no notification address sets one first. BELOW
-        # the factor gate, so a password-only session is sent to prove its factor before it can
-        # choose where notices go. ABOVE the permission loop, for the oracle reason given there.
-        if identity.must_set_notify_email and mfa_gate and route not in _NOTIFY_EMAIL_EXEMPT_ROUTES:
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                NOTIFY_EMAIL_REQUIRED_DETAIL,
-                headers={"X-Notify-Email-Required": "1"},
-            )
-        for permission in permissions:
-            if not identity.has(permission):
-                await auth.audit_permission_denied(
-                    identity, permission, request.url.path, client=client_ip(request)
-                )
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN, f"missing permission: {permission.value}"
-                )
-        # BACKLOG #195a (ASVS 16.3.2): record the authorization GRANT. Under [diagnostics].audit_all_authz
-        # — ON by default since BACKLOG #1277, threaded onto app.state — EVERY satisfied route is audited,
-        # GETs included, except the PHI-view grants that the PHI-access audit path already records. With
-        # the switch off, the method guard drops every GET (including the polled GET /approvals, which
-        # carries APPROVALS_APPROVE) and the permission set drops every read/monitoring grant, leaving
-        # only the sensitive/state-changing surface on a NON-GET request.
-        audit_all = _audit_all_authz(request.app.state)
-        if audit_all or request.method != "GET":
-            audited = _grant_audit_permission(permissions, audit_all=audit_all)
-            if audited is not None:
-                await auth.audit_permission_granted(
-                    identity, audited, request.url.path, client=client_ip(request)
-                )
+        auth, identity = await _admit(request, permissions, mfa_gate=mfa_gate)
+        if auth is not None:
+            await _record_grant(request, auth, identity, permissions)
         return identity
 
     return _gate(dependency, _authenticate_session_before_body)
+
+
+async def _admit(
+    request: Request, permissions: tuple[Permission, ...], *, mfa_gate: bool
+) -> tuple[AuthService | None, Identity]:
+    """Every check :func:`require` makes, and every refusal row it writes, but not its grant row.
+
+    The derived gates call this rather than :func:`require`'s dependency, so that a request one of
+    their own checks then refuses leaves no grant row (BACKLOG #1197, ASVS 16.3.2). They record
+    the decision through :func:`_recorded_decision` once their own checks have run. The service is
+    ``None`` only on the ``allow_no_auth`` path, as :func:`_session_caller` says."""
+    auth, identity = await _session_caller(request)
+    if auth is None:
+        return None, identity
+    if identity.must_change_password and request.url.path not in _MUST_CHANGE_EXEMPT_PATHS:
+        enrol_first = await auth.must_enrol_before_rotating(identity)
+        if not (enrol_first and (request.method, request.url.path) in _ENROL_FIRST_ROUTES):
+            # BACKLOG #1141 (ASVS 6.4.5): this refusal is the renewal instruction every
+            # non-browser caller receives, so it states when the credential dies. The detail
+            # stays a string that STARTS with the old text, because clients match on it as a
+            # substring (``ide/src/engineStatusModel.ts`` ``classifyForbidden``).
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                _password_change_required(
+                    await pending_credential_deadline_for(auth, identity.user_id),
+                    suffix=_ENROL_FIRST_SUFFIX if enrol_first else "",
+                ),
+            )
+    # ASVS 6.3.3 — MFA is an ACCESS gate, not only a step-up gate. Ordering is load-bearing in
+    # BOTH directions. must_change stays FIRST: a fresh account (a new user) is
+    # must_change AND mfa_pending with NO factor, so leading with MFA would point it at
+    # /auth/mfa-verify with nothing to prove there — the brick. Under require_mfa it ENROLS
+    # first, through _ENROL_FIRST_ROUTES above, and only then rotates (ADR 0197 Amendment A);
+    # with the requirement off it rotates first, and /me/password lets it, because the factor
+    # refusal below skips an account with no factor.
+    # A must-change account that HAS a factor (an admin reset) is sent the other way: /me/password
+    # refuses it with X-MFA-Required, and /auth/mfa-verify is must-change-exempt so it can answer
+    # (BACKLOG #1954). And this stays ABOVE the permission loop: refusing below it would tell an
+    # unverified caller whether it holds the permission, a free authorization oracle.
+    route = (request.method, request.url.path)
+    if mfa_gate and route not in _MFA_EXEMPT_ROUTES:
+        pending = not await auth.mfa_satisfied(bearer_token(request))
+    elif mfa_gate and route == _PASSWORD_CHANGE_ROUTE:
+        pending = await auth.password_change_owes_factor(bearer_token(request))
+    else:
+        pending = False
+    if pending:
+        raise await _mfa_refusal(request, auth, identity)
+    # BACKLOG #1139 (ASVS 6.3.7): an account with no notification address sets one first. BELOW
+    # the factor gate, so a password-only session is sent to prove its factor before it can
+    # choose where notices go. ABOVE the permission loop, for the oracle reason given there.
+    if identity.must_set_notify_email and mfa_gate and route not in _NOTIFY_EMAIL_EXEMPT_ROUTES:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            NOTIFY_EMAIL_REQUIRED_DETAIL,
+            headers={"X-Notify-Email-Required": "1"},
+        )
+    for permission in permissions:
+        if not identity.has(permission):
+            await auth.audit_permission_denied(
+                identity, permission, request.url.path, client=client_ip(request)
+            )
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, f"missing permission: {permission.value}"
+            )
+    return auth, identity
+
+
+def _audited_permission(request: Request, permissions: tuple[Permission, ...]) -> Permission | None:
+    """The permission a decision row for this request names, or ``None`` when it writes none.
+
+    BACKLOG #195a (ASVS 16.3.2): the authorization GRANT row. Under [diagnostics].audit_all_authz
+    — ON by default since BACKLOG #1277, threaded onto app.state — EVERY satisfied route is audited,
+    GETs included, except the PHI-view grants that the PHI-access audit path already records. With
+    the switch off, the method guard drops every GET (including the polled GET /approvals, which
+    carries APPROVALS_APPROVE) and the permission set drops every read/monitoring grant, leaving
+    only the sensitive/state-changing surface on a NON-GET request. :func:`_recorded_decision`
+    says why a derived gate's refusal row reads it too."""
+    audit_all = _audit_all_authz(request.app.state)
+    if audit_all or request.method != "GET":
+        return _grant_audit_permission(permissions, audit_all=audit_all)
+    return None
+
+
+async def _record_grant(
+    request: Request, auth: AuthService, identity: Identity, permissions: tuple[Permission, ...]
+) -> None:
+    """Write the GRANT row for a request whose every check has passed."""
+    audited = _audited_permission(request, permissions)
+    if audited is not None:
+        await auth.audit_permission_granted(
+            identity, audited, request.url.path, client=client_ip(request)
+        )
+
+
+class _GateRefusal(HTTPException):
+    """A refusal raised by a check a gate makes after its permission check, carrying the reason
+    its ``auth.gate_refused`` row names (BACKLOG #1197).
+
+    It is an :class:`HTTPException`, so FastAPI answers it, and every caller that catches one,
+    exactly as before. ``reason`` is required, so a raise site cannot drop its row by leaving it
+    out. :meth:`__reduce__` lets ``copy`` and ``pickle`` rebuild one, as they can a plain
+    HTTPException."""
+
+    def __init__(
+        self,
+        status_code: int,
+        detail: str,
+        *,
+        reason: Literal["step_up", "throttled"],
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(status_code, detail, headers=headers)
+        self.reason = reason
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (_rebuild_gate_refusal, (self.status_code, self.detail, self.reason, self.headers))
+
+
+def _rebuild_gate_refusal(
+    status_code: int,
+    detail: str,
+    reason: Literal["step_up", "throttled"],
+    headers: dict[str, str] | None,
+) -> _GateRefusal:
+    """Rebuild a :class:`_GateRefusal` for ``copy`` and ``pickle``, which pass arguments by position."""
+    return _GateRefusal(status_code, detail, reason=reason, headers=headers)
+
+
+@asynccontextmanager
+async def _recorded_decision(
+    request: Request, auth: AuthService, identity: Identity, permissions: tuple[Permission, ...]
+) -> AsyncIterator[None]:
+    """Record a derived gate's decision once its own checks, run inside this block, have decided.
+
+    BACKLOG #1197 (ASVS 16.3.2). A derived gate runs :func:`_admit`, then checks of its own: pacing,
+    the new-address question, a step-up. Each used to call :func:`require`'s dependency first, which
+    had already written the grant row, so a request those checks refused kept a grant row and got no
+    denial row. Now the grant row is written only when the block exits cleanly, and a refusal raised
+    inside it writes ``auth.gate_refused`` instead, naming the permission the grant row would have
+    named and why.
+
+    A refusal row is written exactly where the grant row would have been, so a request still writes
+    at most one decision row, and a gate that wrote no grant row writes no refusal row either. That
+    keeps the per-request volume where the shipped trail already put it while the audit chain has no
+    drain (BACKLOG #1421). The reason comes from the :class:`_GateRefusal` the check raised. Any
+    other exception leaves the block with no decision row from it, which is right for the
+    :func:`_mfa_refusal` 403: it wrote its own ``auth.mfa_denied`` row where it was raised."""
+    try:
+        yield
+    except _GateRefusal as refusal:
+        audited = _audited_permission(request, permissions)
+        if audited is not None:
+            await auth.audit_gate_refused(
+                identity,
+                audited,
+                request.url.path,
+                reason=refusal.reason,
+                client=client_ip(request),
+            )
+        raise
+    await _record_grant(request, auth, identity, permissions)
 
 
 #: The step-up refusal's detail for a session whose step-up is a password or directory re-proof.
@@ -1296,8 +1537,22 @@ async def _step_up_refusal(
         # Set to ``idp`` on an ``oidc`` session's step-up refusal, so a client can branch on a
         # header rather than parse the detail. Absent on every other refusal.
         headers[STEP_UP_VIA_HEADER] = STEP_UP_VIA_IDP
-        return HTTPException(status.HTTP_403_FORBIDDEN, _IDP_STEP_UP_DETAIL, headers=headers)
-    return HTTPException(status.HTTP_403_FORBIDDEN, _STEP_UP_DETAIL, headers=headers)
+    detail = _IDP_STEP_UP_DETAIL if via_idp else _STEP_UP_DETAIL
+    return _GateRefusal(status.HTTP_403_FORBIDDEN, detail, reason="step_up", headers=headers)
+
+
+async def _mfa_refusal(request: Request, auth: AuthService, identity: Identity) -> HTTPException:
+    """The 403 every JSON gate raises for a session whose second factor is still pending.
+
+    Writes its ``auth.mfa_denied`` row first, whichever gate refuses (BACKLOG #1197). It is a
+    plain :class:`HTTPException`, not a :class:`_GateRefusal`, so :func:`_recorded_decision` writes
+    no second row for it."""
+    await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
+    return HTTPException(
+        status.HTTP_403_FORBIDDEN,
+        "multi-factor verification required; POST /auth/mfa-verify then retry",
+        headers={"X-MFA-Required": "1"},
+    )
 
 
 async def refuse_from_new_address(request: Request) -> None:
@@ -1318,7 +1573,7 @@ async def refuse_from_new_address(request: Request) -> None:
 
     Costs one session read per request while ``[auth].admin_new_ip_step_up`` is on, and one more
     on a refusal, to pick its wording. The gate has
-    already read the session through :func:`require`, but the identity it returns does not carry
+    already read the session through :func:`_admit`, but the identity it returns does not carry
     the anchor address. A no-op with no auth service."""
     auth = get_auth(request)
     if auth is None:
@@ -1342,17 +1597,16 @@ def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Ide
     (:func:`refuse_from_new_address`, vault BACKLOG #2620). That runs BEFORE the pacing charge, so
     a refusal here spends none of the holder's write budget (the BACKLOG #1973 rule the console's
     gate states). The step-up gates still pace before they ask, so a refusal there does."""
-    base = require(*permissions)
 
     async def dependency(request: Request) -> Identity:
-        identity = await base(request)
-        auth = get_auth(request)
+        auth, identity = await _admit(request, permissions, mfa_gate=True)
         if auth is not None:
-            await refuse_from_new_address(request)
-            _enforce_admin_write_pacing(request, auth, identity)
+            async with _recorded_decision(request, auth, identity, permissions):
+                await refuse_from_new_address(request)
+                _enforce_admin_write_pacing(request, auth, identity)
         return identity
 
-    return _gate(dependency, _authentication_of(base))
+    return _gate(dependency, _authenticate_session_before_body)
 
 
 # --- mTLS client-cert → Identity resolver (#200, ADR 0083) -------------------------------------------
@@ -1551,10 +1805,12 @@ def require_service_cert(*permissions: Permission) -> Callable[[Request], Awaita
                     # on this factory inherits nothing, which is the gap the grant work would close.
                     #
                     # ``client`` (ADR 0150) is threaded HERE and not inherited: this factory is the
-                    # one authorization gate that does NOT delegate to :func:`require` — it
-                    # authenticates through :func:`resolve_client_cert_identity` and runs its own
-                    # permission loop — so "fix require() and the factories follow" is true of
-                    # ``require_paced`` / ``require_step_up`` and false of this one. A cert plane's
+                    # one authorization gate that does NOT delegate to :func:`_admit`, the checks
+                    # :func:`require` and its derived gates share — it authenticates through
+                    # :func:`resolve_client_cert_identity` and runs its own permission loop — so
+                    # "fix _admit() and the factories follow" is true of ``require_paced`` /
+                    # ``require_step_up`` and false of this one. A check added to ``require``'s own
+                    # dependency body, outside ``_admit``, reaches neither. A cert plane's
                     # peer address is the whole of what identifies the calling SERVICE host, since
                     # there is no session row to join back to.
                     await auth.audit_permission_denied(
@@ -1607,8 +1863,7 @@ def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[
     And it refuses a read from a host the session has not verified from, with the step-up answer
     (:func:`refuse_from_new_address`, vault BACKLOG #2620), before the budget is charged: a read
     that will not be served must not spend the holder's quota."""
-    base = require(*permissions)
-    authenticate = _authentication_of(base)
+    authenticate = _authenticate_session_before_body
 
     async def before_body(request: Request) -> None:
         # The hop refusal answers ahead of sign-in in the dependency below, so it does here too.
@@ -1617,9 +1872,11 @@ def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[
 
     async def dependency(request: Request) -> Identity:
         enforce_phi_read_hop(request)
-        identity = await base(request)
-        await refuse_from_new_address(request)
-        enforce_phi_read_pacing(request, identity)
+        auth, identity = await _admit(request, permissions, mfa_gate=True)
+        if auth is not None:
+            async with _recorded_decision(request, auth, identity, permissions):
+                await refuse_from_new_address(request)
+                enforce_phi_read_pacing(request, identity)
         return identity
 
     return _gate(dependency, before_body)
@@ -1646,9 +1903,10 @@ def enforce_phi_read_pacing(request: Request, identity: Identity) -> None:
             identity.username,
             request.url.path,
         )
-        raise HTTPException(
+        raise _GateRefusal(
             status.HTTP_429_TOO_MANY_REQUESTS,
             "too many requests; please slow down",
+            reason="throttled",
             headers={"Retry-After": str(auth.phi_read_retry_after(identity.user_id))},
         )
 
@@ -1669,9 +1927,10 @@ def _enforce_admin_write_pacing(request: Request, auth: AuthService, identity: I
             identity.username,
             request.url.path,
         )
-        raise HTTPException(
+        raise _GateRefusal(
             status.HTTP_429_TOO_MANY_REQUESTS,
             "too many requests; please slow down",
+            reason="throttled",
             headers={"Retry-After": str(auth.admin_write_retry_after(identity.user_id))},
         )
 
@@ -1686,34 +1945,34 @@ def require_step_up(*permissions: Permission) -> Callable[[Request], Awaitable[I
     refused with 403 (the console then prompts to re-authenticate and retries). An ``oidc``
     session's refusal names the IdP leg instead of ``POST /me/reauth`` (:func:`_step_up_refusal`).
     The embedding/no-auth path is unaffected (there is no session to step up)."""
-    base = require(*permissions)
 
     async def dependency(request: Request) -> Identity:
-        identity = await base(request)
-        auth = get_auth(request)
+        auth, identity = await _admit(request, permissions, mfa_gate=True)
         if auth is not None:
-            token = bearer_token(request)
-            # BACKLOG #193 (ASVS 2.4.2): per-actor anti-automation pacing on the state-changing admin
-            # surface (NON-GET only), shared with require_paced so both gates draw one per-actor bucket.
-            _enforce_admin_write_pacing(request, auth, identity)
-            # Second factor first (WP-14, ASVS 6.3.3): an MFA-required session that has not verified
-            # its TOTP / recovery code cannot perform a sensitive op until it does. A distinct header
-            # tells the console to prompt for a code rather than a password reauth.
-            if not await auth.mfa_satisfied(token):
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN,
-                    "multi-factor verification required; POST /auth/mfa-verify then retry",
-                    headers={"X-MFA-Required": "1"},
+            async with _recorded_decision(request, auth, identity, permissions):
+                token = bearer_token(request)
+                # BACKLOG #193 (ASVS 2.4.2): per-actor anti-automation pacing on the state-changing
+                # admin surface (NON-GET only), shared with require_paced so both gates draw one
+                # per-actor bucket.
+                _enforce_admin_write_pacing(request, auth, identity)
+                # Second factor first (WP-14, ASVS 6.3.3): an MFA-required session that has not
+                # verified its TOTP / recovery code cannot perform a sensitive op until it does. A
+                # distinct header tells the console to prompt for a code rather than a password
+                # reauth. Audited like _admit()'s factor gate, which refuses the same sessions first.
+                if not await auth.mfa_satisfied(token):
+                    raise await _mfa_refusal(request, auth, identity)
+                # Contextual-risk layer (WP-L3-13, ASVS 8.4.2): a sensitive admin action from a client
+                # IP the session has not verified from forces a fresh step-up (and audits +
+                # notifies). A successful POST /me/reauth re-anchors the session to the new IP, so
+                # this then clears.
+                new_ip = await auth.flag_new_client_ip(
+                    token, client_ip(request), path=request.url.path
                 )
-            # Contextual-risk layer (WP-L3-13, ASVS 8.4.2): a sensitive admin action from a client IP
-            # the session has not verified from forces a fresh step-up (and audits + notifies). A
-            # successful POST /me/reauth re-anchors the session to the new IP, so this then clears.
-            new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
-            if new_ip or not await auth.has_recent_step_up(token):
-                raise await _step_up_refusal(auth, token)
+                if new_ip or not await auth.has_recent_step_up(token):
+                    raise await _step_up_refusal(auth, token)
         return identity
 
-    return _gate(dependency, _authentication_of(base))
+    return _gate(dependency, _authenticate_session_before_body)
 
 
 def require_reauth_only(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
@@ -1728,21 +1987,23 @@ def require_reauth_only(*permissions: Permission) -> Callable[[Request], Awaitab
     ``mfa_gate=False`` extends that same deadlock carve-out to the ASVS 6.3.3 ACCESS gate now applied
     by :func:`require`: without it the enrollment routes would sit behind a factor the caller does
     not yet have."""
-    base = require(*permissions, mfa_gate=False)
 
     async def dependency(request: Request) -> Identity:
-        identity = await base(request)
-        auth = get_auth(request)
+        auth, identity = await _admit(request, permissions, mfa_gate=False)
         if auth is not None:
-            token = bearer_token(request)
-            # Same new-client-IP contextual-risk layer as require_step_up (WP-L3-13); the MFA gate is
-            # intentionally skipped here (enrollment would otherwise deadlock — see the docstring).
-            new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
-            if new_ip or not await auth.has_recent_step_up(token):
-                raise await _step_up_refusal(auth, token)
+            async with _recorded_decision(request, auth, identity, permissions):
+                token = bearer_token(request)
+                # Same new-client-IP contextual-risk layer as require_step_up (WP-L3-13); the MFA
+                # gate is intentionally skipped here (enrollment would otherwise deadlock — see the
+                # docstring).
+                new_ip = await auth.flag_new_client_ip(
+                    token, client_ip(request), path=request.url.path
+                )
+                if new_ip or not await auth.has_recent_step_up(token):
+                    raise await _step_up_refusal(auth, token)
         return identity
 
-    return _gate(dependency, _authentication_of(base))
+    return _gate(dependency, _authenticate_session_before_body)
 
 
 async def _action_step_up_ok(auth: AuthService, token: str | None, action: str) -> bool:
@@ -1789,47 +2050,46 @@ def require_step_up_action(
     rejoins the requester's open dual-control hold then needs a live session window
     (:func:`step_up_window_live`), and no new proof. ``tests/test_bound_step_up_hold_rejoin.py``
     pins what each such route may do before its spend."""
-    base = require(*permissions)
 
     async def dependency(request: Request) -> Identity:
-        identity = await base(request)
-        auth = get_auth(request)
+        auth, identity = await _admit(request, permissions, mfa_gate=True)
         if auth is not None:
-            token = bearer_token(request)
-            # BACKLOG #1148 (ASVS 2.4.2): charge the SAME per-actor anti-automation bucket
-            # require_step_up charges, in the SAME position — first, so a throttled write is refused
-            # before any further work. Without this, promoting a route from require_step_up to this
-            # factory SILENTLY STRIPS the pacing floor while reading as a hardening change, because
-            # the action binding is visible in the diff and the lost pacing is not. That already
-            # happened once: PATCH /users/{user_id} was promoted and lost it, and
-            # docs/SECURITY.md filed it under "No limiter of any kind" until then. Adding it here
-            # closes that too rather than only sparing the routes #1148 promotes.
-            _enforce_admin_write_pacing(request, auth, identity)
-            # NOT redundant with the ASVS 6.3.3 gate in require(), despite covering the same sessions
-            # for every non-exempt path. DELETE /me/mfa shares its path with the MFA-exempt
-            # GET /me/mfa, so if _MFA_EXEMPT_ROUTES is ever flattened to bare paths this check is the
-            # ONLY thing stopping a half-authenticated session from switching its own second factor
-            # off. Measured, not assumed: neutering the base gate leaves this route refused. Keep it.
-            if not await auth.mfa_satisfied(token):
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN,
-                    "multi-factor verification required; POST /auth/mfa-verify then retry",
-                    headers={"X-MFA-Required": "1"},
+            async with _recorded_decision(request, auth, identity, permissions):
+                token = bearer_token(request)
+                # BACKLOG #1148 (ASVS 2.4.2): charge the SAME per-actor anti-automation bucket
+                # require_step_up charges, in the SAME position — first, so a throttled write is
+                # refused before any further work. Without this, promoting a route from
+                # require_step_up to this factory SILENTLY STRIPS the pacing floor while reading as a
+                # hardening change, because the action binding is visible in the diff and the lost
+                # pacing is not. That already happened once: PATCH /users/{user_id} was promoted and
+                # lost it, and docs/SECURITY.md filed it under "No limiter of any kind" until then.
+                # Adding it here closes that too rather than only sparing the routes #1148 promotes.
+                _enforce_admin_write_pacing(request, auth, identity)
+                # NOT redundant with the ASVS 6.3.3 gate in _admit(), despite covering the same
+                # sessions for every non-exempt path. DELETE /me/mfa shares its path with the
+                # MFA-exempt GET /me/mfa, so if _MFA_EXEMPT_ROUTES is ever flattened to bare paths
+                # this check is the ONLY thing stopping a half-authenticated session from switching
+                # its own second factor off. Measured, not assumed: neutering the base gate leaves
+                # this route refused. Keep it.
+                if not await auth.mfa_satisfied(token):
+                    raise await _mfa_refusal(request, auth, identity)
+                # `new_ip` is checked first so a short-circuit leaves the single-use grant UNCONSUMED
+                # on a forced-step-up (the grant is only popped when we actually reach the action
+                # check).
+                new_ip = await auth.flag_new_client_ip(
+                    token, client_ip(request), path=request.url.path
                 )
-            # `new_ip` is checked first so a short-circuit leaves the single-use grant UNCONSUMED on a
-            # forced-step-up (the grant is only popped when we actually reach the action check).
-            new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
-            if proof_in_route:
-                # Every check but the step-up itself. The factor-binding refusal is the one
-                # _action_step_up_ok runs above its fork; it pops nothing, so it can run here as
-                # well as at the spend.
-                if new_ip or await auth.factor_binding_is_blocked(token, action):
+                if proof_in_route:
+                    # Every check but the step-up itself. The factor-binding refusal is the one
+                    # _action_step_up_ok runs above its fork; it pops nothing, so it can run here as
+                    # well as at the spend.
+                    if new_ip or await auth.factor_binding_is_blocked(token, action):
+                        raise await _step_up_refusal(auth, token, action)
+                elif new_ip or not await _action_step_up_ok(auth, token, action):
                     raise await _step_up_refusal(auth, token, action)
-            elif new_ip or not await _action_step_up_ok(auth, token, action):
-                raise await _step_up_refusal(auth, token, action)
         return identity
 
-    return _gate(dependency, _authentication_of(base))
+    return _gate(dependency, _authenticate_session_before_body)
 
 
 async def spend_step_up_action(request: Request, action: str) -> None:
@@ -1840,8 +2100,9 @@ async def spend_step_up_action(request: Request, action: str) -> None:
     before it holds or runs anything. A refusal the route makes after the spend, such as a 404 or
     a 409, still costs the proof, unless the route gives it back with
     ``AuthService.refund_action_step_up``, as edit-resend does for a refusal before its store write
-    (owner ruling 2026-10-13, #3241 R1). With no auth service attached it does nothing, as the dependency
-    does."""
+    (owner ruling 2026-10-13, #3241 R1), other than one in ``_EDIT_RESEND_SPENDING_REFUSALS`` in
+    ``api/app.py`` (owner ruling 2026-11-07, #3241 added item 1). With no auth service attached it
+    does nothing, as the dependency does."""
     auth = get_auth(request)
     if auth is None:
         return
@@ -1894,29 +2155,26 @@ def require_reauth_only_action(
     still refused (see ``AuthService._PENDING_REFUSED_ACTIONS``), with ``X-MFA-Required`` and not
     a step-up header: a password re-proof mints it nothing, so pointing it at ``POST /me/reauth``
     would loop a client that already typed the right password (BACKLOG #1951)."""
-    base = require(*permissions, mfa_gate=False)
 
     async def dependency(request: Request) -> Identity:
-        identity = await base(request)
-        auth = get_auth(request)
+        auth, identity = await _admit(request, permissions, mfa_gate=False)
         if auth is not None:
-            token = bearer_token(request)
-            new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
-            # After the new-IP signal, so a refused request still records it, and before the grant
-            # check, which pops: a refusal here must not burn a grant. Audited like require()'s MFA
-            # gate, since this is the same refusal reached past that gate's carve-out.
-            if await auth.factor_binding_is_blocked(token, action):
-                await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN,
-                    "multi-factor verification required; POST /auth/mfa-verify then retry",
-                    headers={"X-MFA-Required": "1"},
+            async with _recorded_decision(request, auth, identity, permissions):
+                token = bearer_token(request)
+                new_ip = await auth.flag_new_client_ip(
+                    token, client_ip(request), path=request.url.path
                 )
-            if new_ip or not await _action_step_up_ok(auth, token, action):
-                raise await _step_up_refusal(auth, token, action)
+                # After the new-IP signal, so a refused request still records it, and before the
+                # grant check, which pops: a refusal here must not burn a grant. Audited like
+                # _admit()'s MFA gate, since this is the same refusal reached past that gate's
+                # carve-out.
+                if await auth.factor_binding_is_blocked(token, action):
+                    raise await _mfa_refusal(request, auth, identity)
+                if new_ip or not await _action_step_up_ok(auth, token, action):
+                    raise await _step_up_refusal(auth, token, action)
         return identity
 
-    return _gate(dependency, _authentication_of(base))
+    return _gate(dependency, _authenticate_session_before_body)
 
 
 async def optional_identity(request: Request) -> Identity | None:
@@ -1987,8 +2245,20 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     """Authorize a WebSocket upgrade: validate the ``Origin`` (4.4.2), then the bearer token from the
     Authorization header and the listed permissions.
 
-    Returns the :class:`Identity` on success, or ``None`` if auth fails (caller should close).
+    Returns the :class:`Identity` on success, or ``None`` if auth fails (caller should close). On
+    success it also records the handshake admitted, and on a refusal not admitted.
+    :class:`WebSocketAcceptGate` reads that record on every socket, before it lets an accept or a
+    denial response through.
     """
+    # Not admitted until this gate answers, so a raise inside it cannot leave an earlier admission.
+    record_ws_gate(websocket, admitted=False)
+    identity = await _authorize_ws(websocket, *permissions)
+    record_ws_gate(websocket, admitted=identity is not None)
+    return identity
+
+
+async def _authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identity | None:
+    """:func:`authorize_ws` without the admitted mark."""
     if not _ws_origin_allowed(websocket):
         return None  # cross-site / disallowed browser Origin — reject before accept()
     auth: AuthService | None = getattr(websocket.app.state, "auth", None)

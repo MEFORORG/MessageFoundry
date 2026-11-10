@@ -78,6 +78,7 @@ from messagefoundry.api.approvals import (
     ApprovalError,
     ApprovalGate,
     IdentityResolver,
+    held_fingerprint,
     named_requester,
 )
 from messagefoundry.api.auth_routes import add_auth_routes
@@ -242,6 +243,7 @@ from messagefoundry.api.security import (
     ConfigWriteNotRecorded,
     ExportStopped,
     StandingRefusal,
+    WebSocketAcceptGate,
     alert_sink_for,
     answers_before_body,
     authorize_ws,
@@ -305,6 +307,7 @@ from messagefoundry.auth.reconcile import (
     PAGING_DEADLINE,
     PROBE_FAULT_ABORT,
     REFERRAL_ABORT,
+    UNREACHED_ACCOUNT,
     ReconcilePlan,
 )
 from messagefoundry.auth.service import (
@@ -1828,14 +1831,15 @@ def _build_approval_gate(
                 "name who ran it; it was not run",
             )
         # Vault BACKLOG #2596, step 3: the release loads only the bytes the approval named. A hold
-        # whose params carry no digest (none is filed that way now) binds to None, which matches
-        # nothing, so it is refused as a mismatch once its directory resolves. On a store that holds
-        # a key the params are sealed with the rest of the request, so a writer to pending_approvals
-        # who changes the digest leaves a request the gate refuses (vault BACKLOG #2592).
-        approved = p.get("fingerprint")
-        approval = ApprovedConfig(
-            approved if isinstance(approved, str) else None, p.get("value_file")
-        )
+        # with no usable digest (held_fingerprint) binds to None, which matches nothing. The gate
+        # refuses such a hold before its claim (requires_fingerprint below, release_blocked
+        # 'params_no_fingerprint', vault BACKLOG #3192), so None reaches this only if that flag is
+        # dropped. It is then refused, with reason no_approved_digest where the release reaches
+        # the digest check.
+        # On a store that holds a key the params are sealed with the rest of the request, so a
+        # writer to pending_approvals who changes the digest leaves a request the gate refuses
+        # (vault BACKLOG #2592).
+        approval = ApprovedConfig(held_fingerprint(p), p.get("value_file"))
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
         # swapped the graph and then failed a follow-on step must report the same degraded outcome
         # the inline path reports, or dual control would be the quieter of the two.
@@ -1910,6 +1914,7 @@ def _build_approval_gate(
         permission=Permission.CONFIG_DEPLOY,
         in_scope=lambda identity, _p: _cross_channel_in_scope(identity),
         requires_requester=True,
+        requires_fingerprint=True,
     )
     return gate
 
@@ -1992,8 +1997,9 @@ def _posture_loosenings(
     ``graph`` is passed. The start passes the graph its snapshot took, so a reload that swaps the
     graph before its row is written cannot change what the row says the start loaded (vault BACKLOG
     #3076). ``graph_env_values`` are the ``env()`` values that graph resolves against, taken with it,
-    so a DATABASE hop's ``env()`` dialect reads as the route reads it off the runner; with none it
-    reads as unresolved. The settings-scoped entries are the same for either graph: a reload
+    so a DATABASE hop's ``env()`` dialect and an ``env()`` endpoint ``url`` read as the route reads
+    them off the runner. With none, the dialect reads as unresolved and the ``url`` as its literal
+    default. The settings-scoped entries are the same for either graph: a reload
     changes no settings."""
     store = getattr(state, "store_settings", None) or StoreSettings()
     cred_settings = getattr(state, "static_credential_settings", None)
@@ -2053,7 +2059,6 @@ def _posture_loosenings(
     cleartext_hops = hops(accepted_cleartext_hops)
     expired_hops = hops(expiry_relaxed_hops)
     hostname_hops = hops(hostname_unchecked_hops)
-    query_hops = hops(query_credential_hops)
     # A DATABASE dialect given as env() is resolved against the values the graph builds with, so a
     # hop is listed as generic only when it resolves to generic. One the values cannot resolve keeps
     # the reader's marker beside its name, because this entry keeps names only and its text states
@@ -2064,6 +2069,9 @@ def _posture_loosenings(
         if graph is not None
         else (runner.env_values if runner is not None else None)
     )
+    # An env() url is read against the same values, so the entry names the URL the build dials
+    # (vault BACKLOG #3766 items 14 and 15).
+    query_hops = hops(partial(query_credential_hops, env_values=db_env_values))
     db_hops = (
         []
         if registry is None
@@ -2086,10 +2094,19 @@ def _posture_loosenings(
     )
     attested_hops = hops(attested_secure_hops)
     revocation_hops = hops(revocation_attested_hops)
-    # Vault BACKLOG #2571. This reader returns plain names already.
-    path_form_hops = [] if registry is None else keep(path_form_fhir_updates(registry))
-    # Resolved against the same values as the DATABASE hops above. A name the values cannot
-    # resolve keeps the reader's marker, because the entry keeps names only.
+    # Vault BACKLOG #2571. Both readers below resolve env() against the same values as the
+    # DATABASE hops above. A name the values cannot resolve keeps the reader's marker, because the
+    # entry keeps names only and its text states that each named connection takes the loosening.
+    path_form_hops = (
+        []
+        if registry is None
+        else [
+            f"{name} ({note})" if note else name
+            for name, note in path_form_fhir_updates(registry, env_values=db_env_values)
+            # Narrowed on the bare name, before any marker is added.
+            if visible is None or visible(name)
+        ]
+    )
     ech_hops = (
         []
         if registry is None
@@ -2653,9 +2670,11 @@ async def _audit_refused_reload(
     filter sees both, and ``invalid_config`` otherwise. A trust-anchor check the store stopped, by
     refusing its audit read or write, writes reason ``store_unavailable`` and answers 503 (BACKLOG
     #3091); it is neither a refused anchor nor a bad graph. A released reload whose config is not the
-    one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch``, or
-    ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
-    BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
+    one its approval named writes ``config_reload_failed`` with ``approved_fingerprint`` and
+    ``current_fingerprint`` and reason ``digest_mismatch``, or ``no_approved_digest`` when the hold
+    carries no usable digest (:func:`held_fingerprint`), whose ``approved_fingerprint`` is then
+    null, and answers 422 (vault BACKLOG #2596); only the
+    executor meets it. One whose digest could not be taken now writes
     reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
     request whose digest cannot be taken is refused the same way, with no hold filed. A release
     refused before its digest check (:class:`ConfigRefusedBeforeApprovalCheck`) keeps its reason
@@ -2712,7 +2731,7 @@ async def _audit_refused_reload(
         action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
     elif isinstance(exc, ConfigDigestMismatch):
-        # A hold that took no digest is told apart, so nobody goes looking for an edit that
+        # A hold with no usable digest is told apart, so nobody goes looking for an edit that
         # never happened.
         unbound = exc.approved is None
         warn(
@@ -3890,6 +3909,13 @@ _INGRESS_GUARD_STATUS: dict[str, int] = {
     "strict": 422,
 }
 
+#: The edit-resend refusals that spend the step-up proof even before the store write: at least a
+#: target out of scope, an unknown message or target, and a target or origin that cannot take the
+#: write (owner ruling 2026-11-07, #3241 added item 1, which supersedes R1 for these three
+#: statuses). Every other refusal before the write refunds, so a new refusal raised before the
+#: write in ``_edit_resend_core`` is checked against this set.
+_EDIT_RESEND_SPENDING_REFUSALS = frozenset({403, 404, 409})
+
 
 async def _guard_resubmission(
     engine: Engine,
@@ -4187,7 +4213,9 @@ async def _run_connection_test(rr: RegistryRunner, name: str, direction: str) ->
         # vault BACKLOG #2371: the dialling CA first, as a lane build checks it.
         await rr.check_test_anchor(name)
         checked = True
-        _direction, connector = rr.build_test_connector(name)
+        # The build runs off the event loop: it can list folders and read files, such as a
+        # DATABASE connector's sslcapath entries (engine PR 2815, hold F2).
+        _direction, connector = await rr.build_test_connector_off_loop(name)
     except WiringError as exc:
         # This catch is EXHAUSTIVE only because build_test_connector normalizes every build failure to
         # WiringError; it did not always, and the escape cost more than a 500. The credential route's
@@ -4773,6 +4801,13 @@ def create_app(
 
         return middleware
 
+    def _refuse_body(request: Request, status: int, detail: str, what: str) -> JSONResponse:
+        _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
+        # `Connection: close` makes the server drop the connection after every refusal, so bytes
+        # it framed one way and a proxy another (RFC 9112 §6.1, §6.3), or a refused body the
+        # client never sent, are never read as a next request.
+        return JSONResponse({"detail": detail}, status_code=status, headers={"Connection": "close"})
+
     def _body_refusal(request: Request) -> JSONResponse | None:
         """The response refusing ``request``'s body before any route runs, or None to admit it."""
         # The HTTP API carries only small JSON (HL7 payloads arrive via MLLP/file, not here), so a
@@ -4780,39 +4815,45 @@ def create_app(
         # Rejections are logged (ASVS 16.3.3) — these are control-bypass attempts (a pre-auth memory
         # DoS probe) and were previously dropped silently. We log to the rotating general log rather
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
-        client = client_ip(request)
-        length = request.headers.get("content-length")
-        transfer_encoding = request.headers.get("transfer-encoding", "").lower()
-        # A request carrying BOTH Content-Length and Transfer-Encoding is ambiguously framed (RFC 9112
-        # §6.1 — TE overrides CL) and is the classic CL.TE request-smuggling vector (ASVS 4.2.1). Under
-        # serve the pinned llhttp parser refuses the pair with its own 400 before this runs (BACKLOG
-        # #1125, protocol_headers.pinned_http_protocol_base). This check covers any other server that
-        # hosts the app: h11, for one, frames the pair by Transfer-Encoding and passes it on.
-        if length is not None and "chunked" in transfer_encoding:
-            _log.warning(
-                "rejected request with both Content-Length and Transfer-Encoding on %s from %s",
-                request.url.path,
-                client,
-            )
-            return JSONResponse(
-                {
-                    "detail": "ambiguous framing: Content-Length with Transfer-Encoding is not accepted"
-                },
-                status_code=400,
-            )
-        if length is None:
-            # No Content-Length means a chunked body (HTTP/1.1 requires one or the other), which the
-            # Content-Length cap can't bound up front — Starlette would buffer it unbounded, a pre-auth
-            # memory DoS. We only accept small JSON, so require a Content-Length (review M-19).
-            if "chunked" in transfer_encoding:
-                _log.warning(
-                    "rejected chunked request body on %s from %s", request.url.path, client
+        lengths = request.headers.getlist("content-length")
+        # The API takes only Content-Length bodies, so ANY Transfer-Encoding is refused, by presence
+        # on any line and whatever its value, and the connection is closed. Beside a Content-Length
+        # the request is ambiguously framed (RFC 9112 §6.1, the CL.TE smuggling vector, ASVS 4.2.1).
+        # Under serve llhttp refuses most such pairs itself (BACKLOG #1125); h11, for one, passes
+        # them on. Without a Content-Length, a coding list that does not end in `chunked` leaves the
+        # body length undetermined (§6.3 rule 4), and a chunked body has no length the cap can
+        # bound up front (review M-19).
+        te_lines = request.headers.getlist("transfer-encoding")
+        if te_lines:
+            if lengths:
+                return _refuse_body(
+                    request,
+                    400,
+                    "ambiguous framing: Content-Length with Transfer-Encoding is not accepted",
+                    "request with both Content-Length and Transfer-Encoding",
                 )
-                return JSONResponse(
-                    {"detail": "chunked request bodies are not accepted; send a Content-Length"},
-                    status_code=411,
+            codings = [c.strip(" \t").lower() for line in te_lines for c in line.split(",")]
+            # RFC 9112 §7: chunked is the final coding and is applied once.
+            if codings[-1] != "chunked" or "chunked" in codings[:-1]:
+                return _refuse_body(
+                    request,
+                    400,
+                    "invalid framing: Transfer-Encoding must end in a single chunked",
+                    "Transfer-Encoding not ending in a single chunked",
                 )
+            return _refuse_body(
+                request,
+                411,
+                "Transfer-Encoding is not accepted; send a Content-Length",
+                "chunked request body",
+            )
+        if not lengths:
             return None
+        # One line holding `1*DIGIT` (RFC 9112 §6.2), not int(): int() takes `+2`, `-5` and `0_2`,
+        # and a repeated line is a second framing claim (an invalid length closes, §6.3 item 5).
+        value = lengths[0].strip(" \t")
+        if len(lengths) > 1 or not (value.isascii() and value.isdigit()):
+            return _refuse_body(request, 400, "invalid Content-Length", "invalid Content-Length")
         # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
         upload_store = getattr(request.app.state, "upload_store", None)
         cap = (
@@ -4820,14 +4861,10 @@ def create_app(
             if upload_store is not None and request.url.path in _UPLOAD_BODY_PATHS
             else _MAX_REQUEST_BODY_BYTES
         )
-        try:
-            too_big = int(length) > cap
-        except ValueError:
-            _log.warning("rejected invalid Content-Length on %s from %s", request.url.path, client)
-            return JSONResponse({"detail": "invalid Content-Length"}, status_code=400)
-        if too_big:
-            _log.warning("rejected oversized request body on %s from %s", request.url.path, client)
-            return JSONResponse({"detail": "request body too large"}, status_code=413)
+        # Digit count first: int() raises past 4300 digits, and a longer number is over any cap.
+        digits = value.lstrip("0") or "0"
+        if len(digits) > len(str(cap)) or int(digits) > cap:
+            return _refuse_body(request, 413, "request body too large", "oversized request body")
         return None
 
     # add_middleware inserts at index 0, so registering in this order keeps _limit_request_body
@@ -4835,6 +4872,9 @@ def create_app(
     # through _security_headers, and the outermost floor (registered below) is what covers them.
     app.add_middleware(_security_headers)
     app.add_middleware(_limit_request_body)
+    # Vault BACKLOG #2955: an in-body WebSocket is accepted only once a gate admitted its caller.
+    # Inside the header floor, so its refusal close gets the floor's 403 like a gate's own refusal.
+    app.add_middleware(WebSocketAcceptGate)
 
     @app.get("/health", response_model=Health)
     @public_route("liveness must answer a tokenless probe; the version needs a session")
@@ -4935,8 +4975,10 @@ def create_app(
         # the broker's revocation refusal. An off-box endpoint with no [ai].endpoint_revocation_attested
         # pair is refused under enforce, and a None posture counts as enforcing there. The cleartext-
         # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
+        # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
+        # context that reads the system trust store, under a lock a worker thread may hold.
         try:
-            broker = ai_broker_from_settings(ai, posture=_phi_read_posture)
+            broker = await asyncio.to_thread(ai_broker_from_settings, ai, posture=_phi_read_posture)
         except AiBrokerError as exc:
             _log.warning("engine AI broker misconfigured: %s", exc)
             raise HTTPException(503, "engine-brokered AI assistance is not available") from exc
@@ -7277,7 +7319,7 @@ def create_app(
             # BACKLOG #1111 -- without this the route answers a degraded apply as clean success.
             if req.dry_run:
                 outcome = await engine.reload_detail(req.config_dir, dry_run=True, propagate=False)
-                failures = [f.step for f in outcome.failures]
+                failures = outcome.failed_steps
             else:
                 outcome, failures = await _reload_and_record(
                     engine, req.config_dir, actor=user.username, client=client_ip(request)
@@ -8413,7 +8455,9 @@ def create_app(
 
         The step-up proof is spent in this route, after FastAPI has validated the body, so a 422
         costs no proof (owner ruling 2026-10-13, #3241 R1 and R2); a refusal raised before the
-        store write gives the proof back."""
+        store write gives the proof back, except one whose status
+        :data:`_EDIT_RESEND_SPENDING_REFUSALS` names, which spends it (owner ruling 2026-11-07,
+        #3241 added item 1)."""
         await spend_step_up_action(request, STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
         return await _edit_resend_core(
             message_id, body=body, engine=engine, identity=identity, request=request
@@ -8440,10 +8484,11 @@ def create_app(
         The console calls this in-process after its own spend."""
         # Owner ruling 2026-10-13 (#3241 R1): a refusal raised BEFORE the store write gives back the
         # proof the gate spent (ADR 0197 Amendment C), so an edit the engine refused costs the
-        # operator no password and the console can re-open the editor without a re-auth. `written`
-        # turns true just before the store call: a refusal from there on keeps the spend, because the
-        # store may have committed. The console calls this handler in-process after its own spend,
-        # so the refund reaches both planes.
+        # operator no password and the console can re-open the editor without a re-auth, except a
+        # status in _EDIT_RESEND_SPENDING_REFUSALS, which keeps the spend. `written` turns true
+        # just before the store call: a refusal from there on keeps the spend, because the store
+        # may have committed. The console calls this handler in-process after its own spend, so the
+        # refund reaches both planes.
         written = False
         try:
             # 404 (not 403) outside the caller's channel scope (mirrors resend/replay/get_message).
@@ -8455,6 +8500,20 @@ def create_app(
                 if not identity.can_access_channel(body.to):
                     await _audit_channel_denied(engine, identity, body.to, client_ip(request))
                     raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
+                # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
+                # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling). They
+                # read nothing from the target, and where they sit in the order is ADR 0197
+                # Amendment D, "The order of the checks", which says what their refusal tells.
+                admitted = await _guard_resubmission(
+                    engine,
+                    identity,
+                    request,
+                    raw=body.raw,
+                    inbound=None,
+                    action="message_edit_resend_reject",
+                    channel_id=row["channel_id"],
+                    detail={"message_id": message_id, "mode": "direct", "to": body.to},
+                )
                 rr = engine.registry_runner
                 if rr is None or body.to not in rr.registry.outbound:
                     raise HTTPException(404, f"no such outbound connection: {body.to}")
@@ -8476,18 +8535,6 @@ def create_app(
                         raise HTTPException(409, _outbound_down_detail(rr, body.to))
                 except KeyError:
                     raise HTTPException(404, f"no such outbound connection: {body.to}") from None
-                # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
-                # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling).
-                admitted = await _guard_resubmission(
-                    engine,
-                    identity,
-                    request,
-                    raw=body.raw,
-                    inbound=None,
-                    action="message_edit_resend_reject",
-                    channel_id=row["channel_id"],
-                    detail={"message_id": message_id, "mode": "direct", "to": body.to},
-                )
                 _refuse_head_only(message_id, row)
                 client = client_ip(request)
 
@@ -8606,9 +8653,13 @@ def create_app(
                 reroute=True,
                 new_message_id=outcome.new_message_id,
             )
-        except HTTPException:
+        except HTTPException as exc:
             auth = get_auth(request)
-            if not written and auth is not None:
+            if (
+                not written
+                and exc.status_code not in _EDIT_RESEND_SPENDING_REFUSALS
+                and auth is not None
+            ):
                 auth.refund_action_step_up(STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
             raise
 
@@ -10367,8 +10418,10 @@ def create_app(
         code.
 
         **Which refusals get their own audit row.** Only the ones this body reaches. ``require_step_up``
-        already records the permission / step-up / MFA 403s as ``auth.permission_denied`` and the body
-        never runs on those, so a second denied row there would double-count. The ``409`` needs none
+        records at least the permission 403 as ``auth.permission_denied``, the MFA 403 as
+        ``auth.mfa_denied``, and the step-up 403 and the pacing 429 as ``auth.gate_refused``
+        (BACKLOG #1197). The body never runs on any gate refusal, so a second denied row there
+        would double-count, and the gate refusals that write no row stay the gate's to record. The ``409`` needs none
         either — the ``cluster_stepdown`` row written from the coordinator's return already reads
         ``was_leader: false, lease_released: false``, which IS the refusal. That leaves the
         not-clustered ``400``, the no-sibling ``412`` and the three ``503``s, which nothing else would
@@ -10564,6 +10617,7 @@ def create_app(
             active=engine.dr_active,
             threshold=dr.priority_threshold.value,
             activation_mode=dr.activation_mode.value,
+            failures=list(engine.dr_activation_failures),
         )
 
     @app.get("/service/status", response_model=ServiceStatusInfo)
@@ -10604,7 +10658,9 @@ def create_app(
         not touched first (vault BACKLOG #2581).
         ``{"dba_attests_restored": true}`` is the operator's per-activation attestation that
         the DBA restored the server-DB ``mefor`` database (REQUIRED on postgres/sqlserver, ignored on
-        SQLite — BACKLOG #102). Aborts return a 4xx/5xx with the failing phase; the box stays passive."""
+        SQLite — BACKLOG #102). Aborts return a 4xx/5xx with the failing phase; the box stays passive.
+        A 200 with ``degraded`` true is not a clean activation: the box is active, and ``failures``
+        names each follow-on step that did not complete, such as ``outbound_close``."""
         coord = engine.dr_coordinator
         if coord is None:
             raise HTTPException(503, "this deployment is not a DR standby ([dr].enabled is false)")
@@ -10642,6 +10698,8 @@ def create_app(
             verify_status=result.verify_status,
             seed_segment=result.seed_segment,
             vip_hook_ran=result.vip_hook_ran,
+            degraded=bool(result.failures),
+            failures=list(result.failures),
         )
 
     @app.post("/dr/release", response_model=DrActionResult)
@@ -10711,7 +10769,9 @@ def create_app(
             identity = await authorize_ws(websocket, Permission.MONITORING_READ)
             token = ws_token(websocket)
         # The three refusals below happen BEFORE accept, so each is the handshake's HTTP answer
-        # (BACKLOG #1120; see header_floor.refuse_websocket).
+        # (BACKLOG #1120; see header_floor.refuse_websocket). The first runs with no gate admitted,
+        # so WebSocketAcceptGate refuses its denial response and the client gets a bodyless 403
+        # (vault BACKLOG #2955); the two 503s run after a gate admitted the caller.
         if identity is None:
             await refuse_websocket(
                 websocket,
@@ -11036,7 +11096,7 @@ def create_app(
     # ASVS 3.4.4/3.4.5 — registered LAST, so Starlette makes it the OUTERMOST user middleware
     # (add_middleware inserts at index 0; the stack is built from reversed(user_middleware)) and its
     # response-path send wrapper runs after every other emitter. That position is the whole point:
-    # _security_headers is the INNERMOST user middleware, so the body cap's four short-circuits above
+    # _security_headers is the INNERMOST user middleware, so the body cap's short-circuits above
     # shipped with no baseline headers at all, and both middlewares that hand-copy the baseline
     # (client_networks._DENIAL_HEADERS, request_timeout._TIMEOUT_HEADERS) omit HSTS. The floor
     # setdefaults, never assigns, so the attachment sandbox CSP re-asserted above and every other
@@ -11363,6 +11423,28 @@ _PAGING_REFUSAL_TEXT: Final[Mapping[str, str]] = {
     PAGING_DEADLINE: "past [auth].ad_group_search_deadline",
     PAGING_CAP: "past the engine's cap on groups or pages",
 }
+#: The source label prefix of a lasting unreachable account's ``ad_reconcile_aborted`` instance
+#: (BACKLOG #3100 closing step 2), keyed on the account as a paging refusal's is, for the same
+#: reason.
+_UNREACHED_ALERT_SOURCE = "directory-reconciler-unreached"
+#: What it tells the operator. Short, and the consequence first, for the store's 200 characters.
+_UNREACHED_ALERT_TEXT: Final[str] = (
+    "This account's sessions are not revoked: {probes} of its directory probes running failed to "
+    "reach the directory. Check its entry, and any outage, referral or configuration alert."
+)
+#: What one page for many such accounts says, on a pass that rolls them up
+#: (``AuthService._record_unreached_accounts`` decides when), so a flapping directory opens one
+#: instance rather than one per signed-in account. It counts only the accounts entering on its
+#: pass, and says so: a later rollup updates the same open instance's text, so a count that read
+#: as a total would be replaced by a smaller one while more accounts stood (BACKLOG #3709). No
+#: process can say how many stand: each counts its own, and the instance is shared. ``probes``
+#: is the shortest run among those entering, in probes, not passes, which differ under a probe
+#: budget smaller than the estate.
+_UNREACHED_ROLLUP_TEXT: Final[str] = (
+    "Accounts newly unreachable: {entering}. Their sessions are not revoked; each failed {probes}+ "
+    "directory probes running. Check the directory and the path to it. "
+    "auth.ad_reconcile_unreached rows name each."
+)
 
 
 def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSink) -> None:
@@ -11420,19 +11502,20 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     referred, refused or raise a fault.
 
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
-    held, aborted, skipped, referred, misconfigured, faulted or unkeyed-binding row no longer ends
-    the pass (BACKLOG #2137): the service logs it at ERROR and returns the plan, so these alerts
-    still fire. Since BACKLOG #3018 the same holds for a revocation's own ``auth.ad_session_revoked``
-    row and a rename's rows. A pass that still raises part-way, such as on a store fault ending one
-    account's sessions, returns no plan, so no alert is raised for the revocations it applied before
-    that point. Their rows stand, except a row that was refused: that account has neither its row
-    nor its alert. ``AuthService._audit_reconciler_row`` says which errors are soft.
+    held, aborted, skipped, referred, misconfigured, faulted, unreached or unkeyed-binding row no
+    longer ends the pass (BACKLOG #2137): the service logs it at ERROR and returns the plan, so
+    these alerts still fire. Since BACKLOG #3018 the same holds for a revocation's own
+    ``auth.ad_session_revoked`` row and a rename's rows. A pass that still raises part-way, such as
+    on a store fault ending one account's sessions, returns no plan, so no alert is raised for the
+    revocations it applied before that point. Their rows stand, except a row that was refused: that
+    account has neither its row nor its alert. ``AuthService._audit_reconciler_row`` says which
+    errors are soft.
 
-    Each standing alert but the probe fault's, the configuration refusal's and a paging refusal's
-    also gets its inverse, which pages nobody and resolves the open instance (BACKLOG #2136):
-    ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
-    ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance, and
-    under the outage's source for the outage's (BACKLOG #3709). The
+    Each standing alert but at least the probe fault's, the configuration refusal's, a paging
+    refusal's and an unreached account's (BACKLOG #3100) also gets its inverse, which pages nobody
+    and resolves the open instance (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and
+    ``ad_reconcile_hold_released``, and ``ad_reconcile_breaker_cleared`` under the referral's source
+    for the referral's instance, and under the outage's source for the outage's (BACKLOG #3709). The
     auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,
     ``plan.hold_clear``, ``plan.referral_clear``, ``plan.outage_clear``; see
     ``AuthService._mark_reconcile_clears`` and ``AuthService._note_directory_outage``), so
@@ -11446,6 +11529,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         # A paging refusal is not the outage, so an outage-shaped pass still pages for it (vault
         # BACKLOG #3696). An outage applies no revocation, so nothing here pages ahead of it.
         _alert_paging_refusals(plan, sink)
+        # BACKLOG #3100: an account can enter on an outage-shaped pass, one whose probe sample
+        # held only unreachable accounts, unless the lasting outage page is raised or stands.
+        _alert_unreached_accounts(plan, sink)
         if plan.outage_page:
             # BACKLOG #3709. After the paging refusals, which page once per account, so a sink that
             # raises here cannot cost one.
@@ -11471,6 +11557,7 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     # After the breaker and the revocations, which do not recur either, and before the referral,
     # the fault and the hold, which page again on the next pass (vault BACKLOG #3696).
     _alert_paging_refusals(plan, sink)
+    _alert_unreached_accounts(plan, sink)  # BACKLOG #3100 closing step 2, the same way
     if plan.referred:
         # BACKLOG #2538. After the breaker and the revocations, matching the service's order.
         sink.ad_reconcile_aborted(
@@ -11536,6 +11623,33 @@ def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
                 "Directory role and scope changes do not reach this account's sessions: its group "
                 f"search was refused, {what}. A disable or deletion still revokes them."
             ),
+        )
+
+
+def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
+    """Page each account that has just entered the lasting unreachable state (BACKLOG #3100
+    closing step 2; ``AuthService._note_unreached_accounts`` says when one enters). That many of
+    its probes running failed to reach the directory, so the
+    reconciler has neither struck nor revoked it. Once per entry, like a paging refusal, and with
+    no inverse: an operator resolves it. The account name is in the source only, as for a paging
+    refusal. On a rolled-up pass (``plan.unreached_rollup``), one page under the bare source covers
+    those entering, naming none, and counting only them."""
+    if plan.unreached_rollup:
+        sink.ad_reconcile_aborted(
+            _UNREACHED_ALERT_SOURCE,
+            reason=UNREACHED_ACCOUNT,
+            probed=plan.asked,
+            detail=_UNREACHED_ROLLUP_TEXT.format(
+                entering=len(plan.unreached), probes=min(n for _u, _n, n in plan.unreached)
+            ),
+        )
+        return
+    for _user_id, username, probes in plan.unreached:
+        sink.ad_reconcile_aborted(
+            f"{_UNREACHED_ALERT_SOURCE}:{username}",
+            reason=UNREACHED_ACCOUNT,
+            probed=plan.asked,
+            detail=_UNREACHED_ALERT_TEXT.format(probes=probes),
         )
 
 
@@ -11858,7 +11972,7 @@ def create_managed_app(
     api_tls_cert_file: str | None = None,
     api_tls_replacements: Sequence[GeneratedPairReplaced] = (),
     api_tls_client_cert_files: Sequence[str] = (),
-    settings_crls: Sequence[MonitoredCert] = (),
+    settings_monitored_files: Sequence[MonitoredCert] = (),
     api_listener: tuple[str, int] | None = None,
     reference_settings: ReferenceSettings | None = None,
     egress_settings: EgressSettings,
@@ -11954,16 +12068,15 @@ def create_managed_app(
         # #329: the derived instance hop posture, computed ONCE here for the OUT-OF-GATE cells this
         # lifespan builds — the alerts webhook sink (notifier_from_settings) and the AD bind
         # (AuthService → LdapAuthenticator). Neither is built inside an active_hop_posture scope, so
-        # current_hop_posture() is None there. The webhook sink's weakened-TLS escape would ship
-        # UNCLAMPED without an explicit posture, and the LDAPS revocation guard reads it (BACKLOG
-        # #2193), as the OIDC legs' guard does. CORRECTED 2026-10-28: this said the plain ldap://
-        # bind refusal reads it; that refusal holds at every posture since vault BACKLOG #3533. The
-        # LDAPS ad_tls_verify=false escape it once clamped is gone (vault BACKLOG #3230). None only
-        # for an embedding that passes no [ai] (serve always passes it). There the webhook escape
-        # fails closed (vault BACKLOG #2354), and so do the [alerts] SMTP login and webhook
-        # revocation guards, which count no posture as enforcing (ADR 0173 section 12); the LDAPS
-        # bind's and the OIDC legs' guards are the unstamped no-op there. Reuses
-        # the same hop_posture_from_ai derivation the store hop and the runner use.
+        # current_hop_posture() is None there. The webhook and LDAPS revocation guards read it
+        # (BACKLOG #2193), as the OIDC legs' guard does. CORRECTED 2026-10-28: this said the plain
+        # ldap:// bind refusal reads it; that refusal holds at every posture since vault BACKLOG
+        # #3533. The LDAPS ad_tls_verify=false escape it once clamped is gone (vault BACKLOG #3230),
+        # and so is the webhook's cleartext-http escape (vault BACKLOG #3533 item 5). None only for
+        # an embedding that passes no [ai] (serve always passes it). There the [alerts] SMTP login
+        # and webhook revocation guards count no posture as enforcing (ADR 0173 section 12); the
+        # LDAPS bind's and the OIDC legs' guards are the unstamped no-op there. Reuses the same
+        # hop_posture_from_ai derivation the store hop and the runner use.
         _hop_posture = (
             hop_posture_from_ai(
                 ai_settings, enforcement=(security_settings or SecuritySettings()).enforcement
@@ -12024,7 +12137,6 @@ def create_managed_app(
                     # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP
                     # hop too, so an estate on a private CA needs no per-alert CA path.
                     trust_anchor_policy=tls_settings.policy() if tls_settings else None,
-                    # #329: clamp the webhook sink's cleartext-http escape to the derived posture.
                     posture=_hop_posture,
                 )
                 if notifier_alerts is not None
@@ -12175,7 +12287,8 @@ def create_managed_app(
         # on an administrative path refuses unless [security].allow_over_granted_vault_token accepts
         # it (audited), and so does a probe failure that is not a network failure, a timeout or a
         # 403, which the opt-out does not lift; every other finding warns and audits
-        # (vault_preflight_outcome). It names the consumers from the
+        # (vault_preflight_outcome). Every finding raises vault_privilege_warning, and a clean read
+        # resolves it. It names the consumers from the
         # resolved service settings, which serve always passes; an embedding that passes none has
         # no Vault consumer this lifespan could name.
         _security = security_settings or SecuritySettings()
@@ -12202,6 +12315,8 @@ def create_managed_app(
                     probe=partial(
                         probe_vault, settings=static_credential_settings, posture=_hop_posture
                     ),
+                    # #2903 slice B: each hop pages, or resolves its page, through the same sink.
+                    alert_sink=notifier or LoggingAlertSink(),
                 )
         except BaseException:
             if notifier is not None:
@@ -12274,8 +12389,8 @@ def create_managed_app(
             engine_version=__version__,
             api_tls_cert_file=api_tls_cert_file,
             api_tls_client_cert_files=api_tls_client_cert_files,
-            # BACKLOG #299: the settings-level CRL files, mostly outbound, for the same expiry scan.
-            settings_crls=settings_crls,
+            # BACKLOG #299, vault #2223: the settings-level CRL and pin files, for the same scan.
+            settings_monitored_files=settings_monitored_files,
             api_listener=api_listener,
             reference_settings=reference_settings,
             egress_settings=egress_settings,

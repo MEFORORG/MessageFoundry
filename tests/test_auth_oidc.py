@@ -655,6 +655,24 @@ def test_flow_round_trip_binds_and_is_single_use() -> None:
     assert cache.pop_if_state_matches(flow_id, flow.state) == (None, False)  # single-use
 
 
+def test_a_consumed_flows_age_stops_at_its_consumption() -> None:
+    """RED when: ``FlowCache.age`` keeps counting after ``pop_if_state_matches`` consumed the flow
+    (vault BACKLOG #3221 item K5). A callback leg reads the age after its own work, such as a store
+    read, so that work must not count as time the person spent before the callback arrived."""
+    clock = [0.0]
+    cache = oidc.FlowCache(clock=lambda: clock[0])
+    flow_id, flow = oidc.start_flow(
+        cache, return_to="/ui", client_ip="10.0.0.1", clock=lambda: clock[0]
+    )
+    assert cache.age(flow) == 0.0 and flow.redeemed is None
+    clock[0] = 0.5
+    assert cache.age(flow) == 0.5, "an unconsumed flow ages with the clock"
+    got, consumed = cache.pop_if_state_matches(flow_id, flow.state)
+    assert consumed and got is not None and got.redeemed == 0.5
+    clock[0] = 30.0
+    assert cache.age(got) == 0.5
+
+
 def test_a_flow_is_consumed_only_by_its_own_state() -> None:
     """BACKLOG #3198. A missing or wrong ``state`` leaves the flow staged, so a forged callback
     cannot spend the one the real IdP return needs. The matching state consumes it once."""

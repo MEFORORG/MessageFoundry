@@ -28,6 +28,7 @@ import json
 import logging
 import smtplib
 import string
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -39,12 +40,10 @@ from typing import Any, Generic, Protocol, TypeVar
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
     _ALERT_CONTROL_EVENT_TYPES,
-    INSECURE_TLS_ESCAPE_ENV,
     AlertRule,
     AlertSeverity,
     AlertsSettings,
     EscalationTier,
-    weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import (
     HopPosture,
@@ -68,13 +67,13 @@ from messagefoundry.pipeline.alerts import (
     sandbox_worker_refused_detail,
 )
 from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
-from messagefoundry.transports.base import NegativeAckError
+from messagefoundry.transports.base import DeliveryError
 
-# Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
+# Not lazy, unlike the two transports imports below: _NoRedirectHandler subclasses one at import.
 # Importing this module already loads the transports package through pipeline/__init__.py, so these
 # add no import cost.
 from messagefoundry.transports.bounded_read import NoRedirectHandler, build_strict_opener
-from messagefoundry.transports.email import checked_envelope, partial_refusal_under
+from messagefoundry.transports.email import checked_envelope, envelope_refusal_under
 
 __all__ = [
     "AlertTransport",
@@ -146,6 +145,9 @@ _AUTO_RESOLVE: dict[str, str] = {
     "dr_released": "dr_activated",
     # #305: a start that OBSERVED a clean store principal resolves the open over-grant warning.
     "store_privilege_clean": "store_privilege_warning",
+    # #2903 (ADR 0216): a start that read a Vault token and found it clean resolves the open
+    # warning for the same hop.
+    "vault_privilege_clean": "vault_privilege_warning",
     # #290: a bound that cleared its resume line resolves the open intake pause for the same bound.
     "intake_resumed": "intake_paused",
     # #2136: a reconcile pass that is evidence the breaker is not tripped, or that no hold stands,
@@ -339,8 +341,8 @@ def _build_no_redirect_opener() -> urllib.request.OpenerDirector:
     approved AEAD default every engine-built hop takes (BACKLOG #300). And ``build_strict_opener``
     reads each reply with the strict response class, keeping the same TLS context (BACKLOG #2052).
 
-    A named function, not an inline module-level expression, so a test can call the exact construction
-    the shared opener is built from instead of reloading this module.
+    A named function apart from :func:`_shared_no_redirect_opener`, so a test can call the exact
+    construction the shared opener is built from and get a fresh one.
 
     Built through the ``tls_policy`` factory so this module still never names ``ssl`` itself, matching
     the plain-data TLS settings :class:`EmailTransport` carries for the same reason."""
@@ -350,12 +352,31 @@ def _build_no_redirect_opener() -> urllib.request.OpenerDirector:
     )
 
 
-# The shared opener, reused for every webhook POST.
-_NO_REDIRECT_OPENER = _build_no_redirect_opener()
+_shared_opener: urllib.request.OpenerDirector | None = None
+_shared_opener_lock = threading.Lock()
+
+
+def _shared_no_redirect_opener() -> urllib.request.OpenerDirector:
+    """The shared opener, reused for every webhook POST: built on first use, the same object after.
+
+    Built on first use, not at import (BACKLOG #2484): an OpenSSL build that refuses a list the engine
+    sets on every TLS context raises ``EngineTlsListRefused`` from the build, and at import that
+    surfaced as a failed import of this module, not as a refusal of the webhook. A build that raises
+    caches nothing, so the next POST is refused the same way. The lock keeps two threads racing the
+    first POST to one opener, as the REST twin does."""
+    global _shared_opener
+    opener = _shared_opener
+    if opener is not None:
+        return opener
+    with _shared_opener_lock:
+        if _shared_opener is None:
+            _shared_opener = _build_no_redirect_opener()
+        return _shared_opener
+
 
 #: The webhook hop's OWN way across its revocation refusal (BACKLOG #2193). The connection-shaped
 #: default names ``[tls].crl_file`` and a connection's attestation, and neither reaches this hop: it
-#: dials through :data:`_NO_REDIRECT_OPENER`, built at import before any config loads, so no CRL can
+#: dials through :func:`_shared_no_redirect_opener`, built with no trust anchor, so no CRL can
 #: reach its context, and it is not a connection. So the attestation pair is the only lever, as on
 #: the Vault hops (ADR 0173 section 12).
 _WEBHOOK_WAYS_ACROSS = (
@@ -476,7 +497,7 @@ def _refuse_webhook_revocation(
     https the engine verifies. Stdlib ssl checks no OCSP or CRL there, so a revoked but unexpired
     certificate would be accepted with no refusal and no record.
 
-    ``context=None``: the hop dials through :data:`_NO_REDIRECT_OPENER`, built at import, and no
+    ``context=None``: the hop dials through :func:`_shared_no_redirect_opener`, and no
     CRL reaches it, so the owner ruling of 2026-10-27 gave it an attestation pair on the pattern of
     ADR 0173 section 12, and no CRL lever. ``posture`` is PASSED, because the sink is built in the
     API lifespan outside every ``active_hop_posture`` scope. ``None`` reads the ambient posture, and
@@ -602,15 +623,10 @@ class WebhookTransport:
         revocation_attested: bool = False,
         revocation_attested_reason: str | None = None,
     ) -> None:
-        # Refuse a plaintext http:// webhook target unless the explicit dev escape is set: the alert
-        # POST otherwise crosses the network in cleartext (ASVS 12.2.1 — no insecure fallback). https
-        # is the only scheme accepted by default; http(s) remain the only schemes at all (see _post).
-        # Same refuse-unless-MEFOR_ALLOW_INSECURE_TLS pattern as SQL Server / MLLP. #329: read
-        # the escape through the ADR-0092 clamp (weakened_tls_escape_permitted) so on an enforcing-PHI
-        # instance the blunt env var can never re-permit a cleartext alert POST. The webhook sink is
-        # built out of the connector-construction gate (notifier_from_settings, in the app lifespan), so
-        # the posture is threaded explicitly; None (a direct/test construction) fails closed since
-        # vault BACKLOG #2354. It used to fall back to the unclamped escape.
+        # https is the only scheme (ASVS 12.2.1). A plaintext http:// target is refused with no
+        # escape, in every posture (vault BACKLOG #3533 item 5): every POST carries the path token
+        # the webhook service issues, the hop's credential, as every AI broker call carries its key.
+        # Until then MEFOR_ALLOW_INSECURE_TLS released it at [security].enforcement = warn.
         #
         # No refusal here prints the URL (BACKLOG #1793). A Slack or Teams hook carries its secret in
         # the PATH, and a userinfo URL carries a password, and redact() keeps both. The userinfo screen
@@ -626,31 +642,25 @@ class WebhookTransport:
             url, "[alerts].webhook_url", use="the path token the webhook service issues"
         )
         scheme = urllib.parse.urlsplit(url).scheme.lower()
-        if scheme not in ("http", "https"):
-            raise ValueError(f"[alerts].webhook_url must be http or https, got scheme {scheme!r}")
-        if scheme == "http" and not weakened_tls_escape_permitted(posture):
-            raise ValueError(
-                "[alerts].webhook_url uses plaintext http; refused unless "
-                f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
-                "(dev/trusted-network only; the escape has no effect while enforcing, the default, "
-                "or with no posture) — use https"
-            )
-        # BACKLOG #5088: the allowlist _post applies, here at the build, so a host it would refuse
-        # at every POST refuses the start instead. Before the permitted-cleartext WARNING, so a
-        # refused URL never logs that its hop was permitted, and before the revocation guard, which
-        # reads no allowlist, so that guard never judges a host the egress policy forbids.
-        _refuse_off_allowlist_webhook(url, allowed_hosts)
+        # Before the allowlist, so an http URL is never sent to fix an entry it cannot use.
         if scheme == "http":
-            log.warning(
-                "webhook target uses plaintext http; permitted only because %s is set on an instance "
-                "at [security].enforcement = warn (cleartext, MITM-able — trusted-network/dev use "
-                "only)",
-                INSECURE_TLS_ESCAPE_ENV,
+            raise ValueError(
+                "[alerts].webhook_url over cleartext http would send the webhook's path token in "
+                "clear; refused, with no escape, in every posture — use https"
             )
+        if scheme != "https":
+            raise ValueError(f"[alerts].webhook_url must be https, got scheme {scheme!r}")
+        # BACKLOG #5088: the allowlist _post applies, here at the build, so a host it would refuse
+        # at every POST refuses the start instead. Before the revocation guard, which reads no
+        # allowlist, so that guard never judges a host the egress policy forbids.
+        _refuse_off_allowlist_webhook(url, allowed_hosts)
         # ASVS 4.2.5: bound the webhook URL. Construction-only is sufficient here and not a shortcut:
         # the URL is operator config and the sole header is a fixed ``Content-Type``, so nothing is
         # added between here and the wire.
         enforce_outbound_length_limits(url, {"Content-Type": "application/json"})
+        # BACKLOG #2484: build the shared opener here, so an OpenSSL that refuses the engine's list
+        # refuses the start, as at #5088 above, rather than failing every POST.
+        _shared_no_redirect_opener()
         # BACKLOG #2193 slice (d): last, so a URL another check refuses never logs a crossing.
         _refuse_webhook_revocation(
             url,
@@ -677,21 +687,19 @@ class WebhookTransport:
 
     def _post(self, event: dict[str, Any]) -> None:
         # Guard the scheme before opening: urllib would otherwise honour file:/ftp:/custom schemes
-        # (bandit B310). The URL is operator-configured, but an http(s)-only check is cheap
+        # (bandit B310). The URL is operator-configured, but an https-only check is cheap
         # defense-in-depth so a typo'd or hostile config can't turn an alert POST into a local-file
-        # read. With the scheme provably http/https here, the Request nosec is justified.
+        # read. With the scheme provably https here, the Request nosec is justified.
         split = urllib.parse.urlsplit(self.url)
-        if split.scheme.lower() not in ("http", "https"):
-            raise ValueError(
-                f"[alerts].webhook_url must be http or https, got scheme {split.scheme!r}"
-            )
+        if split.scheme.lower() != "https":
+            raise ValueError(f"[alerts].webhook_url must be https, got scheme {split.scheme!r}")
         _refuse_off_allowlist_webhook(self.url, self.allowed_hosts)
         # Never serialize INTERNAL routing keys (``_``-prefixed: e.g. the #146 ``_recipients`` override)
         # onto the wire — the fan-out loop pops them before send, but strip defensively so a webhook
         # payload can never carry recipient addresses / internal metadata even if a key slips through.
         payload = {k: v for k, v in event.items() if not k.startswith("_")}
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme guarded to http(s) above
+        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme guarded to https above
             self.url,
             data=data,
             headers={"Content-Type": "application/json"},
@@ -703,7 +711,7 @@ class WebhookTransport:
         from messagefoundry.transports.bounded_read import drain_2xx_reply
 
         # The no-redirect opener (not urllib.request.urlopen) so a 3xx can't divert the POST (15.3.2).
-        with _NO_REDIRECT_OPENER.open(req, timeout=self.timeout) as resp:
+        with _shared_no_redirect_opener().open(req, timeout=self.timeout) as resp:
             # Drain (bounded) so the connection can be reused/closed cleanly. The body is discarded,
             # so completeness is not checked: the POST has already been accepted by this point, and
             # failing the drain on a short reply would report an alert as undelivered when the host
@@ -838,7 +846,7 @@ def send_plain_email(
         failure = type(exc).__name__
     if failure:
         raise ValueError(f"{ALERTS_SMTP_CELL}: the alert body could not be encoded ({failure})")
-    partial: NegativeAckError | None = None
+    refusal: DeliveryError | None = None
     try:
         with smtplib.SMTP(host, port, timeout=timeout) as smtp:
             if use_tls:
@@ -857,18 +865,17 @@ def send_plain_email(
                     channel_encrypted=use_tls,
                     cell=ALERTS_SMTP_CELL,
                 )
-            # A partial RCPT refusal raises a NegativeAckError that names the cell and two counts,
-            # never an address (vault BACKLOG #2924). A refusal of EVERY recipient is still
-            # smtplib's own SMTPRecipientsRefused, whose args hold each address and the reply.
+            # A recipient refusal raises what CheckedEnvelope.send says: an error that names the
+            # cell and counts, never an address or a reply text (vault BACKLOG #2924, #2884).
             envelope.send(smtp, msg, cell=ALERTS_SMTP_CELL)
     except smtplib.SMTPException as exc:
-        # A QUIT refused after a partial refusal must not hide it; raised below, outside this
+        # A QUIT refused after a permanent refusal must not hide it; raised below, outside this
         # handler. Any other SMTP failure propagates unchanged.
-        partial = partial_refusal_under(exc)
-        if partial is None:
+        refusal = envelope_refusal_under(exc)
+        if refusal is None:
             raise
-    if partial is not None:
-        raise partial
+    if refusal is not None:
+        raise refusal
 
 
 class EmailTransport:
@@ -1504,7 +1511,23 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "type": "audit_write_failed",
                 "connection": name,
                 "action": action,
-                "reason": f"the {action} audit row was not written",
+                # Not "was not written" alone: a COMMIT can land with its reply lost (vault
+                # BACKLOG #3193 item 4). A budget-shed row (step_up_return:...) is never written.
+                "reason": f"the {action} audit row was not written, or its write's outcome is "
+                "unknown",
+            }
+        )
+
+    def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
+        # vault BACKLOG #3193 N1: the gate read the row's write back as committed, and only its
+        # off-box copy is missing (AlertSink.audit_offbox_copy_missing says why). Keyed
+        # `approval:<id>`, as audit_write_failed is, and its own instance. No PHI.
+        self._emit(
+            {
+                "type": "audit_offbox_copy_missing",
+                "connection": name,
+                "action": action,
+                "reason": f"the {action} audit row's off-box copy was not written",
             }
         )
 
@@ -1538,7 +1561,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # ADR 0079 mechanism 2: the mass-revoke breaker tripped and the pass applied nothing, or one
         # or more probes were referred (BACKLOG #2538), refused for the configuration (BACKLOG
         # #3010) or faulted (BACKLOG #3100) and left unjudged, or the directory stayed unreachable
-        # for a run of passes (BACKLOG #3709); `reason` tells which. The
+        # for a run of passes (BACKLOG #3709), or one account's probe kept failing to reach it
+        # (BACKLOG #3100); at least those, and `reason` tells which. The
         # fixed source label keys the throttle, so a standing misconfiguration that trips every pass
         # pages once per cooldown rather than once per pass. `detail` is the latched operator explanation,
         # and it is what the instance's reason column shows (detail wins over reason there).
@@ -1661,6 +1685,27 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def store_privilege_clean(self, name: str) -> None:
         # #305: the INVERSE — no page; auto-resolves the open store_privilege_warning via _AUTO_RESOLVE.
         self._record_state({"type": "store_privilege_clean", "connection": name}, "info")
+
+    def vault_privilege_warning(
+        self, name: str, *, finding: str, refusing_count: int, detail: str
+    ) -> None:
+        # #2903 (ADR 0216): the Vault privilege preflight's non-clean arm. The subject
+        # ("vault:<hop>") stands in for "connection", as the store preflight's does; the payload is
+        # the finding, a count and the hop's judgment (policy names and paths, never a token).
+        event: dict[str, Any] = {
+            "type": "vault_privilege_warning",
+            "connection": name,
+            "finding": finding,
+            "detail": detail,
+        }
+        if finding == "over_granted":
+            # An unobservable read judged nothing; a 0 here would read as a clean result.
+            event["refusing_count"] = refusing_count
+        self._emit(event)
+
+    def vault_privilege_clean(self, name: str) -> None:
+        # #2903: the INVERSE -- no page; auto-resolves the open vault_privilege_warning.
+        self._record_state({"type": "vault_privilege_clean", "connection": name}, "info")
 
     def config_changed(
         self,
@@ -2443,7 +2488,7 @@ def notifier_from_settings(
     SMTP hop when ``[alerts].email_tls_ca_file`` names none of its own (#323 layer 3). It only chooses
     WHICH roots verify the relay — it never turns verification off.
 
-    ``posture`` keys the webhook's cleartext refusal (#329) and both transports' revocation guards
+    ``posture`` keys both transports' revocation guards
     (BACKLOG #2193): an off-box https webhook, and an SMTP login to an off-box relay, are refused on
     an enforcing posture unless their ``[alerts]`` attestation pair is set or, for SMTP only, a
     ``[tls].crl_file`` reaches the hop. For those guards ``None`` with none stamped counts as
@@ -2466,9 +2511,7 @@ def notifier_from_settings(
                 alerts.webhook_url,
                 timeout=alerts.webhook_timeout,
                 allowed_hosts=tuple(alerts.webhook_allowed_hosts),
-                # #329: thread the derived instance posture so the cleartext-http refusal is clamped on
-                # an enforcing-PHI instance (the escape can no longer re-permit a plaintext alert POST).
-                # The same posture keys the https hop's revocation guard (BACKLOG #2193).
+                # The derived instance posture keys the https hop's revocation guard (BACKLOG #2193).
                 posture=posture,
                 revocation_attested=alerts.webhook_tls_revocation_attested,
                 revocation_attested_reason=alerts.webhook_tls_revocation_attested_reason,

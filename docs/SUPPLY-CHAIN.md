@@ -336,9 +336,9 @@ have not, the document says nothing about that CVE and your scanner's finding st
   has no runtime npm dependencies, so the SBOM inventories the build toolchain. Continuously audited by
   **npm-audit**. The generator itself, and the jscpd clone report in `quality-advisory.yml`, install
   from a separate committed lock, `ci/npm-tools/package-lock.json` (vault BACKLOG #2793). **No
-  blocking audit lane reads that lock**; Dependabot watches it. Read 2026-10-06, `npm audit` on it
-  reports 5 high findings, all one advisory against `braces` reached through jscpd 4.x, whose only
-  fix is the 5.x line that lock deliberately holds back.
+  blocking audit lane reads that lock**; Dependabot watches it. Read 2026-11-06, with the `overrides`
+  in `ci/npm-tools/package.json` (why: its description), `npm audit` on it reports 0
+  vulnerabilities. That is a dated reading, not a standing property.
 - **Container image** — `trivy image --format cyclonedx` over the built image (OS + Python layers).
   Continuously vuln-scanned by **Trivy** (with our VEX applied).
 
@@ -384,7 +384,10 @@ and fails on a new one. It also fails when a known one stops being reported. Eit
 was withdrawn, or the audit stopped seeing the package, and a person has to find out which. That
 check is what shows, on each run, that the audit still sees the known-vulnerable packages. *This paragraph used to say nothing in CI scans this closure;
 that was true until BACKLOG #1578's audit job landed.* The baseline's first entries were recorded as
-found, not triaged for reachability. The exposure is bounded by where the bundle runs — CI only,
+found, not triaged for reachability. Some have since been triaged, and the baseline's header says
+how to tell which: a triage comment names each advisory id it covers, and says who triaged it
+and on what reading. Among those still recorded as found are the three lodash advisories, on
+code the baseline's header records as in the bundle. The exposure is bounded by where the bundle runs — CI only,
 never in a wheel, sdist or deployment — and `.github/dependabot.yml` records why no automated
 remediation lane exists for it.
 

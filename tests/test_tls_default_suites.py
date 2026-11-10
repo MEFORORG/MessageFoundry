@@ -34,6 +34,8 @@ import ast
 import datetime
 import re
 import ssl
+import subprocess
+import sys
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -599,10 +601,10 @@ def test_every_hop_offers_the_approved_list_in_order(hop: str, pki: _Pki) -> Non
 
 
 def test_the_shared_module_level_openers_are_narrowed_too() -> None:
-    """The two openers built once at import and shared by every connection that needs no extra
+    """The two openers built once and shared by every connection that needs no extra
     handler. The per-hop tests build FRESH ones so they can add a trust root without touching shared
     state; this reads the shared objects themselves."""
-    for opener in (rest._NO_REDIRECT_OPENER, alert_sinks._NO_REDIRECT_OPENER):
+    for opener in (rest._shared_no_redirect_opener(), alert_sinks._shared_no_redirect_opener()):
         assert _tls12(_https_context(opener)) == list(APPROVED_TLS12_SUITES)
 
 
@@ -865,6 +867,92 @@ def test_only_the_narrowers_own_refusal_is_relabelled(monkeypatch: pytest.Monkey
     monkeypatch.setattr(tls_policy, "narrow_tls13_suites", broken)
     with pytest.raises(NotImplementedError):
         narrow_to_approved_suites(ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
+
+
+#: Run in a fresh interpreter, because the defect is at import and this process imported both
+#: modules long ago. The narrower refuses before either module is imported, as a refusing OpenSSL
+#: build would from the start.
+_IMPORT_UNDER_A_REFUSING_NARROWER = """
+from messagefoundry import tls_sigalgs
+from messagefoundry.config import tls_policy
+
+
+def refuse(ctx):
+    raise tls_sigalgs.NarrowerRefused("stub: this OpenSSL refused the engine's TLS 1.3 suites")
+
+
+tls_policy.narrow_tls13_suites = refuse
+from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.wiring import Rest
+from messagefoundry.pipeline import alert_sinks
+from messagefoundry.transports import ai_broker, build_destination, rest
+from tests._egress_policy import permitting
+
+_WARN = tls_policy.HopPosture(enforcing=False)
+_REST = Rest(url="https://partner.example.test/x").settings
+
+
+def _rest_destination():
+    with tls_policy.active_hop_posture(_WARN):
+        build_destination(
+            Destination(name="OB_REST", type=ConnectorType.REST, settings=_REST),
+            egress=permitting(_REST),
+        )
+
+
+uses = {
+    "rest": rest._shared_no_redirect_opener,
+    "alert_sinks": alert_sinks._shared_no_redirect_opener,
+    "rest destination": _rest_destination,
+    "webhook build": lambda: alert_sinks.WebhookTransport(
+        "https://hooks.example.test/x", posture=_WARN
+    ),
+    "ai broker": lambda: ai_broker.AiBroker(
+        endpoint="https://ai.example.test/v1",
+        api_key="k",
+        allowed_endpoints=["ai.example.test"],
+        posture=_WARN,
+    ),
+}
+for name, use in uses.items():
+    for _ in range(2):  # a refused build caches nothing, so the second use is refused too
+        try:
+            use()
+        except ValueError as exc:
+            print("refused", name, type(exc).__name__, tls_policy.ssl.OPENSSL_VERSION in str(exc))
+        else:
+            raise SystemExit(name + " built an opener the narrower refused")
+"""
+
+
+def test_a_refused_engine_list_is_a_refusal_at_first_use_not_an_import_failure() -> None:
+    """BACKLOG #2484 step 3. Both shared no-redirect openers were built at import, so on an OpenSSL
+    that refuses the engine's list, importing ``transports.rest`` or ``pipeline.alert_sinks`` raised.
+    They are built on first use now: both modules import, each getter raises the named
+    configuration refusal, and so does building a REST destination or a webhook sink, so the
+    start is refused rather than each POST. The AI broker raises its own error type, which its
+    route answers. Measured red on the parent commit: the import raised ``EngineTlsListRefused``
+    and the child exited 1."""
+    result = subprocess.run(
+        [sys.executable, "-c", _IMPORT_UNDER_A_REFUSING_NARROWER],
+        cwd=_ROOT,  # sys.path[0] for -c, so the child imports THIS tree, and its tests package
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    refused = "EngineTlsListRefused"
+    expected = [
+        ("rest", refused),
+        ("alert_sinks", refused),
+        ("rest destination", refused),
+        ("webhook build", refused),
+        ("ai broker", "AiBrokerError"),
+    ]
+    assert result.stdout.splitlines() == [
+        f"refused {name} {cls} True" for name, cls in expected for _ in (1, 2)
+    ], result.stdout
 
 
 class _RefusesTls12(ssl.SSLContext):

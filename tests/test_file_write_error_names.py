@@ -38,6 +38,7 @@ from messagefoundry.transports.base import (
     build_destination,
 )
 from messagefoundry.transports.file import FileDestination, _Replaced
+from tests._log_absence import assert_capture_sees
 from tests._refusal_log_capture import record_texts
 
 MRN = "SYN900002"
@@ -167,6 +168,7 @@ async def test_the_runner_stores_and_alerts_no_rendered_name(
     assert detail
     for text in (row["last_error"], event.reason, detail):
         assert MRN not in text
+    assert_capture_sees(caplog, "messagefoundry")
     assert not [r for r in caplog.records if any(MRN in t for t in record_texts(r))]
 
 

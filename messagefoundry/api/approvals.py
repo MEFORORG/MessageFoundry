@@ -65,6 +65,7 @@ from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
+from messagefoundry.config.fingerprint import is_config_digest
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline.alerts import (
@@ -73,7 +74,7 @@ from messagefoundry.pipeline.alerts import (
     LoggingAlertSink,
     authority_seal_alert,
 )
-from messagefoundry.redaction import json_loads_or_refusal
+from messagefoundry.redaction import json_loads_or_refusal, safe_exc
 from messagefoundry.store.base import Store
 from messagefoundry.store.row_seal import (
     APPROVAL_KIND,
@@ -128,12 +129,48 @@ RESOLVE_OUTCOMES: Mapping[str, str] = {
 DRAIN_TIMEOUT_SECONDS = 3.0
 
 
+def _param_text(params: Mapping[str, Any], key: str) -> str | None:
+    """``params[key]`` when it is a non-empty string, otherwise ``None``."""
+    value = params.get(key)
+    return value if isinstance(value, str) and value else None
+
+
 def named_requester(params: Mapping[str, Any]) -> str | None:
     """The requester's name a hold's params carry, or ``None`` when it is missing or not a non-empty
     string (vault BACKLOG #3217). One test for the executors that need the name and for the queue's
     ``params_no_requester`` prediction, so the two cannot drift."""
-    requester = params.get("requester")
-    return requester if isinstance(requester, str) and requester else None
+    return _param_text(params, "requester")
+
+
+def held_fingerprint(params: Mapping[str, Any]) -> str | None:
+    """The config digest a held reload's params carry, or ``None`` when it is missing or is not of
+    the shape a release compares (:func:`~messagefoundry.config.fingerprint.is_config_digest`;
+    vault BACKLOG #3192). A release bound to ``None`` refuses every config, and so would one bound
+    to a value of another shape, so the reload executor and the queue's ``params_no_fingerprint``
+    prediction read this one test."""
+    value = params.get("fingerprint")
+    return value if is_config_digest(value) else None
+
+
+#: The audit action and the 409 text :meth:`ApprovalGate.approve` writes and answers for each
+#: params refusal. One arm serves them all, so the audit row cannot differ between them.
+_PARAMS_REFUSALS: Mapping[ReleaseBlocked, tuple[str, str]] = {
+    "params_unreadable": (
+        "approval.params_unreadable",
+        "request parameters are unreadable; reject it instead",
+    ),
+    "params_no_requester": (
+        "approval.params_no_requester",
+        "this request's parameters record no requester, so the operation could not name who ran "
+        "it; reject it and request the operation again",
+    ),
+    "params_no_fingerprint": (
+        "approval.params_no_fingerprint",
+        "this request's parameters record no config digest, or one not of the form the engine "
+        "writes, so its release could not be bound to the config it names; reject it and request "
+        "the operation again",
+    ),
+}
 
 
 #: The claim owner of an engine that is neither an engine shard nor a cluster node (BACKLOG #1562).
@@ -267,14 +304,48 @@ def _encodable_result(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
-    """Log a shielded write whose caller was cancelled, since nothing else will read its error.
+def log_orphaned(
+    task: asyncio.Future[Any],
+    subject: str,
+    *,
+    cancelled: str,
+    failed: str | None,
+    finished: str | None = None,
+    finished_subject: Callable[[Any], str] | None = None,
+    level: int = logging.ERROR,
+    redact: bool = False,
+    logger: logging.Logger = log,
+) -> None:
+    """Log once how ``task`` ended after its caller was cancelled, since nothing else will read it
+    (vault BACKLOG #3193 N4: the gate's three orphan loggers and :mod:`~messagefoundry.api.outlive`'s
+    were near-copies of this). Reading the error here also marks it retrieved, so asyncio does not
+    report it again.
 
-    Reading the error here also marks it retrieved, so asyncio does not report it again."""
+    Each message is logged after ``subject`` and a colon. ``cancelled`` and ``failed`` are logged
+    at ``level``, ``finished`` at WARNING, after ``finished_subject`` of the task's result where
+    that is given, since the result can name a different subject. A
+    ``None`` logs nothing for that ending. ``failed`` has no default: ``None`` is only for a task
+    that logs its own failure, so no caller drops one by leaving it out. A failure carries its traceback, or with ``redact`` only its
+    :func:`~messagefoundry.redaction.safe_exc` text, for an error whose message may hold content."""
     if task.cancelled():
-        log.error("approval %s: a shielded outcome write was cancelled", approval_id)
+        logger.log(level, "%s: %s", subject, cancelled)
         return
     error = task.exception()
+    if error is None:
+        if finished is not None:
+            named = subject if finished_subject is None else finished_subject(task.result())
+            logger.warning("%s: %s", named, finished)
+    elif failed is not None:
+        if redact:
+            logger.log(level, "%s: %s: %s", subject, failed, safe_exc(error))
+        else:
+            logger.log(level, "%s: %s", subject, failed, exc_info=error)
+
+
+def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
+    """:func:`log_orphaned` for a shielded outcome write, the default of
+    :meth:`ApprovalGate._shielded`."""
+    error = None if task.cancelled() else task.exception()
     if isinstance(error, ApprovalError) and error.status in (409, 503):
         # A refusal the gate raises on purpose. A 409, such as a resolve that lost the race to
         # another operator, is no fault: the row's status says what won. The only 503 a
@@ -287,45 +358,13 @@ def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
             error.status,
             error.detail,
         )
-    elif error is not None:
-        log.error(
-            "approval %s: a shielded outcome write failed after its caller was cancelled",
-            approval_id,
-            exc_info=error,
-        )
-
-
-def _log_orphaned_request(task: asyncio.Future[Any], approval_id: str) -> None:
-    """Log a request write whose caller was cancelled (vault BACKLOG #3193).
-
-    :meth:`ApprovalGate._file_request` logs and pages its own failures, so a failure is only read
-    here, which marks it retrieved. What only this callback can say is that the request was held
-    after the caller stopped waiting, so this call got no 202. For a repeat the held request is
-    the older one it joined, whose own 202 may have reached the requester."""
-    if task.cancelled():
-        log.error("approval %s: a request write was cancelled", approval_id)
         return
-    if task.exception() is None:
-        log.warning(
-            "approval %s: a request was filed or joined after its caller was cancelled, so that "
-            "call got no 202. A repeat by the same requester joins this request",
-            task.result(),
-        )
-
-
-def _log_orphaned_repeat(task: asyncio.Future[Any], approval_id: str) -> None:
-    """Log a rejoin's ``approval.request_repeated`` write whose caller was cancelled (BACKLOG #3740
-    item 9). :meth:`ApprovalGate._record_repeat` logs and pages its own failure, so a failure is
-    only read here, which marks it retrieved."""
-    if task.cancelled():
-        log.error("approval %s: a repeat's audit write was cancelled", approval_id)
-        return
-    if task.exception() is None:
-        log.warning(
-            "approval %s: a repeat's audit row was written after its caller was cancelled, so "
-            "that call got no 202",
-            approval_id,
-        )
+    log_orphaned(
+        task,
+        f"approval {approval_id}",
+        cancelled="a shielded outcome write was cancelled",
+        failed="a shielded outcome write failed after its caller was cancelled",
+    )
 
 
 async def _outlive_caller[T](task: asyncio.Future[T]) -> T:
@@ -351,6 +390,10 @@ class _Operation:
     #: The executor refuses params whose ``requester`` is not a non-empty string (vault BACKLOG
     #: #3217), so :meth:`ApprovalGate._release_blocked` predicts that refusal before the claim.
     requires_requester: bool = False
+    #: The executor binds its release to the config digest in params ``fingerprint``, and refuses
+    #: every config when there is no usable one (:func:`held_fingerprint`; vault BACKLOG #3192), so
+    #: :meth:`ApprovalGate._release_blocked` predicts that refusal before the claim too.
+    requires_fingerprint: bool = False
 
 
 class ApprovalError(Exception):
@@ -680,12 +723,14 @@ class ApprovalGate:
         permission: Permission,
         in_scope: ScopeCheck | None = None,
         requires_requester: bool = False,
+        requires_fingerprint: bool = False,
     ) -> None:
         """Register an approvable operation. ``permission`` is REQUIRED, so no operation can become
         approvable without naming the authority its requester must still hold at release.
         ``requires_requester`` declares that ``execute`` refuses params whose ``requester`` is not a
         non-empty string, so the gate refuses such a request before it claims it and the queue
-        marks it ``params_no_requester``."""
+        marks it ``params_no_requester``. ``requires_fingerprint`` declares the same of
+        :func:`held_fingerprint`, marked ``params_no_fingerprint``."""
         self._ops[key] = _Operation(
             key=key,
             label=label,
@@ -693,6 +738,7 @@ class ApprovalGate:
             permission=permission,
             in_scope=in_scope,
             requires_requester=requires_requester,
+            requires_fingerprint=requires_fingerprint,
         )
 
     @property
@@ -777,7 +823,20 @@ class ApprovalGate:
                 client=client,
             ),
             approval_id,
-            orphaned=_log_orphaned_request,
+            # Vault BACKLOG #3193: _file_request logs and pages its own failures, so a failure is
+            # only read. What only this can say is that the request was held after the caller
+            # stopped waiting, so this call got no 202. For a repeat the held request is the
+            # older one it joined, whose own 202 may have reached the requester.
+            orphaned=lambda task, aid: log_orphaned(
+                task,
+                f"approval {aid}",
+                cancelled="a request write was cancelled",
+                failed=None,  # _file_request logged and paged it
+                # Keyed on the request it holds, which for a repeat is the older one it joined.
+                finished_subject=lambda held: f"approval {held}",
+                finished="a request was filed or joined after its caller was cancelled, so that "
+                "call got no 202. A repeat by the same requester joins this request",
+            ),
         )
 
     async def _file_request(
@@ -853,7 +912,7 @@ class ApprovalGate:
             else:
                 lost_id, action = approval_id, "approval.requested"
                 landed = await self._read_back_request(approval_id)
-                if landed == "held":
+                if isinstance(landed, ApprovalRow):
                     log.warning(
                         "approval %s: the write that filed this %s request by %s reported an "
                         "error, and reading it back found it held, with its approval.requested "
@@ -866,7 +925,9 @@ class ApprovalGate:
                     )
                     # Still paged: the store tees off-box only after a commit it saw succeed, so
                     # the forwarded audit stream lacks this row and nothing else reports the gap.
-                    self._alert_lost_audit(approval_id, "approval.requested")
+                    # The row itself is stored, so the page says only the copy is missing (vault
+                    # BACKLOG #3193 N1).
+                    self._alert_offbox_copy_missing(approval_id, "approval.requested")
                     return approval_id
                 state = {
                     "absent": "Reading it back found no such request, so most likely nothing is held",
@@ -897,21 +958,23 @@ class ApprovalGate:
 
     async def _read_back_request(
         self, approval_id: str
-    ) -> Literal["held", "absent", "unsealed", "unknown"]:
-        """Whether a request whose write reported an error is in the store (vault BACKLOG #3193).
-        ``unsealed`` when it is there but fails its seal, which :meth:`_verified` reports: such a
-        row can never be released, so a retry cannot make a second releasable copy of it.
-        ``unknown`` when the read fails, logged here."""
+    ) -> ApprovalRow | Literal["absent", "unsealed", "unknown"]:
+        """The approval row a write that reported an error left in the store, its seal checked
+        (vault BACKLOG #3193): a request's, or an outcome's in :meth:`_settle`. ``unsealed`` when
+        it is there but fails its seal, which :meth:`_verified` reports: such a row can never be
+        released, so a retry cannot make a second releasable copy of it. ``unknown`` when the read
+        fails, logged here."""
         try:
             found = await self._store.get_pending_approval(approval_id)
             if found is None:
                 return "absent"
             # Inside the try: a row the checker cannot even parse must still end in the caller's
             # ERROR line and page, not escape them.
-            return "held" if await self._verified(found) is not None else "unsealed"
+            row = await self._verified(found)
+            return "unsealed" if row is None else row
         except Exception:  # noqa: BLE001 - every store backend raises its own type
             log.exception(
-                "approval %s: reading back a request whose write failed failed too", approval_id
+                "approval %s: reading back its row after a write failed failed too", approval_id
             )
             return "unknown"
 
@@ -1016,7 +1079,16 @@ class ApprovalGate:
         await self._shielded(
             self._record_repeat(held, operation, requester, client),
             held,
-            orphaned=_log_orphaned_repeat,
+            # BACKLOG #3740 item 9: _record_repeat logs and pages its own failure, so a failure is
+            # only read.
+            orphaned=lambda task, aid: log_orphaned(
+                task,
+                f"approval {aid}",
+                cancelled="a repeat's audit write was cancelled",
+                failed=None,  # _record_repeat logged and paged it
+                finished="a repeat's audit row was written after its caller was cancelled, so that "
+                "call got no 202",
+            ),
         )
         log.info(
             "approval %s: a repeat %s request by %s rejoined it; nothing new is held",
@@ -1095,7 +1167,6 @@ class ApprovalGate:
             "status": "pending",
             "approver": None,
             "decided_at": None,
-            "gated": self.gates(operation),
             "release_blocked": "seal_failed",
         }
 
@@ -1184,6 +1255,11 @@ class ApprovalGate:
         # #3217): past the claim it was compensated to 'failed' while the queue offered Approve.
         if op.requires_requester and named_requester(params) is None:
             return "params_no_requester"
+        # The same kind of test for a held reload: a release bound to no digest refuses every
+        # config, so it is refused before the claim rather than claimed and compensated. Whether
+        # the directory still matches a digest the hold did capture is met only at release.
+        if op.requires_fingerprint and held_fingerprint(params) is None:
+            return "params_no_fingerprint"
         return None
 
     async def _queue_release_blocked(
@@ -1253,9 +1329,6 @@ class ApprovalGate:
             "status": r.status,
             "approver": r.approver,
             "decided_at": r.decided_at,
-            # The same test approve() refuses on (approval.no_longer_gated), so a page can stop
-            # offering a release the gate would refuse. Read now, like the refusal it predicts.
-            "gated": self.gates(operation),
             "release_blocked": blocked,
         }
 
@@ -1289,8 +1362,8 @@ class ApprovalGate:
 
         **The writes on this path answer a mapped status in a store outage (vault BACKLOG #2255).** A
         refusal's own audit row (at least ``approval.too_early``, ``approval.stale_requester``,
-        ``approval.no_longer_gated``, ``approval.params_unreadable`` and
-        ``approval.params_no_requester``) that fails to write is
+        ``approval.no_longer_gated``, ``approval.params_unreadable``,
+        ``approval.params_no_requester`` and ``approval.params_no_fingerprint``) that fails to write is
         logged and the refusal still answers 409, since it runs nothing. A release whose approver account changed after the request
         writes ``approval.approver_provenance``. That row is soft too, and pages if it fails. It is
         written whether the operation succeeded, failed or was cut off. Many failed writes on this path also page
@@ -1339,15 +1412,19 @@ class ApprovalGate:
             # and the request's own configured shape (who must approve, how old) says nothing
             # about that. Fail closed: refuse, stay pending until it expires or is rejected.
             await self._refuse_ungated(approval_id, row, approver=approver, client=client)
-        if blocked == "params_unreadable":
-            # The queue lists such a row as "unreadable" (BACKLOG #2458). Refuse it as a 409 that
-            # leaves the row pending for a reject, rather than a 500 from a bare parse. Before the
-            # dwell floor, so a row that can never be released writes no too-early row or alert.
-            # Audited like the other refusals (vault BACKLOG #3192), soft for the same reason. The
-            # detail carries no params: they are what could not be read.
+        params_refusal = None if blocked is None else _PARAMS_REFUSALS.get(blocked)
+        if params_refusal is not None:
+            # Each is a 409 that leaves the row pending for a reject, as the queue predicts:
+            # unreadable params (BACKLOG #2458) rather than a 500 from a bare parse, and the two the
+            # executor would otherwise refuse only after the claim, compensated to 'failed' (vault
+            # BACKLOG #3217, #3192). Before the dwell floor, so a row that can never be released
+            # writes no too-early row or alert. Audited like the other refusals (vault BACKLOG
+            # #3192), soft for the same reason. The detail carries no params: for one of them,
+            # they are what could not be read.
+            action, refusal = params_refusal
             await self._record_audit_soft(
                 approval_id,
-                "approval.params_unreadable",
+                action,
                 actor=approver,
                 detail=json.dumps(
                     {"approval_id": approval_id, "operation": operation, "requester": row.requester}
@@ -1355,26 +1432,7 @@ class ApprovalGate:
                 client=client,  # ADR 0150: the approver's address, matching this row's actor
                 context="the release was refused",
             )
-            raise ApprovalError(409, "request parameters are unreadable; reject it instead")
-        if blocked == "params_no_requester":
-            # The executor would refuse it after the claim, compensated to 'failed' (vault BACKLOG
-            # #3217). Refused here instead, so it stays pending for a reject, as the queue
-            # predicts. Audited, and soft, like the unreadable-params refusal above.
-            await self._record_audit_soft(
-                approval_id,
-                "approval.params_no_requester",
-                actor=approver,
-                detail=json.dumps(
-                    {"approval_id": approval_id, "operation": operation, "requester": row.requester}
-                ),
-                client=client,  # ADR 0150: the approver's address, matching this row's actor
-                context="the release was refused",
-            )
-            raise ApprovalError(
-                409,
-                "this request's parameters record no requester, so the operation could not name "
-                "who ran it; reject it and request the operation again",
-            )
+            raise ApprovalError(409, refusal)
         op = self._ops.get(operation)
         if blocked is not None or not requester_user_id or op is None or params is None:
             # Unreachable while every reason has its arm above. Fail closed if one is added
@@ -1682,29 +1740,37 @@ class ApprovalGate:
 
         **When the combined write fails**, the status is written alone, so an audit outage never
         leaves the row ``executing``. If that status write finds the row already moved, the method
-        stops there. The combined write most likely committed. No second row is written, and
-        nothing pages. Otherwise the audit row is written alone. If that fails as well, the loss is
+        writes no row alone and reads the row back (vault BACKLOG #3193 N1). Found at ``status``
+        with this write's ``decided_at``, the combined write committed, and it pages
+        ``audit_offbox_copy_missing``, since that row's off-box copy was never sent. Found in any
+        other state, or not read, it pages ``audit_write_failed``. If the status write moves the
+        row, the audit row is written alone. If that fails as well, the loss is
         logged at ERROR with the detail and pages ``audit_write_failed``. If the status
         write fails too, the row may still read ``executing`` until this process restarts, when
         :meth:`reconcile_after_restart` moves it to ``interrupted`` (BACKLOG #2087 limb 4).
 
         ``flag`` names a detail field that records whether the row moved: ``True`` when it moved
         with this row, ``False`` when another caller had already moved it, and ``None`` when the
-        status write failed."""
+        status write failed. The ERROR line logs it as ``"unknown"`` where the read-back cannot tell
+        which: a row absent, unsealed or unreadable, or resolved on the interrupted path."""
 
-        def detail(moved: bool | None) -> str:
+        def detail(moved: bool | Literal["unknown"] | None) -> str:
             # A result json cannot encode must not raise here, before the status moves, after the
-            # operation ran. That would strand the row 'executing'.
+            # operation ran. That would strand the row 'executing'. "unknown" is for a log line
+            # only, never a written row.
             return _audit_detail(fields if flag is None else {**fields, flag: moved})
 
         combined = AuditAppend(action, actor=approver, detail=detail(True), client=client)
+        # Kept to recognise this write on a read-back: every other move stamps its own clock.
+        decided_at: float | None = None
         moved: bool | None
         try:
+            decided_at = self._clock()
             moved = await self._store.decide_pending_approval(
                 approval_id,
                 status=status,
                 approver=approver,
-                decided_at=self._clock(),
+                decided_at=decided_at,
                 from_status="executing",
                 audit=combined,
             )
@@ -1725,20 +1791,55 @@ class ApprovalGate:
             )
             moved = await self._settle_status_only(approval_id, status=status, approver=approver)
             if moved is False:
-                # Nothing else should move a row out of 'executing' while this process runs (the
-                # restart reconcile moves only claims older than this process), so the likeliest cause:
-                # the combined write COMMITTED and only its reply was lost: its row is then already
-                # in the log, and writing another would duplicate the outcome with a false flag.
-                log.error(
-                    "approval %s: %s; the combined write most likely committed, so no second %s "
-                    "row is written. Check the audit log for it. Its off-box copy was not written",
-                    approval_id,
-                    context,
-                    action,
-                )
-                # Paged, as a request that reads back as held is (vault BACKLOG #3193): the store
-                # tees off-box only after a commit it saw succeed, so nothing else reports the gap.
-                self._alert_lost_audit(approval_id, action)
+                # The likeliest cause: the combined write COMMITTED and only its reply was lost, so
+                # its row is already in the log, and writing another would duplicate the outcome
+                # with a false flag. A sibling sharing this claim owner can move the row instead,
+                # so it is read back, as a request is (vault BACKLOG #3193 N1).
+                landed = await self._read_back_request(approval_id)
+                if (
+                    isinstance(landed, ApprovalRow)
+                    and decided_at is not None
+                    and landed.status == status
+                    and landed.decided_at == decided_at
+                ):
+                    log.error(
+                        "approval %s: %s; reading the row back found it '%s', so the combined "
+                        "write committed and no second %s row is written. Its off-box copy was "
+                        "not written",
+                        approval_id,
+                        context,
+                        status,
+                        action,
+                    )
+                    # The store tees off-box only after a commit it saw succeed, so nothing else
+                    # reports the gap, and the row is stored, so the page says only the copy is
+                    # missing.
+                    self._alert_offbox_copy_missing(approval_id, action)
+                else:
+                    # Only a row read back where this write could not have left it shows another
+                    # caller moved it. Absent, unsealed or unread does not, nor a resolved row on
+                    # the interrupted path: this write's own 'interrupted' may have committed and
+                    # been resolved since.
+                    moved_by_other = isinstance(landed, ApprovalRow) and not (
+                        status == "interrupted" and landed.status in RESOLVE_OUTCOMES.values()
+                    )
+                    lost = detail(False if moved_by_other else "unknown")
+                    log.error(
+                        "approval %s: %s; the row was no longer 'executing' and reading it back "
+                        "did not find this write's '%s' (read back: %s), so its %s row was not "
+                        "written or its outcome is unknown. No row is written alone. Lost "
+                        "detail: actor=%s detail=%s",
+                        approval_id,
+                        context,
+                        status,
+                        landed
+                        if isinstance(landed, str)
+                        else f"'{scrub_log_argument(landed.status)}' at {landed.decided_at}",
+                        action,
+                        scrub_log_argument(approver),
+                        scrub_log_argument(lost),  # JSON, so the scrub leaves it as is
+                    )
+                    self._alert_lost_audit(approval_id, action)
                 return
         else:
             if moved:
@@ -2026,6 +2127,17 @@ class ApprovalGate:
             self._alert_sink.audit_write_failed(key or f"approval:{approval_id}", action=action)
         except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
             log.exception("approval %s: the audit_write_failed alert failed to emit", approval_id)
+
+    def _alert_offbox_copy_missing(self, approval_id: str, action: str) -> None:
+        """Page on an audit row whose write the gate read back as committed, whose off-box copy
+        was never sent (vault BACKLOG #3193 N1): ``audit_offbox_copy_missing``, keyed
+        ``approval:<id>``, best effort as :meth:`_alert_lost_audit` is."""
+        try:
+            self._alert_sink.audit_offbox_copy_missing(f"approval:{approval_id}", action=action)
+        except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
+            log.exception(
+                "approval %s: the audit_offbox_copy_missing alert failed to emit", approval_id
+            )
 
     async def _approver_changes(self, approver_user_id: str, requested_at: float) -> list[str]:
         """Which of the approver account's credential facts changed AFTER the request (BACKLOG #315
