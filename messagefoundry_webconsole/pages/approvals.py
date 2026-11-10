@@ -362,8 +362,6 @@ def approvals_page(listing: ApprovalList, *, notice: str = "") -> Markup:
                     "Parameters",
                     "Requester",
                     "Released by",
-                    # decided_at: the cut-off time for a cancel, the claim time for a restart or
-                    # an operator interrupt (PendingApprovalInfo), so "Cut off" alone misreads it.
                     "Cut off or claimed",
                     "Id",
                     "Record",

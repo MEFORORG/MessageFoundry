@@ -2880,7 +2880,7 @@ than to one request.
   another caller moved the row, and `unknown` where the read-back cannot tell.
 
 For some failed writes the gate logs at ERROR and pages nothing. At least this one: a restart
-cannot move a leftover `executing` row to `interrupted`. The next start tries again.
+cannot move a leftover `executing` row to `interrupted`.
 
 An outcome's combined write can fail while the status write that follows finds the row already
 moved. The gate then writes no row alone, and reads the row back (vault BACKLOG #3193 N1). If it
@@ -2972,8 +2972,7 @@ already moved. The gate then writes no row alone and pages, as above.
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
 worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`
 lists `interrupted` rows after the pending ones, each with its `status`, the approver who released it,
-and its `decided_at`. That is the cut-off time for a cancel, and the claim time for a row a restart
-or an operator interrupt moved. Once the operator has checked, `POST /approvals/{id}/resolve` with
+and its `decided_at`. Once the operator has checked, `POST /approvals/{id}/resolve` with
 `{"outcome": "effects_applied"}` or `{"outcome": "effects_not_applied"}` records the finding and moves
 the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resolve:
 
@@ -3018,7 +3017,7 @@ runs once its name is known. Each row is in the same write as its move, written 
 and carries `reason` `engine_restart`, the claim owner and the claim time. The move keeps the row's `decided_at` as the
 claim time, so an `interrupted` row a restart settled shows when it was claimed, not when the
 engine restarted. Nothing re-runs. The operator checks the effects of an `interrupted` row and
-resolves it as above. A move that fails is logged, and the next start tries again.
+resolves it as above. A move that fails is logged.
 
 Engine shards and cluster nodes share one store, so a process touches only its own rows: a
 sibling's `executing` row may be a live release. The owner is:

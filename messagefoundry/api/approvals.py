@@ -331,8 +331,7 @@ def _audit_detail(fields: Mapping[str, Any]) -> str:
 
 
 def _claim_time(row: ApprovalRow, clock: Callable[[], float]) -> float:
-    """``row``'s claim time, which a move out of ``executing`` keeps in ``decided_at`` (BACKLOG
-    #1562); ``clock()`` only for a row that somehow has none."""
+    """``row``'s claim time (BACKLOG #1562); ``clock()`` only for a row that somehow has none."""
     return clock() if row.decided_at is None else row.decided_at
 
 
@@ -718,7 +717,7 @@ class ApprovalGate:
         ``claim_owner`` column existed has none. Nothing was deployed then (CLAUDE.md section 0),
         so such a row can only be left over from a development store.
 
-        A move that fails is logged and skipped, and the next start tries again. Writing the status
+        A move that fails is logged and skipped. Writing the status
         alone would leave an ``interrupted`` row with no audit row saying why. A failed read of this
         process's rows raises, for the caller to log. A failed read of other owners' rows is logged,
         and the moves stand."""
@@ -769,7 +768,7 @@ class ApprovalGate:
             except Exception:  # noqa: BLE001 - every store backend raises its own type
                 log.exception(
                     "approval %s: could not mark this process's leftover 'executing' release "
-                    "interrupted; the next start tries again",
+                    "interrupted",
                     approval_id,
                 )
                 unsettled.append(approval_id)
@@ -2484,8 +2483,7 @@ class ApprovalGate:
         the winner's ``approval.resolved``, say what won.
 
         The status write replaces ``decided_at``, so the audit row carries its earlier value as
-        ``interrupted_at``: the cut-off time for a cancel, the claim time for a restart or an
-        operator interrupt.
+        ``interrupted_at``.
 
         The write runs shielded, so a cancel cannot leave it half done."""
         status = RESOLVE_OUTCOMES.get(outcome)
