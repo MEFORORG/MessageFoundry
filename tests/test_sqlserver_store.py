@@ -7400,12 +7400,11 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
 
     Every string braces the password with :func:`~messagefoundry.odbc_dsn.odbc_brace`. The generic
     builder's (:func:`_build_odbc_dsn`, whose password goes through :func:`_odbc_password` for the
-    ``msodbc`` family) names the host alone, as the generic dialect's egress check requires, so it
-    reaches the default port; it has ``TrustServerCertificate=yes`` appended, which its
-    ``odbc_params`` allowlist does not take and the container's self-signed certificate needs. The
-    SQL Server preset's (:func:`_build_dsn`) and the store's (:func:`connection_string`) take that
-    keyword from the leg's settings, and where the two strings match byte for byte one login
-    covers both. They go through aioodbc and pyodbc.
+    ``msodbc`` family) names the host alone, so it reaches the default port; it has
+    ``TrustServerCertificate=yes`` appended, which its ``odbc_params`` allowlist does not take and
+    the container's self-signed certificate needs. The SQL Server preset's (:func:`_build_dsn`)
+    sets that keyword here, and the store's (:func:`connection_string`) takes it from the leg's
+    settings; where the two strings match byte for byte one login covers both. They go through aioodbc and pyodbc.
 
     A driver that ended a braced value at its first ``}`` or its first ``};``, or did not turn
     ``}}`` into ``}``, would send another password, and the login would be refused. The control
@@ -7431,7 +7430,7 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
     base = load_settings(environ=os.environ).store
     on_default_port = base.port == 1433
     assert on_default_port, (
-        "the generic dialect reaches Microsoft's driver on its default port only"
+        "this test sends the generic string, which names the host alone, to the default port"
     )
     login = scratch_name("mefor_brace")
     tail = secrets.token_hex(8)

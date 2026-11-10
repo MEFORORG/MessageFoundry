@@ -33,9 +33,8 @@ def odbc_brace(value: str) -> str:
 
     The ODBC escape: inside braces a driver that follows it reads ``;``, ``{`` and ``=`` as text,
     and ``}}`` as one ``}``, so an attacker-influenced value cannot end the value early and add a
-    keyword. psqlODBC and MySQL Connector/ODBC were measured to read it on 2026-10-30; the comment
-    above ``_DRIVER_FAMILIES`` in ``messagefoundry/transports/database.py`` names the test
-    for Microsoft's driver (BACKLOG #2705)."""
+    keyword. The comment above ``_DRIVER_FAMILIES`` in ``messagefoundry/transports/database.py``
+    says which drivers were measured to read it (BACKLOG #2705)."""
     return "{" + value.replace("}", "}}") + "}"
 
 
