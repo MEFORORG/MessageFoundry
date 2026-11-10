@@ -113,14 +113,12 @@ audit row and raises an `integrity_drift` alert, with at least these exceptions.
 row or alert. On most of the read path, each process reports a row that keeps failing again only
 after an interval: five minutes for a sealed row, and an hour for a message or saved-search cell.
 A directory reconcile pass is an exception: the engine itself reports an AD map Vault transit
-cannot verify or reach on every pass that meets it, with no interval of its own (ADR 0217). A seal
-refusal that a session revoke meets can be paged to the alert sink, and can be audited where the
-audit write itself succeeds. The engine applies no interval of its own to those revoke reports.
-Where anything limits notification, it is the alert sink's throttle, `[alerts].realert_seconds` or
-a matching rule's `cooldown_seconds`, which is held per sink instance, so at least each process or
-node that pages throttles on its own. The exact rules are in
-[ADR 0217](adr/0217-an-unverifiable-transit-row-seal-is-denied-like-a-failed-one-and-the-ad-reconciler-ends-sessions-rather-than-holding.md),
-and the filed gaps in vault BACKLOG #8202. What each refusal does is in the changelog entries for
+cannot verify or reach on every pass that meets it, with no interval of its own (ADR 0217). How a
+session revoke reports a seal refusal, what limits those reports, and the gaps still open are
+recorded in
+[ADR 0217](adr/0217-an-unverifiable-transit-row-seal-is-denied-like-a-failed-one-and-the-ad-reconciler-ends-sessions-rather-than-holding.md)
+and vault BACKLOG #8202; the alert sink's throttle settings are in
+[CONFIGURATION.md](CONFIGURATION.md#alerts). What each refusal does is in the changelog entries for
 vault BACKLOG #2592, #2593 and #3510 (in `changelog.d/` until the next release, then
 [CHANGELOG.md](../CHANGELOG.md)). The seal format is in
 [`store/row_seal.py`](../messagefoundry/store/row_seal.py).
