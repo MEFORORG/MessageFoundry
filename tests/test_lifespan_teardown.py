@@ -889,8 +889,8 @@ async def test_a_hung_graph_stop_is_cut_and_the_later_steps_still_run(
     )
     engine.drain_config_writes = _drain  # type: ignore[method-assign]
     engine.on_graph_stopped = lambda: calls.append("graph-stopped clear")
-    # Settled now, the AES-GCM bound would stop refilling while the graph's workers may still
-    # encrypt (ASVS 11.3.4); the store's close settles it instead.
+    # Settled before the store's close, the AES-GCM bound would stop refilling while the graph's
+    # workers may still encrypt (ASVS 11.3.4); the close settles it instead.
     engine._gcm_invocation_runner = _gcm_runner(calls)
 
     async def _release_lease() -> None:
@@ -904,15 +904,14 @@ async def test_a_hung_graph_stop_is_cut_and_the_later_steps_still_run(
         await asyncio.wait_for(engine.stop(budget_seconds=budget), _WAIT_S)
         elapsed = time.monotonic() - began
     # No clear says a graph that may still be serving has gone, and the AES-GCM runner keeps
-    # refilling for its workers until the store's close has settled the bound.
-    assert calls == ["graph stop", "config drain", "close", "gcm stopped unsettled"]
+    # refilling for its workers until just before the store's close, which settles the bound.
+    assert calls == ["graph stop", "config drain", "gcm stopped unsettled", "close"]
     assert engine._gcm_invocation_runner is None
     assert elapsed < budget, f"engine.stop() took {elapsed:.2f}s"
     messages = [r.getMessage() for r in caplog.records]
     assert any("the graph's stop did not finish within" in m for m in messages), messages
     assert any("the graph did not stop" in m for m in messages), messages
     assert any("keeps its cluster lease" in m for m in messages), messages
-    assert any("left for the store's close to settle" in m for m in messages), messages
 
 
 async def test_a_graph_that_stopped_gets_its_graph_stopped_clear_under_a_budget(
@@ -933,7 +932,7 @@ async def test_a_graph_that_stopped_gets_its_graph_stopped_clear_under_a_budget(
     await asyncio.wait_for(
         engine.stop(budget_seconds=app_module._ENGINE_STOP_RESERVE_SECONDS), _WAIT_S
     )
-    assert calls == ["graph-stopped clear", "gcm settled", "lease released", "close"]
+    assert calls == ["graph-stopped clear", "lease released", "gcm stopped unsettled", "close"]
 
 
 class _FakeRunner:

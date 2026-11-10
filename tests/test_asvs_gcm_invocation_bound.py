@@ -581,30 +581,34 @@ async def test_runner_refills_ON_DEMAND_without_waiting_out_the_interval(
         await store.close()
 
 
-async def test_a_runner_stopped_after_the_store_closed_neither_settles_nor_keeps_running(
+async def test_a_runner_stopped_unsettled_leaves_the_settlement_to_the_store_s_close(
     tmp_path: Path,
 ) -> None:
-    """BACKLOG #3191: engine.stop() leaves the runner refilling for a graph that did not stop,
-    and stops it once the store's close has settled. It then unhooks and ends without a second
-    settlement against the closed store."""
-    store, cipher = await _keyed_store(tmp_path / "after-close.db")
+    """BACKLOG #3191: engine.stop() stops the runner just before the store's close, without its
+    own settlement, so the close's settlement counts every encrypt up to it. The runner unhooks
+    and ends; the close then squares the persisted total with what was spent."""
+    store, cipher = await _keyed_store(tmp_path / "unsettled.db")
     runner = GcmInvocationRunner(store, alert_sink=_RecordingSink(), interval_seconds=600.0)  # type: ignore[arg-type]
     runner.start()
     task = runner._task
     assert task is not None
     await asyncio.sleep(0)
-    await store.close()
-    settled: list[bool] = []
+    real_checkpoint = store.checkpoint_cipher_invocations
+    settles: list[bool] = []
 
     async def _checkpoint(*, settle: bool = False) -> int | None:
-        settled.append(settle)
-        return None
+        settles.append(settle)
+        return await real_checkpoint(settle=settle)
 
     store.checkpoint_cipher_invocations = _checkpoint  # type: ignore[method-assign]
-    await runner.stop(settle=False)
-    assert task.done() and runner._task is None
-    assert settled == []
-    assert cipher._refill_hook is None
+    try:
+        await runner.stop(settle=False)
+        assert task.done() and runner._task is None
+        assert cipher._refill_hook is None
+        assert settles == [], "the runner settled although its caller closes the store next"
+    finally:
+        await store.close()
+    assert settles == [True], "the store's close is what settles"
 
 
 async def test_runner_is_a_noop_on_a_keyless_store(tmp_path: Path) -> None:

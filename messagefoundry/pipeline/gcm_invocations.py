@@ -121,8 +121,8 @@ class GcmInvocationRunner:
         persisted total with what this process actually spent, so a shutdown neither loses invocations
         the key performed nor permanently burns the unspent remainder of its reserved block. (The store's
         own ``close()`` settles too; both are idempotent, since a settlement zeroes the reserve.)
-        ``settle=False`` skips the settlement, for a store whose close already settled (BACKLOG
-        #3191)."""
+        ``settle=False`` skips the settlement, for a caller that closes the store next, since the
+        close settles (BACKLOG #3191)."""
         bound = self._bound()
         if bound is not None:
             bound.set_refill_hook(None)
