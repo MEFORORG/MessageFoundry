@@ -297,6 +297,11 @@ async def test_sqlserver_clamped_borrow_names_the_setting_that_set_its_limit() -
         async with store._acquire_clamped(FAST):
             pytest.fail("the body must never run on a wedged pool")
     assert "[store].acquire_timeout" not in str(clamped.value)
+    # A tie names the clamp too: raising [store].acquire_timeout alone would not lengthen it.
+    store = _sqlserver_store(_HangingPool(), timeout=FAST)
+    with pytest.raises(StoreAcquireTimeout, match=r"lease_renew_timeout_seconds"):
+        async with store._acquire_clamped(FAST):
+            pytest.fail("the body must never run on a wedged pool")
     store = _sqlserver_store(_HangingPool(), timeout=FAST)
     with pytest.raises(StoreAcquireTimeout, match=r"retune with \[store\]\.acquire_timeout$"):
         async with store._acquire_clamped(5.0):

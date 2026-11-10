@@ -1036,10 +1036,9 @@ def _applock_timeout_ms(command_timeout: int) -> int:
 
 #: What a clamped borrow's :class:`StoreAcquireTimeout` advises when the clamp, not
 #: ``[store].acquire_timeout``, was the limit (:meth:`SqlServerStore._acquire_clamped`). stop()'s
-#: release borrows at its own shutdown bound, which no setting tunes, so the message names both.
-_CLAMPED_BORROW_RETUNE = (
-    "[cluster].lease_renew_timeout_seconds (the cluster clamp; stop()'s release has a fixed bound)"
-)
+#: writes borrow at their own shutdown bound, but inside an event-loop timeout of the same length,
+#: which fires first, so they never raise this.
+_CLAMPED_BORROW_RETUNE = "[cluster].lease_renew_timeout_seconds"
 
 
 def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> int:
@@ -5569,8 +5568,9 @@ class SqlServerStore:
         """:meth:`_acquire` with a SHORTER acquire limit: the smaller of ``[store].acquire_timeout``
         and ``clamp_seconds``. Only the cluster coordinator's clamped statements borrow this way
         (:meth:`_fetchone_clamped` says why). When the clamp is the shorter limit, a borrow that
-        times out names it rather than ``[store].acquire_timeout``, which would not help."""
-        if clamp_seconds < self._settings.acquire_timeout:
+        times out names it rather than ``[store].acquire_timeout``, which would not help; at a tie
+        raising ``[store].acquire_timeout`` would not help either."""
+        if clamp_seconds <= self._settings.acquire_timeout:
             return self._borrow(clamp_seconds, retune=_CLAMPED_BORROW_RETUNE)
         return self._borrow(self._settings.acquire_timeout)
 

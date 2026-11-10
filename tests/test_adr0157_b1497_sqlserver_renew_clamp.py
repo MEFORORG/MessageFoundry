@@ -395,18 +395,20 @@ def test_an_unbounded_rollback_outside_a_task_still_runs() -> None:
     assert conn.closed is False  # rolled back cleanly, so not discarded
 
 
-@pytest.mark.parametrize("method", ["_execute", "_execute_output"])
+@pytest.mark.parametrize("method", ["_execute", "_execute_output", "_execute_clamped"])
 async def test_a_failed_rollback_after_a_failed_write_discards_the_connection(method: str) -> None:
-    """The heartbeat and stepdown-release writes: a rollback that fails may leave the write's X
-    locks held, so the connection is discarded rather than recycled, and the caller sees the write's
-    own error. Before, a bare rollback raised its own error over the write's, and the connection
-    went back to the pool."""
+    """The writes, the start-up registration's unclamped ones and the heartbeat's and release's
+    clamped one (BACKLOG #5064): a rollback that fails may leave the write's X locks held, so the
+    connection is discarded rather than recycled, and the caller sees the write's own error.
+    Before, a bare rollback raised its own error over the write's, and the connection went back
+    to the pool."""
     conn = _Conn()
     conn.rollback_fail = RuntimeError("08S01 communication link failure during rollback")
     conn.fail = RuntimeError("HYT00 query timeout expired")
     store = _store(conn)
+    kwargs = {"timeout_clamp": 3.0} if method == "_execute_clamped" else {}
     with pytest.raises(RuntimeError, match="HYT00"):
-        await getattr(store, method)("UPDATE leader_lease SET owner = NULL", ("A",))
+        await getattr(store, method)("UPDATE leader_lease SET owner = NULL", ("A",), **kwargs)
     assert conn.rolled_back == 1
     assert conn.closed is True
 
@@ -603,9 +605,9 @@ async def test_a_renew_on_a_busy_pool_and_a_stalled_server_resolves_within_twice
     """The kept bound (Manager decision d20261030T213636115-0af931), pinned by timing rather than
     by the warning's arithmetic: the borrow and the statement each get the clamp, with no shared
     deadline, so a renew that waits on a busy pool and then meets a stalled server still resolves
-    inside twice the clamp, and the node takes nothing. The borrow takes 0.75 of the clamp, which
-    leaves the acquire bound 0.5 s of headroom, and the statement the whole of it, so 1.75 x clamp
-    is expected; the 0.5 s allowed over twice the clamp is timer slack on a loaded runner, not part
+    inside twice the clamp, and the node takes nothing. The borrow takes half the clamp, which
+    leaves the acquire bound 1.0 s of headroom against a stalled loop, and the statement the whole
+    of it, so 1.5 x clamp is expected; the 0.5 s allowed over twice the clamp is timer slack on a loaded runner, not part
     of the bound. The lower
     bound shows both windows were spent, so this is the composite and not one window alone. The
     COMMIT is outside both windows, by a reading of pyodbc, not a measurement (BACKLOG #6621); this
@@ -614,16 +616,32 @@ async def test_a_renew_on_a_busy_pool_and_a_stalled_server_resolves_within_twice
     conn = _Conn()
     conn.stalls = True
     store = _store(conn)
-    store._pool = _SlowPool(conn, delay=0.75 * clamp)
+    store._pool = _SlowPool(conn, delay=0.5 * clamp)
     coord = SqlServerCoordinator(store, "A", lease_renew_timeout_seconds=clamp)
     started = time.monotonic()
     with pytest.raises(RuntimeError, match="HYT00"):
         await coord._maintain_leadership()
     elapsed = time.monotonic() - started
-    assert 1.6 * clamp <= elapsed < 2 * clamp + 0.5, elapsed
+    assert 1.4 * clamp <= elapsed < 2 * clamp + 0.5, elapsed
     assert conn.statement_timeouts == [2]
     assert coord.is_leader() is False
     assert not coord._leadership_lock.locked()
+
+
+async def test_stop_bounds_both_its_writes_at_the_driver_by_its_own_bound() -> None:
+    """stop()'s release and its ``left`` write each run at the shutdown bound, not the renew clamp
+    and not [store].command_timeout, so neither keeps its executor thread for 30 s (BACKLOG
+    #5064). Before, the ``left`` write read 30 here."""
+    conn = _Conn()
+    coord = SqlServerCoordinator(
+        _store(conn), "A", lease_renew_timeout_seconds=4.5, stop_write_timeout_seconds=2.0
+    )
+    await coord._maintain_leadership()
+    assert coord.is_leader() is True
+    conn.statement_timeouts.clear()
+    await coord.stop()
+    assert conn.statement_timeouts == [2, 2]
+    assert conn.raw.timeout == 30
 
 
 async def test_the_heartbeat_runs_under_the_renew_clamp() -> None:

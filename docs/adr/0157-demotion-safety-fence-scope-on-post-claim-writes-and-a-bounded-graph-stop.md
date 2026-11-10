@@ -744,7 +744,9 @@ Postgres runtime tests. It adds the two NOCOUNT tests and both recovery-closure 
   the server ends it, and the rollback keeps its executor thread until the driver returns.
   At least these are not clamped either: the start-up
   `_register` and `_ensure_tables`. **CORRECTED 2026-11-09 (BACKLOG #5064):** this list also named
-  the heartbeat, config-version and release statements, which now run under the clamp. The
+  the heartbeat, config-version and release statements. The first two and a stepdown's release
+  now run under the clamp; `stop()`'s release and `left` write run under its own shutdown bound
+  (`STOP_WRITE_TIMEOUT_SECONDS`), at the driver too. The
   claim's borrow is now bounded by the clamp rather than `[store].acquire_timeout` alone, so a
   leader whose pool is busy but healthy can self-fence sooner.
 - If D1 fails and no node ever acquires the lease again, the row stays INFLIGHT. No node is leading

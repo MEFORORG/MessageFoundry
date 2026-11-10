@@ -235,7 +235,7 @@ class SqlServerCoordinator:
         # Forced unconditionally, so a self-fenced node releases its row, and each write bounded
         # (BACKLOG #1987). DbCoordinator.stop() says why the force is unconditional, when the tombstone
         # is skipped, and what the bound does not cover. No asyncpg-style helper here: the store
-        # bounds the borrow (the release's at this bound too, BACKLOG #5064) and quarantines a
+        # bounds the borrow (both writes' at this bound too, BACKLOG #5064) and quarantines a
         # cancelled connection, and STOP_WRITE_TIMEOUT_SECONDS says what that can still cost.
         started = time.monotonic()
         _, _, wrote, _ = await self._release_leadership(
@@ -249,10 +249,13 @@ class SqlServerCoordinator:
             )
             return
         try:
+            # Bounded at the driver too, as the release above is, so an abandoned statement does
+            # not keep its executor thread for [store].command_timeout (BACKLOG #5064).
             async with asyncio.timeout(self._stop_write_timeout):
-                await self._store._execute(
+                await self._store._execute_clamped(
                     "UPDATE nodes SET status=?, last_seen=?, is_leader=0 WHERE node_id=?",
                     ("left", time.time(), self.node_id),
+                    timeout_clamp=self._stop_write_timeout,
                 )
         except Exception as exc:  # pool may already be closing on shutdown — log, don't raise
             log.warning("cluster: failed to mark node %s left: %s", self.node_id, safe_exc(exc))

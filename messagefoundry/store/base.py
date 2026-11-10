@@ -4998,7 +4998,8 @@ DEFAULT_STORE_ACQUIRE_TIMEOUT = 30.0
 
 
 class StoreAcquireTimeout(RuntimeError):
-    """A store pooled-connection borrow exceeded its limit, ``[store].acquire_timeout`` or a shorter one.
+    """A store pooled-connection borrow exceeded its limit: at least ``[store].acquire_timeout``,
+    a shorter cluster clamp, or the longer post-commit limit, as the message names.
 
     An ordinary ``Exception`` on purpose, so it lands in the store callers' existing ``except
     Exception`` handling and is treated as a transient stage failure (retry / dead-letter) — never a
