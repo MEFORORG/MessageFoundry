@@ -13,6 +13,7 @@ the one it read. The race tests below fail on the code before the fix: the delet
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import errno
 import logging
@@ -21,7 +22,7 @@ import pickle
 import shutil
 import stat
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, get_args
@@ -699,6 +700,35 @@ def test_a_rotate_key_with_nothing_to_write_creates_no_lock_file(
     assert (result.resealed, result.skipped) == (0, 0) and not result.incomplete
     assert opened == []
     assert not (root / LOCK_FILE_NAME).exists()
+
+
+def test_a_lock_check_that_raised_is_not_read_as_success_later(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception from the lock attempt other than ``_PairLockFailed`` propagates and leaves the
+    check unmade, so a later call tries the lock again rather than reading no failure as success."""
+    attempts: list[str] = []
+
+    @contextlib.contextmanager
+    def _raises(path: Path, **_: Any) -> Iterator[None]:
+        attempts.append("raised")
+        raise RuntimeError("not a lock failure")
+        yield  # pragma: no cover
+
+    @contextlib.contextmanager
+    def _refused_lock(path: Path, **_: Any) -> Iterator[None]:
+        attempts.append("refused")
+        raise uploads_mod._PairLockFailed("refused", PermissionError(errno.EACCES, "denied"))
+        yield  # pragma: no cover
+
+    gate = uploads_mod._ResealLockCheck(tmp_path / LOCK_FILE_NAME)
+    monkeypatch.setattr(uploads_mod, "_pair_lock", _raises)
+    with pytest.raises(RuntimeError):
+        gate.check()
+    monkeypatch.setattr(uploads_mod, "_pair_lock", _refused_lock)
+    assert gate.check() == "refused"
+    assert gate.check() == "refused"
+    assert attempts == ["raised", "refused"]
 
 
 def test_a_refusal_that_comes_back_after_the_lock_was_taken_is_an_error_again(

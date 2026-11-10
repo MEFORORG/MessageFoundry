@@ -660,13 +660,11 @@ class ResealResult:
     #: it is a skip.
     not_regular: int = 0
     #: True when the uploads root could not be listed, as when it is missing or is not a directory,
-    #: so the pass read nothing (BACKLOG #4940). An unmounted volume and a directory never created
+    #: or was gone after the listing, before the pass's first write (BACKLOG #4940). An unmounted volume and a directory never created
     #: both look like this, and the pass cannot tell them apart: read as zero uploads, an unmounted
     #: volume's uploads would stay under the prior key while the run reported success.
     #: ``rotate-key`` refuses such a root before it writes anything, so this is the backstop for one
     #: that goes away mid-run. It is not a skip: ``rotate-key`` aborts on it before its audit roll.
-    #: A root it can list is never missing, empty or not; what that leaves uncaught is in
-    #: docs/PHI.md, at the ``rotate-key`` passage.
     root_missing: bool = False
 
     @property
@@ -3311,9 +3309,8 @@ def _pair_lock_failure(exc: OSError, root: Path) -> _PairLockFailure:
     another holder kept it past the wait. ``gone``: the root is missing (:func:`_root_gone`).
     ``timeout``: the OS timed out (``ETIMEDOUT``), as a network file system can. ``refused``:
     the file system refused this account (``atomic_edit._REFUSED``), such as a lock file another
-    account owns; ``edit_lock`` also raises ``busy_error`` for a lock path planted as a link,
-    chained from the ``ELOOP``, and that is one too, as is what ``_NOT_A_FILE`` names, and a
-    ``FileNotFoundError`` while ``root`` is there. ``failed``: any other error, such as ``EIO`` or
+    account owns; a ``_PairLockBusy`` chained from an ``ELOOP`` is one too, as is what
+    ``_NOT_A_FILE`` names, and a ``FileNotFoundError`` while ``root`` is there. ``failed``: any other error, such as ``EIO`` or
     ``ESTALE`` from a network file system."""
     if isinstance(exc, _PairLockBusy):
         return "refused" if exc.__cause__ is not None else "busy"
@@ -3342,9 +3339,8 @@ class _ResealLockCheck:
     """The re-seal pass's one pair-lock check in the uploads root, made at the first half that
     needs a write and remembered for the rest of the pass. Finding a lock it cannot take per half
     would decrypt and re-encrypt each upload first, then wait out the lock for each write, so once
-    it fails every half that needs a write is a skip and nothing is written. A pass in which no half
-    needs a write never takes the lock, so it creates no lock file: one created by a ``rotate-key``
-    run as root would refuse every later engine removal its lock."""
+    it fails every half that needs a write is a skip and nothing is written. A pass in which every
+    half is already current takes no lock."""
 
     def __init__(self, lock: Path) -> None:
         self._lock = lock
@@ -3358,12 +3354,14 @@ class _ResealLockCheck:
     def check(self) -> _PairLockFailure | None:
         """Take and release the lock the first time, and return why that failed, or None."""
         if not self._checked:
-            self._checked = True
+            # Marked checked only once the attempt ends in a lock taken or a _PairLockFailed. Any
+            # other exception propagates and leaves it unchecked, so it never reads as success.
             try:
                 with _pair_lock(self._lock, for_reseal=True):
                     pass
             except _PairLockFailed as failed:
                 self.failure = failed.kind
+            self._checked = True
         return self.failure
 
 
@@ -3495,8 +3493,8 @@ _NAME_SURROGATE_TAG = 0x20000000
 
 
 def _refuse_a_planted_link(lock: Path) -> None:
-    """Refuse the pair lock file ``lock`` before ``edit_lock`` opens it when it is a link, or on
-    Windows a reparse point that names another path, such as a junction: raises :class:`_PairLockBusy` chained from an
+    """Refuse the pair lock file ``lock`` before ``edit_lock`` opens it when it is a symbolic link
+    or a name-surrogate reparse point: raises :class:`_PairLockBusy` chained from an
     ``ELOOP``, the shape ``edit_lock`` gives a link its ``O_NOFOLLOW`` open refuses, so
     :func:`_pair_lock_failure` reads it as a refusal. Windows has no ``O_NOFOLLOW``, so there
     ``edit_lock`` follows a planted link and creates or locks its target. A link planted after this
