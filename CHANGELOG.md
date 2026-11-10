@@ -23,9 +23,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   MRN or a `password=` value beside one, as in a typed sign-in name, would have reached the tee
   line unredacted. Now each text field holding a C0 control is scrubbed by the same filters
   before it is encoded. Where that finds more than the plain filters, the whole field ships as
-  `[redacted]`, so that record loses its `actor` or `detail`. The `emit_audit_tee` docstring
-  says what is covered and what is left, at least text that needs two controls read
-  differently. (`BACKLOG #3045`)
+  `[redacted]`, so that record loses at least one of its `action`, `actor`, `channel_id`,
+  `client` or `detail`. The line is then held to what the filters hid of the whole record as it
+  was encoded before this change, so it redacts no less than that line did; where it would, the
+  changed fields ship as `[redacted]`. The `emit_audit_tee` docstring says what is covered and
+  what is left, at least text that needs two controls read differently. (`BACKLOG #3045`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 

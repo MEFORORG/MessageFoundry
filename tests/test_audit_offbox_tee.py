@@ -587,6 +587,8 @@ def test_every_c0_control_beside_or_inside_the_text_of_each_field_is_redacted(
         for (code, value, needle), line in zip(keys, lines, strict=True)
         if needle in line and (code not in whitespace or needle not in scrub_log_text(value))
     ]
+    # Non-vacuous: every C0 code point and the control case, in each of the 19 templates.
+    assert len(keys) >= 627
     assert not leaks, leaks
     # The carve-out is not vacuous, and covers only what the plain chain itself misses.
     assert whitespace == {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x1F}
@@ -660,7 +662,17 @@ def _corpus() -> list[str]:
             for code_1, code_2 in ((0x01, 0x01), (0x00, 0x1F), (0x1B, 0x09)):
                 values.append(f"{first.format(c=chr(code_1))} {second.format(c=chr(code_2))}")
     values += [value for value, _needles in _REVIEW_LEAKS]
+    values += list(_BELOW_THE_OLD_LINE)
     return values
+
+
+#: Values the branch's fifth review round measured shipping a word the line before #3045 hid,
+#: through ``configure_logging``: the old line's chain hid them over the whole record, and the
+#: field scrub's own check, the chain over the field alone, did not see it.
+_BELOW_THE_OLD_LINE = (
+    "DOE\x01^\tDOE JANE\nAuthorization:\r\n|\x02Invalid",
+    "McDona\u0000ld",
+)
 
 
 def _before_and_after(
@@ -677,8 +689,27 @@ def _before_and_after(
 
 # An oracle independent of audit_tee's own word and escape patterns, on purpose.
 _WORD = re.compile(r"[A-Za-z0-9]+")
-#: A JSON escape's text, counted as a word break on both sides of the comparison below.
-_ESCAPE_TEXT = re.compile(r"\\u[0-9a-fA-F]{4}|\\.")
+#: A JSON escape's text, counted as a word break on both sides of the comparison below. The run
+#: of backslashes is taken whole, so an escape whose backslash is itself escaped, as ``\\u0001``
+#: is in a JSON ``detail`` on the line, reads as one break. Taking one backslash pair left
+#: ``u0001JANE`` behind as a word, and the comparison then missed ``JANE`` on either side.
+_ESCAPE_TEXT = re.compile(r"\\+(?:u[0-9a-fA-F]{4}|.)", re.DOTALL)
+
+
+def test_the_placeholder_pattern_is_the_two_placeholders() -> None:
+    from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER
+
+    for placeholder in (audit_tee._FIELD_REDACTED, CREDENTIAL_PLACEHOLDER):
+        assert audit_tee._PLACEHOLDERS.fullmatch(placeholder), placeholder
+    assert audit_tee._PLACEHOLDERS.findall("x [redacted] <redacted> y") == [
+        audit_tee._FIELD_REDACTED,
+        CREDENTIAL_PLACEHOLDER,
+    ]
+
+
+def test_the_oracle_reads_a_doubly_escaped_control_as_a_break() -> None:
+    line = json.dumps({"detail": json.dumps({"e": "x\x01JANE"})})
+    assert "JANE" in _WORD.findall(_ESCAPE_TEXT.sub(" ", line))
 
 
 @pytest.mark.parametrize("field", ["actor", "client", "detail", "detail-as-json"])
@@ -688,24 +719,41 @@ def test_the_field_scrub_shows_no_word_the_line_chain_alone_hides(
     """Closing step 3 of BACKLOG #3045: the change redacts no less than the handler chain did on
     its own. Engine PR 2040's first version lost a redaction that way. No word of a value that the
     line hid before may show after, over the sweep and the two-control corpus. Synthetic values."""
-    values = _corpus()
+    hidden_before, shown = _shown_after_hidden_before(field, _corpus(), capsys, monkeypatch)
+    # The control: the line chain alone hides words in this corpus, so the rule is not vacuous.
+    assert hidden_before
+    assert not shown, shown[:20]
+
+
+def _shown_after_hidden_before(
+    field: str, values: list[str] | tuple[str, ...], capsys, monkeypatch
+) -> tuple[int, list[tuple[str, str]]]:
+    """How many words of ``values`` the line before #3045 hid, and each of those the line now
+    shows. The line before is the whole record as that code built it, through the same handler."""
     before, after = _before_and_after(
         [_sweep_case(field, value) for value in values], capsys, monkeypatch
     )
-    before = [_ESCAPE_TEXT.sub(" ", line) for line in before]
-    after = [_ESCAPE_TEXT.sub(" ", line) for line in after]
     hidden_before = 0
     shown = []
     for value, old, new in zip(values, before, after, strict=True):
-        old_words, new_words = set(_WORD.findall(old)), set(_WORD.findall(new))
+        old_words = set(_WORD.findall(_ESCAPE_TEXT.sub(" ", old)))
+        new_words = set(_WORD.findall(_ESCAPE_TEXT.sub(" ", new)))
         for word in _WORD.findall(value):
             if word not in old_words:
                 hidden_before += 1
                 if word in new_words:
                     shown.append((ascii(value), word))
-    # The control: the line chain alone hides words in this corpus, so the rule is not vacuous.
-    assert hidden_before
-    assert not shown, shown[:20]
+    return hidden_before, shown
+
+
+@pytest.mark.parametrize("field", ["actor", "detail", "detail-as-json"])
+def test_the_values_the_fifth_review_measured_hide_no_less_than_before(
+    field: str, capsys, monkeypatch
+) -> None:
+    """Each shipped a word the line before #3045 hid, at e0e567c8ab, in ``detail``: ``DOE`` and
+    ``McDona``. The line is now held to the old line's chain over the whole record. Synthetic."""
+    _hidden, shown = _shown_after_hidden_before(field, _BELOW_THE_OLD_LINE, capsys, monkeypatch)
+    assert not shown, shown
 
 
 @pytest.mark.parametrize(
