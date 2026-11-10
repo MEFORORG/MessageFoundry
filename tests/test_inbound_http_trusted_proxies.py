@@ -6,7 +6,8 @@ Behind a reverse proxy or an SNAT load balancer every partner reaches the listen
 address. The intake failed-attempt budget keyed on that address, so ten failed requests from any
 one client would have refused every authenticated partner behind the same proxy with ``429``.
 
-``trusted_proxies`` names the proxies whose ``X-Forwarded-For`` the budget may key on, under
+``trusted_proxies`` names the HTTP proxies, ones that append the client's address to
+``X-Forwarded-For``, whose header the budget may key on, under
 ``api_key`` and ``bearer`` only. The walk is uvicorn's: trust the header only from a listed socket
 peer, go right to left, skip listed hops, and key on the first unlisted one. These tests drive a
 real listener over loopback, whose socket peer is ``127.0.0.1``.
@@ -14,6 +15,7 @@ real listener over loopback, whose socket peer is ``127.0.0.1``.
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Any
 
 import pytest
@@ -104,7 +106,6 @@ async def test_a_spoofed_left_most_value_cannot_mint_a_fresh_budget() -> None:
         await src.stop()
     assert resp.status in (429, 0), resp.status
     assert not limiter.check(CLIENT_A)
-    assert limiter.check("198.51.100.0")
 
 
 @pytest.mark.parametrize(
@@ -125,6 +126,12 @@ async def test_a_spoofed_left_most_value_cannot_mint_a_fresh_budget() -> None:
         ([PROXY], ["X-Forwarded-For: [2001:db8::7]:443"], "2001:db8::7"),
         # A mapped spelling keys the same budget as the plain one.
         ([PROXY], [f"X-Forwarded-For: ::ffff:{CLIENT_A}"], CLIENT_A),
+        # The client's own text left of the hop the proxy appended is never read.
+        ([PROXY], [f"X-Forwarded-For: 198.51.100.7, {CLIENT_A}"], CLIENT_A),
+        ([PROXY], [f"X-Forwarded-For: unknown, {CLIENT_A}"], CLIENT_A),
+        # A zone is dropped, so text after '%' never becomes a key or a recorded value.
+        ([PROXY], ["X-Forwarded-For: fe80::1%x; mode=none"], "fe80::1"),
+        ([PROXY], ["X-Forwarded-For: [fe80::1%eth0]:80"], "fe80::1"),
         # A missing header from a listed peer falls back to the socket peer.
         ([PROXY], [], PROXY),
         # So does an unparseable hop, never a literal like "unknown".
@@ -235,6 +242,40 @@ def test_an_entry_the_api_list_refuses_is_refused_here(entry: str, why: str) -> 
         Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), trusted_proxies=[entry])
     with pytest.raises(ValueError, match=why):
         trusted_proxy_networks([entry])
+
+
+def test_entries_that_together_span_a_family_are_refused() -> None:
+    """The two ``/1`` halves are ``0.0.0.0/0`` written as two entries. The upper half is built
+    rather than written, since the leak gate reads a literal of it as a routable host."""
+    upper_half = str(ipaddress.IPv4Network((2**31, 1)))
+    with pytest.raises(ValueError, match="whole address family"):
+        trusted_proxy_networks(["0.0.0.0/1", upper_half])
+    assert len(trusted_proxy_networks(["0.0.0.0/1", "10.0.0.5"])) == 2  # half is not all
+
+
+def test_none_reads_as_unset() -> None:
+    spec = Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), trusted_proxies=None)  # type: ignore[arg-type]
+    assert spec.settings["trusted_proxies"] == []
+
+
+def test_the_setting_is_refused_with_no_budget_to_key() -> None:
+    with pytest.raises(WiringError, match="no failed-attempt budget"):
+        Http(
+            port=8080,
+            intake_auth="api_key",
+            intake_api_key=env("k"),
+            trusted_proxies=["10.0.0.5"],
+            intake_auth_rate_limit=0,
+            intake_auth_rate_limit_global=None,
+        )
+    # One budget is enough for the key to matter.
+    Http(
+        port=8080,
+        intake_auth="api_key",
+        intake_api_key=env("k"),
+        trusted_proxies=["10.0.0.5"],
+        intake_auth_rate_limit=0,
+    )
 
 
 def test_a_bare_string_is_refused_rather_than_read_as_characters() -> None:

@@ -3173,14 +3173,15 @@ def Http(
     ``HEAD`` for a load-balancer check, at the cost of an unauthenticated "is MessageFoundry up, and
     where" oracle on a PHI intake socket.
 
-    ``trusted_proxies`` (BACKLOG #5525) names the reverse proxies or load balancers in front of the
-    listener, under ``api_key`` and ``bearer`` only. The failed-attempt budget keys on the socket
-    peer, so behind a proxy every partner shares one budget and one client's failures would ``429``
-    the rest. From a listed peer the budget keys instead on the client address in
-    ``X-Forwarded-For``, walked right to left as uvicorn walks it. Each entry is an address or a
-    network, read by the rules ``[api].trusted_proxies`` follows, but this list is the
-    connection's own. It changes the budget key only: the allowlist, the connection caps and the
-    peer recorded in the audit row and the connection event stay the socket peer.
+    ``trusted_proxies`` (BACKLOG #5525) names the HTTP reverse proxies in front of the listener
+    that append the client's address to ``X-Forwarded-For``, under ``api_key`` and ``bearer``
+    only. The failed-attempt budget keys on the socket peer, so behind a proxy every partner
+    shares one budget and one client's failures would ``429`` the rest. From a listed peer the
+    budget keys instead on the client address in ``X-Forwarded-For``, walked right to left as
+    uvicorn walks it. Each entry is an address or a network, read by the rules
+    ``[api].trusted_proxies`` follows, but this list is the connection's own. At least the
+    allowlist, the connection caps and the peer recorded in the audit row and the connection event
+    stay the socket peer; a refusal records the forwarded address beside it.
     ``docs/CONNECTIONS.md`` has the walk and what it does not cover.
 
     **Synchronous captured-downstream reply (ADR 0154 D4).** Naming ``reply_from`` turns this inbound
@@ -3261,7 +3262,13 @@ def Http(
             "Remove the setting; a control that is configured but never consulted reads as "
             "protection that does not exist"
         )
-    settings["trusted_proxies"] = list(trusted_proxies)
+    if trusted_proxies and not (intake_auth_rate_limit or intake_auth_rate_limit_global):
+        raise WiringError(
+            "Http sets trusted_proxies but both intake_auth_rate_limit and "
+            "intake_auth_rate_limit_global are off, so no failed-attempt budget exists for it to "
+            "key. Set a budget, or remove the setting"
+        )
+    settings["trusted_proxies"] = list(trusted_proxies or ())
     return ConnectionSpec(ConnectorType.HTTP, settings)
 
 

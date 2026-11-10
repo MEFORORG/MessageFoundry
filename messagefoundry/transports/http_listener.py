@@ -56,10 +56,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, assert_never, cast
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import (
+    _classify_proxy_entries,
     _ipv4_meaning,
     _parse_trusted_proxy,
-    _span_wording,
-    _trusts_every_ipv4_host,
 )
 from messagefoundry.credential import (
     OTHERNAMES_INTACT_KEY,
@@ -740,9 +739,10 @@ def trusted_proxy_networks(value: Any) -> tuple[_ProxyNetwork, ...]:
     Each entry is read by ``_parse_trusted_proxy``, the one reader of ``[api].trusted_proxies``,
     so this list refuses the same forms: ``'*'``, an entry uvicorn would read as a literal that
     never matches, and an IPv6 entry with a zone. It does NOT read ``[api].trusted_proxies`` itself:
-    trusting the admin API's proxy says nothing about who fronts a partner intake socket. A range
-    that trusts a whole address family is refused here too, since it is ``'*'`` written as a
-    network. An IPv4-mapped entry is read as the IPv4 range it names, the form
+    trusting the admin API's proxy says nothing about who fronts a partner intake socket. Entries
+    that together trust a whole address family, as ``_classify_proxy_entries`` counts them (two
+    ``/1`` halves included), are refused here too, since that is ``'*'`` written as networks; the
+    ``[api]`` load only warns about those. An IPv4-mapped entry is read as the IPv4 range it names, the form
     :func:`_hop_address` hands the walk, so one proxy matches in either spelling."""
     if value is None:
         return ()
@@ -761,17 +761,19 @@ def trusted_proxy_networks(value: Any) -> tuple[_ProxyNetwork, ...]:
             parsed = _parse_trusted_proxy(entry)
         except ValueError as exc:
             raise ValueError(
-                f"Http trusted_proxies refuses an entry by the rule it shares with "
-                f"[api].trusted_proxies, which reads: {exc}"
+                "Http trusted_proxies refuses an entry by the rule it shares with "
+                "[api].trusted_proxies. That rule's message follows; its remarks about uvicorn "
+                f"and [security] concern the API only: {exc}"
             ) from exc
-        network = _ipv4_meaning(ipaddress.ip_network(parsed))
-        if network.prefixlen == 0 or _trusts_every_ipv4_host(network):
-            raise ValueError(
-                f"Http trusted_proxies entry {entry!r} trusts a whole address family, so any "
-                f"client could choose its own failed-attempt budget. {_span_wording(network)} "
-                "List the reverse proxy's exact address(es) instead."
-            )
-        networks.append(network)
+        networks.append(_ipv4_meaning(ipaddress.ip_network(parsed)))
+    whole_family, _ = _classify_proxy_entries(value)
+    if whole_family:
+        raise ValueError(
+            f"Http trusted_proxies entries {', '.join(whole_family)} together trust a whole "
+            "address family, as the refused '*' does, so every client would count as a proxy "
+            "and could choose its own failed-attempt budget key. List the reverse proxy's exact "
+            "address(es) instead."
+        )
     return tuple(networks)
 
 
@@ -780,8 +782,9 @@ def _hop_address(text: str) -> _HopAddress | None:
 
     Reads a bare address, ``a.b.c.d:port``, ``[v6]`` and ``[v6]:port``, the forms uvicorn's walk
     reads. Anything else, ``unknown`` and an empty hop included, is ``None`` and never becomes a
-    budget key. An IPv4-mapped address is read as its IPv4 address, so a client keys one budget
-    whichever spelling a dual-stack proxy writes."""
+    budget key. An IPv6 zone is dropped, as ``netaddr`` drops it from a socket peer, so the key and
+    the recorded address never carry text after a ``%``. An IPv4-mapped address is read as its
+    IPv4 address, so a client keys one budget whichever spelling a dual-stack proxy writes."""
     host = text.strip(" \t")
     if host.startswith("["):
         inner, closed, rest = host[1:].partition("]")
@@ -796,8 +799,11 @@ def _hop_address(text: str) -> _HopAddress | None:
         address = ipaddress.ip_address(host)
     except ValueError:
         return None
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-        return address.ipv4_mapped
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.scope_id is not None:
+            address = ipaddress.IPv6Address(int(address))
+        if address.ipv4_mapped is not None:
+            return address.ipv4_mapped
     return address
 
 
@@ -979,8 +985,8 @@ class HttpSource(SourceConnector):
         self.intake_auth_health: str = str(s.get("intake_auth_health") or "require")
         #: The reverse proxies whose ``X-Forwarded-For`` the failed-attempt budget may key on, under
         #: ``api_key`` and ``bearer`` only (BACKLOG #5525). Empty, the default, keys on the socket
-        #: peer as before. Nothing else on this listener reads it: the allowlist, the connection
-        #: caps and the audit and event peer column all stay on the socket peer.
+        #: peer as before. At least the allowlist, the connection caps and the audit and event peer
+        #: column stay on the socket peer; a refusal adds the forwarded address beside it.
         self._trusted_proxies: tuple[_ProxyNetwork, ...] = trusted_proxy_networks(
             s.get("trusted_proxies")
         )
@@ -1524,13 +1530,18 @@ class HttpSource(SourceConnector):
         peer = _hop_address(peer_host)
         if peer is None or not self._is_trusted_proxy(peer):
             return None
-        for hop in reversed(head.forwarded_header.split(",")):
+        # rpartition, not split: the walk usually stops at the right-most hop, and a client behind
+        # the proxy may pad the header up to max_header_bytes.
+        remaining = head.forwarded_header
+        while True:
+            remaining, more, hop = remaining.rpartition(",")
             address = _hop_address(hop)
             if address is None:
                 return None
             if not self._is_trusted_proxy(address):
                 return str(address)
-        return None
+            if not more:
+                return None
 
     def _is_trusted_proxy(self, address: _HopAddress) -> bool:
         # A network of the other IP version never contains an address, so no spelling crosses over.
