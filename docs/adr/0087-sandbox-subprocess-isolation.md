@@ -386,13 +386,20 @@ target, no `pickle` import left to mis-suppress:
   >   writer chooses what the broker runs, the parent writes a reply the worker did not ask for, and
   >   the expected sequence moves on, so the worker's own next lookup or request can then fail. So in
   >   that window the later dispatch does not resolve as `mode=off` does, a case the SHALL above does
-  >   not except. A forged answer that carries the request's id can do worse: a forged `ok` answer,
-  >   with the worker's own answer not yet queued at the check after it, is consumed as the result,
-  >   the worker is kept and the call does not fail, so none of the SHALL's three clauses holds for
-  >   it. A forged `denied` or `failed` answer that carries the id is taken as the answer too: the
-  >   message dead-letters with the writer's error text, and the worker is kept. The owner accepted
-  >   two of these cases as recorded deviations, each only in the scope its record gives; *Owner
-  >   acceptances* below cites both records and names deviations that neither covers. Only a writer that knows the
+  >   not except. A forged answer that carries the request's id can do worse. **The condition for
+  >   every forged-answer case in this bullet:** the worker's own answer is not yet queued when
+  >   `_reject_unsolicited(..., "after")` runs, right after the forged answer is read. If it is
+  >   queued by then, that check kills the worker and the call fails with the unsolicited-frame
+  >   error, whatever the forged answer said. Under that condition, the outcome depends on the
+  >   answer's kind; the wire grammar has `ok` and the fail kinds `denied`, `error` and `memory`. A
+  >   forged `ok` answer is consumed as the result, the worker is kept and the call does not fail,
+  >   so none of the SHALL's three clauses holds for it. A forged `denied` or `error` answer is
+  >   taken as the answer too: the message dead-letters with the writer's error text, and the worker
+  >   is kept. A forged `memory` answer kills the worker and records a `MEMORY_CAP` kill cause for a
+  >   memory cap that was never hit, and the message dead-letters as having run out of memory. The
+  >   owner accepted two of these cases as recorded deviations, each only in the scope its record
+  >   gives; *Owner acceptances* below cites both records and names deviations that neither covers.
+  >   Only a writer that knows the
   >   request's id can carry it: at least a grandchild or same-UID process that read the request (the
   >   grandchild residual below), and code running in the worker (the residual on one Handler not
   >   confined from another). One that arrives after that call's answer meets that call's own check
@@ -414,20 +421,31 @@ target, no `pickle` import left to mis-suppress:
   > of the over-cap bullet, and the pointer to the owner acceptances.
   >
   > **Owner acceptances 2026-11-10.** The owner accepted two cases as recorded deviations from the
-  > SHALL above, each until a fix row narrows or closes it. The fix rows are to be filed.
+  > SHALL above, each until a fix narrows or closes it. The fixes are tracked as steps on
+  > BACKLOG #3135 (ledger ruling R2).
   >
   > - **Record d20261110T144543956-d8f55a:** a stray frame that arrives after a call's check before
   >   its request and ahead of its answer dead-letters that message.
   > - **Record d20261110T165507353-b70f7b:** a grandchild that inherits the worker's request pipe
   >   (fd 0) can read a later request's id and forge an answer that the engine accepts as that
-  >   message's result. This falls under this ADR's no-confinement residual, until a fix row closes
-  >   the fd-0 path. The bullet above gives the condition under which the engine accepts it.
+  >   message's result. This falls under this ADR's no-confinement residual, until a fix closes
+  >   the fd-0 path. The condition under which the engine accepts such an answer is the one in
+  >   bold, *The condition for every forged-answer case in this bullet*, in this amendment's bullet
+  >   *A frame that arrives later meets at least these outcomes*.
   >
-  > At least these deviations above are named in neither record, so neither accepts them: a forged answer
-  > from a same-UID process that opened the worker's `/proc/<pid>/fd/0`, or from code running in the
-  > worker, and the `mode=isolated` lookup in that window.
-  > Closing the fd-0 path alone does not stop a surviving grandchild on Linux from reaching a later
-  > worker through `/proc`, as the grandchild residual says.
+  > *The Manager's 2026-11-10 reading of the code, not the owner's words:* at least these
+  > deviations are named in neither record. Each is not accepted by either owner record, and each
+  > is tracked as a step on BACKLOG #3135.
+  >
+  > - A forged answer from a same-UID process that opened the worker's `/proc/<pid>/fd/0`.
+  > - A forged answer from code running in the worker.
+  > - The `mode=isolated` lookup in that window.
+  > - A forged `memory` answer, which records a `MEMORY_CAP` kill cause that never happened.
+  > - A partial read of fd 0 plus a forged `ok` answer, which desyncs the next message.
+  >
+  > *Also the Manager's 2026-11-10 reading:* closing the fd-0 path alone does not stop a surviving
+  > grandchild on Linux from reaching a later worker through `/proc`, as the grandchild residual
+  > says.
   → `tests/test_sandbox.py::test_a_desynced_or_forged_response_is_rejected`,
   `tests/test_sandbox.py::test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`,
   `tests/test_sandbox.py::test_a_dead_peer_is_not_treated_as_a_forged_frame`,

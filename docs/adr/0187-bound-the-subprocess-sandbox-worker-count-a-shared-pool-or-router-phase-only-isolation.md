@@ -419,7 +419,7 @@ argument above stands for every fault that does kill.
   > raises in at least the cases *Amendment B* lists. `test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`
   > was changed to pin that. A request outside the codec grammar still raises, and keeps the worker.
   >
-  > *Added 2026-11-10, not part of the ruling:* at least one forged frame does not raise. A forged `ok` answer that carries the request's id, with the worker's own answer not yet queued at the check after it, does not raise; see [ADR 0087](0087-sandbox-subprocess-isolation.md) AC-10, which says which cases the owner accepted.
+  > *Added 2026-11-10, not part of the ruling:* at least one forged frame does not raise: a forged `ok` answer that carries the request's id. [ADR 0087](0087-sandbox-subprocess-isolation.md) AC-10's 2026-11-09 amendment states the condition under which it does not raise, and holds the owner acceptances, which are scoped to ADR 0087 AC-10.
 
 ## Consequences
 
