@@ -1614,7 +1614,31 @@ class RevokeSealOutcome:
         (``user_id``), a session by its 12-character ref (``session``), never a token hash.
 
         A held Outage is paged here first, after the commit, with its own text (decision
-        d20261110T004916856-814db8, Q5); it writes no audit row, as before."""
+        d20261110T004916856-814db8, Q5); it writes no audit row, as before.
+
+        **A cancel cannot drop a page.** The revoke has committed, so the loop runs as a task
+        awaited through :func:`asyncio.shield`, and awaited again after each cancel, as
+        ``auth/service.py``'s ``_write_through_cancellation`` runs a refused sign-in's rows; the
+        cancel is re-raised once every row is written and every page sent."""
+        task = asyncio.ensure_future(self._report(record_audit))
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Recorded first, so a cancel landing in the turn the loop ends is still raised.
+                cancelled = True
+        if cancelled:
+            if not task.cancelled() and task.exception() is not None:
+                log.error(
+                    "a revoke's seal report failed while its caller was cancelled",
+                    exc_info=task.exception(),
+                )
+            raise asyncio.CancelledError
+        task.result()
+
+    async def _report(self, record_audit: Callable[..., Awaitable[object]]) -> None:
+        """:meth:`report`'s body, run to completion under its shield."""
         outages, self.outages = self.outages, []
         if self.pager is not None:
             for what in outages:
@@ -19325,14 +19349,17 @@ class MessageStore:
         names, the revoke that called this goes ahead without the raise and reports none: ending
         sessions needs no key, and refusing the revoke would keep them live.
 
-        Not every such account is refused on every read (SDS-3.7, decision
-        d20261109T200352805-599b24 item 6). A Forged or Unverifiable record is. An Outage is not:
-        a read whose Holds answer the Transit sealer cached within
-        :data:`~messagefoundry.store.row_seal.TRANSIT_SEAL_CACHE_TTL_SECONDS` is served without
-        calling Transit, and a read after Transit recovers is served as usual. So after an Outage
-        the account may still be read, its sessions are ended here, and the epoch raise that
-        would stop an older copy of a session row resolving is missing until the owed raise is
-        built (ADR 0217 (b))."""
+        **Residual: an account whose raise went without may later be read as Holds, with its epoch
+        never raised** (SDS-3.7, decision d20261109T200352805-599b24 item 6). Only a Forged
+        record answers the same way on every later read. An Unverifiable answer can change: the
+        Transit sealer caches it only for
+        :data:`~messagefoundry.store.row_seal.TRANSIT_SEAL_CACHE_TTL_SECONDS` and drops it when
+        the probe version moves, and a Transit node that lagged a key rotation answers Holds once
+        it catches up. An Outage can change too: a Holds answer cached within that TTL is served
+        without calling Transit, and a read after Transit recovers is served as usual. In each of
+        those cases the account is read again, its sessions were ended here, and the epoch raise
+        that would stop an older copy of a revoked session row from resolving is missing. Nothing
+        compensates for it until the owed raise is built (ADR 0217 (b))."""
         return await raise_account_epoch(
             lambda bump: self._write_user(user_id, bump), outcome, user_id
         )

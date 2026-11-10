@@ -9578,7 +9578,8 @@ class PostgresStore:
         """Raise the account's session epoch through the write helper, inside ``conn``'s
         transaction (BACKLOG #2592), and report the raise (BACKLOG #4975); store.py's
         ``MessageStore._bump_session_epoch`` says why a seal refusal does not stop the revoke that
-        called this, and reports no raise, and why an Outage is not refused on every read."""
+        called this, and reports no raise, and the residual that leaves for an account read as
+        Holds later."""
         return await raise_account_epoch(
             lambda bump: self._write_user(conn, user_id, bump),
             outcome,

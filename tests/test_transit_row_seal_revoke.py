@@ -849,3 +849,41 @@ async def test_an_outage_revoke_that_fails_before_its_commit_pages_its_own_text(
     finally:
         del store._commit
         await store.close()
+
+
+async def test_a_cancel_after_the_commit_drops_no_page() -> None:
+    """``report`` runs after the revoke has committed. A cancel that lands while the first held
+    refusal's audit row is waiting still lets every row be written and every page be sent, held
+    Outage included, then re-raises the cancel (decision d20261110T004916856-814db8, Q5)."""
+    import asyncio
+
+    from messagefoundry.store.row_seal import SealPager
+    from messagefoundry.store.store import RevokeSealOutcome, _RevokeSealRefusal
+
+    seen: list[str] = []
+    pager = SealPager()
+    pager.arm(lambda subject, reason: seen.append(subject))
+    outcome = RevokeSealOutcome(pager)
+    outcome.outages.append("an account's session epoch raise")
+    outcome.refusals.extend(
+        [_RevokeSealRefusal(True, "user", "u-1", 2, 3), _RevokeSealRefusal(False, "user", "u-2")]
+    )
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+    written: list[str] = []
+
+    async def slow_audit(action: str, **_kwargs: Any) -> None:
+        if not written:
+            waiting.set()
+            await release.wait()
+        written.append(action)
+
+    task = asyncio.ensure_future(outcome.report(slow_audit))
+    await waiting.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(written) == 2
+    assert len(seen) == 3  # the Outage, then one page per held refusal
