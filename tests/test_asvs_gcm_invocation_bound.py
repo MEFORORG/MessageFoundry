@@ -49,10 +49,12 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.gcm_bound import (
     GCM_RESERVE_BLOCK,
+    SETTLE_WAIT_SECONDS,
     bounded_cipher,
     checkpoint_invocations,
     settle_at_close,
 )
+from messagefoundry.store.store import _writer_guard
 
 #: A synthetic placeholder body. enqueue_ingress stores the raw str verbatim (no parsing),
 #: so no real-shaped HL7 - and no temptation toward real PHI - is needed in this suite.
@@ -651,23 +653,45 @@ async def test_two_overlapping_settlements_refund_the_reserve_once(tmp_path: Pat
     assert await _persisted(db, cipher.invocation_key_id) == spent
 
 
-async def test_a_writer_queued_ahead_of_the_close_lands_and_is_counted(tmp_path: Path) -> None:
-    """The SQLite close settles under the writer lock, so a write already queued for it runs
-    first, encrypts, commits and is in the settled total, rather than meeting a closed bound."""
+async def test_a_writer_holding_the_lock_at_close_lands_and_is_counted(tmp_path: Path) -> None:
+    """The SQLite close settles under the writer lock, so a write that holds it when the close
+    begins finishes, encrypts, commits and is in the settled total, rather than meeting a closed
+    bound. Driven by events, not sleeps: the write is parked inside the lock until the close is
+    waiting for it."""
     db = tmp_path / "queued.db"
     store, cipher = await _keyed_store(db)
-    await store._lock.acquire()
-    write = asyncio.ensure_future(store.enqueue_ingress(channel_id="c", raw=_MSG.format(i=1)))
+    inside, release = asyncio.Event(), asyncio.Event()
+    real_add = store._add_cipher_invocations_locked
+
+    async def _write() -> None:
+        async with _writer_guard(store._db, store._lock):
+            inside.set()
+            await release.wait()
+            cipher.encrypt("held")  # a writer sealing a value under the lock
+
+    async def _add(add_key: str, count: int) -> int:
+        settled.append(count)
+        return await real_add(add_key, count)
+
+    settled: list[int] = []
+    store._add_cipher_invocations_locked = _add  # type: ignore[method-assign, assignment]
+    write = asyncio.ensure_future(_write())
     close: asyncio.Future[None] | None = None
     try:
-        await asyncio.sleep(0.02)
+        await asyncio.wait_for(inside.wait(), 10)
         close = asyncio.ensure_future(store.close())
-        await asyncio.sleep(0.02)
-        assert not write.done() and not close.done(), "the control: both wait on the lock"
-    finally:
-        store._lock.release()
+        await asyncio.sleep(0)
+        assert not close.done(), "the control: the close waits for the held lock"
+        release.set()
         await asyncio.wait_for(write, 10)
-        await asyncio.wait_for(close if close is not None else store.close(), 10)
+    finally:
+        release.set()
+        try:
+            if not write.done():
+                await asyncio.wait_for(write, 10)
+        finally:
+            await asyncio.wait_for(close if close is not None else store.close(), 10)
+    assert settled, "the close settled under the lock once the write released it"
     assert await _persisted(db, cipher.invocation_key_id) == cipher._invocations
 
 
@@ -684,7 +708,69 @@ async def test_a_writer_lock_held_past_the_wait_closes_the_bound_unsettled(
     finally:
         store._lock.release()
     assert cipher.invocation_bound_closed
-    assert any("closed unsettled" in r.getMessage() for r in caplog.records)
+    assert any("without refunding" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_close_that_times_out_refunds_nothing_and_charges_an_overspend(
+    tmp_path: Path,
+) -> None:
+    """Past the settle's wait the bound closes with no refund, an over-count of at most a block,
+    and an overspent reserve is still charged once the writer frees: never an under-count."""
+    db = tmp_path / "overspent.db"
+    store, cipher = await _keyed_store(db)
+    key_id = cipher.invocation_key_id
+    reserved = await store.cipher_invocations(key_id)
+    # Spend the whole reserve and 5 more, as a refill that fell behind would leave it.
+    cipher.grant_invocations(-cipher._reserve_remaining - 5, reserved)
+    await store._lock.acquire()
+    close = asyncio.ensure_future(store.close())
+    try:
+        await asyncio.sleep(SETTLE_WAIT_SECONDS * 3)
+        assert cipher.invocation_bound_closed and not close.done()
+    finally:
+        store._lock.release()
+        await asyncio.wait_for(close, 10)
+    assert await _persisted(db, key_id) == reserved + 5
+
+
+async def test_a_close_that_times_out_with_an_unspent_reserve_keeps_the_block(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "unspent.db"
+    store, cipher = await _keyed_store(db)
+    key_id = cipher.invocation_key_id
+    reserved = await store.cipher_invocations(key_id)
+    assert cipher._reserve_remaining > 0, "the control: part of the block is unspent"
+    await store._lock.acquire()
+    try:
+        await asyncio.wait_for(store.close(), 10)
+    finally:
+        store._lock.release()
+    assert await _persisted(db, key_id) == reserved, "no refund: an over-count, never under"
+
+
+async def test_failed_opens_refund_their_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An open that fails after it reserved its block refunds it in its cleanup close, so a
+    crash-looping open does not walk the key toward its ceiling with nothing encrypted."""
+    from messagefoundry.store import store as store_module
+
+    db = tmp_path / "loop.db"
+    store, cipher = await _keyed_store(db)
+    await store.close()
+    key_id = cipher.invocation_key_id
+    before = await _persisted(db, key_id)
+
+    async def _refuse(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("PROBE: the open failed after its reservation")
+
+    monkeypatch.setattr(store_module, "load_audit_chain", _refuse)
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="PROBE"):
+            await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+    monkeypatch.undo()
+    assert await _persisted(db, key_id) == before
 
 
 async def test_a_failed_open_leaves_a_live_handle_s_bound_open(
