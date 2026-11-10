@@ -1930,3 +1930,46 @@ async def test_a_refused_upload_read_through_a_route_alerts_without_promising_a_
         assert "unsealed for good, an operator may delete it" in reason
         assert "docs/PHI.md section 3 names at least some kinds neither can remove" in reason
         assert "until" not in reason and "acme" not in reason and fid not in reason
+
+
+async def test_a_lone_field_value_on_an_upload_browse_is_refused(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #6700: browse_uploaded_file ran make_spec only beside content or field_path, so a
+    lone field_value was dropped and the whole file came back as though filtered. Control: beside a
+    field path the same value filters to the one matching message."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        up = await c.post(
+            "/uploads", files={"file": ("acme.hl7", BATCH, "application/octet-stream")}, headers=h
+        )
+        assert up.status_code == 200, up.text
+        fid = up.json()["file_id"]
+        lone = await c.post(
+            f"/uploads/{fid}/messages/search", json={"field_value": "MRN123"}, headers=h
+        )
+        assert lone.status_code == 400, lone.text
+        assert "field_value needs an HL7 field path" in lone.json()["detail"]
+        ok = await c.post(
+            f"/uploads/{fid}/messages/search",
+            json={"field_path": "PID-3", "field_value": "MRN123"},
+            headers=h,
+        )
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["matched"] == 1
+        # A blank field_value is not a needle, so the browse stays an unfiltered one.
+        blank = await c.post(
+            f"/uploads/{fid}/messages/search", json={"field_value": "   "}, headers=h
+        )
+        assert blank.status_code == 200, blank.text
+        assert blank.json()["matched"] == 2
+        # A content of only spaces is refused, as on origin/main: it must not browse the whole
+        # file as though it had filtered it.
+        spaces = await c.post(f"/uploads/{fid}/messages/search", json={"content": "   "}, headers=h)
+        assert spaces.status_code == 400, spaces.text
