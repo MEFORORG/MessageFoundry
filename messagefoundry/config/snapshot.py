@@ -286,8 +286,8 @@ class ConfigSnapshot:
 
         Raises :class:`NotInSnapshot` for a path the snapshot does not cover. Raises ``OSError``
         where the bytes cannot stand for the file now: the snapshot could not read it or its
-        folder, read a file that is gone now, or read no file by its name while one is there now,
-        created since. The caller refuses then; the values are read again on the next reload."""
+        folder (for ``environments/``, the config directory too), read a file that is gone now,
+        or read no file by its name while one is there now, created since. The caller refuses then; the values are read again on the next reload."""
         value_file = Path(path)
         folder = self._folder_of(value_file)
         if folder is None:

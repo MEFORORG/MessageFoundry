@@ -345,15 +345,16 @@ async def _engine(
         )
     else:
         store = await MessageStore.open(tmp_path / "dc.db")
+    if env_values_provider is None:
+        env_values_provider = _environment_values_reader(
+            base_dir=tmp_path, dir_name="environments", environment="dev"
+        )
     return Engine(
         store,
         poll_interval=0.02,
         config_dir=cfg,
         egress_settings=EgressSettings(deny_by_default=False),
-        env_values_provider=env_values_provider
-        or _environment_values_reader(
-            base_dir=tmp_path, dir_name="environments", environment="dev"
-        ),
+        env_values_provider=env_values_provider,
     )
 
 
@@ -665,32 +666,53 @@ async def test_an_ungated_reload_refuses_a_value_file_it_cannot_read(
         await engine.stop()
 
 
+# --- an ungated reload with no snapshot ----------------------------------------------------------
+
+
 @pytest.mark.parametrize("winerror", [53, 67])
+@pytest.mark.parametrize("provider", ["serve", "embedder"])
 async def test_an_ungated_reload_with_no_snapshot_refuses_a_value_file_on_a_lost_share(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int, provider: str
 ) -> None:
-    """Vault BACKLOG #5120 step 1. With no snapshot, an ungated reload reads the value file from
-    disk. Where the share holding it is lost, ``Path.is_file`` answers ``False`` with nothing
-    raised, so the reload went through with no file's values and every env() default applied."""
+    """Vault BACKLOG #5120 step 1. Where a reload's snapshot cannot be read whole it is None, and an
+    ungated reload then reads the value file from disk: ``serve``'s provider for want of a
+    snapshot, an embedder's because it reads disk always. Where the share holding the file is
+    lost, ``Path.is_file`` answers ``False`` with nothing raised, so the reload went through with no
+    file's values and every env() default applied."""
     from messagefoundry.config.environments import load_environment_values
     from messagefoundry.pipeline import engine as engine_module
     from tests._share_fault import _share_fault
 
     cfg, value_file = _layout(tmp_path)
 
-    def _provider() -> dict[str, Any]:
-        # An embedder's provider: not a SnapshotEnvValuesProvider, so the engine wraps its fault.
+    def _embedder() -> dict[str, Any]:
+        # Not a SnapshotEnvValuesProvider, so the engine wraps its fault in its own refusal.
         return load_environment_values(
             base_dir=tmp_path, dir_name="environments", environment="dev", environ={}
         )
 
-    engine = await _engine(tmp_path, cfg, keyed=False, env_values_provider=_provider)
+    engine = await _engine(
+        tmp_path,
+        cfg,
+        keyed=False,
+        env_values_provider=_embedder if provider == "embedder" else None,
+    )
+    refusal = (
+        "could not read environment values from"
+        if provider == "serve"
+        else "could not re-read this environment's values for the reload"
+    )
     try:
         approved_values = {"host": "approved.example.invalid"}
         await engine.reload_detail(dry_run=False)
         assert cast(Any, engine)._env_values == approved_values
         runner = engine.registry_runner
 
+        # serve's provider vets the file's access list first. That vet is not under test here,
+        # so it passes, and the refusal is the read's own.
+        monkeypatch.setattr(
+            "messagefoundry.config.wiring.assert_trusted_start_paths", lambda *_a, **_k: None
+        )
         # The share is lost: no stat reaches the file, and an existence test finds nothing there.
         value_file.unlink()
         real_stat = Path.stat
@@ -702,7 +724,7 @@ async def test_an_ungated_reload_with_no_snapshot_refuses_a_value_file_on_a_lost
 
         monkeypatch.setattr(Path, "stat", _stat)
 
-        # And the reload's snapshot cannot be read whole, so it is None and the provider reads disk.
+        # And the reload's snapshot cannot be read whole, so it is None.
         def _unreadable(*_a: Any, **_k: Any) -> Any:
             raise OSError(errno.EIO, "the config directory could not be read whole")
 
@@ -717,9 +739,7 @@ async def test_an_ungated_reload_with_no_snapshot_refuses_a_value_file_on_a_lost
 
         monkeypatch.setattr(Engine, "_reload_snapshot", _record)
 
-        with pytest.raises(
-            WiringError, match="could not re-read this environment's values for the reload"
-        ):
+        with pytest.raises(WiringError, match=refusal):
             await engine.reload_detail(dry_run=False)
         assert snapshots == [None]
         assert engine.registry_runner is runner
