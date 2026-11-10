@@ -2571,23 +2571,33 @@ def test_a_second_spawn_over_a_live_worker_is_refused(graph: tuple[Registry, str
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX process-group reap")
-def test_a_worker_reaped_elsewhere_never_has_its_pid_group_signalled(
-    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize("pid_now", ["free", "reused"])
+def test_a_worker_reaped_elsewhere_has_its_group_signalled_only_while_its_pid_is_free(
+    graph: tuple[Registry, str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    pid_now: str,
 ) -> None:
-    """A worker that something else reaped may have its pid reused, so the reap must not signal
-    that pid's group: it skips the group kill and says so at WARNING.
+    """A worker that something else reaped never has its pid's group signalled unread: the reap
+    goes through :func:`proctree.kill_reaped_leader_group`, which signals the old group while the
+    pid names no live process and refuses, with a WARNING naming the inbound, once it names one.
 
     POSIX-only, so NOT RUN on the Windows host this was written on. FALSIFICATION: drop the
     ``_posix_child_state`` check from :func:`_reap_process_tree`, and ``kill_process_group`` is
     called with the reaped pid."""
     _, config_dir = graph
     session = _session(config_dir)
-    signalled: list[int] = []
-    real_kill_group = proctree.kill_process_group
+    unread: list[int] = []
+    killpg_calls: list[int] = []
+    real_killpg = os.killpg
 
-    def _spy(pid: int, **kwargs: Any) -> bool:
-        signalled.append(pid)
-        return real_kill_group(pid, **kwargs)
+    def _spy_unread(pid: int, **kwargs: Any) -> bool:
+        unread.append(pid)
+        return False
+
+    def _spy_killpg(pgid: int, sig: int) -> None:
+        killpg_calls.append(pgid)
+        real_killpg(pgid, sig)
 
     try:
         session._spawn("transform")
@@ -2595,11 +2605,21 @@ def test_a_worker_reaped_elsewhere_never_has_its_pid_group_signalled(
         assert proc is not None
         os.kill(proc.pid, signal.SIGKILL)
         os.waitpid(proc.pid, 0)  # reaped behind the session's back; Popen does not know
-        monkeypatch.setattr(proctree, "kill_process_group", _spy)
+        monkeypatch.setattr(proctree, "kill_process_group", _spy_unread)
+        monkeypatch.setattr(os, "killpg", _spy_killpg)  # the module proctree calls
+        if pid_now == "reused":
+            monkeypatch.setattr(os, "getpgid", lambda pid: pid)  # a live process has it
         caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
         session.close()
-        assert signalled == []
-        assert any("is not signalled" in r.getMessage() for r in caplog.records)
+        assert unread == []
+        refused = [r for r in caplog.records if "is not signalled" in r.getMessage()]
+        if pid_now == "reused":
+            assert killpg_calls == []
+            assert len(refused) == 1
+            assert refused[0].args == ("IB_T", proc.pid)
+        else:
+            assert killpg_calls == [proc.pid]
+            assert refused == []
     finally:
         monkeypatch.undo()
         session.close()
@@ -2613,7 +2633,7 @@ def test_a_fresh_worker_exited_before_its_eof_is_queued_is_respawned(
     served rather than dead-lettered as a write failure or a crash.
 
     FALSIFICATION: return the fresh worker from ``_live_worker`` without probing its exit, and the
-    request goes to a dead worker: the dispatch raises, recorded as ``request_write`` or ``crash``."""
+    request goes to a dead worker: the dispatch raises, recorded under another cause such as ``request_write``."""
     registry, config_dir = graph
     session = _session(config_dir)
     real_spawn = session._spawn
@@ -2640,7 +2660,7 @@ def test_a_fresh_worker_exited_before_its_eof_is_queued_is_respawned(
         assert session.kill_counts == {KillCause.EXITED_AFTER_BOOT: 1}
         # A self-exit, so its line does not say the engine killed it.
         [line] = _kill_warnings(caplog)
-        assert "exited on its own" in line.getMessage()
+        assert "sandbox worker exited during" in line.getMessage()
     finally:
         monkeypatch.undo()
         session.close()

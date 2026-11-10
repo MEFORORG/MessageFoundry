@@ -261,9 +261,10 @@ _RUNNER_ALERTED: Final = frozenset({KillCause.GRAPH_MISMATCH})
 
 #: A kill's line, and the line for a cause in :data:`_SELF_EXITS`.
 _KILL_LINE: Final = "inbound %r: sandbox worker killed during %s (cause=%s)"
-_SELF_EXIT_LINE: Final = "inbound %r: sandbox worker exited on its own during %s (cause=%s)"
+_SELF_EXIT_LINE: Final = "inbound %r: sandbox worker exited during %s (cause=%s)"
 #: The causes recorded only once the worker is seen to have exited, so its WARNING says it exited
-#: rather than that it was killed. A crash or a boot exit is recorded only when the worker exits
+#: rather than that the engine killed it. The exit may still be a signal from outside the engine,
+#: such as the kernel's OOM killer. A crash or a boot exit is recorded only when the worker exits
 #: within the EOF grace (see :func:`_eof_cause_within`).
 _SELF_EXITS: Final = frozenset({KillCause.BOOT_EXIT, KillCause.EXITED_AFTER_BOOT, KillCause.CRASH})
 
@@ -782,13 +783,19 @@ def _assign_kill_on_close_job(proc: subprocess.Popen[bytes]) -> int | None:
     return proctree.kill_on_close_job(handle, who="sandbox")
 
 
-def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None) -> None:
-    """Kill the worker AND every process it spawned.
+def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None, inbound: str) -> None:
+    """Kill the worker AND every process it spawned, as far as can be done safely.
 
     Windows: terminate the kill-on-close job the worker was assigned to (falling back to a
     single-process kill when none was assigned). POSIX: ``SIGKILL`` the worker's own process group,
     which ``start_new_session=True`` made it the leader of — guarded on ``pgid == proc.pid`` so this
-    only ever signals the worker's own group and never the caller's (e.g. the engine/pytest group)."""
+    only ever signals the worker's own group and never the caller's (e.g. the engine/pytest group).
+
+    A POSIX worker that something other than this session already reaped is the exception (vault
+    BACKLOG #3135): its group is signalled only through
+    :func:`proctree.kill_reaped_leader_group`, which refuses when the pid may name another process
+    now. A refusal writes a WARNING naming ``inbound``, and a process the worker started may then
+    survive."""
     if sys.platform == "win32":
         if job is not None:
             proctree.terminate_job(job)
@@ -796,19 +803,19 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None) -> None:
             _kill_single(proc)
         return
     if _posix_child_state(proc) == "reaped":
-        # Something reaped the worker before this did, so its pid may name another process by
-        # now, and ``kill_process_group`` would signal that process's group.
-        # ``started_as_leader=True`` is no better: it signals ``pid``'s group unread. So nothing is
-        # signalled, and a grandchild still in the worker's group may survive (vault BACKLOG
-        # #3135). A running or zombie child's pid cannot have been given to another process. The
-        # check cannot see a pid reaped elsewhere and then reused by another child of this engine,
-        # which needs a reaper of every child, such as ``waitpid(-1)``, and the engine runs none.
-        log.warning(
-            "sandbox worker pid %d was reaped before its process group was, so the group is not "
-            "signalled: that pid may name another process now, and a process the worker started "
-            "may survive",
-            proc.pid,
-        )
+        # Reaped by something else, or by the kernel under ``SIGCHLD`` set to ``SIG_IGN``. A
+        # running or zombie child's pid cannot have been given to another process, so only this
+        # state needs the reuse-safe signal. The state check cannot see a pid reaped elsewhere
+        # and then reused by another child of this engine, which needs a reaper of every child,
+        # such as ``waitpid(-1)``, and the engine runs none.
+        if proctree.kill_reaped_leader_group(proc.pid) is None:
+            log.warning(
+                "inbound %r: sandbox worker pid %d was reaped elsewhere and the pid may name "
+                "another process now, so its process group is not signalled, and a process the "
+                "worker started may survive",
+                inbound,
+                proc.pid,
+            )
         return
     if not proctree.kill_process_group(proc.pid):
         _kill_single(proc)
@@ -1210,7 +1217,7 @@ class SandboxSession:
         # closing a file object under a mid-read thread raises ``ValueError``, which is not what either
         # drain's ``except OSError`` catches, so it would escape into ``threading.excepthook``. The
         # shutdown-only bounded join lives in :meth:`close`.
-        _reap_process_tree(proc, self._job)
+        _reap_process_tree(proc, self._job, self._inbound)
         self._job = None
         try:  # noqa: SIM105
             proc.wait(timeout=5)
@@ -1351,8 +1358,8 @@ class SandboxSession:
         A worker spawned here and found exited by this check is recorded as
         :attr:`KillCause.EXITED_AFTER_BOOT`, whether or not its EOF has reached the queue: the
         check asks the process too. It cannot see an exit that comes after it, so a worker that
-        exits as its request is written is recorded as :attr:`KillCause.REQUEST_WRITE` or
-        :attr:`KillCause.CRASH` instead, and that message dead-letters.
+        exits as its request is written is recorded under another cause, such as
+        :attr:`KillCause.REQUEST_WRITE` or :attr:`KillCause.CRASH`, and that message dead-letters.
 
         Liveness is read with :func:`_has_exited`, which leaves a dead worker unreaped so the
         respawn's reap still reaches its process group."""

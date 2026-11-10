@@ -296,3 +296,39 @@ def kill_process_group(pid: int, *, started_as_leader: bool = False) -> bool:
         )
         return False
     return True
+
+
+def kill_reaped_leader_group(pid: int) -> bool | None:
+    """``SIGKILL`` the process group that ``pid`` led, after ``pid`` itself was reaped, on POSIX.
+
+    Returns ``True`` when the signal was sent, ``False`` when there was nothing to signal (Windows,
+    the caller's own group, or a group with no members left), and ``None`` when it refused because
+    ``pid`` may name another process now.
+
+    POSIX does not reuse a pid while a process group with that id has members, so while the group a
+    reaped leader led has a member, ``pid`` names no live process and ``killpg(pid)`` reaches that
+    group alone. Once the group is empty the pid may be reused, possibly by a new group leader,
+    which ``started_as_leader=True`` on :func:`kill_process_group` would then signal. So this
+    signals only when ``pid`` names no live process, and refuses when it names one or the lookup
+    fails some other way. The gap left is a pid reused between that check and the signal, which
+    needs the group to be empty already and a new leader to take the pid in that instant."""
+    if sys.platform == "win32" or pid == os.getpgrp():
+        return False
+    try:
+        os.getpgid(pid)
+    except ProcessLookupError:
+        pass  # no live process has the pid: only the old group's members can answer to it
+    except OSError:
+        return None
+    else:
+        return None  # the pid names a live process, which cannot be the reaped leader
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return False  # the group is empty
+    except OSError as exc:
+        log.warning(
+            "could not signal process group %d (%s)", pid, exc.strerror or type(exc).__name__
+        )
+        return False
+    return True
