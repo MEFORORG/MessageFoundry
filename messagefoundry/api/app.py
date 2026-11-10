@@ -7319,7 +7319,7 @@ def create_app(
             # BACKLOG #1111 -- without this the route answers a degraded apply as clean success.
             if req.dry_run:
                 outcome = await engine.reload_detail(req.config_dir, dry_run=True, propagate=False)
-                failures = [f.step for f in outcome.failures]
+                failures = outcome.failed_steps
             else:
                 outcome, failures = await _reload_and_record(
                     engine, req.config_dir, actor=user.username, client=client_ip(request)
@@ -11939,7 +11939,7 @@ def create_managed_app(
     api_tls_cert_file: str | None = None,
     api_tls_replacements: Sequence[GeneratedPairReplaced] = (),
     api_tls_client_cert_files: Sequence[str] = (),
-    settings_crls: Sequence[MonitoredCert] = (),
+    settings_monitored_files: Sequence[MonitoredCert] = (),
     api_listener: tuple[str, int] | None = None,
     reference_settings: ReferenceSettings | None = None,
     egress_settings: EgressSettings,
@@ -12254,7 +12254,8 @@ def create_managed_app(
         # on an administrative path refuses unless [security].allow_over_granted_vault_token accepts
         # it (audited), and so does a probe failure that is not a network failure, a timeout or a
         # 403, which the opt-out does not lift; every other finding warns and audits
-        # (vault_preflight_outcome). It names the consumers from the
+        # (vault_preflight_outcome). Every finding raises vault_privilege_warning, and a clean read
+        # resolves it. It names the consumers from the
         # resolved service settings, which serve always passes; an embedding that passes none has
         # no Vault consumer this lifespan could name.
         _security = security_settings or SecuritySettings()
@@ -12281,6 +12282,8 @@ def create_managed_app(
                     probe=partial(
                         probe_vault, settings=static_credential_settings, posture=_hop_posture
                     ),
+                    # #2903 slice B: each hop pages, or resolves its page, through the same sink.
+                    alert_sink=notifier or LoggingAlertSink(),
                 )
         except BaseException:
             if notifier is not None:
@@ -12353,8 +12356,8 @@ def create_managed_app(
             engine_version=__version__,
             api_tls_cert_file=api_tls_cert_file,
             api_tls_client_cert_files=api_tls_client_cert_files,
-            # BACKLOG #299: the settings-level CRL files, mostly outbound, for the same expiry scan.
-            settings_crls=settings_crls,
+            # BACKLOG #299, vault #2223: the settings-level CRL and pin files, for the same scan.
+            settings_monitored_files=settings_monitored_files,
             api_listener=api_listener,
             reference_settings=reference_settings,
             egress_settings=egress_settings,

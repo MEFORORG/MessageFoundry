@@ -1757,7 +1757,7 @@ one.
 | `bearer_token` | — | `Authorization: Bearer …` (a **secret** — supply via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
-| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab. None of these reaches a connection that carries a credential, or a static header outside a short allowlist: that is refused in every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)) |
+| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab. None of these reaches a connection that carries a credential, or a static header outside a short allowlist: that is refused in every case ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)). Nor do they reach a connection that sets `ech_egress`: `false` beside it is refused in every case (vault BACKLOG #2977) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert while the chain's signatures + hostname stay verified (not the other chain certificates' validity periods or a CRL's own window; see the MLLP row) — the narrow alternative to `verify_tls=false`. Same contract as the [MLLP row](#mllp--mllp): **no posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) |
 | `tls_ca_file` | — | **(#1180)** pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
@@ -2523,7 +2523,9 @@ snapshot, or `ApplicationIntent` against an availability-group replica — are a
 
 Grant the lookup account `SELECT` on the objects the feed reads and nothing else. It needs no
 membership in `db_datawriter`, `db_ddladmin` or `db_owner`, and no `EXECUTE` unless a feed genuinely
-reads through a stored procedure — which this gate refuses anyway.
+reads through a stored procedure — which this gate refuses anyway. The engine warns when it finds
+such a role on the login, the first time the lookup's pool opens, but it does not refuse it (see
+*The engine probes a lookup or reference login for write roles*).
 
 > This is a **separate principal** from the engine's own store login. `[store]` settings govern the
 > database MessageFoundry writes its own messages to; a `DatabaseLookup` dials a partner database under
@@ -2586,7 +2588,45 @@ error can hold a reference key. The two class names above are what tell those fa
 
 Neither control is read-only authority, for the reasons in the table above, and the sync pool is
 autocommit. Give the `DatabaseRef` login `SELECT` on what the statement reads, and nothing else. The
-engine does not probe that login's role membership yet.
+engine probes that login's role membership the first time a sync opens its pool, and warns on an
+over-grant; see *The engine probes a lookup or reference login for write roles* below.
+
+#### The engine probes a lookup or reference login for write roles
+
+The engine cannot make a partner login read-only, but it can see whether the login holds a role that
+writes. Each `DatabaseLookup` and `DatabaseRef` login is probed once, when its pool first opens
+(BACKLOG #2617):
+
+- **A lookup** is probed on its first `db_lookup` call, since `serve` does not dial lookups at
+  start. A pool that fails to open is not probed; the next lookup opens it and probes it then. A
+  probe that did not run on an open pool is not tried again until the executor is rebuilt, as on a
+  reload, so its warning is the only record.
+- **A reference set** is probed on its first sync, and again when its `server`, `port`,
+  `database`, `auth` or `username` changes, as when a reload points it at another login. A probe
+  that did not run is tried again on the next sync.
+
+The probe reads the eight classic fixed server roles (`sysadmin`, `securityadmin`, `serveradmin`,
+`setupadmin`, `processadmin`, `diskadmin`, `dbcreator`, `bulkadmin`) with `IS_SRVROLEMEMBER` and the
+nine fixed database roles with `IS_ROLEMEMBER`, by name, the same closed role sets the store's own
+login check reads. **"Clean" means no database-wide write role**: none of those server roles, and no
+fixed database role but `db_datareader`, `db_denydatareader` and `db_denydatawriter`. `db_datawriter`
+beside `db_denydatawriter` is clean too, since the deny takes back its table writes.
+
+It reads role membership only, so at least these still read clean: a permission granted directly at
+any scope, such as `INSERT` on one table, database-scope `CONTROL` or `CONTROL SERVER`; a
+user-defined role; the `##MS_...##` fixed server roles SQL Server 2022 added; and a role held in
+another database on the same server, which a statement can still reach by a three-part name, since
+`IS_ROLEMEMBER` answers for the database the connection names.
+
+| What the probe reads | What the engine does |
+|---|---|
+| clean | logs one INFO line |
+| a role beyond read, such as `db_datawriter`, `db_owner` or `sysadmin` | logs a WARNING naming each role. **Nothing is refused**: the lookup or sync goes ahead |
+| a role that reads NULL, or any value but an integer or boolean 0 or 1, such as the text `"1"` | logs a WARNING that it **cannot judge** the login. A NULL means the name did not resolve for this login, so it is never read as "not a member", and never as clean |
+| no answer: the borrow timed out, the statement failed, or no row came back | logs a WARNING that the probe did not run, naming the timeout, the SQLSTATE or the error type, never the driver's message. The lookup or sync goes ahead |
+
+The warning names the connection as `db_lookup:<name>` or `reference:<name>`, and never the server,
+the DSN or a credential.
 
 #### Static credentials on every backend hop
 
@@ -3033,8 +3073,16 @@ a **permanent** `partial-refusal` `NegativeAckError`: the row dead-letters on th
 already have it. A replay is the operator's choice, and re-sends to **every** recipient. The error names the
 relay's host and port and two counts (*"Email relay.example:587: 1 of 2 recipients refused"*), never an
 address or the relay's reply; the delivery worker's log line names the connection. A
-refusal of **every** recipient is still an ordinary SMTP failure, retried like one. The Direct destination
-fails a partial refusal the same way, and the `[alerts]` mail logs it as a failed send.
+refusal of **every** recipient with a permanent `5xx` reply agrees with it: a **permanent** `total-refusal`
+`NegativeAckError` that dead-letters on the first attempt, rather than a retry to the attempt ceiling. It
+names the relay, a count and the distinct reply codes (*"Email
+relay.example:587: all 2 recipients refused (550)"*), never an address or a reply text. When any of
+those replies is a temporary `4xx`, such as greylisting, or `552`, which RFC 5321 tells a client to treat
+as temporary at `RCPT`, the next attempt may pass, so it is retried, with the same content-free text. A
+relay that drops the session with `421` part way through is retried too, and the text counts only the
+refusals up to and including it (*"1 of 2 recipients refused, then the session closed (421)"*). The relay took no
+message in any of these cases, so nobody gets a duplicate. The Direct destination fails each refusal the
+same way, and the `[alerts]` mail logs each as a failed send.
 
 ```python
 # samples/config/connections.py (excerpt)
@@ -3114,7 +3162,8 @@ never the material or a cert subject (which can identify a patient's provider).
 **Delivery semantics.** Egress is gated by **`[egress].allowed_direct`** — kept separate from
 `allowed_smtp` so a Direct HISP relay can be permitted without opening the general mail relay. An SMTP
 failure raises `DeliveryError`, so the lane **retries** per its `RetryPolicy`. A relay that refuses some
-recipients and accepts the rest is a permanent `partial-refusal`, as on the Email destination. A message that cannot be
+recipients and accepts the rest is a permanent `partial-refusal`, and one that refuses every recipient with a
+`5xx` reply a permanent `total-refusal`, as on the Email destination. A message that cannot be
 **built** raises a **permanent** `NegativeAckError` and dead-letters on the first attempt, because a retry
 would fail the same way. That is a body the `encoding` cannot represent, or a crypto failure that began
 after construction. Its error names the failure class, or the codec and character position, and never the
@@ -3984,7 +4033,7 @@ cleartext_reason   = "vendor firmware predates TLS; segment is not isolated"
 
 | Key | Dir | Type | Default | Meaning |
 |-----|-----|------|---------|---------|
-| `cleartext_accepted` | out | bool | `false` | this outbound's hop is cleartext and that is accepted. Yields **WARN, never ALLOW** — the hop crosses, but every construction logs it and records a line naming the connection, the cell, the host and the reason. It does **not** reach a `verify_tls = false` hop (encrypted-but-unauthenticated, not cleartext — that keeps the clamped `MEFOR_ALLOW_INSECURE_TLS` escape), an SMTP `AUTH` over cleartext (refused outright), or a `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` or `FhirLookup()` credential to a host off this machine, token endpoints and Digest included (refused with no escape, vault BACKLOG #3533 item 4; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)) |
+| `cleartext_accepted` | out | bool | `false` | this outbound's hop is cleartext and that is accepted. Yields **WARN, never ALLOW** — the hop crosses, but every construction logs it and records a line naming the connection, the cell, the host and the reason. It does **not** reach a `verify_tls = false` hop (encrypted-but-unauthenticated, not cleartext — that hop keeps the clamped `MEFOR_ALLOW_INSECURE_TLS` escape; on a REST hop that sets `ech_egress` the escape does not reach it either, see the `refuse_verify_off` docstring in [`transports/rest.py`](../messagefoundry/transports/rest.py)), an SMTP `AUTH` over cleartext (refused outright), or a `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` or `FhirLookup()` credential to a host off this machine, token endpoints and Digest included (refused with no escape, vault BACKLOG #3533 item 4; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)) |
 | `cleartext_reason` | out | str | — | **mandatory** when the flag is set (and rejected without it). The engine checks a reason is present and non-blank; it cannot check that it is *true* — a placeholder is a review problem, not a load problem |
 
 **`Tcp()` and `X12()`: the declaration is permanent, not transitional.** Those connectors have **no TLS
@@ -4018,7 +4067,8 @@ An isolated segment with its own link-layer encryption is the other. An enforcin
 cleartext or verify-off hop then **ALLOWs** it
 ([ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md), owner ruling
 2026-09-24). That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a
-verify-off HTTP-family egress hop and a weakened database TLS hop. It does **not** reach every
+weakened database TLS hop, and a verify-off HTTP-family egress hop that sets no `ech_egress`
+(why: the `refuse_verify_off` docstring in [`transports/rest.py`](../messagefoundry/transports/rest.py)). It does **not** reach every
 verify-off refusal: at least the MLLP, FTPS and email `tls_verify = false` refusals do not read it.
 Nor does it carry an HTTP-family credential: over cleartext `http` to a host off this machine, or
 over `verify_tls = false`, the credential is refused, attested or not (vault BACKLOG #3533 item 4,
