@@ -1964,7 +1964,7 @@ started together, can each raise it; the alert list folds them into one instance
   convergence row carries the version the node converged on. An operator reload whose bump failed
   carries none. A follower's `fingerprint` is of the bytes that node loaded. Beside it, a
   convergence row carries `initiator_digest`: the `fingerprint`, `scheme` and any
-  `unreadable_files` parsed from unauthenticated text read from the shared `cluster_config` row,
+  `unreadable_files` parsed from unsigned text read from the shared `cluster_config` row,
   stamped with the row's `config_version` (vault BACKLOG #3109). Compare the
   two as a start compares digests: only under one `scheme` and with the same `unreadable_files`.
   The digest is the one stored with `config_version`, but the node reads its own directory when it

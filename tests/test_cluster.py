@@ -1489,10 +1489,9 @@ async def test_a_digest_the_bump_cannot_share_is_stored_as_unknown_and_logged(
 
 
 @pytest.mark.parametrize("backend", ["DbCoordinator", "SqlServerCoordinator"])
-def test_a_config_row_that_cannot_be_read_leaves_the_cached_pair_intact(backend: str) -> None:
-    """vault BACKLOG #3109: the cache sets the version and its digest together. A row whose
-    digest read raises sets neither, so the old version is never left beside a new digest, nor
-    the new version beside the old one."""
+def test_a_bad_stamp_caches_the_new_version_with_no_digest(backend: str) -> None:
+    """vault BACKLOG #3109: the digest is advisory, so a row whose stamp cannot be read still moves
+    the cached version, beside no digest rather than the previous one."""
     from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 
     coord: DbCoordinator | SqlServerCoordinator = (
@@ -1501,9 +1500,17 @@ def test_a_config_row_that_cannot_be_read_leaves_the_cached_pair_intact(backend:
     good = {"config_version": 4, "config_digest": "d4", "config_digest_version": 4}
     assert coord._cache_config_row(good) == 4, "control"
     assert coord.config_digest_cached(4) == "d4"
-    with pytest.raises(KeyError):
-        coord._cache_config_row({"config_version": 5, "config_digest": "d5"})  # no stamp key
-    assert coord.config_version_cached() == 4 and coord.config_digest_cached(4) == "d4"
+    for version, bad in enumerate(
+        (
+            {"config_version": 5, "config_digest": "d5"},  # no stamp column
+            {"config_version": 6, "config_digest": "d6", "config_digest_version": "6"},
+            {"config_version": 7, "config_digest": "d7", "config_digest_version": 6},
+        ),
+        start=5,
+    ):
+        assert coord._cache_config_row(bad) == version
+        assert coord.config_version_cached() == version
+        assert coord.config_digest_cached(version) is None, bad
 
 
 def test_a_stored_digest_belongs_only_to_the_version_stamped_beside_it() -> None:
@@ -1515,10 +1522,12 @@ def test_a_stored_digest_belongs_only_to_the_version_stamped_beside_it() -> None
         "config_digest": "d",
         "config_digest_version": 4,
     }
-    assert stamped_config_digest(row) == "d", "control: stamped with its own version"
-    assert stamped_config_digest({**row, "config_version": 5}) is None, "a later, unstamped bump"
-    assert stamped_config_digest({**row, "config_digest_version": None}) is None
-    assert stamped_config_digest({**row, "config_digest": None}) is None
+    assert stamped_config_digest(row, 4) == "d", "control: stamped with its own version"
+    assert stamped_config_digest(row, 5) is None, "a later, unstamped bump"
+    assert stamped_config_digest({**row, "config_digest_version": None}, 4) is None
+    assert stamped_config_digest({**row, "config_digest_version": True}, 1) is None, "not an int"
+    assert stamped_config_digest({**row, "config_digest": None}, 4) is None
+    assert stamped_config_digest({"config_version": 4}, 4) is None, "no digest columns"
 
 
 @pytest.mark.parametrize("seed_first", [True, False], ids=["seeded_before_load", "seeded_at_start"])

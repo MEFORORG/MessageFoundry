@@ -920,17 +920,23 @@ class ClusterCoordinator(Protocol):
         ...
 
 
-def stamped_config_digest(row: Mapping[str, Any]) -> str | None:
-    """A ``cluster_config`` row's ``config_digest``, when its ``config_digest_version`` stamp names
-    the row's ``config_version``, else ``None`` (vault BACKLOG #3109).
+def stamped_config_digest(row: Mapping[str, Any], version: int) -> str | None:
+    """A ``cluster_config`` row's ``config_digest``, when its ``config_digest_version`` stamp is
+    ``version``, the row's ``config_version`` as the caller parsed it, else ``None`` (vault
+    BACKLOG #3109).
 
     A bump writes the digest and the stamp in the same statement as the version. An engine that
     does not write the digest still moves the version, and leaves the previous bump's digest and
     stamp behind: the stamp then names an older version, so that digest is not set beside the new
-    one. Both coordinators read the pair through here."""
-    stamp = row["config_digest_version"]
-    digest = row["config_digest"]
-    if stamp is None or int(stamp) != int(row["config_version"]):
+    one. Both coordinators read the pair through here. It never raises: the digest is advisory, so
+    a missing column, a stamp that is not an int, or a digest that is not text reads as unknown
+    and never stops the version from being cached."""
+    try:
+        stamp = row["config_digest_version"]
+        digest = row["config_digest"]
+    except KeyError:
+        return None
+    if not isinstance(stamp, int) or isinstance(stamp, bool) or stamp != version:
         return None
     return digest if isinstance(digest, str) else None
 
@@ -1396,11 +1402,9 @@ class DbCoordinator:
         return self._cache_config_row(row)
 
     def _cache_config_row(self, row: Any) -> int:
-        """Cache a ``cluster_config`` row's version and digest together, and return the version.
-        Both are read before either is set, so a raise leaves the previous pair intact."""
+        """Cache a ``cluster_config`` row's version and digest together, and return the version."""
         version = int(row["config_version"])
-        digest = stamped_config_digest(row)
-        self._config_version, self._config_digest = version, digest
+        self._config_version, self._config_digest = version, stamped_config_digest(row, version)
         return version
 
     async def cluster_members(self) -> list[ClusterMember]:
