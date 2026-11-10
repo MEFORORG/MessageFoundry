@@ -406,10 +406,9 @@ def _scrub_credential_query(text: str) -> str:
 def _shipped_filters() -> tuple[logging.Filter, ...]:
     """The ``logging.Filter`` objects :func:`_install_phi_filters` puts on a shipped handler, built
     by that function, so the reading :func:`redact_log_value` takes follows the text rewrites those
-    objects make to a record (BACKLOG #3770). It would not model a filter that is not a
+    objects make to a record (BACKLOG #3770). It would not model, at least, a filter that is not a
     ``logging.Filter`` instance, which this drops, or a filter's return value (a veto or a
-    replacement record), which :func:`_settled_reading` ignores. None of the filters
-    :func:`_install_phi_filters` installs today is either."""
+    replacement record), which :func:`_settled_reading` ignores."""
     handler = logging.NullHandler()
     _install_phi_filters(handler)
     return tuple(f for f in handler.filters if isinstance(f, logging.Filter))
@@ -462,8 +461,7 @@ def _shipped_reading(line: str) -> str | None:
     each tab written as a space: a tab, which the control-character escape keeps, makes the
     encoded-HL7-run pass of :func:`messagefoundry.redaction.redact` (its
     ``_HL7_ENCODED_FIELD_RUN`` substitution) read the text as not printable and skip it; its other
-    passes still run (BACKLOG #3770). A no-break space or another Unicode space is not read this
-    way. ``None`` when either reading did not settle."""
+    passes still run (BACKLOG #3770). ``None`` when either reading did not settle."""
     filters = _shipped_filters()
     out = _settled_reading(line, filters)
     if out is not None and "\t" in out:

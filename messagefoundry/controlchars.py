@@ -26,7 +26,7 @@ which is how the escape table came to live in ``logging_setup``.)
 
 THE NEUTRALISERS ARE DIFFERENT AND ONE MUST NEVER BE "SIMPLIFIED" INTO ANOTHER. Beside the
 refusals, that makes three actions built on one predicate. QUOTE, a fourth, escapes by an
-allowlist rather than by the predicate; its bullet below gives the encoding. The four actions:
+allowlist rather than by the predicate; its bullet below gives the encoding. The actions:
 
   * REJECT -- six sites. A control character in a value that reaches a URL path, a header, a
     filename or a config field is refused outright.
