@@ -256,6 +256,7 @@ _LINEAGE_SIGN_IN_SLACK_SECONDS: Final = 120.0
 _RevocationApplied = Literal["skipped", "quiet", "reported"]
 
 
+@cache
 def _row_write_errors() -> tuple[type[Exception], ...]:
     """What :meth:`AuthService._write_with_row` catches from a write that carries its audit row,
     and from that row written on its own: what
@@ -7801,13 +7802,10 @@ class AuthService:
                     detail={"roles": role_ids, "source": "directory"},
                 )
             except Exception as exc:
-                # The route raises the grant's page from the outcome this raise takes away.
-                self._report_directory_admin_grant(
-                    user, before=previous, after=role_ids, via="directory_sign_in"
-                )
-                _hold(exc, held)
-                raise
+                # Raised below, after the grant's page; any error held before it is named on it.
+                held = _hold(exc, held)
         if held is not None:
+            # The route raises the grant's page from the outcome this raise takes away.
             self._report_directory_admin_grant(
                 user, before=previous, after=role_ids, via="directory_sign_in"
             )

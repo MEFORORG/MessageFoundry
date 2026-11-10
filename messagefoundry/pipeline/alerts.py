@@ -1761,13 +1761,20 @@ def step_up_return_audit_alert(sink: AlertSink) -> Callable[[str], None]:
 
     Carries the key and the action name only. Never raises: an alert failure must not change what a
     step-up return answers."""
+    return _keyed_audit_write_failed(sink, STEP_UP_RETURN_AUDIT_KEY, "step-up return")
+
+
+def _keyed_audit_write_failed(sink: AlertSink, prefix: str, source: str) -> Callable[[str], None]:
+    """A callable that raises :meth:`AlertSink.audit_write_failed` keyed ``<prefix>:<action>`` for
+    each action it is given, and logs a sink failure at WARNING, naming ``source``, rather than
+    raising it: an alert failure must never break a request."""
 
     def _raise(action: str) -> None:
         try:
-            sink.audit_write_failed(f"{STEP_UP_RETURN_AUDIT_KEY}:{action}", action=action)
+            sink.audit_write_failed(f"{prefix}:{action}", action=action)
         except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
             log.warning(
-                "the step-up return audit_write_failed alert could not be delivered", exc_info=True
+                "the %s audit_write_failed alert could not be delivered", source, exc_info=True
             )
 
     return _raise
@@ -1784,17 +1791,7 @@ def directory_sign_in_audit_alert(sink: AlertSink) -> Callable[[str], None]:
     audit action of a directory sign-in's role-sync row the store refused twice, raises
     :meth:`AlertSink.audit_write_failed` keyed ``<DIRECTORY_SIGN_IN_AUDIT_KEY>:<action>`` (BACKLOG
     #2221). Carries the key and the action name only. Never raises."""
-
-    def _raise(action: str) -> None:
-        try:
-            sink.audit_write_failed(f"{DIRECTORY_SIGN_IN_AUDIT_KEY}:{action}", action=action)
-        except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
-            log.warning(
-                "the directory sign-in audit_write_failed alert could not be delivered",
-                exc_info=True,
-            )
-
-    return _raise
+    return _keyed_audit_write_failed(sink, DIRECTORY_SIGN_IN_AUDIT_KEY, "directory sign-in")
 
 
 def alert_store_cipher_refusal(sink: AlertSink, table: str, column: str) -> None:
