@@ -217,6 +217,8 @@ def smoke_self(
         # What the hop census reads as an unknown load, so the shared load's failure ends this row
         # rather than the verify run; a config module that exits at import is one (BACKLOG #3803).
         return CheckResult(rid, title, Status.FAIL, f"config failed to load: {safe_exc(exc)}")
+    except Exception as exc:  # the run's shared load keeps whatever it raised; never crash the run
+        return CheckResult(rid, title, Status.FAIL, f"config failed to load: {safe_exc(exc)}")
     msg = synthetic_message()  # a module constant since #1192 — cannot fail
     try:
         result = dry_run(reg, msg, inbound=inbound, snapshot_on_send=snapshot_on_send)

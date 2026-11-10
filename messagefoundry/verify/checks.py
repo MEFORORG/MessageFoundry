@@ -104,8 +104,9 @@ class OdbcHops:
     needs: tuple[tuple[str, str], ...] = ()
     #: For ``host.odbc``: each hop that names the Microsoft driver library by a path, and the path.
     paths: tuple[tuple[str, str], ...] = ()
-    #: For ``host.odbc``: why the store backend, a Driver 18 hop where it is SQL Server, is not known.
-    store_unknown: str | None = None
+    #: For ``host.odbc``: what was not read that a listed Driver 18 answers: the store backend, a
+    #: Driver 18 hop where it is SQL Server, and a graph not given with ``--config``.
+    unless_18: str | None = None
 
     @property
     def takes_none(self) -> bool:
@@ -169,11 +170,12 @@ def check_sqlserver_odbc_driver(driver_hops: Callable[[], OdbcHops]) -> CheckRes
     ``driver_hops`` reads every hop with the driver it needs. A hop naming a registered driver
     needs pyodbc to list it, in any case; a hop naming the library by an absolute path needs that
     file. Any one missing FAILs, naming the hop and the driver. A driver list that cannot be read
-    is ERROR where the configuration takes any ODBC hop, SKIP where it takes none, and MANUAL where
-    that is not known. With every driver checked there, the row PASSes, unless a graph hop could not
-    be read or its driver told, which is MANUAL, or the store backend is not known and Driver 18,
-    which a SQL Server store needs, is not listed, which is MANUAL too. With no hop, it SKIPs, or
-    PASSes where Driver 18 is listed. ``driver_hops`` runs only where pyodbc is importable, because
+    is ERROR where the configuration takes an ODBC hop, one whose driver is not told included, SKIP
+    where it takes none, and MANUAL where that is not known. With every driver checked there, the
+    row PASSes, unless a graph hop of a read ``--config`` could not be read or its driver told,
+    which is MANUAL, or the store backend is not known, or no ``--config`` was given, and Driver 18
+    is not listed, which is MANUAL too. With no hop, it SKIPs, or PASSes where Driver 18 is
+    listed. ``driver_hops`` runs only where pyodbc is importable, because
     it can load the configuration."""
     rid, title = "host.odbc", "SQL Server ODBC drivers"
     if not _can_import("pyodbc"):
@@ -216,8 +218,8 @@ def check_sqlserver_odbc_driver(driver_hops: Callable[[], OdbcHops]) -> CheckRes
     checked = [f"{label} ({_shown(name)})" for label, name in (*hops.needs, *hops.paths)]
     done = f"every driver checked is there: {', '.join(checked)}" if checked else ""
     unread = [hops.unknown] if hops.unknown is not None else []
-    if hops.store_unknown is not None and not has_18:
-        unread.append(hops.store_unknown)
+    if hops.unless_18 is not None and not has_18:
+        unread.append(hops.unless_18)
     if unread:
         lead = f"{done}; " if done else ""
         return CheckResult(
@@ -243,7 +245,7 @@ def _unreadable_driver_list(failure: str, hops: OdbcHops) -> CheckResult:
     """``host.odbc`` where pyodbc's driver list could not be read: ERROR on any ODBC hop, the store
     one included, SKIP with none, MANUAL where that is not known."""
     rid, title = "host.odbc", "SQL Server ODBC drivers"
-    if hops.takes_none and hops.store_unknown is None:
+    if hops.takes_none and hops.unless_18 is None:
         return CheckResult(
             rid,
             title,
@@ -252,7 +254,7 @@ def _unreadable_driver_list(failure: str, hops: OdbcHops) -> CheckResult:
             f"it reads ERROR: {failure}",
         )
     if not hops.found and hops.unknown is None:
-        hops = OdbcHops(unknown=hops.store_unknown)
+        hops = OdbcHops(unknown=hops.unless_18)
     return _as_the_hops_make_it(
         CheckResult(rid, title, Status.ERROR, failure),
         hops,

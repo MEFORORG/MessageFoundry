@@ -1693,13 +1693,13 @@ def _needing(*needs: tuple[str, str], unknown: str | None = None) -> checks.Odbc
         # The store backend not known: a listed Driver 18 answers it, since the store needs that.
         (
             ("SQL Server",),
-            checks.OdbcHops(store_unknown="MEFOR_STORE_BACKEND unset"),
+            checks.OdbcHops(unless_18="MEFOR_STORE_BACKEND unset"),
             Status.MANUAL,
         ),
-        ((_DRIVER_18,), checks.OdbcHops(store_unknown="MEFOR_STORE_BACKEND unset"), Status.PASS),
+        ((_DRIVER_18,), checks.OdbcHops(unless_18="MEFOR_STORE_BACKEND unset"), Status.PASS),
         (
             (RuntimeError("no driver manager"),),
-            checks.OdbcHops(store_unknown="MEFOR_STORE_BACKEND unset"),
+            checks.OdbcHops(unless_18="MEFOR_STORE_BACKEND unset"),
             Status.MANUAL,
         ),
         # A hop on another vendor's driver only: nothing for this row to check.
@@ -1721,7 +1721,7 @@ def test_each_hops_driver_is_checked(
     if expect is Status.ERROR:
         assert r.evidence.startswith("ODBC hops: ") and "no driver manager" in r.detail
     if expect is Status.MANUAL:
-        reason = hops.unknown or hops.store_unknown
+        reason = hops.unknown or hops.unless_18
         assert f"({reason})" in r.detail or f"not read: {reason}" in r.detail
 
 
@@ -1789,7 +1789,7 @@ def test_the_graph_is_loaded_once_per_run(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert loads == [True]
 
 
-@pytest.mark.parametrize("raised", [WiringError, SystemExit, OSError])
+@pytest.mark.parametrize("raised", [WiringError, SystemExit, OSError, LookupError])
 def test_a_failed_shared_load_is_read_once_by_both(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raised: type[BaseException]
 ) -> None:
@@ -1816,7 +1816,7 @@ def test_a_failed_shared_load_is_read_once_by_both(
     )
     rows = {r.id: r for r in results}
     assert rows["host.odbc"].status is Status.MANUAL and "bad graph" in rows["host.odbc"].detail
-    assert "not read: the config dir" in rows["host.odbc"].detail
+    assert "not read: the " in rows["host.odbc"].detail
     assert rows["smoke.self"].status is Status.FAIL
     assert "config failed to load" in rows["smoke.self"].detail
     assert len(loads) == 1
@@ -2076,6 +2076,49 @@ def test_verify_without_a_service_config_reports_manual(
     row = _host_ciphers_row(run_verify(config_dir=str(graph), sections=["host"]))
     assert row.status is Status.MANUAL, row.detail
     assert "no service config was read" in row.detail
+
+
+def test_the_fast_host_check_with_driver_18_passes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No --config given and Driver 18 listed: host.odbc PASSes, as at 08cba626b1 (code review
+    round 7, finding 10). Without Driver 18 it is MANUAL, since the graph was not read."""
+    from messagefoundry.verify.runner import run_verify
+
+    service = _isolate_settings(monkeypatch, tmp_path)
+    _with_pyodbc(monkeypatch, Status.FAIL)
+    _odbc_drivers(monkeypatch, _DRIVER_18)
+    results = run_verify(
+        config_dir="samples/config", service_config=str(service), sections=["host"]
+    )
+    row = next(r for r in results if r.id == "host.odbc")
+    assert row.status is Status.PASS, row.detail
+    _odbc_drivers(monkeypatch, "SQL Server")
+    results = run_verify(
+        config_dir="samples/config", service_config=str(service), sections=["host"]
+    )
+    row = next(r for r in results if r.id == "host.odbc")
+    assert row.status is Status.MANUAL and "--config was left at" in row.detail
+
+
+@pytest.mark.parametrize("driver", ["env", "msodbcsql18.dll"])
+def test_an_unreadable_list_is_an_error_on_a_hop_whose_driver_is_not_told(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, driver: str
+) -> None:
+    """Round 7, finding 1: an env() driver or a bare library name is still an ODBC hop, so an
+    unreadable driver list is ERROR, not MANUAL, and verify exits 1."""
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.wiring import env
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlite")
+    odbc_driver = env("db_driver") if driver == "env" else driver
+    _registry_with(monkeypatch, outbound={"OB_X": _database("OB_X", driver=odbc_driver)})
+    hops = _hops(tmp_path, settings=ServiceSettings(), drivers=True)
+    _odbc_drivers(monkeypatch, RuntimeError("no driver manager"))
+    r = checks.check_sqlserver_odbc_driver(lambda: hops)
+    assert r.status is Status.ERROR, r.detail
+    assert "DATABASE connection OB_X" in r.evidence
 
 
 def test_verify_with_no_config_dir_reports_manual(

@@ -295,10 +295,11 @@ def _driver_hops(
     Server store names Driver 18. ``paths`` holds each preset hop that names the Microsoft library
     by a path, which the driver manager loads from that path, not from pyodbc's list. A hop on
     another vendor's driver is in ``found`` alone: it is an ODBC hop, but this row checks no driver
-    of it. ``unknown`` joins every reason a graph hop could be missed or its driver not told: the
-    graph not read, an ``env()`` driver, and a library named other than by an absolute path.
-    ``store_unknown`` says why the store, which would need Driver 18, is not known, apart, since a
-    listed Driver 18 answers it and nothing else."""
+    of it, as is a hop whose driver is not told. ``unknown`` joins every reason a graph hop could
+    be missed or its driver not told: a ``--config`` that did not load, an ``env()`` driver, and a
+    library named other than by an absolute path. ``unless_18`` holds the reasons a listed Driver
+    18 answers, apart: the store backend not known, which would need Driver 18, and no
+    ``--config`` given at all, the fast host check."""
     store = settings is not None and settings.store.backend is StoreBackend.SQLSERVER
     needs = [("the [store] backend is sqlserver", SQLSERVER_DEFAULT_DRIVER)] if store else []
     paths: list[tuple[str, str]] = []
@@ -307,14 +308,22 @@ def _driver_hops(
     try:
         entries, unread = _buildable_entries(config_dir, graph)
     except Exception as exc:  # a read failure not foreseen: the store's need must survive it
+        _log.warning("host.odbc: the graph read raised %s", type(exc).__name__)
         entries, unread = (
             [],
             f"the graph read raised {type(exc).__name__}: {codec_safe_str(exc)[:200]}",
         )
+    # Reasons a listed Driver 18 answers: the store's backend, and with no --config given the
+    # graph, so the fast host check on a host with Driver 18 reads PASS as before.
+    unless_18: list[str] = []
     if unread is not None:
-        unknowns.append(unread)
+        default = Path(config_dir) == Path(_DEFAULT_CONFIG_DIR)
+        (unless_18 if default else unknowns).append(unread)
+    # Entries whose driver is not told are still ODBC hops, so an unreadable list is ERROR on them.
+    undecided: list[str] = []
     for label, dialect, driver in entries:
         if driver is None:
+            undecided.append(label)
             unknowns.append(f"{label} names its odbc_driver by an env() reference")
         # Only the preset takes a library, so an env() dialect naming one is on the preset.
         elif dialect != "generic" and _DRIVER_LIBRARY.fullmatch(
@@ -325,6 +334,7 @@ def _driver_hops(
             else:
                 # A bare name is searched for, and a relative one is read from the service's
                 # working directory, which need not be this shell's.
+                undecided.append(label)
                 unknowns.append(
                     f"{label} names the library {ascii(driver[:200])} by a name that is not an "
                     "absolute path, which the service resolves where this shell cannot see"
@@ -334,13 +344,20 @@ def _driver_hops(
         else:
             others.append(label)
     store_unknown = None if store else _store_unknown(settings, service_config)
+    if store_unknown is not None:
+        unless_18.append(store_unknown)
     return OdbcHops(
-        found=(*(label for label, _ in needs), *(label for label, _ in paths), *others),
+        found=(
+            *(label for label, _ in needs),
+            *(label for label, _ in paths),
+            *others,
+            *undecided,
+        ),
         unknown="; ".join(unknowns) or None,
         judged=f"the service settings and the graph in {config_dir!r}",
         needs=tuple(needs),
         paths=tuple(paths),
-        store_unknown=store_unknown,
+        unless_18="; ".join(unless_18) or None,
     )
 
 
