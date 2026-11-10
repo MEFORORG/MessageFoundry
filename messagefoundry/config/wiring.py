@@ -3086,6 +3086,7 @@ def Http(
     | None = INTAKE_AUTH_RATE_LIMIT_DEFAULT,  # FAILED intake-auth attempts per minute per peer (0/None disables)
     intake_auth_rate_limit_global: int
     | None = INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,  # FAILED intake-auth attempts per minute across all peers
+    trusted_proxies: Sequence[str] = (),  # api_key/bearer: proxies whose X-Forwarded-For is read
     # --- Synchronous captured-downstream reply (ADR 0154 D4) — reply_from's presence is the switch ---
     reply_from: str
     | None = None,  # names the outbound whose CAPTURED reply becomes this request's HTTP body
@@ -3172,6 +3173,16 @@ def Http(
     ``HEAD`` for a load-balancer check, at the cost of an unauthenticated "is MessageFoundry up, and
     where" oracle on a PHI intake socket.
 
+    ``trusted_proxies`` (BACKLOG #5525) names the reverse proxies or load balancers in front of the
+    listener, under ``api_key`` and ``bearer`` only. The failed-attempt budget keys on the socket
+    peer, so behind a proxy every partner shares one budget and one client's failures would ``429``
+    the rest. From a listed peer the budget keys instead on the client address in
+    ``X-Forwarded-For``, walked right to left as uvicorn walks it. Each entry is an address or a
+    network, read by the rules ``[api].trusted_proxies`` follows, but this list is the
+    connection's own. It changes the budget key only: the allowlist, the connection caps and the
+    peer recorded in the audit row and the connection event stay the socket peer.
+    ``docs/CONNECTIONS.md`` has the walk and what it does not cover.
+
     **Synchronous captured-downstream reply (ADR 0154 D4).** Naming ``reply_from`` turns this inbound
     from fire-and-forget into a **proxy**: the HTTP turn blocks until the named outbound's reply has
     been captured and **committed**, then returns that reply as the response body. One knob, not two —
@@ -3234,6 +3245,23 @@ def Http(
     }
     _validate_intake_auth(settings)
     _validate_sync_reply(settings)
+    # BACKLOG #5525, owner ruling 2026-11-10 ("Per-connection proxies"). Read by the listener's own
+    # reader, so the factory and the listener cannot disagree on an entry; never [api].trusted_proxies.
+    from messagefoundry.transports.http_listener import trusted_proxy_networks
+
+    try:
+        trusted_proxy_networks(trusted_proxies)
+    except ValueError as exc:
+        raise WiringError(str(exc)) from exc
+    if trusted_proxies and intake_auth not in _INTAKE_KEY_MODES:
+        raise WiringError(
+            f"Http sets trusted_proxies but intake_auth={intake_auth!r}; it keys the failed-attempt "
+            "budget only under 'api_key' or 'bearer'. Under 'mtls_subject' the certificate is "
+            "checked at accept, before any header is read, and under 'none' nothing is budgeted. "
+            "Remove the setting; a control that is configured but never consulted reads as "
+            "protection that does not exist"
+        )
+    settings["trusted_proxies"] = list(trusted_proxies)
     return ConnectionSpec(ConnectorType.HTTP, settings)
 
 

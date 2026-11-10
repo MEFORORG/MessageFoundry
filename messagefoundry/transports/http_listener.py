@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
 import re
@@ -54,6 +55,12 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar, assert_never, cast
 
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.config.settings import (
+    _ipv4_meaning,
+    _parse_trusted_proxy,
+    _span_wording,
+    _trusts_every_ipv4_host,
+)
 from messagefoundry.credential import (
     OTHERNAMES_INTACT_KEY,
     VERIFIED_ISSUER_KEY,
@@ -108,6 +115,7 @@ __all__ = [
     "HttpRequestError",
     "HttpSource",
     "reply_seconds",
+    "trusted_proxy_networks",
 ]
 
 logger = logging.getLogger(__name__)
@@ -153,6 +161,10 @@ class HttpRequestError(Exception):
         self.status = status
         self.reason = reason
         self.kind = kind
+        #: The client address a listed proxy forwarded, which the failed-attempt budget keyed this
+        #: refusal on, or ``None`` where it keyed on the socket peer (BACKLOG #5525). Set by
+        #: ``HttpSource._authorize_head``, and read only to record it beside the socket peer.
+        self.forwarded_for: str | None = None
         #: Extra response headers this refusal owes the peer — ``WWW-Authenticate`` on a ``401``,
         #: ``Retry-After`` on a ``429`` (ADR 0154 D6). Additive so the intake-auth refusals ride the
         #: shipped ``HttpRequestError`` arm in ``_serve_one`` rather than growing a parallel one.
@@ -166,7 +178,7 @@ class HttpRequest:
     metadata (ADR 0004 §4), never executed; the body is handed verbatim to the pipeline handler.
     """
 
-    __slots__ = ("method", "target", "headers", "body", "repeated")
+    __slots__ = ("method", "target", "headers", "body", "repeated", "forwarded_header")
 
     def __init__(
         self,
@@ -175,6 +187,7 @@ class HttpRequest:
         headers: dict[str, str],
         body: bytes,
         repeated: frozenset[str],
+        forwarded_header: str = "",
     ) -> None:
         self.method = method
         self.target = target
@@ -185,6 +198,10 @@ class HttpRequest:
         #: ``headers`` keeps only the LAST value of each, so a caller that reads a security-relevant
         #: header checks here first (BACKLOG #2051).
         self.repeated = repeated
+        #: Every ``X-Forwarded-For`` line joined with ``,`` in the order received, as uvicorn joins
+        #: them. ``headers`` keeps only the last line, and the walk in
+        #: ``HttpSource._forwarded_client`` must cross line boundaries (BACKLOG #5525).
+        self.forwarded_header = forwarded_header
 
 
 def _status_line(status: int) -> str:
@@ -476,6 +493,7 @@ async def _read_head(
     # Counted with `_` folded into `-`, because some front ends fold the two (BACKLOG #1913), so a
     # repeat hidden behind an underscore spelling is still a repeat (BACKLOG #2051).
     folded_counts: dict[str, int] = {}
+    forwarded_lines: list[str] = []
     for line in lines[1:]:
         if not line:
             continue
@@ -507,6 +525,8 @@ async def _read_head(
         header_counts[key] = header_counts.get(key, 0) + 1
         folded_counts[folded] = folded_counts.get(folded, 0) + 1
         headers[key] = value.strip(" \t")
+        if key == _FORWARDED_FOR:
+            forwarded_lines.append(headers[key])
 
     # Reject AMBIGUOUS framing before any Content-Length is trusted — the HTTP request-smuggling
     # defense (RFC 7230 §3.3.3). A duplicate Content-Length / Transfer-Encoding, or the two present
@@ -586,7 +606,7 @@ async def _read_head(
         raise HttpRequestError(400, "missing Host header", kind="framing_error")
 
     repeated = frozenset(name for name, count in folded_counts.items() if count > 1)
-    return HttpRequest(method, target, headers, b"", repeated)
+    return HttpRequest(method, target, headers, b"", repeated, ",".join(forwarded_lines))
 
 
 async def _read_body(
@@ -701,6 +721,92 @@ def reply_seconds(s: Mapping[str, Any], key: str) -> float:
     if value is None or value == "":
         return 30.0
     return positive_seconds(value, knob=key, transport="HTTP source")
+
+
+#: The header a reverse proxy appends the client's address to. Only this exact spelling is read, as
+#: uvicorn reads it: ``X_Forwarded_For`` is a different header to a proxy that does not fold ``_``.
+_FORWARDED_FOR = "x-forwarded-for"
+#: A port after an ``X-Forwarded-For`` hop, which some proxies write (``a.b.c.d:port``, ``[v6]:port``).
+_HOP_PORT_RE = re.compile(r"[0-9]{1,5}")
+
+_ProxyNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+_HopAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+def trusted_proxy_networks(value: Any) -> tuple[_ProxyNetwork, ...]:
+    """Read ``Http(trusted_proxies=...)`` into the networks the forwarded-address walk matches
+    (BACKLOG #5525). Raises ``ValueError``; the ``Http`` factory and the listener both call it.
+
+    Each entry is read by ``_parse_trusted_proxy``, the one reader of ``[api].trusted_proxies``,
+    so this list refuses the same forms: ``'*'``, an entry uvicorn would read as a literal that
+    never matches, and an IPv6 entry with a zone. It does NOT read ``[api].trusted_proxies`` itself:
+    trusting the admin API's proxy says nothing about who fronts a partner intake socket. A range
+    that trusts a whole address family is refused here too, since it is ``'*'`` written as a
+    network. An IPv4-mapped entry is read as the IPv4 range it names, the form
+    :func:`_hop_address` hands the walk, so one proxy matches in either spelling."""
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(
+            "Http trusted_proxies must be a list of proxy addresses or CIDR networks, "
+            "e.g. trusted_proxies=['10.0.0.5']"
+        )
+    networks: list[_ProxyNetwork] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            raise ValueError(
+                "Http trusted_proxies entries must be strings: an address or a network"
+            )
+        try:
+            parsed = _parse_trusted_proxy(entry)
+        except ValueError as exc:
+            raise ValueError(
+                f"Http trusted_proxies refuses an entry by the rule it shares with "
+                f"[api].trusted_proxies, which reads: {exc}"
+            ) from exc
+        network = _ipv4_meaning(ipaddress.ip_network(parsed))
+        if network.prefixlen == 0 or _trusts_every_ipv4_host(network):
+            raise ValueError(
+                f"Http trusted_proxies entry {entry!r} trusts a whole address family, so any "
+                f"client could choose its own failed-attempt budget. {_span_wording(network)} "
+                "List the reverse proxy's exact address(es) instead."
+            )
+        networks.append(network)
+    return tuple(networks)
+
+
+def _hop_address(text: str) -> _HopAddress | None:
+    """One ``X-Forwarded-For`` hop, or a socket peer, as an address; ``None`` when it is not one.
+
+    Reads a bare address, ``a.b.c.d:port``, ``[v6]`` and ``[v6]:port``, the forms uvicorn's walk
+    reads. Anything else, ``unknown`` and an empty hop included, is ``None`` and never becomes a
+    budget key. An IPv4-mapped address is read as its IPv4 address, so a client keys one budget
+    whichever spelling a dual-stack proxy writes."""
+    host = text.strip(" \t")
+    if host.startswith("["):
+        inner, closed, rest = host[1:].partition("]")
+        if not closed or (rest and not (rest[:1] == ":" and _HOP_PORT_RE.fullmatch(rest[1:]))):
+            return None
+        host = inner
+    elif host.count(":") == 1:
+        host, _, port = host.partition(":")
+        if not _HOP_PORT_RE.fullmatch(port):
+            return None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    return address
+
+
+def _with_forwarded(text: str, exc: HttpRequestError) -> str:
+    """``text`` with the forwarded client address the refusal keyed on, where it had one, so an
+    audit detail and an event reason record it the same way beside the socket peer (BACKLOG #5525)."""
+    if exc.forwarded_for is None:
+        return text
+    return f"{text}; forwarded_for={exc.forwarded_for}"
 
 
 def _subjects_by_issuer(subjects: Any) -> dict[str, dict[str, str]]:
@@ -871,6 +977,13 @@ class HttpSource(SourceConnector):
             s.get("intake_client_subjects")
         )
         self.intake_auth_health: str = str(s.get("intake_auth_health") or "require")
+        #: The reverse proxies whose ``X-Forwarded-For`` the failed-attempt budget may key on, under
+        #: ``api_key`` and ``bearer`` only (BACKLOG #5525). Empty, the default, keys on the socket
+        #: peer as before. Nothing else on this listener reads it: the allowlist, the connection
+        #: caps and the audit and event peer column all stay on the socket peer.
+        self._trusted_proxies: tuple[_ProxyNetwork, ...] = trusted_proxy_networks(
+            s.get("trusted_proxies")
+        )
         # Synchronous captured-downstream reply (ADR 0154 D4). reply_from's presence is the mode
         # switch; absent, every path below is byte-identical to the shipped 202 slice (AC-8).
         self.reply_from: str | None = s.get("reply_from") or None
@@ -1389,7 +1502,42 @@ class HttpSource(SourceConnector):
             return
         if head.method in _HEALTH_PROBE_METHODS and self.intake_auth_health == "allow":
             return  # explicit opt-out for a load-balancer probe that cannot carry the credential
-        peer = peer_host or "unknown"
+        forwarded = self._forwarded_client(head, peer_host)
+        try:
+            self._authorize_credential(head, forwarded or peer_host or "unknown")
+        except HttpRequestError as exc:
+            exc.forwarded_for = forwarded  # recorded beside the socket peer, never instead of it
+            raise
+
+    def _forwarded_client(self, head: HttpRequest, peer_host: str | None) -> str | None:
+        """The client address a listed proxy forwarded, or ``None`` to key on the socket peer.
+
+        uvicorn's walk (BACKLOG #5525): the header counts only when the socket peer is a listed
+        proxy; the hops are read right to left, a listed hop is skipped, and the first unlisted one
+        is the client. That hop is the address the nearest listed proxy itself saw, so a client
+        cannot choose it; everything left of it is the client's own text and is never read.
+        uvicorn takes the left-most hop when every hop is listed, and this walk does not: it falls
+        back to the socket peer then, as it does for a missing header or a hop that is not an
+        address, so no budget is ever keyed on text a client wrote."""
+        if not self._trusted_proxies or not head.forwarded_header or peer_host is None:
+            return None
+        peer = _hop_address(peer_host)
+        if peer is None or not self._is_trusted_proxy(peer):
+            return None
+        for hop in reversed(head.forwarded_header.split(",")):
+            address = _hop_address(hop)
+            if address is None:
+                return None
+            if not self._is_trusted_proxy(address):
+                return str(address)
+        return None
+
+    def _is_trusted_proxy(self, address: _HopAddress) -> bool:
+        # A network of the other IP version never contains an address, so no spelling crosses over.
+        return any(address in network for network in self._trusted_proxies)
+
+    def _authorize_credential(self, head: HttpRequest, peer: str) -> None:
+        """The budget check and the credential comparison, keyed on ``peer``."""
         limited = self._rate_limit_refusal(peer)
         if limited is not None:
             raise limited
@@ -1442,10 +1590,14 @@ class HttpSource(SourceConnector):
         if action is None:
             return
         # The reason is a fixed string at every call site, never request data, so it is safe to log.
-        # It is what tells a repeated credential header apart from a wrong key (BACKLOG #2051).
+        # It is what tells a repeated credential header apart from a wrong key (BACKLOG #2051). The
+        # forwarded address is request data, but only ever an address `_hop_address` parsed and
+        # re-rendered, never the header's own text (BACKLOG #5525).
         logger.warning(
-            "HTTP intake authentication refused: peer=%s mode=%s outcome=%s reason=%s",
+            "HTTP intake authentication refused: peer=%s forwarded_for=%s mode=%s outcome=%s "
+            "reason=%s",
             peer_host or "unknown",
+            exc.forwarded_for or "-",
             self.intake_auth,
             exc.kind,
             exc.reason,
@@ -1453,10 +1605,12 @@ class HttpSource(SourceConnector):
         sink = self.on_intake_audit
         if sink is None:
             return
+        detail = _with_forwarded(f"mode={self.intake_auth}", exc)
         try:
             # The tamper-evident arm: connection_event is operator-disableable diagnostics, audit_log
-            # is a hash chain they cannot silently switch off.
-            await sink(action, peer_host, f"mode={self.intake_auth}")
+            # is a hash chain they cannot silently switch off. Its client column stays the socket
+            # peer; the forwarded address rides in the detail beside it.
+            await sink(action, peer_host, detail)
         except Exception as sink_exc:  # fail-soft; an audit bug cannot drop an HTTP client
             logger.warning("HTTP intake audit emit failed: %s", safe_exc(sink_exc))
 
@@ -1664,7 +1818,8 @@ class HttpSource(SourceConnector):
             # §7 pre-ingress connection_event (metadata only — never a body or field value). An
             # intake-auth refusal additionally writes its tamper-evident audit row here; it is a no-op
             # for every other kind.
-            await self._emit_event(exc.kind, peer_host=peer_host, reason=exc.reason)
+            reason = _with_forwarded(exc.reason, exc)
+            await self._emit_event(exc.kind, peer_host=peer_host, reason=reason)
             await self._audit_intake_refusal(exc, peer_host)
             await self._write_safely(
                 writer,
