@@ -885,8 +885,7 @@ those nonces. `ide/src/webviewMessaging.ts`
 ## Amendment 2026-11-05 — the four unbuilt external provider names are removed (vault BACKLOG #2595 slice D)
 
 **What changed.** `[store].key_provider` no longer accepts `aws_kms`, `azure_kv`, `gcp_kms` or
-`pkcs11`. The accepted values are `auto`, `env`, `dpapi` and `vault`, and `vault` is the one external
-provider, built in [store/keyprovider_vault.py](../../messagefoundry/store/keyprovider_vault.py).
+`pkcs11`. `vault` is the one external provider, built in [store/keyprovider_vault.py](../../messagefoundry/store/keyprovider_vault.py).
 A removed name is now refused as an unknown name, with the same `KeyProviderError` at store open,
 so selecting one still fails closed and never degrades to the identity (plaintext) cipher. The
 keyless at-rest gate no longer counts a removed name as a configured key: it is judged as any

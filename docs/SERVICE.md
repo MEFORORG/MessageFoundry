@@ -668,13 +668,15 @@ environment.
   file or a folder holding a folder, that sits below a junction, or that is, holds or sits inside
   at least the data, log, store, config, value-file and settings-file folders, NSSM's folder, the
   engine install, the checkout, the Windows folder and Program Files. It refuses a path another
-  service already names as its `MEFOR_SECRETS_DIRECTORY`, so a second service on the same
+  service already names as its `MEFOR_SECRETS_DIRECTORY`, or a folder inside or around one, so a second service on the same
   `-DataDir` needs its own `-SecretsDir`. The installer makes the directory with its owner and
-  access list in one step. The directory starts empty: as an administrator, add one file
-  per setting, named as its variable, and restart the service. Each run makes Administrators the
+  access list in one step. The directory starts empty: as an administrator, create or copy in one
+  file per setting, named as its variable, and restart the service. Do not move a file in: a
+  moved file keeps its old access list. Each run makes Administrators the
   owner and removes every grant there but SYSTEM's, Administrators' and the service account's,
-  whose own grant it keeps, and refuses when any is left. It refuses an existing directory it would
-  adopt for the first time while that holds files, before and after restricting it. A refusal
+  whose own grant it keeps, and refuses when any is left or the account holds no read. It refuses
+  an existing directory it would adopt for the first time while that holds files, before and after
+  restricting it, or while its owner is not Administrators or SYSTEM. A refusal
   after the service is registered sets the service to Disabled. A folder above the directory that the installer
   creates is administrator-only; one that already existed is yours to restrict, since the engine
   does not read it. `uninstall-service.ps1` leaves the directory and its files, names them, and
@@ -694,8 +696,7 @@ environment.
 >
 > Each one's settings and preconditions are in [CONFIGURATION.md](CONFIGURATION.md), under
 > [`[store]`](CONFIGURATION.md#store--message-store--db) and
-> [`[secrets]`](CONFIGURATION.md#secrets--connector-secretprovider-selection); the `[store]` row also
-> lists every key provider the engine accepts. For any other source, fetch the secret in your
+> [`[secrets]`](CONFIGURATION.md#secrets--connector-secretprovider-selection). For any other source, fetch the secret in your
 > service-start wrapper and export it as the corresponding `MEFOR_*` variable, or place the DPAPI key
 > file via your provisioning tool. That covers Windows Credential Manager, Azure Key Vault via a
 > **managed identity**, and any credential with no reference field. An AD **gMSA** has no

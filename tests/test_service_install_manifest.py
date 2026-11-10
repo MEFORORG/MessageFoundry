@@ -3027,8 +3027,10 @@ def test_a_junction_above_the_secrets_directory_is_named(tmp_path: Path) -> None
 @_windows_only
 def test_a_secrets_directory_another_service_names_is_found(tmp_path: Path) -> None:
     """Get-OtherServiceNamingPath, against a services key built under HKCU: a second service whose
-    NSSM environment names the same directory (another case, a trailing backslash) is returned;
-    the installing service itself, and a service naming another directory, are not."""
+    NSSM environment names the same directory (another case, a trailing backslash), the same one
+    through '..' and forward slashes, a folder inside it, or a folder around it is returned; the
+    installing service itself, a sibling whose name only starts the same, a relative value, and a
+    service naming another directory are not."""
     assert _SCRIPT is not None
     root = f"HKCU:\\Software\\MeforTest-{uuid.uuid4().hex[:8]}"
     body = rf"""
@@ -3036,6 +3038,11 @@ def test_a_secrets_directory_another_service_names_is_found(tmp_path: Path) -> N
   try {{
     foreach ($s in @(@('First', 'mefor_secrets_directory=C:\PD\MF-SECRETS\'),
                      @('Mine', 'MEFOR_SECRETS_DIRECTORY=C:\PD\MF-secrets'),
+                     @('Dots', 'MEFOR_SECRETS_DIRECTORY=C:/PD/x/../MF-secrets'),
+                     @('Inside', 'MEFOR_SECRETS_DIRECTORY=C:\PD\MF-secrets\sub'),
+                     @('Around', 'MEFOR_SECRETS_DIRECTORY=C:\PD'),
+                     @('Sibling', 'MEFOR_SECRETS_DIRECTORY=C:\PD\MF-secrets-two'),
+                     @('Relative', 'MEFOR_SECRETS_DIRECTORY=PD\MF-secrets'),
                      @('Other', 'MEFOR_SECRETS_DIRECTORY=C:\PD\elsewhere'))) {{
       $k = New-Item -Path (Join-Path $root "$($s[0])\Parameters") -Force
       Set-ItemProperty -LiteralPath $k.PSPath -Name AppEnvironmentExtra -Type MultiString `
@@ -3053,6 +3060,7 @@ def test_a_secrets_directory_another_service_names_is_found(tmp_path: Path) -> N
                 _SCRIPT,
                 [
                     "Get-OtherServiceNamingPath",
+                    "ConvertTo-NormalPath",
                     "Get-EnvironmentListValue",
                     "Test-EnvironmentEntryNames",
                 ],
@@ -3063,7 +3071,7 @@ def test_a_secrets_directory_another_service_names_is_found(tmp_path: Path) -> N
         .strip()
         .splitlines()[-1]
     )
-    assert got["hits"] == ["First"], got
+    assert sorted(got["hits"]) == ["Around", "Dots", "First", "Inside"], got
 
 
 @_windows_only
@@ -3113,7 +3121,7 @@ def test_the_secrets_directory_refuses_residue_and_held_files(tmp_path: Path) ->
             .splitlines()[-1]
         )
     finally:
-        me = os.environ.get("USERNAME", "")
+        me = subprocess.run(["whoami"], capture_output=True, text=True).stdout.strip()
         subprocess.run(
             ["icacls", str(residue), "/inheritance:e", "/grant", f"{me}:(OI)(CI)F"],
             capture_output=True,

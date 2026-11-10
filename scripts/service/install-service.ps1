@@ -867,8 +867,9 @@ function Get-ReparsePointAncestor {
 
 function Get-OtherServiceNamingPath {
     <#
-      The names of the services, other than $ServiceName, whose NSSM environment names $Path as
-      $Name, case and a trailing backslash aside. Empty when none does.
+      The names of the services, other than $ServiceName, whose NSSM environment names as $Name the
+      directory $Path, a folder inside it, or a folder it sits inside, compared by ConvertTo-NormalPath
+      and ignoring case. Empty when none does. An 8.3 short spelling of either is not recognised.
 
       A SECOND SERVICE ON THE SAME -DataDir GETS THE SAME DEFAULT secrets directory, and
       Set-SecretsDirAcl removes every account's entry but its own service's. So adopting the
@@ -878,14 +879,21 @@ function Get-OtherServiceNamingPath {
     param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$Path,
         [string]$ServicesKey = "HKLM:\SYSTEM\CurrentControlSet\Services")
-    $want = $Path.TrimEnd('\')
+    $want = (ConvertTo-NormalPath $Path) + '\'
     $found = @()
     foreach ($svc in @(Get-ChildItem -LiteralPath $ServicesKey -ErrorAction SilentlyContinue)) {
         if ($svc.PSChildName -eq $ServiceName) { continue }
         $params = Get-Item -LiteralPath (Join-Path $svc.PSPath "Parameters") -ErrorAction SilentlyContinue
         if (-not $params) { continue }
         $named = Get-EnvironmentListValue -List $params.GetValue('AppEnvironmentExtra', $null) -Name $Name
-        if ($named -and ($named.TrimEnd('\') -eq $want)) { $found += $svc.PSChildName }
+        # The engine refuses a relative value, so only an absolute one names a directory.
+        if (-not $named -or ($named -notmatch '^([A-Za-z]:[\\/]|[\\/]{2}[^\\/])')) { continue }
+        # The same directory, or one inside the other: the lockdown of either reaches the other.
+        $theirs = (ConvertTo-NormalPath $named) + '\'
+        if ($theirs.StartsWith($want, [StringComparison]::OrdinalIgnoreCase) -or
+                $want.StartsWith($theirs, [StringComparison]::OrdinalIgnoreCase)) {
+            $found += $svc.PSChildName
+        }
     }
     return $found
 }
@@ -928,7 +936,8 @@ function New-RestrictedDirectory {
     $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
     if ($owner -ne $OwnerSid -or -not $acl.AreAccessRulesProtected) {
         throw ("'$Path' was there before this install made it (its owner is $owner), so it is not " +
-            "the restricted folder the install asked for. Check who made it, and re-run the installer.")
+            "the restricted folder the install asked for. Remove it, check who made it, and re-run " +
+            "the installer.")
     }
     # Read again after the create, as Set-SecretsDirAcl does: a folder above may have become a
     # junction since the preflight judged the path.
@@ -1004,6 +1013,18 @@ function Set-SecretsDirAcl {
         if (-not $acl.AreAccessRulesProtected) { $problems += "it still inherits entries from the folder above" }
         $residue = @(Get-BroadAclResidue -Path $Path -Account $Account)
         if ($residue) { $problems += "it still grants access to: $($residue -join ', ')" }
+        # The account's own read, read back by SID: a spelling of the account that does not
+        # translate would have made its grant look like residue, and the loop above removed it.
+        if ($Account) {
+            $accountSid = ([Security.Principal.NTAccount]$Account).Translate([Security.Principal.SecurityIdentifier]).Value
+            $read = [System.Security.AccessControl.FileSystemRights]::ReadData
+            $held = @($acl.Access | Where-Object {
+                    $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+                    ($_.FileSystemRights -band $read) -eq $read -and
+                    $(try { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $accountSid }
+                        catch { $false }) })
+            if (-not $held) { $problems += "'$Account' holds no read on it, so the service could not read it" }
+        }
     } catch {
         $problems += "its access list could not be read back ($($_.Exception.Message))"
     }
@@ -1027,7 +1048,8 @@ function Get-SecretsDirHeldProblem {
     if ($held.Count -eq 0) { return "" }
     return ("it holds $($held.Count) item(s) the installer did not put there, such as " +
         "'$($held[0].Name)', and the service does not name it. Empty it, check who wrote them, or " +
-        "create a new one, and move each file in after the install")
+        "create a new one, and after the install create or copy each file in, never move one: a " +
+        "moved file keeps its old access list")
 }
 
 function Get-MergedEnvironmentList {
@@ -2107,6 +2129,19 @@ function Resolve-AbsolutePath {
     return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
 }
 
+function ConvertTo-NormalPath {
+    <#
+      $Path, absolute, with '..' and '.' segments and forward slashes resolved and no trailing
+      backslash (a volume root keeps its own). Used for the secrets directory, whose checks compare
+      paths as written. An 8.3 short name is not expanded.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $root = [System.IO.Path]::GetPathRoot($full)
+    if ($full.TrimEnd('\') -eq $root.TrimEnd('\')) { return $root }
+    return $full.TrimEnd('\')
+}
+
 $DataDir = Resolve-AbsolutePath $DataDir
 # -EngineWheel builds the default root further down (vault BACKLOG #2626). Its inputs are read here,
 # before anything acts, and its companions are refused without it rather than silently ignored.
@@ -2191,7 +2226,12 @@ else { $DbPath = Resolve-AbsolutePath $DbPath }
 # sits beside the data directory, not in it: its files are plain, and ADR 0214 keeps them out of
 # what a data-directory backup copies.
 $RegisteredSecretsDir = Get-RegisteredEnvironmentValue -ServiceName $ServiceName -Name "MEFOR_SECRETS_DIRECTORY"
-if ($SecretsDir) { $SecretsDir = Resolve-AbsolutePath $SecretsDir }
+# Every secrets-directory path is compared in one spelling, '..' segments and forward slashes
+# resolved: Get-LockPathProblem's rules and the named and sharer checks compare paths as written.
+if ($RegisteredSecretsDir -and ($RegisteredSecretsDir -match '^([A-Za-z]:[\\/]|[\\/]{2}[^\\/])')) {
+    $RegisteredSecretsDir = ConvertTo-NormalPath $RegisteredSecretsDir
+}
+if ($SecretsDir) { $SecretsDir = ConvertTo-NormalPath (Resolve-AbsolutePath $SecretsDir) }
 elseif ($RegisteredSecretsDir) {
     # A drive path or a UNC path; Path.IsPathFullyQualified is not in Windows PowerShell 5.1.
     if ($RegisteredSecretsDir -notmatch '^([A-Za-z]:\\|\\\\[^\\])') {
@@ -2264,6 +2304,17 @@ if (-not $secretsProblem) {
 $SecretsDirNamed = [bool]$RegisteredSecretsDir -and ($RegisteredSecretsDir.TrimEnd('\') -eq $SecretsDir.TrimEnd('\'))
 if (-not $secretsProblem -and (Test-Path -LiteralPath $SecretsDir) -and -not $SecretsDirNamed) {
     $secretsProblem = Get-SecretsDirHeldProblem -Path $SecretsDir
+    # Only a folder an administrator made is adopted. Whoever made it may hold a handle opened
+    # before the lockdown, and a handle keeps the WRITE_DAC it was granted, so restricting the
+    # folder afterwards does not shut that person out.
+    if (-not $secretsProblem) {
+        $owner = (Get-Acl -LiteralPath $SecretsDir).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($owner -ne "S-1-5-32-544" -and $owner -ne "S-1-5-18") {
+            $secretsProblem = ("it already exists, the service does not name it, and its owner is $owner, " +
+                "not Administrators or SYSTEM. Remove it, check who made it, and re-run the installer, " +
+                "which then makes it restricted")
+        }
+    }
 }
 if ($secretsProblem) {
     throw ("-SecretsDir '$SecretsDir' cannot be the secrets directory: $secretsProblem. Point it at " +
@@ -2716,8 +2767,9 @@ try {
     $replacedSecretsDir = Set-ServiceEnvironmentValue -ServiceName $ServiceName -Name "MEFOR_SECRETS_DIRECTORY" -Value $SecretsDir
     if ($replacedSecretsDir) {
         Write-Warning ("The service's MEFOR_SECRETS_DIRECTORY named '$replacedSecretsDir' and now names " +
-            "'$SecretsDir', as -SecretsDir asked. Move any file from the old directory, and remove " +
-            "the service account's grant there.")
+            "'$SecretsDir', as -SecretsDir asked. Copy each file from the old directory, never move " +
+            "it: a moved file keeps its old access list, not the new directory's. Then delete the old " +
+            "files, and remove the service account's grant there.")
     }
     Write-Host "  Secrets: '$SecretsDir', named to the service as MEFOR_SECRETS_DIRECTORY (docs/SERVICE.md)."
 } catch {
