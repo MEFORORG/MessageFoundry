@@ -209,9 +209,9 @@ async def test_the_queue_marks_the_callers_own_requests_by_user_id(engine: Engin
 async def test_the_queue_marks_a_request_dual_control_no_longer_gates(
     engine: Engine, later: ApprovalsSettings
 ) -> None:
-    """``gated`` is False once the settings no longer gate the operation, and the release it
-    predicts is refused. Held under one app and listed under a second over the same store, as a
-    restart with changed ``[approvals]`` settings gives."""
+    """``release_blocked`` is ``not_gated`` once the settings no longer gate the operation, and the
+    release it predicts is refused. Held under one app and listed under a second over the same
+    store, as a restart with changed ``[approvals]`` settings gives."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     await _add(service, "approver", Role.ADMINISTRATOR)
@@ -222,8 +222,12 @@ async def test_the_queue_marks_a_request_dual_control_no_longer_gates(
         approver = await _token(c, "approver")
         after = (await c.get("/approvals", headers=approver)).json()
         released = await c.post(f"/approvals/{approval_id}/approve", headers=approver)
-    assert [a["gated"] for a in before["approvals"] if a["id"] == approval_id] == [True]
-    assert [a["gated"] for a in after["approvals"] if a["id"] == approval_id] == [False]
+    assert [a["release_blocked"] for a in before["approvals"] if a["id"] == approval_id] == [None]
+    assert [a["release_blocked"] for a in after["approvals"] if a["id"] == approval_id] == [
+        "not_gated"
+    ]
+    # Vault BACKLOG #3193 N3: the redundant ``gated`` flag is gone; ``release_blocked`` carries it.
+    assert all("gated" not in a for a in before["approvals"] + after["approvals"])
     assert released.status_code == 409
     assert await _status_of(engine, approval_id) == "pending"
 

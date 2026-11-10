@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A minimal synthetic ASC X12 interchange builder, and the TA1 a harness X12 sink answers with.
 
-Neither ``messagefoundry.generators`` (HL7 v2 only) nor ``messagefoundry.parsing.x12`` (a codec,
+Neither ``messagefoundry_toolkit.generators`` (HL7 v2 only) nor ``messagefoundry.parsing.x12`` (a codec,
 not a builder) builds an interchange, so this small one lives with the harness. Every value is
 synthetic and fixed except the control numbers: there is no patient, subscriber or provider in it,
 only an envelope around one bare 837 transaction header. ISA15 is ``T`` (test data), so nothing

@@ -110,8 +110,10 @@ jobs:
       # dependency-names is comma-separated for grouped PRs; the group is denied WHOLE if ANY member
       # is ineligible — the same fail-safe the deny-list had, never a partial group merge. Measured
       # consequence: PR #75's five-bump batch carried `pypa/gh-action-pypi-publish`, which is NOT on
-      # the allow row, so that batch would now HOLD — and that action runs in the `id-token: write`
-      # publish job, which is exactly the case worth holding.
+      # the allow row, so that batch would now HOLD — and that action then ran in the `id-token: write`
+      # publish job, which is exactly the case worth holding. Since BACKLOG #5046 that job runs the
+      # action's image by digest instead, which Dependabot does not track at all, so no bump of it
+      # reaches this guard; release.yml's header says how the digest is moved by hand.
       #
       # Every input arrives via `env:`; nothing is interpolated into the body. That is zizmor
       # template-injection parity, and it is what lets the behavioural tests execute this body

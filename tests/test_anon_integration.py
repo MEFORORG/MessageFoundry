@@ -21,9 +21,9 @@ from harness.load.corpus import corpus_from_file
 from harness.load.ids import ControlIds
 from harness.load.profile import LoadProfileError, TypeMix
 from harness.reconcile.capture import CaptureSink
-from messagefoundry.anon import DEFAULT_RULES, FieldRule, SurrogateKind, anonymize
 from messagefoundry.parsing import Peek
 from messagefoundry.transports.mllp import frame
+from messagefoundry_toolkit.anon import DEFAULT_RULES, FieldRule, SurrogateKind, anonymize
 from tee.__main__ import main as tee_main
 from tee.store import RelayStore
 from tests._refusal_log_capture import TOKEN, assert_no_token, record_texts

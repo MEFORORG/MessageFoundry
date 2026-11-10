@@ -229,3 +229,77 @@ def test_a_scheduled_prompt_written_as_a_user_record_is_recognised(config_root: 
     first = {"type": "user", "message": {"role": "user", "content": '<scheduled-task name="t">'}}
     write_transcript(config_root, "D--repo", "ffffffff-1111", first)
     assert scheduled(config_root, "ffffffff-1111") is True
+
+
+def _roots_and_records(home: str | None, cwd: Path | None = None) -> dict[str, Any]:
+    """Get-ClaudeConfigRoots and Get-SessionRecords with USERPROFILE set to ``home``, or unset.
+
+    Any error the reads write fails the call: pwsh -Command exits 0 when only its last statement
+    succeeds, so a throw inside a read would otherwise go unseen."""
+    env = {
+        k: v for k, v in os.environ.items() if k.upper() not in {"USERPROFILE", "CLAUDE_CONFIG_DIR"}
+    }
+    if home is not None:
+        env["USERPROFILE"] = home
+    script = (
+        f". '{REGISTRY}'; "
+        "$roots = @(Get-ClaudeConfigRoots | ForEach-Object { Split-Path $_ -Leaf }); "
+        "$recs = @(Get-SessionRecords -IncludeUnreadable | "
+        "ForEach-Object { if ($_.Unreadable) { 'unreadable:' + (Split-Path $_.File -Leaf) } "
+        "else { [string]$_.Record.sessionId } }); "
+        "[pscustomobject]@{ Roots = $roots; Records = $recs } | ConvertTo-Json -Compress"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        env=env,
+        cwd=cwd,
+    )
+    assert proc.returncode == 0 and not proc.stderr.strip(), proc.stderr
+    parsed: dict[str, Any] = json.loads(proc.stdout.strip())
+    return parsed
+
+
+def test_every_root_and_record_under_the_profile_is_read_by_its_own_name(tmp_path: Path) -> None:
+    """Vault BACKLOG #2985. The reads took paths as wildcard patterns and skipped hidden records: a
+    root named .claude[1] was dropped, [1].json read as 1.json, and a hidden record was not listed.
+    Every one is read now, each by its own name."""
+    home = tmp_path / "home[1]"
+    for leaf, sid in ((".claude", "plain"), (".claude[1]", "in-bracketed-root")):
+        (home / leaf / "sessions").mkdir(parents=True)
+        write_session(home / leaf, pid=1, session_id=sid)
+    sessions = home / ".claude" / "sessions"
+    (sessions / "[1].json").write_text(json.dumps({"sessionId": "bracketed-name"}), "utf-8")
+    hidden = sessions / "2.json"
+    hidden.write_text(json.dumps({"sessionId": "hidden"}), encoding="utf-8")
+    subprocess.run(["attrib", "+h", "+s", str(hidden)], check=True, capture_output=True)
+    # A directory named as a record, hidden or not, is listed and reads as unreadable.
+    for name in ("dir.json", "hidden-dir.json"):
+        (sessions / name).mkdir()
+    subprocess.run(["attrib", "+h", str(sessions / "hidden-dir.json")], check=True)
+
+    got = _roots_and_records(str(home))
+    assert sorted(got["Roots"]) == [".claude", ".claude[1]"], got
+    assert sorted(got["Records"]) == sorted(
+        [
+            "plain",
+            "bracketed-name",
+            "hidden",
+            "in-bracketed-root",
+            "unreadable:dir.json",
+            "unreadable:hidden-dir.json",
+        ]
+    ), got
+
+
+def test_an_unset_profile_names_no_config_root(tmp_path: Path) -> None:
+    """With no USERPROFILE there is no root to read, and the reads return empty. A -LiteralPath read
+    of a null path throws, and the -Path read before it listed the current directory, so the run
+    stands in a directory holding a registry: 0a7ccdca1c read that registry as a root."""
+    in_cwd = tmp_path / ".claude"
+    (in_cwd / "sessions").mkdir(parents=True)
+    write_session(in_cwd, pid=1, session_id="in-the-cwd")
+    assert _roots_and_records(None, cwd=tmp_path) == {"Roots": [], "Records": []}

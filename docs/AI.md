@@ -79,7 +79,7 @@ The policy is two independent axes, then **clamped** by the instance's **product
    `code_only`.
 3. **`deidentified` hard rule** — `deidentified` always falls back to `code_only` today, because **no
    de-identification is wired into the AI-assist path**. (A de-id framework,
-   [`messagefoundry/anon/`](../messagefoundry/anon/) / ADR 0030, exists to build de-identified
+   [`messagefoundry_toolkit/anon/`](../messagefoundry_toolkit/anon/) / ADR 0030, exists to build de-identified
    **test datasets**; it does not de-identify message bodies flowing to the assistant. Its output
    is de-identified, not guaranteed free of PHI: [PHI.md §9](PHI.md#9-de-identification) says what
    its leak-check refuses and what it lets through.)
@@ -284,7 +284,7 @@ editor.
   **only** path by which `phi` scope ever becomes reachable.
 - **Runtime de-identification** (the `deidentified` scope) is **roadmap only** — the AI-assist path has
   no message de-identification wired in today, so the scope falls back to `code_only`. (A de-id
-  framework, [`messagefoundry/anon/`](../messagefoundry/anon/) / ADR 0030, exists to build
+  framework, [`messagefoundry_toolkit/anon/`](../messagefoundry_toolkit/anon/) / ADR 0030, exists to build
   de-identified **test datasets**; it does not de-identify message bodies for the live assistant.)
   See [PHI.md §9](PHI.md#9-de-identification), which also says what that framework's leak-check
   lets through.

@@ -22,6 +22,13 @@ this line.**
 
 ### Added
 
+- **Directory-account enrolment codes (ADR 0207, BACKLOG #2609).** A directory account's user page
+  offers "Issue enrolment code" and "Revoke enrolment code", each behind its own single-use step-up,
+  and the issue shows the code once with the handover rule. An MFA reset of an enabled directory
+  account shows the code it issued. The TOTP confirm form and the passkey page carry an enrolment
+  code field when the session owes one, the passkey page script sends it in its body, and the
+  account page tells a directory user with no factor to ask an Administrator through the site's
+  identity check, not by mail or chat.
 - **The sign-in page offers a combined passkey sign-in.** A "Sign in with password and passkey"
   button runs a usernameless passkey ceremony (`POST /ui/login/passkey`, which charges the sign-in
   window first and sets the challenge's handle as an HttpOnly cookie) and submits the assertion with
@@ -69,6 +76,24 @@ this line.**
 
 ### Security
 
+- **The cookie WebSocket gate records its answer for the engine's accept gate.** `authorize_ui_ws`
+  records on the handshake whether it admitted the caller, which the engine's accept gate reads,
+  the latest recorded answer standing. A handshake with no Origin is not this gate's to judge, so it
+  records nothing there. Needs the engine seam that carries `api.security.record_ws_gate`. See
+  [`docs/SECURITY.md`](../../docs/SECURITY.md). (vault BACKLOG #2955)
+- **One issued continuation mints one grant, even when two re-auths race it.** `POST /ui/reauth`
+  and the federated start `POST /ui/reauth/oidc` now take the issue before the password check or
+  the flow is staged, so a second tab re-authenticating toward the same confirm page meanwhile
+  mints nothing. A wrong password, or a refused IdP prompt, gives the issue back, so the retry still
+  continues. Auto-retry actions and action-bound confirm pages each have their own cap of eight
+  issues per session, so a run of confirm pages no longer evicts an action the operator is
+  confirming. (vault BACKLOG #3241, added items 7 to 9)
+- **A bookmarked confirm page costs one re-auth, not two.** A link to an action-bound confirm page
+  opened from outside the browser is not issued, so `GET /ui/reauth` toward it now shows a link to
+  the page instead of a password form whose re-auth would mint nothing. Following the link issues
+  the page, and the one re-auth then mints its grant. The bulk purge confirm page also keeps its
+  destination and scope selection across the re-auth, up to the 512-character cap on `next`.
+  (vault BACKLOG #3241, added item 2 and step 1)
 - **A channel-scoped caller's bad flag direction gets the audited 403.** `POST
   /ui/connections/{name}/flag` answered 404 for a direction other than `inbound` or `outbound`
   before the engine handler's scope check, so on a first deployment such a caller's probe there
@@ -206,6 +231,11 @@ this line.**
   listing, not every route to the fact; [`docs/SECURITY.md`](../../docs/SECURITY.md) says what it
   leaves out. Seam change: `list_approvals` takes `request`, which the handshake does not check, so
   this console and an engine without that change raise TypeError on the page. (BACKLOG #3747)
+- **An edit-resend the engine refuses with a 403, 404 or 409 now spends its proof.** The editor
+  and the next submit ask for a new re-auth after such a refusal, as they do after a refusal at
+  the store write. That re-auth reopens the editor on the stored body, so the typed edit is lost.
+  Any other refusal before the store write still gives the proof back. The change is in the
+  engine handler the console calls; no seam changes. (BACKLOG #3241)
 
 ### Fixed
 
@@ -215,6 +245,12 @@ this line.**
   503 a later handler change adds is no longer named as the store's refusal. The console now catches
   the engine's `ConfigWriteNotRecorded` and re-raises any other 503. Needs the engine seam that
   carries `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
+- **The Approvals page offers no Approve on a held reload that names no config digest.** The
+  engine marks it `release_blocked: "params_no_fingerprint"`, and the page offers Reject, or
+  Withdraw on the requester's own row, with a note saying why. A held reload's digest parameter
+  that is null or not of the form the engine writes is shown as that refusal, never raw.
+  Needs the engine seam that carries that value; the same seam drops `PendingApprovalInfo.gated`,
+  which the page never read. (vault `BACKLOG #3192`, `#3193`)
 
 ## [0.5.0] — 2026-10-20 — Early Access
 

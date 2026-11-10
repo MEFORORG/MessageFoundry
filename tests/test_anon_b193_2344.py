@@ -19,8 +19,8 @@ from types import ModuleType
 
 import pytest
 
-from messagefoundry.anon import leak as engine_leak
-from messagefoundry.anon import surrogates as engine_surrogates
+from messagefoundry_toolkit.anon import leak as engine_leak
+from messagefoundry_toolkit.anon import surrogates as engine_surrogates
 from tee.anon import leak as tee_leak
 from tee.anon import surrogates as tee_surrogates
 
@@ -78,7 +78,7 @@ def _engine_load(monkeypatch: pytest.MonkeyPatch, module_file: Path) -> ModuleTy
 def test_the_engine_loader_does_not_run_a_guard_planted_anywhere_but_the_import_root(
     depth: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    module_file = _module_file(tmp_path, "messagefoundry")
+    module_file = _module_file(tmp_path, "messagefoundry_toolkit")
     marker = _plant(module_file.parents[depth])
     with pytest.raises(engine_leak.LeakCheckUnavailable):
         _engine_load(monkeypatch, module_file)
@@ -99,7 +99,7 @@ def test_the_engine_loader_runs_the_guard_at_the_import_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The control for the tests above: the marker does appear when a guard runs."""
-    module_file = _module_file(tmp_path, "messagefoundry")
+    module_file = _module_file(tmp_path, "messagefoundry_toolkit")
     marker = _plant(module_file.parents[_IMPORT_ROOT])
     loaded = _engine_load(monkeypatch, module_file)
     assert marker.exists()
@@ -117,7 +117,7 @@ def test_the_tee_loader_runs_the_guard_at_the_import_root(tmp_path: Path) -> Non
 def test_the_guard_at_the_import_root_wins_over_one_planted_above_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    module_file = _module_file(tmp_path, "messagefoundry")
+    module_file = _module_file(tmp_path, "messagefoundry_toolkit")
     ours = _plant(module_file.parents[_IMPORT_ROOT])
     planted = _plant(module_file.parents[_IMPORT_ROOT + 1])
     _engine_load(monkeypatch, module_file)
@@ -130,7 +130,7 @@ def test_the_leak_check_still_refuses_when_no_guard_is_at_the_import_root(
 ) -> None:
     """Fail-closed: with a guard planted above and none at the root, the check raises. It does
     not report the text clean."""
-    module_file = _module_file(tmp_path, "messagefoundry")
+    module_file = _module_file(tmp_path, "messagefoundry_toolkit")
     marker = _plant(module_file.parents[_IMPORT_ROOT + 1])
     monkeypatch.setattr(engine_leak, "__file__", str(module_file))
     monkeypatch.setattr(engine_leak, "_scanner", engine_leak._scanner.__wrapped__)

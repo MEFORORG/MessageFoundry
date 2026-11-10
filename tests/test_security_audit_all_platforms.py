@@ -12,7 +12,10 @@ pip-audit). ``tests/test_audit_all_platforms.py`` pins the engine's workflows to
 
 from __future__ import annotations
 
+import codecs
+import locale
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -23,6 +26,7 @@ import pytest
 from messagefoundry.childenv import python_module_argv
 from messagefoundry.security import audit_all_platforms as audit_module
 from messagefoundry.security.audit_all_platforms import (
+    _URL_SCHEMES,
     PUBLISHED_DISTRIBUTIONS,
     _run,
     _skip_private_refusal,
@@ -166,7 +170,7 @@ def test_the_committed_lock_is_install_checked_then_the_stripped_copy_audited(
     seen: list[tuple[list[str], str]] = []
 
     def run(cmd: list[str]) -> int:
-        seen.append((cmd, Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8")))
+        seen.append((cmd, Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8-sig")))
         return 0 if len(seen) == 1 else 1
 
     # The audit's status is the script's status, so a finding still reds the step.
@@ -191,6 +195,711 @@ def test_the_committed_lock_is_install_checked_then_the_stripped_copy_audited(
     assert "colorama==0.4.6 ; sys_platform == 'win32'" in out
 
 
+#: Each ``(a requirement's first line, what the copy must read, the un-gated entry or None)``. Vault
+#: BACKLOG #3786 L2: the strip split at the first ``;`` and dropped everything after it, so the
+#: first case lost both hashes, the bare URL case lost the end of its URL, and the comment case was
+#: listed as un-gated with its comment for a marker. Each split is where pip 26's
+#: parse_req_from_line makes it: at the first ``;`` of a ``name @ URL``, and at ``; `` after a bare
+#: URL.
+_ONE_LINE_CASES = [
+    (
+        "colorama==0.4.6; sys_platform == 'win32' --hash=sha256:aa --hash=sha256:bb",
+        "colorama==0.4.6 --hash=sha256:aa --hash=sha256:bb",
+        "colorama==0.4.6 ; sys_platform == 'win32'",
+    ),
+    (
+        "pkg @ https://host.invalid/pkg-1.0-py3-none-any.whl;sys_platform == 'win32' --hash=sha256:aa",
+        "pkg @ https://host.invalid/pkg-1.0-py3-none-any.whl --hash=sha256:aa",
+        "pkg @ https://host.invalid/pkg-1.0-py3-none-any.whl ; sys_platform == 'win32'",
+    ),
+    # pip's is_url reads the scheme before the first ":", so with no space this is no URL.
+    (
+        "pkg@https://host.invalid/pkg-1.0-py3-none-any.whl;sys_platform=='win32'",
+        "pkg@https://host.invalid/pkg-1.0-py3-none-any.whl",
+        "pkg@https://host.invalid/pkg-1.0-py3-none-any.whl ; sys_platform=='win32'",
+    ),
+    ("file:/wheels/a;b.whl --hash=sha256:aa", "file:/wheels/a;b.whl --hash=sha256:aa", None),
+    (
+        "https://host.invalid/a;b.whl --hash=sha256:aa",
+        "https://host.invalid/a;b.whl --hash=sha256:aa",
+        None,
+    ),
+    (
+        "https://host.invalid/a;b.whl ; sys_platform == 'win32' --hash=sha256:aa",
+        "https://host.invalid/a;b.whl --hash=sha256:aa",
+        "https://host.invalid/a;b.whl ; sys_platform == 'win32'",
+    ),
+    ("idna==3.2  # pinned; see the note", "idna==3.2  # pinned; see the note", None),
+    (
+        "sspilib==0.6.0 ; sys_platform == 'win32'  # Windows only; SSPI",
+        "sspilib==0.6.0  # Windows only; SSPI",
+        "sspilib==0.6.0 ; sys_platform == 'win32'",
+    ),
+]
+
+
+@pytest.mark.parametrize(("line", "copy", "entry"), _ONE_LINE_CASES)
+def test_a_marker_is_found_where_pip_finds_it(line: str, copy: str, entry: str | None) -> None:
+    """Options after the marker stay; a ``;`` inside a bare URL or a comment is not a marker."""
+    text, stripped, requirements = strip_markers(f"{line}\n")
+    assert (text, stripped, requirements) == (f"{copy}\n", [entry] if entry else [], 1)
+
+
+def test_a_hash_after_the_marker_reaches_pip_audit(tmp_path: Path) -> None:
+    """End to end: the copy pip-audit is handed still carries the one-line hashes."""
+    src = tmp_path / "x.lock"
+    src.write_text(f"{_ONE_LINE_CASES[0][0]}\n", encoding="utf-8")
+    seen: list[str] = []
+
+    def run(cmd: list[str]) -> int:
+        seen.append(Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8-sig"))
+        return 0
+
+    assert main([str(src)], run=run) == 0
+    assert seen[1] == f"{_ONE_LINE_CASES[0][1]}\n"
+
+
+_LATIN1_LOCK = (
+    b"# -*- coding: latin-1 -*-\n# note: caf\xe9\nidna==3.20 ; os_name == 'nt' \\\n"
+    b"    --hash=sha256:aa\n"
+)
+
+
+def test_a_pep_263_declaration_is_honoured_and_kept_in_the_copy(tmp_path: Path) -> None:
+    """Vault BACKLOG #3786 L3. pip decodes by the declaration; reading UTF-8 raised a traceback.
+
+    The copy keeps the declaration, so it is written in the encoding it declares.
+    """
+    src = tmp_path / "x.lock"
+    src.write_bytes(_LATIN1_LOCK)
+    assert read_lock(src) == _LATIN1_LOCK.decode("latin-1")
+    seen: list[bytes] = []
+
+    def run(cmd: list[str]) -> int:
+        seen.append(Path(cmd[cmd.index("-r") + 1]).read_bytes())
+        return 0
+
+    assert main([str(src)], run=run) == 0
+    copy = seen[1].replace(b"\r\n", b"\n")
+    assert copy == _LATIN1_LOCK.replace(b" ; os_name == 'nt'", b"")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "# -*- coding: utf-16 -*-\nidna==3.20 ; os_name == 'nt'\n".encode("utf-16"),
+        b"# owner: \xc3\x81vila\nidna==3.20 ; os_name == 'nt'\n",
+    ],
+    ids=["bom-outranks-declaration", "plain-utf-8"],
+)
+def test_a_copy_not_ruled_by_a_declaration_carries_a_utf8_bom(tmp_path: Path, raw: bytes) -> None:
+    """Vault BACKLOG #3786: pip-audit's parser takes a byte-order mark first and the locale, not
+    UTF-8, last. A copy written as bare UTF-8 was read by a declaration the BOM had outranked, or by
+    a Windows runner's code page."""
+    src = tmp_path / "x.lock"
+    src.write_bytes(raw)
+    seen: list[bytes] = []
+
+    def run(cmd: list[str]) -> int:
+        seen.append(Path(cmd[cmd.index("-r") + 1]).read_bytes())
+        return 0
+
+    assert main([str(src)], run=run) == 0
+    assert seen[1].startswith(b"\xef\xbb\xbf")
+    assert b"idna==3.20\n" in seen[1].replace(b"\r\n", b"\n")
+
+
+def test_a_lock_that_cannot_be_read_is_refused_with_an_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ran, run = _recorder(0)
+    assert main([str(tmp_path / "missing.lock")], run=run) == 2
+    assert not ran
+    assert "not readable" in capsys.readouterr().err
+
+
+def test_a_declaration_after_the_second_line_is_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pip looks at two lines only, so this lock is UTF-8, and the latin-1 byte falls to the locale."""
+    monkeypatch.setattr("locale.getencoding", lambda: "utf-8")
+    src = tmp_path / "x.lock"
+    src.write_bytes(b"# one\n# two\n" + _LATIN1_LOCK)
+    ran, run = _recorder(0)
+    assert main([str(src)], run=run) == 2
+    assert not ran
+
+
+@pytest.mark.parametrize(
+    ("raw", "named"),
+    [
+        (
+            b"# -*- coding: no-such-codec -*-\nidna==3.20\n",
+            "LookupError: unknown encoding: no-such-codec",
+        ),
+        (
+            b"# caf\xe9\nidna==3.20\n",
+            "UnicodeDecodeError: 'utf-8' codec cannot decode at position 5",
+        ),
+    ],
+    ids=["unknown-codec", "undecodable"],
+)
+def test_a_lock_pip_cannot_decode_is_refused_with_an_error(
+    raw: bytes,
+    named: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exit 2 and an ``::error::``, rather than a traceback (exit 1, read as a finding)."""
+    monkeypatch.setattr("locale.getencoding", lambda: "utf-8")
+    src = tmp_path / "x.lock"
+    src.write_bytes(raw)
+    ran, run = _recorder(0)
+    assert main([str(src)], run=run) == 2
+    assert not ran
+    err = capsys.readouterr().err
+    assert "not decodable the way pip decodes" in err
+    # The codec error's own text names the byte it failed on (vault BACKLOG #3033, #3185); the
+    # line names the error's type, and for a codec error its position, never the byte.
+    assert named in err, err
+    assert "\\xe9" not in err and "0xe9" not in err, err
+
+
+def test_a_copy_the_declared_codec_cannot_write_is_refused_without_its_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The idna codec decodes an empty label but cannot encode one, so the copy write fails."""
+    src = tmp_path / "x.lock"
+    src.write_bytes(b"# coding: idna\nidna==3.20 # a..b\n")
+    ran, run = _recorder(0)
+    assert main([str(src)], run=run) == 2
+    assert len(ran) == 1  # the dry-run install check ran; pip-audit did not
+    err = capsys.readouterr().err
+    assert "its copy is not writable as idna: UnicodeEncodeError: 'idna' codec cannot encode" in err
+    assert "label empty" not in err and "\\x2e" not in err, err
+
+
+def test_a_declared_codec_never_hands_pip_audit_a_truncated_copy(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Lander hold on PR 2840: a text-mode copy write never finalized its encoder, and the idna codec
+    holds back the last label, so everything after the lock's last ``.`` was dropped. pip-audit got
+    one of three pins and the run exited 0. Encoding the copy in one call makes the codec see all of
+    it, and this lock has a label too long to encode, so it is refused."""
+    digest = "a" * 64
+    src = tmp_path / "x.lock"
+    src.write_text(
+        "# coding: idna\n"
+        f"idna==3.10 --hash=sha256:x.y --hash=sha256:{digest}\n"
+        f"evil==1 --hash=sha256:{digest}\n"
+        f"worse==2 --hash=sha256:{digest}\n",
+        encoding="ascii",
+        newline="\n",
+    )
+    copies: list[bytes] = []
+
+    def run(cmd: list[str]) -> int:
+        if "pip_audit" in cmd:
+            copies.append(Path(cmd[cmd.index("-r") + 1]).read_bytes())
+        return 0
+
+    status = main([str(src)], run=run)
+    assert copies == [], copies  # was one copy holding only "idna==3.10 --hash=sha256:x."
+    assert status == 2
+    err = capsys.readouterr().err
+    assert "its copy is not writable as idna: UnicodeEncodeError: 'idna' codec cannot encode" in err
+    assert "label too long" in err, err
+    assert "evil" not in err and "worse" not in err, err
+
+
+def _lines_pip_audit_reads(raw: bytes) -> list[str]:
+    """The copy's lines as pip-audit 2.10.1 gets them: pip-requirements-parser 32.0.1's
+    ``auto_decode`` (a mark, else a first-two-lines declaration, else the locale), then
+    ``str.splitlines``. Written here apart from the module's own reader, so the test does not take
+    the code under test as its oracle."""
+    return [ln.strip() for ln in _text_pip_audit_reads(raw).splitlines()]
+
+
+def _text_pip_audit_reads(raw: bytes) -> str:
+    """The copy's text as pip-requirements-parser 32.0.1's ``auto_decode`` gives it."""
+    boms = [
+        (codecs.BOM_UTF8, "utf-8"),
+        (codecs.BOM_UTF16, "utf-16"),
+        (codecs.BOM_UTF16_BE, "utf-16-be"),
+        (codecs.BOM_UTF16_LE, "utf-16-le"),
+        (codecs.BOM_UTF32, "utf-32"),
+        (codecs.BOM_UTF32_BE, "utf-32-be"),
+        (codecs.BOM_UTF32_LE, "utf-32-le"),
+    ]
+    text = next((raw[len(bom) :].decode(name) for bom, name in boms if raw.startswith(bom)), None)
+    if text is None:
+        cookies = [m for ln in raw.split(b"\n")[:2] if ln[:1] == b"#" and (m := _COOKIE.search(ln))]
+        encoding = cookies[0][1].decode("ascii") if cookies else locale.getpreferredencoding(False)
+        text = raw.decode(encoding)
+    return text
+
+
+_COOKIE = re.compile(rb"coding[:=]\s*([-\w.]+)")
+_DIGEST = "a" * 64
+_EVIL = f"evil==1 --hash=sha256:{_DIGEST}"
+_REFUSED = "its copy does not read back, the way pip-audit reads it, as the text whose pins"
+
+
+def _audit_copies(src: Path) -> tuple[int, list[list[str]]]:
+    """``main``'s status on ``src``, and each copy pip-audit was handed, as it reads the lines."""
+    copies: list[list[str]] = []
+
+    def run(cmd: list[str]) -> int:
+        if "pip_audit" in cmd:
+            copies.append(_lines_pip_audit_reads(Path(cmd[cmd.index("-r") + 1]).read_bytes()))
+        return 0
+
+    return main([str(src)], run=run), copies
+
+
+@pytest.mark.parametrize("scheme", ["git", "svn"])
+def test_a_bare_vcs_scheme_is_no_url_so_its_marker_is_stripped(
+    scheme: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Lander hold 5 on PR 2840 (issuecomment-6738522998): bare ``git`` and ``svn`` were read as URL
+    schemes, which neither pip 26's ``is_url`` nor pip-requirements-parser 32.0.1's takes, so the
+    marker after a ``;`` with no space was kept. pip-audit's parser split it off and skipped the pin
+    for its false marker, while the run exited 0 and counted it audited."""
+    url = f"{scheme}://h/evil-1.0-py3-none-any.whl"
+    digest = f"--hash=sha256:{_DIGEST}"
+    src = tmp_path / "x.lock"
+    src.write_text(f"{url};sys_platform=='zz' {digest}\nbar==2 {digest}\n", encoding="utf-8")
+    status, copies = _audit_copies(src)
+    out = capsys.readouterr().out
+    # Was the lock's own first line, marker and all, with "0 un-gated".
+    assert (status, copies) == (0, [[f"{url} {digest}", f"bar==2 {digest}"]])
+    assert "2 pinned requirements audited, 1 un-gated" in out
+    assert f"  {url} ; sys_platform=='zz'\n" in out
+
+
+def test_the_url_schemes_are_the_parsers() -> None:
+    """The set is pip-requirements-parser 32.0.1's ``is_url`` list, copied here as that file writes
+    it (pip 26.3's ``vcs.all_schemes`` holds the same 22), so a drift in the module's table shows."""
+    vcs_all_schemes = [
+        "bzr+http", "bzr+https", "bzr+ssh", "bzr+sftp", "bzr+ftp", "bzr+lp", "bzr+file",
+        "git+http", "git+https", "git+ssh", "git+git", "git+file",
+        "hg+file", "hg+http", "hg+https", "hg+ssh", "hg+static-http",
+        "svn+ssh", "svn+http", "svn+https", "svn+svn", "svn+file",
+    ]  # fmt: skip
+    assert frozenset(["http", "https", "file", "ftp", *vcs_all_schemes]) == _URL_SCHEMES
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # unicode_escape escapes every newline, so the copy is one line, its declaration is no
+        # longer at the start of a line, and pip-audit reads one pin with the rest as its options.
+        (f"bar==1 --hash=sha256:{_DIGEST}\n# coding: unicode_escape\n{_EVIL}\n").encode("ascii"),
+        # raw_unicode_escape decodes the two escapes below to a backslash and a line separator,
+        # which str.splitlines breaks on; it encodes the pair back as a backslash and an escaped
+        # line separator, which it decodes as written, so pip-audit reads evil inside the comment.
+        (
+            f"bar==1 --hash=sha256:{_DIGEST}\n# coding: raw_unicode_escape\n"
+            f"# note \\u005c\\u2028{_EVIL}\n"
+        ).encode("ascii"),
+    ],
+    ids=["unicode_escape", "raw_unicode_escape"],
+)
+def test_a_copy_pip_audit_would_read_short_is_refused(
+    raw: bytes, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Lander hold on PR 2840 (issuecomment-6734482781): a declared codec whose encode does not
+    round-trip handed pip-audit a copy with fewer pins than the count, and the run exited 0. The copy
+    is now read back as pip-audit reads it and refused unless that is the counted text."""
+    src = tmp_path / "x.lock"
+    src.write_bytes(raw)
+    status, copies = _audit_copies(src)
+    out, err = capsys.readouterr()
+    # Was exit 0, "2 pinned requirements audited", and one copy without the evil pin.
+    assert copies == [], (status, out, copies)
+    assert status == 2
+    assert _REFUSED in err, err
+    # Neither the lock's pins nor its codec name, which is the lock's own text.
+    assert "evil" not in err and "bar==" not in err and "escape" not in err, err
+
+
+def test_a_copy_pip_audit_would_read_by_its_own_locale_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lone CR keeps the declaration on pip's second byte-line, but the copy's newline puts it on
+    the third, where pip-audit does not look, so pip-audit decodes the copy by its own locale. That
+    is a child process whose UTF-8 mode need not be the auditor's: an auditor started with -X utf8
+    read U+2028 back and passed, while a cp1252 pip-audit kept evil inside the comment. The patch
+    stands in for that auditor; the reader no longer consults the locale, so it changes nothing
+    now, and without it the earlier reader refused this lock only where the locale was not UTF-8."""
+    monkeypatch.setattr("locale.getpreferredencoding", lambda do_setlocale=True: "utf-8")
+    src = tmp_path / "x.lock"
+    src.write_bytes(
+        b"# x\r# y\n# coding: utf-8\n# note \xe2\x80\xa8"
+        + f"{_EVIL}\nbar==1 --hash=sha256:{_DIGEST}\n".encode("ascii")
+    )
+    status, copies = _audit_copies(src)
+    assert (status, copies) == (2, []), copies  # was exit 0
+    assert _REFUSED in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        f"# owner: \N{LATIN CAPITAL LETTER A WITH ACUTE}vila\n"
+        f"idna==3.20 ; os_name == 'nt' --hash=sha256:{_DIGEST}\n{_EVIL}\n".encode(),
+        b"# -*- coding: latin-1 -*-\n# note: caf\xe9\n"
+        + f"idna==3.20 ; os_name == 'nt' --hash=sha256:{_DIGEST}\n{_EVIL}\n".encode("ascii"),
+    ],
+    ids=["utf-8", "latin-1-declared"],
+)
+def test_a_copy_that_reads_back_whole_hands_pip_audit_every_pin(tmp_path: Path, raw: bytes) -> None:
+    """The control for the refusal above: an ordinary lock still reaches pip-audit, every pin in it."""
+    src = tmp_path / "x.lock"
+    src.write_bytes(raw)
+    status, copies = _audit_copies(src)
+    assert status == 0
+    assert len(copies) == 1
+    assert f"idna==3.20 --hash=sha256:{_DIGEST}" in copies[0], copies
+    assert _EVIL in copies[0], copies
+
+
+def test_a_copy_whose_read_back_fails_is_refused_without_the_error_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-back that raises is refused with the same fixed line, naming none of the error."""
+
+    def fail(raw: bytes) -> str:
+        raise UnicodeDecodeError("utf-8", b"\xe9", 0, 1, "invalid continuation byte")
+
+    monkeypatch.setattr("messagefoundry.security.audit_all_platforms._read_as_pip_audit", fail)
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    status, copies = _audit_copies(src)
+    assert (status, copies) == (2, [])
+    err = capsys.readouterr().err
+    assert _REFUSED in err, err
+    assert "invalid continuation" not in err and "xe9" not in err, err
+
+
+def _requirements_pip_audit_reads(raw: bytes) -> list[str]:
+    """The requirement lines pip-requirements-parser 32.0.1 makes of the copy: ``join_lines`` joins
+    a line ending in a backslash, unless it is a comment, to the next, with its backslashes stripped;
+    ``split_comments`` drops each comment and blank line; a line left that does not start with an
+    option is a requirement. It does not count an ``-e`` line, which the parser does, and which no
+    copy the auditor hands on holds. Written apart from the module's model but from the same parser source,
+    so it shares any misreading of that source; the recorded counts below are the parser's own."""
+    comment = re.compile(r"(^|\s+)(#.*)$")
+    logical: list[str] = []
+    pending = ""
+    for line in _text_pip_audit_reads(raw).splitlines():
+        if line.endswith("\\") and not comment.match(line):
+            pending += line.strip("\\")
+            continue
+        logical.append(pending + (f" {line}" if comment.match(line) else line))
+        pending = ""
+    logical.append(pending)
+    texts = ([p.strip() for p in comment.split(ln) if p.strip()] for ln in logical)
+    return [t[0] for t in texts if t and t[0][:1] not in ("#", "-")]
+
+
+@pytest.mark.parametrize(
+    "pin",
+    [
+        "foo @ https://example.invalid/foo-1.0-py3-none-any.whl\\",
+        "https://example.invalid/foo-1.0-py3-none-any.whl\\",
+        "foo===1.0\\",
+        "",
+    ],
+    ids=["name-at-url", "bare-url", "arbitrary-equality", "empty-pin"],
+)
+def test_a_pin_left_ending_in_a_backslash_is_refused_before_the_count(
+    pin: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Lander hold on PR 2840 (issuecomment-6736152691): a pin that ends in a backslash once its
+    marker is removed joins the next pin onto it in the copy. The auditor printed "2 pinned
+    requirements audited" while pip-audit's parser read one. The copy is now counted as that parser
+    counts it, and refused before the count is printed unless the two agree. A pin the strip
+    empties is the same short count by another road."""
+    status, ran, printed, read, err = _counted_and_read(
+        tmp_path, capsys, f"{pin} ; sys_platform == 'zz'\n"
+    )
+    # Was exit 0, printed [2], and pip-audit's parser read one requirement.
+    assert [len(reqs) for reqs in read] == printed, (printed, read)
+    assert (status, ran) == (2, [])
+    assert _COUNT_REFUSED in err, err
+    assert "evil" not in err and "example.invalid" not in err and "foo" not in err, err
+
+
+def test_a_backslash_pin_before_a_skipped_one_is_refused_by_the_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The count is checked before ``--skip-private`` reads the stripped lines, so the refusal
+    names the fold, not a private pin the lock does pin."""
+    head = (
+        "foo @ https://example.invalid/foo-1.0-py3-none-any.whl\\ ; os_name == 'nt'\n"
+        f"priv==1 --hash=sha256:{_DIGEST}\n"
+    )
+    status, ran, _, _, err = _counted_and_read(tmp_path, capsys, head, ["--skip-private", "priv"])
+    assert (status, ran) == (2, [])
+    assert _COUNT_REFUSED in err, err
+    assert "does not pin" not in err, err
+
+
+def test_a_pin_the_strip_leaves_as_options_alone_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A pin the strip empties leaves its options as a line of their own, which the count model
+    cannot classify; main refuses that copy rather than skip the check."""
+    status, ran, printed, read, err = _counted_and_read(
+        tmp_path, capsys, f";os_name == 'nt' --hash=sha256:{_DIGEST}\n"
+    )
+    assert [len(reqs) for reqs in read] == printed, (printed, read)
+    assert (status, ran) == (2, [])
+    assert _COUNT_REFUSED in err, err
+
+
+_COUNT_REFUSED = "its copy would not hand pip-audit's parser the number of requirements counted"
+
+
+def _counted_and_read(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], head: str, before: list[str] | None = None
+) -> tuple[int, list[list[str]], list[int], list[list[str]], str]:
+    """Run ``main`` on ``head`` then the evil pin, with ``before`` ahead of the lock: its status,
+    the commands it ran, each count it printed, the requirements pip-audit's parser reads from each
+    copy it was handed, and stderr without the lock's path."""
+    src = tmp_path / "x.lock"
+    src.write_text(f"{head}{_EVIL}\n", encoding="utf-8")
+    ran: list[list[str]] = []
+    read: list[list[str]] = []
+
+    def run(cmd: list[str]) -> int:
+        ran.append(cmd)
+        if "pip_audit" in cmd:
+            read.append(_requirements_pip_audit_reads(Path(cmd[cmd.index("-r") + 1]).read_bytes()))
+        return 0
+
+    status = main([*(before or []), str(src)], run=run)
+    out, err = capsys.readouterr()
+    printed = [int(n) for n in re.findall(r": (\d+) pinned requirements audited", out)]
+    return status, ran, printed, read, err.replace(str(src), "")
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        "foo @ https://example.invalid/foo-1.0-py3-none-any.whl\\ ; sys_platform == 'zz'\n# note\n",
+        "colorama==0.4.6 ; sys_platform == 'win32' \\\n    --hash=sha256:aaaa\n    # via pytest\n",
+    ],
+    ids=["backslash-then-comment", "uv-export"],
+)
+def test_a_copy_whose_parser_count_matches_is_audited(
+    head: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the refusal above: where the parser reads as many requirements from the copy
+    as were counted, as it does when a comment line takes the backslash, pip-audit gets the copy.
+    The check is of the count: the parser reads that URL without its trailing backslash."""
+    status, _, printed, read, _ = _counted_and_read(tmp_path, capsys, head)
+    assert status == 0
+    assert printed == [2] and [len(reqs) for reqs in read] == printed, (printed, read)
+    assert _EVIL in read[0], read
+
+
+_MARKER_REFUSED = (
+    "its copy holds a requirement in which pip-audit's parser could find an environment"
+)
+
+
+@pytest.mark.parametrize(
+    "pin",
+    [
+        pytest.param("https://h/evil-1.0.tar.gz#egg=evil==1.0;sys_platform=='zz'", id="egg-https"),
+        pytest.param(
+            "git+https://h/evil.git@v1#egg=evil==1.0;sys_platform=='zz'", id="egg-git+https"
+        ),
+        pytest.param("file:///tmp/evil-1.0.tar.gz#egg=evil==1.0;sys_platform=='zz'", id="egg-file"),
+        pytest.param(
+            "https://h/evil-1.0.tar.gz?a=1&egg=evil==1.0;sys_platform=='zz'",
+            id="egg-after-ampersand",
+        ),
+        pytest.param("https://h/evil-1.0.tar.gz#egg=evil;sys_platform=='zz'", id="egg-name-only"),
+        # A wheel's version, from its file name: the parser turns "_" there into "-", so this
+        # marker names no variable with one. Link percent-decodes the file name twice, and
+        # urlsplit drops a tab first.
+        pytest.param("https://h/evil-1.0;extra=='x'-py3-none-any.whl", id="wheel-version"),
+        pytest.param(
+            "https://h/evil-1.0%253Bextra%253D%253D%2527x%2527-py3-none-any.whl",
+            id="wheel-version-encoded-twice",
+        ),
+        pytest.param(
+            "https://h/evil-1.0%3\tBextra%3D%3D%27x%27-py3-none-any.whl",
+            id="wheel-version-encoded-across-a-tab",
+        ),
+        # A relative file: URL is re-made from its decoded path, egg fragment and all.
+        pytest.param(
+            "file:///x/../evil-1.0.tar.gz%23egg=evil==1.0%3Bextra=='x'",
+            id="relative-file-egg-encoded",
+        ),
+        # No URL: the strip does not rewrite a continuation line that starts with "-", and the
+        # parser joins it onto the pin as "evil-x;<marker>".
+        pytest.param("evil\\\n-x;sys_platform=='zz'", id="continued-onto-an-option-line"),
+    ],
+)
+def test_a_marker_the_strip_leaves_in_the_copy_is_refused(
+    pin: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Lander hold 6 on PR 2840 (issuecomment-6739690438): the strip splits a bare URL's marker off
+    only at a ``; ``, as pip does, so a ``;`` inside the URL stays in the copy. pip-requirements-parser
+    32.0.1 reads a marker from there, and pip-audit skips the pin with no error where the host fails
+    it. Each pin here is one the parser itself marked, recorded 2026-11-09. Step 1 is stubbed: pip
+    26.2 refuses an egg fragment holding a ``;``, but the auditor must not lean on that."""
+    digest = f"--hash=sha256:{_DIGEST}"
+    src = tmp_path / "x.lock"
+    src.write_text(f"{pin} {digest}\nbar==2 {digest}\n", encoding="utf-8")
+    ran, run = _recorder(0)
+    status = main([str(src)], run=run)
+    out, err = capsys.readouterr()
+    # Was exit 0 and "2 pinned requirements audited", while pip-audit audited bar alone.
+    assert (status, ran) == (2, []), out
+    assert "pinned requirements audited" not in out
+    err = err.replace(str(src), "")
+    assert _MARKER_REFUSED in err, err
+    assert "evil" not in err and "extra" not in err, err
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param("https://h/evil-1.0.tar.gz#egg=evil==1.0", id="egg"),
+        pytest.param("https://h/evil-1.0%2Blocal-py3-none-any.whl", id="percent-encoded-wheel"),
+        # No URL, so pip-audit audits it rather than failing it as a URL requirement.
+        pytest.param("./evil-1.0%2Blocal-py3-none-any.whl", id="percent-encoded-path-wheel"),
+    ],
+)
+def test_a_url_pin_with_no_marker_left_in_it_is_handed_on(url: str, tmp_path: Path) -> None:
+    """The control for the refusal above: a URL pin with no ``;``, as written or decoded, reaches
+    pip-audit."""
+    digest = f"--hash=sha256:{_DIGEST}"
+    src = tmp_path / "x.lock"
+    src.write_text(f"{url} ; sys_platform == 'zz' {digest}\nbar==2 {digest}\n", encoding="utf-8")
+    status, copies = _audit_copies(src)
+    assert (status, copies) == (0, [[f"{url} {digest}", f"bar==2 {digest}"]])
+
+
+@pytest.mark.parametrize(
+    ("private", "status"), [("evil", 0), ("bar", 2)], ids=["marked-pin-skipped", "other-skipped"]
+)
+def test_the_marker_check_reads_the_copy_left_after_skip_private(
+    private: str, status: int, tmp_path: Path
+) -> None:
+    """The check reads what pip-audit is handed: a pin ``--skip-private`` leaves out cannot be
+    skipped by pip-audit too, and leaving out another pin does not excuse it."""
+    digest = f"--hash=sha256:{_DIGEST}"
+    src = tmp_path / "x.lock"
+    src.write_text(
+        f"evil\\\n-x;sys_platform=='zz' {digest}\nbar==2 {digest}\nidna==3 {digest}\n",
+        encoding="utf-8",
+    )
+    ran, run = _recorder(0)
+    assert main(["--skip-private", private, str(src)], run=run) == status
+    assert len(ran) == (2 if status == 0 else 0)
+
+
+def test_a_requirement_still_decoding_after_the_last_pass_is_refused() -> None:
+    """The model stops after a fixed number of passes, which keeps it linear, and answers yes where
+    it cannot tell; a string that stops decoding sooner is judged on its last form."""
+    from messagefoundry.security.audit_all_platforms import _pip_audit_may_see_marker
+
+    assert _pip_audit_may_see_marker("https://h/a%2541") is False
+    assert _pip_audit_may_see_marker("https://h/a%" + "25" * 64 + "41") is True
+
+
+#: Each text with the requirement strings pip-requirements-parser 32.0.1 itself gave for it
+#: (``preprocess``, then ``break_args_options``), recorded 2026-11-09. The marker check reads these.
+_PARSER_STRINGS = [
+    ("evil\\\n-x;sys_platform=='zz' --hash=sha256:a\n", ["evil-x;sys_platform=='zz'"]),
+    ("foo==1 \\\n    --hash=sha256:a\n    # via x\n", ["foo==1    "]),
+    ("https://h/x.tar.gz#egg=a==1;m  --hash=sha256:a\n", ["https://h/x.tar.gz#egg=a==1;m "]),
+    ("foo @ https://h/x.whl # c;d\n", ["foo @ https://h/x.whl"]),
+    ("a#b==1 --hash=sha256:a;b\n", ["a#b==1"]),
+    ("foo==1\tx --hash=sha256:a\n", ["foo==1\tx"]),
+]
+
+
+@pytest.mark.parametrize(("text", "strings"), _PARSER_STRINGS)
+def test_the_requirement_strings_agree_with_the_parser(text: str, strings: list[str]) -> None:
+    from messagefoundry.security.audit_all_platforms import _pip_audit_requirements
+
+    assert _pip_audit_requirements(text) == strings
+
+
+#: Each text with the requirement count pip-requirements-parser 32.0.1 itself gave for it
+#: (``preprocess``, then its line parser: a requirement string or an editable), recorded 2026-11-09.
+_PARSER_COUNTS = [
+    (
+        "foo==1 \\\n    --hash=sha256:a \\\n    --hash=sha256:b\n    # via x\n"
+        "bar==2 \\\n    --hash=sha256:c\n",
+        2,
+    ),
+    ("foo @ https://h/x.whl\\\nbar==1 --hash=sha256:a\n", 1),
+    ("https://h/x.whl\\\nbar==1\n", 1),
+    ("foo===1.0\\\nbar==1\n", 1),
+    ("foo @ https://h/x.whl\\\n# note\nbar==1\n", 2),
+    ("foo==1 \\\n\nbar==1\n", 2),
+    ("\\\\foo==1\\\\\nbar==1\n", 1),
+    ("foo==1 # c \\\nbar==1\n", 1),
+    ("  # c \\\nbar==1\n", 1),
+    ("foo==1\\", 1),
+    ("\n\n   \nfoo==1\n", 1),
+    ("foo==1\x0bbar==2\n", 2),
+    ("a#b==1\n", 1),
+]
+
+
+@pytest.mark.parametrize(("text", "count"), _PARSER_COUNTS)
+def test_the_count_model_agrees_with_the_parser(text: str, count: int) -> None:
+    # Imported here, so the rest of this file still collects against a module without it.
+    from messagefoundry.security.audit_all_platforms import _pip_audit_requirement_count
+
+    assert _pip_audit_requirement_count(text) == count
+
+
+def test_a_line_of_options_alone_is_not_counted_either_way() -> None:
+    """Optparse would read ``-e`` there as an editable requirement; the model does not guess."""
+    from messagefoundry.security.audit_all_platforms import _pip_audit_requirement_count
+
+    assert _pip_audit_requirement_count("--hash=sha256:a\nfoo==1\n") is None
+
+
+def test_utf8_failing_falls_back_to_the_locale_as_pip_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("locale.getencoding", lambda: "cp1252")
+    src = tmp_path / "x.lock"
+    src.write_bytes(b"# caf\xe9\nidna==3.20\n")
+    assert read_lock(src) == "# caf\N{LATIN SMALL LETTER E WITH ACUTE}\nidna==3.20\n"
+
+
+def test_main_classifies_the_lock_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Vault BACKLOG #3786 L6: the refusals and the strip read one classification."""
+    import messagefoundry.security.audit_all_platforms as auditor
+
+    calls: list[int] = []
+    real = auditor._kinds
+
+    def counting(lines: list[str]) -> list[str]:
+        calls.append(len(lines))
+        return real(lines)
+
+    monkeypatch.setattr(auditor, "_kinds", counting)
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main([str(src)], run=run) == 0
+    assert calls == [len(LOCK.splitlines())]
+
+
 @pytest.mark.parametrize(
     "line", ["-r base.lock", "-e ./pkg", "--index-url https://example.invalid"]
 )
@@ -209,7 +918,7 @@ def _seen_by(tmp_path: Path, argv: list[str]) -> tuple[int, list[tuple[list[str]
     seen: list[tuple[list[str], str]] = []
 
     def run(cmd: list[str]) -> int:
-        seen.append((cmd, Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8")))
+        seen.append((cmd, Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8-sig")))
         return 0
 
     return main([*argv, str(src)], run=run), seen

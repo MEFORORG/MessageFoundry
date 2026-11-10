@@ -19,12 +19,12 @@ from types import ModuleType
 
 import pytest
 
-from messagefoundry.anon import DEFAULT_RULES, AnonError, FieldRule, SurrogateKind
-from messagefoundry.anon import anonymize as engine_anonymize
-from messagefoundry.anon import anonymize_checked as engine_anonymize_checked
-from messagefoundry.anon import hl7 as engine_hl7
-from messagefoundry.anon import leak as engine_leak
-from messagefoundry.anon import load_rules as engine_load_rules
+from messagefoundry_toolkit.anon import DEFAULT_RULES, AnonError, FieldRule, SurrogateKind
+from messagefoundry_toolkit.anon import anonymize as engine_anonymize
+from messagefoundry_toolkit.anon import anonymize_checked as engine_anonymize_checked
+from messagefoundry_toolkit.anon import hl7 as engine_hl7
+from messagefoundry_toolkit.anon import leak as engine_leak
+from messagefoundry_toolkit.anon import load_rules as engine_load_rules
 from tee.anon import DEFAULT_RULES as TEE_DEFAULT_RULES
 from tee.anon import AnonError as TeeAnonError
 from tee.anon import FieldRule as TeeFieldRule

@@ -245,6 +245,9 @@ _AUTHZ_KEY_LEN = 32  # bytes — HMAC-SHA256 key
 #: The store id the row-seal key is derived with until a store id is minted (BACKLOG #2592). Empty,
 #: so the derivation is well defined now and changes by construction once a real id is supplied.
 NO_STORE_ID: bytes = b""
+#: The length of a minted store id (vault BACKLOG #3411; the key-custody draft's rule 1 mints 16
+#: random bytes). Nothing mints one yet.
+STORE_ID_BYTES = 16
 
 # Per-store data sub-key (ADR 0196, BACKLOG #2070). The cell-bound writer seals under
 # HKDF-SHA256(DEK, salt=None, info=_STORE_DATA_KEY_INFO || store_salt), not under the DEK itself. Each

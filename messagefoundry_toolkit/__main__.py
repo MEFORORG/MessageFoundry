@@ -355,7 +355,12 @@ def _adr_analyze(args: argparse.Namespace) -> int:
         # with `error` inside it, and so is NOT _emit_store_open_error's bare {"error": ...}: `ok`
         # has to stay readable for a consumer that branches on it and nothing else.
         if not args.json:
-            print(f"error: {result.error}", file=sys.stderr)  # not _safe_print; see its docstring
+            # _print_record_line's rule, on stderr: a control in the path, a symlink's resolved
+            # target included, is escaped, and a non-ASCII letter prints as itself, so the
+            # operator can paste most paths back; the rule doubles a backslash before a component
+            # that starts with one (BACKLOG #2891).
+            shown = escape_for_terminal(result.error, single_line=True, keep_printable_unicode=True)
+            print(f"error: {shown}", file=sys.stderr)
         return 2
     if not args.json:
         with_criteria = sum(1 for r in result.reports if r.has_criteria)
@@ -382,7 +387,8 @@ def _adr_analyze(args: argparse.Namespace) -> int:
 def _print_record_line(line: str) -> None:
     """``_safe_print`` a line that carries record text, with each character a terminal would act
     on written as a visible escape (BACKLOG #2516). Every human stdout line goes through here, so
-    a new one cannot forget the escape. The ``error:`` line on stderr does not.
+    a new one cannot forget the escape. The ``error:`` line on stderr does not go through here,
+    but takes the same rule.
 
     THE RULE IS THE ENGINE'S SHARED ONE, :func:`messagefoundry.terminal_text.escape_for_terminal`
     (BACKLOG #2891), so a later hardening there reaches this command too; its docstring says what
@@ -398,14 +404,14 @@ def _print_record_line(line: str) -> None:
 
 
 def _hl7schema(args: argparse.Namespace) -> int:
-    from messagefoundry.hl7schema import hl7_schema
+    from messagefoundry_toolkit.hl7schema import hl7_schema
 
     _print_json(hl7_schema(), compact=args.json)
     return 0
 
 
 def _hl7structures(args: argparse.Namespace) -> int:
-    from messagefoundry.hl7structures import to_json
+    from messagefoundry_toolkit.hl7structures import to_json
 
     _print_json(to_json(), compact=args.json)
     return 0
@@ -626,7 +632,7 @@ def _init(args: argparse.Namespace) -> int:
 
 
 def _generate(args: argparse.Namespace) -> int:
-    from messagefoundry.generators import (
+    from messagefoundry_toolkit.generators import (
         _core,
         all_types,  # noqa: F401  (registers every built-in type)
     )

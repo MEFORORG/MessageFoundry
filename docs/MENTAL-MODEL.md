@@ -306,7 +306,7 @@ This engine carries PHI, so security is built, not bolted on:
 | auth/ | Authn + RBAC core (no FastAPI): permissions/roles, Identity, passwords, tokens, ldap, totp. |
 | api/ | FastAPI app + models + auth — the engine's only external surface (serves the `/ui` web console same-origin). |
 | apiclient/ | Qt-free / FastAPI-free engine-client library (ADR 0088) — the shared HTTP client. |
-| generators/ | Conformant synthetic HL7 generators — messagefoundry-toolkit generate. |
+| messagefoundry_toolkit/generators/ | Conformant synthetic HL7 generators — messagefoundry-toolkit generate. The toolkit distribution, not the engine wheel (ADR 0201). |
 | checks.py | messagefoundry check — commit/CI gate (validate + dryrun + advisory lint). |
 | ide/ | VS Code extension (TypeScript): setup, promote, test bench, AI commands. |
 | samples/ | Example Connection/Router/Handler modules + send_mllp.py sender. |

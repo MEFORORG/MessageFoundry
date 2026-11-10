@@ -96,6 +96,33 @@
 # `-*` tags publish to PRODUCTION PyPI (a TestPyPI route would need its own Trusted Publisher). Cut the tag
 # only AFTER the py.typed marker (WS-3) is on main — the wheel smoke step enforces this on a tag.
 #
+# EVERY PYPI UPLOAD RUNS THE PUBLISH ACTION'S CONTAINER IMAGE BY DIGEST, NOT THE ACTION (BACKLOG
+# #5046). Called as `pypa/gh-action-pypi-publish@<commit>`, that action is a composite whose step
+# "Create Docker container action" writes a docker action naming
+# `docker://ghcr.io/pypa/gh-action-pypi-publish:<commit>`: a registry TAG, so the commit pin on the
+# action never pinned the code that uploads. Whoever can push that package can repoint the tag, and
+# the image would then run holding the publish job's `id-token: write` under the `pypi` environment.
+# The tag has already moved once in ordinary operation: upstream's `release/v1` and `release/v1.14`
+# build runs both pushed it for the same commit. So each upload step names, by its `sha256:` digest,
+# the image that COMMIT's tag resolved to when this pin was taken, and calls the image directly.
+# That is the image the action itself would have run. Upstream's `:v1.14.3` tag names a different
+# build of the same commit, with a different digest, so do not check the pin against that tag.
+# Calling the image skips the composite, which also supplied the image's input defaults, so each
+# upload step passes every input the composite passed, at the composite's own default value, except
+# `skip-existing`, which stays true where the composite defaults it false (the toolkit step says
+# why: a re-run must not die on "File already exists"). The
+# image's entry script runs under `set -u` and reads at least the user name, password and verbose
+# inputs directly, so leaving one out fails the step; its token exchange reads the repository URL
+# with no default, so leaving that out fails it too. A repository URL other than PyPI's would send
+# the OIDC token to that index and turn PEP 740 attestations off. The token user name with an empty
+# password is how the image selects Trusted Publishing; neither carries a secret.
+# tests/test_release_pipeline.py pins the image spelling, one digest and one comment at every
+# site, and every input's value.
+# DEPENDABOT DOES NOT MOVE THIS DIGEST, and no longer sees the action at all: its github-actions
+# parser skips a `docker://` reference, and its docker entry scans /docker only. A bump is a hand
+# edit: read action.yml and twine-upload.sh at the new commit, re-check the inputs against them,
+# resolve the new commit tag's digest, and change every upload step together.
+#
 # SECOND distribution — `messagefoundry-harness` (the synthetic test/load/failover harness,
 # packaging/messagefoundry-harness/) — is built by the `release-harness` job and published by the
 # last step of `publish-pypi`, after the engine it pins, in lockstep (same version, same tag). That
@@ -588,7 +615,8 @@ jobs:
           python -m venv /tmp/relsmoke
           /tmp/relsmoke/bin/pip install --quiet dist/*.whl
           # `-I` IS THE CHECK, not decoration. The interpreter was already the clean venv, which reads
-          # as sufficient and is not: for `python -c` sys.path[0] is the empty string — the CURRENT
+          # as sufficient and is not: for `python -c`, and for the `python -` this step runs now,
+          # sys.path[0] is the empty string — the CURRENT
           # WORKING DIRECTORY — and this job's cwd is the checkout, so `import messagefoundry`
           # resolved to the checkout's SOURCE TREE rather than to the wheel just installed. A wheel
           # missing the package entirely still printed a version and exited 0, so the one step whose
@@ -597,18 +625,123 @@ jobs:
           # `-I` over `-P`: -P drops only the cwd and leaves PYTHONPATH and the user site-packages as
           # two more routes back onto sys.path; -I is -P plus -E plus -s, so one flag closes all three
           # and this step needs none of them. A `cd` out of the checkout would work too, but this same
-          # step later reads constraints.lock and dist/*.whl by RELATIVE path, so it would need a
+          # step reads constraints.lock and dist/*.whl by RELATIVE path, so it would need a
           # subshell and would break quietly on a later edit.
-          built=$(/tmp/relsmoke/bin/python -I -c "import messagefoundry; print(messagefoundry.__version__)")
-          # An empty read is the same false green one layer down: the import succeeded and told us
+          #
+          # `packaging` pin DERIVED from constraints.lock, never hardcoded — it IS a DEP-1 dependency
+          # (requirements.lock + constraints.lock both pin it), so a literal here would drift silently on
+          # the next Dependabot bump. Same run-time-read pattern as quality-advisory.yml's ruff pin, but
+          # FAIL-CLOSED rather than falling back to an unpinned fetch: this is the release path. Installed
+          # BEFORE the inspection below, which compares versions with it, and OUTSIDE the tag guard so a
+          # workflow_dispatch dry-run exercises the pinned install — an install this step never reaches
+          # cannot be validated before the tag that depends on it. Still AFTER the wheel install, as it
+          # always was, so the engine's own dependency resolution runs exactly as before.
+          PKG_PIN="$(sed -n 's/^packaging==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
+          if [ -z "$PKG_PIN" ]; then
+            echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
+          fi
+          echo "packaging pin from constraints.lock: $PKG_PIN"
+          /tmp/relsmoke/bin/pip install --quiet "packaging==$PKG_PIN"
+          # INSPECT THE INSTALLED WHEEL, not just its import (BACKLOG #1583). `-I` keeps the checkout
+          # off sys.path, but a green import alone still cannot say WHICH tree answered or what the
+          # artifact will publish as. So, the toolkit/console/harness smokes' shape: the imported
+          # module must lie inside this venv and be a file the installed distribution's RECORD lists,
+          # and the version handed to the tag guard is the INSTALLED METADATA's — the version the
+          # artifact declares — after it has been checked equal to the module's own __version__.
+          # A failure inside the command substitution fails the step; the console smoke's step
+          # below carries the measurement.
+          built=$(/tmp/relsmoke/bin/python -I - <<'PYSMOKE'
+          import importlib
+          import sys
+          from importlib.metadata import distribution
+          from pathlib import Path
+
+          DIST = "messagefoundry"
+          PKG = "messagefoundry"
+
+          prefix = Path(sys.prefix).resolve()
+
+          # A real import, not find_spec: this venv holds the engine's runtime dependencies (the
+          # install above is not --no-deps), so importing the package is affordable, and it is what
+          # an operator's first command does. messagefoundry/ is a regular package, so a real
+          # __init__.py gives a real __file__; a namespace directory with no module gives None.
+          try:
+              package = importlib.import_module(PKG)
+          except ImportError as exc:
+              raise SystemExit(
+                  f"::error::cannot import {PKG} from the smoke venv ({exc}) — the wheel shipped no "
+                  f"package tree, or shipped one this interpreter cannot load"
+              ) from None
+          if not getattr(package, "__file__", None):
+              raise SystemExit(
+                  f"::error::{PKG} has no __file__ — the wheel shipped no package tree there"
+              )
+          origin = Path(package.__file__).resolve()
+          if not origin.is_relative_to(prefix):
+              raise SystemExit(
+                  f"::error::{PKG} resolved to {origin}, OUTSIDE the smoke venv {prefix} — the "
+                  f"checkout shadowed the wheel and this step inspected the wrong tree"
+              )
+
+          # BIND THE MODULE TO THIS DISTRIBUTION: RECORD is what says the file came out of THIS wheel.
+          dist = distribution(DIST)
+          recorded = [name for f in (dist.files or []) if (name := str(f)).startswith(PKG + "/")]
+          if not recorded:
+              raise SystemExit(
+                  f"::error::{DIST} RECORD lists no {PKG}/ members — the wheel is metadata wrapped "
+                  f"around an empty package tree (a broken force-include builds and installs cleanly)"
+              )
+          if not any(Path(f.locate()).resolve() == origin for f in (dist.files or [])):
+              raise SystemExit(
+                  f"::error::{origin} is not a file {DIST} recorded — the module this step imported "
+                  f"belongs to something else on sys.path, so the wheel was never inspected"
+              )
+
+          # METADATA AGAINST THE MODULE, as PEP 440 versions: whether `Version:` keeps the typed
+          # spelling or the canonical one depends on the hatchling release (pyproject.toml's
+          # [build-system] note), so a string compare could reject `0.3.0-rc1` against
+          # `0.3.0rc1`, the same release. An empty or missing __version__ is
+          # refused here too, so the dry-run arm (no tag to compare against) cannot pass on one.
+          # Imported after the stdlib-only guards above, so a broken wheel reports as a broken wheel.
+          from packaging.version import InvalidVersion, Version
+
+          module_version = str(getattr(package, "__version__", "") or "")
+          if not module_version:
+              raise SystemExit(
+                  f"::error::the installed {PKG} has an EMPTY __version__, so this smoke proved nothing"
+              )
+          try:
+              source_version, metadata_version = Version(module_version), Version(dist.version)
+          except InvalidVersion as exc:
+              raise SystemExit(
+                  f"::error::unparseable version ({exc}) — installed {PKG}.__version__ "
+                  f"{module_version!r}, wheel metadata {dist.version!r}"
+              )
+          if source_version != metadata_version:
+              raise SystemExit(
+                  f"::error::installed {PKG}.__version__ {module_version} != wheel metadata version "
+                  f"{dist.version} (normalised {source_version} != {metadata_version}) — the engine's "
+                  f"version root and its built artifact disagree"
+              )
+
+          print(
+              f"engine wheel installed from {origin}: {len(recorded)} {PKG}/ members, "
+              f"__version__ == metadata == {dist.version}",
+              file=sys.stderr,
+          )
+          print(dist.version)
+          PYSMOKE
+          )
+          # An empty read is the same false green one layer down: the inspection succeeded and told us
           # nothing. The tag guard below would catch it (Version("") is unparseable), but the
           # workflow_dispatch dry-run — the arm that exists to validate this path BEFORE a tag — would
           # not, so fail here where both arms see it.
           if [ -z "$built" ]; then
-            echo "::error::the wheel smoke read an EMPTY __version__ from the installed wheel, so it proved nothing"; exit 1
+            echo "::error::the wheel smoke read an EMPTY version from the installed wheel's metadata, so it proved nothing"; exit 1
           fi
-          echo "built version: $built"
-          # On a tag push, the built version MUST equal the tag (single-source check).
+          echo "built version (installed metadata): $built"
+          # On a tag push, the built version MUST equal the tag (single-source check). `built` is the
+          # INSTALLED DISTRIBUTION METADATA's version, checked equal to __version__ above (#1583).
           #
           # Compared as PEP 440 VERSIONS, not as strings. A pre-release tag has to be spelled with a
           # hyphen to match the `v[0-9]+.[0-9]+.[0-9]+-*` trigger above (`v0.3.0rc1` fires nothing), so
@@ -616,23 +749,11 @@ jobs:
           # the gate — while hatchling/PyPI normalise it to 0.3.0rc1 everywhere else, meaning the tag,
           # the module attribute and the wheel filename could not all be canonical at once. Version()
           # normalises both sides, so canonical "0.3.0rc1" in __init__.py matches tag v0.3.0-rc1 and the
-          # check still fails loudly on a genuine mismatch.
-          # `packaging` pin DERIVED from constraints.lock, never hardcoded — it IS a DEP-1 dependency
-          # (requirements.lock + constraints.lock both pin it), so a literal here would drift silently on
-          # the next Dependabot bump. Same run-time-read pattern as quality-advisory.yml's ruff pin, but
-          # FAIL-CLOSED rather than falling back to an unpinned fetch: this is the release path. Installed
-          # OUTSIDE the tag guard so a workflow_dispatch dry-run exercises the pinned install — the guard
-          # below is what stays tag-only, and an install this step never reaches cannot be validated
-          # before the tag that depends on it.
-          PKG_PIN="$(sed -n 's/^packaging==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
-          if [ -z "$PKG_PIN" ]; then
-            echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
-          fi
-          echo "packaging pin from constraints.lock: $PKG_PIN"
-          /tmp/relsmoke/bin/pip install --quiet "packaging==$PKG_PIN"
+          # check still fails loudly on a genuine mismatch. `-I` as for the inspection: nothing
+          # from the cwd belongs on sys.path.
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#v}"
-            /tmp/relsmoke/bin/python - "$built" "$want" <<'PYVER'
+            /tmp/relsmoke/bin/python -I - "$built" "$want" <<'PYVER'
           import sys
           from packaging.version import InvalidVersion, Version
 
@@ -1288,7 +1409,7 @@ jobs:
     outputs:
       upload-outcome: ${{ steps.harness-upload.outcome }}
     # The ONLY kind of job that names the `pypi` environment, and it builds nothing (vault BACKLOG
-    # #2631, limb 1). No checkout: it runs no repository code, only the pinned actions below.
+    # #2631, limb 1). No checkout: it runs no repository code, only the pinned actions and image below.
     environment: pypi
     permissions:
       id-token: write   # PyPI Trusted Publishing (OIDC) and PEP 740 attestations; nothing else
@@ -1348,11 +1469,17 @@ jobs:
       # on, not the pending publisher (ADR 0201, To resolve on acceptance, records the reading).
       - name: Publish messagefoundry-toolkit to PyPI before the engine (Trusted Publishing / OIDC)
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
-        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # commit 7245906fb61fa33a13554f9d5fb856fe61758086 (v1.14.3), its commit tag's image; the header says why
         with:
           packages-dir: toolkit-dist/
           skip-existing: true
           attestations: true
+          repository-url: https://upload.pypi.org/legacy/
+          user: __token__
+          password: ""
+          verify-metadata: true
+          verbose: true
+          print-hash: true
 
       # AFTER THE BUILD on purpose: PyPI is the one IRREVERSIBLE sink (uploads can't be replaced), so
       # it runs after build/smoke/sign/release — this job needs `release` and `release-harness`, and
@@ -1368,11 +1495,17 @@ jobs:
       # version==tag smoke check already prevents a wrong-version upload).
       - name: Publish to PyPI (Trusted Publishing / OIDC)
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
-        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # commit 7245906fb61fa33a13554f9d5fb856fe61758086 (v1.14.3), its commit tag's image; the header says why
         with:
           packages-dir: dist-pub/
           skip-existing: true
           attestations: true
+          repository-url: https://upload.pypi.org/legacy/
+          user: __token__
+          password: ""
+          verify-metadata: true
+          verbose: true
+          print-hash: true
 
       # AFTER THE ENGINE, which the harness pins exactly: the implicit success() skips this step if
       # the engine upload failed, so no harness naming an engine PyPI lacks is uploaded. THIS BENDS
@@ -1385,11 +1518,17 @@ jobs:
       - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
         id: harness-upload
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-harness.outputs.publish-harness == 'true' && vars.PUBLISH_HARNESS == 'true' }}
-        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # commit 7245906fb61fa33a13554f9d5fb856fe61758086 (v1.14.3), its commit tag's image; the header says why
         with:
           packages-dir: harness-dist/
           skip-existing: true
           attestations: true
+          repository-url: https://upload.pypi.org/legacy/
+          user: __token__
+          password: ""
+          verify-metadata: true
+          verbose: true
+          print-hash: true
 
   release-webconsole:
     # Build + publish the SEPARATE `messagefoundry-webconsole` distribution (the browser ops console,
@@ -1799,7 +1938,7 @@ jobs:
     outputs:
       upload-outcome: ${{ steps.webconsole-upload.outcome }}
     # The ONLY kind of job that names the `pypi` environment, and it builds nothing (vault BACKLOG
-    # #2631, limb 1). No checkout: it runs no repository code, only the pinned actions below.
+    # #2631, limb 1). No checkout: it runs no repository code, only the pinned actions and image below.
     environment: pypi
     permissions:
       id-token: write   # PyPI Trusted Publishing (OIDC) and PEP 740 attestations; nothing else
@@ -1843,11 +1982,17 @@ jobs:
       - name: Publish messagefoundry-webconsole to PyPI (Trusted Publishing / OIDC)
         id: webconsole-upload
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-webconsole.outputs.publish-webconsole == 'true' && vars.PUBLISH_WEBCONSOLE == 'true' }}
-        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # commit 7245906fb61fa33a13554f9d5fb856fe61758086 (v1.14.3), its commit tag's image; the header says why
         with:
           packages-dir: webconsole-dist/
           skip-existing: true
           attestations: true
+          repository-url: https://upload.pypi.org/legacy/
+          user: __token__
+          password: ""
+          verify-metadata: true
+          verbose: true
+          print-hash: true
 
   # PUBLISH THE CONSOLE'S GITHUB RELEASE ONCE ITS WHEEL IS ON PYPI (vault BACKLOG #2975). Before this
   # job, release-webconsole published its release in the call that made it, so the release was public
@@ -1966,7 +2111,7 @@ jobs:
           # so the old step passed it and the release shipped an empty distribution. The wheel is now
           # installed into the smoke venv and its entry module imported out of it.
           #
-          # PEP 440 comparison below, for a STRONGER reason than the engine's copy of this check: `built`
+          # PEP 440 comparison below, for the reason the engine's copy has too since BACKLOG #1583: `built`
           # comes from the wheel's own METADATA, which hatchling has already normalised. On tag
           # v0.3.0-rc1 the metadata says 0.3.0rc1 while want=0.3.0-rc1, so a string compare could NEVER
           # match — this job failed on every pre-release tag by construction, whatever __version__ said.
@@ -1987,7 +2132,8 @@ jobs:
           python -m venv /tmp/harnesssmoke
           /tmp/harnesssmoke/bin/pip install --quiet "packaging==$PKG_PIN"
           # --no-deps IS LOAD-BEARING, NOT AN OPTIMISATION. messagefoundry-harness depends on
-          # messagefoundry[harness], so a full install would resolve the ENGINE AND PySide6 FROM PYPI
+          # messagefoundry[harness] and messagefoundry-toolkit, so a full install would resolve the
+          # ENGINE, THE TOOLKIT AND PySide6 FROM PYPI
           # inside a job holding contents: write — and on a first run the engine is not on PyPI
           # yet, since publish-pypi waits on this job (a re-run of this job may follow its upload),
           # so it would also be a live index round-trip on the release path. Install the
@@ -2168,10 +2314,42 @@ jobs:
                   f"table in packaging/messagefoundry-harness/pyproject.toml and re-cut the tag."
               )
 
+          # THE TOOLKIT PIN, THE SAME WAY (ADR 0201 slice 7, AC-7). The harness imports
+          # messagefoundry_toolkit.generators, so it declares the toolkit, lockstep like the engine.
+          # The resolution check below stubs the toolkit at this wheel's own version and so cannot
+          # see this pin drift, and nothing else here reads it: a missing or loose line would
+          # publish a harness that dies on ImportError at its first generator call.
+          toolkit = [
+              req
+              for raw in (dist.metadata.get_all("Requires-Dist") or [])
+              if (req := Requirement(raw)).name.replace("_", "-").lower() == "messagefoundry-toolkit"
+              and not gated_by_an_extra(req)
+          ]
+          toolkit_clauses = list(toolkit[0].specifier) if len(toolkit) == 1 else []
+          toolkit_pin = None
+          if (
+              len(toolkit_clauses) == 1
+              and toolkit_clauses[0].operator == "=="
+              and toolkit[0].marker is None
+              and not toolkit[0].extras
+          ):
+              try:
+                  toolkit_pin = Version(toolkit_clauses[0].version)
+              except InvalidVersion:
+                  toolkit_pin = None  # a wildcard pin is a drift, as for the engine above
+          if toolkit_pin != shipped:
+              raise SystemExit(
+                  f"::error::{DIST} {dist.version} requires {[str(req) for req in toolkit]} of "
+                  f"messagefoundry-toolkit, not exactly messagefoundry-toolkit=={dist.version} (ADR "
+                  f"0201 AC-7). Fix the dependencies table in "
+                  f"packaging/messagefoundry-harness/pyproject.toml and re-cut the tag."
+              )
+
           print(
               f"harness wheel installed from {origin}: {len(recorded)} {PKG}/ members, "
               f"entry point {PKG}.__main__:main resolves, requires "
-              f"messagefoundry[harness]{engine[0].specifier}, version {dist.version}",
+              f"messagefoundry[harness]{engine[0].specifier} and "
+              f"messagefoundry-toolkit{toolkit[0].specifier}, version {dist.version}",
               file=sys.stderr,
           )
           print(dist.version)

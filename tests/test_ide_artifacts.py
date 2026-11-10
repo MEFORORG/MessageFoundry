@@ -14,8 +14,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from messagefoundry.hl7schema import hl7_schema
-from messagefoundry.hl7structures import to_json
+from messagefoundry_toolkit.hl7schema import hl7_schema
+from messagefoundry_toolkit.hl7structures import to_json
 
 _MEDIA = Path(__file__).resolve().parents[1] / "ide" / "media"
 

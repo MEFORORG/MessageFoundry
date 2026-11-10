@@ -213,16 +213,76 @@ that package's build code may run in CI:
     passes a URL or editable requirement unaudited. It skips an included file without a word
     (measured), so the job refuses a line starting `-r` or `--requirement`, read as plain bytes:
     a file with a byte-order mark, UTF-16, or an abbreviated option gets past that check. List
-    every pin in `requirements.txt` itself. Its closure is audited only through the lock, so a lock
-    that was not regenerated after `requirements.txt` changed audits the old closure, and nothing
-    in the job detects that.
-  - The job takes the engine's pin out of the lock, as pip reads the lock, and installs that pin
-    alone with `--no-deps --require-hashes`. The lock must pin `messagefoundry` exactly once, or the
-    job says so and fails; pip refuses the pin if it carries no hash. No other locked package is
+    every pin in `requirements.txt` itself. Its closure is audited only through the lock.
+  - So the job fails on a stale lock: one that does not pin a package `requirements.txt` names,
+    or pins it only under a marker false on the Windows runner, or at a version the requirement's
+    specifier does not allow. The step copies pip 26's line handling for continuation lines,
+    comments and options. Its `${VAR}` expansion is not pip's. The step expands each `${VAR}` the
+    line names once, in one pass. pip replaces them one after another, so it can also expand a
+    `${VAR}` that a value brings in, whole or in part, when the line names that variable later.
+    The step also expands with this job's environment, which need not match an install's. So the
+    step can read a line differently from pip, in the requirement or in its options. At least two
+    results follow. A line pip follows as an include or a constraint can pass the step. A
+    requirement whose marker pip reads as true can be only noted as false on the runner, so pip
+    can install a package the step did not check against the lock. The step parses each
+    requirement with the `packaging` copy pip carries, so versions compare as pip compares them,
+    and reads a line of options with no requirement with pip's own parser. A requirement whose marker is false on the runner, an extra
+    (a lock records none), a URL or path with no package name, and an editable line (`-e` or
+    `--editable`, abbreviated or attached as pip allows, which installs a source tree or checkout
+    no lock pin holds) are only noted. A requirement it cannot parse fails, and so does a line of
+    options with no requirement that pip cannot read. The options on a line that also holds a
+    requirement are not read. An include or constraint line (`-r`, `--requirement`, `-c` or
+    `--constraint`, abbreviated or attached as pip allows, with no editable on the line) fails
+    too, because the step follows no file a line names, so it cannot check an included file's pins
+    or a constraints file's limits against the lock. No new lock clears it. For an included file,
+    move its lines into `requirements.txt`. For a constraints file, remove the line only once its
+    limits apply elsewhere, in two places:
+    - The lock. While the line is in `requirements.txt`, a lock command that reads that file, such
+      as `uv pip compile`, reads the line on every regeneration. Once it is gone, nothing passes
+      the file unless you do, every time, so add `-c <file>` to each of the README's lock commands
+      and keep it there. This check compares only the requirements in `requirements.txt` with the
+      lock, so it cannot see a limit a regeneration dropped.
+    - The install. Every `pip install -r requirements.txt` reads the line too: at least the `check`
+      job, step 1 of the README's "Use it", the VS Code extension's "Set Up Python Environment"
+      command in the layout below, and each deploying host's install. Once it is gone
+      those installs resolve live, with none of its limits, unless each passes `-c <file>` itself
+      or applies the lock. To apply the lock, set `PIP_CONSTRAINT=requirements.lock` for that
+      command only, or install with `pip install --require-hashes -r requirements.lock` in its
+      place. Do not export `PIP_CONSTRAINT` for the whole shell or job: a hashed constraints file
+      turns on hash checking for everything pip installs under it, so an install the lock does not
+      cover, such as `requirements-dev.txt`, is refused.
+      The scaffolded `check` job and the README's "Use it" apply the lock in neither way; the
+      README recommends both as hardening for any PHI-handling adopter. The lock must also cover
+      the platform of each install it is applied to. The `check` job runs on `ubuntu-latest`, the
+      engine depends on `uvloop` on Linux, and the README's lock commands lock Windows alone, so
+      that lock cannot be applied there. A universal lock covers both (read the
+      universal-lock note in this section first).
+      The extension's command does not apply the lock. Where the workspace's first folder holds
+      `requirements.txt` and `requirements-dev.txt` and no `pyproject.toml`, it runs
+      `pip install -r requirements.txt -r requirements-dev.txt` as one command in a terminal. That
+      command passes no `-c` and names no lock, and the extension has no setting that adds either.
+      In any other layout it installs something else and does not read the line. So once the line
+      is gone, that install keeps a constraints file's limits only if something else passes them,
+      such as `PIP_CONSTRAINT` set in that terminal's environment. A hashed constraints file, the
+      lock among them, turns on hash checking for that whole command. pip then refuses a package
+      the file does not pin with hashes, such as `messagefoundry-toolkit` when the file is a lock
+      written from `requirements.txt` alone.
+
+    A `-c requirements.lock` line is refused too, and only the install step applies to it: do not
+    pass the lock to the command that writes it. Removing the line is safe only once every install
+    applies the lock as above. While it is there, it also limits each regeneration to the lock's
+    own pins, so a requirement moved off its locked version cannot resolve until the line is gone.
+  - The job picks the engine's pin out of the lock, reading the lock as the stale-lock step reads
+    `requirements.txt`. It writes that pin's lines as the lock has them, and pip installs them
+    alone with `--no-deps --require-hashes`, expanding any `${VAR}` its own way. The lock must pin
+    `messagefoundry` exactly once, or the job says so and fails; pip refuses the pin if it carries no hash. No other locked package is
     installed into the interpreter that runs the auditor, pip and `pip-audit`, so no other locked
     package's code (a `.pth` file runs at every interpreter start) runs inside them.
-  - `pip-audit` itself is pinned to one version, and its own dependencies are installed into that
-    interpreter, resolved live and unhashed.
+  - `pip-audit` and its own dependencies are installed into that interpreter from
+    `requirements-audit.lock`, with `--require-hashes`, so they are not resolved live, with or
+    without a lock of yours. `messagefoundry-toolkit init` writes that file from the engine
+    release's own scanner lock, and its header says how to regenerate it. Hash-pinned, it no longer
+    moves on its own, so the job audits it too, as the runner evaluates its markers.
   - Then it runs the engine's own auditor, `python -P -m messagefoundry.security.audit_all_platforms
     requirements.lock`. That is the code the engine's own required audit runs, and the module
     documents what it checks. It dry-run installs the lock with `--require-hashes`, installing
@@ -249,11 +309,17 @@ that package's build code may run in CI:
     an entry that is not a name, an engine variable, `VAULT_TOKEN` and `PGPASSWORD` among them, and
     `PYTHONINSPECT`.
   - It refuses a lock with pip option lines, such as an index URL, `--trusted-host` or `--find-links`.
-    `uv pip compile --universal --generate-hashes requirements.txt -o requirements.lock` writes none
-    by default and writes every platform's pins. `pip-compile` needs its `--no-emit-*` flags for each
-    such line, and locks only the platform it runs on, so run it on Windows.
+    `uv pip compile --python-platform windows --python-version 3.14 --generate-hashes
+    requirements.txt -o requirements.lock` writes none by default and locks Windows alone.
+    `pip-compile` needs its `--no-emit-*` flags for each such line, and locks only the platform it
+    runs on, so run it on Windows.
   - A lock that pins one name at two versions under two markers fails: with the markers removed,
     `pip-audit` refuses the duplicate.
+  - A universal lock (`uv pip compile --universal`) pins every platform's dependencies, and the
+    auditor audits all of them. So an advisory against a package only another platform installs
+    fails the job, and so does a package the lock pins at two versions for two platforms. Triage
+    either by locking for Windows alone, as above, or, for an advisory, with `--ignore-vuln <ID>`
+    and the reason.
   - A requirement that continues onto a line other than a hash, option or comment fails, since a
     marker there would stay in place.
 - Each check is its own step, and a failed one does not hide a later one's result; the lock audit
@@ -337,6 +403,17 @@ What CI **does** guarantee on every PR:
 3. **Keep fixtures and CI logs PHI-free.** `generate`/`dryrun` can emit full message bodies — the
    corpus must be **synthetic**, and you must never redirect their output into a committed file or a
    CI log.
+
+4. **`check` holds no time bound on a strict validation that hangs.** Where a connection turns
+   strict validation on, the dry-run validates each fixture inline and compares the time it took to
+   the connection's strict-validation timeout only after the validator returns
+   ([dryrun.py](../messagefoundry/pipeline/dryrun.py) `_strict_validation_error`), so a validator
+   that never returns would hang `check`. At least two other surfaces run the same dry-run and would
+   hang with it: `messagefoundry verify`'s smoke self-check, on its one built-in message
+   ([verify/smoke.py](../messagefoundry/verify/smoke.py)), and the git pre-commit hook the VS Code
+   extension writes, which execs `messagefoundry check`
+   ([ide/src/sourceControl.ts](../ide/src/sourceControl.ts)). The live listener handles the same
+   timeout differently; [HL7-VALIDATION.md](HL7-VALIDATION.md) describes how.
 
 ---
 

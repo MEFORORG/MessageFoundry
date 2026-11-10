@@ -7,6 +7,6 @@
   anything reads it. stop() closes a socket still in its handshake at once there too, and a failed
   handshake is reported with its peer. The stdlib path is unchanged. For the `MLLP()` listener, a
   loop that subclasses a stdlib loop now takes the same path as an unknown loop. The `Http()`
-  listener is unchanged: it still upgrades TLS itself on any `asyncio.BaseEventLoop`, so its caps
-  and `max_handshakes_per_host` still apply before the handshake there. See
+  listener takes the same accept loop since BACKLOG #2479; its own entry says what that changes.
+  See
   [CONNECTIONS.md](../docs/CONNECTIONS.md). (`BACKLOG #1606`, `vault BACKLOG #4552`)

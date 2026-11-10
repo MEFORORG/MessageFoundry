@@ -43,8 +43,9 @@
     IT FAILS CLOSED. No exit code but 10 is NO-REVIEW, so a crash (1), a usage error (2) or anything
     else reads as no permission. A read that fails, a seat that cannot be named, and a cost reading
     that is UNKNOWN all answer REVIEW. HALT comes from the cost rung only, and is checked first; the
-    Lander is exempt from it (korus roles/STEWARD.md 3e). The gate stops at the first condition that
-    closes the no-review path before the log is read, so a REVIEW for a kill switch reads no log.
+    Lander is exempt from it (korus roles/COMMON.md, The three usage states). The gate stops at the
+    first condition that closes the no-review path before the log is read, so a REVIEW for a kill
+    switch reads no log.
     Today no seat is calibrated, so it answers REVIEW (or HALT) for everyone. That is correct.
 
     THE CHAIN. -BuildsOn names the decisions this one builds on. Depth is the unsampled (unrated)
@@ -328,7 +329,7 @@ function Invoke-DecisionGate {
     $why = [System.Collections.Generic.List[string]]::new()
     try {
         if (Test-DecisionLanderSeat $Seat) {
-            $why.Add('cost rung: not read, because the Lander is exempt from the Steward''s states (korus roles/STEWARD.md 3e)')
+            $why.Add('cost rung: not read, because the Lander is exempt from the Steward''s states (korus roles/COMMON.md, The three usage states)')
         } else {
             $rung = Get-DecisionCostRung -UsageScript $UsageScript -ThresholdsFile $ThresholdsFile -TimeoutSeconds $UsageTimeoutSeconds
             $why.Add("cost rung $($rung.State): $($rung.Reason)")

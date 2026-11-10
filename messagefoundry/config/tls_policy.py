@@ -957,9 +957,9 @@ def skips_validity_period(ctx: ssl.SSLContext) -> bool:
     BACKLOG #5086). At least the MLLP destination and the DICOM SCU also ask it of the context they
     dial with and, on True, pass ``expiry_relaxed=True`` with that context (vault BACKLOG #2978 and
     #5089, ADR 0173 §13). FTPS (vault BACKLOG #2193) reaches the same answer from the
-    ``tls_allow_expired`` setting and passes the same flag. The REST family (vault BACKLOG #2188)
-    reads the setting too and hands the guard no context, and does not name
-    :data:`EXPIRY_RELAXED_WAYS_ACROSS`."""
+    ``tls_allow_expired`` setting and passes the same flag. The REST, SOAP and FHIR destinations
+    (vault BACKLOG #2188) read the setting too, hand the guard no context, and pass the same flag,
+    REST only on a hop with no ECH sidecar (vault BACKLOG #2977 item 2)."""
     return bool(ctx.verify_flags & _X509_V_FLAG_NO_CHECK_TIME)
 
 
@@ -1583,11 +1583,7 @@ def _narrow_tls13_and_sigalgs(ctx: ssl.SSLContext) -> None:
     :class:`RuntimeError`, such as a ``NotImplementedError``. Before #2484 only the ldap3 and hvac
     seam caught it. Converting here, in the two wrappers, reaches every seam that calls one. The
     narrowers' own message names the list; this adds the linked OpenSSL, because the fault is that
-    build's.
-
-    It does not reach a context built at IMPORT. At least ``rest._NO_REDIRECT_OPENER`` and
-    ``alert_sinks._NO_REDIRECT_OPENER`` are, so on such a build the import itself fails before any
-    seam can report a refusal."""
+    build's."""
     try:
         narrow_tls13_suites(ctx)
         narrow_signature_algorithms(ctx)
@@ -2123,13 +2119,13 @@ class StoreTlsRefused(InsecureHopRefused):
     reports a refused store hop reports this too, and still a ``ValueError`` for every caller
     that caught it as one.
 
-    Its text names the setting, the file's path and the fix, and reads no value from the server.
-    The SQL Server and weakened-hop texts are the engine's own. The PostgreSQL wrap carries the
-    context builder's ``ValueError`` text whole, which can quote the ``ssl`` or ``cryptography``
-    library's message and what was read from the operator's pin or CRL file, such as its dates.
-    Where that ``ValueError`` is, holds or was raised from a codec error, the wrap carries a fixed
-    text instead and no chain, so the byte it met is not quoted (the PostgreSQL store's
-    ``_verifying_context_at_open``). Print it through ``codec_safe_str``, as
+    Its text names at least the setting, and reads no value from the server. The SQL Server and
+    weakened-hop texts are the engine's own. The PostgreSQL wrap raises a new refusal with a fixed
+    text naming the settings in place of the context builder's error, built and raised after its
+    handler has exited, so it keeps no chain and a traceback does not print that error's text, which
+    can quote the ``ssl`` or ``cryptography`` library's message, what was read from the operator's
+    pin or CRL file, or a byte a codec error met (the eighth hold on engine PR 2818; the PostgreSQL
+    store's ``_verifying_context_at_open``). Print it through ``codec_safe_str``, as
     ``_open_store_or_refuse`` in the CLI does."""
 
 
@@ -2882,8 +2878,8 @@ class RevocationHopGuard:
         # validity, which it leaves False whether the caller passed `expiry_relaxed` or only handed
         # over such a context, keeps this line (vault BACKLOG #5086). At least FTPS
         # (_guard_ftps_revocation), MLLP and the DICOM SCU pass `expiry_relaxed=True` on a
-        # tls_allow_expired hop, and the REST, SOAP and FHIR destinations pass no context there
-        # (ADR 0173 §4.3 and §13). Those hops cross on the attestation and keep the line for that
+        # tls_allow_expired hop, and the REST (off an ECH hop), SOAP and FHIR destinations pass it
+        # with no context there (ADR 0173 §4.3 and §13). Those hops cross on the attestation and keep the line for that
         # reason.
         # blanket_attested is not here: under an enforcing posture it can no longer produce an ALLOW
         # (BACKLOG #299), and under a non-enforcing one `posture.enforcing` already excludes the line.
@@ -2997,12 +2993,12 @@ class TrustAnchor:
         Callers that must choose between a shared, unanchored client and a per-connection one read THIS
         rather than spelling out the test, so the five HTTP-family call sites cannot drift apart.
 
-        **A CRL counts (BACKLOG #299), and it has to.** Those five call sites reuse a shared,
-        module-level opener whenever the anchor does not narrow. That opener is built once at import,
-        before any config is loaded, so a CRL could never reach it — a hop that answered "nothing to
-        narrow" here would silently keep the unrevoked shared opener while its guard was told
-        revocation was checked. Widening this predicate is what routes such a hop onto its own
-        opener, with its own context, carrying its own CRL."""
+        **A CRL counts (BACKLOG #299), and it has to.** Those five call sites reuse a shared
+        opener whenever the anchor does not narrow. That opener is built with no anchor, so a CRL
+        could never reach it — a hop that answered "nothing to narrow" here would silently keep the
+        unrevoked shared opener while its guard was told revocation was checked. Widening this
+        predicate is what routes such a hop onto its own opener, with its own context, carrying its
+        own CRL."""
         return self.cafile is not None or self.crl_file is not None
 
 
@@ -3091,8 +3087,9 @@ def _naming_the_ca_setting(anchor: TrustAnchor) -> Iterator[None]:
     try:
         yield
     except OSError as exc:
-        # No path in the text, as the bare FileNotFoundError this replaces carried none: a connection
-        # test returns this text to the caller and audits it. The setting tells the operator where.
+        # No path in the text, as the bare FileNotFoundError this replaces carried none: a
+        # connection test returns this text to the caller and audits it. The setting tells the
+        # operator where.
         #
         # A [tls].crl_file refusal on the same hop still names its file, and the two shapes are
         # kept by Manager decision (BACKLOG #3096 item 11). This CA setting is per connection. The
@@ -3120,7 +3117,11 @@ def build_verifying_client_context(
     ``cafile=`` argument cannot express. Verification stays ON (``CERT_REQUIRED`` + ``check_hostname``,
     the ``create_default_context`` secure defaults) — the caller layers the TLS floor / KEX / strict
     flags / optional mTLS client cert exactly as before. Purpose is a parameter only so a future
-    client-auth context could reuse it; every current caller verifies a *server* cert."""
+    client-auth context could reuse it.
+
+    The ``tls_verify=false`` arms of the SMTP, MLLP and FTPS contexts build here too, with the empty
+    policy, and turn verification off afterwards (vault BACKLOG #2370). So a step added here must
+    not assume the hop it builds verifies its peer."""
     ctx: ssl.SSLContext
     if anchor.load_system_roots:
         ctx = ssl.create_default_context(purpose)
@@ -3234,8 +3235,8 @@ def requests_verify_from_anchor(anchor: TrustAnchor, *, cell: str) -> str | None
     if anchor.crl_file is not None:
         raise ValueError(
             f"{cell}: [tls].crl_file cannot be expressed to a requests-based client, which takes one "
-            f"bundle path and no revocation flag. Terminate this hop at a revocation-checking proxy or "
-            f"leave the CRL unset rather than have it silently ignored here."
+            f"bundle path and no revocation flag, so the CRL is refused here rather than silently "
+            f"ignored."
         )
     if anchor.cafile is None:
         return None
@@ -3346,17 +3347,18 @@ def build_smtp_tls_context(
     the connection names no ``ca_file`` of its own. It only chooses WHICH roots verify the peer — it
     never turns verification off.
     """
-    if verify:
-        anchor = resolve_trust_anchor(
-            connection_ca_file=ca_file,
-            host=host,
-            policy=trust_anchor_policy if trust_anchor_policy is not None else TrustAnchorPolicy(),
-            connection=name or None,
-            setting=ca_setting,
-        )
-        ctx = build_verifying_client_context(anchor)
-    else:
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_file)
+    # The verify-off arm takes the empty policy: it verifies nothing, so an instance CA or CRL could
+    # only add a way to refuse. It loads ca_file through the anchor for the named refusal (vault #2370).
+    anchor = resolve_trust_anchor(
+        connection_ca_file=ca_file,
+        host=host,
+        policy=trust_anchor_policy
+        if verify and trust_anchor_policy is not None
+        else TrustAnchorPolicy(),
+        connection=name or None,
+        setting=ca_setting,
+    )
+    ctx = build_verifying_client_context(anchor)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if verify:
         ctx.check_hostname = check_hostname

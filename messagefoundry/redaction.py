@@ -1123,8 +1123,8 @@ def redact_untrusted(text: str, *, window: int = _REDACT_WINDOW) -> str:
 # use it as a key. BACKLOG #2079 widened the DICOM pass to all of group 0010 and closed a one-word name
 # under ``name``.
 #
-# Not :mod:`messagefoundry.anon`. That framework de-identifies a whole HL7 v2 message by FIELD ADDRESS
-# (``PID-5``) into keyed surrogates, loads its token denylist from ``scripts/`` in a source checkout,
+# Not the ``anon`` package in the ``messagefoundry-toolkit`` distribution. That framework
+# de-identifies a whole HL7 v2 message by FIELD ADDRESS (``PID-5``) into keyed surrogates, loads its token denylist from ``scripts/`` in a source checkout,
 # and has no FHIR, XML or DICOM vocabulary at all. This module is the one redaction chokepoint, pure
 # stdlib by design, so the shapes are added here beside the passes they complement.
 

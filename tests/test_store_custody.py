@@ -1,0 +1,1495 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""Key custody primitives (vault BACKLOG #3411, slice S3; the vault key custody ADR draft).
+
+Round trips, the refusals, and that no key material reaches a repr or an exception message. The
+DPAPI cases run on Windows and the file-mode and credential cases on POSIX; the decisions behind the
+file checks are pure and run everywhere."""
+
+from __future__ import annotations
+
+import errno
+import os
+import stat
+import struct
+import sys
+from pathlib import Path
+
+import pytest
+
+from messagefoundry import restricted_file
+from messagefoundry.restricted_file import RestrictedFileError
+from messagefoundry.secrets_dpapi import DpapiUnavailable
+from messagefoundry.store import custody
+from messagefoundry.store.custody import (
+    CredentialUnavailable,
+    CustodyError,
+    HostBlob,
+    MasterKey,
+    RecoveryKey,
+    StoreId,
+    unwrap_master_key,
+    wrap_master_key,
+)
+
+windows_only = pytest.mark.skipif(sys.platform != "win32", reason="DPAPI is Windows-only")
+linux_only = pytest.mark.skipif(
+    sys.platform != "linux", reason="custody files on POSIX are read on Linux only"
+)
+
+
+#: Taken at import, so a test that stands in for fstatfs cannot change what this fixture reads:
+#: fixtures a test names with ``usefixtures`` are set up before this one.
+_REAL_FILE_SYSTEM_TYPE = restricted_file.linux_file_system_type
+
+
+@pytest.fixture
+def tmp_path(tmp_path: Path) -> Path:
+    """pytest's own, but on Linux only where a host file may be kept: a ``/tmp`` on tmpfs, the
+    default on at least Fedora and Arch, is not on the host file system allowlist, so a test that
+    writes a real host file there is skipped, saying why, rather than failing."""
+    if sys.platform == "linux":
+        fd = os.open(tmp_path, os.O_RDONLY)
+        try:
+            magic = _REAL_FILE_SYSTEM_TYPE(fd)
+        finally:
+            os.close(fd)
+        if magic not in restricted_file.LINUX_HOST_FILE_SYSTEMS:
+            pytest.skip(f"the temporary directory is on file system type {magic:#010x}")
+    return tmp_path
+
+
+# Fixed, recognisable key material, so a test can look for it in text.
+_MASTER = bytes(range(32))
+_RECOVERY = bytes(range(100, 132))
+
+
+def _blob(earlier: int = 2) -> HostBlob:
+    return HostBlob(
+        MasterKey(_MASTER),
+        StoreId(b"\x11" * 16),
+        tuple(StoreId(bytes([0x20 + i]) * 16) for i in range(earlier)),
+    )
+
+
+def _leaks(text: str, *secrets: bytes) -> list[str]:
+    """Each rendering of a secret that appears in ``text``: hex, either case, and the raw repr."""
+    found = []
+    for secret in secrets:
+        for form in (secret.hex(), secret.hex().upper(), repr(secret)[2:-1]):
+            if form in text:
+                found.append(form)
+    return found
+
+
+# --- mint ---------------------------------------------------------------------------------------
+
+
+def test_mint_gives_the_sizes_the_draft_names_and_a_fresh_value_each_time() -> None:
+    assert len(MasterKey.mint().material()) == 32
+    assert len(StoreId.mint().value) == 16
+    assert len(RecoveryKey.mint().material()) == 32
+    assert MasterKey.mint() != MasterKey.mint()
+    assert StoreId.mint() != StoreId.mint()
+    assert RecoveryKey.mint() != RecoveryKey.mint()
+
+
+@pytest.mark.parametrize("cls", [MasterKey, RecoveryKey, StoreId])
+def test_a_value_of_the_wrong_size_is_refused(cls: type) -> None:
+    with pytest.raises(CustodyError, match="bytes, not 31"):
+        cls(b"\x00" * 31)
+
+
+# --- the recovery key text ------------------------------------------------------------------------
+
+
+def test_recovery_key_text_round_trips_and_is_grouped() -> None:
+    key = RecoveryKey(_RECOVERY)
+    text = key.text()
+    groups = text.split("-")
+    assert len(groups) == 14 and all(len(g) == 4 for g in groups)
+    assert RecoveryKey.parse(text) == key
+    # Case, dashes and spaces do not matter, and the look-alike letters read as their digits.
+    loose = " ".join(groups).lower()
+    assert RecoveryKey.parse(loose) == key
+    assert RecoveryKey.parse(text.replace("0", "O").replace("1", "I")) == key
+    # A word processor's en dash between groups is a separator too.
+    assert RecoveryKey.parse(text.replace("-", "–")) == key
+
+
+def test_a_non_ascii_letter_is_not_read_as_a_digit() -> None:
+    text = RecoveryKey(_RECOVERY).text()
+    # U+0131, dotless i, upper-cases to an ASCII I; it is refused rather than read as a 1.
+    with pytest.raises(CustodyError, match="character 1 of the entry"):
+        RecoveryKey.parse("ı" + text[1:])
+
+
+def test_every_single_character_mistype_is_refused_by_the_checksum() -> None:
+    text = RecoveryKey(_RECOVERY).text().replace("-", "")
+    alphabet = custody._ALPHABET
+    refused = 0
+    for position, ch in enumerate(text):
+        swap = alphabet[(alphabet.index(ch) + 7) % len(alphabet)]
+        entry = text[:position] + swap + text[position + 1 :]
+        with pytest.raises(CustodyError, match="checksum does not match") as excinfo:
+            RecoveryKey.parse(entry)
+        message = str(excinfo.value)
+        assert entry not in message and text not in message
+        assert not any(entry[i : i + 4] in message for i in range(0, 56, 4))
+        refused += 1
+    assert refused == 56  # the control: every position was tried
+
+
+def test_a_recovery_key_of_the_wrong_length_or_alphabet_is_refused_without_echo() -> None:
+    text = RecoveryKey(_RECOVERY).text()
+    compact = text.replace("-", "")
+    with pytest.raises(CustodyError, match="this entry has 55") as short:
+        RecoveryKey.parse(compact[:-1])
+    # The position counts the dashes the person sees: the third character of the second group.
+    bad_entry = text[:7] + "U" + text[8:]
+    with pytest.raises(CustodyError, match="character 8 of the entry") as bad:
+        RecoveryKey.parse(bad_entry)
+    for excinfo in (short, bad):
+        message = str(excinfo.value)
+        # No run of the entry survives into the message: not the whole key, not one group of it.
+        assert compact[:-1] not in message and bad_entry not in message
+        assert not any(group in message for group in bad_entry.split("-"))
+
+
+def test_a_refusal_leaves_no_key_material_in_the_raising_frame() -> None:
+    # A renderer that prints frame locals (BACKLOG #3471's concern) walks the traceback's frames.
+    text = RecoveryKey(_RECOVERY).text()
+    mistyped = ("1" if text[0] != "1" else "2") + text[1:]
+    bad_blob = _blob().serialize()[:-1]
+    for call in (lambda: RecoveryKey.parse(mistyped), lambda: HostBlob.parse(bad_blob)):
+        with pytest.raises(CustodyError) as excinfo:
+            call()
+        seen = 0
+        tb = excinfo.value.__traceback__
+        while tb is not None:
+            frame = tb.tb_frame
+            if frame.f_code.co_filename == custody.__file__:
+                seen += 1
+                rendered = repr(dict(frame.f_locals))
+                assert mistyped not in rendered and text[5:9] not in rendered
+                assert not _leaks(rendered, _MASTER)
+            tb = tb.tb_next
+        assert seen == 1  # the control: the raising frame in custody.py was examined
+
+
+def test_a_long_paste_is_refused_at_the_first_extra_character() -> None:
+    text = RecoveryKey(_RECOVERY).text()
+    with pytest.raises(CustodyError, match="this entry has more"):
+        RecoveryKey.parse(text + "0" * 2_000_000)
+
+
+def test_earlier_store_ids_are_held_as_a_tuple() -> None:
+    ids = [StoreId(b"\x21" * 16)]
+    blob = HostBlob(MasterKey(_MASTER), StoreId(b"\x11" * 16), ids)  # type: ignore[arg-type]
+    ids.append(StoreId(b"\x11" * 16))  # a later change to the list does not reach the blob
+    assert blob.earlier_store_ids == (StoreId(b"\x21" * 16),)
+    generated = HostBlob(MasterKey(_MASTER), StoreId(b"\x11" * 16), (s for s in ids[:1]))  # type: ignore[arg-type]
+    assert generated.earlier_store_ids == (StoreId(b"\x21" * 16),)
+
+
+def test_a_host_blob_given_as_a_bytearray_parses() -> None:
+    assert HostBlob.parse(bytearray(_blob().serialize())) == _blob()
+
+
+# --- the host blob --------------------------------------------------------------------------------
+
+
+def test_host_blob_round_trips() -> None:
+    for earlier in (0, 1, 3):
+        blob = _blob(earlier)
+        assert HostBlob.parse(blob.serialize()) == blob
+
+
+@pytest.mark.parametrize("version", [1, 3])
+def test_an_unknown_host_blob_version_is_refused(version: int) -> None:
+    # Version 1 had no recovery proof; it is refused like any version this engine does not write.
+    data = bytearray(_blob().serialize())
+    data[4] = version
+    with pytest.raises(
+        CustodyError, match=f"version {version}, and this engine reads version 2 only"
+    ):
+        HostBlob.parse(bytes(data))
+
+
+def test_the_recovery_proof_round_trips_and_reads_none_for_never() -> None:
+    proved = HostBlob(MasterKey(_MASTER), StoreId(b"\x11" * 16), (), 1_800_000_000)
+    assert HostBlob.parse(proved.serialize()).recovery_proved_at == 1_800_000_000
+    assert HostBlob.parse(_blob().serialize()).recovery_proved_at is None
+    assert "recovery_proved_at=1800000000" in repr(proved)
+    with pytest.raises(CustodyError, match="recovery proof"):
+        HostBlob(MasterKey(_MASTER), StoreId(b"\x11" * 16), (), -1)
+
+
+@pytest.mark.parametrize(
+    "mangle",
+    [
+        lambda d: b"XXXX" + d[4:],  # not the magic
+        lambda d: d[:-1],  # short by one
+        lambda d: d + b"\x00",  # long by one
+        lambda d: d[:10],  # shorter than the head
+    ],
+)
+def test_a_host_blob_of_the_wrong_shape_is_refused(mangle: object) -> None:
+    data = _blob().serialize()
+    with pytest.raises(CustodyError) as excinfo:
+        HostBlob.parse(mangle(data))  # type: ignore[operator]
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+def test_a_host_blob_naming_a_store_id_twice_is_refused() -> None:
+    current = StoreId(b"\x11" * 16)
+    with pytest.raises(CustodyError, match="each store id once"):
+        HostBlob(MasterKey(_MASTER), current, (current,))
+
+
+# --- the recovery wrap ----------------------------------------------------------------------------
+
+
+def test_recovery_wrap_round_trips() -> None:
+    master, recovery, store_id = MasterKey(_MASTER), RecoveryKey(_RECOVERY), StoreId.mint()
+    wrapped = wrap_master_key(master, recovery, store_id)
+    assert _MASTER not in wrapped  # the wrap holds ciphertext, not the key
+    assert unwrap_master_key(wrapped, recovery, store_id) == master
+    # A fresh nonce each time: two wraps of one key differ and both open.
+    again = wrap_master_key(master, recovery, store_id)
+    assert again != wrapped
+    assert unwrap_master_key(again, recovery, store_id) == master
+
+
+def test_a_wrong_recovery_key_is_refused() -> None:
+    store_id = StoreId.mint()
+    wrapped = wrap_master_key(MasterKey(_MASTER), RecoveryKey(_RECOVERY), store_id)
+    with pytest.raises(CustodyError, match="does not open this recovery wrap") as excinfo:
+        unwrap_master_key(wrapped, RecoveryKey.mint(), store_id)
+    # Raised outside the handler: no chained exception at all, not one merely hidden.
+    assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
+    assert not _leaks(str(excinfo.value), _MASTER, _RECOVERY)
+
+
+def test_a_wrong_store_id_in_the_associated_data_is_refused() -> None:
+    recovery = RecoveryKey(_RECOVERY)
+    wrapped = wrap_master_key(MasterKey(_MASTER), recovery, StoreId(b"\x01" * 16))
+    assert unwrap_master_key(wrapped, recovery, StoreId(b"\x01" * 16)).material() == _MASTER
+    with pytest.raises(CustodyError, match="does not open this recovery wrap"):
+        unwrap_master_key(wrapped, recovery, StoreId(b"\x02" * 16))
+
+
+def test_a_recovery_wrap_of_another_version_or_shape_is_refused() -> None:
+    recovery, store_id = RecoveryKey(_RECOVERY), StoreId.mint()
+    wrapped = wrap_master_key(MasterKey(_MASTER), recovery, store_id)
+    with pytest.raises(CustodyError, match="version 9, and this engine reads version 1 only"):
+        unwrap_master_key(wrapped[:4] + b"\x09" + wrapped[5:], recovery, store_id)
+    with pytest.raises(CustodyError, match="not a recovery wrap"):
+        unwrap_master_key(b"MFRW", recovery, store_id)
+    with pytest.raises(CustodyError, match="not a recovery wrap"):
+        unwrap_master_key(b"", recovery, store_id)
+    with pytest.raises(CustodyError, match="bytes, not"):
+        unwrap_master_key(wrapped[:-1], recovery, store_id)
+
+
+# --- nothing renders key material -----------------------------------------------------------------
+
+
+def test_no_type_renders_its_key_material() -> None:
+    blob = _blob()
+    recovery = RecoveryKey(_RECOVERY)
+    for value in (blob.master_key, recovery, blob):
+        for text in (repr(value), str(value), f"{value!r}", f"{[value]}"):
+            assert not _leaks(text, _MASTER, _RECOVERY), text
+            assert recovery.text() not in text
+    # The control: a store id is not a secret, and its repr names it.
+    assert blob.store_id.hex() in repr(blob)
+    assert repr(blob.store_id) == f"StoreId({'11' * 16})"
+
+
+def test_the_key_types_are_not_hashable() -> None:
+    # A hash of a key would be a stable value derived from it, sitting in any dict or set it joins.
+    with pytest.raises(TypeError):
+        hash(MasterKey(_MASTER))
+    with pytest.raises(TypeError):
+        hash(RecoveryKey(_RECOVERY))
+
+
+# --- the POSIX file decisions, run everywhere -----------------------------------------------------
+
+
+_HOST = custody._HOST_FILE_POLICY
+_CREDENTIAL = custody._CREDENTIAL_POLICY  # the production policy, not a copy built here
+_REG = stat.S_IFREG
+_UNDEFINED_ID = 0xFFFFFFFF
+_R, _RW = 0o4, 0o6
+_USER_OBJ, _USER, _GROUP_OBJ = custody._ACL_USER_OBJ, custody._ACL_USER, custody._ACL_GROUP_OBJ
+_GROUP, _MASK, _OTHER = custody._ACL_GROUP, custody._ACL_MASK, custody._ACL_OTHER
+_ACL_XATTR = restricted_file.POSIX_ACL_XATTR
+
+
+def _entry(tag: int, perms: int, ident: int = _UNDEFINED_ID) -> bytes:
+    return custody._ACL_ENTRY.pack(tag, perms, ident)
+
+
+def _acl(*entries: bytes) -> bytes:
+    """A ``system.posix_acl_access`` value as Linux stores it: the version, then each entry."""
+    return custody._ACL_HEADER.pack(custody._ACL_VERSION) + b"".join(entries)
+
+
+def _systemd_acl(*named: bytes, group_perms: int = 0, uid: int = 1000) -> bytes:
+    """The list systemd leaves on a credential for a non-root service user (``uid``): the owner and
+    the named user read only, the group nothing, the mask read, and nothing for others."""
+    return _acl(
+        _entry(_USER_OBJ, _R),
+        *(named or (_entry(_USER, _R, uid),)),
+        _entry(_GROUP_OBJ, group_perms),
+        _entry(_MASK, _R),
+        _entry(_OTHER, 0),
+    )
+
+
+def _problem(
+    mode: int,
+    owner: int,
+    policy: custody._PosixPolicy,
+    *,
+    group: int = 1000,
+    acl: bytes | None = None,
+    kind: int = _REG,
+) -> str | None:
+    return custody._posix_file_problem(
+        kind | mode, policy, acl, owner=owner, group=group, euid=1000
+    )
+
+
+def test_the_posix_host_file_check_refuses_any_group_or_other_bit_and_a_foreign_owner() -> None:
+    assert _problem(0o600, 1000, _HOST) is None  # the control
+    assert "0644" in str(_problem(0o644, 1000, _HOST))
+    assert "0610" in str(_problem(0o610, 1000, _HOST))
+    # Group read is refused even for the engine's own group.
+    assert "gid 1000 read" in str(_problem(0o640, 1000, _HOST))
+    assert "uid 0" in str(_problem(0o600, 0, _HOST))
+    assert "not a regular file" in str(_problem(0o700, 1000, _HOST, kind=stat.S_IFDIR))
+    assert "not a regular file" in str(_problem(0o600, 1000, _HOST, kind=stat.S_IFIFO))
+
+
+@pytest.mark.parametrize("mode", [0o400, 0o200, 0o700, 0o000, 0o4600, 0o2600, 0o1600])
+def test_the_posix_host_file_mode_is_exactly_0600(mode: int) -> None:
+    # Draft rule 3b names mode 0600, so the owner's own bits and the setuid, setgid and sticky bits
+    # are judged too. The control is 0600 in the test above.
+    assert "must be exactly 0600" in str(_problem(mode, 1000, _HOST))
+
+
+def test_each_production_policy_names_its_own_file_system_allowlist() -> None:
+    assert _HOST.file_systems is restricted_file.LINUX_HOST_FILE_SYSTEMS
+    assert _CREDENTIAL.file_systems is restricted_file.LINUX_CREDENTIAL_FILE_SYSTEMS
+    assert len({_HOST, _CREDENTIAL}) == 2  # a policy hashes, by identity
+
+
+def test_the_production_credential_policy_fixes_no_mode_and_admits_root() -> None:
+    assert _CREDENTIAL.owners == frozenset({0})
+    assert _CREDENTIAL.access_list is True
+    assert _CREDENTIAL.mode is None
+    # The owner's own bits are not judged for a credential: systemd writes 0400, and 0600 passes.
+    assert _problem(0o600, 0, _CREDENTIAL, group=0) is None
+    assert _problem(0o400, 1000, _CREDENTIAL) is None
+    assert "uid 2000" in str(_problem(0o400, 2000, _CREDENTIAL))
+
+
+def test_the_credential_reader_judges_under_the_production_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[object] = []
+
+    def _read(path: Path, policy: custody._PosixPolicy) -> bytes:
+        seen.append(policy)
+        return _blob().serialize()
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(custody, "_read_posix_checked", _read)
+    environ = {"CREDENTIALS_DIRECTORY": str(tmp_path)}
+    assert custody.read_systemd_credential("store-a", environ=environ) == _blob()
+    assert seen == [custody._CREDENTIAL_POLICY]
+    assert seen[0] is custody._CREDENTIAL_POLICY
+
+
+def test_a_systemd_credential_with_no_list_is_read_by_its_owner_alone() -> None:
+    assert _problem(0o400, 0, _CREDENTIAL, group=0) is None  # the control
+    assert _problem(0o400, 1000, _CREDENTIAL, group=1000) is None
+    assert _problem(0o400, 1000, _CREDENTIAL, group=5) is None
+    # No group reads a credential, not even root's or the engine's own: neither systemd form needs it.
+    assert "gid 0 read" in str(_problem(0o440, 0, _CREDENTIAL, group=0))
+    assert "gid 1000 read" in str(_problem(0o440, 1000, _CREDENTIAL, group=1000))
+    assert "gid 5 read" in str(_problem(0o440, 0, _CREDENTIAL, group=5))
+    assert "0444" in str(_problem(0o444, 0, _CREDENTIAL, group=0))
+    assert "0460" in str(_problem(0o460, 0, _CREDENTIAL, group=0))
+    assert "0450" in str(_problem(0o450, 0, _CREDENTIAL, group=0))
+    assert "uid 2000" in str(_problem(0o400, 2000, _CREDENTIAL))
+
+
+def test_the_access_control_list_systemd_writes_for_a_service_user_is_accepted() -> None:
+    # Owned by root at 0400, with read for the service user in a named entry, which shows the mode
+    # as 0440. The group bits are the mask, so the file's group (gid 5 here) reads nothing.
+    assert _problem(0o440, 0, _CREDENTIAL, group=0, acl=_systemd_acl()) is None
+    assert _problem(0o440, 0, _CREDENTIAL, group=5, acl=_systemd_acl()) is None
+
+
+@pytest.mark.parametrize(
+    ("acl", "group", "expected"),
+    [
+        (_systemd_acl(_entry(_USER, _R, 2000)), 0, "names uid 2000"),
+        (_systemd_acl(_entry(_USER, 0, 2000)), 0, "names uid 2000"),
+        (_systemd_acl(_entry(_USER, _RW, 1000)), 0, "own uid more than read"),
+        (_systemd_acl(_entry(_USER, _R, 1000), _entry(_GROUP, _R, 0)), 0, "names gid 0"),
+        (_systemd_acl(group_perms=_R), 0, "group gid 0 access"),
+        (_systemd_acl(group_perms=_R), 5, "group gid 5 access"),
+        (_systemd_acl(group_perms=_RW), 0, "group gid 0 access"),
+        (
+            _acl(_entry(_USER_OBJ, _R), _entry(_GROUP_OBJ, 0), _entry(_OTHER, _R)),
+            0,
+            "every other account",
+        ),
+        (
+            _acl(_entry(_USER_OBJ, _R), _entry(_GROUP_OBJ, 0), _entry(_OTHER, 0), _entry(0x40, _R)),
+            0,
+            "of a kind this engine does not read",
+        ),
+        # Not a list Linux writes: no group or other entry, a second owner entry, named entries
+        # with no mask, two masks, or the header alone. Each is refused, not read as granting nothing.
+        (_acl(_entry(_USER_OBJ, _RW), _entry(_OTHER, 0)), 0, "not in a form"),
+        (_acl(_entry(_USER_OBJ, _RW), _entry(_GROUP_OBJ, 0)), 0, "not in a form"),
+        (_systemd_acl() + _entry(_USER_OBJ, _R), 0, "not in a form"),
+        (
+            _acl(
+                _entry(_USER_OBJ, _R),
+                _entry(_USER, _R, 1000),
+                _entry(_GROUP_OBJ, 0),
+                _entry(_OTHER, 0),
+            ),
+            0,
+            "not in a form",
+        ),
+        (_systemd_acl() + _entry(_MASK, _R), 0, "not in a form"),
+        (_acl(), 0, "not in a form"),
+        (_systemd_acl()[:-1], 0, "not in a form"),
+        (struct.pack("<I", 1) + _systemd_acl()[4:], 0, "not in a form"),
+        (b"", 0, "not in a form"),
+    ],
+)
+def test_an_access_control_list_entry_beyond_the_policy_is_refused(
+    acl: bytes, group: int, expected: str
+) -> None:
+    assert expected in str(_problem(0o440, 0, _CREDENTIAL, group=group, acl=acl))
+
+
+_CARRIES_A_LIST = "carries a POSIX access control list"
+
+
+def test_the_host_file_carries_no_access_control_list_whatever_it_grants() -> None:
+    assert _problem(0o600, 1000, _HOST) is None  # the control: no list
+    owner_only = _acl(_entry(_USER_OBJ, _RW), _entry(_GROUP_OBJ, 0), _entry(_OTHER, 0))
+    assert _CARRIES_A_LIST in str(_problem(0o600, 1000, _HOST, acl=owner_only))
+    # Even the engine's own uid in a named entry is refused.
+    assert _CARRIES_A_LIST in str(_problem(0o600, 1000, _HOST, acl=_systemd_acl()))
+    named = _systemd_acl(_entry(_USER, 0, 2000))
+    assert _CARRIES_A_LIST in str(_problem(0o600, 1000, _HOST, acl=named))
+
+
+def test_a_host_file_at_0640_with_a_read_mask_and_an_empty_group_entry_is_refused() -> None:
+    # The mask makes the mode read 0640, and with a list the group bits are the mask, so the mode's
+    # group read is not judged; the list's group entry grants nothing. That file is still refused.
+    masked = _acl(
+        _entry(_USER_OBJ, _RW), _entry(_GROUP_OBJ, 0), _entry(_MASK, _R), _entry(_OTHER, 0)
+    )
+    assert _CARRIES_A_LIST in str(_problem(0o640, 1000, _HOST, acl=masked))
+    # The same list is one a credential may carry, so the refusal is the host policy's.
+    assert _problem(0o440, 0, _CREDENTIAL, acl=masked) is None
+
+
+@pytest.mark.parametrize(
+    ("code", "no_list"),
+    [(errno.ENODATA, True), (errno.ENOTSUP, True), (errno.EOPNOTSUPP, True), (errno.EIO, False)],
+)
+def test_only_no_attribute_or_no_extended_attributes_reads_as_no_access_control_list(
+    code: int, no_list: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _getxattr(fd: int, name: str) -> bytes:
+        assert name == _ACL_XATTR
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "getxattr", _getxattr, raising=False)
+    if no_list:
+        assert restricted_file.posix_access_acl(3) is None
+    else:  # a list that could not be read is not a list shown absent
+        with pytest.raises(OSError) as excinfo:
+            restricted_file.posix_access_acl(3)
+        assert excinfo.value.errno == code
+
+
+def test_custody_files_are_refused_on_a_posix_host_other_than_linux(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "store-a").write_bytes(_blob().serialize())
+    environ = {"CREDENTIALS_DIRECTORY": str(tmp_path)}
+    monkeypatch.setattr(sys, "platform", "darwin")
+    with pytest.raises(CustodyError, match="Linux and Windows only"):
+        custody.read_host_file(tmp_path / "store-a")
+    with pytest.raises(CustodyError, match="Linux and Windows only"):
+        custody.write_host_file(tmp_path / "host.blob", _blob())
+    assert not (tmp_path / "host.blob").exists()
+    # A set directory there is a credential meant and not honoured: refused, so no caller falls
+    # back to a weaker provider, as on Linux for a set directory that does not exist.
+    with pytest.raises(
+        CustodyError, match="is set, but a systemd credential is read on Linux only"
+    ):
+        custody.read_systemd_credential("store-a", environ=environ)
+    with pytest.raises(CredentialUnavailable, match="is not set"):  # the control: unset
+        custody.read_systemd_credential("store-a", environ={})
+
+
+@pytest.mark.parametrize("platform", ["darwin", "freebsd14", "win32"])
+def test_a_set_credentials_directory_off_linux_is_refused_not_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    monkeypatch.setattr(sys, "platform", platform)
+    with pytest.raises(CustodyError) as excinfo:
+        custody.read_systemd_credential("store-a", environ={"CREDENTIALS_DIRECTORY": str(tmp_path)})
+    assert not isinstance(excinfo.value, CredentialUnavailable)
+
+
+# --- the POSIX host file, for real ----------------------------------------------------------------
+
+
+@linux_only
+def test_posix_host_file_round_trips_at_mode_0600(tmp_path: Path) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert custody.read_host_file(path) == _blob()
+    with pytest.raises(FileExistsError):
+        custody.write_host_file(path, _blob(0))
+
+
+@linux_only
+def test_posix_host_file_at_0644_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+    os.chmod(path, 0o644)
+    with pytest.raises(CustodyError, match="mode is 0644") as excinfo:
+        custody.read_host_file(path)
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@linux_only
+def test_posix_host_file_that_is_a_link_is_refused(tmp_path: Path) -> None:
+    real = tmp_path / "host.blob"
+    custody.write_host_file(real, _blob())
+    link = tmp_path / "link.blob"
+    link.symlink_to(real)
+    with pytest.raises(CustodyError, match="could not be read"):
+        custody.read_host_file(link)
+
+
+@linux_only
+def test_posix_host_file_that_is_a_fifo_is_refused_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / "host.blob"
+    os.mkfifo(fifo, 0o600)
+    with pytest.raises(CustodyError, match="not a regular file"):
+        custody.read_host_file(fifo)
+
+
+_TMPFS = 0x01021994
+_OVERLAY = 0x794C7630
+
+
+@pytest.fixture
+def credential_on_tmpfs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Report every file as on tmpfs, where systemd keeps a unit's credentials, so a credential the
+    test writes under ``tmp_path`` (a disk file system) passes the credential allowlist."""
+    monkeypatch.setattr(restricted_file, "linux_file_system_type", lambda fd: _TMPFS)
+
+
+@linux_only
+@pytest.mark.usefixtures("credential_on_tmpfs")
+def test_systemd_credential_is_read_from_the_named_file(tmp_path: Path) -> None:
+    (tmp_path / "store-a").write_bytes(_blob().serialize())
+    os.chmod(tmp_path / "store-a", 0o400)
+    environ = {"CREDENTIALS_DIRECTORY": str(tmp_path)}
+    assert custody.read_systemd_credential("store-a", environ=environ) == _blob()
+    with pytest.raises(CredentialUnavailable, match="no credential named 'store-b'"):
+        custody.read_systemd_credential("store-b", environ=environ)
+    os.chmod(tmp_path / "store-a", 0o404)
+    with pytest.raises(CustodyError, match="mode is 0404"):
+        custody.read_systemd_credential("store-a", environ=environ)
+    with pytest.raises(CustodyError, match="absolute path"):
+        custody.read_systemd_credential("store-a", environ={"CREDENTIALS_DIRECTORY": "relative"})
+
+
+@linux_only
+def test_a_credentials_directory_that_does_not_exist_is_refused_not_unavailable(
+    tmp_path: Path,
+) -> None:
+    environ = {"CREDENTIALS_DIRECTORY": str(tmp_path / "missing")}
+    with pytest.raises(CustodyError, match="names no directory") as excinfo:
+        custody.read_systemd_credential("store-a", environ=environ)
+    assert not isinstance(excinfo.value, CredentialUnavailable)
+
+
+def _set_acl_or_skip(path: Path, name: str, acl: bytes) -> None:
+    try:
+        os.setxattr(path, name, acl)
+    except OSError as exc:
+        if exc.errno in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+            pytest.skip("this file system keeps no POSIX access control list")
+        raise
+
+
+@linux_only
+def test_a_host_file_carrying_any_access_control_list_is_refused(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+    other = os.geteuid() + 1
+    acl = _acl(
+        _entry(_USER_OBJ, _RW),
+        _entry(_USER, _R, other),
+        _entry(_GROUP_OBJ, 0),
+        _entry(_MASK, 0),
+        _entry(_OTHER, 0),
+    )
+    _set_acl_or_skip(path, _ACL_XATTR, acl)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600  # the mode alone would pass
+    with pytest.raises(CustodyError, match=_CARRIES_A_LIST) as excinfo:
+        custody.read_host_file(path)
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@linux_only
+def test_a_host_file_at_0640_with_a_read_mask_and_an_empty_group_entry_is_refused_for_real(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+    assert custody.read_host_file(path) == _blob()  # the control
+    masked = _acl(
+        _entry(_USER_OBJ, _RW), _entry(_GROUP_OBJ, 0), _entry(_MASK, _R), _entry(_OTHER, 0)
+    )
+    _set_acl_or_skip(path, _ACL_XATTR, masked)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640  # the group bits are now the mask
+    with pytest.raises(CustodyError, match=_CARRIES_A_LIST) as excinfo:
+        custody.read_host_file(path)
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@linux_only
+@pytest.mark.usefixtures("credential_on_tmpfs")
+def test_a_credential_with_the_access_control_list_systemd_writes_is_read(tmp_path: Path) -> None:
+    path = tmp_path / "store-a"
+    path.write_bytes(_blob().serialize())
+    os.chmod(path, 0o400)
+    euid = os.geteuid()
+    _set_acl_or_skip(path, _ACL_XATTR, _systemd_acl(uid=euid))
+    assert stat.S_IMODE(path.stat().st_mode) == 0o440  # the group bits are now the mask
+    environ = {"CREDENTIALS_DIRECTORY": str(tmp_path)}
+    assert custody.read_systemd_credential("store-a", environ=environ) == _blob()
+    os.setxattr(path, _ACL_XATTR, _systemd_acl(_entry(_USER, _R, euid + 1)))
+    with pytest.raises(CustodyError, match=f"names uid {euid + 1}"):
+        custody.read_systemd_credential("store-a", environ=environ)
+
+
+@linux_only
+def test_a_host_file_written_under_a_default_access_control_list_reads_back(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "keys"
+    directory.mkdir()
+    default = _acl(
+        _entry(_USER_OBJ, 0o7),
+        _entry(_USER, _RW, os.geteuid() + 1),
+        _entry(_GROUP_OBJ, 0o5),
+        _entry(_MASK, 0o7),
+        _entry(_OTHER, 0o5),
+    )
+    _set_acl_or_skip(directory, "system.posix_acl_default", default)
+    path = directory / "host.blob"
+    custody.write_host_file(path, _blob())
+    with pytest.raises(OSError) as excinfo:  # no access control list is left on the file
+        os.getxattr(path, _ACL_XATTR)
+    assert excinfo.value.errno == errno.ENODATA
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert custody.read_host_file(path) == _blob()
+
+
+@linux_only
+def test_an_inherited_access_control_list_that_cannot_be_removed_leaves_no_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _removexattr(fd: int, name: str) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(restricted_file, "posix_access_acl", lambda fd: b"inherited")
+    monkeypatch.setattr(os, "removexattr", _removexattr)
+    path = tmp_path / "host.blob"
+    with pytest.raises(RestrictedFileError, match="inherited POSIX access control list"):
+        custody.write_host_file(path, _blob())
+    assert not path.exists()
+
+
+@linux_only
+def test_an_inherited_access_control_list_still_there_after_removal_leaves_no_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(restricted_file, "posix_access_acl", lambda fd: b"inherited")
+    monkeypatch.setattr(os, "removexattr", lambda fd, name: None)
+    path = tmp_path / "host.blob"
+    with pytest.raises(RestrictedFileError, match="still carries one after it was removed"):
+        custody.write_host_file(path, _blob())
+    assert not path.exists()
+
+
+@linux_only
+def test_a_host_file_is_written_at_0600_whatever_the_umask(tmp_path: Path) -> None:
+    previous = os.umask(0o677)
+    try:
+        custody.write_host_file(tmp_path / "host.blob", _blob())
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE((tmp_path / "host.blob").stat().st_mode) == 0o600
+    assert custody.read_host_file(tmp_path / "host.blob") == _blob()
+
+
+@linux_only
+def test_an_access_control_list_that_cannot_be_read_refuses_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+
+    def _getxattr(fd: int, name: str) -> bytes:
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(os, "getxattr", _getxattr)
+    with pytest.raises(CustodyError, match="access control list could not be read"):
+        custody.read_host_file(path)
+
+
+@linux_only
+def test_the_file_system_type_is_read_through_the_descriptor(tmp_path: Path) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        magic = restricted_file.linux_file_system_type(fd)
+    finally:
+        os.close(fd)
+    # The control for the refusals below: the test's own directory is on a listed file system.
+    assert magic in restricted_file.LINUX_HOST_FILE_SYSTEMS
+    assert custody.read_host_file(path) == _blob()
+
+
+@linux_only
+@pytest.mark.parametrize("magic", [0x6969, 0xFF534D42, 0x517B, 0x65735546, _OVERLAY, 0x19830326])
+def test_a_custody_file_on_a_file_system_the_allowlist_does_not_name_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, magic: int
+) -> None:
+    # NFS, CIFS, SMB, FUSE, overlay and BeeGFS. Such a file system may answer ENOTSUP for the POSIX
+    # list, so without this the file would be judged on its mode and owner alone.
+    name = f"type {magic:#010x}"
+    host = tmp_path / "host.blob"
+    custody.write_host_file(host, _blob())
+    credential = tmp_path / "store-a"
+    credential.write_bytes(_blob().serialize())
+    os.chmod(credential, 0o400)
+    seen: list[int] = []
+
+    def _fstatfs(fd: int) -> int:
+        seen.append(fd)
+        return magic
+
+    monkeypatch.setattr(restricted_file, "linux_file_system_type", _fstatfs)
+    with pytest.raises(CustodyError, match=name) as excinfo:
+        custody.read_host_file(host)
+    assert not _leaks(str(excinfo.value), _MASTER)
+    environ = {"CREDENTIALS_DIRECTORY": str(tmp_path)}
+    with pytest.raises(CustodyError, match=name):
+        custody.read_systemd_credential("store-a", environ=environ)
+    assert len(seen) == 2  # the control: each read asked the descriptor it opened
+
+
+@linux_only
+def test_each_custody_file_kind_has_its_own_file_system_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = tmp_path / "host.blob"
+    custody.write_host_file(host, _blob())
+    credential = tmp_path / "store-a"
+    credential.write_bytes(_blob().serialize())
+    os.chmod(credential, 0o400)
+    environ = {"CREDENTIALS_DIRECTORY": str(tmp_path)}
+    # On the test's own disk: the host file reads, and a credential there is refused.
+    assert custody.read_host_file(host) == _blob()
+    with pytest.raises(CustodyError, match="ramfs or tmpfs only"):
+        custody.read_systemd_credential("store-a", environ=environ)
+    # On tmpfs: the other way round.
+    monkeypatch.setattr(restricted_file, "linux_file_system_type", lambda fd: _TMPFS)
+    assert custody.read_systemd_credential("store-a", environ=environ) == _blob()
+    with pytest.raises(CustodyError, match=f"type {_TMPFS:#010x}"):
+        custody.read_host_file(host)
+
+
+@linux_only
+def test_a_host_file_is_not_written_on_a_file_system_the_allowlist_does_not_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sizes: list[int] = []
+
+    def _fstatfs(fd: int) -> int:
+        sizes.append(os.fstat(fd).st_size)
+        return 0x6969
+
+    monkeypatch.setattr(restricted_file, "linux_file_system_type", _fstatfs)
+    path = tmp_path / "host.blob"
+    with pytest.raises(RestrictedFileError, match="type 0x00006969") as excinfo:
+        custody.write_host_file(path, _blob())
+    assert sizes == [0]  # judged while still empty
+    assert not path.exists()
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@linux_only
+def test_a_status_that_cannot_be_read_refuses_the_custody_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+    real = os.fstat
+
+    def _fstat(fd: int) -> os.stat_result:
+        if os.readlink(f"/proc/self/fd/{fd}") == str(path):  # only the custody file's descriptor
+            raise OSError(errno.EIO, "I/O error")
+        return real(fd)
+
+    monkeypatch.setattr(os, "fstat", _fstat)
+    with pytest.raises(CustodyError, match="could not be read: I/O error"):
+        custody.read_host_file(path)
+
+
+@linux_only
+def test_a_file_system_type_that_cannot_be_read_refuses_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+
+    def _fstatfs(fd: int) -> int:
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(restricted_file, "linux_file_system_type", _fstatfs)
+    with pytest.raises(CustodyError, match="file system could not be read"):
+        custody.read_host_file(path)
+
+
+@linux_only
+def test_a_host_file_at_0400_is_refused_for_real(tmp_path: Path) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+    os.chmod(path, 0o400)
+    with pytest.raises(CustodyError, match="must be exactly 0600"):
+        custody.read_host_file(path)
+
+
+@linux_only
+def test_a_c_library_with_no_fstatfs_refuses_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ctypes
+
+    class _NoSymbols:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            pass
+
+        def __getattr__(self, name: str) -> object:
+            raise AttributeError(name)
+
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+    monkeypatch.setattr(ctypes, "CDLL", _NoSymbols)
+    with pytest.raises(CustodyError, match="file system could not be read"):
+        custody.read_host_file(path)
+
+
+def test_the_file_system_type_is_read_on_linux_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    with pytest.raises(RestrictedFileError, match="Linux only"):
+        restricted_file.linux_file_system_type(0)
+
+
+def test_systemd_credential_refusals_that_need_no_file() -> None:
+    with pytest.raises(CredentialUnavailable, match="is not set"):
+        custody.read_systemd_credential("store-a", environ={})
+    for name in ("", ".", "..", "a/b", "a\\b", "a\x00b"):
+        with pytest.raises(CustodyError, match="plain file name"):
+            custody.read_systemd_credential(name, environ={"CREDENTIALS_DIRECTORY": "/run/x"})
+
+
+# --- the Windows host provider and the handoff ----------------------------------------------------
+
+
+@pytest.fixture
+def dpapi_scopes(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """The ``machine_scope`` of each real ``dpapi_protect`` call made during the test."""
+    from messagefoundry import secrets_dpapi
+
+    scopes: list[bool] = []
+    real = secrets_dpapi.dpapi_protect
+
+    def _spy(secret: bytes, *, machine_scope: bool) -> bytes:
+        scopes.append(machine_scope)
+        return real(secret, machine_scope=machine_scope)
+
+    monkeypatch.setattr(secrets_dpapi, "dpapi_protect", _spy)
+    return scopes
+
+
+@windows_only
+def test_windows_host_blob_round_trips_under_user_scope_dpapi(dpapi_scopes: list[bool]) -> None:
+    protected = custody.protect_host_blob(_blob())
+    assert dpapi_scopes == [False]  # user scope: only this account can open it
+    assert _MASTER not in protected
+    assert custody.unprotect_host_blob(protected) == _blob()
+
+
+@windows_only
+def test_windows_host_file_round_trips(tmp_path: Path) -> None:
+    path = tmp_path / "master.key"
+    custody.write_host_file(path, _blob())
+    assert _MASTER not in path.read_bytes()
+    assert custody.read_host_file(path) == _blob()
+
+
+def _aces(path: Path) -> set[tuple[int, int, str]]:
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    security = _win32_config_source_probes().read_path(path)
+    assert security.aces is not None
+    return set(security.aces)
+
+
+_SYSTEM, _ADMINS = "S-1-5-18", "S-1-5-32-544"
+#: A per-service account's SID shape (NT SERVICE\<name>); no such service need exist.
+_SERVICE = "S-1-5-80-1-2-3-4-5"
+_FULL, _READ, _READ_DELETE = 0x1F01FF, 0x120089, 0x130089
+
+
+def _engine_sid() -> str:
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    sid = _win32_config_source_probes().self_sid
+    assert sid is not None
+    return sid
+
+
+def _is_elevated() -> bool:
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+
+
+#: The handoff is written owned by Administrators, which only an elevated administrator or SYSTEM may
+#: make a file's owner, so a test that writes one needs that token. The hosted Windows legs run
+#: elevated; off-admin, :func:`test_windows_a_handoff_is_refused_up_front_off_admin` runs instead.
+elevated_only = pytest.mark.skipif(
+    not _is_elevated(),
+    reason="writing a handoff needs an elevated administrator, as provision-admin",
+)
+
+
+@windows_only
+@pytest.mark.skipif(_is_elevated(), reason="the off-admin arm; an elevated token may write it")
+def test_windows_a_handoff_is_refused_up_front_off_admin(
+    tmp_path: Path, dpapi_scopes: list[bool]
+) -> None:
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="must be owned by Administrators") as excinfo:
+        custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
+    assert not path.exists()
+    assert dpapi_scopes == []  # refused before the blob was protected, let alone written
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@windows_only
+def test_windows_a_token_without_administrators_is_refused_up_front(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dpapi_scopes: list[bool]
+) -> None:
+    # The same refusal on an elevated leg, where the real pre-check would pass.
+    monkeypatch.setattr(restricted_file, "_administrators_enabled", lambda: False)
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="must be owned by Administrators"):
+        custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
+    assert not path.exists()
+    assert dpapi_scopes == []
+
+
+@windows_only
+@pytest.mark.skipif(_is_elevated(), reason="the off-admin arm; an elevated token may set the owner")
+def test_windows_a_create_refused_its_owner_is_a_custody_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Past a pre-check that answered wrongly, Windows itself refuses the owner at the create.
+    monkeypatch.setattr(restricted_file, "_administrators_enabled", lambda: True)
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="may not make") as excinfo:
+        custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
+    assert isinstance(excinfo.value.__cause__, RestrictedFileError)
+    assert not path.exists()
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@windows_only
+@elevated_only
+def test_windows_handoff_carries_exactly_the_drafts_descriptor(
+    tmp_path: Path, dpapi_scopes: list[bool]
+) -> None:
+    path = tmp_path / "handoff.key"
+    custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
+    assert dpapi_scopes == [True]  # machine scope, so the service account can open it
+    # D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRSD;;;<service>), and no entry for the account that wrote
+    # it: the draft's descriptor, with DELETE for the service so it can delete the handoff.
+    assert _aces(path) == {(0, _FULL, _SYSTEM), (0, _FULL, _ADMINS), (0, _READ_DELETE, _SERVICE)}
+    assert _engine_sid() not in {sid for _type, _mask, sid in _aces(path)}
+
+
+@windows_only
+@elevated_only
+def test_windows_a_handoff_made_for_another_account_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "handoff.key"
+    custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
+    # The list names another account, so the engine's own account is refused.
+    with pytest.raises(CustodyError) as excinfo:
+        custody.read_handoff_file(path)
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@windows_only
+@pytest.mark.parametrize(
+    ("shared", "expected"),
+    [
+        ("NT AUTHORITY\\LOCAL SERVICE", "many services share"),
+        ("*S-1-5-20", "many services share"),
+        ("NT AUTHORITY\\SYSTEM", "many services share"),
+        ("*S-1-5-18", "many services share"),
+        # Not one account: groups and aliases, and a SID Windows maps to no account.
+        ("*S-1-5-32-544", "to an alias"),  # Administrators
+        ("*S-1-5-32-551", "to an alias"),  # Backup Operators
+        ("*S-1-5-21-1-2-3-512", "to no account"),  # a Domain Admins SID of no domain here
+        ("*S-1-5-80-0", "well-known group"),  # ALL SERVICES
+    ],
+)
+def test_windows_a_handoff_for_a_shared_account_is_not_written(
+    tmp_path: Path, dpapi_scopes: list[bool], shared: str, expected: str
+) -> None:
+    # Refused before the token is asked about, so this runs off-admin too, unstubbed.
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match=expected):
+        custody.write_handoff_file(path, _blob(), service_account=shared)
+    assert not path.exists()
+    assert dpapi_scopes == []  # refused before the blob was protected
+
+
+@windows_only
+def test_windows_a_grantee_that_cannot_be_looked_up_is_a_custody_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _fails(sid: str) -> int | None:
+        raise RestrictedFileError(f"the account {sid} could not be looked up (Win32 error 1789)")
+
+    monkeypatch.setattr(restricted_file, "_lookup_sid_kind", _fails)
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="could not be looked up"):
+        custody.write_handoff_file(path, _blob(), service_account="*S-1-5-21-1-2-3-1001")
+    assert not path.exists()
+
+
+def _engine_as(monkeypatch: pytest.MonkeyPatch, sid: str) -> None:
+    """Make the engine's own account read as ``sid``; every other probe is the real one."""
+    import dataclasses
+
+    from messagefoundry.config import wiring
+
+    probes = dataclasses.replace(wiring._win32_config_source_probes(), self_sid=sid)
+    monkeypatch.setattr(wiring, "_win32_config_source_probes", lambda: probes)
+
+
+@windows_only
+@pytest.mark.parametrize("shared", ["S-1-5-18", "S-1-5-19", "S-1-5-20"])
+def test_windows_an_engine_on_a_shared_account_keeps_no_host_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared: str, dpapi_scopes: list[bool]
+) -> None:
+    path = tmp_path / "master.key"
+    custody.write_host_file(path, _blob())  # the control, as this account
+    assert custody.read_host_file(path) == _blob()
+    dpapi_scopes.clear()
+    _engine_as(monkeypatch, shared)
+    with pytest.raises(CustodyError, match="engine's own account is refused"):
+        custody.read_host_file(path)
+    fresh = tmp_path / "fresh.key"
+    with pytest.raises(CustodyError, match="engine's own account is refused"):
+        custody.write_host_file(fresh, _blob())
+    assert not fresh.exists() and dpapi_scopes == []  # refused before the blob was protected
+
+
+@windows_only
+@pytest.mark.parametrize("shared", ["S-1-5-18", "S-1-5-19", "S-1-5-20"])
+def test_windows_an_engine_on_a_shared_account_reads_no_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared: str
+) -> None:
+    path = tmp_path / "handoff.key"
+    _handoff_as_this_account(path)
+    assert custody.read_handoff_file(path) == _blob()  # the control
+    _engine_as(monkeypatch, shared)
+    with pytest.raises(CustodyError, match="many services share"):
+        custody.read_handoff_file(path)
+    with pytest.raises(CustodyError, match="many services share"):
+        custody.consume_handoff_file(path, lambda blob: None)
+    assert path.exists()
+
+
+@windows_only
+@elevated_only
+def test_windows_a_handoff_made_for_this_account_round_trips(tmp_path: Path) -> None:
+    path = tmp_path / "handoff.key"
+    me = _engine_sid()
+    # enforcing=False: the account may be a domain one on a dev box; the rule is the wiring's test.
+    custody.write_handoff_file(path, _blob(), service_account=f"*{me}", enforcing=False)
+    assert _aces(path) == {(0, _FULL, _SYSTEM), (0, _FULL, _ADMINS), (0, _READ_DELETE, me)}
+    assert custody.read_handoff_file(path) == _blob()
+    assert custody.consume_handoff_file(path, lambda blob: None) == _blob()
+    assert not path.exists()
+
+
+def _os_handle(fd: int) -> int:
+    """The Windows handle a descriptor owns."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("a handle exists only on Windows")
+    import msvcrt
+
+    return msvcrt.get_osfhandle(fd)
+
+
+@windows_only
+@pytest.mark.skipif(
+    not _is_elevated(), reason="needs an elevated administrator, as provision-admin"
+)
+def test_windows_an_elevated_handoff_is_owned_by_administrators_and_reads(tmp_path: Path) -> None:
+    from messagefoundry.store import store as store_mod
+
+    path = tmp_path / "handoff.key"
+    custody.write_handoff_file(path, _blob(), service_account=f"*{_engine_sid()}", enforcing=False)
+    parsed = store_mod._parse_sddl_dacl(store_mod._read_dacl_sddl(path, owner=True) or "")
+    assert parsed is not None and parsed.owner == _ADMINS
+    assert custody.read_handoff_file(path) == _blob()
+
+
+@windows_only
+def test_windows_a_key_file_with_an_extra_entry_is_refused(tmp_path: Path) -> None:
+    from messagefoundry.store import store as store_mod
+
+    path = tmp_path / "master.key"
+    custody.write_host_file(path, _blob())
+    assert custody.read_host_file(path) == _blob()  # the control
+    # Not a broad group and not a package: one named account, which only the exact check refuses.
+    store_mod._grant_read(path, "*S-1-5-20")  # NETWORK SERVICE
+    assert "S-1-5-20" in {sid for _t, _m, sid in _aces(path)}  # the grant landed
+    assert restricted_file.broad_access_problem(path) is None  # the broad check alone passes it
+    with pytest.raises(CustodyError, match="S-1-5-20"):
+        custody.read_host_file(path)
+
+
+@windows_only
+@pytest.mark.parametrize(
+    "package",
+    [
+        "*S-1-15-2-1",
+        "*S-1-15-2-3624051433-2125758914-1423191267-1740899205-1073925389-3782572162-737981194",
+    ],
+)
+def test_windows_handoff_refuses_a_package_sid(tmp_path: Path, package: str) -> None:
+    # Refused before the token is asked about, so this runs off-admin too.
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="application package"):
+        custody.write_handoff_file(path, _blob(), service_account=package)
+    assert not path.exists()
+
+
+_PACKAGE = "S-1-15-2-3624051433-2125758914-1423191267-1740899205-1073925389-3782572162-737981194"
+
+
+@windows_only
+def test_windows_a_key_file_widened_to_a_package_after_creation_is_refused(
+    tmp_path: Path,
+) -> None:
+    from messagefoundry.store import store as store_mod
+
+    path = tmp_path / "master.key"
+    custody.write_host_file(path, _blob())
+    assert custody.read_host_file(path) == _blob()  # the control
+    store_mod._grant_read(path, f"*{_PACKAGE}")
+    assert _PACKAGE in {sid for _t, _m, sid in _aces(path)}  # the grant landed
+    with pytest.raises(CustodyError, match="application package"):
+        custody.read_host_file(path)
+
+
+@windows_only
+@elevated_only
+def test_windows_a_blob_of_the_other_scope_is_refused(tmp_path: Path) -> None:
+    from messagefoundry.secrets_dpapi import dpapi_protect
+
+    # Each file's own list names the engine's account differently (read for the handoff, full
+    # control for the host file), so a file renamed to the other's path is refused on its list.
+    handoff = tmp_path / "handoff.key"
+    custody.write_handoff_file(handoff, _blob(), service_account=f"*{_engine_sid()}")
+    with pytest.raises(CustodyError, match="beyond the key file's own"):
+        custody.read_host_file(handoff)
+    host = tmp_path / "master.key"
+    custody.write_host_file(host, _blob())
+    with pytest.raises(CustodyError, match="beyond the key file's own"):
+        custody.read_handoff_file(host)
+    # Behind the list, the scope is checked too.
+    machine = dpapi_protect(_blob().serialize(), machine_scope=True)
+    with pytest.raises(CustodyError, match="not a user-scope DPAPI blob"):
+        custody.unprotect_host_blob(machine)
+    with pytest.raises(CustodyError, match="not a machine-scope DPAPI blob"):
+        custody._unprotect_in_scope(
+            custody.protect_host_blob(_blob()), machine_scope=True, what="handoff blob"
+        )
+    with pytest.raises(CustodyError, match="not a user-scope DPAPI blob"):
+        custody.unprotect_host_blob(b"too short")
+
+
+@windows_only
+def test_windows_the_owner_and_list_are_read_through_the_open_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "master.key"
+    custody.write_host_file(path, _blob())
+    handles: list[int] = []
+    real_open, real_read = custody._open_windows_held, restricted_file._read_handle_security
+
+    def _open(p: Path, **kw: bool) -> int:
+        fd = real_open(p, **kw)
+        handles.append(_os_handle(fd))
+        return fd
+
+    def _read(handle: int) -> restricted_file._HandleSecurity:
+        handles.append(handle)
+        return real_read(handle)
+
+    def _by_name(*_a: object, **_k: object) -> str | None:
+        raise AssertionError("a custody read must not judge the file by its name")
+
+    monkeypatch.setattr(custody, "_open_windows_held", _open)
+    monkeypatch.setattr(restricted_file, "_read_handle_security", _read)
+    monkeypatch.setattr(restricted_file, "broad_access_problem", _by_name)
+    assert custody.read_host_file(path) == _blob()
+    assert len(handles) == 2 and handles[0] == handles[1]  # the handle opened is the one judged
+
+
+@windows_only
+def test_windows_a_check_that_cannot_run_is_a_custody_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "master.key"
+    custody.write_host_file(path, _blob())
+
+    def _fails(handle: int, *, engine_read_only: bool) -> str | None:
+        raise OSError(5, "Access is denied")
+
+    monkeypatch.setattr(restricted_file, "key_file_handle_problem", _fails)
+    with pytest.raises(CustodyError, match="owner and access list could not be read"):
+        custody.read_host_file(path)
+
+
+@windows_only
+def test_windows_a_custody_file_that_is_a_link_is_refused(tmp_path: Path) -> None:
+    real = tmp_path / "master.key"
+    custody.write_host_file(real, _blob())
+    link = tmp_path / "link.key"
+    try:
+        os.symlink(real, link)
+    except OSError:
+        pytest.skip("this account may not create a symbolic link")
+    with pytest.raises(CustodyError, match="is refused"):
+        custody.read_host_file(link)
+
+
+@windows_only
+def test_windows_the_held_file_cannot_be_replaced_or_deleted(tmp_path: Path) -> None:
+    path = tmp_path / "master.key"
+    custody.write_host_file(path, _blob())
+    other = tmp_path / "other.key"
+    other.write_bytes(b"planted")
+    fd = custody._open_windows_held(path)
+    try:
+        with pytest.raises(PermissionError):
+            os.replace(other, path)
+        with pytest.raises(PermissionError):
+            os.unlink(path)
+    finally:
+        os.close(fd)
+    os.replace(other, path)  # the control: once released, the name can be replaced
+
+
+@windows_only
+def test_windows_a_device_is_refused() -> None:
+    # A device that exists and is not a disk file: the null device.
+    with pytest.raises(CustodyError, match="not a file on disk"):
+        custody._open_windows_held(Path("NUL"))
+
+
+@windows_only
+def test_windows_a_missing_custody_file_is_file_not_found(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        custody.read_host_file(tmp_path / "absent.key")
+    with pytest.raises(FileNotFoundError):
+        custody.read_handoff_file(tmp_path / "absent.key")
+
+
+def _handoff_as_this_account(path: Path, *, read_delete: bool = True) -> None:
+    """A handoff as :func:`custody.write_handoff_file` writes it, but for and owned by this
+    account, which any token may make, so the read and consume tests run off-admin too."""
+    from messagefoundry.secrets_dpapi import dpapi_protect
+
+    restricted_file.write_restricted_file(
+        path,
+        dpapi_protect(_blob().serialize(), machine_scope=True),
+        read_grants=[f"*{_engine_sid()}"],
+        creator_access=False,
+        read_delete=read_delete,
+    )
+
+
+@windows_only
+def test_windows_consuming_a_handoff_deletes_it_through_the_handle_that_read_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "handoff.key"
+    _handoff_as_this_account(path)
+    opened: list[int] = []
+    deleted: list[int] = []
+    converted: list[HostBlob] = []
+    real_open, real_delete = custody._open_windows_held, restricted_file.delete_through_handle
+
+    def _open(p: Path, **kw: bool) -> int:
+        assert kw == {"delete": True}  # the reader asks for DELETE
+        fd = real_open(p, **kw)
+        opened.append(_os_handle(fd))
+        return fd
+
+    def _delete(handle: int) -> None:
+        assert path.exists() and converted  # deleted only once the conversion returned
+        deleted.append(handle)
+        real_delete(handle)
+
+    monkeypatch.setattr(custody, "_open_windows_held", _open)
+    monkeypatch.setattr(restricted_file, "delete_through_handle", _delete)
+    assert custody.consume_handoff_file(path, converted.append) == _blob()
+    assert converted == [_blob()]
+    assert deleted == opened and len(opened) == 1  # the handle that read it is the one deleting
+    assert not path.exists()
+
+
+@windows_only
+def test_windows_a_handoff_that_cannot_be_converted_is_left_in_place(tmp_path: Path) -> None:
+    path = tmp_path / "handoff.key"
+    _handoff_as_this_account(path)
+
+    def _fails(blob: HostBlob) -> None:
+        raise CustodyError("stand-in: the host file could not be written")
+
+    with pytest.raises(CustodyError, match="stand-in"):
+        custody.consume_handoff_file(path, _fails)
+    assert path.exists()
+    assert (
+        custody.read_handoff_file(path) == _blob()
+    )  # the start never ran from it, and it is whole
+
+
+@windows_only
+def test_windows_a_handoff_the_delete_refuses_is_a_custody_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "handoff.key"
+    _handoff_as_this_account(path)
+
+    def _refuse(handle: int) -> None:
+        raise PermissionError(errno.EACCES, "Access is denied")
+
+    monkeypatch.setattr(restricted_file, "delete_through_handle", _refuse)
+    converted: list[HostBlob] = []
+    with pytest.raises(custody.HandoffLeftBehind, match="could not be deleted") as excinfo:
+        custody.consume_handoff_file(path, converted.append)
+    # Not a CustodyError: a caller refusing a start on one must not take this, after the
+    # conversion, for a refusal before it.
+    assert not isinstance(excinfo.value, CustodyError)
+    assert converted == [_blob()] and path.exists()
+    assert not _leaks(str(excinfo.value), _MASTER)
+    assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
+
+
+@windows_only
+def test_windows_a_handoff_whose_name_outlives_the_delete_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "handoff.key"
+    _handoff_as_this_account(path)
+    # A delete Windows accepted whose name stays: here, one that did nothing.
+    monkeypatch.setattr(restricted_file, "delete_through_handle", lambda handle: None)
+    with pytest.raises(custody.HandoffLeftBehind, match="its name is still there"):
+        custody.consume_handoff_file(path, lambda blob: None)
+    assert path.exists()
+
+
+@windows_only
+def test_windows_reading_a_handoff_asks_for_no_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "handoff.key"
+    _handoff_as_this_account(path)
+    asked: list[dict[str, bool]] = []
+    real_open = custody._open_windows_held
+
+    def _open(p: Path, **kw: bool) -> int:
+        asked.append(kw)
+        return real_open(p, **kw)
+
+    monkeypatch.setattr(custody, "_open_windows_held", _open)
+    assert custody.read_handoff_file(path) == _blob()
+    assert asked == [{"delete": False}]
+    assert path.exists()
+
+
+@windows_only
+def test_windows_a_handoff_granting_read_alone_is_refused(tmp_path: Path) -> None:
+    # The earlier descriptor, FR for the service: it cannot be deleted through the reading handle.
+    path = tmp_path / "handoff.key"
+    _handoff_as_this_account(path, read_delete=False)
+    with pytest.raises(CustodyError, match="is refused"):
+        custody.read_handoff_file(path)
+    with pytest.raises(CustodyError, match="is refused"):
+        custody.consume_handoff_file(path, lambda blob: None)
+    assert path.exists()
+
+
+def test_the_handoff_is_windows_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    with pytest.raises(DpapiUnavailable):
+        custody.write_handoff_file(tmp_path / "h", _blob(), service_account="svc")
+    with pytest.raises(DpapiUnavailable):
+        custody.read_handoff_file(tmp_path / "h")
+    with pytest.raises(DpapiUnavailable):
+        custody.consume_handoff_file(tmp_path / "h", lambda blob: None)

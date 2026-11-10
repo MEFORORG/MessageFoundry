@@ -111,7 +111,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerEditorToolbar(context);
   registerInsertElement(context);
   // Live-debug v1 (#92): status-bar toggle + on-save dryrun → CodeLens summaries (off by default).
-  registerLiveDebug(context);
+  const liveDebug = registerLiveDebug(context);
   // Engine status bar (#221c, then the engine-link doctor ADR): the promote target, an HONEST verdict on
   // whether the IDE can actually USE it (a green check is earned against a protected route, never assumed
   // from a 200), and the repairs. Distinct from the left-side live-debug toggles above — this reflects the
@@ -482,6 +482,7 @@ export function activate(context: vscode.ExtensionContext): void {
           repaintStatusBar: () => engineStatusBar.repaint(),
           refreshEngineTrust: () => refreshEngineTrustThenRecheck(),
           suggestSourceControl: () => maybeSuggestSourceControl(context),
+          rerunLiveDebug: () => liveDebug.onTrustGranted(),
         },
         (step, err) => engineLog().error(`trust grant: ${step} failed: ${String(err)}`),
       ),

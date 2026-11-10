@@ -39,6 +39,7 @@ from typing import Any, Final
 from messagefoundry.store.crypto import (
     AUDIT_KEYLESS_MAC,
     AUDIT_SCHEME_IN_HEAP,
+    STORE_ID_BYTES,
     AuditScheme,
     audit_key_id,
     generate_key,
@@ -46,11 +47,13 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
+    AuditGenesisStoreId,
     audit_genesis_detail,
     audit_handover_tag,
     audit_range_closing,
     audit_row_hash,
     parse_audit_genesis,
+    parse_audit_genesis_store_id,
 )
 
 __all__ = ["CASES", "ChainBackend", "server_chain_backend"]
@@ -774,6 +777,91 @@ async def a_chain_renamed_keyless_and_recomputed_does_not_pass_as_keyless(b: Cha
         await keyless.close()
 
 
+# --- vault BACKLOG #3411: a genesis row may record the store id ------------------------------------
+
+
+#: Store id fields no writer produces: each must be refused, never read as a record of no store id.
+#: ``tests/test_audit_genesis_store_id_3411.py`` runs the parser over all of them; the chain case
+#: below takes the first two, since each pass opens a store on every backend.
+MALFORMED_STORE_IDS: Final[tuple[object, ...]] = (
+    None,
+    "AB" * STORE_ID_BYTES,  # upper-case hex
+    "",
+    "ab" * (STORE_ID_BYTES - 1),
+    "ab" * (STORE_ID_BYTES + 1),
+    "zz" * STORE_ID_BYTES,
+    int("ab" * STORE_ID_BYTES, 16),
+    ["ab" * STORE_ID_BYTES],
+)
+
+
+def genesis_record_with_store_id(key_id: str, store_id: object) -> str:
+    """A genesis row's detail naming the in-heap scheme and recording ``store_id`` as given, which
+    the writer refuses to produce for a malformed one."""
+    record = json.loads(genesis_record(key_id, AUDIT_SCHEME_IN_HEAP))
+    return json.dumps({**record, "store_id": store_id}, sort_keys=True)
+
+
+async def a_genesis_row_may_record_a_store_id_and_a_malformed_one_is_refused(
+    b: ChainBackend,
+) -> None:
+    """The genesis row a store writes today records no store id, and its chain verifies. A genesis
+    row recording one, sealed by its key's holder, verifies too, and the id reads back. A malformed
+    one is refused, as an unknown scheme is: the walk reports it, and a handle with no key still
+    reads the chain as keyed, so it is never read as a record that names no store id. So is a
+    well-formed one on a record naming no scheme, a shape no release writes, reported as naming no
+    scheme."""
+    await b.reset()
+    key = generate_key()
+    store = await b.open_keyed(key, ())
+    try:
+        await _seed(store, "act", 1)
+        ok, message = await store.verify_audit_chain()
+        assert ok, f"{b.name}: {message}"
+    finally:
+        await store.close()
+    today = (await _chain(b))[0]["detail"]
+    assert "store_id" not in json.loads(today)
+    assert parse_audit_genesis_store_id(today) == AuditGenesisStoreId(None, refused=False)
+    store_id = bytes(range(STORE_ID_BYTES))
+    mac = _mac_key(key)
+    key_id = audit_key_id(mac)
+    act = ("act", json.dumps({"n": 1}), mac)
+    await b.reset()
+    rows = await _write_chain(
+        b, [(AUDIT_KEY_EPOCH_ACTION, audit_genesis_detail(key_id, store_id), mac), act]
+    )
+    label = parse_audit_genesis_store_id(rows[0]["detail"])
+    assert label == AuditGenesisStoreId(store_id, refused=False), b.name
+    store = await b.open_keyed(key, ())
+    try:
+        ok, message = await store.verify_audit_chain()
+        assert ok and store._audit_ranges_trusted, f"{b.name}: {message}"
+        # The one-row MAC check reads the genesis record too, and accepts the label.
+        assert await store.newest_keyed_audit_row("act", actor="u", after_seq=0), b.name
+    finally:
+        await store.close()
+    unnamed = json.dumps({"genesis": 1, "key_id": key_id, "store_id": store_id.hex()})
+    malformed = [genesis_record_with_store_id(key_id, bad) for bad in MALFORMED_STORE_IDS[:2]]
+    refused = [(detail, "malformed store_id") for detail in malformed]
+    for detail, needle in [*refused, (unnamed, "names no scheme")]:
+        await b.reset()
+        await _write_chain(b, [(AUDIT_KEY_EPOCH_ACTION, detail, mac), act])
+        store = await b.open_keyed(key, ())
+        try:
+            ok, message = await store.verify_audit_chain()
+            assert not ok and needle in (message or ""), f"{b.name}: {message}"
+            assert store._audit_ranges_trusted is False, b.name
+            assert await store.newest_keyed_audit_row("act", actor="u", after_seq=0) is None
+        finally:
+            await store.close()
+        keyless = await b.open_keyless()
+        try:
+            assert keyless.audit_append_refusal() is not None, f"{b.name}: {detail}"
+        finally:
+            await keyless.close()
+
+
 #: Every case, for a backend's test module to parametrise over.
 CASES: tuple[Callable[[ChainBackend], Awaitable[None]], ...] = (
     an_untouched_keyed_chain_verifies,
@@ -791,4 +879,5 @@ CASES: tuple[Callable[[ChainBackend], Awaitable[None]], ...] = (
     records_that_name_no_scheme_still_verify,
     a_record_naming_a_scheme_this_release_does_not_hold_is_refused,
     a_chain_renamed_keyless_and_recomputed_does_not_pass_as_keyless,
+    a_genesis_row_may_record_a_store_id_and_a_malformed_one_is_refused,
 )

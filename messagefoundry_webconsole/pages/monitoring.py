@@ -737,6 +737,8 @@ def status(
             ["Active", _yn(dr.active)],
             ["Threshold", dr.threshold],
             ["Activation", dr.activation_mode],
+            # What a degraded activation left unfinished (engine PR 2815), for the operator to do.
+            *([["Unfinished steps", ", ".join(dr.failures)]] if dr.failures else []),
         ],
         adjustable=False,
     )

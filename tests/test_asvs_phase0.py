@@ -174,27 +174,31 @@ def test_dead_letter_replay_request_bounds_length() -> None:
         DeadLetterReplayRequest(channel_id="x" * 257)
 
 
-def test_webhook_rejects_non_http_scheme() -> None:
-    # Non-http(s) schemes are refused at construction (urllib would otherwise honour file:/ftp:).
-    with pytest.raises(ValueError, match="must be http or https"):
+def test_webhook_rejects_non_https_scheme() -> None:
+    # Non-https schemes are refused at construction (urllib would otherwise honour file:/ftp:).
+    with pytest.raises(ValueError, match="must be https"):
         WebhookTransport("ftp://host/hook")
 
 
 def test_webhook_rejects_plaintext_http_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     # ASVS 12.2.1: a plaintext http:// webhook target is refused at construction (no insecure
-    # fallback) unless the explicit MEFOR_ALLOW_INSECURE_TLS dev escape is set.
+    # fallback).
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    with pytest.raises(ValueError, match="plaintext http"):
+    with pytest.raises(ValueError, match="cleartext http"):
         WebhookTransport("http://hooks.example/x")
+    # The scheme is read case-folded, so an upper-case spelling meets the same no-escape text.
+    with pytest.raises(ValueError, match="cleartext http"):
+        WebhookTransport("HTTP://hooks.example/x")
 
 
-def test_webhook_allows_plaintext_http_with_insecure_escape(
+def test_webhook_refuses_plaintext_http_even_with_insecure_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # With the explicit escape set, a plaintext target constructs (trusted-network dev only).
+    # The escape no longer releases it at warn: the path token is the hop's credential (vault
+    # BACKLOG #3533 item 5).
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    t = WebhookTransport("http://hooks.example/x", posture=_WARN)
-    assert t.url == "http://hooks.example/x"
+    with pytest.raises(ValueError, match="cleartext http"):
+        WebhookTransport("http://hooks.example/x", posture=_WARN)
 
 
 def test_webhook_rejects_host_outside_allowlist() -> None:

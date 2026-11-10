@@ -662,8 +662,8 @@ def _mllp_ssl_context(
     ``trust_anchor_policy`` (#190, ADR 0093, OUTBOUND verify path only) supplies the instance ``[tls]``
     internal-CA fallback: when the connection names no ``tls_ca_file`` of its own, an internal hop
     verifies against the org internal CA per the resolved anchor (``system``/``augment``/``pinned``).
-    ``None`` (a direct test build) keeps the historical ``create_default_context(cafile=…)`` behaviour,
-    byte-identical. It only chooses WHICH roots verify the peer — it never touches the ``tls_verify=false``
+    ``None`` (a direct test build) keeps the historical ``create_default_context(cafile=…)`` trust
+    store. It only chooses WHICH roots verify the peer — it never touches the ``tls_verify=false``
     refusal below — so the internal CA can never bypass verification.
 
     ``tls_key_password`` decrypts a passphrase-encrypted private key (``env()``-sourced, mirroring the
@@ -747,18 +747,18 @@ def _mllp_ssl_context(
             "effect while enforcing, the default, or with no posture)."
         )
     # #190 (ADR 0093): resolve the trust anchor — the connection's own tls_ca_file wins verbatim, else an
-    # internal hop may anchor on the [tls] internal CA. Only the VERIFY path uses it; the tls_verify=false
-    # branch below stays CERT_NONE and is already refused above, so the internal CA never bypasses a refusal.
-    if verify and trust_anchor_policy is not None:
-        anchor = resolve_trust_anchor(
-            connection_ca_file=str(ca) if ca else None,
-            host=str(s.get("host", "127.0.0.1")),
-            policy=trust_anchor_policy,
-            connection=name or None,
-        )
-        ctx = build_verifying_client_context(anchor)
-    else:
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
+    # internal hop may anchor on the [tls] internal CA. Only the VERIFY path uses the policy; the
+    # tls_verify=false branch below stays CERT_NONE, reached only through the clamped escape above,
+    # and takes the empty policy. Every arm loads through the anchor for the named refusal (vault #2370).
+    anchor = resolve_trust_anchor(
+        connection_ca_file=str(ca) if ca else None,
+        host=str(s.get("host", "127.0.0.1")),
+        policy=trust_anchor_policy
+        if verify and trust_anchor_policy is not None
+        else TrustAnchorPolicy(),
+        connection=name or None,
+    )
+    ctx = build_verifying_client_context(anchor)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if verify:
         ctx.check_hostname = bool_setting(s, "tls_check_hostname", default=True)
@@ -1647,8 +1647,8 @@ def _upgrades_tls_itself(loop: asyncio.AbstractEventLoop) -> bool:
     """Whether the MLLP TLS listener on ``loop`` accepts plain TCP and upgrades each socket itself
     with ``StreamWriter.start_tls``, so its caps and allowlist run before the handshake (BACKLOG
     #1606). True only for the stdlib's own loop classes, ``SelectorEventLoop`` and
-    ``ProactorEventLoop``. The HTTP listener has its own predicate,
-    ``http_listener._upgrades_tls_itself``.
+    ``ProactorEventLoop``. The HTTP listener imports this predicate and the accept loop below, so
+    the same holds there (BACKLOG #2479).
 
     The upgrade is safe only where pausing reading inside ``connection_made`` is known to keep the
     ClientHello out of the plaintext reader. On the stdlib loops it is, read in their source: the
@@ -1751,11 +1751,13 @@ def _accept_fault_is_fatal(exc: OSError, sock: socket.socket) -> bool:
 _FAMILY_NOT_ENABLED = frozenset({errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT})
 
 
-async def _bind_tcp(host: str, port: int) -> list[socket.socket]:
+async def _bind_tcp(host: str, port: int, *, transport: str = "MLLP") -> list[socket.socket]:
     """Listening sockets for ``host``:``port``, bound as ``asyncio.start_server`` binds them: one per
     address ``host`` resolves to, with ``socket.create_server``'s options (``SO_REUSEADDR`` on
     POSIX, an IPv6 socket IPv6-only) and a backlog of 100. As there, an address whose family the
-    host has not enabled is skipped rather than failing the whole start (bpo-30945)."""
+    host has not enabled is skipped rather than failing the whole start (bpo-30945). ``transport``
+    names the listener in a log line and an error, since the HTTP listener binds through this too
+    (BACKLOG #2479)."""
     infos = await asyncio.get_running_loop().getaddrinfo(
         host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
@@ -1769,7 +1771,8 @@ async def _bind_tcp(host: str, port: int) -> list[socket.socket]:
                 if exc.errno not in _FAMILY_NOT_ENABLED:
                     raise
                 logger.debug(
-                    "MLLP listener skipped %r, its family is not enabled: %s",
+                    "%s listener skipped %r, its family is not enabled: %s",
+                    transport,
                     address,
                     safe_exc(exc),
                 )
@@ -1777,7 +1780,9 @@ async def _bind_tcp(host: str, port: int) -> list[socket.socket]:
         if not sockets:
             # The last skip keeps its errno, so a bind host no interface holds still reads as a
             # bind failure (EADDRNOTAVAIL) to the runner, as it does from asyncio.start_server.
-            raise skipped or OSError(f"MLLP listener: {host!r} resolved to no address to bind")
+            raise skipped or OSError(
+                f"{transport} listener: {host!r} resolved to no address to bind"
+            )
     except BaseException:
         for sock in sockets:
             sock.close()
@@ -1794,9 +1799,13 @@ class _HandshakeProtocol(asyncio.StreamReaderProtocol):
     may already hold a whole frame."""
 
     connected = False
+    # The TLS transport, once connected, so the HTTP listener can abort a handshake that completed
+    # before its cancelled task stepped (BACKLOG #2479).
+    tls_transport: asyncio.Transport | None = None
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.connected = True
+        self.tls_transport = cast(asyncio.Transport, transport)
         super().connection_made(transport)
 
 
@@ -1813,7 +1822,7 @@ class _AcceptedPeer:
         return self._peername if name == "peername" else default
 
 
-def _closer(sock: socket.socket, name: str) -> Callable[[asyncio.Task[None]], None]:
+def _closer(sock: socket.socket, name: str, transport: str) -> Callable[[asyncio.Task[None]], None]:
     """A done callback for an accept loop: close its listening socket ``sock`` whatever the task's
     outcome, and log a fault that ended it, since nothing else would record that it stopped."""
 
@@ -1821,10 +1830,39 @@ def _closer(sock: socket.socket, name: str) -> Callable[[asyncio.Task[None]], No
         sock.close()
         if not done.cancelled() and (exc := done.exception()) is not None:
             logger.error(
-                "MLLP listener %s: accept loop failed and stopped: %s", name, safe_exc(exc)
+                "%s listener %s: accept loop failed and stopped: %s",
+                transport,
+                name,
+                safe_exc(exc),
             )
 
     return close
+
+
+async def _accept_one(
+    loop: asyncio.AbstractEventLoop, sock: socket.socket
+) -> tuple[socket.socket, Any]:
+    """``loop.sock_accept(sock)``, except that a cancellation never drops a socket the accept
+    already took (BACKLOG #2479).
+
+    Awaited directly, a cancellation that lands after the loop's accept completed, but before the
+    awaiting task stepped, is thrown into ``sock_accept`` and its result is lost: CPython 3.14's
+    selector ``sock_accept`` does not handle it. So the accept runs in its own task, shielded from
+    the cancellation. On one, a single loop turn lets a completed accept's task step, and a socket
+    it took is closed; an accept still pending is cancelled, and the loop's accept then takes no
+    socket. The cancellation is then raised as before."""
+    accept = asyncio.ensure_future(loop.sock_accept(sock))
+    try:
+        return await asyncio.shield(accept)
+    except asyncio.CancelledError:
+        try:
+            await asyncio.sleep(0)
+        finally:
+            if not accept.done():
+                accept.cancel()
+            elif not accept.cancelled() and accept.exception() is None:
+                accept.result()[0].close()
+        raise
 
 
 class _AcceptingServer:
@@ -1835,6 +1873,8 @@ class _AcceptingServer:
     it in plain TCP and only an admitted socket reaches the loop's TLS layer. A TLS client speaks
     first, but its ClientHello waits in the kernel until that layer reads it. It offers no
     ``close_clients()``: the listener tracks the sockets it accepted itself (`MLLPSource.stop`).
+    The HTTP intake listener runs it too (BACKLOG #2479); ``transport`` names the listener in its
+    log lines.
     """
 
     def __init__(
@@ -1843,16 +1883,18 @@ class _AcceptingServer:
         on_socket: Callable[[socket.socket], None],
         *,
         name: str,
+        transport: str = "MLLP",
     ) -> None:
         self.sockets = sockets
         self._name = name
+        self._transport = transport
         loop = asyncio.get_running_loop()
         self._accepting: list[asyncio.Task[None]] = []
         for sock in sockets:
             task = loop.create_task(self._accept(sock, on_socket))
             # Closed once its accept loop is done, so never under an accept still pending, and
             # closed even if the task is cancelled before its first step.
-            task.add_done_callback(_closer(sock, name))
+            task.add_done_callback(_closer(sock, name, transport))
             self._accepting.append(task)
 
     async def _accept(
@@ -1862,7 +1904,7 @@ class _AcceptingServer:
         skipped = 0  # failed accepts in a row since the last success or wait
         while True:
             try:
-                conn, _address = await loop.sock_accept(sock)
+                conn, _address = await _accept_one(loop, sock)
             except OSError as exc:
                 if _accept_fault_is_fatal(exc, sock):
                     raise  # the listening socket is gone; `_closer` closes and logs it
@@ -1870,20 +1912,25 @@ class _AcceptingServer:
                     skipped += 1
                 if exc.errno not in _ACCEPT_SHORTAGE and skipped <= _ACCEPT_SKIP_RUN:
                     # This connection's own failure, the peer gone before the accept among them:
-                    # skip it and keep accepting. A selector loop's sock_accept fails at once,
-                    # without yielding, so this yields a turn first, or a run of such failures
-                    # would spin. asyncio's own servers are no model here: the selector one tries
+                    # skip it and keep accepting. A turn is yielded first, or a run of such failures
+                    # could spin: `_accept_one` suspends only while its task is pending, and under
+                    # an eager task factory a selector loop's failed accept completes without
+                    # suspending. asyncio's own servers are no model here: the selector one tries
                     # at most backlog + 1 accepts per wakeup and hands any failure but a dropped
                     # connection or a shortage to the loop's exception handler, and the Proactor
                     # one closes its listening socket on any failed accept.
                     logger.debug(
-                        "MLLP listener %s skipped a failed accept: %s", self._name, safe_exc(exc)
+                        "%s listener %s skipped a failed accept: %s",
+                        self._transport,
+                        self._name,
+                        safe_exc(exc),
                     )
                     await asyncio.sleep(0)
                     continue
                 skipped = 0
                 logger.warning(
-                    "MLLP listener %s accept failed, retrying in %gs: %s",
+                    "%s listener %s accept failed, retrying in %gs: %s",
+                    self._transport,
                     self._name,
                     _ACCEPT_RETRY_DELAY,
                     safe_exc(exc),
@@ -1896,13 +1943,14 @@ class _AcceptingServer:
             except Exception as exc:  # noqa: BLE001 - one connection's fault must not end the listener
                 conn.close()
                 logger.error(
-                    "MLLP listener %s could not take an accepted connection: %s",
+                    "%s listener %s could not take an accepted connection: %s",
+                    self._transport,
                     self._name,
                     safe_exc(exc),
                 )
-            # A selector loop's accept completes at once while connections are queued, and an
-            # await on a finished future does not yield; one turn per accept keeps a flood from
-            # starving the loop, the admission tasks above included.
+            # One turn per accept keeps a flood of queued connections from starving the loop, the
+            # admission tasks above included, even where an accept completes without suspending,
+            # as under an eager task factory (see the skip arm above).
             await asyncio.sleep(0)
 
     def close(self) -> None:
@@ -2143,18 +2191,14 @@ def _sender_issuer_lookup(
     Returns the lookup from a leaf's DER to the subject of the loaded CA whose key signed it, or
     ``""``. A key naming no loaded CA, or two loaded CAs with one subject and different keys, would
     refuse every sender under it with nothing in the log, so each is warned about here, as the
-    inbound HTTP listener does for ``intake_client_subjects``."""
+    inbound HTTP listener does for ``intake_client_subjects``, as is a loaded certificate that is no
+    CA with a loaded CA's subject (:meth:`~messagefoundry.pki.IssuerIndex.namesake_warnings`).
+    Raises ``ValueError``, refusing the start, when :class:`~messagefoundry.pki.IssuerIndex`
+    refuses the file; what it compares with the TLS library is stated there."""
     # Lazy: pki pulls in cryptography, which a listener without the allowlist never needs.
     from messagefoundry.pki import IssuerIndex
 
-    index = IssuerIndex(cadata)
-    if index.unreadable:
-        logger.warning(
-            "MLLP listener %s: %d certificate(s) in tls_ca_file could not be parsed for "
-            "tls_client_subjects; no sender certificate is admitted under them",
-            name,
-            index.unreadable,
-        )
+    index = IssuerIndex(cadata, label=f"{_tls_label('MLLP listener', name)}: tls_ca_file")
     for issuer in index.unmatched_keys(subjects):
         logger.warning(
             "MLLP listener %s: tls_client_subjects issuer %r names no CA certificate loaded from "
@@ -2163,6 +2207,8 @@ def _sender_issuer_lookup(
             name,
             issuer,
         )
+    for warning in index.namesake_warnings():
+        logger.warning("MLLP listener %s: tls_ca_file %s", name, warning)
     return index.issuer_of
 
 
@@ -3055,8 +3101,11 @@ class MLLPSource(SourceConnector):
             writer.close()
             return
         # Register before anything else so stop() can always find + close this connection — no race
-        # with a client that connects just as we're stopping (review H-2).
-        task = asyncio.current_task()
+        # with a client that connects just as we're stopping (review H-2). A `_handshake_accepted`
+        # task is already registered, and `_accepted_task_done` drops it when it ends: dropped here
+        # instead, it would leave `_client_tasks` while the finally below still awaits the close,
+        # so stop() would not wait for it (BACKLOG #2479).
+        task = asyncio.current_task() if slot is None else None
         self._clients.add(writer)
         if task is not None:
             self._client_tasks.add(task)

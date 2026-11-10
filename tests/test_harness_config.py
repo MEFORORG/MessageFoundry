@@ -11,10 +11,13 @@ after delivery), so that's what the PROCESSED rows assert here.
 from __future__ import annotations
 
 from messagefoundry.config.wiring import load_config
-from messagefoundry.generators import _core, all_types  # noqa: F401  (registers message types)
 from messagefoundry.parsing import Peek, normalize
 from messagefoundry.pipeline.dryrun import DryRunResult, dry_run
 from messagefoundry.store import MessageStatus
+from messagefoundry_toolkit.generators import (  # noqa: F401  (registers message types)
+    _core,
+    all_types,
+)
 
 _CONFIG = "harness/config"
 # A valid 2.5.1 message declared as 2.3 — the strict inbound must reject it (version mismatch).

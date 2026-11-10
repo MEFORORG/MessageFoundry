@@ -180,7 +180,7 @@ def test_the_root_patterns_stay_anchored() -> None:
         if Path(path).name in SHIPPED_ROOT_FILES
         and path not in SHIPPED_ROOT_FILES  # not the root copy itself
         and path not in SHIPPED_PACKAGING_FILES  # pinned by their own anchored lines
-        and not path.startswith("messagefoundry/")  # covered on purpose by the package glob
+        and not path.startswith(("messagefoundry/", "messagefoundry_toolkit/"))  # the package globs
     ]
     assert len(candidates) > 10, (
         f"expected many same-named files at depth to test against, found {len(candidates)} -- "

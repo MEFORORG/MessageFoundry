@@ -22,11 +22,11 @@ from pathlib import Path
 
 from harness.load.ids import ControlIds
 from harness.load.profile import LoadProfile, LoadProfileError, TypeMix
-from messagefoundry.generators import _core
-from messagefoundry.generators import (
+from messagefoundry.parsing.message import Message
+from messagefoundry_toolkit.generators import _core
+from messagefoundry_toolkit.generators import (
     all_types as _all_types,  # noqa: F401  (registers message types)
 )
-from messagefoundry.parsing.message import Message
 
 
 @dataclass(frozen=True)

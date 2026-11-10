@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Tee-side HL7 anonymization adapter (ADR 0030 §1) — the standalone **non-parity seam**.
 
-Does the *same thing* as ``messagefoundry/anon/hl7.py`` but through a tiny pure-stdlib splitter, so
+Does the *same thing* as ``messagefoundry_toolkit/anon/hl7.py`` but through a tiny pure-stdlib splitter, so
 the tee needs no ``python-hl7`` / ``messagefoundry`` import (the write-side companion to the existing
 read-only ``tee/hl7_fields.py``). It shares the ``normalized_message`` / ``read_message_seps`` /
 ``scrub_message_site_codes`` / ``preserve_obx5_value`` helpers and the **same fail-closed contract** as

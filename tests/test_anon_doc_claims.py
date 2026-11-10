@@ -89,11 +89,11 @@ _SITES = (
         2,
         id="parity-test-comments",
     ),
-    # The module docstring of messagefoundry/anon/__init__.py made the blanket claim. Only some
+    # The module docstring of messagefoundry_toolkit/anon/__init__.py made the blanket claim. Only some
     # files under tee/anon/ are byte-identical copies, and the docstring now points at the parity
     # test, which names them.
     pytest.param(
-        "messagefoundry/anon/__init__.py",
+        "messagefoundry_toolkit/anon/__init__.py",
         ("a byte-identical tee/anon/",),
         "tests/test_anon_parity.py names which",
         1,

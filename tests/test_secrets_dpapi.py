@@ -38,7 +38,7 @@ def test_protect_and_unprotect_raise_off_windows(monkeypatch: pytest.MonkeyPatch
     # env-var key, never silently store unprotected. Covered on every platform.
     monkeypatch.setattr(sys, "platform", "linux")
     with pytest.raises(DpapiUnavailable):
-        dpapi_protect(b"secret")
+        dpapi_protect(b"secret", machine_scope=True)
     with pytest.raises(DpapiUnavailable):
         dpapi_unprotect(b"blob")
 
@@ -46,7 +46,7 @@ def test_protect_and_unprotect_raise_off_windows(monkeypatch: pytest.MonkeyPatch
 @windows_only
 def test_dpapi_roundtrip() -> None:
     secret = b"a binary \x00\x01\xff payload"
-    blob = dpapi_protect(secret)
+    blob = dpapi_protect(secret, machine_scope=True)
     assert blob != secret  # actually encrypted, not pass-through
     assert dpapi_unprotect(blob) == secret
 
@@ -61,7 +61,7 @@ def test_dpapi_user_scope_roundtrip() -> None:
 def test_key_file_roundtrip(tmp_path: Path) -> None:
     key = generate_key()
     out = tmp_path / "key.dpapi"
-    protect_key_to_file(key, out)
+    protect_key_to_file(key, out, machine_scope=True)
     assert out.read_bytes() != key.encode("ascii")  # the file holds ciphertext, not the key
     assert load_protected_key(out) == key
 
@@ -114,7 +114,7 @@ def test_dpapi_unprotect_failure_leaks_no_key_material(
     # log. Windows-only: the real Win32 failure path is unreachable off Windows (there it raises the
     # platform guard DpapiUnavailable, which holds no decrypted key). CRYPTO-10 regression guard.
     key = generate_key()
-    protected = bytearray(dpapi_protect(key.encode("ascii")))
+    protected = bytearray(dpapi_protect(key.encode("ascii"), machine_scope=True))
     protected[len(protected) // 2] ^= 0xFF  # tamper the DPAPI ciphertext → integrity check fails
 
     with caplog.at_level(logging.DEBUG), pytest.raises(DpapiError) as excinfo:
