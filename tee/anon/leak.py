@@ -78,7 +78,8 @@ def forbidden_names() -> list[tuple[re.Pattern[str], str]]:
     Read at call time: a copy taken at import kept the tables of that moment while the report read
     the guard's liveness live, so after a ``reload_tokens()`` it could scan with empty tables and
     still call the denylist live (BACKLOG #5541)."""
-    names: list[tuple[re.Pattern[str], str]] = _GUARD.FORBIDDEN if _GUARD else []  # type: ignore[attr-defined]
+    # A copy, so a caller that edits the list cannot edit the guard's own table.
+    names: list[tuple[re.Pattern[str], str]] = list(_GUARD.FORBIDDEN) if _GUARD else []  # type: ignore[attr-defined]
     return names
 
 
@@ -629,7 +630,7 @@ def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
     for rep in value.split(seps.repetition):
         comps = rep.split(seps.component)
         # A component with no escape character comes back from unescape as it was.
-        if comps[0] and any(
+        if unescape(comps[0], seps, field_sep) and any(
             unescape(comp, seps, field_sep).upper() in _MRN_TYPES for comp in comps
         ):
             return True

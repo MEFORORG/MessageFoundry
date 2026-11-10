@@ -211,3 +211,42 @@ def test_merged_token_hits_scans_the_decoded_text_once_more() -> None:
         merge: Callable[[Callable[[str], list[str]], str], list[str]] = leak._merged_token_hits
         assert merge(scan, f"{_HEAD}\rZPD|1|A\\T\\B") == ["r"]
         assert len(seen) == 2
+
+
+# --- the decoder reads as the engine's parser reads ----------------------------------------------
+_BODIES = (
+    *("F", "S", "T", "R", "E", "H", "N", "", "Q", "Zlocal", "C2842", "M2442", "Note"),
+    *("X2D", "X4D52", "X2", "X2G", "X002D", "XZZ41"),
+    *(".br", ".sp", ".ce", ".in", ".ti", ".sk", ".fi", ".nf", ".zz"),
+    *(".sp0", ".sp1", ".sp2", ".sp512", ".sp513", ".sp+1", ".sp 1", ".sp-1", ".spx", ".in1_0"),
+)
+
+
+@pytest.mark.parametrize("body", _BODIES)
+@_SURROGATES
+def test_the_decoder_reads_each_escape_as_the_engine_s_parser_does(
+    surrogates: ModuleType, body: str
+) -> None:
+    """The decoder's contract is the engine's reading, so it is checked against that reading. The
+    one difference allowed is the spelling of a break or a run of spaces, which both sides write
+    as whitespace; it is folded to one space before the compare."""
+    from messagefoundry.parsing._builtin_hl7 import unescape as engine_unescape
+
+    value = f"123\\{body}\\45 A\\{body}"
+    engine = engine_unescape(value, ("|", "^", "~", "&", "\\"))
+    ours = surrogates.unescape(value, surrogates.Seps(), "|")
+    assert re.sub(r"\s+", " ", ours) == re.sub(r"\s+", " ", engine)
+
+
+@_LEAKS
+def test_an_unclosed_escape_does_not_pair_across_a_separator(leak: ModuleType) -> None:
+    """Each subcomponent is decoded on its own, as the engine decodes it, so the unclosed escape in
+    component 1 does not swallow the escaped delimiter in component 2."""
+    decoded = leak.unescaped_message(f"{_HEAD}\rZPD|1|X\\^ZQSYNTH\\T\\PARTNER")
+    assert decoded.split("\r")[-1] == "ZPD|1|X\\^ZQSYNTH&PARTNER"
+
+
+@_LEAKS
+def test_an_id_that_decodes_to_nothing_is_no_mrn(leak: ModuleType) -> None:
+    assert _hits(leak, "\\.fi\\^^^H^MR") == []
+    assert _hits(leak, "1^^^H^MR")  # the control

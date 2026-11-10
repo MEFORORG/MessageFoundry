@@ -587,7 +587,7 @@ def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
     for rep in value.split(seps.repetition):
         comps = rep.split(seps.component)
         # A component with no escape character comes back from unescape as it was.
-        if comps[0] and any(
+        if unescape(comps[0], seps, field_sep) and any(
             unescape(comp, seps, field_sep).upper() in _MRN_TYPES for comp in comps
         ):
             return True

@@ -161,10 +161,10 @@ def _fake_digits(rng: random.Random, length: int) -> str:
 
 
 def _fake_like(rng: random.Random, sample: str) -> str:
-    """A fabricated value with the **same shape** as ``sample``: each digit → an ASCII digit, each
-    letter and each other non-ASCII character → an upper-case ASCII letter, ASCII punctuation and
-    spaces kept verbatim. Preserves the original width AND the alphanumeric shape (so ``A0049`` →
-    ``X7321``, not a shrunk digit-only string). A non-ASCII letter used to be kept as it was, so
+    """A fabricated value with the **same shape** as ``sample``: each digit becomes an ASCII digit,
+    each letter and each other non-ASCII character becomes an upper-case ASCII letter, and ASCII
+    punctuation and spaces are kept verbatim. Preserves the original width AND the alphanumeric
+    shape (so ``A0049`` becomes ``X7321``, not a shrunk digit-only string). A non-ASCII letter used to be kept as it was, so
     an accented letter of a real id reached the output (BACKLOG #5534)."""
     if not sample:
         return _fake_digits(rng, 6)
@@ -546,13 +546,12 @@ def read_message_seps(text: str) -> tuple[Seps, str] | None:
     return None
 
 
-#: The dotted formatting commands that decode to nothing, as the engine's parser reads them:
-#: ``.fi`` and ``.nf`` (fill and no-fill). Every other dotted command it knows writes a line break
-#: or spaces, which this decoder writes as one space, so two runs of digits never join.
-_EMPTY_FORMAT_COMMANDS = frozenset({".fi", ".nf"})
 #: The dotted formatting commands that write a break or spaces: ``.br``, ``.sp``, ``.ce``, ``.in``,
-#: ``.ti`` and ``.sk``. Any other dotted body is unmappable.
+#: ``.ti`` and ``.sk``. Any other dotted body, ``.fi`` and ``.nf`` among them, decodes to nothing.
 _SPACING_FORMAT_COMMANDS = frozenset({".br", ".sp", ".ce", ".in", ".ti", ".sk"})
+#: The largest repeat count the engine's parser expands in a dotted command
+#: (``_builtin_hl7.MAX_ESCAPE_REPEAT``). A count past it, or below 1, writes nothing there.
+_MAX_ESCAPE_REPEAT = 512
 
 
 def _decode_hex(digits: str) -> str:
@@ -568,45 +567,56 @@ def _decode_hex(digits: str) -> str:
     return "".join(out)
 
 
-def _decode_escape(body: str, seps: Seps, field_sep: str) -> str:
-    """What one escape sequence decodes to, given the text between its two escape characters. It
-    follows ``messagefoundry/parsing/_builtin_hl7.unescape``, the engine's own reading, so a value
-    reads here as an HL7 receiver reads it (BACKLOG #5532): a delimiter escape becomes the
-    message's own delimiter, ``\\H\\`` and ``\\N\\`` become ``_``, a hex escape becomes its
-    characters, and a sequence the receiver cannot map, an empty one included, decodes to nothing.
-    One deliberate difference: a dotted formatting command that writes a break or spaces decodes
-    to one space, not the break or the run of spaces. Either keeps two runs of digits apart."""
-    # A delimiter escape names its delimiter by letter: F field, S component, T subcomponent,
-    # R repetition and E the escape character itself.
-    delimiter = {
-        "F": field_sep,
-        "S": seps.component,
-        "T": seps.subcomponent,
-        "R": seps.repetition,
-        "E": seps.escape,
-        "H": "_",
-        "N": "_",
-    }.get(body)
-    if delimiter is not None:
-        return delimiter
+def _spacing_command(body: str) -> bool:
+    """True if a dotted ``body`` writes a break or spaces on the engine's parser: a spacing command
+    alone, or one whose repeat count ``int()`` reads as 1 to :data:`_MAX_ESCAPE_REPEAT`."""
+    if body[:3] not in _SPACING_FORMAT_COMMANDS:
+        return False
+    if len(body) == 3:
+        return True
+    try:
+        return 0 < int(body[3:]) <= _MAX_ESCAPE_REPEAT
+    except ValueError:
+        return False
+
+
+def _decode_escape(body: str, letters: dict[str, str]) -> str:
+    """What one escape sequence decodes to, given the text between its two escape characters and
+    the message's single-letter escapes. It follows ``messagefoundry/parsing/_builtin_hl7.unescape``,
+    the engine's own reading, so a value reads here as an HL7 receiver reads it (BACKLOG #5532): a
+    delimiter escape becomes the message's own delimiter, ``\\H\\`` and ``\\N\\`` become
+    ``_``, a hex escape becomes its characters, and a sequence the receiver cannot map, an empty
+    one included, decodes to nothing. One deliberate difference: a dotted command that writes a
+    break or spaces decodes to one space, not the break or the run of spaces. Either keeps two
+    runs of digits apart. ``tests/test_anon_b214_5532.py`` compares the two decoders."""
+    if (letter := letters.get(body)) is not None:
+        return letter
     if body.startswith("X"):
         return _decode_hex(body[1:])
-    # A spacing command may carry a repeat count, as ``\.sp2\`` does.
-    if body[:3] in _SPACING_FORMAT_COMMANDS and (len(body) == 3 or body[3:].isdigit()):
-        return " "
-    # The empty fill commands, the character-set switches and every unmappable sequence.
-    return ""
+    return " " if _spacing_command(body) else ""
 
 
 def unescape(value: str, seps: Seps, field_sep: str) -> str:
     """``value`` with every HL7 escape sequence decoded, by the message's own escape character and
     separators (BACKLOG #5532), as :func:`_decode_escape` reads each one. The tee cannot import the
     engine's parser, so the leak-check of both copies decodes here, in this byte-identical file.
-    The anonymizer never calls it. An escape character that no second one closes is kept, with
-    the text after it, as the engine's parser keeps it. Never raises."""
+    The anonymizer never calls it. Pass one leaf, a subcomponent, as the engine's parser decodes
+    one: an escape character no second one closes is kept, with the text after it, and across a
+    separator it would pair with the next sequence's opener. Never raises."""
     escape = seps.escape
     if not escape or escape not in value:
         return value
+    # The single-letter escapes: F field, S component, T subcomponent, R repetition, E the escape
+    # character itself, and H and N, highlighting on and off, which the engine writes as ``_``.
+    letters = {
+        "F": field_sep,
+        "S": seps.component,
+        "T": seps.subcomponent,
+        "R": seps.repetition,
+        "E": escape,
+        "H": "_",
+        "N": "_",
+    }
     out: list[str] = []
     at = 0
     while (start := value.find(escape, at)) != -1:
@@ -614,17 +624,32 @@ def unescape(value: str, seps: Seps, field_sep: str) -> str:
         if end == -1:
             break
         out.append(value[at:start])
-        out.append(_decode_escape(value[start + 1 : end], seps, field_sep))
+        out.append(_decode_escape(value[start + 1 : end], letters))
         at = end + 1
     out.append(value[at:])
     return "".join(out)
 
 
+def _unescape_field(field: str, seps: Seps, field_sep: str) -> str:
+    """``field`` with each subcomponent decoded on its own and the separators kept as written."""
+    if not seps.escape or seps.escape not in field:
+        return field
+    return seps.repetition.join(
+        seps.component.join(
+            seps.subcomponent.join(
+                unescape(leaf, seps, field_sep) for leaf in comp.split(seps.subcomponent)
+            )
+            for comp in rep.split(seps.component)
+        )
+        for rep in field.split(seps.repetition)
+    )
+
+
 def unescaped_message(text: str) -> str:
-    """``text`` with the escape sequences in every field decoded, for the token scan (BACKLOG
-    #5532). The encoding characters of a header line are left as written, since they hold the
-    escape character itself. ``text`` is returned as it is when it has no parseable MSH or no field
-    holds an escape sequence that decodes."""
+    """``text`` with the escape sequences in every field decoded, a subcomponent at a time, for the
+    token scan (BACKLOG #5532). The encoding characters of a header line are left as written, since
+    they hold the escape character itself. ``text`` is returned as it is when it has no parseable
+    MSH or no field holds an escape sequence."""
     parsed = read_message_seps(text)
     if parsed is None:
         return text
@@ -634,7 +659,7 @@ def unescaped_message(text: str) -> str:
     for line in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
         fields = line.split(field_sep)
         kept = 2 if fields[0].upper() in HEADER_SEGMENTS else 1
-        decoded = [unescape(field, seps, field_sep) for field in fields[kept:]]
+        decoded = [_unescape_field(field, seps, field_sep) for field in fields[kept:]]
         changed = changed or decoded != fields[kept:]
         lines.append(field_sep.join(fields[:kept] + decoded))
     return "\r".join(lines) if changed else text

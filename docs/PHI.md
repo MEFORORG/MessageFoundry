@@ -2442,7 +2442,8 @@ the next of kin's mother's maiden name, passes the same way. The detectors stay 
 **An escaped value is read decoded too (BACKLOG #5532).** HL7 lets a sender write any character
 as an escape sequence, so `123\X2D\45\X2D\6789` is a dashed SSN and `M\X52\` is the id type
 `MR`. The shape detectors read each unmapped value as written and then each of its subcomponents
-decoded, and the token scan reads the whole message as written and then decoded. The escape
+decoded, and the token scan reads the whole message as written and then with each subcomponent
+decoded. The escape
 character is the one the message's own `MSH-2` declares. Each sequence decodes as the engine's
 own parser reads it: `\F\`, `\S\`, `\T\`, `\R\` and `\E\` become that message's own
 delimiters, `\H\` and `\N\` become `_`, and a hex escape `\Xhh\` becomes the character with
@@ -2452,8 +2453,9 @@ that writes a line break or spaces, such as `\.br\`, decodes to one space, so tw
 never join. An escape character that no second one closes is kept as written. At least these
 still pass:
 
-- A subcomponent is decoded on its own, so a shape whose parts sit in different components or
-  subcomponents is not joined.
+- A subcomponent is decoded on its own, as the engine's parser decodes it, so a shape whose parts
+  sit in different components or subcomponents is not joined, and an escape character with no
+  closing one in a subcomponent never pairs with a sequence in the next.
 - The site-code check does not decode, so a site code written with an escape sequence passes it.
 - The check for a shape cut across fields by the field separator does not decode.
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
