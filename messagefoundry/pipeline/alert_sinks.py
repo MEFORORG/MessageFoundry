@@ -11,8 +11,8 @@ the other transports still run — alerting is best-effort and never breaks deli
 
 Transports use only the **standard library** (``urllib.request`` / ``smtplib``), so wiring real
 notifications adds no dependency. Payloads never carry a message body, but they are **not**
-PHI-free: some events still send free-text ``detail``/``reason`` off the box, and docs/PHI.md
-row 10 records which.
+PHI-free: some events still send free-text ``detail``/``reason`` off the box. docs/PHI.md row
+10 names at least some of them, and is not a complete list.
 
 Construction is config-driven: :func:`notifier_from_settings` turns an
 :class:`~messagefoundry.config.settings.AlertsSettings` into a :class:`NotifierAlertSink`, or ``None``

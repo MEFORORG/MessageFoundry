@@ -5883,7 +5883,7 @@ class AlertsSettings(_Section):
     ``email_smtp_host`` + ``email_from`` + at least one ``email_to`` for email. The SMTP password is a
     secret — supply it via ``MEFOR_ALERTS_EMAIL_PASSWORD``, never the file. Payloads never carry a
     message body, but they are not PHI-free: some events still send free-text detail off the box,
-    and docs/PHI.md row 10 records which."""
+    and docs/PHI.md row 10 names at least some of them."""
 
     # --- webhook (generic HTTP POST; fronts Slack/Teams/PagerDuty/custom) ----
     webhook_url: str | None = None

@@ -1080,8 +1080,8 @@ class AlertSink(Protocol):
 
 
 class LoggingAlertSink:
-    """Default :class:`AlertSink`: log each event at ``WARNING``. No PHI — only the connection name
-    and queue shape are recorded, never a message body."""
+    """Default :class:`AlertSink`: log each event at ``WARNING``. Never a message body, but not
+    PHI-free: an event's free-text detail or reason can go into the line (docs/PHI.md row 13)."""
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
         # Not "outbound ... internal error": a start failure, an inbound router or transform halt and
