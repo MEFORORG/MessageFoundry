@@ -397,8 +397,10 @@ async def report_cell_tag_failure(store: _AuditSink, err: CellTagError) -> None:
 
     The cell is muted for the interval only once its row is WRITTEN, so a write that fails or is
     cancelled leaves the cell's next refusal to write it (BACKLOG #6697). Nothing marks a write in
-    flight: concurrent reports of one cell may each write a row, since a duplicate audit row is the
-    price of never losing one."""
+    flight: concurrent reports of one cell may each write a row, so a failed write never mutes
+    another report. The row is written at most once per later refusal, not guaranteed: a failed
+    write is retried only if the cell is refused again, and a row the pipeline dead-letters is not
+    read again by the pipeline, so its audit row would be lost unless a later read refuses it."""
     if err.audited or not err.drift:
         return
     key = _memo_key(err)
@@ -466,15 +468,21 @@ def dead_letters_on_cell_tag[S: CellTagSink, **P](
     was raised at the read), and the handoff reports ``False``. Without this the runner would read the
     raise as an infrastructure fault and re-pend the row until the inbound stopped.
 
-    ``routed_id`` must be keyword-only, so every call that reaches the handoff carries it in
-    ``kwargs``; a handoff that takes it any other way is refused here, at decoration (BACKLOG
-    #6698)."""
+    ``routed_id`` must be keyword-only with no default, so every call that reaches the handoff
+    carries it in ``kwargs``; a handoff that takes it any other way is refused here, at decoration
+    (BACKLOG #6698)."""
     # STRING: only the kind is read, so no annotation is evaluated (a TYPE_CHECKING-only one would
     # raise NameError at decoration).
     sig = inspect.signature(fn, annotation_format=annotationlib.Format.STRING)
     param = sig.parameters.get("routed_id")
-    if param is None or param.kind is not inspect.Parameter.KEYWORD_ONLY:
-        raise TypeError(f"{fn.__qualname__} must take routed_id as a keyword-only parameter")
+    if (
+        param is None
+        or param.kind is not inspect.Parameter.KEYWORD_ONLY
+        or param.default is not inspect.Parameter.empty
+    ):
+        raise TypeError(
+            f"{fn.__qualname__} must take routed_id as a keyword-only parameter with no default"
+        )
 
     async def wrapper(self: S, /, *args: P.args, **kwargs: P.kwargs) -> bool:
         try:

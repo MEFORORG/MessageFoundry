@@ -333,6 +333,12 @@ async def test_the_handoff_wrapper_requires_a_keyword_only_routed_id() -> None:
 
     with pytest.raises(TypeError, match="keyword-only"):
         dead_letters_on_cell_tag(positional)
+
+    async def defaulted(self: _DeadLetterSink, *, routed_id: str = "") -> bool:
+        return True
+
+    with pytest.raises(TypeError, match="no default"):  # a call could omit it from kwargs
+        dead_letters_on_cell_tag(defaulted)
     # An annotation naming a TYPE_CHECKING-only type, in a module without the future import, is not
     # evaluated at decoration.
     namespace: dict[str, Any] = {}
