@@ -78,9 +78,14 @@ CLUSTER_RENEW_RETUNE = "[cluster].lease_renew_timeout_seconds"
 CLUSTER_FENCE_RETUNE = "[cluster].leader_fence_timeout_seconds"
 #: stop()'s two writes. Their clamp is a fixed bound, and each runs inside an event-loop timeout of
 #: the same length, which starts first and so fires first: in practice this text is never seen.
-CLUSTER_STOP_RETUNE = "no setting (stop()'s shutdown bound is fixed)"
+CLUSTER_STOP_RETUNE = "nothing: stop()'s shutdown bound is fixed"
 
-__all__ = ["SqlServerCoordinator"]
+__all__ = [
+    "CLUSTER_FENCE_RETUNE",
+    "CLUSTER_RENEW_RETUNE",
+    "CLUSTER_STOP_RETUNE",
+    "SqlServerCoordinator",
+]
 
 if TYPE_CHECKING:
     from messagefoundry.pipeline.cluster import ClusterCoordinator
@@ -580,12 +585,15 @@ class SqlServerCoordinator:
     def _paused_read_clamp(self) -> tuple[float, str]:
         """The paused owner read's driver clamp, the smaller of the renew clamp and half the
         paused-read budget, and the setting that sets it, decided together so neither can change
-        alone (BACKLOG #5064). At a tie the renew setting is named, though raising either alone
-        would not lengthen the clamp."""
+        alone (BACKLOG #5064). The terms are compared as the store runs them, floored at 1 s
+        (``SqlServerStore._clamp_bounds``), so a budget term the floor lifts to the renew clamp's
+        length does not name the fence. At such a tie, or any other, the renew setting is named,
+        though raising either alone would not lengthen the clamp."""
         budget_term = self._paused_read_budget / 2.0
-        if budget_term < self._renew_timeout:
-            return budget_term, CLUSTER_FENCE_RETUNE
-        return self._renew_timeout, CLUSTER_RENEW_RETUNE
+        clamp = min(self._renew_timeout, budget_term)
+        if max(1.0, budget_term) < max(1.0, self._renew_timeout):
+            return clamp, CLUSTER_FENCE_RETUNE
+        return clamp, CLUSTER_RENEW_RETUNE
 
     async def _fence_watchdog_loop(self) -> None:
         while not self._stop.is_set():

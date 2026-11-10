@@ -5001,7 +5001,7 @@ class StoreAcquireTimeout(RuntimeError):
     """A store pooled-connection borrow exceeded its limit: at least ``[store].acquire_timeout``,
     a shorter cluster clamp, or the longer post-commit limit. The message names the setting
     its caller passed, ``[store].acquire_timeout`` unless the caller says otherwise. A SQL Server
-    cluster coordinator's clamped borrow names the setting that set its clamp, as the coordinator
+    cluster coordinator's clamped borrow names what set its clamp, as the coordinator
     passes it (``messagefoundry.pipeline.cluster_sqlserver``, BACKLOG #5064).
 
     An ordinary ``Exception`` on purpose, so it lands in the store callers' existing ``except

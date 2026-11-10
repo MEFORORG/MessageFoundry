@@ -635,6 +635,31 @@ async def test_the_paused_owner_read_is_clamped_at_the_smaller_of_clamp_and_budg
     assert advice == [CLUSTER_RENEW_RETUNE]
 
 
+@pytest.mark.parametrize(
+    ("fence", "renew", "expected"),
+    [
+        (4.0, 5.0, (1.5, CLUSTER_FENCE_RETUNE)),  # half the budget binds
+        (20.0, 5.0, (5.0, CLUSTER_RENEW_RETUNE)),  # the renew clamp binds
+        (8.0, 3.0, (3.0, CLUSTER_RENEW_RETUNE)),  # a tie names the renew setting
+        (2.0, 1.0, (0.75, CLUSTER_RENEW_RETUNE)),  # the 1 s floor lifts the budget term to a tie
+    ],
+)
+def test_the_paused_read_names_the_term_that_sets_its_floored_clamp(
+    fence: float, renew: float, expected: tuple[float, str]
+) -> None:
+    """BACKLOG #5064: the paused read's clamp is unchanged, the smaller of the two terms, and its
+    advice names the fence only when half the budget is the smaller term as the store runs it,
+    floored at 1 s; raising the fence cannot lengthen a clamp the floor or the renew clamp sets."""
+    coord = SqlServerCoordinator(
+        object(),
+        "A",
+        leader_fence_timeout_seconds=fence,
+        lease_renew_timeout_seconds=renew,
+        monotonic=lambda: 0.0,
+    )
+    assert coord._paused_read_clamp() == expected
+
+
 async def test_a_short_fence_halves_the_paused_read_budget_below_the_renew_clamp() -> None:
     """The budget term on its own: at a 4 s fence the budget is 3 s, so the read is clamped at
     1.5 s, below a 5 s renew clamp. Clamping at the renew clamp, or at the unhalved budget, would
@@ -669,8 +694,8 @@ async def test_each_renew_clamped_statement_names_the_renew_setting_alone() -> N
     """BACKLOG #5064: the heartbeat, the lease claim, the config-version refresh and a stepdown's
     release are clamped at ``[cluster].lease_renew_timeout_seconds`` alone, so a borrow that times
     out names that setting, never the fence, which on the default derived clamp would shrink it.
-    The lease release under ``stop()``'s fixed bound names no setting; its ``left`` write passes the
-    same constant, and both run inside an event-loop timeout that fires first."""
+    The lease release under ``stop()``'s fixed bound, the path its first write takes, names no
+    setting; its ``left`` write is not driven here."""
     seen: list[tuple[str, str]] = []
 
     class _Store:
