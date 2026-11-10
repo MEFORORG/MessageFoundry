@@ -5247,8 +5247,9 @@ class EgressSettings(_Section):
     is empty refuses every destination of that type; once a transport's list is set, a destination of
     that transport not on it is **refused at config load/reload** (fail-closed), checked against the
     resolved (``env()``-substituted) destination. With ``deny_by_default`` off, each list is opt-in and
-    an empty one is unrestricted. The webhook/SMTP *alert* sinks carry no PHI bodies and keep
-    their own ``[alerts]`` host allowlists.
+    an empty one is unrestricted. The webhook/SMTP *alert* sinks keep their own ``[alerts]`` host
+    allowlists. They send no message body, but some alerts carry free-text detail (the docs/PHI.md
+    logging-inventory rows for the ``[alerts]`` webhook and SMTP transports, rows 10 and 11).
 
     The comment on ``deny_by_default`` says what else it covers and how operators set it.
     """
@@ -5887,8 +5888,9 @@ class AlertsSettings(_Section):
 
     A transport is *enabled* when its essentials are present: ``webhook_url`` for the webhook;
     ``email_smtp_host`` + ``email_from`` + at least one ``email_to`` for email. The SMTP password is a
-    secret — supply it via ``MEFOR_ALERTS_EMAIL_PASSWORD``, never the file. Payloads carry only the
-    connection name + queue shape (no PHI)."""
+    secret — supply it via ``MEFOR_ALERTS_EMAIL_PASSWORD``, never the file. Payloads have no
+    message-body field, but they are not PHI-free: some events still send free-text detail off the
+    box, and docs/PHI.md row 10 names at least some of them."""
 
     # --- webhook (generic HTTP POST; fronts Slack/Teams/PagerDuty/custom) ----
     webhook_url: str | None = None

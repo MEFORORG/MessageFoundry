@@ -41,6 +41,7 @@ __all__ = [
     "intake_pause_detail",
     "remote_debug_refused_detail",
     "sandbox_worker_refused_detail",
+    "shown_error_class",
     "store_restored_detail",
     "utc_or_unknown",
 ]
@@ -210,6 +211,14 @@ def sandbox_worker_refused_detail(*, content_only: bool) -> str:
         'dead-lettered as ERROR under internal_error = "continue", or the inbound stops under '
         '"stop". A WARNING line in the engine log names what differs.'
     )
+
+
+def shown_error_class(error_class: str | None) -> str:
+    """The exception class a ``connection_error`` alert shows in the log and off the box, or the
+    fixed token ``unnamed error`` for one that is not a plain identifier (BACKLOG #3210, #5021)."""
+    if type(error_class) is str and error_class.isascii() and error_class.isidentifier():
+        return error_class
+    return "unnamed error"
 
 
 #: The subject a ``store_restored`` alert is raised under (BACKLOG #2614). No connection can be
@@ -407,7 +416,8 @@ class AlertSink(Protocol):
         (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
         one alert per lane per cooldown (#46, Corepoint "connection lost"). ``kind`` is the connection-
         event kind (``connection_lost``); ``detail`` is a ``safe_exc`` reason, and it can echo
-        transport text, so an implementation must not assume it is free of message content.
+        transport text, so an implementation must not assume it is free of message content, and must
+        not send it off the box (BACKLOG #5021).
         ``error_class`` is the failing exception's class name (BACKLOG #3210). A partner *rejection*
         (``NegativeAckError``) is NOT a connection error and never fires this."""
         ...
@@ -1115,8 +1125,8 @@ class AlertSink(Protocol):
 
 
 class LoggingAlertSink:
-    """Default :class:`AlertSink`: log each event at ``WARNING``. No PHI — only the connection name
-    and queue shape are recorded, never a message body."""
+    """Default :class:`AlertSink`: log each event at ``WARNING``. No message-body field, but not
+    PHI-free: an event's free-text detail or reason can go into the line (docs/PHI.md row 13)."""
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
         # Not "outbound ... internal error": a start failure, an inbound router or transform halt and
@@ -1174,12 +1184,11 @@ class LoggingAlertSink:
     ) -> None:
         """This line is general-log text, so it names the caller's exception class and never reads
         ``detail``, which can echo transport text (BACKLOG #3210)."""
-        plain = error_class is not None and error_class.isascii() and error_class.isidentifier()
         log.warning(
             "ALERT connection_error: outbound %r %s (%s); the reason is not logged",
             name,
             kind,
-            error_class if plain else "unnamed error",
+            shown_error_class(error_class),
         )
 
     def log_write_failed(

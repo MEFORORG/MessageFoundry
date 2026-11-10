@@ -408,6 +408,16 @@ class ReloadOutcome:
     ``None`` at least on a single node, on a dry run, when the bump failed, and on any
     ``propagate=False`` reload until :meth:`Engine._converge_reload` sets it.
 
+    ``initiator_digest`` is, on a convergence reload, the digest the initiating node stored with
+    ``config_version`` when it bumped it (:func:`~messagefoundry.config.fingerprint.shared_digest_of`
+    reads it), so the row can set the operator's bytes beside this node's own ``fingerprint`` (vault
+    BACKLOG #3109). What pairs it with the version is the stamp the bump stores beside it
+    (:func:`~messagefoundry.pipeline.cluster.stamped_config_digest`) and the coordinator's
+    version-equality check
+    (:meth:`~messagefoundry.pipeline.cluster.ClusterCoordinator.config_digest_cached`). ``None``
+    when not known: on every other reload, when the initiator stored none, when the cache had
+    already moved on to a later bump, or when what was stored is not a digest.
+
     ``restart_required`` names each settings trust anchor the settings preflight found changed on
     disk since its consumer loaded it. The reload checked the new file but does not apply it, so
     those take a restart (BACKLOG #2185, #3015). ``None`` means not checked: a dry run skips the
@@ -421,6 +431,7 @@ class ReloadOutcome:
     failures: tuple[ReloadStepFailure, ...] = ()
     fingerprint: Mapping[str, object] | None = None
     config_version: int | None = None
+    initiator_digest: Mapping[str, object] | None = None
     restart_required: tuple[str, ...] | None = None
 
     @property
@@ -890,6 +901,9 @@ class Engine:
             Callable[[Exception, int, set[str]], Awaitable[None]] | None
         ) = None
         self._convergence_failures: tuple[int, set[str]] | None = None
+        # vault BACKLOG #3109: the shared version whose stored initiator's digest was last logged
+        # as unreadable, so a version the runner retries every tick logs it once.
+        self._initiator_digest_warned: int | None = None
 
     def _engine_owned_dirs(self) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
         """The engine's own directories and trees for the ``.processed`` sweep's guard (BACKLOG
@@ -2712,7 +2726,13 @@ class Engine:
         later start compared against the wrong digest. A fault in that writer is logged and goes no
         further: the graph has swapped, and a raise would make the runner retry a reload that already
         ran. A reload that raises is passed to :attr:`convergence_reload_failed` with the rows
-        already written for ``version``, and then re-raised, so the runner still retries it."""
+        already written for ``version``, and then re-raised, so the runner still retries it.
+
+        The row also carries the initiating node's digest for ``version``, read from the
+        coordinator's cache before anything here awaits (vault BACKLOG #3109). The runner read
+        ``version`` from that cache with no await since, so the two come from one read of the
+        shared row; read after the reload, a refresh could have moved the cache to a later bump."""
+        initiator_digest = self._initiator_digest(version)
         try:
             outcome = await self.reload_detail(propagate=False)
         except Exception as exc:
@@ -2727,13 +2747,43 @@ class Engine:
             raise
         # A version that failed and then converged is reported again if it ever fails again.
         self._convergence_failures = None
-        outcome = replace(outcome, config_version=version)
+        outcome = replace(outcome, config_version=version, initiator_digest=initiator_digest)
         if self.convergence_reload_audit is None:
             return
         try:
             await self.convergence_reload_audit(outcome)
         except Exception:  # noqa: BLE001 - see the docstring; the API's writer already logs its own
             log.exception("cluster: the convergence reload swapped the graph, but its audit failed")
+
+    def _initiator_digest(self, version: int) -> Mapping[str, object] | None:
+        """The initiating node's digest stored with shared config ``version``, as a convergence row
+        names it, or ``None`` when it is not known (vault BACKLOG #3109).
+
+        The digest is an advisory field on the row, so no fault in reading it reaches the reload: a
+        stored value that is not a digest, or a coordinator that raises, reads as unknown. Either is
+        logged at WARNING once per version, since the runner retries a failing version every tick;
+        a raise is logged with its traceback, as it is a fault in this code rather than in the row."""
+        from messagefoundry.config.fingerprint import shared_digest_of
+
+        fault: str | None = None
+        error: Exception | None = None
+        try:
+            stored = self._coordinator.config_digest_cached(version)
+            digest = shared_digest_of(stored)
+            if stored is not None and digest is None:
+                fault = "is not a digest"
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            digest, fault, error = None, f"could not be read ({type(exc).__name__})", exc
+        if fault is not None and self._initiator_digest_warned != version:
+            self._initiator_digest_warned = version
+            log.warning(
+                "cluster: the initiator's digest stored with shared config version %d %s, so it "
+                "reads as unknown",
+                version,
+                fault,
+                exc_info=error,
+            )
+        return digest
 
     async def set_connection_flag(
         self,
@@ -3581,15 +3631,37 @@ class Engine:
         # leave the cluster converging on a graph the initiator never took.
         config_version: int | None = None
         if propagate and self._coordinator.is_clustered():
+            from messagefoundry.config.fingerprint import digest_coverage, shared_digest_text
+
+            # The bump stores this node's digest with the new version, so a follower's
+            # convergence row can name the operator's bytes beside its own (vault BACKLOG #3109).
             try:
-                config_version = await self._coordinator.bump_config_version()
-                self._applied_config_version = config_version
+                digest_text = shared_digest_text(fingerprint)
+                unshared = digest_text is None and digest_coverage(fingerprint) is not None
+            except Exception as exc:  # noqa: BLE001 - past the swap, an advisory fault fails no reload
+                log.warning(
+                    "cluster: this reload's digest could not be prepared to share (%s), so it is "
+                    "shared as unknown",
+                    type(exc).__name__,
+                    exc_info=exc,
+                )
+                digest_text, unshared = None, False
+            try:
+                config_version = await self._coordinator.bump_config_version(digest=digest_text)
             except Exception as exc:
                 # This node IS running the new graph; only the cluster-wide announcement is missing, so
                 # the other nodes stay on the old config until the next bump or an operator reload
                 # there. That is a partial apply across the cluster, not a failed one here.
                 log.warning("cluster config-version bump after reload failed: %s", safe_exc(exc))
                 failures.append(ReloadStepFailure("cluster_propagate", safe_exc(exc)))
+            else:
+                self._applied_config_version = config_version
+                if unshared:
+                    # Said here, since a follower reads the NULL as "the initiator took none".
+                    log.warning(
+                        "cluster: this reload's digest is not in a shape another node can "
+                        "compare, or is too long to share, so the version bump stored it as unknown"
+                    )
         if failures:
             log.warning(
                 "config reload APPLIED with %d incomplete follow-on step(s): %s",
