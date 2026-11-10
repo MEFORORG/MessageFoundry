@@ -3332,7 +3332,7 @@ class _PairLockFailed(Exception):
     two disagree."""
 
     def __init__(self, kind: _PairLockFailure, cause: OSError) -> None:
-        super().__init__(kind)
+        super().__init__(kind, cause)
         self.kind: _PairLockFailure = kind
         self.cause = cause
 

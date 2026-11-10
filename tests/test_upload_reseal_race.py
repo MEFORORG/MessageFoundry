@@ -13,9 +13,11 @@ the one it read. The race tests below fail on the code before the fix: the delet
 from __future__ import annotations
 
 import asyncio
+import copy
 import errno
 import logging
 import os
+import pickle
 import shutil
 import threading
 from collections.abc import Callable
@@ -730,3 +732,12 @@ def test_every_pair_lock_failure_has_a_reseal_cause() -> None:
     """``blocked`` takes any failure kind, so the cause lookup cannot raise ``KeyError``."""
     kinds = set(get_args(uploads_mod._PairLockFailure.__value__))
     assert set(uploads_mod._RESEAL_BLOCKED) == kinds
+
+
+def test_a_pair_lock_failure_survives_pickle_and_copy() -> None:
+    """``_PairLockFailed`` keeps its kind and cause through ``pickle`` and ``copy``, as an
+    exception that crosses a process boundary or a traceback copy must."""
+    failed = uploads_mod._PairLockFailed("gone", FileNotFoundError(errno.ENOENT, "gone", "x"))
+    for twin in (pickle.loads(pickle.dumps(failed)), copy.copy(failed)):
+        assert twin.kind == "gone"
+        assert isinstance(twin.cause, FileNotFoundError) and twin.cause.errno == errno.ENOENT
