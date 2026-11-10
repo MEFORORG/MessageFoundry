@@ -1601,14 +1601,15 @@ def refuse_unrevoked_verified_hop(
     """Refuse a VERIFYING ``https`` hop that does no certificate revocation checking (#201, ADR 0078 amend).
 
     The revocation twin of :func:`refuse_verify_off`, for the *verify-ON* https path the HTTP-family cells
-    take when ``verify_tls`` is true, and for a REST hop through an ECH sidecar whatever ``verify_tls``
-    says (vault BACKLOG #2977 item 8): urllib rides stdlib ssl, which validates the chain
+    (REST/SOAP/FHIR) take when ``verify_tls`` is true: urllib rides stdlib ssl, which validates the chain
     (+ strict RFC 5280) but performs NO OCSP/CRL, so a revoked-but-unexpired server cert is still accepted.
     A production-PHI verified hop to a non-loopback host is REFUSED at construction unless revocation is
     attested (per-connection ``tls_revocation_attested`` or the blanket ``MEFOR_TLS_REVOCATION_ATTESTED``
     env, folded in by :meth:`RevocationHopGuard.capture`); a non-prod PHI hop WARNs; loopback / synthetic /
     attested hops are byte-identical. Only meaningful for ``https`` — an ``http`` url has no TLS (its
-    cleartext body is refused by :func:`refuse_cleartext_egress`).
+    cleartext body is refused by :func:`refuse_cleartext_egress`) and ``verify_tls=false`` is not a
+    verifying hop (refused by :func:`refuse_verify_off`), so the revocation gate and the #200 cleartext /
+    verify-off gates key on disjoint conditions and never double-refuse one hop.
 
     ``opener`` (BACKLOG #1498) is the opener this hop will really dial through, when the caller has
     already built one. Its https context is then read and handed to the guard, so a ``[tls].crl_file``
@@ -2731,6 +2732,16 @@ class RestDestination(DestinationConnector):
                 "ech_egress and proxy_url are mutually exclusive — the ECH sidecar IS this connection's "
                 "egress path (ADR 0139)"
             )
+        # Vault BACKLOG #2977 item 8: the sidecar, not the engine, makes the TLS connection to the
+        # destination, so verify_tls=false turns off no verification the engine does. It used to skip
+        # the revocation guard below, which runs only on the verify-ON branch. Refused here, above
+        # refuse_verify_off, so that gate logs no attested crossing and no DISABLED warning for a
+        # connection that never builds. No attestation crosses it, as with proxy_url above.
+        if self._ech_sidecar is not None and not bool_setting(s, "verify_tls", default=True):
+            raise ValueError(
+                "ech_egress and verify_tls=false are mutually exclusive — the ECH sidecar, not the "
+                "engine, makes this connection's TLS connection to the destination (ADR 0139)"
+            )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy. None (default, or when
         # ECH is active) → no ProxyHandler and no Proxy-Authorization threaded below → byte-identical.
         self._proxy: ProxyConfig | None = (
@@ -2892,15 +2903,12 @@ class RestDestination(DestinationConnector):
             # loopback rule alone already dials every accepted sidecar direct, so this adds no
             # routing. It makes "no proxy on this hop" hold by construction as well as by rule.
             self._opener = _no_redirect_opener(urllib.request.ProxyHandler({}))
-        if verify or self._ech_sidecar is not None:
+        if verify:
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the peer cert but does no
             # OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI verified
-            # hop unless revocation is attested or this hop's own opener checks a CRL.
-            #
-            # An ECH hop is judged here whatever verify_tls says (vault BACKLOG #2977 item 8): the
-            # sidecar opener above replaced the insecure one, and the sidecar makes the peer's TLS
-            # connection, so verify_tls=false turns off no verification and must not lift this guard.
-            # The SMART and OAuth2 token hop through the same sidecar already runs it unconditionally.
+            # hop unless revocation is attested or this hop's own opener checks a CRL. Composes with
+            # #200: it keys on the verify-ON https path, disjoint from the cleartext / verify-off gates
+            # above, so no hop is ever double-refused.
             #
             # Last in __init__, below every statement that builds or replaces `self._opener`, and no
             # opener with an ECH sidecar or tls_allow_expired: see refuse_unrevoked_verified_hop.
