@@ -216,17 +216,17 @@ that package's build code may run in CI:
     every pin in `requirements.txt` itself. Its closure is audited only through the lock.
   - So the job fails on a stale lock: one that does not pin a package `requirements.txt` names,
     or pins it only under a marker false on the Windows runner, or at a version the requirement's
-    specifier does not allow. The step copies pip 26's line handling (continuation lines, comments,
-    options) and expands `${VAR}`, but not as pip does: it expands each `${VAR}` the line names
-    once, in one pass, while pip replaces them one after another, so pip can also expand a
-    `${VAR}` that a variable's value brings in, whole or in part, when the line names that variable
-    later. On such a line the step can read different text from pip, in the requirement or in its
-    options. At least two results follow: a line pip follows as an include or a constraint can
-    pass the step, and a requirement whose marker pip reads as true can be only noted as false on
-    the runner, so pip installs a package the step did not check against the lock. The step
-    parses each requirement with the `packaging` copy pip
-    carries, so versions compare as pip compares them, and reads a line of options with no
-    requirement with pip's own parser. A requirement whose marker is false on the runner, an extra
+    specifier does not allow. The step copies pip 26's line handling for continuation lines,
+    comments and options. Its `${VAR}` expansion is not pip's. The step expands each `${VAR}` the
+    line names once, in one pass. pip replaces them one after another, so it can also expand a
+    `${VAR}` that a value brings in, whole or in part, when the line names that variable later.
+    The step also expands with this job's environment, which need not match an install's. So the
+    step can read a line differently from pip, in the requirement or in its options. At least two
+    results follow. A line pip follows as an include or a constraint can pass the step. A
+    requirement whose marker pip reads as true can be only noted as false on the runner, so pip
+    can install a package the step did not check against the lock. The step parses each
+    requirement with the `packaging` copy pip carries, so versions compare as pip compares them,
+    and reads a line of options with no requirement with pip's own parser. A requirement whose marker is false on the runner, an extra
     (a lock records none), a URL or path with no package name, and an editable line (`-e` or
     `--editable`, abbreviated or attached as pip allows, which installs a source tree or checkout
     no lock pin holds) are only noted. A requirement it cannot parse fails, and so does a line of
@@ -257,25 +257,25 @@ that package's build code may run in CI:
       engine depends on `uvloop` on Linux, and the README's lock commands lock Windows alone, so
       that lock cannot be applied there. A universal lock covers both (read the
       universal-lock note in this section first).
-      The extension's command applies the lock in neither way either: in a repository
-      with both `requirements.txt` and `requirements-dev.txt` and no `pyproject.toml`, it runs
-      `pip install -r requirements.txt -r requirements-dev.txt` as one command that passes no
-      `-c` and names no lock, and it has no setting that adds either. In any other layout it
-      installs something else and does not read the line. On a machine whose environment that
-      command sets up, a constraints file with no hashes reaches that install through the line,
-      so keep the line for as long as anyone sets up an environment that way. A constraints file
-      with hashes, `requirements.lock` among them, turns on hash checking for that whole command,
-      and pip 26 refuses it while `requirements-dev.txt` holds a pin with no hash, as the
-      scaffolded one does.
+      The extension's command does not apply the lock. Where the workspace's first folder holds
+      `requirements.txt` and `requirements-dev.txt` and no `pyproject.toml`, it runs
+      `pip install -r requirements.txt -r requirements-dev.txt` as one command in a terminal. That
+      command passes no `-c` and names no lock, and the extension has no setting that adds either.
+      In any other layout it installs something else and does not read the line. So once the line
+      is gone, that install keeps a constraints file's limits only if something else passes them,
+      such as `PIP_CONSTRAINT` set in that terminal's environment. A hashed constraints file, the
+      lock among them, turns on hash checking for that whole command. pip then refuses a package
+      the file does not pin with hashes, such as `messagefoundry-toolkit` when the file is a lock
+      written from `requirements.txt` alone.
 
     A `-c requirements.lock` line is refused too, and only the install step applies to it: do not
     pass the lock to the command that writes it. Removing the line is safe only once every install
     applies the lock as above. While it is there, it also limits each regeneration to the lock's
     own pins, so a requirement moved off its locked version cannot resolve until the line is gone.
-  - The job takes the engine's pin out of the lock, reading it as the stale-lock step reads
-    `requirements.txt` (`${VAR}` expansion included, as above), and installs that pin
-    alone with `--no-deps --require-hashes`. The lock must pin `messagefoundry` exactly once, or the
-    job says so and fails; pip refuses the pin if it carries no hash. No other locked package is
+  - The job picks the engine's pin out of the lock, reading the lock as the stale-lock step reads
+    `requirements.txt`. It writes that pin's lines as the lock has them, and pip installs them
+    alone with `--no-deps --require-hashes`, expanding any `${VAR}` its own way. The lock must pin
+    `messagefoundry` exactly once, or the job says so and fails; pip refuses the pin if it carries no hash. No other locked package is
     installed into the interpreter that runs the auditor, pip and `pip-audit`, so no other locked
     package's code (a `.pth` file runs at every interpreter start) runs inside them.
   - `pip-audit` and its own dependencies are installed into that interpreter from

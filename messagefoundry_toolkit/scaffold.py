@@ -569,8 +569,7 @@ for group in logical_lines("requirements.txt"):
                     " docs/ADOPTER-CI.md, Job 3, says: for a file other than requirements.lock,"
                     " pass -c FILE to every command that writes requirements.lock and keep it in"
                     " the README's, and for any file, make every install of requirements.txt"
-                    " apply the lock (Job 3 names one that never does, the VS Code extension's"
-                    " setup, so keep the line where it runs), with"
+                    " apply the lock (Job 3 says what the VS Code extension's setup needs), with"
                     " PIP_CONSTRAINT=requirements.lock for that command only or pip install"
                     " --require-hashes -r requirements.lock in its place, using a lock that covers"
                     " that install's platform",
