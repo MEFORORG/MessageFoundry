@@ -704,6 +704,29 @@ it supersedes, and only where it disagrees; the earlier text is kept as it was.
   `_POST_COMMIT_REVOKE_ATTEMPTS` (3) times from `_revoke_after_commit`, and up to twice from
   `revoke_other_sessions` and `revoke_every_session`, which retry once. A refusal that an attempt
   which committed also met is reported once, by that attempt.
+- **The AD-map piece of slice 3 is built (owner ruling 2026-11-10, in session: *"Hold, build AD-map
+  piece"*).** Before it, an Unverifiable or Outage answer on an AD map raised out of
+  `reconcile_directory_sessions`; the reconcile loop in `api/app.py` logged "pass failed" and the
+  pass revoked nothing, offboardings included. Now `AuthService._reconcile_ad_map` catches both
+  answers on either map. Each pass that meets one logs a WARNING and writes a soft audit row:
+  `integrity.authority_seal_unverifiable` with reason `directory_map_unverifiable`, or
+  `integrity.authority_seal_unavailable` with reason `seal_unavailable`. Its detail is the kind
+  `adset`, the map's name and `during: reconcile`. The pass then pages through the store's own
+  `SealPager`, with no cap or throttle: an Unverifiable map under
+  `authority-seal-transit-unverifiable:adset:<map name>`, an Outage under `authority-seal-transit`.
+  The pass reads that map as empty and plans as `main` plans on a Forged map, under the same
+  breaker. This is step 1 of (b): the holders that empty role map would demote, and the accounts an
+  empty scope map would withdraw from, lose their sessions, and a trip applies nothing. No role is
+  written from that pass, and each `auth.ad_session_revoked` row carries `map_unverified: true` and
+  no `roles`.
+- **What that ruling leaves unbuilt, filed under vault #8202.** At least: step 2 (the groups-moved
+  set and its sealed group digest); the Forged map's change from `main`; the sealed empty map; a
+  failing user row's probing for revocation, and an Unverifiable user row read by `_load_user` or
+  `_load_users`, which still raises out of the pass; the Vault-wide `seal_unavailable` abort and its
+  `seal_clear`; and a pass where a map did not hold still confirming accounts. An Outage on a map row
+  takes step 1 here, where (b) gives it step 2 alone. (b) says a single timed-out call must not sign
+  out every role holder, and below the brake's thresholds this build lets one do that. With no
+  step 2 built, the only alternative was the old behaviour, which revoked nothing.
 - **The held `refused()` log.** `RevokeSealOutcome.refused` no longer logs at refusal time, inside
   the writer transaction. Its line is held and written once the outcome is known, with the
   committed or the failed wording, as the skipped-raise count is, which is logged after a commit

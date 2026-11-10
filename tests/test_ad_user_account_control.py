@@ -2727,7 +2727,10 @@ async def test_a_forfeited_hold_logs_once_when_its_held_passes_raise(
             assert service._reconcile_hold_standing == "forfeit"
 
             async def refusing(
-                revocation: SessionRevocation, *, watermark: _AuditWatermark | None
+                revocation: SessionRevocation,
+                *,
+                watermark: _AuditWatermark | None,
+                maps_held: bool = True,
             ) -> _RevocationApplied:
                 raise sqlite3.OperationalError("synthetic: the store refused the revocation")
 

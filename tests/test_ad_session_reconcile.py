@@ -5926,10 +5926,13 @@ async def test_the_pass_judges_the_scope_stored_after_its_probes() -> None:
         apply = service._apply_reconcile_revocation
 
         async def spy(
-            revocation: reconcile.SessionRevocation, *, watermark: _AuditWatermark | None
+            revocation: reconcile.SessionRevocation,
+            *,
+            watermark: _AuditWatermark | None,
+            maps_held: bool = True,
         ) -> _RevocationApplied:
             planned.append(revocation)
-            return await apply(revocation, watermark=watermark)
+            return await apply(revocation, watermark=watermark, maps_held=maps_held)
 
         service._apply_reconcile_revocation = spy  # type: ignore[method-assign]
         plan = await service.reconcile_directory_sessions()
@@ -5950,12 +5953,15 @@ async def test_a_scope_revocation_is_skipped_when_the_scope_moved_before_it_appl
         apply = service._apply_reconcile_revocation
 
         async def login_then_apply(
-            revocation: reconcile.SessionRevocation, *, watermark: _AuditWatermark | None
+            revocation: reconcile.SessionRevocation,
+            *,
+            watermark: _AuditWatermark | None,
+            maps_held: bool = True,
         ) -> _RevocationApplied:
             await store.set_user_channel_scope(
                 revocation.user_id, json.dumps(["IB_B"]), source=SCOPE_SOURCE_AD
             )
-            return await apply(revocation, watermark=watermark)
+            return await apply(revocation, watermark=watermark, maps_held=maps_held)
 
         service._apply_reconcile_revocation = login_then_apply  # type: ignore[method-assign]
         plan = await service.reconcile_directory_sessions()

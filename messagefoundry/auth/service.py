@@ -179,6 +179,8 @@ from messagefoundry.store.row_seal import (
     ADSET_KIND,
     ROLE_KIND,
     SESSION_KIND,
+    TRANSIT_OUTAGE_SUBJECT,
+    UNVERIFIABLE_SUBJECT_PREFIX,
     USER_KIND,
     AnyRowSealer,
     RowSealError,
@@ -191,6 +193,7 @@ from messagefoundry.store.row_seal import (
 from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
+    AUTHORITY_SEAL_UNVERIFIABLE_AUDIT_ACTION,
     LOGIN_ADDRESS_RESET_MARKER,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
@@ -3529,6 +3532,16 @@ def oidc_client_auth_from_settings(
 
 #: The audit action written when an authority row fails its integrity seal (BACKLOG #2592).
 AUTHORITY_SEAL_FAILED_ACTION: Final = "integrity.authority_seal_failed"
+#: The audit action an Unverifiable authority row writes (ADR 0217, *The four answers*); the
+#: store's own constant, so the two cannot drift.
+AUTHORITY_SEAL_UNVERIFIABLE_ACTION: Final = AUTHORITY_SEAL_UNVERIFIABLE_AUDIT_ACTION
+#: The audit action a reconcile pass writes when Vault transit was unavailable reading an AD map
+#: (owner ruling 2026-11-10 on ADR 0217, *"Hold, build AD-map piece"*).
+AUTHORITY_SEAL_UNAVAILABLE_ACTION: Final = "integrity.authority_seal_unavailable"
+#: The reason an AD map Vault transit could not verify is reported with (ADR 0217 (b)).
+DIRECTORY_MAP_UNVERIFIABLE: Final = "directory_map_unverifiable"
+#: The reason an AD map read during a Vault transit Outage is reported with (ADR 0217 (b)).
+SEAL_UNAVAILABLE: Final = "seal_unavailable"
 #: How many times :meth:`AuthService.finish_webauthn_assertion` reads the passkey set and then the
 #: holder while the account's passkey digest keeps moving between the two, before it refuses the
 #: factor as unverifiable (BACKLOG #3068).
@@ -9079,8 +9092,11 @@ class AuthService:
         scopes: dict[str, channel_scope.ScopeInput] = {}
         # Both directory maps read once for the pass, each through its seal check (BACKLOG #2592),
         # so every account in the pass is judged against one version of each map.
-        role_map = await self._ad_map(AD_ROLE_MAP)
-        scope_map = await self._ad_map(AD_SCOPE_MAP)
+        # A map Vault transit could not verify reads as empty and writes no role (ADR 0217 (b),
+        # owner ruling 2026-11-10): `_reconcile_ad_map`.
+        role_map, role_map_held = await self._reconcile_ad_map(AD_ROLE_MAP)
+        scope_map, scope_map_held = await self._reconcile_ad_map(AD_SCOPE_MAP)
+        maps_held = role_map_held and scope_map_held
         for probe in probes:
             if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
                 continue
@@ -9227,7 +9243,7 @@ class AuthService:
                 self._advance_referral_standing("forfeit")
             # An account with no watermark recorded gets None, which reports.
             outcome = await self._apply_reconcile_revocation(
-                revocation, watermark=watermarks.get(revocation.user_id)
+                revocation, watermark=watermarks.get(revocation.user_id), maps_held=maps_held
             )
             if outcome != "skipped":
                 applied.append(revocation)
@@ -10642,7 +10658,11 @@ class AuthService:
         return isinstance(detail, dict) and detail.get("reason") == revocation.reason
 
     async def _apply_reconcile_revocation(
-        self, revocation: reconcile.SessionRevocation, *, watermark: _AuditWatermark | None
+        self,
+        revocation: reconcile.SessionRevocation,
+        *,
+        watermark: _AuditWatermark | None,
+        maps_held: bool = True,
     ) -> _RevocationApplied:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
         live sessions, audit, and notify the affected user out-of-band (ASVS 6.3.7). A scope
@@ -10673,7 +10693,11 @@ class AuthService:
         read, since the compare is on the set, not the record. **Residual, at least:** the second
         can still end a session the first had not yet ended, when its whole apply runs between the
         first's role write and the first's own session revocation. Both then report, the first for
-        the roles and the second for the session."""
+        the roles and the second for the session.
+
+        ``maps_held`` is False on a pass where an AD map did not verify
+        (:meth:`_reconcile_ad_map`): no role is written, the sessions still end, and the audit row
+        carries ``map_unverified: true`` and no ``roles``."""
         user = await self._load_user(revocation.user_id)
         if revocation.reason == reconcile.SCOPE_CHANGED and (
             user is None or user.channel_scope != revocation.scope_from
@@ -10696,6 +10720,11 @@ class AuthService:
         # #3085): only the first of them writes and counts a change, and a write that finds the
         # roles moved since this read writes nothing and counts none.
         roles_changed = False
+        # ADR 0217 (b), owner ruling 2026-11-10: on a pass where a map did not verify, the plan's
+        # target roles come from a map read as empty, so no role is written from them; the
+        # sessions below still end.
+        if not maps_held:
+            revocation = replace(revocation, role_ids=None)
         if (
             revocation.role_ids is not None
             and user is not None
@@ -10756,6 +10785,8 @@ class AuthService:
                 {
                     "reason": revocation.reason,
                     "sessions": revoked,
+                    # Only when a map did not verify, so every other row keeps its exact string.
+                    **({} if maps_held else {"map_unverified": True}),
                     **(
                         {"roles": list(revocation.role_ids)}
                         if revocation.role_ids is not None
@@ -12080,6 +12111,64 @@ class AuthService:
             {"kind": ADSET_KIND, "map": name},
         )
         return None
+
+    async def _reconcile_ad_map(self, name: str) -> tuple[AdMap, bool]:
+        """The AD map ``name`` for one reconcile pass, and whether the pass may write roles from it
+        (ADR 0217 (b), owner ruling 2026-11-10, *"Hold, build AD-map piece"*).
+
+        A map that holds, or one that is Forged, reads as :meth:`_ad_map` reads it, as on ``main``.
+        A map Vault transit cannot verify (Unverifiable) or cannot reach (Outage) used to raise out
+        of the pass, so the reconcile loop logged it and the pass revoked nothing. Now it is
+        reported (:meth:`_report_reconcile_map`) and read as empty with ``False``: the pass plans
+        as ``main`` plans on a Forged map, under the same breaker, so the accounts the map governs
+        lose their sessions, and writes no role from it. Only this map piece of ADR 0217 slice 3
+        is built; the groups-moved second step and the rest stay filed (vault #8202)."""
+        try:
+            return await self._ad_map(name), True
+        except (TransitSealUnverifiableError, RowSealUnverifiableError):
+            await self._report_reconcile_map(name, unverifiable=True)
+        except TransitSealUnavailableError:
+            await self._report_reconcile_map(name, unverifiable=False)
+        return AdMap(name), False
+
+    async def _report_reconcile_map(self, name: str, *, unverifiable: bool) -> None:
+        """Report one AD map a reconcile pass could not verify: a WARNING, a soft ``integrity.*``
+        audit row, and a page through the store's own seal pager.
+
+        Unverifiable writes :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION` with reason
+        :data:`DIRECTORY_MAP_UNVERIFIABLE` and pages under the map's own fixed subject,
+        ``authority-seal-transit-unverifiable:adset:<map name>``, which no cap or throttle holds
+        (ADR 0217, *The map page has no latch*). An Outage writes
+        :data:`AUTHORITY_SEAL_UNAVAILABLE_ACTION` with reason :data:`SEAL_UNAVAILABLE` and pages
+        under the shared ``authority-seal-transit``. Every pass that meets the map reports it. A
+        refused audit write is logged, not raised, so the pass still ends the sessions."""
+        if unverifiable:
+            action, slug = AUTHORITY_SEAL_UNVERIFIABLE_ACTION, DIRECTORY_MAP_UNVERIFIABLE
+            subject = f"{UNVERIFIABLE_SUBJECT_PREFIX}:{ADSET_KIND}:{name}"
+            reason = (
+                f"the {name} integrity seal could not be verified by Vault transit; this directory"
+                " reconcile pass wrote no role from it and ended the sessions it governs"
+            )
+        else:
+            action, slug = AUTHORITY_SEAL_UNAVAILABLE_ACTION, SEAL_UNAVAILABLE
+            subject = TRANSIT_OUTAGE_SUBJECT
+            reason = (
+                f"Vault transit was unavailable reading the {name}; this directory reconcile pass"
+                " wrote no role from it and ended the sessions it governs"
+            )
+        _log.warning("%s", reason)
+        detail = {"kind": ADSET_KIND, "map": name, "reason": slug, "during": "reconcile"}
+        await write_audit_soft(
+            lambda: self._audit(action, detail=_json(detail)),
+            log=_log,
+            message="the %s audit row for an unverified AD map could not be written",
+            args=(action,),
+            errors=audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
+        pager = getattr(self._store, "seal_pager", None)
+        if callable(pager):
+            pager().page(subject, reason)
 
     async def _ad_roles_for_groups(self, groups: Iterable[str]) -> set[str]:
         """The role ids the AD group-to-role map gives ``groups``; none when the map fails its
