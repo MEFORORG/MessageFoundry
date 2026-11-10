@@ -16,8 +16,9 @@
 > these residuals stay open: the same-process re-promotion case (Consequence 1c); on SQL Server, a
 > renew that can land up to about twice the clamp after it is issued, because its borrow and its
 > statement each get the full clamp while the margin check compares the clamp alone; the SQL Server
-> claim's COMMIT, which the clamp does not bound; and the SQL Server heartbeat, config-version refresh
-> and stepdown release, which still run under `[store].command_timeout`.
+> claim's COMMIT, which the clamp does not bound. **CORRECTED 2026-11-09 (BACKLOG #5064):** this
+> list also named the SQL Server heartbeat, config-version refresh and stepdown release as running
+> under `[store].command_timeout`; they now run under the clamp, as the claim does.
 >
 > **Inc 3 is BUILT (2026-09-26, BACKLOG #1497), on a measured premise.** Its gate asked whether a
 > coroutine cancelled mid-`execute` leaves an aioodbc transaction committed or rolled back. Hosted CI
@@ -392,16 +393,23 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    Postgres. First, the timeout counts whole seconds, so the clamp is rounded DOWN, never above the
 >    value `_renew_fits_the_margin` checked, and never below 1, and
 >    `ServiceSettings._sqlserver_renew_clamp_whole_seconds` refuses a clamp under 1 s on this
->    backend. Second, it binds the claim call only: its borrow waits at most the clamp too, but
+>    backend. Second, it binds each call on its own, never a shared deadline: the claim, and since
+>    BACKLOG #5064 the loop's other statements and the stepdown release. Each call's borrow waits at
+>    most the clamp too, but
 >    unlike Postgres the borrow and the statement do not share one deadline (a whole-second timeout
 >    cannot carry what a borrow leaves of a 1 s clamp), so a renew can land up to about twice the
 >    clamp after it is issued, while the margin check compares the clamp alone. The COMMIT after the
->    statement is not bounded by it, and the heartbeat, config-version refresh and stepdown release
->    still run under `command_timeout`. The first difference is on purpose; the second is a kept
+>    statement is not bounded by it. Since BACKLOG #5064 the heartbeat, config-version refresh and
+>    stepdown release run under the clamp the same way, each with the same twice-the-clamp bound, three
+>    times when its rollback runs (`SqlServerStore._execute_clamped` for the two writes,
+>    `_fetchone_clamped` for the refresh); until then they ran under `command_timeout`, as this
+>    sentence said. Whether msodbcsql bounds the COMMIT (`SQLEndTran`) needs a live server; BACKLOG
+>    #6621 measures it. The first difference is on purpose; the second is a kept
 >    residual (Manager decision d20261030T213636115-0af931): the margin check is unchanged, and
 >    `serve` logs `ServiceSettings.sqlserver_renew_bound_warning` at start-up, without refusing, when
 >    twice the clamp reaches the margin. Deviation 4 says what that means for the derived default.
->    `tests/test_adr0157_b1497_sqlserver_renew_clamp.py` pins it offline, and its gated test shows the driver
+>    `tests/test_adr0157_b1497_sqlserver_renew_clamp.py` pins it offline, by the warning's arithmetic and
+>    by a timing test of the two windows, and its gated test shows the driver
 >    ending a slow statement at the clamp.
 > 4. **The default is DERIVED from the margin, not a fixed 5.0 — a correction made inside this
 >    increment, before merge.** The first cut shipped a constant 5.0 and it refused **this
@@ -735,7 +743,10 @@ Postgres runtime tests. It adds the two NOCOUNT tests and both recovery-closure 
   server: the discarded session keeps its open transaction and its locks until its close lands or
   the server ends it, and the rollback keeps its executor thread until the driver returns.
   At least these are not clamped either: the start-up
-  `_register` and `_ensure_tables`, and the heartbeat, config-version and release statements. The
+  `_register` and `_ensure_tables`. **CORRECTED 2026-11-09 (BACKLOG #5064):** this list also named
+  the heartbeat, config-version and release statements. The heartbeat, the config-version
+  refresh and a stepdown's release now run under the clamp; `stop()`'s release and `left` write run under its own shutdown bound
+  (`STOP_WRITE_TIMEOUT_SECONDS`), at the driver too. The
   claim's borrow is now bounded by the clamp rather than `[store].acquire_timeout` alone, so a
   leader whose pool is busy but healthy can self-fence sooner.
 - If D1 fails and no node ever acquires the lease again, the row stays INFLIGHT. No node is leading

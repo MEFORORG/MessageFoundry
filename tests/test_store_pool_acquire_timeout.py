@@ -406,6 +406,26 @@ async def test_sqlserver_store_acquire_is_bounded() -> None:
             pytest.fail("the body must never run on a wedged pool")
 
 
+async def test_sqlserver_clamped_borrow_names_the_setting_that_set_its_limit() -> None:
+    """BACKLOG #5064: a borrow cut at the cluster clamp names the clamp, since raising
+    ``[store].acquire_timeout`` would not lengthen it; one cut at ``[store].acquire_timeout``,
+    the shorter of the two, still names that setting."""
+    store = _sqlserver_store(_HangingPool(), timeout=0.2)
+    with pytest.raises(StoreAcquireTimeout, match=r"lease_renew_timeout_seconds") as clamped:
+        async with store._acquire_clamped(FAST):
+            pytest.fail("the body must never run on a wedged pool")
+    assert "[store].acquire_timeout" not in str(clamped.value)
+    # A tie names the clamp too: raising [store].acquire_timeout alone would not lengthen it.
+    store = _sqlserver_store(_HangingPool(), timeout=FAST)
+    with pytest.raises(StoreAcquireTimeout, match=r"lease_renew_timeout_seconds"):
+        async with store._acquire_clamped(FAST):
+            pytest.fail("the body must never run on a wedged pool")
+    store = _sqlserver_store(_HangingPool(), timeout=FAST)
+    with pytest.raises(StoreAcquireTimeout, match=r"retune with \[store\]\.acquire_timeout$"):
+        async with store._acquire_clamped(5.0):
+            pytest.fail("the body must never run on a wedged pool")
+
+
 async def test_postgres_store_acquire_is_bounded() -> None:
     store = _postgres_store(_HangingPool())
     with pytest.raises(StoreAcquireTimeout):
@@ -882,8 +902,9 @@ def test_sqlserver_longer_post_commit_borrow_has_exactly_its_two_writes() -> Non
     """BACKLOG #3023: the SQL Server counterpart of the Postgres pin above. The longer post-commit
     borrow is reached from ``revoke_user_sessions`` directly and from ``rotate_session`` through
     ``_write_session_txn(after_commit=True)``, the only call passing that keyword; nothing else.
-    ``_borrow`` is called only by ``_acquire``, ``_acquire_after_commit`` and, for the cluster lease
-    claim's SHORTER limit (BACKLOG #1497), ``_acquire_clamped``; strict mypy keeps
+    ``_borrow`` is called only by ``_acquire``, ``_acquire_after_commit`` and, for the SHORTER limit
+    of the cluster coordinator's clamped statements (the lease claim since BACKLOG #1497, the
+    loop's other statements and the release writes since #5064), ``_acquire_clamped``; strict mypy keeps
     ``None`` out of its ``float`` limit. A third write moved onto the longer limit would pass every offline test, so
     its callers are pinned by name."""
     assert _sqlserver_functions_referencing("_acquire_after_commit") == [
@@ -894,13 +915,16 @@ def test_sqlserver_longer_post_commit_borrow_has_exactly_its_two_writes() -> Non
         " it too follows a committed write nothing retries, then update this pin"
     )
     assert _sqlserver_functions_referencing("after_commit") == ["rotate_session"]
-    # BACKLOG #1497 added a SHORTER borrow for the cluster lease claim alone; pinned the same way.
+    # BACKLOG #1497 added a SHORTER borrow for the cluster lease claim, which #5064 widened to the
+    # coordinator's other clamped statements; pinned the same way.
     assert _sqlserver_functions_referencing("_borrow") == [
         "_acquire",
         "_acquire_after_commit",
         "_acquire_clamped",
     ]
-    assert _sqlserver_functions_referencing("_acquire_clamped") == ["_fetch_rows"]
+    # BACKLOG #5064 moved it behind _clamp_bounds, shared by the clamped read and the clamped write.
+    assert _sqlserver_functions_referencing("_acquire_clamped") == ["_clamp_bounds"]
+    assert _sqlserver_functions_referencing("_clamp_bounds") == ["_fetch_rows", "_write_rows"]
 
 
 # --- the setting -------------------------------------------------------------

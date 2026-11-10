@@ -402,7 +402,8 @@ async def stop_tasks_within(
     tombstone, so the row reads ``active`` and leading until ``node_timeout_seconds`` passes. For
     that time a sibling's stepdown can count this stopped node as a promotable sibling.
 
-    Both are bounded by the cancelled statement's own timeout, the renew clamp on Postgres, and the
+    Both are bounded by the cancelled statement's own timeout, the renew clamp on both backends
+    (on SQL Server since BACKLOG #5064, and there short of a COMMIT nothing is known to bound), and the
     abandoned task holds its connection that long, so the store's pool close can wait for it.
 
     Never raises. A task's stored error is read and logged here rather than raised, because the
@@ -648,10 +649,14 @@ def paused_read_budget_seconds(fence_timeout_seconds: float) -> float:
 
     * Postgres: :func:`_call_within` at ``min(renew clamp, budget / 2)``, because that helper costs
       at most twice its timeout. The halving applies only when the clamp is the larger term.
-    * SQL Server: an ``asyncio.timeout`` of the whole budget around the store read. The store's own
-      ``command_timeout`` still ends the statement cleanly when it is the shorter of the two, so the
-      client-side cancel, which quarantines a pooled connection, fires only when the store's limit
-      would overrun the budget. A cancel that lands during the stalled statement unwinds at once:
+    * SQL Server: an ``asyncio.timeout`` of the whole budget around a store read clamped at
+      ``min(renew clamp, budget / 2)`` (BACKLOG #5064), halved because the clamped borrow and
+      statement each take up to the clamp. The driver's statement timeout, the smaller of that
+      clamp rounded down to whole seconds and the store's ``command_timeout``, ends the statement
+      cleanly, so the client-side cancel, which quarantines a pooled connection, fires at least
+      when the borrow, the statement and a rollback after it together overrun the budget, when the
+      1 s floor on the clamp exceeds half a short budget, or when a COMMIT that nothing is known to
+      bound stalls (``SqlServerStore._fetchone_clamped``). A cancel that lands during the stalled statement unwinds at once:
       the store hands the close to that statement rather than waiting on it. One that lands between
       two driver calls can wait up to the store's ``_DIRTY_CLOSE_TIMEOUT`` (5 s) for the close, and
       at the shipped 20 s fence that is enough to reach the fence. The quarter of the fence this
@@ -1869,8 +1874,9 @@ class DbCoordinator:
                 # ARMED A SECOND TIME, from the instant the write RETURNED, taking whichever expiry is
                 # LATER. The arm above is measured from before the write, so the write's own duration
                 # comes out of the pause. Since BACKLOG #2523 that duration is bounded, at the borrow
-                # wait plus twice the renew clamp; the SQL Server twin's has only
-                # `[store].command_timeout`, and a bound
+                # wait plus twice the renew clamp; the SQL Server twin's borrow and statement are
+                # bounded by the clamp too since BACKLOG #5064, but its COMMIT is not known to be
+                # bounded at all (SqlServerStore._fetchone_clamped), and a bound
                 # is still a cost taken out of the pause. The window that matters starts when the row
                 # becomes takeable, which is the
                 # commit, not the call: measuring from before it would hand a sibling (the pause - write
@@ -2132,7 +2138,7 @@ def build_coordinator(
             leader_fence_timeout_seconds=getattr(
                 cluster_settings, "leader_fence_timeout_seconds", 20.0
             ),
-            # ADR 0157 Inc 0, as for DbCoordinator below: the claim/renew statement's own timeout.
+            # ADR 0157 Inc 0, as for DbCoordinator below: the loop's and stepdown's statement clamp.
             lease_renew_timeout_seconds=_renew_timeout_or_default(cluster_settings),
             acquire_delay_seconds=getattr(cluster_settings, "acquire_delay_seconds", 0.0),
             promotable=getattr(cluster_settings, "promotable", True),
@@ -2149,7 +2155,8 @@ def build_coordinator(
             cluster_settings, "leader_fence_timeout_seconds", 20.0
         ),
         # ADR 0157 Inc 0. Threaded to both coordinators; SqlServerCoordinator applies it as the
-        # claim/renew statement's own ODBC timeout (SqlServerStore._fetchone_clamped).
+        # ODBC timeout and borrow bound of the heartbeat, the claim/renew, the config-version
+        # refresh and a stepdown's release (BACKLOG #5064; SqlServerStore._fetchone_clamped).
         #
         # ClusterSettings resolves the UNSET case (derive it from the detection margin) inside its own
         # validator, so a real settings object always hands over a concrete float and the derivation
