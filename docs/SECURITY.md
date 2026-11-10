@@ -2186,7 +2186,10 @@ the same permission set on the same method reds CI until it is listed here.
 > source counts as `ad` here (BACKLOG #2252):** it predates the source column, the sync withdraws
 > it like a directory scope, and the GET still reports it as null. The 409 detail names the
 > conflict, never the scope. Each 409 writes one `user.channel_scope_change_refused` audit row
-> naming the administrator, the account and the conflict, never the scope (BACKLOG #2271). A store
+> naming the administrator, the account and the conflict, never the scope (BACKLOG #2271); a
+> reader without `users:manage` reads its conflict fields withheld (the `GET /users` bullet under
+> *Every route of the default JSON API has a channel-scope class*, below, in
+> [The `/ui` console plane](#the-ui-console-plane-serve_uitrue)). A store
 > that refuses that row leaves an ERROR log line instead, and the 409 stands. The web console sends `expected_source` when the administrator ticks "Make this scope
 > manual", and shows a race as a refused save with the edits kept.
 >
@@ -2394,7 +2397,27 @@ the same permission set on the same method reds CI until it is listed here.
 > - `GET /users` sends each account's `channel_scope` and `channel_scope_source` only to a
 >   `users:manage` holder, the tier `GET /users/{user_id}/channel-scope` reads on. Everyone else
 >   gets null for both and `channel_scope_withheld: true`, so a null there means "not shown". The
->   console's user list reads that flag and drops both scope columns for such a reader.
+>   console's user list reads that flag and drops both scope columns for such a reader. On the
+>   same rule, `GET /audit`, its console page and `GET /audit/export` narrow, for such a reader,
+>   the detail of the four audit actions a census of the writers on 2026-11-09 found naming a
+>   channel list or who owns a scope: `user.channel_scope_changed` and `auth.ad_scope_resynced`
+>   read as the account's `user_id`, where the row has one, and `"channels": "withheld"`;
+>   `auth.ad_session_revoked` reads `scope_from` and `scope_to` as `"withheld"` on a scope-delta
+>   row, the only row that carries them, and keeps `scope_changed`; and
+>   `user.channel_scope_change_refused` reads `owner`, `read_source`, `expected_source` and
+>   `reason` as `"withheld"` (vault BACKLOG #3748). Each rule is an
+>   allowlist, so a key a later writer adds to one of those four is withheld, but a NEW action
+>   whose detail names a scope is shown whole until a rule for it is added to `_NARROWED` in
+>   `messagefoundry/auth/audit_visibility.py`, which holds each action's kept and withheld keys.
+>   `tests/test_audit_scope_census.py` fails on some such writers, not all: its docstring lists at
+>   least the shapes it misses, among them a detail built outside the call and a key it does not
+>   know. `GET /logs/tail` gives such a reader no audit
+>   copies at all. **Left open:** this hides the stored lists and sources, not every inference.
+>   Rows left whole can still let such a reader piece a scope together: at least an `auth.channel_denied`
+>   row or a channel-attributed access row, each naming an actor and one channel, and the actors of
+>   `auth.ad_scope_resynced` rows, which say the directory owned that account's scope.
+>   `/me/security-events` is not narrowed either: it shows a holder its own `auth.*` rows whole,
+>   and, on the residuals its own bullet under *Single-route data rules* names, another account's.
 > - `POST /config/reload` refuses a scoped caller 403, a dry run included, because a reload loads
 >   the whole graph and a dry run's reply describes it. So a deployer needs the all-channels grant.
 >   The refusal writes one `auth.channel_denied` row naming no channel. The approval gate refuses
@@ -7150,7 +7173,11 @@ behind it, `"logout"` at a sign-out, and `"superseded"` at another sign-in on th
 which may be another account's (BACKLOG #2298, #3749; see [Admin password reset](#admin-password-reset-wp-l3-12-asvs-646)). The permission decides, not the role name; no custom role can grant
 `users:manage` (ADR 0045 D1). The store applies the filter in the query before `limit`, so a page
 never comes back short. The account holder's own `/me/security-events` feed is not filtered: it
-selects rows by the caller's own username, so it shows the holder their own lock and no one else's.
+selects rows by the caller's own username at or after the account's `created_at`, so it shows the
+holder their own rows. It can show another account's, at least where an account keeps its
+`created_at` while its name or holder changes, and on the store-side name-compare residuals
+`_security_events_where` in `messagefoundry/store/store.py` lists (the `GET /me/security-events` bullet under *Single-route data rules*, in
+[The `/ui` console plane](#the-ui-console-plane-serve_uitrue)).
 **The cost, accepted in the ruling: the Auditor can no longer review lockouts.** The list and its
 reasons are in `messagefoundry/auth/audit_visibility.py`.
 
@@ -7227,7 +7254,14 @@ open. The detector reads `config_loaded` rows and no `config_reload` row, so at 
 unseen. A reload whose swap lands after that read leaves the alert resolved while the loosened graph
 runs. A reload onto a loosened graph after a clean start raises nothing until a later start. A
 reload onto a clean graph resolves nothing either. `GET /security/posture` reads the live graph, so
-read that for the current posture.
+read that for the current posture. A cluster convergence reload's `config_reload` row, under
+`system:cluster-convergence`, carries a `loosenings` key read off the graph that reload loaded,
+as a start's row does, and the detector does not read it either (vault BACKLOG #3814). The key is
+`null`, which says unknown, at least when the list could not be read and when the reload ran
+before the start had put in place the settings it reads, as one inside the start's own
+convergence does. A convergence whose row is lost writes no list at all. An operator reload's row
+has no such key. So on a single node, no row names the loosenings an operator reload brings in
+until a later start's row lists them; on a cluster, the other nodes' convergence rows can.
 
 **`posture_loosened` may not name a given switch, the layer's own included.** Its sentence gives the
 count of every loosening, then their names, cut at 200 characters and ending in `...`. The

@@ -15,7 +15,7 @@ import logging
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -421,6 +421,11 @@ class ReloadOutcome:
     fingerprint: Mapping[str, object] | None = None
     config_version: int | None = None
     restart_required: tuple[str, ...] | None = None
+    #: The ``env()`` values an applied reload swapped in with ``registry``, so an audit row reads
+    #: that graph's loosenings against the values it builds with, whatever the runner holds by then
+    #: (vault BACKLOG #3814). ``None`` for a dry run. They include secret values, so they are kept
+    #: out of the repr and of equality.
+    env_values: Mapping[str, Any] | None = field(default=None, repr=False, compare=False)
 
     @property
     def degraded(self) -> bool:
@@ -3603,6 +3608,10 @@ class Engine:
             fingerprint=fingerprint,
             config_version=config_version,
             restart_required=restart_required,
+            # The values this reload applied, not copied again. On a first load, or with no
+            # provider, this is the engine's own dict, which nothing changes in place: a reload
+            # rebinds it.
+            env_values=env_values,
         )
 
     def _resolve_reload_target(self, config_dir: str | Path | None) -> Path:
