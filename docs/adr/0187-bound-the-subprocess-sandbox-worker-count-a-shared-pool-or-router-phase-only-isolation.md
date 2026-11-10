@@ -97,7 +97,8 @@ Two consequences follow, and both cut toward pooling:
 dispatch at a time**. Inside that body, every isolation fault ends in `self._kill(proc)` — a marshal
 rejection, a `wall_seconds` timeout, an EOF from a crashed child, a codec rejection, and a frame no
 outstanding request asked for. There is no wire-level cancel: killing the process *is* how a runaway
-call is stopped, and `_kill` reaps the whole tree.
+call is stopped, and `_kill` reaps the whole tree. (*Amendment B* records that a marshal rejection
+and a codec refusal of a request no longer kill the worker, and that the kill records its cause.)
 
 Against one inbound, the blast radius of a kill is that inbound. Against a shared worker it is every
 lane that worker serves, and that is the design work this memo exists to price.
@@ -342,6 +343,27 @@ for the build, open to the build's own review.
    a leftover thread, a write to fd 1, `sys.exit`, `os._exit`, a memory leak.
 5. The N=1500 two-arm comparison runs against **the pool**, the shape that would ship, on both
    Windows and Linux, with N=750 recorded beside it (BACKLOG #3132).
+
+## Amendment B (2026-11-09) -- a refused request keeps its worker, and a kill records its cause
+
+The Context section above describes `main` before vault BACKLOG #3135, and is kept as written. Since
+#3135:
+
+- **A request the codec refuses, or one over the frame cap, no longer kills the worker.** It is
+  refused before a byte is written, so the worker is still in step; only that message fails. A
+  failure while writing the request still kills it, since the worker may hold part of a frame.
+- **A frame waiting before a request kills the worker and retries the message once on a fresh one**
+  (owner ruling 2026-11-09, #3135 step 4). The message never reached the worker. It dead-letters
+  only if the fresh worker has a stray frame waiting too. A frame left after an answer still
+  dead-letters the message it follows.
+- **Every kill records a cause from a closed set**, `KillCause` in `messagefoundry/pipeline/sandbox.py`,
+  and writes one `WARNING` naming the inbound, the phase and the cause token, never message content.
+  A graph refusal writes none, because the runner alerts on it, and a shutdown logs at `INFO`. This
+  is the kill-cause record design point 1 of *Amendment A* puts ahead of any kill budget; the budget
+  itself is still unbuilt.
+
+The kill is still the only cancellation primitive for a running dispatch, so the blast-radius
+argument above stands for every fault that does kill.
 
 ## Acceptance Criteria
 

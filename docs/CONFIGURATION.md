@@ -1356,8 +1356,13 @@ chain, and every live socket. `mode="off"` (**the default**) runs them in-proces
 with zero overhead**. `mode="subprocess"` runs each inbound's Router/Handler in a **persistent
 per-inbound worker child** (never a per-message fork), enforcing a forbidden-import guard
 (socket/store/crypto) and the resource caps below. An isolation denial (forbidden op, cap overrun,
-worker crash, a rejected frame) routes the message to `ERROR`/dead-letter **post-ACK** (no NAK, never
-dropped).
+worker crash, an invalid or forged answer) routes the message to `ERROR`/dead-letter **post-ACK** (no
+NAK, never dropped). Two cases differ (vault BACKLOG #3135). A request the codec refuses, or one over
+the frame cap, dead-letters only that message and keeps the worker, since no byte of it was written. A
+stray frame found waiting **before** a request kills the worker and retries the message once on a fresh
+one (owner ruling 2026-11-09); it dead-letters only if the fresh worker has a stray frame waiting too.
+Each worker kill writes one `WARNING` naming the inbound, the phase and a cause token, and no message
+content, except a graph refusal, which the runner alerts on instead, and a shutdown, logged at `INFO`.
 **Read once at engine start — a `/config/reload` does NOT re-read it (restart to change).**
 
 **`mode` is engine-wide — there is no per-connection sandbox setting.** One policy is rendered for the
@@ -1498,7 +1503,8 @@ spawns inherits the response pipe and can stage a frame while the worker is aliv
 now reaps its whole process tree (a Windows kill-on-close job object / a POSIX process group), so such
 a grandchild no longer outlives the kill (BACKLOG #342). That reap is best-effort process hygiene: what
 makes a stray frame *harmless* is still the codec plus the request-answer binding (a live grandchild can
-force a respawn, i.e. dead-letter messages on that inbound, but nothing more), not the process teardown.
+force a respawn and dead-letter the message whose answer its frame follows; a frame waiting before a
+request costs that message one retry on a fresh worker; nothing more), not the process teardown.
 The child's **stderr is captured by the engine, not inherited** (ADR 0176): a Handler that prints is
 relayed into the engine's log attributed to the inbound, the child pid and the worker generation, with
 **the content itself only at `DEBUG`**. At `INFO` and above you get a rate-limited `WARNING` naming the
