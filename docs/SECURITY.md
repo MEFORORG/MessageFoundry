@@ -2383,14 +2383,15 @@ the same permission set on the same method reds CI until it is listed here.
 >   allowlist, so a key a later writer adds to one of those four is withheld, but a NEW action
 >   whose detail names a scope is shown whole until a rule for it is added to `_NARROWED` in
 >   `messagefoundry/auth/audit_visibility.py`, which holds each action's kept and withheld keys.
->   `tests/test_audit_scope_census.py` fails on such a writer when its detail is a dict literal
->   in the call, and misses one built elsewhere. `GET /logs/tail` gives such a reader no audit
+>   `tests/test_audit_scope_census.py` fails on some such writers, not all: its docstring lists at
+>   least the shapes it misses, among them a detail built outside the call and a key it does not
+>   know. `GET /logs/tail` gives such a reader no audit
 >   copies at all. **Left open:** this hides the stored lists and sources, not every inference.
 >   Rows left whole can still let such a reader piece a scope together: at least an `auth.channel_denied`
 >   row or a channel-attributed access row, each naming an actor and one channel, and the actors of
 >   `auth.ad_scope_resynced` rows, which say the directory owned that account's scope.
->   `/me/security-events` is not narrowed either: it shows a holder its own rows whole, and, on the
->   residual its own bullet under *Single-route data rules* names, a predecessor's.
+>   `/me/security-events` is not narrowed either: it shows a holder its own `auth.*` rows whole,
+>   and, on the residuals its own bullet under *Single-route data rules* names, another account's.
 > - `POST /config/reload` refuses a scoped caller 403, a dry run included, because a reload loads
 >   the whole graph and a dry run's reply describes it. So a deployer needs the all-channels grant.
 >   The refusal writes one `auth.channel_denied` row naming no channel. The approval gate refuses
@@ -7120,8 +7121,9 @@ which may be another account's (BACKLOG #2298, #3749; see [Admin password reset]
 `users:manage` (ADR 0045 D1). The store applies the filter in the query before `limit`, so a page
 never comes back short. The account holder's own `/me/security-events` feed is not filtered: it
 selects rows by the caller's own username at or after the account's `created_at`, so it shows the
-holder their own rows, and another account's only where an account keeps its `created_at` while its
-name or holder changes (the `GET /me/security-events` bullet under *Single-route data rules*, in
+holder their own rows. It can show another account's, at least where an account keeps its
+`created_at` while its name or holder changes, and on the store-side name-compare residuals
+`_security_events_where` in `messagefoundry/store/store.py` lists (the `GET /me/security-events` bullet under *Single-route data rules*, in
 [The `/ui` console plane](#the-ui-console-plane-serve_uitrue)).
 **The cost, accepted in the ruling: the Auditor can no longer review lockouts.** The list and its
 reasons are in `messagefoundry/auth/audit_visibility.py`.

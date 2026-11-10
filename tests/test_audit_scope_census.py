@@ -10,16 +10,18 @@ that detail, and fails when a key that can carry a channel list or a scope's sou
 action that is neither narrowed nor on :data:`_WHOLE_ROW`, the named list of actions checked and
 left whole, each with its reason.
 
-**What it does not see:** a detail built outside the call (a variable, a helper's return), a key
-not spelled as a string literal, and an action passed as an expression it cannot resolve. Those are
-counted, so a writer that moves its detail out of the call shows up as a drop in the scanned total
-rather than a silent pass.
+**What it does not see, at least:** a detail built outside the call (a variable, a helper's
+return), a scope written under a key not in :data:`_SCOPE_KEYS`, a key not spelled as a string
+literal, an action passed by keyword or as an expression other than a string or a module-level
+string constant, and a writer outside ``messagefoundry/``. Each of those passes silently. The
+``missing`` check catches such a move only on one of the four narrowed writers.
 """
 
 from __future__ import annotations
 
 import ast
 from collections import defaultdict
+from functools import cache
 from pathlib import Path
 
 from messagefoundry.auth import audit_visibility
@@ -53,12 +55,24 @@ _WHOLE_ROW: dict[str, str] = {
 }
 
 
-def _action_constants() -> dict[str, str]:
-    return {
-        name: value
-        for name, value in vars(audit_visibility).items()
-        if name.endswith("_ACTION") and isinstance(value, str)
-    }
+def _string_constants(tree: ast.Module) -> dict[str, str]:
+    """One module's top-level ``NAME = "..."`` and ``NAME: Final = "..."``, so an action held in a
+    constant beside its writer resolves as one imported from audit_visibility does."""
+    found: dict[str, str] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            target, value = stmt.targets[0], stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            target, value = stmt.target, stmt.value
+        else:
+            continue
+        if (
+            isinstance(target, ast.Name)
+            and isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+        ):
+            found[target.id] = value.value
+    return found
 
 
 def _dict_keys(node: ast.AST) -> set[str]:
@@ -71,12 +85,18 @@ def _dict_keys(node: ast.AST) -> set[str]:
     }
 
 
+@cache
 def _census() -> tuple[dict[str, set[str]], int]:
-    constants = _action_constants()
+    shared = {
+        name: value
+        for name, value in vars(audit_visibility).items()
+        if name.endswith("_ACTION") and isinstance(value, str)
+    }
     found: dict[str, set[str]] = defaultdict(set)
     scanned = 0
     for path in sorted(_ROOT.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        constants = {**shared, **_string_constants(tree)}
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not node.args:
                 continue
@@ -101,9 +121,11 @@ def _census() -> tuple[dict[str, set[str]], int]:
 
 def test_every_audit_write_with_a_scope_key_is_narrowed_or_named_whole() -> None:
     found, scanned = _census()
-    # Positive control: the instrument must see the writes it is meant to judge. Every narrowed
-    # action is written with a scope key in a literal detail, so each must be found.
-    assert scanned > 100, f"the scan saw only {scanned} audit writes; the instrument is broken"
+    # Positive controls. The count is of every call with a resolvable first argument and a
+    # ``detail=`` keyword, audit writes and others (``CheckResult`` among them), so it shows only
+    # that the scan ran over the tree. The ``missing`` check is what shows it still sees audit
+    # writers: each narrowed action is written with a scope key in a literal detail.
+    assert scanned > 100, f"the scan saw only {scanned} calls; the instrument is broken"
     missing = CHANNEL_LIST_ACTIONS - set(found)
     assert not missing, f"the census no longer sees these narrowed writers: {sorted(missing)}"
     unclassified = {

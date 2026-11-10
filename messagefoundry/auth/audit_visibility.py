@@ -65,10 +65,12 @@ scope sources on the rows :data:`CHANNEL_LIST_ACTIONS` names, through :func:`aud
 ``GET /audit``, its console page and the CSV export.
 
 ``/me/security-events`` is not filtered. It selects rows by the caller's own username at or after
-the account's ``created_at``, so it shows the holder their own rows, the lock rows and the scope
-rows whole. It can show another account's where an account keeps its ``created_at`` while its name
-or holder changes; ``docs/SECURITY.md`` (the ``GET /me/security-events`` bullet under *Single-route
-data rules*) names that residual.
+the account's ``created_at``, so it shows the holder their own ``auth.*`` rows whole, the lock rows
+and ``auth.ad_scope_resynced`` and ``auth.ad_session_revoked`` among them. It can show another
+account's, at least where an account keeps its ``created_at`` while its name or holder changes,
+and on the name-compare residuals ``_security_events_where`` in ``messagefoundry/store/store.py``
+lists; ``docs/SECURITY.md`` (the ``GET /me/security-events`` bullet under *Single-route data
+rules*) names the first.
 """
 
 from __future__ import annotations
@@ -206,8 +208,8 @@ class _Narrowed:
 #: Checked and left whole: at least ``ad_group_scope_map.updated`` (a count), the session-revoke
 #: rows' ``scope`` word (which sessions, not which channels) and ``auth.channel_denied`` (one
 #: channel id the caller itself asked for). A NEW action whose detail names a scope is shown whole
-#: until it is added here. ``tests/test_audit_scope_census.py`` fails on such a writer when its
-#: detail is a dict literal in the call; a detail built elsewhere escapes it.
+#: until it is added here. ``tests/test_audit_scope_census.py`` fails on some such writers, not
+#: all; its docstring lists at least the shapes it misses.
 _NARROWED: Final[Mapping[str, _Narrowed]] = MappingProxyType(
     {
         CHANNEL_SCOPE_CHANGED_ACTION: _Narrowed(shown=("user_id",), always=("channels",)),
