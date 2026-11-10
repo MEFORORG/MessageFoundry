@@ -1248,7 +1248,11 @@ hop's token clean raises `vault_privilege_clean`, which pages nobody and resolve
 instance, as `store_privilege_clean` does for the store. The subject names the hop and nothing
 about the token, because a fix is usually a new token: so engine processes that share one store
 share each hop's alert, and a clean start by one resolves a warning another raised on a different
-token. The log line and the audit row of every start stay the record.
+token. A warning another process raises after the clean start read the alert is not resolved by
+that start. It stays open until a later clean start of any process sharing the store, or an
+operator, closes it, since this check runs only at start. The fenced auto-resolve in
+[ADR 0044](adr/0044-operator-alert-state.md) (the BACKLOG #4916 amendment) says when. The log line and the audit row of every start stay the
+record.
 
 ### Data-layer hops refuse cleartext on their defaults (ASVS 12.3.1 census)
 
