@@ -53,7 +53,7 @@ from .._auth import (
     require_ui_step_up_action,
 )
 from ..pages._common import _seg
-from ._common import _form_pairs
+from ._common import _form_pairs, posted_field_value
 
 # The browse GET decrypts PHI (step-up), so register it as an UNLOCK form — a stale step-up 303s to
 # /ui/reauth and GET-redirects back to the browse page. The PHI-shaped filter now travels in the POST
@@ -588,7 +588,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             criteria = UploadedMessageSearchRequest(
                 content=form.get("content") or None,
                 field_path=form.get("field_path") or None,
-                field_value=form.get("field_value") or None,
+                field_value=posted_field_value(form),
                 message_type=form.get("message_type") or None,
                 control_id=form.get("control_id") or None,
                 limit=200,  # the form carries no page-size control; same default the GET declares
