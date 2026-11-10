@@ -3608,7 +3608,8 @@ class Engine:
             fingerprint=fingerprint,
             config_version=config_version,
             restart_required=restart_required,
-            env_values=dict(env_values),
+            # Not copied again: the runner already holds its own copy of these.
+            env_values=env_values,
         )
 
     def _resolve_reload_target(self, config_dir: str | Path | None) -> Path:

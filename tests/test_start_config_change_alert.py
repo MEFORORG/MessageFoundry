@@ -1718,8 +1718,8 @@ async def test_a_convergence_inside_the_start_records_its_loosenings_as_unknown(
     tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
 ) -> None:
     """vault BACKLOG #3814: a convergence reload that runs inside engine.start() comes before the
-    settings the loosenings reader needs are stashed, so a list read then could leave the
-    settings-scoped loosenings out. It is recorded as unknown, ``None``."""
+    lifespan stashes the settings the loosenings reader needs, so a list read then could leave
+    the settings-scoped loosenings out. It is recorded as unknown, ``None``."""
     real_start = Engine.start
 
     async def _start_then_converge(self: Engine) -> None:
@@ -1753,7 +1753,6 @@ async def test_an_applied_reload_carries_the_env_values_it_swapped_in(
         live = dict(rr.env_values)
         dry = await engine.reload_detail(None, dry_run=True, propagate=False)
     assert outcome.env_values is not None and dict(outcome.env_values) == live
-    assert outcome.env_values is not rr.env_values, "a copy, not the runner's own dict"
     assert dry.env_values is None
     assert "env_values" not in repr(outcome)
 

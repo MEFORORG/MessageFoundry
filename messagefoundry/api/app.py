@@ -2226,9 +2226,8 @@ class _LoadedConfig:
     registry: Registry | None
     #: The ``env()`` values ``registry`` resolves against, taken with it, so the start row's
     #: loosenings resolve a DATABASE hop's ``env()`` dialect as ``GET /security/posture`` does.
-    #: A reload's are the values it swapped in (vault BACKLOG #3814). ``None`` when the snapshot
-    #: did not take them. They include secret values, so they are kept out of the repr and of
-    #: equality.
+    #: ``None`` when the snapshot did not take them, as a reload's row does not. They include
+    #: secret values, so they are kept out of the repr and of equality.
     env_values: Mapping[str, Any] | None = field(default=None, repr=False, compare=False)
 
     @classmethod
@@ -2266,7 +2265,7 @@ class _LoadedConfig:
     def of(cls, outcome: ReloadOutcome) -> _LoadedConfig:
         """What an applied reload itself loaded, read off its own outcome (vault BACKLOG #2257), so
         the row names that reload's graph whatever the engine runs by the time it is written."""
-        return cls._of(outcome.directory, outcome.registry, outcome.fingerprint, outcome.env_values)
+        return cls._of(outcome.directory, outcome.registry, outcome.fingerprint)
 
     def swapped(self, engine: Engine) -> bool:
         """Whether the engine's graph is no longer the one this snapshot read: a reload has
@@ -3399,10 +3398,10 @@ async def _graph_loosenings(
             service_env=await asyncio.to_thread(service_env_posture),
             security=_posture_security(state),
         )
+        return [name for name, _risk in pairs]
     except Exception:  # noqa: BLE001 - a live graph's audit row must not fail on its list
         _log.exception("the loosenings list could not be read; %s records None", action)
         return None
-    return [name for name, _risk in pairs]
 
 
 async def _record_start_audit(
@@ -12438,13 +12437,12 @@ def create_managed_app(
                 "config_fingerprint" in failed or digest_coverage(outcome.fingerprint) is None
             )
 
-            # The row names the digest judged above, not the engine's at the write: a later
-            # reload marks it superseded instead (vault BACKLOG #3765, item 19).
             # The loosenings of the graph this reload loaded, read against the env() values it
             # swapped in, as a start row records its own (vault BACKLOG #3814). Read inside the
             # row's write, so a cancel waits for the row as it does for the write. A convergence
-            # inside engine.start() can run before the settings the reader needs are stashed; its
-            # list would leave settings-scoped loosenings out, so it is recorded as unknown.
+            # before the lifespan has stashed the settings the reader needs, at least one inside
+            # engine.start(), would leave settings-scoped loosenings out, so it is recorded as
+            # unknown.
             async def _loosenings() -> list[str] | None:
                 if not posture_stashed:
                     return None
@@ -12452,6 +12450,8 @@ def create_managed_app(
                     app.state, engine, outcome.registry, outcome.env_values, "config_reload"
                 )
 
+            # The row names the digest judged above, not the engine's at the write: a later
+            # reload marks it superseded instead (vault BACKLOG #3765, item 19).
             await _record_reload_audit(
                 engine,
                 actor=_CONVERGENCE_ACTOR,

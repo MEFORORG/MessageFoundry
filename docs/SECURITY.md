@@ -7178,9 +7178,10 @@ read that for the current posture. A cluster convergence reload's `config_reload
 `system:cluster-convergence`, carries a `loosenings` key read off the graph that reload loaded,
 as a start's row does, and the detector does not read it either (vault BACKLOG #3814). The key is
 `null`, which says unknown, at least when the list could not be read and when the reload ran
-inside the start before the settings it reads were in place. A convergence whose row is lost
-writes no list at all. An operator reload's row has no such key, so until a later start's row
-lists them, no row names the loosenings an operator reload brings in.
+before the start had put in place the settings it reads, as one inside the start's own
+convergence does. A convergence whose row is lost writes no list at all. An operator reload's row
+has no such key. So on a single node, no row names the loosenings an operator reload brings in
+until a later start's row lists them; on a cluster, the other nodes' convergence rows can.
 
 **`posture_loosened` may not name a given switch, the layer's own included.** Its sentence gives the
 count of every loosening, then their names, cut at 200 characters and ending in `...`. The
