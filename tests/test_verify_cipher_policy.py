@@ -1652,48 +1652,85 @@ def test_a_missing_driver_with_no_configured_hop_skips(monkeypatch: pytest.Monke
     _odbc_drivers(monkeypatch, "SQL Server")
     r = checks.check_sqlserver_odbc_driver(lambda: checks.OdbcHops(judged="the graph in 'cfg'"))
     assert (r.id, r.status) == ("host.odbc", Status.SKIP)
-    assert "no hop naming ODBC Driver 18 in the graph in 'cfg'" in r.detail
-    assert "reads FAIL" in r.detail and "not found" in r.detail
+    assert "no hop naming a SQL Server driver in the graph in 'cfg'" in r.detail
+    assert "not found" in r.detail
+
+
+_STORE_HOP = ("the [store] backend is sqlserver", _DRIVER_18)
+_DRIVER_17 = "ODBC Driver 17 for SQL Server"
+
+
+def _needing(*needs: tuple[str, str], unknown: str | None = None) -> checks.OdbcHops:
+    return checks.OdbcHops(
+        found=tuple(label for label, _ in needs), unknown=unknown, needs=tuple(needs)
+    )
 
 
 @pytest.mark.parametrize(
     ("drivers", "hops", "expect"),
     [
-        (("SQL Server",), _A_HOP, Status.FAIL),
+        # A hop's registered driver missing FAILs, Driver 18 or another (code review round 5,
+        # finding 2): a Driver 17 hop on a host with Driver 18 alone read SKIP at 08cba626b1.
+        (("SQL Server",), _needing(_STORE_HOP), Status.FAIL),
+        ((_DRIVER_18,), _needing(("DATABASE connection OB_X", _DRIVER_17)), Status.FAIL),
+        ((_DRIVER_18, _DRIVER_17), _needing(("DATABASE connection OB_X", _DRIVER_17)), Status.PASS),
+        # pyodbc's list is read in any case, as the driver managers look a name up.
+        ((_DRIVER_17.upper(),), _needing(("DATABASE connection OB_X", _DRIVER_17)), Status.PASS),
+        # An unreadable driver list is ERROR on any ODBC hop, not only one naming Driver 18
+        # (finding 1): a PostgreSQL hop read SKIP at 08cba626b1.
         ((RuntimeError("no driver manager"),), _A_HOP, Status.ERROR),
-        (("SQL Server",), checks.OdbcHops(unknown="no config dir"), Status.MANUAL),
+        (
+            (RuntimeError("no driver manager"),),
+            checks.OdbcHops(found=("DATABASE connection OB_PG",)),
+            Status.ERROR,
+        ),
         ((RuntimeError("no driver manager"),), checks.OdbcHops(unknown="x"), Status.MANUAL),
         ((RuntimeError("no driver manager"),), checks.OdbcHops(), Status.SKIP),
+        # Part of the configuration unread: MANUAL unless Driver 18 is listed.
+        (("SQL Server",), checks.OdbcHops(unknown="no config dir"), Status.MANUAL),
+        ((_DRIVER_18,), checks.OdbcHops(unknown="no config dir"), Status.PASS),
+        # A hop on another vendor's driver only: nothing for this row to check.
+        (("SQL Server",), checks.OdbcHops(found=("DATABASE connection OB_PG",)), Status.SKIP),
     ],
 )
-def test_a_failing_driver_reading_counts_as_the_hops_make_it(
+def test_each_hops_driver_is_checked(
     monkeypatch: pytest.MonkeyPatch,
     drivers: tuple[str | Exception, ...],
     hops: checks.OdbcHops,
     expect: Status,
 ) -> None:
-    """A configured hop keeps FAIL and ERROR and names the hop; a configuration that could not be
-    read is MANUAL with the reading in the detail, never a PASS."""
     _odbc_drivers(monkeypatch, *drivers)
     r = checks.check_sqlserver_odbc_driver(lambda: hops)
-    assert r.status is expect
-    if hops.found:
-        assert r.evidence.startswith("ODBC hops: the [store] backend is sqlserver")
+    assert r.status is expect, r.detail
+    if expect is Status.FAIL:
+        label, name = hops.needs[0]
+        assert f"{label} needs {name!r}" in r.detail
+    if expect is Status.ERROR:
+        assert r.evidence.startswith("ODBC hops: ") and "no driver manager" in r.detail
     if expect is Status.MANUAL:
-        assert f"({hops.unknown})" in r.detail and "the driver reads" in r.detail
+        assert f"({hops.unknown})" in r.detail or f"not read: {hops.unknown}" in r.detail
 
 
-def test_a_present_driver_passes_without_the_census(monkeypatch: pytest.MonkeyPatch) -> None:
-    def must_not_run() -> checks.OdbcHops:
-        raise AssertionError("the census ran for a driver that is there")
-
-    _odbc_drivers(monkeypatch, "SQL Server", _DRIVER_18)
-    assert checks.check_sqlserver_odbc_driver(must_not_run).status is Status.PASS
+def test_a_driver_library_path_is_judged_by_the_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A hop naming the driver library by a path is judged by whether the file is there, since the
+    driver manager loads it from the path, not from pyodbc's list (code review round 5, finding 4:
+    it read MANUAL in a fully read configuration at 08cba626b1)."""
+    library = tmp_path / "libmsodbcsql-18.3.so.3.1"
+    _odbc_drivers(monkeypatch, "SQL Server")
+    hops = checks.OdbcHops(
+        found=("DatabaseLookup LK",), paths=(("DatabaseLookup LK", str(library)),)
+    )
+    missing = checks.check_sqlserver_odbc_driver(lambda: hops)
+    assert missing.status is Status.FAIL and "which is not a file" in missing.detail
+    library.write_bytes(b"")
+    assert checks.check_sqlserver_odbc_driver(lambda: hops).status is Status.PASS
 
 
 def test_each_row_reads_its_own_census(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """``host.odbc`` asks which hops name Driver 18, ``host.ciphers`` which take the host policy,
-    and ``run_host_checks`` hands each row its own answer."""
+    """``host.odbc`` reads every hop with its driver, ``host.ciphers`` the hops that take the host
+    policy, and ``run_host_checks`` hands each row its own answer."""
     _odbc_drivers(monkeypatch, "SQL Server")
     _with_pyodbc(monkeypatch, Status.FAIL)
     monkeypatch.setattr(sys, "platform", "linux")
@@ -1701,7 +1738,7 @@ def test_each_row_reads_its_own_census(monkeypatch: pytest.MonkeyPatch, tmp_path
         ports={},
         writable_dir=tmp_path,
         odbc_hops=lambda: _A_HOP,
-        driver_18_hops=lambda: checks.OdbcHops(judged="the graph"),
+        driver_hops=lambda: checks.OdbcHops(judged="the graph"),
     )
     rows = {r.id: r for r in results}
     assert (rows["host.odbc"].status, rows["host.ciphers"].status) == (Status.SKIP, Status.FAIL)
@@ -1765,7 +1802,7 @@ def test_a_failed_shared_load_is_read_once_by_both(
     )
     rows = {r.id: r for r in results}
     assert rows["host.odbc"].status is Status.MANUAL and "bad graph" in rows["host.odbc"].detail
-    assert "whether a hop here needs ODBC Driver 18 is not known" in rows["host.odbc"].detail
+    assert "not read: the config dir" in rows["host.odbc"].detail
     assert rows["smoke.self"].status is Status.FAIL
     assert "config failed to load" in rows["smoke.self"].detail
     assert len(loads) == 1
@@ -1809,38 +1846,40 @@ def test_the_wiring_reader_names_each_odbc_entry_and_its_driver() -> None:
 @pytest.mark.parametrize(
     ("dialect", "driver", "ciphers", "odbc"),
     [
-        # The preset's default and an explicit Driver 18: a hop for both rows.
-        (None, None, "found", "found"),
+        # The preset's default: a hop of both rows, needing Driver 18.
+        (None, None, "found", "needs"),
         # The generic dialect on Microsoft's Driver 18 (the code review's round-one finding 1).
-        ("generic", "ODBC Driver 18 for SQL Server", "found", "found"),
-        # Another Microsoft driver takes the host policy, but needs no Driver 18 (finding 2).
-        (None, "ODBC Driver 17 for SQL Server", "found", "none"),
-        # Another vendor's driver needs no Driver 18 (finding 7); its own TLS is not read.
-        ("generic", "PostgreSQL Unicode", "unknown", "none"),
+        ("generic", "ODBC Driver 18 for SQL Server", "found", "needs"),
+        # Another Microsoft driver takes the host policy, and host.odbc checks that driver
+        # (code review round 5, finding 2).
+        (None, "ODBC Driver 17 for SQL Server", "found", "needs"),
+        # Another vendor's driver is an ODBC hop, with no SQL Server driver to check; its own TLS is
+        # not read.
+        ("generic", "PostgreSQL Unicode", "unknown", "other"),
         # The preset builds only on a Microsoft driver, so an env() driver there still takes the
-        # host policy (round two, finding 1); whether it names Driver 18 is not known.
+        # host policy (round two, finding 1); which driver it needs is not known.
         (None, "env", "found", "unknown"),
         # A preset entry on another vendor's driver is refused at build, so nothing dials it and it
         # is no hop of either row (code review round 3, finding 2).
         (None, "PostgreSQL Unicode", "none", "none"),
-        # The Driver 18 library named by its path: a Microsoft hop, but pyodbc lists registered
-        # names, not paths, so whether the row's reading applies is not known (round 3, finding 1).
-        (None, "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.3.so.3.1", "found", "unknown"),
-        (None, r"C:\Windows\System32\msodbcsql18.dll", "found", "unknown"),
-        # Another version's library needs no Driver 18.
-        (None, "/opt/microsoft/msodbcsql17/lib64/libmsodbcsql-17.10.so.6.1", "found", "none"),
+        # The library named by its path: judged by the file, not pyodbc's list (round 5, finding 4).
+        (None, "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.3.so.3.1", "found", "path"),
+        (None, r"C:\Windows\System32\msodbcsql18.dll", "found", "path"),
+        (None, "/opt/microsoft/msodbcsql17/lib64/libmsodbcsql-17.10.so.6.1", "found", "path"),
+        # A bare library file name is searched for by the loader, so it is not judged here.
+        (None, "msodbcsql18.dll", "found", "unknown"),
         # The preset sends the name as written and refuses a padded one at build, so it is no hop.
         (None, " ODBC Driver 18 for SQL Server ", "none", "none"),
-        # An env() dialect naming the Driver 18 library by path can only be on the preset, which
-        # alone takes a path (code review round 4, finding 2).
-        ("env", "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.3.so.3.1", "found", "unknown"),
+        # An env() dialect naming the library by path can only be on the preset, which alone takes
+        # a path (code review round 4, finding 2).
+        ("env", "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.3.so.3.1", "found", "path"),
         # A dialect the build refuses is no hop (round 4, finding 5).
         ("mssql", None, "none", "none"),
         # A driver every arm the entry can take refuses is no hop (round 4, finding 6).
         ("env", "FreeTDS", "none", "none"),
         ("generic", "FreeTDS", "none", "none"),
         # An env() dialect on another vendor's allowed driver may be generic, with its own TLS.
-        ("env", "PostgreSQL Unicode", "unknown", "none"),
+        ("env", "PostgreSQL Unicode", "unknown", "other"),
     ],
 )
 def test_each_row_counts_the_hops_its_driver_question_reaches(
@@ -1865,9 +1904,41 @@ def test_each_row_counts_the_hops_its_driver_question_reaches(
     def outcome(hops: checks.OdbcHops) -> str:
         return "found" if hops.found else "unknown" if hops.unknown else "none"
 
+    def needed(hops: checks.OdbcHops) -> str:
+        if hops.unknown:
+            return "unknown"
+        return (
+            "path" if hops.paths else "needs" if hops.needs else "other" if hops.found else "none"
+        )
+
     settings = ServiceSettings()
     assert outcome(_hops(tmp_path, settings=settings)) == ciphers
-    assert outcome(_hops(tmp_path, settings=settings, driver_18=True)) == odbc
+    hops = _hops(tmp_path, settings=settings, drivers=True)
+    assert needed(hops) == odbc
+    if odbc == "needs":
+        assert hops.needs == (("DATABASE connection OB_X", (driver or _DRIVER_18).strip()),)
+    if odbc == "path":
+        assert hops.paths == (("DATABASE connection OB_X", driver),)
+
+
+def test_the_driver_census_reads_the_graph_beside_a_sql_server_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The store names Driver 18, and host.odbc still reads the graph's hops for their own
+    drivers, where host.ciphers stops at the first hop."""
+    from types import SimpleNamespace
+
+    from messagefoundry.config.settings import StoreBackend
+
+    monkeypatch.chdir(tmp_path)
+    _registry_with(monkeypatch, outbound={"OB_X": _database("OB_X", driver=_DRIVER_17)})
+    settings = SimpleNamespace(store=SimpleNamespace(backend=StoreBackend.SQLSERVER))
+    hops = _hops(tmp_path, settings=settings, drivers=True)
+    assert hops.needs == (
+        ("the [store] backend is sqlserver", _DRIVER_18),
+        ("DATABASE connection OB_X", _DRIVER_17),
+    )
+    assert hops.unknown is None
 
 
 def _host_ciphers_row(results: list[CheckResult]) -> CheckResult:
@@ -1972,12 +2043,14 @@ def _hops(
     *,
     settings: Any = None,
     service_config: str | None = "service.toml",
-    driver_18: bool = False,
+    drivers: bool = False,
 ) -> checks.OdbcHops:
-    from messagefoundry.verify.runner import _Graph, _odbc_hops
+    """The ``host.ciphers`` census, or with ``drivers`` the ``host.odbc`` one."""
+    from messagefoundry.verify.runner import _driver_hops, _Graph, _odbc_hops
 
     graph = _Graph(str(config_dir))
-    return _odbc_hops(settings, service_config, str(config_dir), graph, driver_18=driver_18)
+    census = _driver_hops if drivers else _odbc_hops
+    return census(settings, service_config, str(config_dir), graph)
 
 
 def _database(name: str, dialect: Any = None, *, deployed: bool = True, driver: Any = None) -> Any:
@@ -2159,7 +2232,7 @@ def test_host_section_carries_the_row(monkeypatch: pytest.MonkeyPatch, tmp_path:
         ports={"MLLP": 2575},
         writable_dir=tmp_path,
         odbc_hops=checks.OdbcHops,
-        driver_18_hops=checks.OdbcHops,
+        driver_hops=checks.OdbcHops,
     )
     assert "host.ciphers" in {r.id for r in results}
 

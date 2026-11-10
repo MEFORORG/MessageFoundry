@@ -48,7 +48,7 @@ def test_run_host_checks_never_errors(tmp_path: Path) -> None:
         ports={"MLLP": 2575},
         writable_dir=tmp_path,
         odbc_hops=checks.OdbcHops,
-        driver_18_hops=checks.OdbcHops,
+        driver_hops=checks.OdbcHops,
     )
     assert results, "no host checks produced"
     for r in results:
@@ -189,7 +189,7 @@ def test_host_console_row_is_gone(tmp_path: Path) -> None:
         ports={"MLLP": 2575},
         writable_dir=tmp_path,
         odbc_hops=checks.OdbcHops,
-        driver_18_hops=checks.OdbcHops,
+        driver_hops=checks.OdbcHops,
     )
     assert "host.console" not in {r.id for r in results}
 
