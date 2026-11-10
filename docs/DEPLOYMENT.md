@@ -931,7 +931,7 @@ does not resolve to a listed `host:port` makes the config **fail at load / reloa
 | `[egress].allowed_syslog` | the off-box log forwarder's collector (`[logging].forward_host`). Checked at start, not at config load; see [CONFIGURATION.md](CONFIGURATION.md#egress) |
 
 **The alert sinks are *not* on this table and are not covered by `[egress]`.** The webhook and SMTP
-*alert* sinks carry no PHI bodies and keep their **own** host allow-lists —
+*alert* sinks carry no message body, though some alerts carry free-text detail ([PHI.md](PHI.md#logging-inventory-1611--1623) rows 10 and 11), and keep their **own** host allow-lists —
 `[alerts].webhook_allowed_hosts` and `[alerts].smtp_allowed_hosts`. Populate those separately; an
 `[egress].allowed_http` entry does nothing for a webhook alert.
 
@@ -1166,7 +1166,7 @@ on the shipped posture.
 |---|---|
 | **SQL Server store hop** | `[store].encrypt` defaults **true** and `[store].trust_server_certificate` defaults **false** — and SQL Server is a documented production store. The PostgreSQL store hop *is* gated; its SQL Server twin is not |
 | **`dialect='sqlserver'` DATABASE destination** | `Encrypt=yes` / `TrustServerCertificate=false` defaults |
-| **`[alerts]` SMTP sink** and the **per-user security-event notifier**, **with no `email_username`** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. With no login the hop sends no credential, and an alert body carries no PHI, so it takes no revocation guard by the owner ruling of 2026-10-27, recorded in ADR 0173. With a login it is gated (above). Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead, for a hop with no login. Beside `email_username` either deviation is refused at settings load, with no escape (vault BACKLOG #3533) |
+| **`[alerts]` SMTP sink** and the **per-user security-event notifier**, **with no `email_username`** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. With no login the hop sends no credential, so it takes no revocation guard by the owner ruling of 2026-10-27, recorded in ADR 0173. That decline does not rest on the alert body being PHI-free, which it is not today: events other than `connection_error` can still send free-text detail or reason over this hop, and [PHI.md](PHI.md#logging-inventory-1611--1623) rows 10 and 11 say what a body carries. The owner has ruled that the fix is one key allowlist every off-box alert passes through, which is not built yet. With a login it is gated (above). Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead, for a hop with no login. Beside `email_username` either deviation is refused at settings load, with no escape (vault BACKLOG #3533) |
 
 For every hop in that table, revocation is exactly what the ASVS row above calls *delegated* — **your
 PKI's or your egress proxy's job, written into your runbook**. The engine will not make you say so, and

@@ -5247,8 +5247,9 @@ class EgressSettings(_Section):
     is empty refuses every destination of that type; once a transport's list is set, a destination of
     that transport not on it is **refused at config load/reload** (fail-closed), checked against the
     resolved (``env()``-substituted) destination. With ``deny_by_default`` off, each list is opt-in and
-    an empty one is unrestricted. The webhook/SMTP *alert* sinks carry no PHI bodies and keep
-    their own ``[alerts]`` host allowlists.
+    an empty one is unrestricted. The webhook/SMTP *alert* sinks keep their own ``[alerts]`` host
+    allowlists. They send no message body, but some alerts carry free-text detail (docs/PHI.md
+    rows 10 and 11).
 
     The comment on ``deny_by_default`` says what else it covers and how operators set it.
     """

@@ -570,7 +570,11 @@ def _refuse_alert_smtp_revocation(
     guards that hop, with ``[tls].crl_file`` or the ``[alerts]`` attestation pair as the levers.
 
     **A hop with no login takes no guard**, by the same ruling, recorded in ADR 0173: it carries no
-    credential, and an alert body carries no PHI. A hop with ``use_tls`` or ``tls_verify`` off
+    credential. The decline does not rest on the alert body being PHI-free, which it is not today:
+    events other than ``connection_error`` can still send free-text detail or reason over this hop,
+    and docs/PHI.md rows 10 and 11 are the one place that says what a body carries. The owner has
+    ruled that the fix is to route every off-box alert through one key allowlist, which is not built
+    yet; the decline stands either way. A hop with ``use_tls`` or ``tls_verify`` off
     builds no verifying context, and a login over one is refused at load and again at each send,
     so there is nothing for this guard to judge.
 
