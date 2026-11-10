@@ -42,7 +42,9 @@ monitor's own clock is resolved, bounded by the count it saw. A live paused proc
 reminder every :data:`REALERT_SECONDS`, which moves the count, so its alert stays open while those
 writes land. A paused process cut off from the store cannot remind, so another process's sweep
 expires its alert while it is still paused; its first reminder that lands again opens a new
-instance. Nothing sweeps on a store only one process uses. No clock is compared across processes.
+instance. No monitor expires its own subjects, so a lone process sweeps only the subjects other
+labels left behind, and a pause of its own whose clear did not land stays open for an operator. No
+clock is compared across processes.
 """
 
 from __future__ import annotations

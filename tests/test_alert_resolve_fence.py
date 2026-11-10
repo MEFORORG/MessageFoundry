@@ -312,3 +312,102 @@ async def test_a_clear_nobody_settles_pays_for_no_re_read(tmp_path: Path) -> Non
         assert view_a.calls.get(_FENCED) == 1
     finally:
         await store.close()
+
+
+async def test_a_superseded_clear_gives_back_the_suspend_and_occurrence_count(
+    tmp_path: Path,
+) -> None:
+    """Round-3 item 1: an inverse drops the key's suspend window and occurrence count as it is
+    emitted. A superseded resolve leaves the row open, so both go back, and a later raise is still
+    muted by the operator's suspend and counts on from where it was."""
+    from tests.test_alert_sinks import _RecordingTransport
+
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        view_a = _Gated(store)
+        sent = _RecordingTransport("rec")
+        a = NotifierAlertSink([sent], store=view_a)
+        b = NotifierAlertSink([], store=store)
+        a.start()
+        key = f"intake_paused:{KEY}"
+        _raise(a)
+        _raise(a)
+        await _drain(a)
+        a._suspended[key] = time.time() + 3600.0  # an operator's suspend, as the API route sets it
+        gate = view_a.gate(_FENCED)
+        _clear(a)
+        assert key not in a._suspended, "the clear drops the suspend as it is emitted"
+        await view_a.wait_returned("open_alert_generations")
+        _raise(b)
+        await _drain(b)
+        gate.set()
+        await _drain(a)
+        assert key in a._suspended, "the superseded clear gave the suspend back"
+        assert a._occurrences[key] == 2, "and the occurrence count"
+        await asyncio.sleep(0.05)
+        before = len(sent.events)
+        _raise(a)
+        await _drain(a)
+        await asyncio.sleep(0.05)
+        assert len(sent.events) == before, "the operator's suspend still mutes the next raise"
+        assert a._occurrences[key] == 3, "the escalation count goes on from where it was"
+        await a.aclose()
+    finally:
+        await store.close()
+
+
+async def test_a_clear_that_closes_the_row_keeps_the_suspend_dropped(tmp_path: Path) -> None:
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        a = NotifierAlertSink([], store=store)
+        key = f"intake_paused:{KEY}"
+        _raise(a)
+        await _drain(a)
+        a._suspended[key] = time.time() + 3600.0
+        _clear(a)
+        await _drain(a)
+        assert await _live(store) == []
+        assert key not in a._suspended and key not in a._occurrences
+        assert key not in a._pending_clears
+    finally:
+        await store.close()
+
+
+async def test_a_failed_verdict_re_read_is_not_retried_and_logs_no_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round-3 item 3: the fenced UPDATE has committed when the re-read runs, so a fault there is
+    not a failed resolve: no retry, no "gave up" ERROR, and the cleared state is kept."""
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        reads = 0
+
+        class _ReReadFails(_Gated):
+            def __getattr__(self, name: str) -> Any:
+                if name == "open_alert_generations":
+
+                    async def read(**kw: Any) -> Any:
+                        nonlocal reads
+                        reads += 1
+                        if reads > 1:
+                            raise RuntimeError("store unavailable")
+                        return await store.open_alert_generations(**kw)
+
+                    return read
+                return super().__getattr__(name)
+
+        view_a = _ReReadFails(store)
+        a = NotifierAlertSink([], store=view_a)
+        settled: list[bool] = []
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.alert_sinks"):
+            a._record_state(
+                {"type": "intake_resumed", "connection": KEY}, "info", on_settled=settled.append
+            )
+            await _drain(a)
+        assert reads == 2
+        assert view_a.calls[_FENCED] == 1, "not retried"
+        assert settled == [False], "not knowing, the clear is kept as not landed"
+        assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+        assert any("re-read failed" in r.getMessage() for r in caplog.records)
+    finally:
+        await store.close()

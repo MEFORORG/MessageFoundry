@@ -388,5 +388,8 @@ from another process in that gap is still closed, as before the fence.
 No clock is compared: the `last_seen <= now` guard the PR for #3756 declined (decision
 d20261030T211551515-1de84e) would leave an alert open for good under cross-node clock skew. A
 resolve that closes nothing while a live instance remains was superseded: it is settled as not
-landed, so `connection_started`'s in-memory clear goes back, and it is not retried. A store without
-the fence methods, or a failed read, resolves unfenced, as before.
+landed, and it is not retried. What the clear dropped from memory as it was emitted goes back: the
+key's suspend window and occurrence count for every inverse, and `connection_started`'s cooldown
+too, so a later raise of the still-open row stays muted and keeps its escalation tier. A fault in
+the re-read that tells superseded apart is treated as superseded, with no retry. A store without
+the fence methods, or a failed snapshot read, resolves unfenced, as before.

@@ -259,20 +259,33 @@ class _ResolveFence:
             seen=seen[0] if seen else None,
             now=now,
         )
-        if (
-            not closed
-            and self._verdict
-            and await self._store.open_alert_generations(
-                event_type=self._event_type, connection=self._connection
-            )
-        ):
-            self.superseded = True
-            log.info(
-                "alert-instance resolve for %s %r closed nothing: another process raised it after "
-                "this clear, so it stays open",
-                self._event_type,
-                self._connection,
-            )
+        if not closed and self._verdict:
+            # The UPDATE has committed, so a fault here must not reach the retry loop: a retry
+            # would run the resolve again and end in a false "gave up" ERROR. Not knowing, keep
+            # what the clear dropped (superseded), which is the safe side.
+            try:
+                live = bool(
+                    await self._store.open_alert_generations(
+                        event_type=self._event_type, connection=self._connection
+                    )
+                )
+            except Exception as exc:
+                log.warning(
+                    "alert-instance resolve for %s %r closed nothing and the re-read failed (%s); "
+                    "keeping its in-memory alert state",
+                    self._event_type,
+                    self._connection,
+                    type(exc).__name__,
+                )
+                live = True
+            if live:
+                self.superseded = True
+                log.info(
+                    "alert-instance resolve for %s %r closed nothing: another process raised it "
+                    "after this clear, so it stays open",
+                    self._event_type,
+                    self._connection,
+                )
         return closed
 
 
@@ -2212,8 +2225,20 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # suspend cache entry AND the escalation occurrence counter for the resolved key, so a later
             # re-open of the SAME key starts un-suspended at the base tier (the durable suspended_until /
             # escalation_tier were on the now-resolved row and never return via list_active).
-            self._suspended.pop(key, None)
-            self._occurrences.pop(key, None)
+            # BACKLOG #4916: the drop is provisional, as connection_started's is (BACKLOG #1741). A
+            # fenced resolve can leave the row open on purpose, so what it dropped goes back if it
+            # does not land (_resolve_settled). connection_started passes its own on_settled and
+            # has already taken both entries, so nothing is queued for it here.
+            suspended = self._suspended.pop(key, None)
+            occurrences = self._occurrences.pop(key, None)
+            if on_settled is None and (suspended is not None or occurrences is not None):
+                cleared = _ClearedState(None, occurrences, suspended)
+                self._pending_clears.setdefault(key, []).append(cleared)
+
+                def settle_cleared(landed: bool) -> None:
+                    self._resolve_settled(key, cleared, landed=landed)
+
+                on_settled = settle_cleared
 
             # Only a settle callback reads the superseded verdict, so only then is it paid for.
             fence = (

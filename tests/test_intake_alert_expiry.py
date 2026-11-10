@@ -400,3 +400,38 @@ async def test_a_check_that_keeps_raising_logs_once_per_streak(
         assert sum("intake bound check raised" in r.getMessage() for r in caplog.records) == 1
     finally:
         await store.close()
+
+
+async def test_a_cancel_passed_on_by_the_monitor_still_lets_the_engine_close_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 item 4: the monitor's stop passes a caller's cancel on. Engine.stop holds it until
+    the alert-state drain and the store close have run, then raises it."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.engine import Engine
+
+    engine = await Engine.create(
+        tmp_path / "engine.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
+    await engine.start()
+    assert engine._intake_monitor is not None
+    real_monitor: IntakeBoundMonitor = engine._intake_monitor
+
+    class _CancelledStop:
+        async def stop(self) -> None:
+            await real_monitor.stop()
+            raise asyncio.CancelledError
+
+    engine._intake_monitor = cast(IntakeBoundMonitor, _CancelledStop())
+    closed: list[bool] = []
+    real_close = engine.store.close
+
+    async def close() -> None:
+        closed.append(True)
+        await real_close()
+
+    monkeypatch.setattr(engine.store, "close", close)
+    with pytest.raises(asyncio.CancelledError):
+        await engine.stop()
+    assert closed == [True], "the store closed before the cancel went on"
+    assert engine._intake_monitor is None

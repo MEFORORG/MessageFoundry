@@ -3926,9 +3926,15 @@ class Engine:
             await self._registry_runner.stop()
         # After the graph, so the listeners are already closed when the monitor opens the gate on its
         # way out; stopping it first would let a paused listener read again during shutdown.
+        monitor_cancelled = False
         if self._intake_monitor is not None:
-            await self._intake_monitor.stop()
-            self._intake_monitor = None
+            monitor, self._intake_monitor = self._intake_monitor, None
+            try:
+                await monitor.stop()
+            except asyncio.CancelledError:
+                # The monitor passes a cancel of this stop on once its gate is open (BACKLOG
+                # #3269). Finish the teardown below first, so the store still drains and closes.
+                monitor_cancelled = True
         # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that is
         # still serving has gone, and ahead of the alert-state drain, which gives its write a chance.
         if self.on_graph_stopped is not None:
@@ -3982,3 +3988,5 @@ class Engine:
         if drain is not None:
             await drain(_ALERT_STATE_DRAIN_SECONDS)
         await self.store.close()
+        if monitor_cancelled:
+            raise asyncio.CancelledError
