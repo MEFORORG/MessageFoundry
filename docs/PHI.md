@@ -2450,7 +2450,9 @@ delimiters, `\H\` and `\N\` become `_`, and a hex escape `\Xhh\` becomes the cha
 each pair's code. A sequence the parser cannot map, an empty one included, decodes to nothing, so
 `123\Q\-45-6789` reads as the SSN a receiver would see. One difference: a formatting command
 that writes a line break or spaces, such as `\.br\`, decodes to one space, so two runs of digits
-never join. An escape character that no second one closes is kept as written. At least these
+never join. An escape character that no second one closes is kept as written. Decoding only adds
+hits: a value the check refuses as written is still refused, so an MRN-typed identifier whose id
+is an unmappable sequence such as `\Z98765\`, which decodes to nothing, is refused. At least these
 still pass:
 
 - A subcomponent is decoded on its own, as the engine's parser decodes it, so a shape whose parts

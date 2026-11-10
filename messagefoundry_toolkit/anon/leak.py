@@ -581,17 +581,26 @@ def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]
 def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
     """True if any repetition of ``value`` is a CX with a non-empty id (component 1) and a whole
     ``MR``/``MRN`` id-type component — an unmapped medical-record number by HL7 structure, far more
-    precise than a bare digit-run heuristic. Each component is compared decoded, which for one
-    with no escape character is the component as written, so an id type written with an escape
-    sequence, such as ``M\\X52\\``, counts (BACKLOG #5532)."""
+    precise than a bare digit-run heuristic. A fail-closed detector refuses on either form, so
+    each id-type component counts as written or decoded a subcomponent at a time, as the engine's
+    parser decodes it: an id type written ``M\\X52\\`` counts (BACKLOG #5532). The id counts when
+    it is non-empty as written, so one that decodes to nothing, such as ``\\Z98765\\``, counts."""
     for rep in value.split(seps.repetition):
         comps = rep.split(seps.component)
-        # A component with no escape character comes back from unescape as it was.
-        if unescape(comps[0], seps, field_sep) and any(
-            unescape(comp, seps, field_sep).upper() in _MRN_TYPES for comp in comps
-        ):
+        if comps[0] and any(_is_mrn_type(comp, seps, field_sep) for comp in comps):
             return True
     return False
+
+
+def _is_mrn_type(comp: str, seps: Seps, field_sep: str) -> bool:
+    """True if ``comp`` is a whole ``MR``/``MRN`` id type as written, or decoded a subcomponent at
+    a time with the subcomponent separators kept."""
+    if comp.upper() in _MRN_TYPES:
+        return True
+    if not seps.escape or seps.escape not in comp:
+        return False
+    leaves = (unescape(leaf, seps, field_sep) for leaf in comp.split(seps.subcomponent))
+    return seps.subcomponent.join(leaves).upper() in _MRN_TYPES
 
 
 def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:

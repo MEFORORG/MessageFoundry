@@ -247,6 +247,37 @@ def test_an_unclosed_escape_does_not_pair_across_a_separator(leak: ModuleType) -
 
 
 @_LEAKS
-def test_an_id_that_decodes_to_nothing_is_no_mrn(leak: ModuleType) -> None:
-    assert _hits(leak, "\\.fi\\^^^H^MR") == []
-    assert _hits(leak, "1^^^H^MR")  # the control
+@pytest.mark.parametrize(
+    "value",
+    [
+        "\\Z98765\\^^^H^MR",  # an unmappable sequence as the whole id
+        "\\.fi\\^^^H^MR",  # a fill command, which writes nothing
+        "\\Z9&8\\^^^H^MR",  # one sequence across a subcomponent separator, unclosed in each leaf
+        "\\Z9\\&\\Q8\\^^^H^M\\X52\\",  # two leaves that each decode to nothing, id type escaped
+        "1^^^H^MR",  # the control, written plainly
+    ],
+    ids=["unmappable-id", "fill-command-id", "across-subcomponents", "two-empty-leaves", "plain"],
+)
+def test_an_id_written_non_empty_is_an_mrn_however_it_decodes(leak: ModuleType, value: str) -> None:
+    """A fail-closed detector refuses on the value as written or decoded. Decoding turns the id
+    here into nothing, but it is a value in the field as written, and the check refused it before
+    it decoded anything, so it still does."""
+    hits = _hits(leak, value)
+    assert any("MRN" in hit and "ZPD-4" in hit for hit in hits), hits
+
+
+@_LEAKS
+@pytest.mark.parametrize(
+    "value",
+    [
+        "98765^^^H^M\\X52&\\",  # each leaf unclosed, as the engine reads it: no MR
+        "98765^^^H^MR&X",  # a subcomponent after MR, as written: not a whole MR component
+        "^^^H^M\\X52\\",  # no id
+    ],
+    ids=["unclosed-in-each-leaf", "mr-with-subcomponent", "no-id"],
+)
+def test_the_id_type_decodes_a_subcomponent_at_a_time(leak: ModuleType, value: str) -> None:
+    """The id type is read as the engine's parser reads it, each subcomponent on its own, so an
+    escape that would pair only across the subcomponent separator decodes nothing, and the false
+    positive budget holds."""
+    assert _hits(leak, value) == []
