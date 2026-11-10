@@ -6380,9 +6380,11 @@ class ClusterSettings(_Section):
     # take over until the lease it just re-extended expires again.
     #
     # SCOPE, stated because a control that claims more than it covers is worse than none: on POSTGRES
-    # it bounds every maintenance-loop statement with its borrow (BACKLOG #2523); on SQL SERVER only
-    # the claim/renew, as SqlServerStore._fetchone_clamped describes, and a value under 1 s is refused
-    # there (ServiceSettings._sqlserver_renew_clamp_whole_seconds).
+    # it bounds every maintenance-loop statement with its borrow (BACKLOG #2523); on SQL SERVER the
+    # heartbeat, the claim/renew, the config-version refresh and a stepdown's release (BACKLOG #5064),
+    # and the paused tick's owner read at the smaller of this and half its own budget, at least,
+    # each borrow and statement separately, as SqlServerStore._fetchone_clamped describes, and a value
+    # under 1 s is refused there (ServiceSettings._sqlserver_renew_clamp_whole_seconds).
     #
     # UNSET (the default) means DERIVED from the detection margin, not a fixed number: half the margin,
     # capped at 5.0 s and floored at 1.0 s. The floor is a LIVENESS bound the margin cannot express --

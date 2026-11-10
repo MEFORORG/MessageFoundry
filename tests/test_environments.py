@@ -99,8 +99,9 @@ def test_resolve_env_settings_redacts_a_cast_that_raises_a_non_value_error() -> 
     # `resolve_env_settings` RAW, and an exception's own text routinely carries the value that
     # provoked it -- a KeyError's text IS the key it was given, which is the measured case below.
     # That re-opened, for every arm but ValueError/TypeError, exactly the leak BACKLOG #1183 closed.
-    # `except Exception` puts them all through the one redaction. NEVER BaseException: a
-    # KeyboardInterrupt or SystemExit is not a cast failure and must keep propagating.
+    # `except Exception` puts them all through the one redaction. A SystemExit from the cast is
+    # refused the same way (vault BACKLOG #5105, tests/test_env_cast_sys_exit.py). NEVER
+    # BaseException: a KeyboardInterrupt is not a cast failure and must keep propagating.
     secret = "pw-K3yErr_Val-88"
 
     def _table_cast(raw: object) -> int:

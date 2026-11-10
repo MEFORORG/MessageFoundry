@@ -113,6 +113,7 @@ from messagefoundry.config.wiring import (
     apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
+    read_lax_flag,
     refuse_capture_conflicts,
     refuse_resolved_verify_off,
     refuse_unresolved_hop_flags,
@@ -163,6 +164,9 @@ from messagefoundry.parsing.sniff import (
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
+from messagefoundry.pipeline.dryrun import (
+    UserCodeCalledSysExit as UserCodeCalledSysExit,  # re-exported, one definition (BACKLOG #5105)
+)
 from messagefoundry.pipeline.ingress_guards import (
     STRICT_VALIDATE_TIMEOUT_SECONDS,
     IngressBodyRejected,
@@ -285,6 +289,23 @@ is keyed by ``(Direction, name)`` rather than by the bare name."""
 
 type _LaneFault = Literal["credential", "configuration"]
 """A connection fault that STOPs an outbound lane and keeps its queue (#109, BACKLOG #2083)."""
+
+
+def _batch_member(outbox_id: str | None) -> str:
+    """The log and alert suffix that names the batch member a fault came from, by its outbox id and
+    never its content, in the refusal lines' own form, so one search finds both (vault BACKLOG
+    #5100); empty when the fault is the whole batch's."""
+    return f"; batch member {outbox_id}" if outbox_id is not None else ""
+
+
+def _member_error(error: str, outbox_id: str | None, *, lead: str = "") -> str:
+    """``error`` as a batch's stored ``last_error``, the member a fault came from named FIRST. The
+    store bounds a ``last_error`` at 200 characters and keeps the head, so a suffix after a long
+    error would be the part it cut (vault BACKLOG #5100). ``lead`` qualifies the name where the
+    member is only where the fault struck, not its cause. ``error`` alone when the fault is the
+    whole batch's."""
+    return f"{lead}batch member {outbox_id}: {error}" if outbox_id is not None else error
+
 
 type _RefusedMember = tuple[str, str, NegativeAckError]
 """A batch member its frame check or the batch re-attach refused: its outbox row id, the
@@ -1261,6 +1282,26 @@ class DrIntakeState(NamedTuple):
     parked: frozenset[str]
 
 
+class FailedLine(NamedTuple):
+    """One lane's recorded start failure (ADR 0031), the value of ``RegistryRunner._failed``.
+
+    ``reason`` is the line the lane's status and its ``connection_stopped`` alert carry.
+    ``store_fault`` says whether that line records the store stopping the lane's CA check
+    (:class:`AnchorStoreUnavailable` on the failure's explicit cause chain, :func:`_is_store_fault`)
+    rather than any other failure, a refused CA included (vault BACKLOG #5146). It lives in the
+    value, so a pop or a replace of the line can never leave the class behind it. Read it with
+    :meth:`RegistryRunner.failed_on_store_fault`."""
+
+    reason: str
+    store_fault: bool
+
+
+def _is_store_fault(exc: BaseException) -> bool:
+    """Whether ``exc`` is the store stopping a CA check, read off its explicit cause chain, never
+    off its text (vault BACKLOG #3746, #5146)."""
+    return explicit_cause(exc, AnchorStoreUnavailable) is not None
+
+
 class _IngressFields(NamedTuple):
     """The peek reads an ingress commit records, taken once (see :func:`_read_ingress_fields`)."""
 
@@ -1885,7 +1926,7 @@ class RegistryRunner:
         # success, so a retry storm emits one transition pair, not one per delivery. A partner reject
         # (NegativeAckError) is not a transport failure and never flips it.
         self._lane_healthy: dict[str, bool] = {}
-        # Connections that FAILED to build/bind at start ((kind, name) → reason). A failed connection is
+        # Connections that FAILED to build/bind at start ((kind, name) → FailedLine). A failed connection is
         # isolated, never fatal — the rest of the graph still comes up (a failed connection must not
         # crash the engine, ADR 0031). A failed OUTBOUND still gets its delivery worker, but with no
         # connector in _destinations, so rows routed to it are retried + alerted (never silently
@@ -1898,7 +1939,8 @@ class RegistryRunner:
         # reported itself healthy, while an operator restarting that outbound afterwards re-set the entry
         # and made a status reader call the healthy inbound failed. Read it through the direction-scoped
         # accessors (inbound_failed / outbound_failed), never by reaching in with a bare name.
-        self._failed: dict[tuple[Direction, str], str] = {}
+        # A FailedLine carries the reason and whether it is a store fault (vault BACKLOG #5146).
+        self._failed: dict[tuple[Direction, str], FailedLine] = {}
         # Connections SKIPPED by the DR run-profile (#61, ADR 0048): (kind, name) → reason (e.g. "DR
         # profile threshold=critical: connection tier=normal is below threshold"). Distinct from _failed
         # (ADR 0031): a filtered connection did not FAIL to build/bind — it was deliberately not started
@@ -3162,22 +3204,47 @@ class RegistryRunner:
         """The failure reason if the INBOUND of this name failed to build/bind at start, else ``None``
         (ADR 0031). A failed connection is isolated, not fatal: the engine starts the rest of the graph
         and an operator recovers it (fix the cause, then reload or restart it)."""
-        return self._failed.get(("inbound", name))
+        line = self._failed.get(("inbound", name))
+        return None if line is None else line.reason
 
     def outbound_failed(self, name: str) -> str | None:
         """The failure reason if the OUTBOUND of this name failed to build at start, else ``None``
         (ADR 0031) - the outbound half of :meth:`inbound_failed`."""
-        return self._failed.get(("outbound", name))
+        line = self._failed.get(("outbound", name))
+        return None if line is None else line.reason
+
+    def failed_on_store_fault(self, kind: Direction, name: str) -> bool:
+        """Whether the ``kind`` lane ``name`` is recorded failed and its line records the store
+        stopping its CA check (:attr:`FailedLine.store_fault`, vault BACKLOG #5146). ``False`` for
+        a lane recorded failed for any other reason, a refused CA included, and for one not
+        recorded failed."""
+        line = self._failed.get((kind, name))
+        return line is not None and line.store_fault
+
+    def _repeats_failed_class(self, kind: Direction, name: str, exc: BaseException) -> bool:
+        """Whether the ``kind`` lane ``name`` already has a failed line of ``exc``'s class: both a
+        store fault, or both not (vault BACKLOG #5146). The once-only guards stay silent on a
+        repeat, so a scheduled retry or a rule's restart does not page again. The inbound guards ask
+        this of any failure; the outbound build's guard asks it only of a :class:`TrustAnchorError`.
+        What replaces what is stated once, in docs/SECURITY.md, in the paragraph *The same store
+        fault would not read as a refused anchor*. The class is a flag, never the line's text, which
+        varies."""
+        line = self._failed.get((kind, name))
+        return line is not None and line.store_fault == _is_store_fault(exc)
 
     def degraded_inbound(self) -> dict[str, str]:
         """Snapshot of ``{inbound: reason}`` for INBOUND connections that failed to bind (ADR 0031).
         Empty when every inbound came up."""
-        return {name: reason for (kind, name), reason in self._failed.items() if kind == "inbound"}
+        return {
+            name: line.reason for (kind, name), line in self._failed.items() if kind == "inbound"
+        }
 
     def degraded_outbound(self) -> dict[str, str]:
         """Snapshot of ``{outbound: reason}`` for OUTBOUND connections that failed to build (ADR 0031).
         Empty when every outbound came up."""
-        return {name: reason for (kind, name), reason in self._failed.items() if kind == "outbound"}
+        return {
+            name: line.reason for (kind, name), line in self._failed.items() if kind == "outbound"
+        }
 
     def degraded_stages(self) -> dict[str, str]:
         """Snapshot of ``{stage: reason}`` for pooled pipeline stages with a claimer that died and has
@@ -3855,7 +3922,8 @@ class RegistryRunner:
         Once only, as :meth:`_record_window_open_failure` records: a scheduled poller retries at
         every in-window tick, and every alert could re-fire a ``restart_inbound`` control action,
         so a page per refusal would be an alert-restart loop. A start that binds clears the record,
-        so the next refusal pages again."""
+        so the next refusal pages again. So does a failure whose class differs from the recorded
+        line's, a store fault against anything else (:meth:`_repeats_failed_class`)."""
         try:
             await self._check_inbound_lane_anchor(name)
             await self._start_inbound_unsafe(name)
@@ -3865,7 +3933,7 @@ class RegistryRunner:
             if (
                 name in self.registry.inbound
                 and not self.inbound_running(name)  # a raise after the bind leaves it serving
-                and ("inbound", name) not in self._failed
+                and not self._repeats_failed_class("inbound", name, exc)
             ):
                 self._record_failed(name, exc, kind="inbound")
             raise
@@ -3881,10 +3949,12 @@ class RegistryRunner:
         keeps one open, escalating, throttled instance (BACKLOG #1741).
 
         An engine restart whose start fails records the inbound failed and alerts through
-        :meth:`_record_failed`, as :meth:`start` does, once while the record stands. Its stop half
+        :meth:`_record_failed`, as :meth:`start` does, once while the record stands and its class,
+        a store fault or not, holds (:meth:`_repeats_failed_class`). Its stop half
         already ran, so without the record a restart queued behind an operator's resolving start
         could leave the inbound down with no record and no open alert. Either way the error still
-        reaches the caller; an operator's restart records nothing, as before."""
+        reaches the caller. This method records nothing for an operator's restart, as before; the
+        start's own :meth:`_checked_inbound_start` still records a failure, on either path."""
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
         # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
@@ -3905,7 +3975,7 @@ class RegistryRunner:
                     and not self.inbound_running(name)
                     and name in self.registry.inbound
                     and self._deployed(name, "inbound")
-                    and ("inbound", name) not in self._failed
+                    and not self._repeats_failed_class("inbound", name, exc)
                 ):
                     self._record_failed(name, exc, kind="inbound")
                 raise
@@ -4255,7 +4325,9 @@ class RegistryRunner:
                     exc_info=not refused,
                 )
                 line = _lane_anchor_line(direction, name, settings, exc, passive=True)
-                self._record_failed(name, line, kind=direction)
+                # The line is not linked to its cause, which would put the refusal's traceback in
+                # the ERROR the record logs, so its class is named here (vault BACKLOG #5146).
+                self._record_failed(name, line, kind=direction, store_fault=_is_store_fault(exc))
 
     def engine_parked_outbounds(self) -> frozenset[str]:
         """The outbounds the ENGINE holds down by design: those the DR run-profile parks, and those
@@ -4648,10 +4720,15 @@ class RegistryRunner:
             # first failed for another reason keeps that older reason in its status; the CA
             # refusal is in the server log and the auth.trust_anchor rows (vault BACKLOG #3224,
             # item 3, declined: recording it again is what the alert-storm test pins against).
-            # A store fault's line is a TrustAnchorError too, so it is held to the same rule.
-            if not (isinstance(exc, TrustAnchorError) and ("outbound", name) in self._failed):
+            # A store fault's line is a TrustAnchorError too, so it is held to the same rule,
+            # within its class: a refusal after a store fault's line, or a store fault after any
+            # other line, replaces the line and alerts once (vault BACKLOG #5146).
+            if not (
+                isinstance(exc, TrustAnchorError)
+                and self._repeats_failed_class("outbound", name, exc)
+            ):
                 self._record_failed(name, exc, kind="outbound")
-            return exc if explicit_cause(exc, AnchorStoreUnavailable) is not None else None
+            return exc if _is_store_fault(exc) else None
         self._destinations[name] = connector
         self._failed.pop(("outbound", name), None)
         self._dr_unbuilt.pop(name, None)
@@ -4970,15 +5047,16 @@ class RegistryRunner:
         another process took meanwhile is first found here, after the reload has committed. Before
         this, the error reached :meth:`_schedule_worker`, which logged a traceback every tick and
         recorded nothing an operator reads as status. The next tick still retries, and a bind that
-        succeeds clears the record. While the record stands, a retry that fails is logged at DEBUG
-        only, whatever its reason: keying on the reason text would re-alert every tick on an error
-        whose message varies. A reload clears the record (see :meth:`reload`), so the next window
-        open alerts afresh.
+        succeeds clears the record. While the record stands, a retry that fails in the same class,
+        a store fault or not (:meth:`_repeats_failed_class`), is logged at DEBUG only: keying on
+        the reason text would re-alert every tick on an error whose message varies. A reload
+        clears the record (see :meth:`reload`), so the next window open alerts afresh.
 
         :meth:`_checked_inbound_start` records a failed start before this runs (BACKLOG #3859), so
         this usually finds the record and only logs the retry. It still records anything that
-        method leaves unrecorded, including a raise after the bind."""
-        if ("inbound", name) in self._failed:
+        method leaves unrecorded, including a raise after the bind, and a failure whose class
+        differs from the recorded line's (:meth:`_repeats_failed_class`, vault BACKLOG #5146)."""
+        if self._repeats_failed_class("inbound", name, exc):
             log.debug(
                 "schedule: inbound connection %r still cannot start (%s); retrying next tick",
                 name,
@@ -5344,7 +5422,9 @@ class RegistryRunner:
         if source is not None:
             await source.stop()
 
-    def _record_failed(self, name: str, exc: BaseException, *, kind: Direction) -> None:
+    def _record_failed(
+        self, name: str, exc: BaseException, *, kind: Direction, store_fault: bool | None = None
+    ) -> None:
         """Isolate a connection that failed to build/bind (ADR 0031): record the reason, log it
         loudly, and alert — the engine keeps the rest of the graph running. Reuses the AlertSink
         ``connection_stopped`` signal: its meaning ("this connection is down until an operator
@@ -5352,10 +5432,22 @@ class RegistryRunner:
 
         ``kind`` is part of the KEY, not just the log line (see ``_failed``). The alert still carries the
         bare name: an alert row is addressed to the operator's connection, and the detail says which
-        direction failed to start."""
+        direction failed to start.
+
+        The line's class (:class:`FailedLine`) is read off ``exc``'s explicit cause chain, unless
+        ``store_fault`` names it for a fixed line recorded with no cause: the passive preflight's,
+        whose cause would put a refusal's traceback in this ERROR (vault BACKLOG #5146)."""
         fixed = isinstance(exc, TrustAnchorError) and exc.fixed_text
         reason = safe_exc(exc, limit=_ANCHOR_LINE_LIMIT) if fixed else safe_exc(exc)
-        self._failed[(kind, name)] = reason  # stored before the alert fires, so a sink reads it
+        if store_fault is None:
+            store_fault = _is_store_fault(exc)
+        if store_fault:
+            # A store fault's line replaces a refusal's, so the refusal's mark goes with it: the
+            # lane no longer reads as held on a refused CA, and the next reload reads the CA
+            # again rather than keep a failure its line no longer states (vault BACKLOG #5146).
+            self._anchor_refused.pop((kind, name), None)
+        # Stored before the alert fires, so a sink reads it.
+        self._failed[(kind, name)] = FailedLine(reason, store_fault)
         self._log_and_alert_start_failure(
             f"{kind} connection {name!r}",
             name,
@@ -6170,7 +6262,9 @@ class RegistryRunner:
                     len(self._failed),
                     # Named WITH the direction — an operator reading this has to know which half
                     # of a dual-role name to go and fix.
-                    ", ".join(f"{k} {n} ({r})" for (k, n), r in sorted(self._failed.items())),
+                    ", ".join(
+                        f"{k} {n} ({line.reason})" for (k, n), line in sorted(self._failed.items())
+                    ),
                 )
             else:
                 log.info(
@@ -7690,12 +7784,16 @@ class RegistryRunner:
                         # passive start wrote stays, so the lane still reads failed, in words
                         # that no longer ask for the activation that has run.
                         self._dr_unbuilt[name] = False
-                        if ("outbound", name) in self._failed:
-                            self._failed[("outbound", name)] = (
-                                f"outbound connection '{name}' failed its check at the passive "
-                                "start, and the log halt held the activation's build of it. Repair "
-                                "the log and the cause, then reload or start the connection; the "
-                                "server log says why"
+                        passive_line = self._failed.get(("outbound", name))
+                        if passive_line is not None:
+                            # New words, the passive check's class (vault BACKLOG #5146).
+                            self._failed[("outbound", name)] = passive_line._replace(
+                                reason=(
+                                    f"outbound connection '{name}' failed its check at the passive "
+                                    "start, and the log halt held the activation's build of it. "
+                                    "Repair the log and the cause, then reload or start the "
+                                    "connection; the server log says why"
+                                )
                             )
                     self._dr_filters_out(name, oc.priority, kind="outbound")
                     continue
@@ -7723,8 +7821,9 @@ class RegistryRunner:
                     # failed record a passive start or an earlier activation may have left is
                     # dropped, so a fault still there is recorded and alerted as this build's
                     # own. A lane whose build already failed since this activation keeps its
-                    # record, and a CA still refused is not alerted again
-                    # (_ensure_destination_built). Marked before the await, which a cancelled
+                    # record, and a CA failure of the class that record holds, a store fault or
+                    # not, is not alerted again (_ensure_destination_built,
+                    # _repeats_failed_class). Marked before the await, which a cancelled
                     # reload can end there: the passive marker is gone, and this mark sends the
                     # next reload down this path again. A build that succeeds drops it.
                     self._filtered.pop(("outbound", name), None)
@@ -10200,6 +10299,11 @@ class RegistryRunner:
         # no send and no disposition. Members are carried VERBATIM (the head too — never re-encoded); only
         # the head is PARSED, for the BHS separators + the BHS-11 control id.
         refused: list[_RefusedMember] = []
+        # The outbox id of the member whose own step is running, set before each per-member step and
+        # cleared before a batch-wide one, so every arm below names the member a fault came from,
+        # by id and never by content, and names none when the fault is the batch's (vault BACKLOG
+        # #5100).
+        current: str | None = None
         try:
             # #149 (ADR 0105 Phase 1b): re-attach each member's detached document VERBATIM before framing
             # the envelope, so a batched streaming feed delivers full inline documents (never a raw
@@ -10207,41 +10311,62 @@ class RegistryRunner:
             # a DeliveryError (caught below → the whole batch re-pends), so the peer never sees a handle.
             # A store read fault is a _StoreReadFault and re-pends the same way (vault BACKLOG #2756).
             # A member whose own payload breaks the re-attach (a permanent NegativeAckError, vault
-            # BACKLOG #2809) is refused alone, as the frame split below refuses one. Kept local until
+            # BACKLOG #2809) is refused alone, as the frame check below refuses one. Kept local until
             # every member has hydrated, so a fault that sends the whole batch to an arm below takes
-            # that member with it rather than leaving it in two dispositions.
+            # that member with it rather than leaving it in two dispositions. A refusal that is not
+            # permanent, or one that must stop the lane, is the whole batch's, as in the frame check.
+            # Any other fault takes the whole batch to its arm below: a DeliveryError or a
+            # _StoreReadFault re-pends it, and any other, such as a stored CR (ADR 0105), goes to
+            # the internal-error arm. Each arm names the member by its outbox id (vault BACKLOG
+            # #5100), and a frame check's fault does the same.
             hydrated_items: list[OutboxItem] = []
             hydrated: list[str] = []
             unhydratable: list[_RefusedMember] = []
             for it in items:
+                current = it.id
                 try:
                     hydrated.append(await self._hydrate_payload(it.payload, it.message_id))
                 except NegativeAckError as exc:
-                    unhydratable.append((it.id, safe_exc(exc), exc.with_traceback(None)))
+                    unhydratable.append(self._refuse_alone_or_raise(it.id, exc))
                 else:
                     hydrated_items.append(it)
+            current = None
             # ADR 0205 rule 1, per member: one member the frame cannot carry, or that holds more
             # than one message (ADR 0209), is dead-lettered alone and the rest batch, rather than
             # all N dying on one envelope offset. It runs before the shadow branch below, so a
-            # simulate outbound records the same dispositions. The split writes nothing; the
+            # simulate outbound records the same dispositions. The check writes nothing; the
             # refused members are dead-lettered after this try, on every path.
+            unframeable: list[_RefusedMember] = []
             if _frames(connector):
-                kept, members, unframeable = self._split_unframeable_members(
-                    connector, hydrated_items, hydrated
-                )
-                refused = unhydratable + unframeable
+                kept: list[OutboxItem] = []
+                members: list[Message | str] = []
+                for it, payload in zip(hydrated_items, hydrated, strict=True):
+                    current = it.id
+                    refusal = self._check_member_frame(connector, it.id, payload)
+                    if refusal is None:
+                        kept.append(it)
+                        members.append(payload)
+                    else:
+                        unframeable.append(refusal)
+                current = None
             else:
                 kept, members = hydrated_items, list[Message | str](hydrated)
-                refused = unhydratable
+            # Assigned only once both loops are done, so a fault in either leaves it empty and its
+            # arm takes every member. In claim order, so the refusal lines follow the lane's FIFO.
+            by_id = {r[0]: r for r in unhydratable + unframeable}
+            refused = [by_id[it.id] for it in items if it.id in by_id]
             ids = [it.id for it in kept]
             if kept:
                 first = kept[0]  # the envelope's head is the first member that survived
+                # The head's own fields: a non-HL7 head faults here, and it is this member's.
+                current = first.id
                 control_id = Message.parse(first.payload).control_id or first.id  # stable
-                envelope = encode_batch(
-                    members,
-                    control_id=control_id,
-                    timestamp=_hl7_batch_timestamp(first.created_at),
-                )
+                timestamp = _hl7_batch_timestamp(first.created_at)
+                # encode_batch parses the HYDRATED head for the separators and normalizes every
+                # member, in one call, so a fault inside it cannot be told apart by member; the
+                # send is the whole envelope's. Neither names one.
+                current = None
+                envelope = encode_batch(members, control_id=control_id, timestamp=timestamp)
                 if not self._simulate.get(name, False):  # shadow suppresses the real egress
                     await connector.send(envelope)
         except NegativeAckError as exc:
@@ -10251,7 +10376,9 @@ class RegistryRunner:
             # retry would re-authenticate toward a partner lockout. So STOP the lane and release
             # every member un-errored (BACKLOG #2073). A configuration fault stops it the same way
             # (BACKLOG #2083). "dead_letter" falls through to the ordinary permanent reject below,
-            # exactly as the single row does.
+            # exactly as the single row does. A lane-stopping fault is the connection's, and a
+            # permanent one reaches here only from the send, so only a member's transient refusal,
+            # which re-pends the batch, names the member (vault BACKLOG #5100).
             fault = self._lane_stopping_fault(exc)
             if fault is not None:
                 # Refused members first: a store fault here then escapes before the stop, not
@@ -10274,25 +10401,36 @@ class RegistryRunner:
                     ids[0],
                 )
             else:
-                failed = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
+                failed = await self._mark_batch_failed_and_arm(
+                    name, ids, _member_error(safe_exc(exc), current), retry
+                )
                 retry_until = failed.retry_at
                 self._note_retry_exhausted(name, exc, failed, batch=True)
                 await self._delivery_failure_alert_checks(name)
         except _StoreReadFault as exc:
             # Vault BACKLOG #2756, the batch twin of the single-row arm: nothing was sent, so all N
             # re-pend on the retry policy's backoff rather than dead-lettering through the
-            # internal-error arm below.
-            failed = await self._mark_batch_failed_and_arm(name, ids, str(exc), retry)
+            # internal-error arm below. The member named is the one whose read was running when
+            # the store faulted, which says where, not that the member caused it.
+            failed = await self._mark_batch_failed_and_arm(
+                name, ids, _member_error(str(exc), current, lead="store read during "), retry
+            )
             retry_until = failed.retry_at
-            self._note_store_read_fault(name, exc, len(ids), failed)
+            self._note_store_read_fault(name, exc, len(ids), failed, member=_batch_member(current))
             self._note_retry_exhausted(name, _EngineCause.STORE_READ, failed, batch=True)
             await self._delivery_failure_alert_checks(name)
         except DeliveryError as exc:
-            failed = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
+            failed = await self._mark_batch_failed_and_arm(
+                name, ids, _member_error(safe_exc(exc), current), retry
+            )
             retry_until = failed.retry_at
             self._note_retry_exhausted(name, exc, failed, batch=True)
             await self._delivery_failure_alert_checks(name)
-            self._note_lane_unhealthy(name, ids[0] if ids else head.id, exc)
+            # The member whose re-attach raised it; otherwise the send raised it, which only
+            # happens with a member kept, and the envelope's head stands for it, as it did before
+            # members were named.
+            blamed = current if current is not None else (ids[0] if ids else head.id)
+            self._note_lane_unhealthy(name, blamed, exc)
         except Exception as exc:
             # A framing error (unparseable/non-HL7 head) or an internal/code error — NOT the partner's
             # fault. The per-connection policy decides: STOP halts the lane and alerts, and
@@ -10301,34 +10439,45 @@ class RegistryRunner:
             # vanished member, and on the retry branch a terminal one); CONTINUE (default)
             # dead-letters the members still present (bad data can never frame/deliver —
             # replayable from the DLQ) so a code bug or a mis-typed feed can't wedge the lane.
+            # A fault one member's own step raised (its re-attach, its frame check, or the head's
+            # parse) names that member by its outbox id, never its content, in the log, the stored
+            # error and the alert (vault BACKLOG #5100).
+            member = _batch_member(current)
             if (
                 self._internal_error.get(name, self._internal_error_default)
                 is InternalErrorPolicy.STOP
             ):
                 await self._dead_letter_refused(name, refused)  # before the stop, as above
                 log.error(
-                    "delivery worker %r: framing/internal error delivering a batch of %d (%s); STOPPING "
-                    "connection (operator must fix + reload/restart to resume)",
+                    "delivery worker %r: framing/internal error delivering a batch of %d (%s%s); "
+                    "STOPPING connection (operator must fix + reload/restart to resume)",
                     name,
                     len(ids),
                     type(exc).__name__,
+                    member,
                 )
                 failed = await self.store.mark_batch_failed(
-                    ids, f"internal error (connection stopped): {safe_exc(exc)}", retry
+                    ids,
+                    _member_error(f"internal error (connection stopped): {safe_exc(exc)}", current),
+                    retry,
                 )
                 _note_stop_dead_letter("delivery worker", name, failed, head.stage)
                 self._alert_sink.connection_stopped(
-                    name, detail=f"{type(exc).__name__} delivering a batch of {len(ids)}"
+                    name, detail=f"{type(exc).__name__} delivering a batch of {len(ids)}{member}"
                 )
                 self._hold_for_operator(name, "outbound")
                 return _ItemOutcome.STOPPED, None
             log.warning(
-                "delivery worker %r: framing/internal error delivering a batch of %d (%s); dead-lettering",
+                "delivery worker %r: framing/internal error delivering a batch of %d (%s%s); "
+                "dead-lettering",
                 name,
                 len(ids),
                 type(exc).__name__,
+                member,
             )
-            await self.store.dead_letter_batch(ids, f"internal error: {safe_exc(exc)}")
+            await self.store.dead_letter_batch(
+                ids, _member_error(f"internal error: {safe_exc(exc)}", current)
+            )
         else:
             if ids:  # nothing was sent when every member was refused
                 self._note_lane_healthy(name)
@@ -10337,42 +10486,39 @@ class RegistryRunner:
         await self._dead_letter_refused(name, refused)
         return _ItemOutcome.PROCESSED, retry_until
 
-    def _split_unframeable_members(
-        self,
-        connector: DestinationConnector,
-        items: Sequence[OutboxItem],
-        payloads: Sequence[str],
-    ) -> tuple[list[OutboxItem], list[Message | str], list[_RefusedMember]]:
-        """Split the batch into the members ``connector``'s frame can carry, with their hydrated
-        payloads, and the ``(id, error, refusal)`` of each member it refuses permanently (ADR 0205
-        rule 1). Pure: it writes and logs nothing, so a store fault cannot strike between a refusal
-        and the send, and the caller dead-letters and logs the refused members once the rest are
+    def _check_member_frame(
+        self, connector: DestinationConnector, outbox_id: str, payload: str
+    ) -> _RefusedMember | None:
+        """``None`` when ``connector``'s frame can carry one batch member's hydrated ``payload``,
+        else the ``(id, error, refusal)`` of a permanent refusal (ADR 0205 rule 1). It writes
+        nothing to the store and logs nothing, so a store fault cannot strike between a refusal and
+        the send, and the caller dead-letters and logs the refused members once the rest are
         resolved. A refusal that is not permanent, or one that must stop the lane, is re-raised for
-        the whole batch, as a send would raise it. The MLLP and TCP checks name no content: a
-        member the frame cannot carry is named by the frame byte and its offset, one its charset
-        cannot encode by the position of its first offending character, and a
-        ``multiple-messages`` member (ADR 0209) by the rule it breaks. Another connector's own
+        the whole batch, as a send would raise it, and so is any other fault. The MLLP and TCP
+        checks name no content: a member the frame cannot carry is named by the frame byte and its
+        offset, one its charset cannot encode by the position of its first offending character, and
+        a ``multiple-messages`` member (ADR 0209) by the rule it breaks. Another connector's own
         refusal text is its own, stored through ``safe_exc``."""
-        kept: list[OutboxItem] = []
-        kept_payloads: list[Message | str] = []
-        refused: list[_RefusedMember] = []
-        for item, payload in zip(items, payloads, strict=True):
-            try:
-                connector.check_frame(payload, rewrite=False)
-            except NegativeAckError as exc:
-                if not exc.permanent or self._lane_stopping_fault(exc) is not None:
-                    raise
-                # No traceback: it would hold this frame, and with it every hydrated payload of
-                # the batch, in a cycle until the collector ran.
-                refused.append((item.id, safe_exc(exc), exc.with_traceback(None)))
-            else:
-                kept.append(item)
-                kept_payloads.append(payload)
-        return kept, kept_payloads, refused
+        try:
+            connector.check_frame(payload, rewrite=False)
+        except NegativeAckError as exc:
+            return self._refuse_alone_or_raise(outbox_id, exc)
+        return None
+
+    def _refuse_alone_or_raise(self, outbox_id: str, exc: NegativeAckError) -> _RefusedMember:
+        """The ``(id, error, refusal)`` of a batch member refused alone, by the re-attach or the
+        frame check, which share this one rule (vault BACKLOG #5100). A refusal that is not
+        permanent, or one that must stop the lane, is the whole batch's, so it is re-raised for
+        the batch's own arm, as a send would raise it."""
+        if not exc.permanent or self._lane_stopping_fault(exc) is not None:
+            raise exc
+        # No traceback: it would hold the caller's frame, and with it every hydrated payload of
+        # the batch, in a cycle until the collector ran.
+        return outbox_id, safe_exc(exc), exc.with_traceback(None)
 
     async def _dead_letter_refused(self, name: str, refused: Sequence[_RefusedMember]) -> None:
-        """Dead-letter each batch member :meth:`_split_unframeable_members` or the batch re-attach
-        refused, alone, then log it. The line used to be written in the split, before any write, so
+        """Dead-letter each batch member :meth:`_check_member_frame` or the batch re-attach
+        refused, alone, then log it. The line used to be written in the frame check, before any write, so
         a member a later refusal sent back with the whole batch was logged as dead-lettered when it
         was not. It goes through the same throttle as the other permanent-refusal lines (BACKLOG
         #3043). Its reason
@@ -11910,7 +12056,7 @@ class RegistryRunner:
         )
 
     def _note_store_read_fault(
-        self, name: str, exc: _StoreReadFault, rows: int, failed: FailOutcome
+        self, name: str, exc: _StoreReadFault, rows: int, failed: FailOutcome, *, member: str = ""
     ) -> None:
         """Log a pre-send store read fault AFTER its outcome is written, so the line says what the
         store reported: a retry time, a dead-letter at the retry cap, or neither, which is a row
@@ -11930,10 +12076,11 @@ class RegistryRunner:
         self._store_read_fault_runs[name] = run.record(
             log,
             exc,
-            "delivery worker %r: %s before sending %d row(s); %s",
+            "delivery worker %r: %s before sending %d row(s)%s; %s",
             name,
             exc,
             rows,
+            member,
             outcome,
             level=logging.WARNING,
             count_label=_WORKER_RUN_COUNT,
@@ -12252,39 +12399,6 @@ class _RedactedFault(Exception):
     ``last_error`` built from it carries no raw driver text, which can quote a cell (section 9)."""
 
 
-class UserCodeCalledSysExit(_RedactedFault):
-    """A Router or a Handler raised ``SystemExit``, ``sys.exit()`` called at run time (vault BACKLOG
-    #3134). Converted at least where the engine runs that code in-process, so the message takes the
-    internal-error policy as for any other raise. At ``[sandbox].mode`` subprocess or isolated, the
-    worker's ``_run_one`` converts at least a ``sys.exit()`` raised while the Router, predicate or
-    Handler runs, a generator Router's body included, and reports this class's text as an error;
-    the parent then raises ``SandboxError`` carrying it, and the worker serves the next message.
-    At least one case is not converted: at ``mode=off``, a ``sys.exit()`` in the ``__str__`` of an
-    exception user code raised, which the internal-error path renders on the event loop.
-
-    **Why this differs from the config-code rule in ``config/wiring.py``**, whose comments say never
-    to catch ``BaseException`` because ``SystemExit`` must keep propagating. That rule is about code
-    the operator runs: a setting cast or a diagnostic, during a load the operator started. A Router
-    or Handler runs once per message, after the ACK, in a worker thread, and a ``SystemExit`` there
-    is a script habit in one piece of logic, not a request to stop the engine. Left alone, asyncio
-    re-raises it out of the event loop and every connection stops. Only ``SystemExit`` is converted.
-    The catch is no wider, so a ``KeyboardInterrupt`` or ``CancelledError`` that Router or Handler
-    code raises itself still escapes, as it did before this class existed. In a worker thread a
-    ``KeyboardInterrupt`` is no signal to the engine, since Python delivers Ctrl+C to the main
-    thread, so one Router or Handler code raises would still be re-raised out of the event loop and
-    stop every connection. Converting it too is not done here.
-
-    Redacted by construction: the text names an integer exit code and nothing else, since
-    ``sys.exit("...")`` carries the author's text, which could quote a field. Named without a leading
-    underscore because the name reaches operators, in a dead-letter reason and an alert detail."""
-
-    @classmethod
-    def from_exit(cls, exc: SystemExit) -> UserCodeCalledSysExit:
-        code = exc.code
-        named = f" with code {code}" if isinstance(code, int) and not isinstance(code, bool) else ""
-        return cls(f"Router or Handler code raised SystemExit{named} (sys.exit() at run time)")
-
-
 def _as_content_fault(exc: Exception | SystemExit) -> Exception:
     """``exc``, with a ``SystemExit`` from Router or Handler code turned into :class:`UserCodeCalledSysExit`."""
     return UserCodeCalledSysExit.from_exit(exc) if isinstance(exc, SystemExit) else exc
@@ -12433,9 +12547,9 @@ def _mirror_declarations(
     settings: dict[str, Any],
     *,
     connection: str,
-    cleartext_accepted: bool,
+    cleartext_accepted: object,
     cleartext_reason: str | None,
-    tls_revocation_attested: bool,
+    tls_revocation_attested: object,
     tls_revocation_attested_reason: str | None,
 ) -> None:
     """Replace the declaration keys the settings-driven seams read with the typed declarations.
@@ -12447,17 +12561,23 @@ def _mirror_declarations(
 
     The NAME is written always. A refusal needs it as much as an audit record does, and a refusal is
     exactly the case where nothing was declared. The two declarations are written only when set.
+    Each flag is read as the typed model reads it (:func:`read_lax_flag`), so a false spelling such
+    as ``"off"``, which the model holds as ``False``, is not mirrored as set with no reason (vault
+    BACKLOG #5286); a value the model would refuse is refused here, before the model is built.
 
     The one writer for both ``_dest_config`` and ``_fhir_lookup_settings`` (BACKLOG #2050): the
     lookup path once stripped only the revocation keys, so a hand-set ``cleartext_accepted`` crossed
     the read hop without the audited declaration."""
+    where = f"connection {connection!r}"
+    accepted = read_lax_flag(cleartext_accepted, where, "cleartext_accepted")
+    attested = read_lax_flag(tls_revocation_attested, where, "tls_revocation_attested")
     for key in _DECLARATION_MIRROR_KEYS:
         settings.pop(key, None)
     settings[MIRRORED_CONNECTION_SETTING] = connection
-    if cleartext_accepted:
+    if accepted:
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = cleartext_reason
-    if tls_revocation_attested:
+    if attested:
         settings["tls_revocation_attested"] = True
         settings["tls_revocation_attested_reason"] = tls_revocation_attested_reason
 
