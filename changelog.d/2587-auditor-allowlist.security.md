@@ -9,8 +9,13 @@
   the auditor's `--pass-environment` does: a child started with it set waits at a prompt instead of
   exiting. `PYTHONBREAKPOINT` may still be named,
   so `PYTHONBREAKPOINT=0` reaches the child. (`BACKLOG #2587`)
-- **The dependency auditor refuses a word after the lock that holds `=` and is not a pip-audit
-  option given as `--option=value`**, naming its position rather than the word, so a
-  `NAME=value` typed there never reaches pip-audit's usage error and the CI log. Give a value that
-  holds `=` in the `=` form of its option, as `--index-url=URL`. What the auditor prints itself
-  withholds what follows the first `=` of every word it was given. (`BACKLOG #2587`)
+- **The dependency auditor refuses, without quoting it, a word that pip-audit's or its own usage
+  error would print with a value typed into it.** After the lock: its own `--skip-private` and
+  `--pass-environment`, abbreviated or in the `=` form, which go before the lock; and any other
+  word holding `=` that is not a pip-audit option taking a value, named in full and given as
+  `--option=value`. Before the lock: a lock path or `--skip-private` entry holding `=`. Once any
+  word holds `=`, an argparse usage error prints no reason, since its reason can quote that word.
+  A free-text value that holds `=`,
+  such as `--index-url=URL` or `--ignore-vuln=ID`, still reaches pip-audit, which can print it in
+  its own output, at least in its `--verbose` debug line of the arguments it parsed.
+  (`BACKLOG #2587`)

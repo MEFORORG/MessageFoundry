@@ -1116,54 +1116,69 @@ _SECRET = "marker-not-a-key"
 
 
 @pytest.mark.parametrize(
-    "after",
+    ("after", "position", "reason"),
     [
-        [f"--pass-environment=KEYRING_A={_SECRET}"],
-        [f"--pass-env=KEYRING_A={_SECRET}"],
-        [f"--p=KEYRING_A={_SECRET}"],
-        [f"--PASS-ENVIRONMENT=KEYRING_A={_SECRET}"],
-        [f"-pass-environment=KEYRING_A={_SECRET}"],
-        [f"--env=KEYRING_A={_SECRET}"],
-        [f"KEYRING_A={_SECRET}"],
-        ["--pass-env", f"KEYRING_A={_SECRET}"],
+        ([f"--pass-environment=KEYRING_A={_SECRET}"], 1, "own option"),
+        ([f"--pass-env=KEYRING_A={_SECRET}"], 1, "own option"),
+        ([f"--skip-private=idna={_SECRET}"], 1, "own option"),
+        (["--pass-env", f"KEYRING_A={_SECRET}"], 1, "own option"),
+        (["--pas", "KEYRING_A"], 1, "own option"),
+        (["--skip-p", "idna"], 1, "own option"),
+        ([f"--p=KEYRING_A={_SECRET}"], 1, "holds '='"),
+        ([f"--pa=KEYRING_A={_SECRET}"], 1, "holds '='"),
+        ([f"--PASS-ENVIRONMENT=KEYRING_A={_SECRET}"], 1, "holds '='"),
+        ([f"-pass-environment=KEYRING_A={_SECRET}"], 1, "holds '='"),
+        ([f"--env=KEYRING_A={_SECRET}"], 1, "holds '='"),
+        (["--desc", f"KEYRING_A={_SECRET}"], 2, "holds '='"),
+        # An abbreviation in the = form is refused rather than resolved.
+        ([f"--out=KEYRING_A={_SECRET}"], 1, "holds '='"),
         # A flag in the = form: argparse's "ignored explicit argument" error quotes the value.
-        [f"--strict={_SECRET}"],
-        [f"--help={_SECRET}"],
+        ([f"--strict={_SECRET}"], 1, "holds '='"),
+        ([f"--help={_SECRET}"], 1, "holds '='"),
+        ([f"-S={_SECRET}"], 1, "holds '='"),
         # A fixed-form value holding "=": its "invalid choice" error quotes the value.
-        [f"--format=json={_SECRET}"],
-        [f"--skip-private=idna={_SECRET}"],
+        ([f"--format=json={_SECRET}"], 1, "holds '='"),
+        ([f"-f=json={_SECRET}"], 1, "holds '='"),
     ],
 )
-def test_an_equals_word_after_the_lock_that_is_no_pip_audit_option_is_refused_unquoted(
-    after: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_a_word_after_the_lock_that_pip_audit_would_quote_is_refused_unquoted(
+    after: list[str],
+    position: int,
+    reason: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """After the lock, argparse hands every word to pip-audit, whose usage error quotes a word it
     does not take, or its value, whole, so ``NAME=value`` typed there in any spelling would carry
-    the value into a CI log. Any word holding ``=`` that is not ``--option=value`` for a pip-audit
-    option taking a value is refused: pip-audit never starts, and the refusal names the word's
-    position, not the word."""
+    the value into a CI log. This auditor's own options go before the lock, and any other word
+    holding ``=`` must be a pip-audit option that takes a value, named in full: pip-audit never
+    starts, and the refusal names the word's position, not the word."""
     src = tmp_path / "x.lock"
     src.write_text(LOCK, encoding="utf-8")
     ran, run = _recorder(0)
     assert main([str(src), *after], run=run) == 2
     assert not ran
     out, err = capsys.readouterr()
-    assert f"word {len(after)} after the lock holds '='" in err
+    assert f"word {position} after the lock" in err
+    assert reason in err
     assert _SECRET not in out + err
 
 
 def test_pip_audits_own_options_still_pass_through_after_the_lock(tmp_path: Path) -> None:
-    """The control for the refusal above: pip-audit's own options reach it, abbreviated, in the
-    ``=`` form, and with a value that holds ``=`` where that value is free text."""
+    """The control for the refusal above, with an invocation pip-audit 2.10.1 accepts beside the
+    ``-r``, ``--desc``, ``--disable-pip`` and ``--strict`` the auditor gives it: options in the
+    ``=`` form, long and short, a free-text value that holds ``=``, and ``--skip``, pip-audit's
+    own abbreviation of ``--skip-editable``."""
     src = tmp_path / "x.lock"
     src.write_text(LOCK, encoding="utf-8")
     ran, run = _recorder(0)
     passed = [
         "--progress-spinner=off",
-        "--pa=x",
-        "--path",
-        "x",
+        "--timeout=30",
+        "-f=json",
+        "-o=report.json",
         "--index-url=https://index.invalid/simple?a=b",
+        "--skip",
         "--ignore-vuln",
         "GHSA-0000-0000-0000",
     ]
@@ -1177,23 +1192,26 @@ def test_pip_audits_own_options_still_pass_through_after_the_lock(tmp_path: Path
         # argparse's own "unrecognized arguments" line.
         [f"--pass-enviroment=KEYRING_A={_SECRET}", "LOCK"],
         [f"--Pass-Environment=KEYRING_A={_SECRET}", "LOCK"],
-        # A word whose value a shorter word's value starts: one substitution, longest first.
         ["--pass-enviroment=K=marker", f"--pass-enviroment=K=marker{_SECRET}", "LOCK"],
         # argparse's "ignored explicit argument" error quotes only the value, as a repr.
         [f"--help=K={_SECRET}", "LOCK"],
-        # A word with a space is read as the lock, so the "not readable" line quotes it.
+        # A word with a space is read as the lock.
         [f"--pass-enviroment=K={_SECRET} b", "LOCK"],
-        # The flag forgotten: NAME=value is read as the lock.
+        # The flag forgotten: NAME=value is read as the lock, a "/" in it included, which a path
+        # normalises past anything a substring match could find.
         [f"KEYRING_A={_SECRET}", "LOCK"],
-        # A package name canonical_name would rewrite past what withhold matches.
+        [f"PIP_INDEX_URL=https://user:{_SECRET}@host.invalid/simple/", "LOCK"],
+        [f"PIP_INDEX_URL=https://user:{_SECRET}@host.invalid//simple/"],
+        # A package name canonical_name would rewrite.
         [f"--skip-private=idna=KEY_{_SECRET}", "LOCK"],
     ],
 )
 def test_nothing_the_auditor_prints_holds_a_value_typed_before_the_lock(
     words: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Its usage error and every ``::error::`` line withhold what follows the first ``=`` of each
-    word it was given, so a typo does not put a value in the CI log (vault BACKLOG #2600)."""
+    """A word holding ``=`` before the lock is refused unquoted wherever it lands: argparse's own
+    usage error quotes nothing once such a word is given, and a lock path or ``--skip-private``
+    entry holding ``=`` is refused before any line prints it (vault BACKLOG #2600)."""
     src = tmp_path / "x.lock"
     src.write_text(LOCK, encoding="utf-8")
     ran, run = _recorder(0)
@@ -1206,9 +1224,17 @@ def test_nothing_the_auditor_prints_holds_a_value_typed_before_the_lock(
     assert status == 2
     assert not ran
     out, err = capsys.readouterr()
-    # Withheld where a line quotes the word, or refused without quoting it.
-    assert "<withheld>" in err or "not a package name" in err
+    assert err
     assert _SECRET not in out + err
+
+
+def test_an_unreadable_lock_is_named_through_safe_exc(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ``OSError`` is printed with ``safe_exc``, which names its type, not the raw text."""
+    assert main([str(tmp_path / "missing.lock")], run=_recorder(0)[1]) == 2
+    err = capsys.readouterr().err
+    assert "not readable: FileNotFoundError" in err
 
 
 def test_a_relative_pythonpath_entry_does_not_reach_pip_or_pip_audit(
