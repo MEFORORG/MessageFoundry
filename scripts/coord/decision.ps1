@@ -37,28 +37,27 @@
                             without review.
         REVIEW     exit 11  take the adversarial-review path first.
         HALT       exit 12  do not act; defer. The cost rung is hit.
-    NO-REVIEW needs all of: the act names, with -Touches, every repository path it changes
-    (relative, one per line: pwsh -File passes one string, so lines are how to give several), and no
-    path is one _decisionlog.ps1 Get-DecisionClassCPath names or cannot classify. An act that changes
-    no file has no git undo, so it has no fast path. The seat is one docs/roles/seats.json resolves,
-    so an alias shares its seat's calibration and budget. The kill switch reads exactly OFF
-    (afk-kill.ps1 -Status); the seat's Class B is calibrated, by the digest's own arithmetic
-    (_decisionlog.ps1 Get-DecisionCalibration: the reversal rate and the rates of reds after merge
-    and Lander holds over 14 days, each at 5 percent or less, plus any blind-sample breach; 60 owner
-    ratings are no longer needed, and every input is an `outcome` record a seat logs by hand); no decision on the item was
-    reversed in the 60 days read; the reversal budget is open (plan 4.5: 3 reversals fleet-wide or 2
-    of the seat's own decisions inside 24 hours close it for 24 hours); the chain is no deeper than
-    two (plan 4.6, below); and the cost rung is not hit (plan 4.7). The paths are the session's own
-    statement, and the list is a denylist, so a clean answer never shows the act is not a security
-    control.
+    The conditions NO-REVIEW needs are docs/AUTONOMY-PLAN.md R4 and section 12, stated there once;
+    this header does not restate them. What the gate itself reads, in order: the cost rung (plan
+    4.7); a seat docs/roles/seats.json resolves; that it runs in a checkout whose origin is
+    MEFORORG/MessageFoundry; the paths the act touches, which it derives itself from git (the
+    branch's diff against origin/main, the uncommitted and staged changes, and untracked files)
+    joined with any -Touches (relative paths, one per line: pwsh -File passes one string); that
+    every one of them is on the fast-path allowlist, _decisionlog.ps1 DecisionFastPathAllow, and
+    not refused by Get-DecisionClassCPath; the kill switch (afk-kill.ps1 -Status); the seat's
+    calibration (_decisionlog.ps1 Get-DecisionCalibration, the digest's own arithmetic); any
+    reversal on the item; the reversal budgets (plan 4.5); and the chain (plan 4.6, below). A
+    NO-REVIEW lists on stderr the conditions it did not check.
     IT FAILS CLOSED. No exit code but 10 is NO-REVIEW, so a crash (1), a usage error (2) or anything
-    else reads as no permission. A read that fails, a seat that cannot be named, and a cost reading
-    that is UNKNOWN all answer REVIEW. HALT comes from the cost rung only, and is checked first; the
-    Lander is exempt from it (korus roles/COMMON.md, The three usage states). The gate stops at the
-    first condition that closes the no-review path before the log is read, so a REVIEW for a kill
-    switch reads no log.
-    A seat with no decisions in the 14 days reads calibrated, because no signal has breached; the
-    reversal budget and the chain limit are what bound its first acts.
+    else reads as no permission. A read that fails, a seat that cannot be named, an empty or
+    unreadable set of touched paths, and a cost reading that is UNKNOWN all answer REVIEW. HALT
+    comes from the cost rung only, and is checked first; the Lander is exempt from it (korus
+    roles/COMMON.md, The three usage states). The gate stops at the first condition that closes the
+    no-review path before the log is read, so a REVIEW for a kill switch reads no log.
+    A seat is not calibrated until at least 20 of its Class B decisions in the 14 days carry a
+    resolved outcome, so an empty history answers REVIEW, and THE FAST PATH STAYS CLOSED BY THIS
+    FLOOR UNTIL OUTCOMES ARE LOGGED (decision.ps1 -Log -Kind outcome, a Lander and Manager duty;
+    plan section 12).
 
     THE CHAIN. -BuildsOn names the decisions this one builds on. Depth is the unsampled (unrated)
     Class B decisions on the same item reachable through those links, and never less than the
@@ -81,7 +80,9 @@
     KINDS. `decision` is one Class A to D decision. `tripwire` is a tripwire hit. `rating` is the
     owner's blind-sample verdict on a decision (-Ref, -Rating). `outcome` updates a decision's
     outcome later (-Ref, -Outcome), and `-Outcome reversed` is what the digest counts as a reversal:
-    a revert, a reopen, a re-brief or an override.
+    a revert, a reopen, a re-brief or an override; `reopened`, `rebriefed`, `re-briefed` and
+    `overridden` count the same. A reversal, a `red-after-merge` and a `held` are sticky: no later
+    outcome cancels one.
 
     THE FIELDS ARE ADR 0211's SCHEMA. -Predicate takes `name=evidence` strings, the predicates this
     turn checked and what each read showed. -Confidence is the session's stated confidence, 0 to
@@ -327,6 +328,36 @@ function Write-Flushed($Result) {
     foreach ($e in $Result.Warnings) { [Console]::Error.WriteLine("decision.ps1: WARNING: $e") }
 }
 
+function Test-DecisionEngineOrigin([string]$Top) {
+    # True only when the checkout's origin is MEFORORG/MessageFoundry on GitHub, never the vault.
+    $url = & git -C $Top remote get-url origin 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $url) { return $false }
+    $u = ([string]$url).Trim().TrimEnd('/').ToLowerInvariant()
+    if ($u.EndsWith('.git')) { $u = $u.Substring(0, $u.Length - 4) }
+    return ($u -match '^(https://|ssh://git@|git@)github\.com[/:]mefororg/messagefoundry$')
+}
+
+function Get-DecisionTouchedPaths([string]$Top) {
+    <#
+      The repository paths this checkout's act changes, from git: the branch's diff against
+      origin/main, the uncommitted and staged changes against HEAD, and untracked files. Renames
+      list both sides. Error is set when any read fails, and the caller then treats the set as
+      unknown.
+    #>
+    $paths = [System.Collections.Generic.List[string]]::new()
+    $reads = @(
+        @('diff', '--name-only', '--no-renames', 'origin/main...HEAD'),
+        @('diff', '--name-only', '--no-renames', 'HEAD'),
+        @('ls-files', '--others', '--exclude-standard')
+    )
+    foreach ($a in $reads) {
+        $out = & git -C $Top -c core.quotepath=off @a 2>$null
+        if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Paths = @(); Error = "git $($a -join ' ') failed" } }
+        foreach ($l in @($out)) { if ([string]$l) { $paths.Add(([string]$l).Trim()) } }
+    }
+    return [pscustomobject]@{ Paths = @($paths | Select-Object -Unique); Error = '' }
+}
+
 function New-GateAnswer([string]$Result, $Why) {
     return [pscustomobject]@{ Result = $Result; Reasons = @($Why) }
 }
@@ -364,25 +395,40 @@ function Invoke-DecisionGate {
             $why.Add('-NoPost reads no network, so the kill switch and the log were not read')
             return (New-GateAnswer 'REVIEW' $why)
         }
-        # T1's no-Class-C-path condition, the one the gate can partly see (plan section 12).
-        if (-not $Touches.Count) {
-            $why.Add('touches: no -Touches path was given, so the gate cannot show the act touches no Class C path, or that a git revert undoes it')
-            return (New-GateAnswer 'REVIEW' $why)
-        }
-        $classC = @($Touches | ForEach-Object { Get-DecisionClassCPath $_ } | Where-Object { $_ })
-        # A directory in this checkout may hold any file, so it is not classified as one path.
+        # The allowlist is the engine repository's, so the fast path runs nowhere else (plan
+        # section 12, Manager decision 2026-11-09).
         $top = & git -C (Get-Location).Path rev-parse --show-toplevel 2>$null
         if ($LASTEXITCODE -ne 0 -or -not $top) {
-            $classC += 'the checkout could not be found, so no path can be shown not to be a directory'
-        } else {
-            foreach ($t in $Touches) {
-                if ([System.IO.Directory]::Exists((Join-Path ([string]$top).Trim() $t))) { $classC += "'$t' is a directory in this checkout, so it cannot be classified; name the files" }
-            }
-        }
-        if ($classC.Count) {
-            foreach ($c in $classC) { $why.Add("touches: $c, so the T1 fast path does not apply") }
+            $why.Add('repository: the checkout could not be found, so neither the repository nor the touched paths can be read')
             return (New-GateAnswer 'REVIEW' $why)
         }
+        $top = ([string]$top).Trim()
+        if (-not (Test-DecisionEngineOrigin $top)) {
+            $why.Add('repository: this checkout''s origin is not MEFORORG/MessageFoundry, and the fast-path allowlist is that repository''s alone')
+            return (New-GateAnswer 'REVIEW' $why)
+        }
+        # T1's path condition, the one the gate can partly see: the paths come from git, joined with
+        # what the session names, so leaving a path out of -Touches does not hide it.
+        $derived = Get-DecisionTouchedPaths $top
+        if ($derived.Error) {
+            $why.Add("touches: $($derived.Error), so the paths the act changes are unknown")
+            return (New-GateAnswer 'REVIEW' $why)
+        }
+        $paths = @(@($derived.Paths) + @($Touches) | Where-Object { $_ } | Select-Object -Unique)
+        if (-not $paths.Count) {
+            $why.Add('touches: git shows no changed path and no -Touches was given, and an act that changes no file has no git undo, so it has no fast path')
+            return (New-GateAnswer 'REVIEW' $why)
+        }
+        $refused = @($paths | ForEach-Object { Get-DecisionFastPathRefusal $_ } | Where-Object { $_ })
+        # A directory in this checkout may hold any file, so it is not classified as one path.
+        foreach ($t in $paths) {
+            if ([System.IO.Directory]::Exists((Join-Path $top $t))) { $refused += "'$t' is a directory in this checkout, so it cannot be classified; name the files" }
+        }
+        if ($refused.Count) {
+            foreach ($c in $refused) { $why.Add("touches: $c, so the T1 fast path does not apply") }
+            return (New-GateAnswer 'REVIEW' $why)
+        }
+        $touched = $paths.Count
         $canon = Get-DecisionSeatKey $Seat
         if (-not $canon) {
             $why.Add("seat: '$Seat' is not a live seat or alias in docs/roles/seats.json, or that roster could not be read, so it cannot be held to a seat's calibration and budget")
@@ -419,13 +465,13 @@ function Invoke-DecisionGate {
                 $_.kind -eq 'decision' -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id)) -and (Get-DecisionSeatKey ([string]$_.seat)) -eq $canon
             })
         if (-not $cal.Calibrated) {
-            $why.Add("calibration: $Seat's Class B is not calibrated (blind sample $($cal.Blind); over 14 days, reversal rate $($cal.RateText), red after merge $($cal.RedText), Lander holds $($cal.HeldText))")
+            $why.Add("calibration: $Seat's Class B is not calibrated (blind sample $($cal.Blind); over 14 days, reversal rate $($cal.RateText), red after merge $($cal.RedText), Lander holds $($cal.HeldText); resolved outcomes $($cal.ResolvedText))")
             $closed = $true
         }
         # Items compare without case, surrounding space or a leading '#', so '#3905' is 3905.
-        $itemKey = $Item.Trim().TrimStart('#').ToLowerInvariant()
+        $itemKey = Get-DecisionItemKey $Item
         foreach ($r in $reversals) {
-            if (([string]$r.Item).Trim().TrimStart('#').ToLowerInvariant() -eq $itemKey) {
+            if ((Get-DecisionItemKey $r.Item) -eq $itemKey) {
                 $why.Add("item: decision $($r.Ref) on item $Item was reversed")
                 $closed = $true
             } elseif (-not $r.Item) {
@@ -453,7 +499,16 @@ function Invoke-DecisionGate {
             $closed = $true
         }
         if ($closed) { return (New-GateAnswer 'REVIEW' $why) }
-        $why.Add("every condition the gate can see holds: no Class C path named, kill switch OFF, calibrated, no reversal on the item, budgets open, chain depth $($ch.Depth)")
+        $why.Add("every condition the gate can see holds: $touched touched path(s), all on the fast-path allowlist; kill switch OFF; calibrated; no reversal on the item; budgets open; chain depth $($ch.Depth)")
+        # NECESSARY, NOT SUFFICIENT: these are the plan R4 conditions the gate cannot see.
+        foreach ($u in @(
+                'a single revert or PR close undoes the act, with no effect outside git',
+                'the act serves one item',
+                'the act changes no security control, whatever its path',
+                'the live state the act rests on was read this turn',
+                'the act is not class C under plan R3 for a reason no path shows')) {
+            $why.Add("unchecked: $u; the session checks it before acting without review")
+        }
         return (New-GateAnswer 'NO-REVIEW' $why)
     } catch {
         $why.Add("the gate failed, so it fails closed: $($_.Exception.Message)")
@@ -538,9 +593,9 @@ if ($Ref -and -not (Get-DecisionIdDay $Ref)) {
     exit 2
 }
 $normOutcome = $Outcome.Trim().ToLowerInvariant()
-if ($Kind -eq 'outcome' -and $normOutcome -ne 'reversed' -and -not (Test-DecisionSignalOutcome $normOutcome) -and
-    $normOutcome -match '^(lander[-_ ]?)?hold(s|ing)?$|^held.|^red($|[-_ ])|^revers|^revert') {
-    [Console]::Error.WriteLine("decision.ps1: -Outcome '$Outcome' reads like a calibration signal but is not one: use reversed, red-after-merge or held. A near miss would be the decision's latest outcome and hide a reversal. Nothing was written.")
+if ($Kind -eq 'outcome' -and -not (Test-DecisionMarkOutcome $normOutcome) -and
+    $normOutcome -match '^(lander[-_ ]?)?hold(s|ing)?$|^held.|^red($|[-_ ])|^revers|^revert|^reopen|^re-?brief|^overrid|^overrule') {
+    [Console]::Error.WriteLine("decision.ps1: -Outcome '$Outcome' reads like a calibration signal but is not one: use reversed, reopened, rebriefed, overridden, red-after-merge or held. A near miss would be read as a status and the signal lost. Nothing was written.")
     exit 2
 }
 if ($Reviewed -eq 'yes' -and -not $ReviewedBy) {

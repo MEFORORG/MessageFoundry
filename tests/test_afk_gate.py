@@ -10,7 +10,9 @@ host account's own usage files.
 A calibrated seat with nothing else against it answers NO-REVIEW, and each REVIEW or HALT test
 starts from that seat, so a REVIEW proves the one condition the test adds closed the path. Every
 gate call names what the act touches (a plain engine file) unless the test is about that, because
-the T1 fast path (owner ruling 2026-11-09; docs/AUTONOMY-PLAN.md section 12) needs it.
+the T1 fast path (owner ruling 2026-11-09; docs/AUTONOMY-PLAN.md section 12) needs it. The sandbox
+is a committed checkout whose origin is the engine repository and whose origin/main is its HEAD, so
+git shows no touched path of its own; a test about the derived paths adds one.
 """
 
 from __future__ import annotations
@@ -84,15 +86,17 @@ def rec(kind: str = "decision", at: datetime | None = None, **fields: Any) -> di
     return base
 
 
-def calibrated(seat: str) -> list[dict[str, Any]]:
-    """60 Class B decisions by ``seat``, 20 days old, each rated agree: calibrated, all on one day
-    so the gate reads one more issue for them, and outside the 14-day reversal window."""
-    decided = [rec(at=ago(days=20, minutes=i), seat=seat, item="calib") for i in range(60)]
-    rated = [
-        rec("rating", at=ago(days=20, minutes=-1 - i), seat="owner", ref=d["id"], rating="agree")
-        for i, d in enumerate(decided)
+FLOOR = 20
+
+
+def calibrated(seat: str, count: int = FLOOR) -> list[dict[str, Any]]:
+    """``count`` Class B decisions by ``seat``, 3 days old, each with the resolved outcome
+    ``merged``: the resolved-outcome floor met, all on one day so the gate reads one more issue for
+    them, and outside the chain floor's 24 hours."""
+    return [
+        rec(at=ago(days=3, minutes=i), seat=seat, item="calib", outcome="merged")
+        for i in range(count)
     ]
-    return decided + rated
 
 
 def reversal(decision: dict[str, Any], at: datetime, by: str = "lander") -> dict[str, Any]:
@@ -115,6 +119,43 @@ def usage(pct: float | None = 40.0, **seven: Any) -> dict[str, Any]:
     return {"state": window["state"], "exit_code": 0, "seven_day": window}
 
 
+ENGINE_ORIGIN = "https://github.com/MEFORORG/MessageFoundry.git"
+
+
+def git(repo: Path, *args: str) -> str:
+    # No hooks: the sandbox is a scratch repository, and the account's hooks are not its subject.
+    nohooks = repo.parent / "nohooks"
+    nohooks.mkdir(exist_ok=True)
+    proc = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=sandbox",
+            "-c",
+            "user.email=sandbox@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            f"core.hooksPath={nohooks}",
+            *args,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return proc.stdout
+
+
+def resync(sb: Sandbox) -> None:
+    """Commit the sandbox as it stands and point origin/main at it, so git shows no touched path."""
+    git(sb.repo, "add", "-A")
+    git(sb.repo, "commit", "-q", "--allow-empty", "-m", "sandbox")
+    git(sb.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+
 @pytest.fixture
 def sb(tmp_path: Path) -> Sandbox:
     s = make_sandbox(tmp_path)
@@ -124,6 +165,9 @@ def sb(tmp_path: Path) -> Sandbox:
     roster = s.repo / "docs" / "roles"
     roster.mkdir(parents=True)
     shutil.copy2(ROOT / "docs" / "roles" / "seats.json", roster / "seats.json")
+    # The fast path runs only in the engine repository, and reads the touched paths from git.
+    git(s.repo, "remote", "add", "origin", ENGINE_ORIGIN)
+    resync(s)
     return s
 
 
@@ -177,11 +221,38 @@ def test_a_calibrated_seat_with_nothing_against_it_may_act_without_review(sb: Sa
     assert (code, doc["result"]) == (NO_REVIEW, "NO-REVIEW"), why(doc)
 
 
-def test_a_seat_with_no_samples_and_no_signals_may_act_without_review(sb: Sandbox) -> None:
-    """T1 replaced the 60-sample gate: with no owner rating and no signal against it, a seat is
-    calibrated, and the reversal budget and the chain limit bound its first acts."""
+def test_an_empty_history_is_not_calibrated(sb: Sandbox) -> None:
+    """Manager decision 2026-11-09: no signal against a seat is not evidence for it, so the fast
+    path stays closed until 20 resolved outcomes are logged."""
     code, doc = gate(sb)
-    assert (code, doc["result"]) == (NO_REVIEW, "NO-REVIEW"), why(doc)
+    assert code == REVIEW and "resolved outcomes 0/20 BELOW FLOOR" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize(("count", "expected"), [(FLOOR - 1, REVIEW), (FLOOR, NO_REVIEW)])
+def test_the_resolved_outcome_floor(sb: Sandbox, count: int, expected: int) -> None:
+    pending = [rec(at=ago(days=2, minutes=i), item=f"p{i}") for i in range(30)]
+    seed_vault(sb, calibrated("manager", count) + pending)
+    code, doc = gate(sb)
+    assert code == expected, why(doc)
+
+
+def test_a_status_logged_later_resolves_a_decision(sb: Sandbox) -> None:
+    decided = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(FLOOR)]
+    merged = [
+        rec("outcome", at=ago(days=1), seat="lander", ref=d["id"], outcome="merged")
+        for d in decided
+    ]
+    seed_vault(sb, decided + merged)
+    code, doc = gate(sb)
+    assert code == NO_REVIEW, why(doc)
+
+
+def test_no_review_names_the_conditions_it_did_not_check(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    proc = sb.run(DECISION, *no_host_usage(sb, ("-Gate", "-Item", "1", "-Seat", "manager", *PLAIN)))
+    assert proc.returncode == NO_REVIEW and proc.stdout.strip() == "NO-REVIEW", proc.stderr
+    for unchecked in ("a single revert or PR close undoes the act", "the act serves one item"):
+        assert f"unchecked: {unchecked}" in proc.stderr, proc.stderr
 
 
 def test_the_plain_answer_is_one_word_with_the_reasons_on_stderr(sb: Sandbox) -> None:
@@ -198,7 +269,115 @@ def test_an_act_that_names_nothing_it_touches_reviews(sb: Sandbox) -> None:
     """An act that changes no file has no git undo, so it has no fast path."""
     seed_vault(sb, calibrated("manager"))
     code, doc = gate_touching(sb, ())
-    assert code == REVIEW and "no -Touches path was given" in why(doc)
+    assert code == REVIEW and "git shows no changed path and no -Touches" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "messagefoundry/parsing/peek.py",
+        "messagefoundry/parsing/_builtin_hl7.py",
+        "samples/config/IB_DEMO_ORU_router.py",
+        "messagefoundry_toolkit/generators/adt.py",
+        "docs/CONNECTIONS.md",
+        "tests/test_parsing.py",
+    ],
+)
+def test_a_path_on_the_allowlist_may_take_the_fast_path(sb: Sandbox, path: str) -> None:
+    seed_vault(sb, calibrated("manager"))
+    code, doc = gate_touching(sb, ("-Touches", path))
+    assert code == NO_REVIEW, why(doc)
+
+
+def test_a_path_git_shows_is_read_though_touches_omits_it(sb: Sandbox) -> None:
+    """The paths are derived from git, so leaving one out of -Touches does not hide it."""
+    seed_vault(sb, calibrated("manager"))
+    (sb.repo / "docs" / "SECURITY.md").write_text("x\n", encoding="utf-8")
+    git(sb.repo, "add", "-A")
+    git(sb.repo, "commit", "-q", "-m", "branch work")
+    code, doc = gate(sb)
+    assert code == REVIEW and "touches: 'docs/SECURITY.md'" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize("staged", [False, True], ids=["untracked", "staged"])
+def test_an_uncommitted_path_is_read_too(sb: Sandbox, staged: bool) -> None:
+    seed_vault(sb, calibrated("manager"))
+    (sb.repo / "CLAUDE.md").write_text("x\n", encoding="utf-8")
+    if staged:
+        git(sb.repo, "add", "CLAUDE.md")
+    code, doc = gate(sb)
+    assert code == REVIEW and "touches: 'CLAUDE.md'" in why(doc), why(doc)
+
+
+def test_a_modified_tracked_file_is_read(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    seats = sb.repo / "docs" / "roles" / "seats.json"
+    seats.write_text(seats.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == REVIEW and "docs/roles/seats.json" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://github.com/MEFORORG/MessageFoundry-vault.git",
+        "https://github.com/someone/MessageFoundry.git",
+        "https://example.com/MEFORORG/MessageFoundry.git",
+        None,
+    ],
+    ids=["vault", "fork", "other-host", "no-origin"],
+)
+def test_the_fast_path_runs_only_in_the_engine_repository(sb: Sandbox, origin: str | None) -> None:
+    seed_vault(sb, calibrated("manager"))
+    if origin is None:
+        git(sb.repo, "remote", "remove", "origin")
+    else:
+        git(sb.repo, "remote", "set-url", "origin", origin)
+    code, doc = gate(sb)
+    assert code == REVIEW and "repository:" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["git@github.com:MEFORORG/MessageFoundry.git", "https://github.com/MEFORORG/MessageFoundry"],
+)
+def test_the_engine_origin_in_its_other_spellings_passes(sb: Sandbox, origin: str) -> None:
+    seed_vault(sb, calibrated("manager"))
+    git(sb.repo, "remote", "set-url", "origin", origin)
+    code, doc = gate(sb)
+    assert code == NO_REVIEW, why(doc)
+
+
+def test_a_missing_roster_reviews(sb: Sandbox) -> None:
+    (sb.repo / "docs" / "roles" / "seats.json").unlink()
+    resync(sb)
+    seed_vault(sb, calibrated("manager"))
+    code, doc = gate(sb)
+    assert code == REVIEW and "not a live seat or alias" in why(doc), why(doc)
+
+
+def test_a_malformed_roster_reviews(sb: Sandbox) -> None:
+    (sb.repo / "docs" / "roles" / "seats.json").write_text("{", encoding="utf-8")
+    resync(sb)
+    seed_vault(sb, calibrated("manager"))
+    code, doc = gate(sb)
+    assert code == REVIEW and "not a live seat or alias" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize("body", [None, "{"], ids=["missing", "malformed"])
+def test_an_alias_without_a_roster_is_not_exempt_from_the_halt(
+    sb: Sandbox, body: str | None
+) -> None:
+    """'land' is the Lander only through the roster, so without one the cost rung is read."""
+    seats = sb.repo / "docs" / "roles" / "seats.json"
+    if body is None:
+        seats.unlink()
+    else:
+        seats.write_text(body, encoding="utf-8")
+    resync(sb)
+    write_fake_usage(_usage_path(sb), usage(99.0, state="CRITICAL"))
+    code, doc = gate(sb, seat="land")
+    assert code == HALT, why(doc)
 
 
 def test_a_seat_the_roster_does_not_resolve_reviews(sb: Sandbox) -> None:
@@ -294,6 +473,29 @@ def test_an_alias_shares_its_seats_calibration(sb: Sandbox) -> None:
         "docs/ARCHITECTURE.md",
         ":/scripts/hooks/x.py",
         "CLAUDE.md::$DATA",
+        "messagefoundry/transports/mllp.py",
+        "messagefoundry/store/store.py",
+        "messagefoundry/pipeline/engine.py",
+        "messagefoundry/config/wiring.py",
+        "messagefoundry/__main__.py",
+        "messagefoundry_webconsole/app.py",
+        "environments/prod.toml",
+        "docs/SUPPLY-CHAIN.md",
+        "docs/ASVS-ASSESSMENT-METHOD.md",
+        "docs/EXPOSURE-SURFACE.md",
+        "docs/DEPLOYMENT.md",
+        "tests/conftest.py",
+        "tests/_fake_gh.py",
+        "tests/fixtures/x.hl7",
+        "tests/test_builtin_hl7_hardening.py",
+        "tests/test_parser_refusal_guards.py",
+        "tests/test_peek.py",
+        "PROGRA~1/x.py",
+        "messagefoundry/parsing/PEEK~1.PY",
+        "~/x.py",
+        "samples/../scripts/hooks/x.py",
+        "README.md",
+        "harness/app.py",
     ],
 )
 def test_a_class_c_or_unclassifiable_path_reviews(sb: Sandbox, path: str) -> None:
@@ -372,9 +574,11 @@ def test_a_reversal_logged_with_a_hash_item_closes_the_item(sb: Sandbox) -> None
     assert code == REVIEW and "on item 4242 was reversed" in why(doc), why(doc)
 
 
-@pytest.mark.parametrize("near", ["hold", "Lander-hold", "red", "red after merge", "reverted"])
+@pytest.mark.parametrize(
+    "near", ["hold", "Lander-hold", "red", "red after merge", "reverted", "reopen", "override"]
+)
 def test_a_near_miss_signal_spelling_is_refused_at_write(sb: Sandbox, near: str) -> None:
-    """It would be the decision's latest outcome and hide a reversal, so it is never written."""
+    """It would be read as a status and the signal lost, so it is never written."""
     ref = rec()["id"]
     proc = sb.run(
         DECISION, "-Log", "-Kind", "outcome", "-Seat", "lander", "-Ref", ref, "-Outcome", near
@@ -390,13 +594,21 @@ def test_a_signal_is_read_whatever_its_case(sb: Sandbox) -> None:
     assert code == REVIEW and "Lander holds 20.0% BREACH" in why(doc), why(doc)
 
 
-def test_a_halted_decision_is_not_in_the_signal_denominator(sb: Sandbox) -> None:
-    """Deferred decisions can collect no signal, so they cannot dilute a breach."""
-    acted = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(10)]
-    halted = [rec(at=ago(days=4, minutes=i), item=f"h{i}", gate="HALT") for i in range(40)]
-    seed_vault(sb, acted + halted + [_signal(d, "held") for d in acted[:2]])
+@pytest.mark.parametrize(
+    "fields",
+    [{"gate": "HALT"}, {"gate": "PENDING"}, {"outcome": "dropped"}],
+    ids=["halted", "pending-gate", "dropped"],
+)
+def test_a_decision_that_cannot_carry_a_result_is_not_in_the_denominator(
+    sb: Sandbox, fields: dict[str, str]
+) -> None:
+    """Deferred, unfinished or dropped decisions can collect no signal, so they cannot dilute a
+    breach."""
+    acted = calibrated("manager")
+    idle = [rec(at=ago(days=4, minutes=i), item=f"h{i}", **fields) for i in range(60)]
+    seed_vault(sb, acted + idle + [_signal(d, "held") for d in acted[:2]])
     code, doc = gate(sb)
-    assert code == REVIEW and "Lander holds 20.0% BREACH" in why(doc), why(doc)
+    assert code == REVIEW and "Lander holds 10.0% BREACH" in why(doc), why(doc)
 
 
 def test_a_hold_later_cleared_still_counts(sb: Sandbox) -> None:
@@ -413,7 +625,7 @@ def test_a_hold_later_cleared_still_counts(sb: Sandbox) -> None:
 
 
 def test_one_signal_in_twenty_is_inside_the_bar(sb: Sandbox) -> None:
-    recent = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(20)]
+    recent = calibrated("manager")
     seed_vault(sb, [*recent, _signal(recent[0], "red-after-merge"), _signal(recent[1], "held")])
     code, doc = gate(sb)
     assert code == NO_REVIEW, why(doc)
@@ -1236,14 +1448,31 @@ def test_a_breach_older_than_24_hours_has_reopened(sb: Sandbox) -> None:
     assert code == NO_REVIEW, why(doc)
 
 
-def test_a_reversal_corrected_by_a_later_outcome_is_not_one(sb: Sandbox) -> None:
+def test_a_reversal_is_sticky_whatever_is_logged_after_it(sb: Sandbox) -> None:
+    """Manager decision 2026-11-09: no later outcome cancels a reversal."""
     mine = [rec(at=ago(days=20), seat="manager", item=f"x{i}") for i in range(2)]
     seed_vault(sb, calibrated("manager") + mine)
     seed_vault(sb, [reversal(mine[0], ago(hours=3)), reversal(mine[1], ago(hours=2))])
     fixed = rec("outcome", at=ago(hours=1), seat="lander", ref=mine[0]["id"], outcome="kept")
     seed_vault(sb, [fixed])
     code, doc = gate(sb)
-    assert code == NO_REVIEW, why(doc)
+    assert code == REVIEW and "two reversals of manager's decisions" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize("word", ["reopened", "rebriefed", "re-briefed", "Overridden"])
+def test_every_reversal_word_is_a_reversal(sb: Sandbox, word: str) -> None:
+    theirs = rec(at=ago(days=6), seat="builder", item="4242")
+    undone = rec("outcome", at=ago(days=5), seat="lander", ref=theirs["id"], outcome=word)
+    seed_vault(sb, [*calibrated("manager"), theirs, undone])
+    code, doc = gate(sb)
+    assert code == REVIEW and "on item 4242 was reversed" in why(doc), why(doc)
+
+
+def test_a_reversal_word_counts_in_the_reversal_rate(sb: Sandbox) -> None:
+    recent = calibrated("manager")
+    seed_vault(sb, recent + [_signal(d, "reopened") for d in recent[:2]])
+    code, doc = gate(sb)
+    assert code == REVIEW and "reversal rate 10.0% BREACH" in why(doc), why(doc)
 
 
 def test_an_earlier_reversal_on_the_same_item_reviews(sb: Sandbox) -> None:
@@ -1275,6 +1504,16 @@ def test_the_item_floor_counts_unsampled_class_b_in_24_hours(
     seed_vault(sb, [*calibrated("manager"), *recent, stale, class_c])
     code, doc = gate(sb)
     assert code == expected, why(doc)
+
+
+def test_the_item_floor_reads_a_hash_item_as_the_same_item(sb: Sandbox) -> None:
+    recent = [
+        rec(at=ago(hours=1 + i), seat="builder", item=name)
+        for i, name in enumerate(["#4242", " 4242", "4242"])
+    ]
+    seed_vault(sb, [*calibrated("manager"), *recent])
+    code, doc = gate(sb)
+    assert code == REVIEW and "chain: depth 3" in why(doc), why(doc)
 
 
 def test_a_future_dated_decision_counts_toward_the_floor(sb: Sandbox) -> None:
@@ -1330,7 +1569,7 @@ def test_a_builds_on_day_outside_the_window_does_not_widen_calibration(sb: Sandb
         rec("rating", at=ago(days=80, minutes=-1 - i), seat="owner", ref=d["id"], rating="disagree")
         for i, d in enumerate(old)
     ]
-    seed_vault(sb, old + rated)
+    seed_vault(sb, old + rated + calibrated("manager"))
     code, doc = gate(sb, "-BuildsOn", old[0]["id"])
     assert code == NO_REVIEW, why(doc)
 
@@ -1857,8 +2096,8 @@ def test_the_digest_shows_the_gate_state_and_lists_the_attic_without_pruning(
     gate_part = out[out.index("## Gate state") : out.index("## The attic")]
     assert "fleet-wide: 2 of 3 in the trailing 24 hours; open" in gate_part
     assert "| manager | 2 of 2 in the trailing 24 hours; CLOSED" in gate_part
-    # Three recent decisions with no signal against them: calibrated under T1.
-    assert "| builder | 0 of 2 in the trailing 24 hours; open | yes |" in gate_part
+    # Three recent decisions with no signal against them, none resolved: below the floor.
+    assert "| builder | 0 of 2 in the trailing 24 hours; open | no |" in gate_part
     assert "Cost rung, read now on the account this digest ran on: **OK**" in gate_part
     assert "- item 77: 3 unsampled Class B decisions" in gate_part
     attic = out[out.index("## The attic") :]

@@ -335,7 +335,7 @@ def test_the_digest_shows_reds_after_merge_and_lander_holds(sb: Sandbox) -> None
     ]
     seed_vault(sb, recent + signals)
     cells = _calibration_row(digest(sb, "-Sample", "0"), "lander", "B")
-    assert cells[7:10] == ["0.0%", "10.0% BREACH", "20.0% BREACH"]
+    assert cells[8:11] == ["0.0%", "10.0% BREACH", "20.0% BREACH"]
 
 
 def test_the_fourteen_day_reversal_rate_breaches_above_five_percent(sb: Sandbox) -> None:
@@ -349,7 +349,9 @@ def test_the_fourteen_day_reversal_rate_breaches_above_five_percent(sb: Sandbox)
     seed_vault(sb, recent + stale + reversed_)
     out = digest(sb, "-Sample", "0")
     cells = _calibration_row(out, "lander", "B")
-    assert cells[5:8] == ["10", "1", "10.0% BREACH"]
+    assert [cells[5], *cells[7:9]] == ["10", "1", "10.0% BREACH"]
+    # Ten decisions, none with a resolved status, and one reversal mark: below the floor.
+    assert cells[6] == "1/20 BELOW FLOOR"
     assert f"reversal of `{recent[0]['id']}`" in out
 
 

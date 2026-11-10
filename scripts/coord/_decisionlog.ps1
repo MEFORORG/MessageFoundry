@@ -581,45 +581,68 @@ function Get-DecisionKillSwitch {
 function Get-DecisionLatest($Records, [string]$Kind) {
     # The latest record of a kind per decision it refers to. Ordered by id, which is the UTC write
     # time to the millisecond with a random tail: `ts` reads back as a DateTime, whose string form
-    # sorts month first and drops the milliseconds. A signal outcome (Test-DecisionSignalOutcome) is
-    # never the latest outcome: it is read by Get-DecisionSignals, and a hold or red logged after a
-    # reversal must not hide the reversal from the gate.
+    # sorts month first and drops the milliseconds. For `outcome` this is the decision's STATUS:
+    # a signal or a reversal (Test-DecisionMarkOutcome) is never it, because those are marks that
+    # Get-DecisionSignals reads and no later record cancels.
     $map = @{}
-    foreach ($r in @($Records | Where-Object { $_.kind -eq $Kind -and $_.ref -and -not ($Kind -eq 'outcome' -and (Test-DecisionSignalOutcome $_.outcome)) } |
+    foreach ($r in @($Records | Where-Object { $_.kind -eq $Kind -and $_.ref -and -not ($Kind -eq 'outcome' -and (Test-DecisionMarkOutcome $_.outcome)) } |
                 Sort-Object { [string]$_.id })) { $map[[string]$r.ref] = $r }
     return $map
 }
 
 function Get-DecisionOutcome($Record, [hashtable]$Outcomes) {
-    # A decision's outcome: its latest `outcome` record's, else the one it was logged with.
+    # A decision's status outcome: its latest non-mark `outcome` record's, else the one it was
+    # logged with.
     if ($Outcomes.ContainsKey([string]$Record.id)) { return [string]$Outcomes[[string]$Record.id].outcome }
     return [string]$Record.outcome
 }
 
-# The outcome values that are automated calibration signals besides `reversed` (owner ruling
-# 2026-11-09, tier T1; docs/AUTONOMY-PLAN.md section 12): a required check that went red after the
-# act merged, and a Lander hold on the act's pull request.
+# The outcome values that are calibration signals (owner ruling 2026-11-09, tier T1;
+# docs/AUTONOMY-PLAN.md section 12): a required check red after the act merged, a Lander hold, and
+# a reversal, which plan 4.2 defines as a revert, a reopen, a re-brief or an override. Every one is
+# STICKY: once logged it counts, and no later outcome cancels it.
 $script:DecisionSignalOutcomes = @('red-after-merge', 'held')
+$script:DecisionReversalOutcomes = @('reversed', 'reopened', 'rebriefed', 're-briefed', 'overridden')
+# The status outcomes that are not yet a result.
+$script:DecisionUnresolvedOutcomes = @('', 'pending', 'asked')
+# NO-REVIEW needs at least this many of the seat's decisions in the 14-day window to carry a
+# resolved outcome (Manager decision 2026-11-09, plan section 12).
+$script:DecisionResolvedFloor = 20
+
+function Get-DecisionOutcomeWord($Outcome) { return ([string]$Outcome).Trim().ToLowerInvariant() }
 
 function Test-DecisionSignalOutcome($Outcome) {
     # Case and surrounding space ignored, so a hand-logged `Held` counts as `held`.
-    return ($script:DecisionSignalOutcomes -contains ([string]$Outcome).Trim().ToLowerInvariant())
+    return ($script:DecisionSignalOutcomes -contains (Get-DecisionOutcomeWord $Outcome))
+}
+
+function Test-DecisionReversalOutcome($Outcome) {
+    return ($script:DecisionReversalOutcomes -contains (Get-DecisionOutcomeWord $Outcome))
+}
+
+function Test-DecisionMarkOutcome($Outcome) {
+    return ((Test-DecisionSignalOutcome $Outcome) -or (Test-DecisionReversalOutcome $Outcome))
 }
 
 function Get-DecisionSignals($Records) {
     <#
-      Every signal outcome ever recorded per decision, as ref -> list of lower-case values. Unlike
-      `reversed`, which reads the LATEST outcome so a mistaken one can be corrected, a signal counts
-      once any `outcome` record carries it: a hold that was later cleared was still a hold.
+      Every mark ever recorded per decision, as ref -> list of lower-case values: `red-after-merge`,
+      `held`, and `reversed` for any reversal word. A mark counts once any `outcome` record carries
+      it, so a hold that was later cleared was still a hold, and a reversal stays a reversal.
     #>
     $map = @{}
-    foreach ($o in @($Records | Where-Object { $_.kind -eq 'outcome' -and $_.ref -and (Test-DecisionSignalOutcome $_.outcome) })) {
+    foreach ($o in @($Records | Where-Object { $_.kind -eq 'outcome' -and $_.ref -and (Test-DecisionMarkOutcome $_.outcome) })) {
         $ref = [string]$o.ref
-        $v = ([string]$o.outcome).Trim().ToLowerInvariant()
+        $v = if (Test-DecisionReversalOutcome $o.outcome) { 'reversed' } else { Get-DecisionOutcomeWord $o.outcome }
         if (-not $map.ContainsKey($ref)) { $map[$ref] = [System.Collections.Generic.List[string]]::new() }
         if (-not $map[$ref].Contains($v)) { $map[$ref].Add($v) }
     }
     return $map
+}
+
+function Get-DecisionItemKey($Item) {
+    # Items compare without case, surrounding space or a leading '#', so '#4242' is 4242.
+    return ([string]$Item).Trim().TrimStart('#').Trim().ToLowerInvariant()
 }
 
 $script:DecisionRoster = $null
@@ -664,18 +687,19 @@ function Format-DecisionRate([int]$Count, [int]$Of) {
 
 function Get-DecisionCalibration {
     <#
-      One seat and class's calibration. Since the owner ruling of 2026-11-09 (tier T1; plan section
-      12) it is the signals over the decisions logged on -RecentDays and not answered HALT (a
-      halted decision was deferred, so it can collect no signal): the reversal rate, the rate of
-      decisions with a red after merge, and the rate with a Lander hold, each a breach above 5
-      percent. No decisions in the window is no breach. The arithmetic is automatic; its inputs
-      are `outcome` records a seat logs, and nothing writes one for it.
+      One seat and class's calibration (owner ruling 2026-11-09, tier T1, and the Manager's
+      decisions of that day; plan section 12). It reads the seat's decisions logged on -RecentDays
+      that can carry a result: not answered HALT, not left PENDING, and not dropped (status outcome
+      `dropped`). A decision answered REVIEW and acted on after its review counts.
 
-      The owner's blind sample is optional now, so fewer than 60 ratings no longer holds a class on
-      the review path. A rating the owner did give still counts: any trailing window of up to 60
-      ratings holding more than 3 disagreements is a breach, and after the latest one, 60 ratings
-      newer than it must pass (plan section 4.2). Calibrated means no breach of any kind. The
-      digest's calibration table prints this, and the gate reads Calibrated.
+      Calibrated needs all of: at least $script:DecisionResolvedFloor of those decisions with a
+      resolved outcome (a mark, or a status other than pending or asked), so an empty or unlogged
+      history is NOT calibrated; the reversal rate, the rate of reds after merge and the rate of
+      Lander holds each at 5 percent or less; and no blind-sample breach. The blind sample is
+      optional: any trailing window of up to 60 ratings holding more than 3 disagreements is a
+      breach, and after the latest one, 60 ratings newer than it must pass (plan section 4.2). The
+      arithmetic is automatic; its inputs are `outcome` records a seat logs, and nothing writes one
+      for it. The digest's calibration table prints this, and the gate reads Calibrated.
     #>
     param($Decisions, [hashtable]$Ratings, [hashtable]$Outcomes, [string[]]$RecentDays, [hashtable]$Signals = @{})
     # Verdicts oldest first.
@@ -693,23 +717,63 @@ function Get-DecisionCalibration {
     $blind = if ($lastBreach -ge 0 -and $since -lt 60) { "BREACH: review path, $since/60 fresh samples" }
     elseif ($n -lt 60) { $blindOk = $true; "optional, $n/60 samples" }
     else { $blindOk = $true; 'calibrated' }
-    $recent = @($Decisions | Where-Object { [string]$_.gate -ne 'HALT' -and $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) })
-    $revd = @($recent | Where-Object { (Get-DecisionOutcome $_ $Outcomes).Trim() -eq 'reversed' }).Count
-    $red = @($recent | Where-Object { $Signals.ContainsKey([string]$_.id) -and $Signals[[string]$_.id].Contains('red-after-merge') }).Count
-    $held = @($recent | Where-Object { $Signals.ContainsKey([string]$_.id) -and $Signals[[string]$_.id].Contains('held') }).Count
+    $recent = @($Decisions | Where-Object {
+            [string]$_.gate -notin @('HALT', 'PENDING') -and (Get-DecisionOutcomeWord (Get-DecisionOutcome $_ $Outcomes)) -ne 'dropped' -and
+            $RecentDays -contains (Get-DecisionIdDay ([string]$_.id))
+        })
+    function Test-Mark($d, [string]$Mark) { return ($Signals.ContainsKey([string]$d.id) -and $Signals[[string]$d.id].Contains($Mark)) }
+    $revd = @($recent | Where-Object { Test-Mark $_ 'reversed' }).Count
+    $red = @($recent | Where-Object { Test-Mark $_ 'red-after-merge' }).Count
+    $held = @($recent | Where-Object { Test-Mark $_ 'held' }).Count
+    $resolved = @($recent | Where-Object {
+            $Signals.ContainsKey([string]$_.id) -or $script:DecisionUnresolvedOutcomes -notcontains (Get-DecisionOutcomeWord (Get-DecisionOutcome $_ $Outcomes))
+        }).Count
     $of = $recent.Count
     $breach = $of -and (($revd / $of) -gt 0.05 -or ($red / $of) -gt 0.05 -or ($held / $of) -gt 0.05)
+    $floorOk = $resolved -ge $script:DecisionResolvedFloor
     return [pscustomobject]@{
         Rated = $rated; Disagree = $dis; Blind = $blind; Recent = $of; Reversed = $revd
         RateText = (Format-DecisionRate $revd $of); Red = $red; RedText = (Format-DecisionRate $red $of)
-        Held = $held; HeldText = (Format-DecisionRate $held $of); Calibrated = ($blindOk -and -not $breach)
+        Held = $held; HeldText = (Format-DecisionRate $held $of); Resolved = $resolved
+        ResolvedText = "$resolved/$($script:DecisionResolvedFloor)$(if ($floorOk) { '' } else { ' BELOW FLOOR' })"
+        Calibrated = ($blindOk -and -not $breach -and $floorOk)
     }
+}
+
+# THE FAST-PATH ALLOWLIST, the one place it lives (Manager decision 2026-11-09, plan section 12).
+# A path the T1 fast path may touch matches one of these, and Get-DecisionClassCPath names nothing
+# about it. Anything else goes to review. Product code outside the security modules, and its tests:
+# keep it conservative, since a path added here skips review.
+$script:DecisionFastPathAllow = @(
+    '^messagefoundry/parsing/.+',
+    '^messagefoundry_toolkit/generators/.+',
+    '^messagefoundry_toolkit/hl7(schema|structures)\.py$',
+    '^samples/.+',
+    # Ordinary product pages, named one by one: a rule, assurance, security, deployment or
+    # exposure page is never here.
+    '^docs/(architecture-diagram|browser-support|codesets|connections|dicom|feature-map|hl7-message-ordering-reference|hl7-validation|load-testing|mental-model|message-ordering-design|steps-palette|system-requirements|throughput|tray|user-guide)\.md$',
+    # Their tests, named one by one: a hardening, bounds, guard, transport or pipeline test is not.
+    '^tests/test_(binary_carriage|builtin_hl7_parity|generate_cli|generated_adt|generators_(choice|core|types)|hl7_core_features|hl7_raw_separators|hl7schema|hl7structures|message|message_(copy|split|timestamps|type_of)|parse_tree|parsing|samples_typed_steps|x12_parsing|x12_validate)\.py$'
+)
+
+function Get-DecisionFastPathRefusal([string]$Path) {
+    <#
+      Why a path keeps the act off the T1 fast path, or '' when the path may take it. It fails
+      closed: a path Get-DecisionClassCPath refuses or names, or one that matches no pattern in
+      $script:DecisionFastPathAllow, is refused. The allowlist is the engine repository's.
+    #>
+    $c = Get-DecisionClassCPath $Path
+    if ($c) { return $c }
+    $l = ((@(([string]$Path).Trim() -replace '\\', '/' -split '/' | Where-Object { $_ -and $_ -ne '.' } | ForEach-Object { $_.TrimEnd('.') })) -join '/').ToLowerInvariant()
+    foreach ($a in $script:DecisionFastPathAllow) { if ($l -match $a) { return '' } }
+    return "'$Path' is not on the fast-path allowlist (_decisionlog.ps1 DecisionFastPathAllow)"
 }
 
 function Get-DecisionClassCPath([string]$Path) {
     <#
       Why a path the act touches keeps it off the T1 fast path, or '' when this list does not name
-      it. It names at least these: the rule and instruction files plan R3 lists, the coordination,
+      it. The gate reads it through Get-DecisionFastPathRefusal, so a path this list does not name
+      still needs the allowlist; this list is what overrides the allowlist. It names at least these: the rule and instruction files plan R3 lists, the coordination,
       hook, gate, release and dev-setup scripts and the tests that pin them, any file whose name
       reads as security, PHI, credential, TLS or policy code, the API code, the scan and lint
       configuration, the ADRs (T4 reads their direction), the legal files, the ignore and worktree
@@ -727,7 +791,8 @@ function Get-DecisionClassCPath([string]$Path) {
     $p = ([string]$Path).Trim() -replace '\\', '/'
     if (-not $p) { return 'an empty path cannot be classified' }
     if ($p -match '[\s,;:$*?\[\]{}|<>"]') { return "'$Path' carries a glob, a list separator, whitespace, a colon or a dollar sign, so it cannot be classified; name each path on its own line" }
-    if ($p -match '^(/|~)') { return "'$Path' is not a path relative to the repository, so it cannot be classified" }
+    if ($p -match '^/') { return "'$Path' is not a path relative to the repository, so it cannot be classified" }
+    if ($p.Contains('~')) { return "'$Path' carries a '~', a home path or an 8.3 short name that may alias another path, so it cannot be classified" }
     $segs = @($p -split '/' | Where-Object { $_ -and $_ -ne '.' } | ForEach-Object { $_.TrimEnd('.') })
     if ($segs -contains '' -or $segs -contains '..') { return "'$Path' climbs out with '..' or names a dot-only segment, so it cannot be classified" }
     if (-not $segs.Count) { return "'$Path' names the whole tree, so it cannot be classified" }
@@ -744,8 +809,9 @@ function Get-DecisionClassCPath([string]$Path) {
     $words = 'redact|secret|credential|tls|auth|keywrap|pki|dpapi|crypt|cert|password|mfa|webauthn|token|security|policy|phi|guard|gate|smart'
     if ($leaf -match "($words)") { return "'$Path' is named as security, PHI, credential or policy code (Class C on the fast path)" }
     $dirs = @(
-        '.agents', '.claude', '.codex', '.github', '.mefor-hooks', '.semgrep', 'docker/locks', 'docs/adr', 'docs/roles',
-        'docs/security', 'messagefoundry/api', 'messagefoundry/auth', 'messagefoundry/security', 'messagefoundry/support',
+        '.agents', '.claude', '.codex', '.github', '.mefor-hooks', '.semgrep', 'docker', 'docs/adr', 'docs/roles', 'environments', 'net-helper',
+        'docs/security', 'messagefoundry/api', 'messagefoundry/auth', 'messagefoundry/config', 'messagefoundry/pipeline', 'messagefoundry/security',
+        'messagefoundry/store', 'messagefoundry/support', 'messagefoundry/transports', 'messagefoundry_webconsole', 'scripts', 'tests/fixtures',
         'messagefoundry_toolkit/anon', 'roles', 'scripts/asvs', 'scripts/ci', 'scripts/coord', 'scripts/dev', 'scripts/hooks',
         'scripts/quality', 'scripts/release', 'scripts/security', 'scripts/worktree', 'security', 'skills', 'tee/anon'
     )
@@ -762,28 +828,28 @@ function Get-DecisionClassCPath([string]$Path) {
     foreach ($x in @($dirs) + @($files)) {
         if ($x.StartsWith("$l/")) { return "'$Path' holds $x, so as a directory it cannot be classified; name the files" }
     }
-    $pins = 'afk|coord|worktree|role_cards|claim|push|required_contexts|dependency_boundaries|collision|glyph|ledger|installed|operator_docs|hook|seat|mail|lane|alloc'
+    if ($leaf -eq 'conftest.py' -or ($l.StartsWith('tests/') -and $leaf.StartsWith('_'))) { return "'$Path' is a test fixture or shared test helper (Class C on the fast path)" }
+    $pins = 'afk|coord|worktree|role_cards|claim|push|required_contexts|dependency_boundaries|collision|glyph|ledger|installed|operator_docs|hook|seat|mail|lane|alloc|claude|attribution|announce|cloud|durability|session|asvs|anon|audit|settings'
     if ($l -match "^tests/test_($pins)") { return "'$Path' is a test that pins a gate or a rule (Class C)" }
     return ''
 }
 
 function Get-DecisionReversals($Records) {
     <#
-      Each reversed decision once: an `outcome` record with outcome `reversed`, deduplicated by its
-      ref, and the earliest such record is when it was reversed. A decision whose LATEST outcome is
-      something else (a mistaken `reversed`, corrected) is not one, as the calibration reads it.
+      Each reversed decision once: an `outcome` record with a reversal word (`reversed`,
+      `reopened`, `rebriefed`, `re-briefed`, `overridden`), deduplicated by its ref, and the
+      earliest such record is when it was reversed. A reversal is sticky: no later outcome cancels
+      it (Manager decision 2026-11-09).
       Seat and Item are the DECISION's, joined through the ref, never the seat that logged the
       outcome. A ref the records do not hold has no Seat, and its Item is the outcome record's own,
       which may be empty.
     #>
     $byId = @{}
     foreach ($r in @($Records | Where-Object { $_.kind -eq 'decision' })) { $byId[[string]$r.id] = $r }
-    $latest = Get-DecisionLatest $Records 'outcome'
     $seen = [System.Collections.Generic.HashSet[string]]::new()
     $out = [System.Collections.Generic.List[object]]::new()
-    foreach ($o in @($Records | Where-Object { $_.kind -eq 'outcome' -and ([string]$_.outcome).Trim() -eq 'reversed' -and $_.ref } | Sort-Object { [string]$_.id })) {
+    foreach ($o in @($Records | Where-Object { $_.kind -eq 'outcome' -and (Test-DecisionReversalOutcome $_.outcome) -and $_.ref } | Sort-Object { [string]$_.id })) {
         $ref = [string]$o.ref
-        if (([string]$latest[$ref].outcome).Trim() -ne 'reversed') { continue }
         if (-not $seen.Add($ref)) { continue }
         $d = if ($byId.ContainsKey($ref)) { $byId[$ref] } else { $null }
         $out.Add([pscustomobject]@{
@@ -877,10 +943,10 @@ function Get-DecisionChain {
         if (-not $byId.ContainsKey($id)) { $missing.Add($id); continue }
         $r = $byId[$id]
         if ($Ratings.ContainsKey($id)) { continue }
-        if ([string]$r.item -eq $Item -and (Test-DecisionUnsampledB $r $Ratings)) { $walked++ }
+        if ((Get-DecisionItemKey $r.item) -eq (Get-DecisionItemKey $Item) -and (Test-DecisionUnsampledB $r $Ratings)) { $walked++ }
         foreach ($p in @($r.buildsOn | Where-Object { $_ })) { $queue.Enqueue([string]$p) }
     }
-    $floor = @(Get-DecisionRecentUnsampledB -Records $byId.Values -Now $Now -Ratings $Ratings | Where-Object { [string]$_.item -eq $Item }).Count
+    $floor = @(Get-DecisionRecentUnsampledB -Records $byId.Values -Now $Now -Ratings $Ratings | Where-Object { (Get-DecisionItemKey $_.item) -eq (Get-DecisionItemKey $Item) }).Count
     return [pscustomobject]@{ Walked = $walked; Floor = $floor; Depth = [Math]::Max($walked, $floor); Missing = $missing.ToArray() }
 }
 

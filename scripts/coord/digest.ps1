@@ -37,13 +37,17 @@
     CALIBRATION, per seat and class, over the records -Window days back (default 60). Since the
     owner ruling of 2026-11-09 (tier T1; docs/AUTONOMY-PLAN.md section 12) it is automated signals,
     and the blind sample is optional:
-      * the 14-day reversal rate -- decisions marked `reversed` by an `outcome` record, over the
-        decisions logged in the 14 days ending -Day; above 5 percent is a breach;
+      * the 14-day reversal rate -- decisions any `outcome` record marks `reversed`, `reopened`,
+        `rebriefed`, `re-briefed` or `overridden`, over the decisions logged in the 14 days ending
+        -Day that can carry a result (not answered HALT, not left PENDING, not dropped); above 5
+        percent is a breach. Every mark is sticky: no later outcome cancels it;
       * the 14-day rates of reds after merge and of Lander holds -- decisions any `outcome` record
         marks `red-after-merge` or `held`; above 5 percent is a breach;
       * the owner's disagreement on the ratings given -- any trailing window of up to 60 holding
         more than 3 disagreements is a breach, and the class then stays on the review path until 60
-        ratings newer than the breach pass (plan section 4.2). Fewer than 60 ratings is no breach.
+        ratings newer than the breach pass (plan section 4.2). Fewer than 60 ratings is no breach;
+      * the floor -- fewer than 20 of those 14-day decisions with a resolved outcome (a mark, or a
+        status other than pending or asked) is not calibrated, so an empty history is not.
     A rating older than the window is not read, so the trailing 60 is a trailing 60 within it.
 
     THE GATE'S STATE (plan 4.5 to 4.7): the reversal budget fleet-wide and per seat, the cost rung
@@ -233,7 +237,7 @@ $md.Add('')
 
 $md.Add('## Reversals and tripwire hits')
 $md.Add('')
-$rev = @($today | Where-Object { $_.kind -eq 'outcome' -and $_.outcome -eq 'reversed' })
+$rev = @($today | Where-Object { $_.kind -eq 'outcome' -and (Test-DecisionReversalOutcome $_.outcome) })
 $trip = @($today | Where-Object { $_.kind -eq 'tripwire' })
 if (-not ($rev.Count + $trip.Count)) { $md.Add('None.') }
 foreach ($r in $rev) {
@@ -282,8 +286,8 @@ $md.Add('## Calibration, per seat and class')
 $md.Add('')
 $md.Add("Trailing 60 rated decisions within the last $Window days; reversals, reds after merge and Lander holds over the 14 days ending $Day.")
 $md.Add('')
-$md.Add('| Seat | Class | Rated | Disagree | Blind status | Decisions, 14 days | Reversed | Reversal rate | Red after merge | Lander holds |')
-$md.Add('|---|---|---|---|---|---|---|---|---|---|')
+$md.Add('| Seat | Class | Rated | Disagree | Blind status | Decisions, 14 days | Resolved, of the floor | Reversed | Reversal rate | Red after merge | Lander holds |')
+$md.Add('|---|---|---|---|---|---|---|---|---|---|---|')
 $recent = @(Get-DecisionDayRange $Day 14)
 # Kept by "seat|class", so the gate-state table below reads each seat's Class B row from here.
 $calibration = @{}
@@ -294,7 +298,7 @@ foreach ($g in @($decisions | Group-Object { "$(Get-DigestSeat ([string]$_.seat)
     $seat, $class = $g.Name -split '\|', 2
     $c = Get-DecisionCalibration -Decisions $g.Group -Ratings $ratings -Outcomes $outcomes -Signals $signals -RecentDays $recent
     $calibration[$g.Name] = $c
-    $md.Add("| $seat | $class | $($c.Rated) | $($c.Disagree) | $($c.Blind) | $($c.Recent) | $($c.Reversed) | $($c.RateText) | $($c.RedText) | $($c.HeldText) |")
+    $md.Add("| $seat | $class | $($c.Rated) | $($c.Disagree) | $($c.Blind) | $($c.Recent) | $($c.ResolvedText) | $($c.Reversed) | $($c.RateText) | $($c.RedText) | $($c.HeldText) |")
 }
 
 # THE GATE'S STATE (plan 4.5-4.7), from the shared functions decision.ps1 -Gate calls, as of the end
@@ -326,7 +330,7 @@ $md.Add('')
 $md.Add('| Seat | Seat reversal budget | Class B calibrated |')
 $md.Add('|---|---|---|')
 foreach ($s in @($decisions | ForEach-Object { Get-DigestSeat ([string]$_.seat) } | Where-Object { $_ } | Sort-Object -Unique)) {
-    # A seat with no Class B decisions has nothing against it, which the gate reads as calibrated.
+    # A seat with no Class B decisions is below the resolved-outcome floor, so it is not calibrated.
     $cal = $calibration["$s|B"]
     if (-not $cal) { $cal = Get-DecisionCalibration -Decisions @() -Ratings $ratings -Outcomes $outcomes -Signals $signals -RecentDays $recent }
     $md.Add("| $s | $(Format-Budget (Get-DecisionBudget -Reversals $reversals -Now $asOf -Seat $s)) | $(if (-not (Get-DecisionSeatKey $s)) { 'no, not a roster seat' } elseif ($cal.Calibrated) { 'yes' } else { 'no' }) |")
@@ -335,7 +339,7 @@ $md.Add('')
 $md.Add('Chain limit: each item where a further Class B decision would build on more than two unsampled ones, by the 24-hour floor. A decision''s own buildsOn links can only raise its depth.')
 $md.Add('')
 $deep = @(Get-DecisionRecentUnsampledB -Records $decisions -Now $asOf -Ratings $ratings | Where-Object { $_.item } |
-        Group-Object { [string]$_.item } | Where-Object { $_.Count -gt 2 } | Sort-Object Name |
+        Group-Object { Get-DecisionItemKey $_.item } | Where-Object { $_.Count -gt 2 } | Sort-Object Name |
         ForEach-Object { "- item $($_.Name): $($_.Count) unsampled Class B decisions in the trailing 24 hours" })
 if (-not $deep.Count) { $md.Add('None.') }
 foreach ($l in $deep) { $md.Add($l) }
