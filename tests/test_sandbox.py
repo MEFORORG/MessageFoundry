@@ -2491,13 +2491,16 @@ def test_the_eof_grace_is_one_budget_per_dispatch(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(sandbox_mod, "_has_exited", lambda proc: False)  # never exits
     session = _session(".")
     proc: Any = object()
-    started = time.monotonic()
-    assert session._eof_cause(proc, KillCause.CRASH) is KillCause.STDOUT_CLOSED
-    assert session._eof_cause(proc, KillCause.CRASH) is KillCause.STDOUT_CLOSED
-    assert session._eof_cause(proc, KillCause.CRASH) is KillCause.STDOUT_CLOSED
-    # Three graces would be 1.5 s; one grace and two floors are 0.7 s. The margin is for a slow host.
-    assert time.monotonic() - started < 2 * sandbox_mod._EOF_EXIT_GRACE_SECONDS
-    assert session._eof_grace_left == 0.0
+    try:
+        started = time.monotonic()
+        for _ in range(3):
+            assert session._eof_cause(proc, KillCause.CRASH) is KillCause.STDOUT_CLOSED
+        # Three graces would be 1.5 s; one grace and two floors are 0.7 s. The rest is margin for
+        # a slow host's sleeps.
+        assert time.monotonic() - started < 2.8 * sandbox_mod._EOF_EXIT_GRACE_SECONDS
+        assert session._eof_grace_left == 0.0
+    finally:
+        session.close()
 
 
 def test_a_fresh_worker_that_keeps_exiting_records_a_cause_and_says_so(

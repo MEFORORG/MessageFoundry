@@ -199,7 +199,8 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     A reap that is not a kill records nothing. At least these are such reaps: closing a session
     whose worker is gone, the prior generation's reap at the top of a spawn (a worker that died
     between dispatches on its own), and the reap after a queued EOF from a worker that has exited,
-    which only says the peer died, the check after an answer included. A worker that
+    which only says the peer died, the check after an answer included unless the answer announced
+    the exit (:attr:`MEMORY_CAP`). A worker that
     exits right after its boot is the exception, recorded as :attr:`EXITED_AFTER_BOOT`, because a
     feed whose workers keep doing so is a crash loop, not a peer that happened to die.
 
@@ -1040,7 +1041,10 @@ class SandboxSession:
                 f"sandbox worker did not start within {self.policy.startup_seconds}s"
             ) from None
         if frame is _EOF:
-            self._kill(proc, self._eof_kill_cause(proc, KillCause.BOOT_EXIT), phase)
+            cause = self._eof_kill_cause(proc, KillCause.BOOT_EXIT)
+            self._kill(proc, cause, phase)
+            if cause is KillCause.STDOUT_CLOSED:
+                raise SandboxError("sandbox worker closed its response pipe during bootstrap")
             raise SandboxError("sandbox worker exited during bootstrap")
         try:
             if frame is _OVERSIZE:
@@ -1209,7 +1213,6 @@ class SandboxSession:
         when: str,
         phase: str,
         *,
-        exited: KillCause | None = None,
         announced_exit: KillCause | None = None,
     ) -> None:
         """Drop the worker if anything is pending that no outstanding request asked for.
@@ -1252,8 +1255,8 @@ class SandboxSession:
         a child that died between dispatches would lose the next one instead of respawning
         transparently. Reap it and let the caller carry on.
 
-        ``exited`` and ``announced_exit`` are :meth:`_drop_unsolicited`'s."""
-        if self._drop_unsolicited(proc, when, phase, exited=exited, announced_exit=announced_exit):
+        ``announced_exit`` is :meth:`_drop_unsolicited`'s."""
+        if self._drop_unsolicited(proc, when, phase, announced_exit=announced_exit):
             raise _unsolicited_error(when)
 
     def _drop_unsolicited(
@@ -1267,7 +1270,8 @@ class SandboxSession:
     ) -> bool:
         """:meth:`_reject_unsolicited`'s check without the raise: True when a stray FRAME, or an
         over-cap length header, killed the worker. False when nothing was waiting or a queued EOF
-        reaped it.
+        was found, which reaps the worker and may also record a kill, as below, so a False return
+        does not say that nothing was recorded.
 
         A queued EOF is a kill as :attr:`KillCause.STDOUT_CLOSED` if the worker is still running
         once the grace is spent. If it has exited, it is recorded as ``exited``, or not at all when
@@ -1300,7 +1304,8 @@ class SandboxSession:
         The unsolicited check runs **after** the liveness check, not before: a killed worker's queue is
         discarded wholesale by :meth:`_spawn`, so its leftovers are neither reachable nor evidence
         about the *new* child. The check runs on every worker, a fresh one included, which can have
-        written a stray frame or exited between its boot reply and this check. A leftover EOF reaps it (see :meth:`_reject_unsolicited`), so spawn once more rather
+        written a stray frame or exited between its boot reply and this check. A leftover EOF
+        reaps it (see :meth:`_reject_unsolicited`), so spawn once more rather
         than dead-letter this message on a peer that merely died.
 
         A leftover FRAME kills the worker, and this message, which never reached it, is retried
@@ -1361,10 +1366,12 @@ class SandboxSession:
                     f"sandbox {phase} {name!r} exceeded the {self.policy.wall_seconds}s wall cap"
                 ) from None
             if frame is _EOF:
-                self._kill(proc, self._eof_kill_cause(proc, KillCause.CRASH), phase)
+                cause = self._eof_kill_cause(proc, KillCause.CRASH)
+                self._kill(proc, cause, phase)
                 served = expected_seq - 1
                 after = f", after {served} brokered lookup(s)" if served else ""
-                raise SandboxError(f"sandbox worker crashed while running {phase} {name!r}{after}")
+                what = "closed its response pipe" if cause is KillCause.STDOUT_CLOSED else "crashed"
+                raise SandboxError(f"sandbox worker {what} while running {phase} {name!r}{after}")
             try:
                 # Decoding happens HERE, on the dispatch thread, inside this try — not on the daemon
                 # reader thread, where a rejection would be a silent reader death and a wall-cap hang.
