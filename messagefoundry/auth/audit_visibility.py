@@ -185,9 +185,9 @@ class _Narrowed:
     if_present: tuple[str, ...] = ()
 
 
-#: The rows narrowed for a reader without ``users:manage`` (vault BACKLOG #3748 item 6). Every
-#: account's scope and its source go only to a ``users:manage`` holder, the tier ``GET /users``
-#: shows them to (BACKLOG #3189). The row itself stays visible: who acted on whose scope, and when,
+#: The rows narrowed for a reader without ``users:manage`` (vault BACKLOG #3748 item 6): their
+#: stored scope and its source are withheld from that reader, as ``GET /users`` withholds them
+#: (BACKLOG #3189). Inference from rows left whole is not covered; ``docs/SECURITY.md`` names it. The row itself stays visible: who acted on whose scope, and when,
 #: is not the scope. These are the audit actions whose detail names a channel list or a scope's
 #: source, by a census of the writers on 2026-11-09:
 #:
@@ -244,7 +244,8 @@ def audit_detail_for(identity: Identity, action: str, detail: str | None) -> str
             **{key: stored[key] for key in rule.shown if key in stored},
             **{key: SCOPE_WITHHELD for key in rule.if_present if key in stored},
             **dict.fromkeys(rule.always, SCOPE_WITHHELD),
-        }
+        },
+        sort_keys=True,  # the writers' own form (``_json``), so a narrowed row reads like a stored one
     )
 
 

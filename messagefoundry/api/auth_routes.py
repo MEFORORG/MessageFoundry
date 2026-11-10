@@ -2219,10 +2219,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         )
         if not narrows_scope_rows_for(identity):
             return rows
-        return [
-            {**row, "detail": audit_detail_for(identity, row["action"], row["detail"])}
-            for row in rows
-        ]
+        # audit_detail_for hands back the stored detail itself for a row it leaves alone, so only
+        # a narrowed row is copied.
+        narrowed = []
+        for row in rows:
+            detail = audit_detail_for(identity, row["action"], row["detail"])
+            narrowed.append(row if detail is row["detail"] else {**row, "detail": detail})
+        return narrowed
 
     async def _count_audit(
         service: AuthService,

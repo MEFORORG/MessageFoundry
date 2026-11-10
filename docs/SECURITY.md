@@ -2160,7 +2160,8 @@ the same permission set on the same method reds CI until it is listed here.
 > source counts as `ad` here (BACKLOG #2252):** it predates the source column, the sync withdraws
 > it like a directory scope, and the GET still reports it as null. The 409 detail names the
 > conflict, never the scope. Each 409 writes one `user.channel_scope_change_refused` audit row
-> naming the administrator, the account and the conflict, never the scope (BACKLOG #2271). A store
+> naming the administrator, the account and the conflict, never the scope (BACKLOG #2271); a
+> reader without `users:manage` reads its conflict fields withheld (Channel scope, below). A store
 > that refuses that row leaves an ERROR log line instead, and the 409 stands. The web console sends `expected_source` when the administrator ticks "Make this scope
 > manual", and shows a race as a refused save with the edits kept.
 >
@@ -2377,12 +2378,14 @@ the same permission set on the same method reds CI until it is listed here.
 >   `scope_changed`; and `user.channel_scope_change_refused` reads `owner`, `read_source`,
 >   `expected_source` and `reason` as `"withheld"` (vault BACKLOG #3748). Each rule is an
 >   allowlist, so a key a later writer adds to one of those four is withheld, but a NEW action
->   whose detail names a scope is shown whole until it is added to `CHANNEL_LIST_ACTIONS` in
->   `messagefoundry/auth/audit_visibility.py`. `GET /logs/tail` gives such a reader no audit copies
->   at all. **Left open:** this hides the stored lists and sources, not every inference. Rows left
+>   whose detail names a scope is shown whole until a rule for it is added to `_NARROWED` in
+>   `messagefoundry/auth/audit_visibility.py`, which holds each action's kept and withheld keys.
+>   `GET /logs/tail` gives such a reader no audit copies at all. **Left open:** this hides the stored lists and sources, not every inference. Rows left
 >   whole can still let such a reader piece a scope together: at least an `auth.channel_denied`
 >   row or a channel-attributed access row, each naming an actor and one channel, and the actors of
 >   `auth.ad_scope_resynced` rows, which say the directory owned that account's scope.
+>   `/me/security-events` is not narrowed either: it shows a holder its own rows whole, and its own
+>   residuals (a directory rename onto a name, among them) could show a predecessor's.
 > - `POST /config/reload` refuses a scoped caller 403, a dry run included, because a reload loads
 >   the whole graph and a dry run's reply describes it. So a deployer needs the all-channels grant.
 >   The refusal writes one `auth.channel_denied` row naming no channel. The approval gate refuses
