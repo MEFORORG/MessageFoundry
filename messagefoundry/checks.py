@@ -101,7 +101,6 @@ from __future__ import annotations
 import ast
 import functools
 import importlib.metadata
-import json
 import os
 import re
 import shutil
@@ -2572,19 +2571,6 @@ def _check_alert_smtp_tls(
 _BARE_DECLARATION_NAME = re.compile(r"[A-Za-z0-9_.:-]+")
 
 
-def _quoted_text(text: str) -> str:
-    """``text`` as one double-quoted token that its own content cannot close or extend.
-
-    JSON string quoting escapes every quote, backslash and C0 control, so a reason cannot end its
-    token and write a separator, a second entry or a mark after it. ``ensure_ascii`` also writes
-    every non-ASCII character as ``\\uXXXX``, so a lookalike quote such as U+02BA or U+FF02, or a
-    right-to-left letter, cannot fake that end for a human reader. The log escape then covers DEL,
-    the one ASCII control JSON leaves raw (vault BACKLOG #3139)."""
-    from messagefoundry.controlchars import scrub_control_chars
-
-    return scrub_control_chars(json.dumps(text))
-
-
 def _declared_entry(name: str, reason: str | None, *, refused: bool = False) -> str:
     """One entry of a declaration list on an advisory check line: ``name ("reason")``.
 
@@ -2593,8 +2579,10 @@ def _declared_entry(name: str, reason: str | None, *, refused: bool = False) -> 
     pattern, so any other name is quoted too. Every character an author controls is therefore
     inside quotes, and ``REFUSED`` after the entry can only come from the caller (vault BACKLOG
     #3139)."""
-    shown = name if _BARE_DECLARATION_NAME.fullmatch(name) else _quoted_text(name)
-    why = "none recorded" if reason is None else _quoted_text(reason)
+    from messagefoundry.controlchars import quote_log_text
+
+    shown = name if _BARE_DECLARATION_NAME.fullmatch(name) else quote_log_text(name)
+    why = "none recorded" if reason is None else quote_log_text(reason)
     return f"{shown} ({why}){' REFUSED' if refused else ''}"
 
 
