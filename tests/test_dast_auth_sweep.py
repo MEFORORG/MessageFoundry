@@ -53,6 +53,7 @@ from scripts.security.dast_auth_sweep import (
 )
 from scripts.security.dast_target import (
     ADMIN_USERNAME,
+    DastReproofRefused,
     DastTargetUnusable,
     _login,
     dast_target,
@@ -241,7 +242,7 @@ def test_ungated_routes_are_exactly_the_documented_anonymous_set(
         "the receipt no longer reports the WebSocket row it excluded from HTTP probing"
     )
     # Vault BACKLOG #2955: each WebSocket row carries its kind, and none is refused or unexplained.
-    fields = ("kind", "declaration", "gates")
+    fields = ("kind", "declaration", "gates", "permissions")
     assert all(f in r for r in receipt["websocket_rows"] for f in fields), receipt["websocket_rows"]
     undeclared_ws = websocket_rows_not_declared(receipt)
     assert not undeclared_ws, f"WebSocket rows refused or not shown to authorize: {undeclared_ws}"
@@ -484,6 +485,7 @@ def test_a_policy_without_floors_fails_closed(tmp_path: Path) -> None:
             "negative_probes": 198,
             "reached": 46,
             "bfla_probes": 19,
+            "websocket_rows": _passing_ws_rows(),
             "write_reached": 61,
             "write_bfla_probes": 43,
             "ungated_routes": _declared_public(policy),
@@ -615,6 +617,7 @@ def test_a_write_pass_that_never_ran_fails_closed() -> None:
         "negative_probes": 204,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "unreached_unexplained": 0,
         "ungated_routes": _declared_public(policy),
         "findings": [],
@@ -623,6 +626,30 @@ def test_a_write_pass_that_never_ran_fails_closed() -> None:
     assert code == 2, f"a receipt with no write counts exited {code}"
     assert any("min_write_rows_reached" in line for line in errors), errors
     assert any("min_write_bfla_probes" in line for line in errors), errors
+
+
+def test_a_receipt_with_no_websocket_rows_fails_closed() -> None:
+    """Engine PR 2390 note 4 (vault BACKLOG #2955). The WebSocket kind check passes on an empty list,
+    so a walk that stopped yielding socket rows read as clean; the floor makes it exit 2."""
+    policy = _policy()
+    receipt = {
+        "gated_http_rows": 102,
+        "route_rows_examined": 108,
+        "negative_probes": 204,
+        "reached": 46,
+        "bfla_probes": 19,
+        "write_reached": 61,
+        "write_bfla_probes": 43,
+        "unreached_unexplained": 0,
+        "ungated_routes": _declared_public(policy),
+        "findings": [],
+    }
+    assert evaluate({**receipt, "websocket_rows": _passing_ws_rows()}, policy) == (0, [])
+    no_rows: tuple[dict[str, Any], ...] = ({}, {"websocket_rows": []})
+    for rows in no_rows:
+        code, errors = evaluate({**receipt, **rows}, policy)
+        assert code == 2, errors
+        assert any("min_websocket_rows" in line for line in errors), errors
 
 
 def test_the_bfla_canary_floors_the_write_pass_separately() -> None:
@@ -639,6 +666,7 @@ def test_the_bfla_canary_floors_the_write_pass_separately() -> None:
         "negative_probes": 204,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
@@ -663,6 +691,7 @@ def test_too_many_destroyed_sessions_is_a_could_not_measure() -> None:
         "negative_probes": 204,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
@@ -776,13 +805,100 @@ def test_without_a_re_proof_the_action_bound_rows_are_findings(
     )
 
 
-async def test_a_refused_re_proof_is_a_could_not_measure() -> None:
-    """A re-proof the engine refuses raises ``DastTargetUnusable``, which ``main()`` turns into
-    exit 2. Driven on the real endpoint with a token that authenticates nothing."""
+async def test_a_refused_re_proof_raises_from_the_target() -> None:
+    """A re-proof the engine refuses raises ``DastTargetUnusable`` out of the target's
+    ``reprove``. Driven on the real endpoint with a token that authenticates nothing. The sweep
+    catches it per row; the next test pins what it does then."""
     async with dast_target() as target:
         with pytest.raises(DastTargetUnusable) as caught:
             await target.reprove("dast-not-a-real-token", "config_reload")
     assert "measured nothing" in str(caught.value), caught.value
+
+
+def test_a_refused_re_proof_is_a_finding_and_the_sweep_goes_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3241, added item 3. One refused re-proof used to end the whole sweep with
+    exit 2, so every row after it went unmeasured. Now the sweep goes on: the refused rows are
+    listed and scored, every other action-bound row is still re-proved, and the run still exits 2,
+    a could-not-measure. RED when: a refused re-proof aborts the run, its rows are not listed, or
+    the run exits other than 2."""
+    import scripts.security.dast_auth_sweep as sweep
+
+    real = dast_target
+    # A row the clean run re-proves: POST /config/reload with no body stops at validation first.
+    refused_action = "connection_purge"
+
+    @asynccontextmanager
+    async def _target(**kwargs: Any) -> AsyncIterator[Any]:
+        async with real(**kwargs) as target:
+            real_reprove = target.reprove
+
+            async def _refuse_one_action(token: str, action: str) -> str:
+                if action == refused_action:
+                    raise DastReproofRefused(
+                        "synthetic: the engine refused this re-proof", status=403
+                    )
+                return await real_reprove(token, action)
+
+            yield replace(target, reprove=_refuse_one_action)
+
+    monkeypatch.setattr(sweep, "dast_target", _target)
+    receipt_path = tmp_path / "receipt.json"
+    code = main(["--policy", str(_POLICY), "--receipt", str(receipt_path)])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    assert code == 2, f"a refused re-proof is a could-not-measure, exit 2, not {code}"
+    expected = {"POST /connections/{name}/purge"}
+    assert _action_bound_rows()[("POST", "/connections/{name}/purge")] == refused_action
+    assert set(receipt["step_up_reproof_refused_rows"]) == expected, receipt
+    assert receipt["step_up_reproof_refusals"] == len(expected)
+    # The rows after the refusal were still measured: the other bound rows were re-proved.
+    assert receipt["step_up_reproofs"] > 0
+    assert not set(receipt["step_up_reproof_rows"]) & expected
+    assert refused_action not in json.dumps(receipt)  # the action is a header value
+
+
+@pytest.mark.parametrize("status", [401, 429])
+def test_a_run_wide_re_proof_refusal_still_ends_the_sweep(
+    status: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dead session (401) or a tripped limiter (429) would refuse every later re-proof too, so the
+    sweep does not go on probing with that token and listing rows that look measured: it ends with
+    exit 2 as before. RED when: the sweep goes on after such a refusal, or exits other than 2."""
+    import scripts.security.dast_auth_sweep as sweep
+
+    real = dast_target
+    calls: list[str] = []
+
+    @asynccontextmanager
+    async def _target(**kwargs: Any) -> AsyncIterator[Any]:
+        async with real(**kwargs) as target:
+
+            async def _refuse_all(token: str, action: str) -> str:
+                calls.append(action)
+                raise DastReproofRefused("synthetic run-wide refusal", status=status)
+
+            yield replace(target, reprove=_refuse_all)
+
+    monkeypatch.setattr(sweep, "dast_target", _target)
+    receipt_path = tmp_path / "receipt.json"
+    code = main(["--policy", str(_POLICY), "--receipt", str(receipt_path)])
+    assert code == 2, f"a run-wide re-proof refusal is a could-not-measure, exit 2, not {code}"
+    assert len(calls) == 1, f"the sweep went on re-proving after a {status}: {len(calls)} calls"
+
+
+def test_a_receipt_with_a_refused_re_proof_does_not_pass(
+    clean_run: tuple[int, dict[str, Any]],
+) -> None:
+    """The receipt-side half: a refused re-proof is an error on its own, so a row that is also
+    allowlisted, or otherwise scored as reached, cannot hide it. The clean receipt is the control."""
+    clean_code, clean = clean_run
+    assert clean_code == 0 and clean["step_up_reproof_refused_rows"] == []
+    code, errors = evaluate(
+        {**clean, "step_up_reproof_refused_rows": ["POST /config/reload"]}, _policy()
+    )
+    assert code == 2 and any("refused the action-bound re-proof" in e for e in errors), errors
 
 
 # =====================================================================================================
@@ -879,6 +995,7 @@ def test_bfla_oracle_treats_404_as_a_violation() -> None:
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "write_reached": 61,
         "write_bfla_probes": 43,
         "bfla_violations": 1,
@@ -910,6 +1027,7 @@ def test_an_unexplained_unreached_operation_is_a_finding() -> None:
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 3,
@@ -934,6 +1052,7 @@ def test_a_newly_ungated_route_reds_the_run() -> None:
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
@@ -974,6 +1093,7 @@ def test_an_allow_listed_route_that_is_not_declared_public_reds_the_run(
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
@@ -994,6 +1114,16 @@ def _ws_row(**fields: Any) -> dict[str, Any]:
 
 
 _GATES = ["authorize_ws"]
+_PERMS = ["monitoring:read"]
+
+
+def _passing_ws_rows() -> list[dict[str, Any]]:
+    """One WebSocket row that passes, so a hand-built receipt meets ``min_websocket_rows``."""
+    return [
+        _ws_row(
+            kind=route_gates.KIND_IN_BODY, declaration=_REASON, gates=_GATES, permissions=_PERMS
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1017,11 +1147,35 @@ _GATES = ["authorize_ws"]
             id="outside-no-gate",
         ),
         pytest.param(_ws_row(kind=None, declaration=_REASON, gates=_GATES), True, id="no-kind"),
-        # The shape the receipt wrote before #2955: method and path only.
-        pytest.param(_ws_row(), True, id="older-receipt"),
-        pytest.param(_ws_row(kind=route_gates.KIND_GATED, declaration=None), False, id="gated"),
+        # Engine PR 2390 note 5: a gate found that demands no Permission does not vouch for it.
         pytest.param(
             _ws_row(kind=route_gates.KIND_IN_BODY, declaration=_REASON, gates=_GATES),
+            True,
+            id="in-body-no-permission-field",
+        ),
+        pytest.param(
+            _ws_row(
+                kind=route_gates.KIND_IN_BODY, declaration=_REASON, gates=_GATES, permissions=[]
+            ),
+            True,
+            id="in-body-no-permission",
+        ),
+        # The shape the receipt wrote before #2955: method and path only.
+        pytest.param(_ws_row(), True, id="older-receipt"),
+        pytest.param(
+            _ws_row(kind=route_gates.KIND_GATED, declaration=None, permissions=_PERMS),
+            False,
+            id="gated",
+        ),
+        pytest.param(
+            _ws_row(kind=route_gates.KIND_GATED, declaration=None, permissions=[]),
+            True,
+            id="gated-no-permission",
+        ),
+        pytest.param(
+            _ws_row(
+                kind=route_gates.KIND_IN_BODY, declaration=_REASON, gates=_GATES, permissions=_PERMS
+            ),
             False,
             id="in-body",
         ),
@@ -1029,7 +1183,9 @@ _GATES = ["authorize_ws"]
             _ws_row(kind=route_gates.KIND_PUBLIC, declaration=_REASON), False, id="public"
         ),
         pytest.param(
-            _ws_row(kind=route_gates.KIND_OUTSIDE, declaration=_REASON, gates=_GATES),
+            _ws_row(
+                kind=route_gates.KIND_OUTSIDE, declaration=_REASON, gates=_GATES, permissions=_PERMS
+            ),
             False,
             id="outside-with-reason",
         ),
@@ -1047,6 +1203,7 @@ def test_a_websocket_row_the_engine_refuses_reds_the_run(row: dict[str, Any], re
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
@@ -1054,6 +1211,11 @@ def test_a_websocket_row_the_engine_refuses_reds_the_run(row: dict[str, Any], re
         "findings": [],
     }
     assert evaluate(clean, policy) == (0, [])
+    if row.get("kind") == route_gates.KIND_PUBLIC:
+        # Allow-listed, so this case reads the kind check alone; the allow-list has its own test.
+        policy["public_websocket_allowlist"] = [
+            {"method": route_gates.WS_METHOD, "path": "/ws/planted"}
+        ]
     receipt = {**clean, "websocket_rows": [row]}
     code, errors = evaluate(receipt, policy)
     (summary,) = [line for line in receipt_lines(receipt, policy, "") if "WebSocket rows" in line]
@@ -1064,6 +1226,87 @@ def test_a_websocket_row_the_engine_refuses_reds_the_run(row: dict[str, Any], re
     else:
         assert (code, errors) == (0, [])
         assert summary.endswith(" -- 1/1"), summary
+
+
+@pytest.mark.parametrize("listed", [False, True], ids=["not-listed", "listed-and-present"])
+def test_the_public_websocket_set_is_pinned_to_the_allow_list(listed: bool) -> None:
+    """Engine PR 2390 note 3 (vault BACKLOG #2955). A public socket is the one the engine accepts
+    with no gate, so a new one reds the run unless the policy documents it, and a documented one
+    that went away reds it too. Before, a public row with a reason passed on the kind check alone."""
+    policy = _policy()
+    assert policy["public_websocket_allowlist"] == []
+    public = _ws_row(kind=route_gates.KIND_PUBLIC, declaration=_REASON)
+    receipt: dict[str, Any] = {
+        "gated_http_rows": 99,
+        "route_rows_examined": 105,
+        "negative_probes": 198,
+        "reached": 46,
+        "bfla_probes": 19,
+        "websocket_rows": [*_passing_ws_rows(), public],
+        "write_reached": 61,
+        "write_bfla_probes": 43,
+        "unreached_unexplained": 0,
+        "ungated_routes": _declared_public(policy),
+        "findings": [],
+    }
+    if listed:
+        policy["public_websocket_allowlist"] = [{"method": "WS", "path": "/ws/planted"}]
+        assert evaluate(receipt, policy) == (0, [])
+        receipt["websocket_rows"] = _passing_ws_rows()
+    code, errors = evaluate(receipt, policy)
+    assert code == 1, errors
+    expected = "documented but absent: [('WS', '/ws/planted')]" if listed else "Newly public: [("
+    assert any("public WebSocket" in line and expected in line for line in errors), errors
+
+
+def test_a_policy_without_the_public_websocket_allowlist_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    policy = _policy()
+    del policy["public_websocket_allowlist"]
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(policy), encoding="utf-8")
+    assert main(["--policy", str(path)]) == 2
+    # The refusal must be the policy check's own, not some later failure that also exits 2.
+    assert "'public_websocket_allowlist'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("key", ["anonymous_allowlist", "public_websocket_allowlist"])
+def test_an_allow_list_that_is_not_a_list_cannot_measure(key: str) -> None:
+    """A null allow-list is a bad policy, so evaluate() answers 2, not a crash that exits 1."""
+    policy = _policy()
+    receipt: dict[str, Any] = {
+        "gated_http_rows": 99,
+        "route_rows_examined": 105,
+        "negative_probes": 198,
+        "reached": 46,
+        "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
+        "write_reached": 61,
+        "write_bfla_probes": 43,
+        "unreached_unexplained": 0,
+        "ungated_routes": _declared_public(policy),
+        "findings": [],
+    }
+    assert evaluate(receipt, policy) == (0, [])  # control: the same receipt passes
+    policy[key] = None
+    code, errors = evaluate(receipt, policy)
+    assert code == 2 and any(key in line and "must be a list" in line for line in errors), errors
+
+
+@pytest.mark.parametrize(
+    "key", ["unreachable_allowlist", "anonymous_allowlist", "public_websocket_allowlist"]
+)
+def test_a_policy_whose_allow_list_is_not_a_list_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], key: str
+) -> None:
+    """Read before any sweep runs, so receipt_lines() and the reach check never iterate a null."""
+    policy = _policy()
+    policy[key] = None
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(policy), encoding="utf-8")
+    assert main(["--policy", str(path)]) == 2
+    assert f"{key!r} as NoneType, not a list" in capsys.readouterr().err
 
 
 async def _planted_undeclared(websocket: WebSocket) -> None:

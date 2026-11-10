@@ -803,8 +803,8 @@ def test_only_the_stdlib_loop_upgrades_tls_itself() -> None:
     """uvloop's Loop is an AbstractEventLoop and not a BaseEventLoop, so this is what sends it to the
     listener's own accept loop; see `_upgrades_tls_itself` for why. A BaseEventLoop subclass goes
     there too: its transports are not the ones the upgrade was read against (vault BACKLOG #4552).
-    The HTTP listener, which has no accept loop of its own, has its own predicate and keeps the
-    upgrade on such a subclass."""
+    The HTTP listener runs the same accept loop since BACKLOG #2479, so its predicate matches the
+    same way."""
 
     class _OtherLoop(asyncio.AbstractEventLoop):
         pass
@@ -812,15 +812,15 @@ def test_only_the_stdlib_loop_upgrades_tls_itself() -> None:
     class _SubclassedLoop(asyncio.SelectorEventLoop):
         pass
 
+    # One predicate for both listeners, so they cannot disagree on which loop gets the accept loop.
+    assert http_module._upgrades_tls_itself is mllp_module._upgrades_tls_itself
     stdlib = asyncio.new_event_loop()
     selector = asyncio.SelectorEventLoop()
     subclassed = _SubclassedLoop()
     try:
-        for predicate in (mllp_module._upgrades_tls_itself, http_module._upgrades_tls_itself):
-            assert predicate(stdlib) is True
-            assert predicate(selector) is True
+        assert mllp_module._upgrades_tls_itself(stdlib) is True
+        assert mllp_module._upgrades_tls_itself(selector) is True
         assert mllp_module._upgrades_tls_itself(subclassed) is False
-        assert http_module._upgrades_tls_itself(subclassed) is True
     finally:
         stdlib.close()
         selector.close()
@@ -828,7 +828,6 @@ def test_only_the_stdlib_loop_upgrades_tls_itself() -> None:
     # Never run: the probe only asks which class the loop is, so its abstract methods stay unbound.
     other = _OtherLoop()  # type: ignore[abstract]
     assert mllp_module._upgrades_tls_itself(other) is False
-    assert http_module._upgrades_tls_itself(other) is False
 
 
 # --- stop() on a loop whose server has no close_clients() (BACKLOG #1606) ------------------------
@@ -1324,7 +1323,12 @@ def test_a_long_run_of_skipped_accepts_waits_and_warns(
         listening = socket.socket()
         server = mllp_module._AcceptingServer([listening], lambda _conn: None, name="IB_TEST")
         try:
-            for _ in range(20):
+            # A turn cap with an early exit once a fifth accept was tried, as in
+            # test_a_connection_the_listener_cannot_take_is_closed_and_accepting_goes_on. The cap
+            # stays far below the fake's call limit.
+            for _ in range(100):
+                if fake.calls > 4:
+                    break
                 await asyncio.sleep(0)
             assert listening.fileno() != -1
         finally:
@@ -1368,7 +1372,12 @@ def test_a_connection_the_listener_cannot_take_is_closed_and_accepting_goes_on(
         listening = socket.socket()
         server = mllp_module._AcceptingServer([listening], on_socket, name="IB_TEST")
         try:
-            for _ in range(5):
+            # A turn cap with an early exit, not a fixed count: how many turns one accept takes is
+            # the accept loop's business. Not `_until`: its wall-clock wait would let the failing
+            # fake reach its call limit and end the accept loop.
+            for _ in range(50):
+                if fails_after.calls:
+                    break
                 await asyncio.sleep(0)
             assert accepted.fileno() == -1, "the connection it could not take was left open"
             assert fails_after.calls >= 1, "the accept loop stopped after the fault"
@@ -1400,6 +1409,68 @@ def test_the_accept_loop_stops_on_a_fault_of_its_listening_socket(
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.mllp"):
         asyncio.run(scenario())
     assert "IB_TEST: accept loop failed and stopped" in caplog.text
+
+
+def test_close_closes_a_socket_the_cancelled_accept_already_took() -> None:
+    """BACKLOG #2479 round-3 finding 3: close() cancels the accept loop, and a cancellation that
+    lands after the loop's accept completed, but before the task stepped, used to be thrown into
+    ``sock_accept`` and lose its result, leaving the accepted socket open with no owner. The
+    interleaving is pinned without a race: the accept completes, and close() runs, in one turn."""
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        gate: asyncio.Future[tuple[socket.socket, object]] = loop.create_future()
+
+        async def accept(sock: socket.socket) -> tuple[socket.socket, object]:
+            return await gate
+
+        loop.sock_accept = accept  # type: ignore[method-assign]
+        taken: list[socket.socket] = []
+        listening = socket.socket()
+        server = mllp_module._AcceptingServer([listening], taken.append, name="IB_TEST")
+        accepted, peer = socket.socketpair()
+        try:
+            for _ in range(3):
+                await asyncio.sleep(0)  # the accept loop reaches its wait
+            gate.set_result((accepted, ("127.0.0.1", 1)))
+            server.close()  # same turn: the accept is done and its task has not stepped
+            await asyncio.wait_for(server.wait_closed(), timeout=5.0)
+            assert taken == []
+            assert accepted.fileno() == -1, "a socket the accept took was dropped unclosed"
+            assert listening.fileno() == -1
+        finally:
+            accepted.close()
+            peer.close()
+
+    asyncio.run(scenario())
+
+
+def test_close_with_no_accept_completed_takes_no_socket() -> None:
+    """The control for the test above: a close() while the accept is still waiting cancels it,
+    takes nothing, and still closes the listening socket."""
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        waited: list[bool] = []
+        gate: asyncio.Future[tuple[socket.socket, object]] = loop.create_future()
+
+        async def accept(sock: socket.socket) -> tuple[socket.socket, object]:
+            waited.append(True)
+            return await gate
+
+        loop.sock_accept = accept  # type: ignore[method-assign]
+        taken: list[socket.socket] = []
+        listening = socket.socket()
+        server = mllp_module._AcceptingServer([listening], taken.append, name="IB_TEST")
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert waited == [True]
+        server.close()
+        await asyncio.wait_for(server.wait_closed(), timeout=5.0)
+        assert gate.cancelled(), "the pending accept was left running"
+        assert taken == [] and listening.fileno() == -1
+
+    asyncio.run(scenario())
 
 
 async def test_failed_handshakes_are_counted_and_their_events_throttled(

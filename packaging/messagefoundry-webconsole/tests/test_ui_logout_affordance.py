@@ -241,9 +241,8 @@ async def test_ui_logout_with_a_cookie_naming_no_session_still_records_the_addre
     owner to name and says ``nothing_to_revoke``; the client address is still recorded. Read beside
     the test above, it shows the actor there comes from the session, not from the request.
 
-    No budget drops such a row (BACKLOG #3749 item 6): ``tests/test_session_supersession.py``
-    drives many of them from one address, and docs/SECURITY.md names the unbounded growth as an
-    open gap."""
+    One such row is within the bound on these rows (BACKLOG #4735); the engine suite's
+    ``tests/test_session_supersession.py`` floods past it, and docs/SECURITY.md states it."""
     service = await _service(engine)
     out = await _sign_out_with(engine, service, "a-token-that-names-no-session")
     assert out.status_code == 303

@@ -49,6 +49,7 @@ from messagefoundry.integrity import (
 from messagefoundry.pipeline.alerts import AlertSink
 from messagefoundry.security import handler_semgrep_rules
 from messagefoundry.store import open_store, sqlite_settings
+from tests._log_absence import assert_capture_sees
 
 
 def _record_hash(data: bytes) -> str:
@@ -889,6 +890,7 @@ async def test_declared_editable_under_the_default_posture_stays_silent(
         with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
             out = await run_startup_attestation(store, sink, fail_closed_on_drift=False)
         assert out.declared_editable is True
+        assert_capture_sees(caplog, "messagefoundry.integrity")
         assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
         assert [a for a in await store.list_audit() if a["action"] == "startup_integrity"] == []
         assert sink.events == []
@@ -1319,6 +1321,7 @@ async def test_console_absent_changes_nothing_even_under_fail_closed(
         with caplog.at_level(logging.WARNING, logger="messagefoundry.integrity"):
             result = await run_startup_attestation(store, sink, fail_closed_on_drift=True)
         assert result.ok is True and result.checked == 2
+        assert_capture_sees(caplog, "messagefoundry.integrity")
         assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
         assert _startup_rows(await store.list_audit()) == []
         assert sink.events == []

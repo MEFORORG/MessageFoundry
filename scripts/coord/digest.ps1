@@ -310,7 +310,7 @@ $md.Add("- Reversal budget, fleet-wide: $(Format-Budget (Get-DecisionBudget -Rev
 # record whichever account and minute the digest happened to be rebuilt on.
 if ($dayEnd -gt $now) {
     $rung = Get-DecisionCostRung -UsageScript $UsageScript -ThresholdsFile $ThresholdsFile
-    $md.Add("- Cost rung, read now on the account this digest ran on: **$($rung.State)**. $($rung.Reason). UNKNOWN sends a decision to review, not to a halt; the Lander is exempt (korus roles/STEWARD.md 3e).")
+    $md.Add("- Cost rung, read now on the account this digest ran on: **$($rung.State)**. $($rung.Reason). UNKNOWN sends a decision to review, not to a halt; the Lander is exempt (korus roles/COMMON.md, The three usage states).")
 } else {
     $md.Add('- Cost rung: a live reading, so a past day''s digest does not carry it.')
 }

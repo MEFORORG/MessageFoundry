@@ -206,6 +206,8 @@ refusal, because doing so would *break* the documented gate invocation `messagef
 - With **no** `--env`, the offline gate behaves exactly as today (no env values loaded, no posture refusal).
 - With `--env`/`--project-root`/`--service-config`, the gate resolves the **identical root + active-env
   `env()` values** as `serve` for those flags, but never enforces the required-env-/posture-refusal.
+  **Amended for `check --env` alone** ([Amendment A](#amendment-a-check---env-matches-serve-2026-11-09)):
+  given `--env`, `check`'s settings checks read the name as `serve --env` does.
 
 This is the **larger half** of #33-A. It is **not** the ADR 0017 trio: making the offline paths resolve the
 env values `serve` does requires plumbing an `env_values()` provider into the offline `validate`/`dryrun`/
@@ -263,12 +265,15 @@ given** — which is exactly AC-6.
   resolve empty (the NSSM case), THE SYSTEM SHALL emit a startup WARNING pointing at `--project-root`, fired
   **once at boot** and **not** re-fired on a subsequent reload/promote.
   → `tests/test_config_anchoring.py::test_nssm_silent_miss_warns_once_at_startup`
-- **AC-6** — WHERE `validate`/`graph`/`dryrun`/`check` are invoked with `--project-root`/`--env`/
+- **AC-6** *(amended 2026-11-09, [Amendment A](#amendment-a-check---env-matches-serve-2026-11-09))* —
+  WHERE `validate`/`graph`/`dryrun`/`check` are invoked with `--project-root`/`--env`/
   `--service-config`, THE SYSTEM SHALL resolve the identical **project root and active-environment `env()`
   values** that `serve` resolves for the same flags, **without** adopting `serve`'s required-active-env /
-  explicit-posture refusal; AND `check` SHALL suppress its `messagefoundry.toml` upward-walk when
+  explicit-posture refusal, **except that WHEN `check` is given `--env`, its settings checks SHALL read
+  that name as `serve --env` does**; AND `check` SHALL suppress its `messagefoundry.toml` upward-walk when
   `--service-config`/`--project-root` is supplied.
-  → `tests/test_cli_offline_resolution.py::test_check_matches_serve_env_resolution`
+  → `tests/test_checks_gate_parity.py::test_every_settings_leg_reads_an_instance_named_by_check_env`
+  → `tests/test_checks_gate_parity.py::test_check_env_beats_mefor_ai_environment_and_the_file`
   → `tests/test_cli_offline_resolution.py::test_offline_does_not_inherit_serve_posture_refusal`
 - **AC-7** — THE SYSTEM SHALL honor an explicit **absolute** `--config`/`--service-config`/`--db`/
   `[store].path` as-is even when a project root is set, AND SHALL resolve a **relative**
@@ -405,3 +410,32 @@ given** — which is exactly AC-6.
 - **Fail-loud boundary (AC-3):** the hard error fires **only** when a project root is *explicitly* set **and** the loaded graph has ≥1 `env()` reference **and** the `<env>.toml` is absent. A zero-`env()` deployment that legitimately ships no value file is never regressed.
 - **Precedence:** explicit flag > project-root > CWD; a relative `--db` / `--service-config` resolves under the root.
 - **No auto-discovery** (walk-up marker) this slice — keep anchoring explicit; `check`'s existing upward `_find_service_toml` walk is suppressed when `--service-config` / `--project-root` is passed.
+
+---
+
+## Amendment A: `check --env` matches `serve` (2026-11-09)
+
+Decided by the Manager under the owner's delegation of 2026-11-09 (decision d20261109T161629902-42e4ec), after an adversarial review: in the Manager's own session the owner quoted its bundled owner questions, including the line '#2355: should check match serve?', and answered '/driver'. Under CLAUDE.md section 5 that record counts as the owner's ruling for this question.
+
+**What changes.** When `check` is given `--env`, every settings check reads the name as `serve
+--env` reads it: a CLI override of `[ai].environment`, above the settings file and
+`MEFOR_AI_ENVIRONMENT`. With no `messagefoundry.toml`, `--env` declares the instance, so those
+checks read the settings from the environment instead of skipping. The `posture` check therefore
+fails a custom name with no explicit production tier, as `serve` refuses to start on it, where §3
+said the gate never enforces that refusal.
+The `dryrun` check is not a settings check: it takes only `[pipeline].snapshot_on_send` from
+those settings, and its Handlers still run with no active environment.
+
+**What does not change.**
+
+- With no `--env`, `check` adopts no required-active-env refusal: an instance that names no
+  environment still skips the `posture` check, so the documented `check --config config --messages
+  messages/sets` invocation is unchanged.
+- `validate`, `graph` and `dryrun` still read `--env` for values alone and adopt no refusal.
+
+**What "matches `serve`" covers.** The settings checks read the environment name `serve --env`
+reads. Value-file location is shared too: the offline `<env>.toml` check under `--project-root` now
+reads `MEFOR_ENVIRONMENTS_DIR` above the file's `[environments].dir`, as `serve`'s settings load
+does. The file it reads that `dir` from can still differ from the one `serve` reads. It does not cover a `[environments].base_dir`
+set in the file or the environment without `--project-root`: `serve` fails loud on a missing value
+file under that root, and the offline check fires only under an explicit `--project-root`.

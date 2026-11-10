@@ -39,6 +39,7 @@ from messagefoundry.transports import mllp as mllp_module
 from messagefoundry.transports.http_listener import HttpSource
 from messagefoundry.transports.mllp import MLLPDestination
 from messagefoundry.transports.receipt import receipt_handler
+from tests._log_absence import assert_capture_sees
 from tests.test_mllp_tls import ADT, _ack, _cert, _close_raw, _Events, _tls_source, _until
 
 _PLAINTEXT = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -472,7 +473,8 @@ def test_no_listener_is_kept_alive_by_its_hook_or_its_counter(tmp_path: Path) ->
 
     def http() -> object:
         source, _cert_path = _http_tls_source(tmp_path / "http")
-        # What start() does where the loop runs the handshake.
+        # A hooked context, as start() left one where the loop ran the handshake before BACKLOG
+        # #2479. start() no longer hooks it on any loop; the hook's references are what is tested.
         assert source._ssl is not None
         source._tls_failures.watch(source._ssl)
         return source
@@ -508,6 +510,7 @@ async def test_a_counter_whose_listener_is_gone_reports_nothing_and_never_raises
     failures._reported_at = None  # so the next failure is due at once, not held for the window
     with caplog.at_level(logging.DEBUG, logger="messagefoundry.tls_handshake_failures"):
         _fail_in_memory(ctx)
+        assert_capture_sees(caplog, "messagefoundry.tls_handshake_failures", logging.DEBUG)
     assert failures.count == 2  # counted, then the report went nowhere
     assert not [r for r in caplog.records if "recording a failed" in r.getMessage()]
 
@@ -552,9 +555,10 @@ async def _no_reply(_raw: bytes) -> str | None:
 async def test_the_http_listener_records_a_failed_handshake(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: str
 ) -> None:
-    """On the stdlib loop the listener runs its own handshakes since BACKLOG #2479, and counts a
-    failure with its peer. ``loop`` forces the path uvloop takes, where the context's hook counts
-    it and does not read the peer."""
+    """The listener counts a failure with its peer on every loop since BACKLOG #2479: it runs
+    the handshake itself on the stdlib loop, and hands an admitted socket to
+    ``connect_accepted_socket`` through its own accept loop on every other. ``loop`` forces the
+    path uvloop takes, where before the accept loop the context's hook counted it, with no peer."""
     if runner == "loop":
         monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
     source, cert = _http_tls_source(tmp_path)
@@ -574,8 +578,8 @@ async def test_the_http_listener_records_a_failed_handshake(
         failed = [e for e in events.seen if e[0] == "tls_handshake_failed"]
         assert len(failed) == 1
         (_kind, peer, reason) = failed[0]
-        # The listener's own handshake knows its peer; the loop's hook does not read it.
-        assert peer == ("127.0.0.1" if runner == "listener" else None)
+        # The listener admitted the socket before its handshake on both paths, so knows its peer.
+        assert peer == "127.0.0.1"
         assert reason is not None and reason.startswith("1 failed handshake(s)")
         assert "GET" not in reason  # a cause, never the peer's bytes
         assert source.tls_handshake_failures == 1
@@ -597,8 +601,8 @@ async def test_the_http_listener_window_shortens_through_the_shared_seam(
 ) -> None:
     """Vault BACKLOG #3785 item 4: HTTP had no window seam, because its counter took the window
     as a default bound at import. Patched in one place, every listener's window is read from it.
-    Run on the loop-run path, through the context hook it was written for (BACKLOG #2479 moved the
-    stdlib loop's default onto the listener's own handshake)."""
+    Run on the accept-loop path; it was written for the context hook, which the HTTP listener no
+    longer arms on any loop (BACKLOG #2479)."""
     monkeypatch.setattr(tls_handshake_failures, "EVENT_SECONDS", 0.3)
     monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
     source, _cert_path = _http_tls_source(tmp_path)

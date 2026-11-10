@@ -317,7 +317,7 @@ def test_the_issue_body_names_the_workflow_that_failed() -> None:
         str(s.get("run", "")) for s in _load(_NOTICE)["jobs"]["notice"]["steps"] if "run" in s
     )
     assert body, "the notice job has no `run:` step to inspect"
-    assert "Nightly (scheduled) $WF_NAME failed." in body, (
+    assert "Nightly (scheduled) $WF_NAME $OUTCOME." in body, (
         "the issue body does not name the workflow that actually failed. It must read from $WF_NAME, "
         "the same value the title is derived from, or it will assert the wrong workflow broke."
     )
@@ -769,6 +769,10 @@ def test_a_cancelled_dependency_floors_nightly_opens_an_issue(
     # Pinned as text: the two remedies this row added, which the subset check cannot hold in place.
     assert "declares no floor this check can read" in body, _diagnostic(run)
     assert "The run concluded cancelled or timed out" in body, _diagnostic(run)
+    # PR 2390 note (d): the run did not fail, so the body must not open by saying it did.
+    outcome = {"cancelled": "was cancelled", "timed_out": "timed out"}[conclusion]
+    assert body.splitlines()[0] == f"Nightly (scheduled) {workflow} {outcome}.", _diagnostic(run)
+    assert "failed" not in body.splitlines()[0], _diagnostic(run)
 
 
 def test_a_skipped_dependency_floors_run_writes_nothing(tmp_path: Path) -> None:

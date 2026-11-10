@@ -19,6 +19,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import AsyncIterator
@@ -1103,6 +1104,22 @@ async def test_concurrent_admin_removals_leave_one(store) -> None:
     await assert_concurrent_removals_leave_one(store)
 
 
+async def test_role_write_if_held_contract(store) -> None:
+    """Vault BACKLOG #3085 on Postgres: the reconciler's compare-and-set role write writes only
+    while the record holds the set the caller read."""
+    from tests._role_write_if_held_contract import assert_role_write_if_held_contract
+
+    await assert_role_write_if_held_contract(store)
+
+
+async def test_concurrent_role_writes_from_one_read_write_once(store) -> None:
+    """Vault BACKLOG #3085 on Postgres: two writes from one read on two pooled connections, at once.
+    The ``FOR UPDATE`` read serializes them; one writes."""
+    from tests._role_write_if_held_contract import assert_concurrent_role_writes_write_once
+
+    await assert_concurrent_role_writes_write_once(store)
+
+
 async def test_first_admin_grant_contract(store) -> None:
     """BACKLOG #3078 on Postgres: the first-administrator grant refuses while another enabled
     administrator exists, and over credentials the caller did not write."""
@@ -1119,6 +1136,15 @@ async def test_first_admin_grant_counts_only_a_local_administrator_that_signs_in
     )
 
     await assert_grant_counts_only_a_local_administrator_that_signs_in(store)
+
+
+async def test_first_admin_grant_refuses_a_row_holding_a_passkey(store) -> None:
+    """BACKLOG #3078 F2 on Postgres: the grant's refusal rolls its role write back."""
+    from tests._first_admin_grant_store_contract import (
+        assert_grant_refuses_a_row_holding_a_passkey,
+    )
+
+    await assert_grant_refuses_a_row_holding_a_passkey(store)
 
 
 async def test_concurrent_first_admin_grants_leave_one(store) -> None:
@@ -1140,6 +1166,14 @@ async def test_roles_permissions_contract(store) -> None:
     await _assert_roles_contract(store)
 
 
+async def test_enrolment_code_store_contract(store) -> None:
+    """ADR 0207 on the real Postgres backend: the enrolment code's conditional issue, revoke,
+    spend and TOTP fold, the disable's clear, and AC-10's race of two spends on one code."""
+    from tests._enrolment_code_store_contract import assert_enrolment_code_store_contract
+
+    await assert_enrolment_code_store_contract(store)
+
+
 async def test_webauthn_store_contract(store) -> None:
     """ADR 0068 §4 webauthn_credentials contract on the real Postgres backend: multi-row CRUD,
     the 1023-byte credential-id round-trip, duplicate-label integrity violation, and the strict
@@ -1149,6 +1183,13 @@ async def test_webauthn_store_contract(store) -> None:
     from tests._webauthn_store_contract import _assert_webauthn_store_contract
 
     await _assert_webauthn_store_contract(store)
+
+
+async def test_a_session_for_a_missing_account_is_refused(store) -> None:
+    """BACKLOG #2733 on Postgres: the session's user foreign key, as on SQLite and SQL Server."""
+    from tests._webauthn_store_contract import assert_a_session_for_a_missing_account_is_refused
+
+    await assert_a_session_for_a_missing_account_is_refused(store)
 
 
 async def test_webauthn_conditional_bind_contract(store) -> None:
@@ -1383,6 +1424,14 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
         _assert_bind_and_user_delete_take_one_lock_order,
     )
 
+    await _assert_bind_and_user_delete_take_one_lock_order(store, **_lock_wait_probes(store))
+
+
+def _lock_wait_probes(store: Any) -> dict[str, Any]:
+    """The lock-order tests' probes on this backend: ``holder_of`` names a connection's backend
+    pid, and ``is_blocking`` reads ``pg_locks`` for a request not yet granted whose blocker, per
+    ``pg_blocking_pids``, is that backend."""
+
     async def _backend_pid(conn: Any) -> object:
         return conn.get_server_pid()
 
@@ -1395,9 +1444,21 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
             )
         )
 
-    await _assert_bind_and_user_delete_take_one_lock_order(
-        store, holder_of=_backend_pid, is_blocking=_is_blocking
-    )
+    return {"holder_of": _backend_pid, "is_blocking": _is_blocking}
+
+
+async def test_rotation_racing_a_sweep_is_swept(store) -> None:
+    """BACKLOG #4974 on the real Postgres backend: a session rotated while a bind, an unbind, a
+    revoke of the user's sessions or the every-account revoke runs is swept under its new hash.
+
+    This store's rotation takes no account row. Its sweep waits on the rotated session's row and,
+    under READ COMMITTED, then re-checks the row's newest version, which the re-key left in place
+    under its new hash. docs/SECURITY.md stated that from the code; this runs it. The shared body
+    is the one the SQL Server suite runs, without the second order, which only that store's
+    rotation has. Probes as the lock-order test above."""
+    from tests._federated_unbind_store_contract import _assert_rotation_racing_a_sweep_is_swept
+
+    await _assert_rotation_racing_a_sweep_is_swept(store, **_lock_wait_probes(store))
 
 
 async def test_directory_id_comparison_is_byte_exact_on_postgres(store) -> None:
@@ -6243,3 +6304,103 @@ async def test_webauthn_rehash_contract(store) -> None:
     from tests._webauthn_store_contract import _assert_webauthn_rehash_contract
 
     await _assert_webauthn_rehash_contract(store)
+
+
+async def _empty_every_census_table(store) -> None:
+    """Every table the census lists, emptied but for ``schema_meta``, and the epoch back at its
+    seed, so the census reads a store nothing has used. The fixture leaves at least store_salt,
+    nodes and leader_lease as earlier tests wrote them."""
+    names = [n for n in await store.table_occupancy() if n != "schema_meta"]
+    names.remove("global_session_epoch")
+    quoted = ", ".join('"' + n.replace('"', '""') + '"' for n in names)
+    async with store._pool.acquire() as conn:
+        await conn.execute(f"TRUNCATE {quoted} RESTART IDENTITY CASCADE")
+        await conn.execute("DELETE FROM global_session_epoch WHERE id <> 1")
+        await conn.execute("UPDATE global_session_epoch SET epoch = 0 WHERE id = 1")
+
+
+async def test_table_occupancy_reads_the_store_schema_and_counts_a_connection_event(
+    store,
+) -> None:
+    # PR 2804 hold (A): the mint's server probe reads every table in the store's schema from the
+    # catalog, so a connection event alone holds data. The negative arm reads a store nothing has
+    # used as absent first, so the positive one is not true of every store.
+    from messagefoundry.store import postgres
+    from messagefoundry.store.custody_host import store_holds_data
+
+    await _empty_every_census_table(store)
+    before = await store.table_occupancy()
+    # The control on the census itself, from this build's DDL rather than from the census: every
+    # table the schema batch creates is listed, so emptying "every census table" emptied them all.
+    created = re.compile(r"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)", re.I)
+    assert {t for statement in postgres._SCHEMA for t in created.findall(statement)} <= set(before)
+    assert before["connection_event"] is False
+    assert not await store_holds_data(store)
+    await store.record_connection_event(
+        connection="IB_TEST_ADT", transport="mllp", direction="inbound", kind="established"
+    )
+    after = await store.table_occupancy()
+    assert after["connection_event"] is True
+    assert await store_holds_data(store)
+
+
+async def test_a_keyed_fresh_store_holds_data_until_its_chain_is_gone(store) -> None:
+    # PR 2804 hold (A): a keyed open, the shape a mint makes, starts the chain and so holds data. A
+    # mint that failed after the keyed open's own commits but before its genesis record leaves only
+    # the salt, counter and markers, which do not count, so the mint can be run again.
+    #
+    # Each open passes the audit MAC key open_store derives from a local cipher, whose audit MAC
+    # function is None. Without the key the handle has no active audit key, so _load_audit_chain
+    # writes no genesis row; the negative arm pins that.
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import audit_key_id
+    from messagefoundry.store.custody_host import KEYED_OPEN_TABLES, store_holds_data
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.store import AUDIT_KEY_EPOCH_ACTION, parse_audit_genesis
+
+    settings = load_settings(environ=os.environ).store
+
+    async def open_keyed(*, with_audit_key: bool = True) -> str | None:
+        """Open and close a keyed handle. The key id its genesis row should name, or None when no
+        audit key was passed and so no genesis row is written."""
+        cipher = make_cipher(generate_key(), write_v2=True)
+        mac_key = cipher.audit_mac_key()
+        assert mac_key is not None and cipher.audit_mac_fn() is None
+        opened = await PostgresStore.open(
+            settings, cipher=cipher, audit_mac_key=mac_key if with_audit_key else None
+        )
+        await opened.close()
+        return audit_key_id(mac_key) if with_audit_key else None
+
+    async def assert_chain_started_under(key_id: str | None) -> None:
+        assert key_id is not None
+        genesis = await store._audit_genesis_row()
+        assert genesis is not None
+        assert genesis["action"] == AUDIT_KEY_EPOCH_ACTION
+        assert parse_audit_genesis(genesis["detail"]) == key_id
+
+    async def empty_audit_log() -> None:
+        async with store._pool.acquire() as conn:
+            await conn.execute("TRUNCATE audit_log RESTART IDENTITY CASCADE")
+
+    await _empty_every_census_table(store)
+    try:
+        # The mint's create on a fresh store: markers sealed and the chain started in one open.
+        await assert_chain_started_under(await open_keyed())
+        occupancy = await store.table_occupancy()
+        assert all(occupancy[table] for table in KEYED_OPEN_TABLES)
+        assert await store_holds_data(store)
+        # A mint that failed before its genesis record: the keyed tables alone.
+        await empty_audit_log()
+        assert not await store_holds_data(store)
+        # Negative control: a keyed open with no audit key starts no chain over them.
+        await open_keyed(with_audit_key=False)
+        assert not (await store.table_occupancy())["audit_log"]
+        assert not await store_holds_data(store)
+        # The re-run's own create: a new key opens over the salt, counter and markers the failed
+        # one left, and starts its chain.
+        await assert_chain_started_under(await open_keyed())
+        assert await store_holds_data(store)
+    finally:
+        # Leave no chain under a key nobody holds for a later module on this database.
+        await empty_audit_log()

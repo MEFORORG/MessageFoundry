@@ -7,9 +7,10 @@ BACKLOG #2239. ``verify_mfa`` has asked since #2023 (``tests/test_mfa_directory_
 passkey leg did not, so an account disabled in the directory could clear the MFA gate with its
 passkey until the reconciliation pass revoked it.
 
-Each refusal asserts four things: the factor was not marked, the challenge was not taken (the same
-assertion verifies once the directory answers), the sign count did not move, and nothing was charged
-to the lockout. A local account is the control that must never reach the directory. All directory
+Each refusal asserts four things: the factor was not marked, the ceremony is back in flight (the
+same assertion verifies once the directory answers), the sign count did not move, and nothing was
+charged to the lockout. The directory is asked only once the assertion has verified (BACKLOG
+#3068: a caller that has proved nothing is not told what the directory said). A local account is the control that must never reach the directory. All directory
 data here is synthetic.
 """
 
@@ -17,10 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
+import sys
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, replace
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -30,9 +34,11 @@ pytest.importorskip("webauthn")
 from webauthn.helpers import base64url_to_bytes  # noqa: E402
 
 from messagefoundry.auth import reconcile  # noqa: E402
+from messagefoundry.auth import service as auth_service_module  # noqa: E402
 from messagefoundry.auth.identity import SessionMechanism  # noqa: E402
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer  # noqa: E402
 from messagefoundry.auth.service import (  # noqa: E402
+    _PASSKEY_SETTLE_PASSES,
     DIRECTORY_OBJECT_ID_MISSING,
     DIRECTORY_ROLES_DEMOTED,
     DIRECTORY_UNCONFIRMED,
@@ -43,6 +49,11 @@ from messagefoundry.auth.service import (  # noqa: E402
 )
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
+from messagefoundry.store.base import (  # noqa: E402
+    StoreAcquireTimeout,
+    audit_write_errors,
+    store_call_errors,
+)
 from messagefoundry.store.crypto import CipherError, generate_key, make_cipher  # noqa: E402
 from messagefoundry.store.store import (  # noqa: E402
     MessageStore,
@@ -50,8 +61,10 @@ from messagefoundry.store.store import (  # noqa: E402
     UserRecord,
 )
 from tests._admin_account import ADMIN_USERNAME, login_admin  # noqa: E402
+from tests._enrolment_code import enrolment_code_for  # noqa: E402
 from tests._fake_directory import FakeDirectory as _Directory  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
+from tests._webauthn_store_contract import _cred  # noqa: E402
 
 _RP, _ORIGIN = "t", "http://t"
 
@@ -108,6 +121,8 @@ async def _register_passkey(
         token=token,
         rp_id=_RP,
         origin=_ORIGIN,
+        # ADR 0207: a directory account's first factor binds only with an issued code.
+        enrolment_code=await enrolment_code_for(service, identity.user_id),  # type: ignore[attr-defined]
     )
     assert enrolled.ok
 
@@ -208,8 +223,7 @@ async def test_a_directory_the_account_is_not_confirmed_in_refuses_the_passkey(
     store: MessageStore, answer: DirectoryAnswer, unreachable: bool, outcome: str
 ) -> None:
     """RED when: ``finish_webauthn_assertion`` marks a directory account's factor without asking the
-    directory, asks only after taking the challenge or moving the counter, or fails open on an
-    outage."""
+    directory, asks only after moving the counter, or fails open on an outage."""
     p = await _directory_session_owing_a_passkey(store)
     before = await _sign_count(store, p.user_id)
     p.directory.answer = answer
@@ -218,7 +232,7 @@ async def test_a_directory_the_account_is_not_confirmed_in_refuses_the_passkey(
     await _assert_refused_and_uncharged(p, outcome, before)
     assert p.directory.probes == [("kpark", _PRINCIPAL.directory_object_id)]  # by the immutable id
 
-    # The challenge was not taken and the counter did not move, so the SAME assertion verifies once
+    # The ceremony was put back and the counter did not move, so the SAME assertion verifies once
     # the directory confirms the account.
     p.directory.answer = DirectoryAnswer.FOUND
     p.directory.unreachable = False
@@ -251,8 +265,7 @@ async def test_a_directory_account_with_no_directory_configured_is_refused(
     p = await _directory_session_owing_a_passkey(store)
     before = await _sign_count(store, p.user_id)
     unwired = AuthService(store, AuthSettings(require_mfa=False, mfa_verify_min_elapsed_seconds=0))
-    # The challenge cache is per service, so stage the unwired service's own: the refusal must
-    # still come before it is taken.
+    # The challenge cache is per service, so the unwired service reads the one already staged.
     unwired._webauthn_challenges = p.service._webauthn_challenges
     p.service = unwired
 
@@ -300,7 +313,7 @@ async def test_a_directory_account_demoted_since_sign_in_is_refused_the_passkey(
     await _assert_refused_and_uncharged(p, DIRECTORY_ROLES_DEMOTED, before)
     assert set(await store.get_user_role_ids(p.user_id)) == {"operator", "viewer"}
 
-    # The challenge is still in flight, so the SAME assertion verifies once the groups are back.
+    # The ceremony is back in flight, so the SAME assertion verifies once the groups are back.
     p.directory.principal = replace(_PRINCIPAL, groups=frozenset({_OPERATORS, _VIEWERS}))
     served = await _finish(p)
     assert served.ok is True and served.token is not None
@@ -453,18 +466,34 @@ async def test_a_post_with_nothing_staged_costs_no_directory_lookup(
     assert not any(d.get("reason") == DIRECTORY_UNCONFIRMED for d in failures)
 
 
-async def test_a_staged_ceremony_is_peeked_not_taken_before_the_lookup(
-    store: MessageStore,
+@pytest.mark.parametrize("proof", ["malformed", "unknown-credential", "wrong-challenge"])
+async def test_a_staged_ceremony_with_a_proof_that_fails_costs_no_directory_lookup(
+    store: MessageStore, proof: str
 ) -> None:
-    """Item 1, the other half. RED when: the check before the lookup pops the staged ceremony, so
-    the assertion it refused cannot verify once the directory answers."""
+    """Item 1, step 1's last sentence. A session that has staged a ceremony has still proved
+    nothing until its assertion verifies, so a post that does not verify must not reach the
+    directory or read its answer. RED when: the lookup runs before the assertion is verified (the
+    directory, set to refuse, is then probed and the refusal reads ``directory_unconfirmed``)."""
     p = await _directory_session_owing_a_passkey(store)
     p.directory.answer = DirectoryAnswer.DISABLED
-    assert (await _finish(p)).directory_refusal is DirectoryRefusal.UNCONFIRMED
-    assert p.service._webauthn_challenges.peek((hash_token(p.token), "assert")) is not None
+    if proof == "malformed":
+        p.response = "{}"
+    elif proof == "unknown-credential":
+        stranger = SoftAuthenticator(rp_id=_RP, origin=_ORIGIN)
+        challenge = await p.service.begin_webauthn_assertion(p.token, rp_id=_RP)
+        assert challenge is not None
+        p.response = stranger.get_response(base64url_to_bytes(json.loads(challenge)["challenge"]))
+    else:
+        p.response = p.key.get_response(b"\x07" * 32)  # signed, but not over the staged challenge
 
-    p.directory.answer = DirectoryAnswer.FOUND
-    assert (await _finish(p)).ok is True
+    refused = await _finish(p)
+
+    assert refused == Elevation()  # the plain failure, nothing about the directory
+    assert p.directory.probes == []
+    failures = await _audited_assertion_failures(store)
+    assert not any(d.get("reason") == DIRECTORY_UNCONFIRMED for d in failures)
+    session = await store.get_session(hash_token(p.token))
+    assert session is not None and session.mfa_verified_at is None
 
 
 async def test_an_oidc_minted_session_is_checked_too(store: MessageStore) -> None:
@@ -602,6 +631,122 @@ async def test_what_lands_before_the_factor_write_is_honoured(
         assert user is not None and user.second_step_locked_until is not None  # not cleared
 
 
+@pytest.mark.parametrize("change", ["lock", "revoke", "disable"])
+@pytest.mark.parametrize("account", ["directory", "local"])
+async def test_what_lands_during_the_passkey_re_read_is_honoured(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str, account: str
+) -> None:
+    """Item 2, closing step 2. The passkey set is read again after the sign-count write, and its
+    awaits must not sit between the last session, account and lock read and the factor write. RED
+    when: a lock, a revocation or a disable that lands during that passkey read does not stop the
+    factor write, which would then mark the factor and clear both lockout counters."""
+    if account == "directory":
+        p = await _directory_session_owing_a_passkey(store)
+        service, token, response, user_id = p.service, p.token, p.response, p.user_id
+    else:
+        service, token, response, user_id = await _local_assertion(store)
+    real_held = service._passkey_held
+
+    async def _held_while_something_lands(*args: Any) -> Any:
+        if change == "lock":
+            await _lock_second_step(store, user_id)
+        elif change == "revoke":
+            await store.revoke_session(hash_token(token))
+        else:
+            await store.set_user_disabled(user_id, disabled=True)
+        return await real_held(*args)
+
+    monkeypatch.setattr(service, "_passkey_held", _held_while_something_lands)
+
+    refused = await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+
+    assert refused.ok is False
+    assert refused.session_lost is (change != "lock")
+    session = await store.get_session(hash_token(token))
+    assert session is not None and session.mfa_verified_at is None
+    assert await store.list_audit(action="auth.webauthn_verified") == []
+    reason = "locked" if change == "lock" else "session_lost"
+    assert {"reason": reason} in await _audited_assertion_failures(store)
+    if change == "lock":
+        user = await store.get_user(user_id)
+        assert user is not None and user.second_step_locked_until is not None  # not cleared
+
+
+@pytest.mark.parametrize("keyed", [True, False], ids=["keyed", "keyless"])
+async def test_a_passkey_deleted_during_the_holder_re_read_is_seen(
+    monkeypatch: pytest.MonkeyPatch, keyed: bool
+) -> None:
+    """Item 2. The holder re-read is the last read before the factor write, so a passkey deleted
+    after the set was read is seen through the account row's passkey digest, which every store
+    rewrites on each passkey write, sealed or not. RED when: the factor is marked although the
+    passkey that signed is gone, or the refusal is not audited ``factor_removed``."""
+    cipher = make_cipher(generate_key()) if keyed else None
+    store = await MessageStore.open(":memory:", cipher=cipher)
+    try:
+        service, token, response, user_id = await _local_assertion(store)
+        real_holder = service._factor_holder_current
+        calls = {"n": 0}
+
+        async def _the_passkey_goes_then_the_holder_is_read(*args: Any, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                (held,) = await store.list_webauthn_credentials(user_id)
+                assert await store.delete_webauthn_credential(user_id, held.credential_id_hash)
+            return await real_holder(*args, **kwargs)
+
+        monkeypatch.setattr(
+            service, "_factor_holder_current", _the_passkey_goes_then_the_holder_is_read
+        )
+
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+
+        assert refused.ok is False and refused.session_lost is False
+        assert calls["n"] == 2  # the moved digest sent it back to the set, then the holder
+        assert {"reason": "factor_removed"} in await _audited_assertion_failures(store)
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
+    finally:
+        await store.close()
+
+
+async def test_a_passkey_set_that_keeps_moving_is_refused_as_unverifiable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 2, the settle loop's bound. A set whose digest moves before every holder re-read never
+    settles, so after its last pass the leg refuses the factor as unverifiable rather than reading
+    for ever. RED when: the loop is unbounded (the test hangs or reads more than the bound), or the
+    factor is marked."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response, user_id = await _local_assertion(store)
+        real_holder = service._factor_holder_current
+        calls = {"n": 0}
+
+        async def _another_passkey_lands_then_the_holder_is_read(*args: Any, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            extra = _cred(user_id, f"extra-{calls['n']}", id_hash=f"extra-hash-{calls['n']}")
+            assert await store.add_webauthn_credential(extra)
+            return await real_holder(*args, **kwargs)
+
+        monkeypatch.setattr(
+            service, "_factor_holder_current", _another_passkey_lands_then_the_holder_is_read
+        )
+
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+
+        assert refused.ok is False and refused.session_lost is False
+        assert calls["n"] == _PASSKEY_SETTLE_PASSES
+        assert {"reason": "factor_unverified"} in await _audited_assertion_failures(store)
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
+    finally:
+        await store.close()
+
+
 @pytest.mark.parametrize("keyed", [True, False], ids=["keyed", "keyless"])
 async def test_an_account_deleted_mid_assertion_is_a_lost_session(keyed: bool) -> None:
     """On a keyed store an account gone also fails its passkey set's seal re-read. RED when: the
@@ -731,16 +876,23 @@ async def test_every_sign_count_miss_is_a_clone_signal_naming_the_store_answer(c
         await store.close()
 
 
-async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question_raises() -> None:
+@pytest.mark.parametrize("raises", [False, True], ids=["refused", "propagates"])
+async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question_raises(
+    raises: bool,
+) -> None:
     """BACKLOG #3068, review of the merged head. The passkey question after a miss is two to four
     store reads, and a store error in any of them must not drop the clone row (ADR 0068 decision
-    4). RED when: the error propagates with no ``auth.webauthn_clone_suspected`` row written."""
+    4), whether it is refused or propagates. RED when: no ``auth.webauthn_clone_suspected`` row is
+    written; a ``RuntimeError`` propagates rather than refusing as ``store_error`` (BACKLOG #3775);
+    or ``sqlite3.InterfaceError``, which the set read's catch does not take, does not propagate."""
     store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
     try:
         service, token, response, user_id = await _local_assertion(store)
         real_update = store.update_webauthn_sign_count
 
         async def _store_error(*_args: Any) -> list[object]:
+            if raises:
+                raise sqlite3.InterfaceError("synthetic: the store read failed")
             raise RuntimeError("synthetic: the store read failed")
 
         async def _miss(*args: Any, **kwargs: Any) -> SignCountAnswer:
@@ -760,9 +912,15 @@ async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question
 
         store.update_webauthn_sign_count = _miss  # type: ignore[method-assign]
 
-        with pytest.raises(RuntimeError, match="synthetic"):
-            await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
-
+        if raises:
+            with pytest.raises(sqlite3.InterfaceError, match="synthetic"):
+                await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+        else:
+            refused = await service.finish_webauthn_assertion(
+                token, response, rp_id=_RP, origin=_ORIGIN
+            )
+            assert refused.ok is False and refused.session_lost is False
+            assert {"reason": "store_error"} in await _audited_assertion_failures(store)
         assert await _clone_answers(store) == ["mismatch"]
         session = await store.get_session(hash_token(token))
         assert session is not None and session.mfa_verified_at is None
@@ -815,12 +973,12 @@ async def test_a_passkey_deleted_after_a_sign_count_miss_still_reads_mismatch(
 
 
 #: Each case: what lands with the unsealed delete, and the reason the refusal is audited with
-#: (``None``: the set read raises, so the call raises rather than refusing).
-_UNSEALED_GONE_CASES: dict[str, str | None] = {
+#: (``store_error``: the set read raises a store fault, which refuses, BACKLOG #3775).
+_UNSEALED_GONE_CASES: dict[str, str] = {
     "revoke": "session_lost",
     "disable": "session_lost",
     "lock": "locked",
-    "set-read-raises": None,
+    "set-read-raises": "store_error",
 }
 
 
@@ -863,16 +1021,17 @@ async def test_an_unsealed_gone_passkey_writes_one_clone_row_whatever_the_holder
         store.update_webauthn_sign_count = _gone_unsealed_while_something_lands  # type: ignore[method-assign]
 
         reason = _UNSEALED_GONE_CASES[change]
-        if reason is None:
-            with pytest.raises(RuntimeError, match="synthetic"):
-                await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
-        else:
-            refused = await service.finish_webauthn_assertion(
-                token, response, rp_id=_RP, origin=_ORIGIN
-            )
-            assert refused.ok is False
-            assert refused.session_lost is (reason == "session_lost")
-            assert {"reason": reason} in await _audited_assertion_failures(store)
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+        assert refused.ok is False
+        assert refused.session_lost is (reason == "session_lost")
+        assert {"reason": reason} in await _audited_assertion_failures(store)
+        if change != "set-read-raises":
+            # BACKLOG #3068 N2: the set is read before the holder, so its failed seal is reported
+            # even when the holder refusal is what the caller gets. A set read that raises reads
+            # no seal.
+            assert await store.list_audit(action="integrity.authority_seal_failed") != []
         store.list_webauthn_credentials = real_list  # type: ignore[method-assign]
         assert await _clone_answers(store) == ["gone"]
         session = await store.get_session(hash_token(token))
@@ -917,12 +1076,15 @@ async def test_a_passkey_set_failing_its_seal_after_the_write_is_unverified() ->
 #: Each case: how the passkey goes before the write (``"held"``: it does not, and the store is made
 #: to answer ``gone`` anyway; ``"sealed"``: through the store's sealed delete; ``"unsealed"``:
 #: outside it, so the set fails its seal), and what the request answers (a refusal reason,
-#: ``"raises"`` or ``"cancelled"``).
+#: ``"raises"`` or ``"cancelled"``). A ``RuntimeError`` in the set read refuses as ``store_error``
+#: and a ``sqlite3.InterfaceError`` there raises (BACKLOG #3775); the holder re-read's still raises
+#: (vault BACKLOG #4728 finding 2).
 _GONE_CASES: dict[str, tuple[str, str]] = {
     "set-held": ("held", "factor_removed"),
     "set-removed": ("sealed", "factor_removed"),
     "set-unverified": ("unsealed", "factor_unverified"),
-    "set-read-raises": ("sealed", "raises"),
+    "set-read-raises": ("sealed", "store_error"),
+    "set-read-propagates": ("sealed", "raises"),
     "set-read-cancelled": ("sealed", "cancelled"),
     "account-unloadable": ("sealed", "session_lost"),
     "account-deleted-after-load": ("sealed", "session_lost"),
@@ -938,11 +1100,12 @@ async def test_every_gone_answer_writes_one_clone_row_whatever_follows(case: str
     """BACKLOG #3774, the Manager's ruling on PR 2392 at 38b26723. Engine main writes the clone row
     on every compare-and-set miss, so a ``gone`` answer writes it too, once, before any other read,
     naming ``gone``. RED when: a gone answer whose set still holds the passkey, loses it through
-    the sealed delete, fails its seal, or whose set read raises or is cancelled; whose account does
-    not load or is deleted after it loads; or whose holder re-read refuses (revoked, disabled,
-    locked) or raises, leaves other than one ``auth.webauthn_clone_suspected`` row naming ``gone``,
-    or a set that fails its seal is refused as ``factor_removed``. A cancel after the store answers
-    (``set-read-cancelled``) leaves the row. Keyed, so the seal can fail."""
+    the sealed delete, fails its seal, or whose set read refuses, raises or is cancelled; whose
+    account does not load or is deleted after it loads; or whose holder re-read refuses
+    (revoked, disabled, locked) or raises, leaves other than one
+    ``auth.webauthn_clone_suspected`` row naming ``gone``, or a set that fails its seal is
+    refused as ``factor_removed``. A cancel after the store answers (``set-read-cancelled``)
+    leaves the row. Keyed, so the seal can fail."""
     gone_by, outcome = _GONE_CASES[case]
     store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
     try:
@@ -956,6 +1119,8 @@ async def test_every_gone_answer_writes_one_clone_row_whatever_follows(case: str
         async def _set_read_fails(*_args: Any) -> list[object]:
             if case == "set-read-cancelled":
                 raise asyncio.CancelledError
+            if case == "set-read-propagates":
+                raise sqlite3.InterfaceError("synthetic: the store read failed")
             raise RuntimeError("synthetic: the store read failed")
 
         async def _holder_reread_fails(*_args: Any, **_kwargs: Any) -> Any:
@@ -982,7 +1147,7 @@ async def test_every_gone_answer_writes_one_clone_row_whatever_follows(case: str
                     await store._db.commit()
                 answer = await real_update(*args, **kwargs)
                 assert answer == "gone"
-            if case in ("set-read-raises", "set-read-cancelled"):
+            if case in ("set-read-raises", "set-read-propagates", "set-read-cancelled"):
                 store.list_webauthn_credentials = _set_read_fails  # type: ignore[method-assign,assignment]
             state["written"] = True
             return answer
@@ -1002,7 +1167,7 @@ async def test_every_gone_answer_writes_one_clone_row_whatever_follows(case: str
             service._factor_holder_current = _holder_reread_fails  # type: ignore[method-assign]
 
         if outcome == "raises":
-            with pytest.raises(RuntimeError, match="synthetic"):
+            with pytest.raises((RuntimeError, sqlite3.InterfaceError), match="synthetic"):
                 await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
         elif outcome == "cancelled":
             with pytest.raises(asyncio.CancelledError):
@@ -1032,24 +1197,21 @@ async def test_every_gone_answer_writes_one_clone_row_whatever_follows(case: str
 
 
 @pytest.mark.parametrize("keyed", [True, False], ids=["keyed", "keyless"])
-async def test_an_account_deleted_after_the_holder_re_read_is_a_lost_session(keyed: bool) -> None:
-    """BACKLOG #3068. An account deleted between the holder re-read and the passkey re-read leaves a
-    passkey set that is empty (keyless) or fails its seal (keyed). Either way the token no longer
-    authenticates. RED when: it is refused as a removed or unverifiable factor rather than a lost
-    session."""
+async def test_an_account_deleted_during_the_passkey_re_read_is_a_lost_session(keyed: bool) -> None:
+    """BACKLOG #3068. An account deleted as the passkey set is read again leaves a set that is
+    empty (keyless) or fails its seal (keyed). Either way the token no longer authenticates. RED
+    when: it is refused as a removed or unverifiable factor rather than a lost session."""
     cipher = make_cipher(generate_key()) if keyed else None
     store = await MessageStore.open(":memory:", cipher=cipher)
     try:
         service, token, response, user_id = await _local_assertion(store)
-        real_holder = service._factor_holder_current
+        real_held = service._passkey_held
 
-        async def _holder_then_the_account_goes(*args: Any, **kwargs: Any) -> Any:
-            holder = await real_holder(*args, **kwargs)
-            assert not isinstance(holder, Elevation)
+        async def _the_account_goes_then_the_set_is_read(*args: Any) -> Any:
             await store.delete_user(user_id)
-            return holder
+            return await real_held(*args)
 
-        service._factor_holder_current = _holder_then_the_account_goes  # type: ignore[method-assign]
+        service._passkey_held = _the_account_goes_then_the_set_is_read  # type: ignore[method-assign,assignment]
 
         refused = await service.finish_webauthn_assertion(
             token, response, rp_id=_RP, origin=_ORIGIN
@@ -1134,13 +1296,16 @@ async def test_a_store_fault_in_the_passkey_re_read_refuses_with_an_audit_row(
     the attempt with no audit row. RED when: the fault raises past ``finish_webauthn_assertion``,
     the factor is marked, no ``auth.webauthn_failed`` row names ``store_error`` when the audit
     write lands, or a refused audit write (any class ``audit_write_errors`` names) turns the
-    refusal into a raise. The fault is logged either way."""
+    refusal into a raise. The fault is logged either way, by type: RED when the read fault's
+    message reaches an ERROR record, the refused audit write's chained traceback included."""
     store, token, refused = await _assert_with_the_set_read_failing(
         monkeypatch, sqlite3.OperationalError("synthetic: the set read was refused"), audit_fault
     )
     try:
         assert refused.ok is False and refused.session_lost is False
         assert "the passkey re-read raised" in caplog.text
+        # A refused audit write's own traceback must not carry the read fault as its context.
+        assert "the set read was refused" not in _error_log_text(caplog)
         failures = await _audited_assertion_failures(store)
         assert ({"reason": "store_error"} in failures) is (audit_fault is None)
         assert await store.list_audit(action="auth.webauthn_verified") == []
@@ -1152,6 +1317,13 @@ async def test_a_store_fault_in_the_passkey_re_read_refuses_with_an_audit_row(
         await store.close()
 
 
+def _error_log_text(caplog: pytest.LogCaptureFixture) -> str:
+    """Every ERROR-or-above record caplog holds, formatted with its traceback and any chained
+    exception, as a handler would write it."""
+    formatter = logging.Formatter()
+    return "\n".join(formatter.format(r) for r in caplog.records if r.levelno >= logging.ERROR)
+
+
 async def test_a_defect_in_the_passkey_re_read_still_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1161,4 +1333,103 @@ async def test_a_defect_in_the_passkey_re_read_still_raises(
     with pytest.raises(sqlite3.ProgrammingError, match="synthetic"):
         await _assert_with_the_set_read_failing(
             monkeypatch, sqlite3.ProgrammingError("synthetic: a bad bind")
+        )
+
+
+class _PyodbcError(Exception):
+    """A stand-in for pyodbc's ``Error`` root, which pyodbc raises for a deadlock victim (40001)."""
+
+
+@pytest.fixture
+def fake_pyodbc() -> Iterator[None]:
+    """A stand-in ``pyodbc`` module with its ``Error`` root, imported the way the store's guarded
+    imports read it. The cached catch sets are cleared on the way in and out, so each is built once
+    against the stand-in and once without it. Its own patch context, so the test's
+    ``monkeypatch.undo()`` in the read-fault helper does not take the stand-in away mid-test."""
+    module = ModuleType("pyodbc")
+    module.Error = _PyodbcError  # type: ignore[attr-defined]
+    module.DatabaseError = type("DatabaseError", (_PyodbcError,), {})  # type: ignore[attr-defined]
+    caches = (
+        store_call_errors,
+        audit_write_errors,
+        auth_service_module._session_write_errors,
+        auth_service_module._passkey_read_errors,
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(sys.modules, "pyodbc", module)
+        for cached in caches:
+            cached.cache_clear()
+        try:
+            yield
+        finally:
+            for cached in caches:
+                cached.cache_clear()
+
+
+#: Each case builds its fault in the test, so no instance (and its traceback) outlives a run.
+_READ_FAULTS: dict[str, Callable[[], Exception]] = {
+    "call-runtime": lambda: RuntimeError("synthetic: an engine refusal"),
+    "call-closed": lambda: ValueError("synthetic: no active connection"),
+    "lost-socket": lambda: OSError("synthetic: the connection was lost at the socket"),
+    "acquire-timeout": lambda: StoreAcquireTimeout("synthetic: the pool borrow timed out"),
+}
+
+
+async def _assert_the_read_fault_refuses(
+    read_fault: Exception, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    store, token, refused = await _assert_with_the_set_read_failing(monkeypatch, read_fault)
+    try:
+        assert refused.ok is False and refused.session_lost is False
+        assert "the passkey re-read raised" in caplog.text
+        logged = _error_log_text(caplog)
+        assert type(read_fault).__qualname__ in logged
+        assert str(read_fault) not in logged  # the type only, never the message
+        assert {"reason": "store_error"} in await _audited_assertion_failures(store)
+        assert await store.list_audit(action="auth.webauthn_verified") == []
+        assert await _clone_answers(store) == []
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.revoked_at is None
+        assert session.mfa_verified_at is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("case", list(_READ_FAULTS))
+async def test_a_store_call_read_fault_takes_the_refusal_path(
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3775, vault BACKLOG #4728 finding 3. The passkey re-read after the sign-count write
+    catches ``store_call_errors()`` and ``store_connect_errors()``, so each of these faults takes
+    one path: a ``store_error`` refusal with its audit row, no clone row, the factor unmarked. All
+    of these are in ``store_call_errors()``; the pyodbc test below covers what the connect half
+    adds. RED when: any of them raises past ``finish_webauthn_assertion``, marks the factor, or
+    writes no ``store_error`` row. Under the narrower session-write catch the ``call-runtime`` and
+    ``call-closed`` cases raised; the other two were already refused."""
+    await _assert_the_read_fault_refuses(_READ_FAULTS[case](), monkeypatch, caplog)
+
+
+@pytest.mark.usefixtures("fake_pyodbc")
+async def test_a_pyodbc_root_read_fault_takes_the_connect_class_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3775. pyodbc's ``Error`` root, which it raises for a deadlock victim, is in the
+    connect set and not in ``store_call_errors()``, so it is what the connect half of the catch
+    adds. RED when: the catch drops ``store_connect_errors()`` and the fault raises. CONTROL: the
+    call set alone really misses it."""
+    assert not isinstance(_PyodbcError(), store_call_errors())
+    await _assert_the_read_fault_refuses(_PyodbcError("40001"), monkeypatch, caplog)
+
+
+async def test_a_sqlite_interface_error_in_the_passkey_re_read_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3775. ``sqlite3.InterfaceError`` is outside both sets the catch takes (it is a
+    ``sqlite3.Error``, not a ``DatabaseError``), and ADR 0068 says it still raises there. RED when:
+    a wider catch answers it as a ``store_error`` refusal while the ADR still says otherwise."""
+    with pytest.raises(sqlite3.InterfaceError, match="synthetic"):
+        await _assert_with_the_set_read_failing(
+            monkeypatch, sqlite3.InterfaceError("synthetic: SQLITE_MISUSE")
         )
