@@ -47,6 +47,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
     _bounded_address_text,
+    _bounded_text,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -333,9 +334,10 @@ async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings(
         assert repeat == {"path": forged}
         assert over == {"path": forged, "seen_ip": "10.9.9.9"}
         assert over_long["seen_ip"] == "10.9.9.8"
-        assert over_long["path"] == _bounded_address_text(
+        assert over_long["path"] == _bounded_text(
             long_path, _NEW_IP_LOG_PATH_MAX, _NEW_IP_LOG_PATH_PREFIX
         )
+        assert len(over_long["path"]) <= 300  # an independent ceiling: 192 + 74 for this path
     finally:
         await store.close()
 

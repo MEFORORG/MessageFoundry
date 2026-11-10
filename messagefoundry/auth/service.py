@@ -517,7 +517,8 @@ _NEW_IP_PER_SESSION_MAX = 8
 # Other sinks of the same text, such as sessions.client and other audit rows, are not bounded here.
 _NEW_IP_TEXT_MAX = 64
 _NEW_IP_TEXT_PREFIX = 24
-# BACKLOG #3770: the longest request path the new-address WARNINGs log as it is. The path is
+# BACKLOG #3770: the longest request path the new-address WARNINGs log as it is, in characters
+# before quoting; the quoting writes a non-ASCII character as up to 12 ASCII ones. The path is
 # caller-supplied and bounded only by the HTTP server's request-line limit, so a longer one keeps a
 # prefix and gains the SHA-256 of the whole, as an address does. The replacement is longer than the
 # bound, so it can never equal a path kept as it is.
@@ -601,24 +602,28 @@ def _client_limiter_key(client: str | None) -> str:
     return _host_key(client) if client else "unknown"
 
 
-def _bounded_address_text(
-    address: str, limit: int = _NEW_IP_TEXT_MAX, prefix_length: int = _NEW_IP_TEXT_PREFIX
-) -> str:
-    """``address`` itself when it is at most ``limit`` characters, else a prefix of
-    ``prefix_length`` characters and the SHA-256 of the whole (BACKLOG #3772).
+def _bounded_address_text(address: str) -> str:
+    """``address`` itself when it is at most ``_NEW_IP_TEXT_MAX`` characters, else a short prefix
+    and the SHA-256 of the whole (BACKLOG #3772).
 
     The same input always gives the same output, so it serves as a dedupe key. At least the
     new-address signal uses it; :func:`_host_key` stays unbounded, because the persisted
-    known-address record and :meth:`AuthService._same_host` compare by it. The new-address
-    WARNINGs bound their request path with it too, under their own limit (BACKLOG #3770)."""
-    if len(address) <= limit:
-        return address
+    known-address record and :meth:`AuthService._same_host` compare by it."""
+    return _bounded_text(address, _NEW_IP_TEXT_MAX, _NEW_IP_TEXT_PREFIX)
+
+
+def _bounded_text(text: str, limit: int, prefix_length: int) -> str:
+    """``text`` itself when it is at most ``limit`` characters, else its first ``prefix_length``
+    characters and the SHA-256 of the whole: the one bounding rule behind
+    :func:`_bounded_address_text` and :func:`_logged_request_path` (BACKLOG #3772, #3770)."""
+    if len(text) <= limit:
+        return text
     # surrogatepass, so a lone surrogate cannot make the digest raise; the encoding is injective, so
     # distinct text still gives distinct digests. A dedupe key, not a credential, so a plain digest.
-    digest = hashlib.sha256(address.encode("utf-8", "surrogatepass")).hexdigest()
+    digest = hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
     # The prefix is only a reading aid, so a lone surrogate in it becomes "?" (one character each),
     # and the result can be stored. Text within the bound is returned as it is, as on main.
-    prefix = address[:prefix_length].encode("utf-8", "replace").decode("utf-8")
+    prefix = text[:prefix_length].encode("utf-8", "replace").decode("utf-8")
     return f"{prefix}...sha256:{digest}"
 
 
@@ -626,9 +631,7 @@ def _logged_request_path(path: str) -> str:
     """``path`` as a new-address WARNING logs it: bounded to ``_NEW_IP_LOG_PATH_MAX`` the way an
     address is, then quoted, so a path with a space in it cannot write a field of its own after
     ``path=`` (BACKLOG #3770)."""
-    return quote_log_text(
-        _bounded_address_text(path, _NEW_IP_LOG_PATH_MAX, _NEW_IP_LOG_PATH_PREFIX)
-    )
+    return quote_log_text(_bounded_text(path, _NEW_IP_LOG_PATH_MAX, _NEW_IP_LOG_PATH_PREFIX))
 
 
 #: The refusals on an IdP step-up's return that draw :meth:`AuthService.allow_step_up_return_audit`

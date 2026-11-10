@@ -5412,10 +5412,11 @@ and what ran at the start differs by response (BACKLOG #3469). The client-networ
 handshake. The bulk message export's gate, `require_step_up_action` with the export's action, also
 ran the new-address check, and the route spends a fresh step-up bound to the export before it
 streams. With `[auth].require_action_step_up = false` that spend reads the session's step-up window
-instead, so a recent step-up for anything else serves. The `/ws/stats` gate
+instead, which a recent step-up for anything else opens, and so does a recent local sign-in that
+owed no second factor. The `/ws/stats` gate
 (`authorize_ws`, or the console's cookie twin) and the audit export's gate
 (`require(Permission.AUDIT_EXPORT)`, or the console's `require_ui(Permission.AUDIT_EXPORT)`) run
-neither, so neither response is step-up gated at any point. Each resolves the token it started with, so a session rotation (a step-up
+no step-up and no new-address check, so neither response is step-up gated at any point. Each resolves the token it started with, so a session rotation (a step-up
 on that session, for example) ends it as a revocation would.
 
 - The `/ws/stats` live feed asks before every frame, about one a second. A refusal closes the socket
