@@ -11,6 +11,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from fastapi.exception_handlers import http_exception_handler
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
@@ -23,7 +24,12 @@ from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
 from messagefoundry.store.cell_tag import PRESET_TAG_FAILED_ACTION
-from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
+from messagefoundry.store.crypto import (
+    AesGcmCipher,
+    CipherUnavailableError,
+    generate_key,
+    make_cipher,
+)
 from tests._admin_account import create_local_user_chosen
 
 PW = "Correct-Horse-Battery-Staple-9"
@@ -266,6 +272,19 @@ async def test_malformed_stored_criteria_are_still_a_400(engine: Engine, stored:
     assert r.json()["detail"] == f"preset {pid} has malformed criteria"
 
 
+def _keep_raised(app: FastAPI) -> list[StarletteHTTPException]:
+    """Record each HTTPException ``app`` raises, so a refusal's own chain can be read (#1796)."""
+    raised: list[StarletteHTTPException] = []
+
+    async def _keep(request: Request, exc: Exception) -> Response:
+        assert isinstance(exc, StarletteHTTPException)
+        raised.append(exc)
+        return await http_exception_handler(request, exc)
+
+    app.add_exception_handler(StarletteHTTPException, _keep)
+    return raised
+
+
 async def test_a_preset_planted_in_the_callers_account_answers_423(tmp_path: Path) -> None:
     """BACKLOG #2593: criteria bind their owner. Another account's preset moved into the caller's
     account outside the store is refused on the layered recall with a 423, audited and alerted once,
@@ -290,15 +309,7 @@ async def test_a_preset_planted_in_the_callers_account_answers_423(tmp_path: Pat
         them = await service.store.get_user_by_username("op2")
         assert me is not None and them is not None
         app = create_app(keyed, auth=service)
-        # Keep each HTTPException the app raises, so the 423's own chain can be read (BACKLOG #1796).
-        raised: list[StarletteHTTPException] = []
-
-        async def _keep(request: Request, exc: Exception) -> Response:
-            assert isinstance(exc, StarletteHTTPException)
-            raised.append(exc)
-            return await http_exception_handler(request, exc)
-
-        app.add_exception_handler(StarletteHTTPException, _keep)
+        raised = _keep_raised(app)
         transport = httpx.ASGITransport(app=app)
         alerts: list[tuple[str, str]] = []
         cipher.set_tag_failure_hook(lambda table, reason: alerts.append((table, reason)))
@@ -348,6 +359,157 @@ async def test_a_preset_planted_in_the_callers_account_answers_423(tmp_path: Pat
     finally:
         side.close()
         await keyed.stop()
+
+
+@pytest.mark.parametrize("stored", ["", None], ids=["empty", "null"])
+async def test_a_blanked_criteria_cell_answers_423_rather_than_widening(
+    engine: Engine, stored: str | None
+) -> None:
+    """BACKLOG #5523: a narrowing preset whose criteria cell is blanked outside the store is refused,
+    never read as an empty filter. Read as ``{}``, it dropped out of the compose and the layered
+    search matched rows the preset would have excluded. Control: before the blanking, the narrowing
+    preset excludes the seeded message."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    await engine.store.enqueue_message(
+        channel_id="ch1",
+        raw=ADT,
+        deliveries=[("o", ADT)],
+        control_id="MSG1",
+        message_type="ADT^A01",
+    )
+    service = await _user(engine, Role.OPERATOR, "op")
+    app = create_app(engine, auth=service)
+    raised = _keep_raised(app)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        h = await _login(c, "op")
+        ids = []
+        for name, criteria in (
+            ("needle", {"content": "MRN999"}),
+            ("narrow", {"channel_id": "ch2"}),
+        ):
+            r = await c.post(
+                "/search/presets", json={"name": name, "criteria": criteria}, headers=h
+            )
+            assert r.status_code == 200, r.text
+            ids.append(r.json()["id"])
+        needle, narrow = ids
+        layered = {"presets": f"{needle},{narrow}"}
+        r = await c.get("/search/layered", params=layered, headers=h)
+        assert r.status_code == 200 and r.json()["matched"] == 0, r.text  # control: it narrows
+        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
+        await engine.store._db.execute(
+            "UPDATE search_presets SET criteria=? WHERE id=?", (stored, narrow)
+        )
+        await engine.store._db.commit()
+        r = await c.get("/search/layered", params=layered, headers=h)
+    assert r.status_code == 423, r.text
+    assert r.json()["detail"] == f"preset {narrow} failed its integrity check and cannot be used"
+    assert raised[-1].__context__ is None and raised[-1].__cause__ is None
+
+
+async def test_a_plain_cipher_error_on_the_criteria_answers_423_not_500(tmp_path: Path) -> None:
+    """BACKLOG #5523: ``open_tagged_cell`` re-raises a cipher error that is not a tag failure, here
+    the refusal of an unmarked value planted in a keyed store. It escaped as a 500. It is a 423 now,
+    naming no cipher detail and chaining nothing."""
+    import sqlite3
+
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    db = tmp_path / "keyed.db"
+    store = await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))
+    keyed = Engine(store, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False))
+    side = sqlite3.connect(db, timeout=30)  # a writer with no key, outside the store
+    try:
+        service = await _user(keyed, Role.OPERATOR, "op")
+        app = create_app(keyed, auth=service)
+        raised = _keep_raised(app)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            h = await _login(c, "op")
+            r = await c.post(
+                "/search/presets", json={"name": "n", "criteria": {"content": "MRN999"}}, headers=h
+            )
+            assert r.status_code == 200, r.text
+            pid = r.json()["id"]
+            side.execute(
+                "UPDATE search_presets SET criteria=? WHERE id=?", ('{"content": "MRN999"}', pid)
+            )
+            side.commit()
+            r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+        assert r.status_code == 423, r.text
+        assert r.json()["detail"] == f"preset {pid} cannot be opened and cannot be used"
+        assert "unmarked" not in r.text and "MRN999" not in r.text
+        assert raised[-1].__context__ is None and raised[-1].__cause__ is None
+    finally:
+        side.close()
+        await keyed.stop()
+
+
+async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5523, after #3734: Vault Transit's outage reaches the route as the
+    ``CipherUnavailableError`` that ``open_tagged_cell`` re-raises for a cipher with no
+    ``holds_key_for``. The store method stands in for that path here. It is a 503 with Retry-After,
+    not the 423 that would send an operator after a preset that is fine, and not a 500. The outage
+    text stays off the response and its chain."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+    from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
+
+    service = await _user(engine, Role.OPERATOR, "op")
+    app = create_app(engine, auth=service)
+    raised = _keep_raised(app)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        h = await _login(c, "op")
+        r = await c.post(
+            "/search/presets", json={"name": "n", "criteria": {"content": "MRN999"}}, headers=h
+        )
+        assert r.status_code == 200, r.text
+        pid = r.json()["id"]
+
+        async def _outage(**_kw: object) -> None:
+            raise CipherUnavailableError("Transit unreachable for key mf-store-secret")
+
+        monkeypatch.setattr(engine.store, "get_search_preset", _outage)
+        r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+    assert r.status_code == 503, r.text
+    assert r.headers["Retry-After"] == str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)
+    assert "Transit" not in r.text and "mf-store-secret" not in r.text
+    assert raised[-1].__context__ is None and raised[-1].__cause__ is None
+
+
+async def test_layered_search_feeds_the_summary_access_audit(engine: Engine) -> None:
+    """BACKLOG #5523: a layered recall that returns summaries is coalesced into ``summary_access``
+    like ``/messages/search`` (review M-5), so it is no way round the harvest signal."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    await engine.store.enqueue_message(
+        channel_id="ch1",
+        raw=ADT,
+        deliveries=[("o", ADT)],
+        control_id="MSG1",
+        message_type="ADT^A01",
+        summary="DOE^JANE",
+    )
+    service = await _user(engine, Role.OPERATOR, "op")
+    app = create_app(engine, auth=service)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        h = await _login(c, "op")
+        r = await c.post(
+            "/search/presets", json={"name": "n", "criteria": {"content": "MRN999"}}, headers=h
+        )
+        assert r.status_code == 200, r.text
+        r = await c.get("/search/layered", params={"presets": r.json()["id"]}, headers=h)
+        assert r.status_code == 200 and r.json()["matched"] == 1, r.text
+        await app.state.summary_auditor.flush(engine.store)
+    rows = await engine.store.list_audit(action="summary_access")
+    assert [a["actor"] for a in rows] == ["op"]
 
 
 async def test_layered_requires_read_permission(engine: Engine) -> None:

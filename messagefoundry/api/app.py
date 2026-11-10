@@ -530,7 +530,7 @@ from messagefoundry.store.content_search import (
     SearchTarget,
     make_spec,
 )
-from messagefoundry.store.crypto import audit_body_digests
+from messagefoundry.store.crypto import CipherError, CipherUnavailableError, audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
 from messagefoundry.store.store import (
@@ -9572,7 +9572,8 @@ def create_app(
             raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
-            integrity_refused = False
+            tampered = f"preset {preset_id} failed its integrity check and cannot be used"
+            refusal: HTTPException | None = None
             try:
                 row = await engine.store.get_search_preset(
                     preset_id=preset_id, owner_user_id=identity.user_id
@@ -9580,20 +9581,40 @@ def create_app(
             except CellTagError:
                 # BACKLOG #2593: the criteria fail their owner tag (alerted and audited) or are
                 # corrupt (logged); the store refused. The caller's own preset exists, so a refusal,
-                # never a 500.
-                integrity_refused = True
-            if integrity_refused:
-                # Raised after the handler, so the 423 chains nothing (BACKLOG #1796): `from None`
-                # would still leave the CellTagError and the cipher's error on __context__.
-                raise HTTPException(
-                    423, f"preset {preset_id} failed its integrity check and cannot be used"
+                # never a 500. Caught before CipherError, which it subclasses.
+                refusal = HTTPException(423, tampered)
+            except CipherUnavailableError as exc:
+                # BACKLOG #5523, as #3734 split the upload routes: the key service gave no verdict,
+                # so a later try may succeed. Its text goes to the log only, as in uploads.
+                _log.warning("layered search answered 503 on preset %s: %s", preset_id, exc)
+                refusal = HTTPException(
+                    503,
+                    f"the store's key service could not open preset {preset_id}. Try again shortly",
+                    headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
                 )
+            except CipherError as exc:
+                # BACKLOG #5523: a key or format problem the cipher raises as is, for example an
+                # unmarked value planted in a keyed store, or a value Vault Transit refused. It
+                # answered 500. The type name only: the text is the cipher's, not this route's.
+                _log.warning("layered search refused preset %s: %s", preset_id, type(exc).__name__)
+                refusal = HTTPException(
+                    423, f"preset {preset_id} cannot be opened and cannot be used"
+                )
+            if refusal is not None:
+                # Raised after the handler, so the refusal chains nothing (BACKLOG #1796): `from
+                # None` would still leave the store's and the cipher's errors on __context__.
+                raise refusal
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
+            if not row["criteria"]:
+                # BACKLOG #5523: the store never writes blank criteria, and a keyed store passes a
+                # blank cell through unopened, so NULL or "" was written outside the store. Read as
+                # `{}` it would drop out of the compose and widen the search, so refuse it.
+                raise HTTPException(423, tampered)
             # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
             # arm is gone: get_search_preset returns the criteria through the cipher, always a str.
-            criteria, refused = json_loads_or_refusal(row["criteria"] or "{}")
+            criteria, refused = json_loads_or_refusal(row["criteria"])
             if refused is not None or not isinstance(criteria, dict):
                 raise HTTPException(400, f"preset {preset_id} has malformed criteria")
             criterias.append(criteria)
@@ -9618,6 +9639,18 @@ def create_app(
         )
         messages = [_summary(r) for r in result.rows]
         messages = [redact_unauthorized(m, identity) for m in messages]
+        # BACKLOG #5523: coalesced into summary_access like /messages/search, so a layered recall
+        # is no way round the harvest signal (review M-5). Counted post-redaction.
+        exposed, masked = count_exposed(messages), count_masked(messages)
+        if exposed or masked:
+            await request.app.state.summary_auditor.note(
+                engine.store,
+                identity.username,
+                meta["channel_id"],
+                exposed,
+                time.time(),
+                masked=masked,
+            )
         await engine.store.record_audit(
             "preset.layered_search",
             actor=identity.username,
