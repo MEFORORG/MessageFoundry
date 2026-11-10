@@ -2054,10 +2054,13 @@ audit evidence is emitted even when `[logging].level` is `WARNING`. **Not used:*
 **A collector should not assume every tee record parses or is whole.** Each record leaves as one
 JSON object, but the handler filters can rewrite it as text afterwards. On a first deployment, a
 collector could receive a record that fails to parse. It could also receive one that parses with
-fields missing, or with one field's text under another key. And a C0 control in a field, such as a
-typed sign-in name, could let text beside it reach the tee unredacted. The `emit_audit_tee`
-docstring in [`store/audit_tee.py`](../messagefoundry/store/audit_tee.py) names at least three
-residuals that cause these.
+fields missing, or with one field's text under another key. The `emit_audit_tee`
+docstring in [`store/audit_tee.py`](../messagefoundry/store/audit_tee.py) names at least two
+residuals that cause these. A text field holding a C0 control, such as a typed sign-in name, is
+scrubbed before it is encoded, and in at least the cases `_scrub_field` in the same file lists,
+the whole field ships as `[redacted]`. That includes a typed sign-in name a client chose to put a
+control in, so on a first deployment a client could keep its own typed name out of the off-box
+copy. The `emit_audit_tee` docstring says what that scrub does not cover.
 
 ### Logging inventory (16.1.1 / 16.2.3)
 
