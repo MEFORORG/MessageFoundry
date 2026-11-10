@@ -278,7 +278,8 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   re-attach failed by its outbox id, never its content. A member's re-attach refusal that is not
   permanent, or that must stop the connection, is the whole batch's, as the frame split treats one,
   and the members refused alone are logged in the order they were claimed.
-  A held attachment whose read fails stays the retryable `DeliveryError` above. One GC'd with its
+  A held attachment whose read fails stays the retryable `DeliveryError` above; on a batched
+  outbound the whole batch re-pends, and its stored error names the member the same way. One GC'd with its
   header, or on a backend without the substrate, is linked to no message, so its handle is refused
   permanently by the binding below.
 - **A handle resolves only to its own message's attachment (BACKLOG #5099, added 2026-11-03).** The

@@ -30,7 +30,7 @@ import hashlib
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -59,6 +59,7 @@ from messagefoundry.parsing.binary import (
     reattach_documents_in_hl7,
 )
 from messagefoundry.parsing.message import Message
+from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import MessageStore, OutboxStatus
@@ -723,6 +724,24 @@ async def test_an_engine_value_error_in_a_batch_reattach_still_stops_a_stop_lane
     assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 0
 
 
+async def _enqueue(store: MessageStore, payloads: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Enqueue one member per payload, in claim order, and return the message ids and the outbox
+    ids, so a test can tell a middle member from the head and the last."""
+    mids = [
+        await store.enqueue_message(channel_id="c1", raw=sk, deliveries=[(DEST, sk)], now=100.0)
+        for sk in payloads
+    ]
+    return mids, [await _outbox_id(store, m) for m in mids]
+
+
+def _three(middle: str) -> list[str]:
+    return [_hl7_with_value(v) for v in ("clean one", middle, "clean three")]
+
+
+async def _rows(store: MessageStore, mids: Sequence[str]) -> list[tuple[str, str]]:
+    return [row for m in mids for row in await _outbox_rows(store, m)]
+
+
 @pytest.mark.parametrize("corrupt_head", [False, True], ids=["corrupt-second", "corrupt-head"])
 @pytest.mark.parametrize("policy", [InternalErrorPolicy.STOP, InternalErrorPolicy.CONTINUE])
 async def test_a_batch_member_with_a_stored_cr_takes_the_whole_batch_to_the_policy(
@@ -735,15 +754,13 @@ async def test_a_batch_member_with_a_stored_cr_takes_the_whole_batch_to_the_poli
     ref_a, ref_bad = await _store_doc(store, a), await _store_doc_with_a_cr(store)
     sk_a = _hl7_with_value(make_doc_ref(ref_a, "application/pdf"))
     sk_bad = _hl7_with_value(make_doc_ref(ref_bad, "application/pdf"))
-    # Both orders: with the clean member as the head, naming the head instead of the corrupt
-    # member fails.
-    t_a, t_bad = (101.0, 100.0) if corrupt_head else (100.0, 101.0)
-    mid_a = await store.enqueue_message(
-        channel_id="c1", raw=sk_a, deliveries=[(DEST, sk_a)], now=t_a
-    )
-    mid_bad = await store.enqueue_message(
-        channel_id="c1", raw=sk_bad, deliveries=[(DEST, sk_bad)], now=t_bad
-    )
+    # Both orders. claim_next_fifo claims in insert order, not by `now`, so the corrupt member is
+    # the head only when it is enqueued first. With it last, naming the head instead fails; with it
+    # first, naming the last member instead fails.
+    if corrupt_head:
+        (mid_bad, mid_a), _ = await _enqueue(store, [sk_bad, sk_a])
+    else:
+        (mid_a, mid_bad), _ = await _enqueue(store, [sk_a, sk_bad])
     col = _Collector()
     runner, sink = _batch_runner(store, col)
     runner._internal_error[DEST] = policy
@@ -768,6 +785,125 @@ async def test_a_batch_member_with_a_stored_cr_takes_the_whole_batch_to_the_poli
         assert sink.stopped == []
         assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 2
         assert all(err.startswith("internal error: ValueError") for _, err in rows)
+
+
+async def test_a_stored_cr_in_the_middle_member_names_the_middle_member(
+    store: MessageStore,
+) -> None:
+    # Vault BACKLOG #5100: with the corrupt member neither the head nor the last, naming either of
+    # those instead fails. CONTINUE still dead-letters all three (option (a), ADR 0105).
+    ref_bad = await _store_doc_with_a_cr(store)
+    mids, ids = await _enqueue(store, _three(make_doc_ref(ref_bad, "application/pdf")))
+    col = _Collector()
+    runner, _ = _batch_runner(store, col)
+
+    await _run_batch(runner, store)
+
+    assert col.deliveries == []
+    rows = await _rows(store, mids)
+    assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 3
+    assert all(err.endswith(f"; batch member {ids[1]}") for _, err in rows)
+    assert not any(ids[0] in err or ids[2] in err for _, err in rows)
+
+
+@pytest.mark.parametrize(
+    ("fault", "blames", "logs"),
+    [
+        (lambda: DeliveryError("attachment missing"), True, False),
+        (lambda: wiring_runner._StoreReadFault("attachment read failed"), False, True),
+        # A NegativeAckError is a DeliveryError, but its own arm comes first and marks no down edge.
+        (lambda: _transient_refusal(), False, False),
+    ],
+    ids=["delivery-error", "store-read-fault", "transient-refusal"],
+)
+async def test_a_retryable_fault_in_the_middle_members_reattach_names_that_member(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fault: Callable[[], Exception],
+    blames: bool,
+    logs: bool,
+) -> None:
+    # Vault BACKLOG #5100: the arms that re-pend the batch name the member whose re-attach raised,
+    # in every member's stored error; a DeliveryError blames it in the lane's down edge, and a store
+    # read fault names it in its log line.
+    caplog.set_level(logging.DEBUG, logger="messagefoundry")
+    mids, ids = await _enqueue(store, _three("FAULT"))
+    runner, _ = _batch_runner(store, _Collector())
+    real = runner._hydrate_payload
+
+    async def _hydrate(payload: str, message_id: str) -> str:
+        if "FAULT" in payload:
+            raise fault()
+        return await real(payload, message_id)
+
+    monkeypatch.setattr(runner, "_hydrate_payload", _hydrate)
+    blamed: list[str] = []
+    monkeypatch.setattr(runner, "_note_lane_unhealthy", lambda _n, mid, _e: blamed.append(mid))
+
+    await _run_batch(runner, store)
+
+    named = f"; batch member {ids[1]}"
+    rows = await _rows(store, mids)
+    assert [status for status, _ in rows] == [OutboxStatus.PENDING.value] * 3
+    assert all(err.endswith(named) for _, err in rows)
+    assert blamed == ([ids[1]] if blames else [])
+    if logs:
+        lines = [r.getMessage() for r in caplog.records if "before sending" in r.getMessage()]
+        assert lines and all(named in line for line in lines)
+
+
+async def test_a_non_hl7_head_names_the_head(store: MessageStore) -> None:
+    # Vault BACKLOG #5100: the head's parse for BHS-11 is that member's own step, so a non-HL7 head
+    # names the head, not the last member.
+    mids, ids = await _enqueue(store, ["not an HL7 message at all", _hl7_with_value("clean")])
+    col = _Collector()
+    runner, _ = _batch_runner(store, col)
+
+    await _run_batch(runner, store)
+
+    assert col.deliveries == []
+    rows = await _rows(store, mids)
+    assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 2
+    assert all(err.endswith(f"; batch member {ids[0]}") for _, err in rows)
+
+
+async def test_an_encode_batch_fault_names_no_member(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Vault BACKLOG #5100: encode_batch frames every member at once, so its fault names none rather
+    # than the last member whose own step ran.
+    mids, _ = await _enqueue(store, _three("clean two"))
+    runner, _ = _batch_runner(store, _Collector())
+
+    def _faulting_encode(*_args: object, **_kwargs: object) -> str:
+        raise ValueError("encode bug")
+
+    monkeypatch.setattr(wiring_runner, "encode_batch", _faulting_encode)
+
+    await _run_batch(runner, store)
+
+    rows = await _rows(store, mids)
+    assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 3
+    assert not any("batch member" in err for _, err in rows)
+
+
+async def test_a_send_fault_names_no_member_and_blames_the_envelope_head(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Vault BACKLOG #5100: the send is the whole envelope's, so no member is named, and the lane's
+    # down edge blames the envelope's head, as before members were named.
+    mids, ids = await _enqueue(store, _three("clean two"))
+    runner, _ = _batch_runner(store, _Collector(fail_times=1))
+    blamed: list[str] = []
+    monkeypatch.setattr(runner, "_note_lane_unhealthy", lambda _n, mid, _e: blamed.append(mid))
+
+    await _run_batch(runner, store)
+
+    rows = await _rows(store, mids)
+    assert [status for status, _ in rows] == [OutboxStatus.PENDING.value] * 3
+    assert not any("batch member" in err for _, err in rows)
+    assert blamed == [ids[0]]
 
 
 async def test_a_batch_with_both_kinds_of_refused_member_logs_them_in_claim_order(
