@@ -13,9 +13,9 @@ names (``MEFOR_CONNSCALE_NAME_PREFIX=E0``/``E1``). It drives a small, brief load
   report a peer's rows. This disjoint-lane isolation is the load-bearing correctness the gate needs, and it
   is config-derived so it holds regardless of the write lock.
 
-A third test is SECURITY evidence, not a load smoke: docs/SECURITY.md cites
-``test_a_scoped_operator_asking_the_wrong_engine_gets_the_403_and_a_denial_row`` for the case of
-a channel-scoped operator asking one engine about an in-scope inbound another holds (BACKLOG #3031).
+A third test is SECURITY evidence, not a load smoke:
+``test_a_scoped_operator_asking_the_wrong_engine_gets_the_403_and_a_denial_row`` pins a
+channel-scoped operator asking one engine about an in-scope inbound another holds (BACKLOG #3031).
 
 End-to-end ZERO-LOSS is NOT asserted here. SQLite is single-writer: two ``serve`` processes writing one
 file serialize on the write lock, and a delivery-worker commit can hit ``SQLITE_LOCKED`` (which the
@@ -212,14 +212,12 @@ async def test_multishard_engine_index_base_offsets_lane_tags() -> None:
         assert e.reads > 0, e
 
 
-# --- BACKLOG #3031 step 2: a scoped operator asking the wrong engine shard ---------------------------
+# --- BACKLOG #3031 step 2: a scoped operator asking the wrong engine ---------------------------------
 #
 # Each engine of this rig loads only its own E{k}-tagged inbounds and serves its own API port, over ONE
 # shared store, so accounts, sessions, scopes and the audit trail are shared while each graph is not.
-# The two engines are plain `serve` processes standing in for two engine shards: a `serve --shard`
-# config of more than one engine shard needs a server-DB store (ADR 0063), and this leg runs SQLite.
-# That an engine shard's graph holds only its own inbounds is filter_registry_for_shard's job, pinned
-# in tests/test_sharding.py; this run pins what the API answers given such a graph.
+# The two engines are plain `serve` processes, not engine shards: a `serve --shard` config of more
+# than one engine shard needs a server-DB store (ADR 0063), and this leg runs SQLite.
 
 _OPERATOR = "ms-scoped-operator"
 _E0_OWN = "IB_E0_CS_00000"  # held by engine E0, in the operator's scope
@@ -249,7 +247,8 @@ def _scoped_operator_token(e0: EngineNode) -> str:
         admin.set_channel_scope(created.id, [_E0_OWN, _E1_OWN])
     chosen = rigadmin._new_password()  # a draw the shipped password policy cannot refuse
     with EngineClient(e0.url, cacert=e0.cacert) as operator:
-        assert operator.login(_OPERATOR, created.temp_password).must_change_password
+        first = operator.login(_OPERATOR, created.temp_password)
+        assert first.must_change_password
         operator.change_password(created.temp_password, chosen)
         signed_in = operator.login(_OPERATOR, chosen)
     assert not signed_in.must_change_password
@@ -294,7 +293,7 @@ class _WrongEngineProbe:
 
 
 async def test_a_scoped_operator_asking_the_wrong_engine_gets_the_403_and_a_denial_row() -> None:
-    # BACKLOG #3031 step 2: finding 2 RUN, not only read. docs/SECURITY.md cites this test for the case.
+    # BACKLOG #3031 step 2: finding 2 RUN, not only read.
     probe = _WrongEngineProbe()
     report = await _run_once(probe=probe)
     assert {e.name_tag for e in report.records[0].per_engine} == {"E0", "E1"}
