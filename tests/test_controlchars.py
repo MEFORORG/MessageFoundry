@@ -489,7 +489,7 @@ def test_log_field_token_keeps_a_literal_whole_and_refuses_an_unsafe_one() -> No
     )
     cut = log_field_token("x" * 230 + "<redacted>" * 3, 256, literals=literals)[1:-1]
     assert len(cut) <= 256
-    assert cut.partition("%%crc32-")[0] == "x" * 230 + "<redacted>"
+    assert cut.partition("%%crc32x")[0] == "x" * 230 + "<redacted>"
     for bad in ('"', "a b", "a:b", ""):
         with pytest.raises(ValueError):
             log_field_token("x", 256, literals=(bad,))
@@ -501,7 +501,7 @@ def test_log_field_token_is_bounded_after_its_escape(text: str) -> None:
     twelve times the limit, or a cut lands inside an escape."""
     body = log_field_token(text, 256)[1:-1]
     assert len(body) <= 256
-    head, _, checksum = body.partition("%%crc32-")
+    head, _, checksum = body.partition("%%crc32x")
     assert re.fullmatch(r"[0-9a-f]{8}", checksum)
     assert re.fullmatch(r"(?:[^%]|%u[0-9A-F]{4})*", head)
     # Whole characters only, so the head holds no half of a surrogate pair.

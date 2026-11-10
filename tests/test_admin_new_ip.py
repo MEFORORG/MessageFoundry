@@ -432,7 +432,7 @@ async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings() -> None
     hl7_line = lines[2 * _FORGING_PATHS.index("/a|b|c") + 1]
     assert _logged_fields(hl7_line)[1][1] == "[redacted]"
     longest = _FORGING_PATHS.index("/u" + "x" * 5000)
-    assert "%%crc32-" in _logged_fields(lines[2 * longest + 1])[1][1]
+    assert "%%crc32x" in _logged_fields(lines[2 * longest + 1])[1][1]
 
 
 async def test_alternating_new_addresses_audit_once_each() -> None:
@@ -1290,14 +1290,69 @@ async def test_each_step_up_factory_refuses_a_new_address_holding_a_fresh_proof(
 
 
 def test_a_redaction_that_raises_logs_a_placeholder_not_an_exception(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """RED when: a redaction pass that raises escapes ``redacted_log_field``, so a log argument
-    built inside the new-address gate fails the request it was only describing."""
+    built inside the new-address gate fails the request it was only describing; or the failure is
+    swallowed with no record, or its record carries the value."""
     import messagefoundry.logging_setup as logging_setup
 
     def _boom(text: str) -> str:
         raise RuntimeError(text)
 
     monkeypatch.setattr(logging_setup, "redact_log_value", _boom)
-    assert redacted_log_field("/users", _NEW_IP_LOG_FIELD_MAX) == '"[unloggable: RuntimeError]"'
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.logging_setup"):
+        got = redacted_log_field("/users/SECRETVALUE", _NEW_IP_LOG_FIELD_MAX)
+    assert got == '"[unloggable: RuntimeError]"'
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors and all("RuntimeError" in m and "SECRETVALUE" not in m for m in errors)
+
+
+def test_redact_log_value_follows_the_shipped_filter_chain() -> None:
+    """RED when: a text filter is added to ``_install_phi_filters`` without a matching pass in
+    ``redact_log_value``. The escape hides a field's text from every handler filter, so a pass
+    missing there would never reach a new-address WARNING's path (BACKLOG #3770)."""
+    from messagefoundry.logging_setup import (
+        ControlCharScrubFilter,
+        CredentialQueryScrubFilter,
+        CredentialScrubFilter,
+        RedactionFilter,
+        redact_log_value,
+    )
+
+    handler = logging.NullHandler()
+    _install_phi_filters(handler)
+    # The first three are the passes redact_log_value copies, in order; the last is the escape,
+    # which changes nothing in a token of printable ASCII.
+    assert [type(f) for f in handler.filters] == [
+        RedactionFilter,
+        CredentialQueryScrubFilter,
+        CredentialScrubFilter,
+        ControlCharScrubFilter,
+    ]
+    assert redact_log_value("/x code=a password=b DOE JANE") == (
+        "/x code=<redacted> password=<redacted> [redacted]"
+    )
+
+
+def test_a_cut_checksum_is_never_read_as_a_date() -> None:
+    """RED when: the cut mark ends where a word boundary falls before the checksum, so a checksum
+    of eight decimal digits starting 19 or 20 logs as ``[redacted]`` (BACKLOG #3770)."""
+    streams, handlers = _two_shipped_handlers()
+    logger = logging.getLogger("tests.cut_checksum")
+    logger.propagate = False
+    for handler in handlers:
+        logger.addHandler(handler)
+    try:
+        hits = 0
+        for n in range(20000):
+            token = redacted_log_field(f"/users/{'a' * 300}{n}", _NEW_IP_LOG_FIELD_MAX)
+            if not re.search(r"%%crc32x(?:19|20)[0-9]{6}\"", token):
+                continue
+            hits += 1
+            logger.warning("path=%s", token)
+            assert all(s.getvalue().splitlines()[-1] == f"path={token}" for s in streams)
+        assert hits  # the control: such a checksum occurred in the range
+    finally:
+        for handler in handlers:
+            logger.removeHandler(handler)

@@ -510,7 +510,7 @@ _NEW_IP_PER_SESSION_MAX = 8
 
 # BACKLOG #3772: the longest client-address text the new-address signal keeps as it is, in its dedupe
 # keys, and the seen_ip, known_ip and client of its audit row and its notice. Its past-cap log line
-# carries no address text at all (``_address_log_field``). Every
+# carries a parsed address's canonical form or a digest instead (``_address_log_field``). Every
 # IPv4 or IPv6 address without a zone id fits, the longest being 45 characters; only text that does
 # not parse, or an IPv6 address with a long zone id, is longer. That text is caller-supplied on a
 # proxied hop, and without a bound each session could hold nine copies of it. Longer text keeps a
@@ -601,6 +601,15 @@ def _client_limiter_key(client: str | None) -> str:
     return _host_key(client) if client else "unknown"
 
 
+def _address_digest(address: str) -> str:
+    """The SHA-256 hex digest of ``address``, the one that both the bounded address text and the
+    past-cap log field carry, so the log's 16 digits prefix the audit row's 64.
+
+    surrogatepass, so a lone surrogate cannot make the digest raise; the encoding is injective, so
+    distinct text still gives distinct digests. A dedupe key, not a credential, so a plain digest."""
+    return hashlib.sha256(address.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def _bounded_address_text(address: str) -> str:
     """``address`` itself when it is at most ``_NEW_IP_TEXT_MAX`` characters, else a short prefix
     and the SHA-256 of the whole (BACKLOG #3772).
@@ -610,9 +619,7 @@ def _bounded_address_text(address: str) -> str:
     known-address record and :meth:`AuthService._same_host` compare by it."""
     if len(address) <= _NEW_IP_TEXT_MAX:
         return address
-    # surrogatepass, so a lone surrogate cannot make the digest raise; the encoding is injective, so
-    # distinct text still gives distinct digests. A dedupe key, not a credential, so a plain digest.
-    digest = hashlib.sha256(address.encode("utf-8", "surrogatepass")).hexdigest()
+    digest = _address_digest(address)
     # The prefix is only a reading aid, so a lone surrogate in it becomes "?" (one character each),
     # and the result can be stored. Text within the bound is returned as it is, as on main.
     prefix = address[:_NEW_IP_TEXT_PREFIX].encode("utf-8", "replace").decode("utf-8")
@@ -627,15 +634,16 @@ def _address_log_field(address: str) -> str:
 
     The canonical form holds only hex digits, ``.`` and ``:``, which spell no credential label, HL7
     separator, date or name a handler filter reads, so the field cannot close, merge or erase
-    another, and the address still reads and greps as itself. The address is caller-supplied on a
-    proxied hop, so its text is never logged as it is."""
+    another, and the address still reads as an address. Its spelling may differ from the raw text
+    the audit rows keep, ``2001:db8::1`` for ``2001:DB8:0:0:0:0:0:1`` for one. The address is
+    caller-supplied on a proxied hop, so its text is never logged as it is."""
     try:
         parsed = ipaddress.ip_address(address)
     except ValueError:
         parsed = None
     if parsed is not None and not getattr(parsed, "scope_id", None):
         return f'"{parsed}"'
-    digest = hashlib.sha256(address.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    digest = _address_digest(address)[:16]
     if parsed is None:
         return f'"unparsed-sha256-{digest}"'
     return f'"{ipaddress.IPv6Address(int(parsed))}-zone-sha256-{digest}"'
@@ -13983,12 +13991,6 @@ class AuthService:
                     redacted_log_field(path, _NEW_IP_LOG_FIELD_MAX),
                 )
             return True
-        # What the row, the notice and the past-cap log line carry. Text within _NEW_IP_TEXT_MAX,
-        # which is every address without a long zone id, is unchanged, so a search by address still
-        # finds the row (vault BACKLOG #3197); longer text is bounded, so this row's client then
-        # differs from the raw text other rows of the request carry. Text that does not parse is its
-        # own host key, so its bounded form is reused rather than hashed twice.
-        seen_text = seen_key if host_key == client_ip else _bounded_address_text(client_ip)
         if flag == "over_cap":
             # Past the cap no new-address row is written, so this line carries the address. The
             # address is attacker-supplied text on a proxied hop, so only its parsed form or a
@@ -14002,6 +14004,12 @@ class AuthService:
                     redacted_log_field(path, _NEW_IP_LOG_FIELD_MAX),
                 )
             return True
+        # What the row and the notice carry. Text within _NEW_IP_TEXT_MAX,
+        # which is every address without a long zone id, is unchanged, so a search by address still
+        # finds the row (vault BACKLOG #3197); longer text is bounded, so this row's client then
+        # differs from the raw text other rows of the request carry. Text that does not parse is its
+        # own host key, so its bounded form is reused rather than hashed twice.
+        seen_text = seen_key if host_key == client_ip else _bounded_address_text(client_ip)
         known_text = _bounded_address_text(session.client)
         detail: dict[str, object] = {
             "path": path,

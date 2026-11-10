@@ -50,9 +50,9 @@ escape, not on the predicate:
     value on one line but leaves its spaces, quotes and ``=`` alone, so a value logged before
     another field can still write a field of its own. QUOTE writes everything but a safe alphabet
     as ``%uXXXX`` and wraps the result in quotes, so the value holds no space, quote, ``:`` or ``=``
-    with which to end its field or write another, nor anything a handler filter completes a match
-    on (BACKLOG #3770). A filter may still rewrite a run inside the field, never past it. :func:`quote_log_text` is a separate JSON-quoted
-    form for text printed to a terminal, such as a check line, which no handler filter reads; a
+    with which to end its field or write another, nor any separator a handler filter's match needs
+    to reach past its quotes (BACKLOG #3770). A filter may still rewrite a run of kept characters
+    inside the field, a date for example. :func:`quote_log_text` is a separate JSON-quoted form for text printed to a terminal, such as a check line, which no handler filter reads; a
     credential scrub can close it early, so it is not for a logged field. QUOTE changes the
     value's spelling, so it does not replace ESCAPE on a whole line.
 
@@ -352,15 +352,18 @@ def quote_log_text(text: str) -> str:
 #: (BACKLOG #3770). Every other character is escaped, at least the space and every other
 #: whitespace, both quotes, the backslash, ``:``, ``=``, ``;``, ``,``, ``#``, ``%``, ``|``, ``^``,
 #: ``&``, ``~``, ``<``, ``{``, ``(`` and ``[``. So the value holds nothing with which to end its field
-#: or start one, and nothing a shipped handler filter needs to complete a match: no credential label
-#: can reach its ``:`` or ``=``, no HL7 run its separator, no name run its space. ``:`` goes too,
+#: or start one, and no separator a shipped handler filter's match needs to run past the closing
+#: quote: no credential label can reach its ``:`` or ``=``, no HL7 run its separator, no name run
+#: its space. A filter can still match a run of kept characters, a date of digits, ``-`` and ``/``
+#: for one, and rewrites it as ``[redacted]`` inside the field. ``:`` goes too,
 #: because a kept ``password:`` let the credential scrub take the closing quote and the next key.
 _LOG_FIELD_KEPT = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._/")
 
 #: What :func:`log_field_token` puts in place of the cut tail of a token over its bound. It starts
 #: with "%%", which the escape never writes, so a bounded token cannot read as a kept one, and it
-#: holds no HL7 separator, so a cut head cannot gain one.
-_LOG_FIELD_CUT_MARK = "%%crc32-"
+#: holds no HL7 separator, so a cut head cannot gain one. It ends in a letter, so no word boundary
+#: comes before the checksum digits and the date pass cannot read eight of them as a date.
+_LOG_FIELD_CUT_MARK = "%%crc32x"
 _LOG_FIELD_CUT_LENGTH = len(_LOG_FIELD_CUT_MARK) + 8
 
 #: What a literal :func:`log_field_token` keeps whole may hold: the kept alphabet and the
@@ -386,7 +389,8 @@ def log_field_token(text: str, limit: int, *, literals: tuple[str, ...] = ()) ->
     filters, however many handlers run them in turn (BACKLOG #3770).
 
     Every character outside :data:`_LOG_FIELD_KEPT` is written by :func:`_unit_escape`, so the token
-    holds no space, quote, backslash or separator, and a ``%uXXXX`` decode gives ``text`` back. Each
+    holds no space, quote, backslash or separator, and a ``%uXXXX`` decode gives ``text`` back,
+    except that a lone surrogate pair decodes to the character it would spell. Each
     occurrence of a string in ``literals`` is kept whole instead, which is how the redaction
     placeholders stay searchable as themselves; a literal may hold only :data:`_LOG_FIELD_LITERAL`.
     A text that already holds a placeholder's spelling therefore logs it as it is, so a value can
@@ -397,7 +401,9 @@ def log_field_token(text: str, limit: int, *, literals: tuple[str, ...] = ()) ->
     redacts first.
 
     The escaped text is at most ``limit`` characters, counted after the escape, so the field is at
-    most ``limit`` plus its two quotes whatever ``text`` holds. Longer text keeps whole leading
+    most ``limit`` plus its two quotes whatever ``text`` holds. That is the token's bound; a handler
+    filter's rewrite inside it can lengthen the logged field, at least by up to two characters for
+    each date of eight characters it reads as ``[redacted]``. Longer text keeps whole leading
     pieces, a character's escapes or a literal, and :data:`_LOG_FIELD_CUT_MARK` with the CRC-32 of
     all of ``text``, so two honest long texts that share the head almost never read alike. A
     checksum, not a digest, as in ``pipeline.intake_bound.shorten_with_checksum``: the field is read

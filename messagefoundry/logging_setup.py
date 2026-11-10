@@ -426,6 +426,11 @@ def redacted_log_field(text: str, limit: int) -> str:
             redact_log_value(text), limit, literals=(CREDENTIAL_PLACEHOLDER, PHI_PLACEHOLDER)
         )
     except Exception as exc:  # noqa: BLE001 -- a log argument must never raise
+        # Reported by type only: the message and traceback may carry the value.
+        logging.getLogger(__name__).error(
+            "a log field could not be redacted (%s); it logs as a placeholder",
+            type(exc).__name__,
+        )
         return f'"[unloggable: {type(exc).__name__}]"'
 
 
