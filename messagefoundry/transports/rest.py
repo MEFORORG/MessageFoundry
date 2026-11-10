@@ -269,7 +269,7 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
     NAME is as message-derived as the value — it is a metadata key suffix, and ``_HEADER_NAME_TOKEN``
     bounds its charset, not its content, so ``X-Patient-MRN-12345`` is a well-formed token. This string
     travels through ``safe_exc`` into ``last_error`` and ``message_events.detail``, and on a
-    ``DeliveryError`` arm off-box to the webhook AlertSink. RFC 8187 percent-encoding was considered and
+    ``DeliveryError`` arm into the stored alert reason. RFC 8187 percent-encoding was considered and
     rejected: its ext-value form is opt-in per field definition, so applying it to an arbitrary
     Handler-named header would silently send a partner a wire format it never agreed to parse."""
     if not metadata:
@@ -1759,8 +1759,8 @@ def enforce_send_time_length_limits(
     operator-static; at send time ``outbound_headers_from_metadata`` derives it from a message-
     metadata key suffix (``_HEADER_NAME_TOKEN`` bounds the charset, not the content). This message
     travels through ``safe_exc`` into ``last_error`` and ``message_events.detail``, and on the
-    ``DeliveryError`` arm through ``_note_lane_unhealthy`` → ``connection_error`` → the webhook
-    AlertSink, i.e. **off-box**. ``redaction.py`` concedes single-token identifiers are its
+    ``DeliveryError`` arm through ``_note_lane_unhealthy`` → ``connection_error`` into the stored
+    alert reason, which an operator can reveal. ``redaction.py`` concedes single-token identifiers are its
     acknowledged residual, so only the class and the length may leave.
     """
     violation = find_outbound_length_violation(url, headers)

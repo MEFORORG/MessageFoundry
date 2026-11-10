@@ -18,6 +18,7 @@ import pytest
 
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alert_sinks import EmailTransport, NotifierAlertSink, WebhookTransport
+from messagefoundry.pipeline.alerts import shown_error_class
 from tests.test_alert_state import _RecordingStore
 
 #: An obviously synthetic MRN, standing in for message content a partner's reply echoed.
@@ -111,6 +112,12 @@ async def test_a_class_that_is_not_a_plain_identifier_is_a_fixed_token(
     assert json.loads(posts[0])["error_class"] == "unnamed error"
     assert "error_class: unnamed error" in bodies[0].splitlines()
     assert _ECHO not in posts[0].decode("utf-8") and _ECHO not in bodies[0]
+
+
+def test_a_class_name_that_is_not_a_str_is_a_fixed_token() -> None:
+    # A metaclass can make __name__ anything; the alert must still be raised, not fail on it.
+    weird: Any = 5
+    assert shown_error_class(weird) == "unnamed error"
 
 
 class _RecordingTransport:

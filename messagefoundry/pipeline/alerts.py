@@ -215,7 +215,7 @@ def sandbox_worker_refused_detail(*, content_only: bool) -> str:
 def shown_error_class(error_class: str | None) -> str:
     """The exception class a ``connection_error`` alert shows in the log and off the box, or the
     fixed token ``unnamed error`` for one that is not a plain identifier (BACKLOG #3210, #5021)."""
-    if error_class is not None and error_class.isascii() and error_class.isidentifier():
+    if type(error_class) is str and error_class.isascii() and error_class.isidentifier():
         return error_class
     return "unnamed error"
 
@@ -415,7 +415,8 @@ class AlertSink(Protocol):
         (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
         one alert per lane per cooldown (#46, Corepoint "connection lost"). ``kind`` is the connection-
         event kind (``connection_lost``); ``detail`` is a ``safe_exc`` reason, and it can echo
-        transport text, so an implementation must not assume it is free of message content.
+        transport text, so an implementation must not assume it is free of message content, and must
+        not send it off the box (BACKLOG #5021).
         ``error_class`` is the failing exception's class name (BACKLOG #3210). A partner *rejection*
         (``NegativeAckError``) is NOT a connection error and never fires this."""
         ...

@@ -706,7 +706,7 @@ async def test_rest_trailing_newline_header_name_never_reaches_the_wire() -> Non
 # UnicodeEncodeError from deep inside it. The arm above would now classify that -- but classifying it
 # late is not enough, because `str(UnicodeEncodeError)` names the offending character, and that
 # character is a character of the MESSAGE. Refusing in the helper keeps it off `last_error`,
-# `message_events.detail` and the off-box AlertSink. Same ruling `encode_wire_body` already made for
+# `message_events.detail` and the stored alert reason. Same ruling `encode_wire_body` already made for
 # the BODY (tests/test_encode_wire_body.py); this is the header path that fix left open.
 
 #: Un-encodable as ASCII *and* as latin-1. Same reason as the CJK_CHAR in tests/_content_free.py.
@@ -727,7 +727,7 @@ def test_the_encoding_refusal_names_neither_the_value_nor_the_header() -> None:
     """THE POINT OF THE LIMB. Both halves are message-derived: the value is the Handler's, and at send
     time the NAME is a metadata key suffix that `_HEADER_NAME_TOKEN` bounds by CHARSET, not content --
     so `X-Patient-MRN-12345` is a well-formed token. This string reaches `last_error`,
-    `message_events.detail` and, on a DeliveryError arm, the off-box webhook AlertSink. Only the
+    `message_events.detail` and, on a DeliveryError arm, the stored alert reason. Only the
     codec and an index may leave, exactly as `test_the_message_header_arm_never_names_the_header`
     already requires of the over-length arm.
 
