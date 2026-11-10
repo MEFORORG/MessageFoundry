@@ -4611,7 +4611,7 @@ Facts that are easy to get wrong, stated plainly first:
 
   **Behaviour at the store-pool acquire limit.** The borrow raises `StoreAcquireTimeout` with a
   numeric, PHI-free message naming the backend and the knob, or for a clamped SQL Server cluster
-  borrow, pointing to the paragraph that says which settings set that bound ([CONFIGURATION.md](CONFIGURATION.md) `[cluster]`), since at a tie both the clamp's setting and `[store].acquire_timeout` must be raised. It is an ordinary `Exception`, so it
+  borrow cut at its clamp, pointing to the paragraph that says which settings to raise ([CONFIGURATION.md](CONFIGURATION.md) `[cluster]`). It is an ordinary `Exception`, so it
   reaches the stage worker's existing handling and is treated exactly like any other transient store
   failure — the row stays claimable, the stage handoff re-runs idempotently, and nothing is
   accepted-and-dropped. It is deliberately **not** a `TimeoutError` (since Python 3.11 an `OSError`

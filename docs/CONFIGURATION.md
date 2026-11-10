@@ -2948,14 +2948,15 @@ nodes automatically:
 **Which setting sets a clamped SQL Server borrow's bound.** On SQL Server the coordinator's clamped
 statements wait for a pooled connection for at most their clamp floored at 1 s, or
 `[store].acquire_timeout` if that is shorter. When the clamp is the shorter limit, or ties with
-`[store].acquire_timeout`, a borrow that times out raises `StoreAcquireTimeout`, except in
-`stop()` (last item below), and the message ends
+`[store].acquire_timeout`, a borrow that times out raises `StoreAcquireTimeout`, whose message ends
 `retune with its [cluster] clamp's setting, if any (docs/CONFIGURATION.md [cluster])`,
 because no one setting sets every clamp (BACKLOG #5064). At a tie, raising the clamp alone does not
 lengthen the borrow: raise `[store].acquire_timeout` too. The message's `after Ns` is the limit
 that cut the borrow, so compare it with each term below to tell which applied; the claim and the
 paused owner read run in the same maintenance step, so the step name in the log does not tell them
-apart. At least these set the clamps, and only the first three can produce this message:
+apart. Where an event-loop timeout ends the call first, the call raises `TimeoutError` instead and
+no such message is logged: always for `stop()`'s writes, and for the paused owner read when its
+budget runs out first (both below). At least these set the clamps:
 
 - **The renew clamp**, for the claim and renew, the heartbeat, the config-version refresh and a
   stepdown's release write. It is `lease_renew_timeout_seconds` when set. Left unset, it is derived
@@ -2977,9 +2978,9 @@ apart. At least these set the clamps, and only the first three can produce this 
 - **`stop()`'s two writes**, the lease release and the `left` write. Their clamp is a fixed 2 s
   shutdown bound that no setting changes, and each write runs inside an event-loop timeout of the
   same length. That timeout starts before the borrow's, so it fires first: the write raises
-  `TimeoutError`, logged as a failed release or `left` write, and never this message. A shorter
-  `[store].acquire_timeout` can still cut the borrow sooner, and then the message names that
-  setting. So do not compare this message's `after Ns` with the 2 s bound.
+  `TimeoutError`, logged as a failed release or `left` write. A shorter `[store].acquire_timeout`
+  can still cut the borrow sooner, and then the message names that setting. So the 2 s bound is
+  never the `after Ns` of a message that ends with the clamp advice above.
 
 #### `[cluster.vip]` — engine-managed virtual IP (ADR 0056, Windows-only)
 
