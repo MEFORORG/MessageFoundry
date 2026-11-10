@@ -725,6 +725,13 @@ def test_expect_error_reason_passes_when_the_error_contains_it(tmp_path: Path) -
     assert dr.ok and "expectation-checked" in dr.detail, dr.detail
 
 
+def test_expect_sidecar_with_a_utf8_bom_is_read(tmp_path: Path) -> None:
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "﻿ERROR PV1")
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+
+
 @pytest.mark.parametrize("reason", ["ZZ9-not-in-the-error", "pv1"])
 def test_expect_error_reason_fails_when_the_error_lacks_it(tmp_path: Path, reason: str) -> None:
     # A different reason fails, and the match is case-sensitive. The detail prints neither the
@@ -743,6 +750,7 @@ def test_expect_error_reason_fails_when_the_error_lacks_it(tmp_path: Path, reaso
         ("ERROR first line\nsecond line", "must fit on one line"),
         ("ERROR\tsome reason", "with one space"),
         ("ERROR  some reason", "with one space"),
+        ("RECEIVED\n# some reason", "holds one disposition name"),
     ],
 )
 def test_expect_reason_form_refuses_a_malformed_sidecar(

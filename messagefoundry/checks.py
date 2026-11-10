@@ -1814,11 +1814,16 @@ def _expected_disposition(fixture_path: str | Path, *, cap: int) -> _Expectation
         cap,
         advice="an .expect sidecar holds one disposition name, or ERROR and a reason",
     )
-    word, sep, reason = data.decode("utf-8").strip().partition(" ")
+    # utf-8-sig: a Windows editor's BOM must not turn a correct sidecar into an unknown name.
+    word, sep, reason = data.decode("utf-8-sig").strip().partition(" ")
     if any(ch.isspace() for ch in word):
-        # Not echoed: what follows another whitespace separator is a reason, which can quote the
-        # message.
-        raise ValueError("invalid .expect: separate ERROR from its reason with one space")
+        # Not echoed: what follows another whitespace separator can be a reason, which can quote
+        # the message.
+        if word.split(None, 1)[0].upper() == "ERROR":
+            raise ValueError("invalid .expect: separate ERROR from its reason with one space")
+        raise ValueError(
+            "invalid .expect: a sidecar holds one disposition name, and only ERROR takes a reason"
+        )
     raw = word.upper()
     normalized = _DISPOSITION_ALIASES.get(raw, raw)
     if normalized not in _DRYRUN_DISPOSITIONS:

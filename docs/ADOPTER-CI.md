@@ -295,7 +295,9 @@ dry-run **only** against that feed; a fixture not under such a subdir is cross-p
 fixture then passes only when its dry run lands in that disposition, instead of only when it does
 not error. To pin *why* a fixture errors, write `ERROR <reason>`: `ERROR`, one space, then the
 rest of the line. The run must then be `ERROR` and its error text must contain the reason, matched
-case-sensitively; on a mismatch the gate says the reason did not match and prints neither text,
+case-sensitively against the first 200 characters of a strict-validation refusal, as the listener
+keeps it. When that refusal came back only after the strict-validation timeout, the run's error is
+the timeout text and the reason is matched against the refusal instead. On a mismatch the gate says the reason did not match and prints neither text,
 since both can quote the message. A plain `ERROR` accepts any error. A strict-validation timeout
 satisfies neither form unless the validator, though late, returned a content refusal: a timeout
 measures the runner, not the message.
