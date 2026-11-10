@@ -36,6 +36,7 @@ from fastapi.routing import APIRoute, RouteContext, iter_route_contexts
 from pydantic import BaseModel
 from starlette.requests import HTTPConnection
 from starlette.routing import BaseRoute
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from messagefoundry.api.auth_models import STEP_UP_VIA_HEADER, STEP_UP_VIA_IDP, CredentialReply
 from messagefoundry.api.tls_client_cert import (
@@ -899,19 +900,36 @@ def _record_refusal(route: object, routes: Sequence[BaseRoute]) -> None:
     is the key :func:`undeclared_route_refusal_counts` reports this count under, so the log and
     ``GET /security/posture`` name a refusal alike (vault BACKLOG #2956). It is worked out only when
     a line is written; :func:`_logged_key` says what it misses."""
-    tally = getattr(route, _REFUSALS_ATTR, None) if route is not None else _UNKNOWN_ROUTE_REFUSALS
+    _count_and_log(
+        _tally_on(route, _REFUSALS_ATTR, _UNKNOWN_ROUTE_REFUSALS),
+        "refused route %s: it has no gate dependency and no public declaration",
+        lambda: _logged_key(route, routes),
+    )
+
+
+def _tally_on(route: object, attr: str, fallback: _RefusalTally) -> _RefusalTally:
+    """The :class:`_RefusalTally` ``route`` holds under ``attr``, made on first use; ``fallback``
+    when there is no route."""
+    if route is None:
+        return fallback
+    tally = getattr(route, attr, None)
     if not isinstance(tally, _RefusalTally):
         tally = _RefusalTally()
-        setattr(route, _REFUSALS_ATTR, tally)
+        setattr(route, attr, tally)
+    return tally
+
+
+def _count_and_log(tally: _RefusalTally, message: str, key: Callable[[], str]) -> None:
+    """Count one refusal on ``tally``, and log ``message`` (one ``%s``, the route's ``key``) at
+    ERROR at most once per :data:`REFUSAL_LOG_INTERVAL_SECONDS`, with the counts appended."""
     tally.total += 1
     tally.unlogged += 1
     now = time.monotonic()
     if tally.logged_at is not None and now - tally.logged_at < REFUSAL_LOG_INTERVAL_SECONDS:
         return
     log.error(
-        "refused route %s: it has no gate dependency and no public declaration "
-        "(%d refusals since the last log line, %d in all)",
-        _logged_key(route, routes),
+        message + " (%d refusals since the last log line, %d in all)",
+        key(),
         tally.unlogged,
         tally.total,
     )
@@ -939,6 +957,141 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
     if websocket:
         raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
     raise HTTPException(status.HTTP_403_FORBIDDEN, UNDECLARED_ROUTE_DETAIL)
+
+
+# --- An in-body WebSocket is accepted only after a gate admitted it (vault BACKLOG #2955) -----------
+# ``authorizes_in_body`` says a WebSocket endpoint runs its own gate before ``accept()``, and the
+# route walk reads that gate as a call in the body. A call is not proof the body acts on it: a body
+# that ignored a refusal, or never reached its gate, would still accept. So :func:`authorize_ws`,
+# and the web console's ``authorize_ui_ws`` on a browser handshake, record on the handshake's scope
+# whether they admitted the caller, through :func:`record_ws_gate`,
+# and :class:`WebSocketAcceptGate` refuses ``websocket.accept``, and a denial response of any
+# status, on a socket whose scope does not read admitted. When the latest recorded answer is a
+# refusal, it refuses accept on every socket, whatever its route declares. A scope that records no
+# answer still passes where the route declares its authorization some other way: a gate dependency,
+# which ran before the body did, or a
+# ``public_route`` mark. An undeclared socket the refusal reaches never gets this far, because
+# :func:`refuse_undeclared_route` refuses it first; one outside the refusal, such as a socket in a
+# mount, is refused here at accept instead unless a gate it calls records an admission.
+#
+# The LATEST gate's answer stands: a refusal clears an earlier admission, so a body that ignores a
+# stricter gate's refusal after a laxer gate admitted the caller is still refused, and so is one
+# whose route a gate dependency admitted first. That holds only for a gate that records: a gate
+# that finds the handshake is not its own to judge records nothing, as the web console's cookie
+# gate does for a native client, which sends no Origin. The record is a flag, not an identity: it
+# does not say which permission the route needed. The route walk reads which permissions the body
+# asks for, and refuses an endpoint body that calls ``record_ws_gate`` by that name.
+
+#: The scope key a WebSocket gate sets to record its answer: ``True`` admitted, ``False`` refused.
+_WS_GATE_ADMITTED_KEY = "mefor.ws_gate_admitted"
+#: The route attribute that holds the :class:`_RefusalTally` of accepts :class:`WebSocketAcceptGate`
+#: refused there. Apart from the undeclared-route tally, so neither count includes the other. Unlike
+#: that tally, NOTHING reports it: ``GET /security/posture`` does not read it. Refusals after a
+#: burst's last log line reach the log only as the count on the next line for that route.
+_ACCEPT_REFUSALS_ATTR = "_mefor_accept_refusals"
+#: The tally for a refused accept whose scope named no route.
+_UNKNOWN_ROUTE_ACCEPT_REFUSALS = _RefusalTally()
+
+
+def record_ws_gate(websocket: HTTPConnection, *, admitted: bool) -> None:
+    """Record on ``websocket``'s scope whether a gate admitted its caller, replacing any earlier
+    answer. Only a gate calls this; ``scripts/security/route_gates.py`` refuses an endpoint body
+    that calls it by this name."""
+    websocket.scope[_WS_GATE_ADMITTED_KEY] = admitted
+
+
+def ws_accept_allowed(scope: Mapping[str, Any]) -> bool:
+    """Whether :class:`WebSocketAcceptGate` lets this WebSocket scope's ``accept`` through."""
+    answer = scope.get(_WS_GATE_ADMITTED_KEY)
+    if answer is not None:
+        # The latest recorded answer decides on every socket, a public or dependency-gated one
+        # included.
+        return answer is True
+    route = scope.get("route")
+    if route is not None:
+        # As the HTTP rule reads it: a gate dependency or a public mark; an in-body mark is not
+        # enough. A gate dependency that recorded nothing is trusted to have admitted the caller
+        # once it returned. On such a route, a denial response sent for any dependency's raise
+        # passes here too.
+        return route_is_declared(route, websocket=False)
+    # FastAPI's router sets no route for a plain Starlette WebSocket route: the endpoint's own public
+    # mark, when the scope names one, is the only declaration left to read.
+    declared = route_declaration_of(scope.get("endpoint"))
+    return declared is not None and declared.public
+
+
+def _record_refused_accept(scope: Scope) -> None:
+    """Count and log a refused accept as :func:`_record_refusal` does, naming the route by the
+    same key, a path template and never the request's path."""
+    route = scope.get("route")
+    routes = getattr(scope.get("app"), "routes", None) or ()
+    _count_and_log(
+        _tally_on(route, _ACCEPT_REFUSALS_ATTR, _UNKNOWN_ROUTE_ACCEPT_REFUSALS),
+        "refused accept on WebSocket route %s: the latest recorded gate answer was a refusal, or"
+        " none was recorded and the route has no gate dependency or public_route mark",
+        lambda: _logged_key(route, routes),
+    )
+
+
+class WebSocketAcceptGate:
+    """Refuse ``websocket.accept`` on a WebSocket whose latest recorded gate answer is a refusal, or
+    with none and neither a gate dependency nor a ``public_route`` mark, as the note above says.
+
+    Pure ASGI, wrapping ``send`` only. The refusal is a policy-violation close sent in place of the
+    accept, or of a denial response of any status, so the handshake fails exactly as a gate's own
+    pre-accept refusal does; the header floor outside turns it into a 403 where the server allows
+    one. The handler then gets a
+    :class:`WebSocketException`, which Starlette answers with a close this wrapper drops, because
+    the socket is already closed. A refused denial response's body is dropped instead of raising.
+    Every later message but a close raises the same exception."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "websocket":
+            await self.app(scope, receive, send)
+            return
+        accepted = refused = False
+
+        async def guarded_send(message: Message) -> None:
+            nonlocal accepted, refused
+            if accepted:
+                await send(message)
+                return
+            kind = message.get("type")
+            if refused:
+                # The refusal already closed the socket: a close, or the rest of a refused denial
+                # response, is dropped; anything else is refused again.
+                if kind in ("websocket.close", "websocket.http.response.body"):
+                    return
+                raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
+            # A denial response is an HTTP answer the body chooses, its status, headers and body
+            # alike, so it needs an admitted caller just as an accept does. Refused, it becomes the
+            # same bodyless refusal a gate's own pre-accept close gets.
+            if kind in ("websocket.accept", "websocket.http.response.start"):
+                if not ws_accept_allowed(scope):
+                    refused = True
+                    # A refusal status after a gate's recorded refusal is that gate refusing, as it
+                    # should. An accept, a denial no gate answered for, or a non-refusal status
+                    # after a refusal is a body that did not act on its gate: a defect.
+                    gate_refusing = (
+                        kind == "websocket.http.response.start"
+                        and scope.get(_WS_GATE_ADMITTED_KEY) is False
+                        and int(message.get("status", 0)) >= 400
+                    )
+                    if not gate_refusing:
+                        _record_refused_accept(scope)
+                    await send({"type": "websocket.close", "code": status.WS_1008_POLICY_VIOLATION})
+                    if kind == "websocket.accept":
+                        raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
+                    # A denial response ends the handshake anyway, and Starlette cannot answer a
+                    # raise from inside one; its body is dropped above.
+                    return
+                accepted = kind == "websocket.accept"
+            await send(message)
+
+        await self.app(scope, receive, guarded_send)
 
 
 def _gate(dependency: _Gate, authenticate: _Step) -> _Gate:
@@ -1947,8 +2100,9 @@ async def spend_step_up_action(request: Request, action: str) -> None:
     before it holds or runs anything. A refusal the route makes after the spend, such as a 404 or
     a 409, still costs the proof, unless the route gives it back with
     ``AuthService.refund_action_step_up``, as edit-resend does for a refusal before its store write
-    (owner ruling 2026-10-13, #3241 R1). With no auth service attached it does nothing, as the dependency
-    does."""
+    (owner ruling 2026-10-13, #3241 R1), other than one in ``_EDIT_RESEND_SPENDING_REFUSALS`` in
+    ``api/app.py`` (owner ruling 2026-11-07, #3241 added item 1). With no auth service attached it
+    does nothing, as the dependency does."""
     auth = get_auth(request)
     if auth is None:
         return
@@ -2091,8 +2245,20 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     """Authorize a WebSocket upgrade: validate the ``Origin`` (4.4.2), then the bearer token from the
     Authorization header and the listed permissions.
 
-    Returns the :class:`Identity` on success, or ``None`` if auth fails (caller should close).
+    Returns the :class:`Identity` on success, or ``None`` if auth fails (caller should close). On
+    success it also records the handshake admitted, and on a refusal not admitted.
+    :class:`WebSocketAcceptGate` reads that record on every socket, before it lets an accept or a
+    denial response through.
     """
+    # Not admitted until this gate answers, so a raise inside it cannot leave an earlier admission.
+    record_ws_gate(websocket, admitted=False)
+    identity = await _authorize_ws(websocket, *permissions)
+    record_ws_gate(websocket, admitted=identity is not None)
+    return identity
+
+
+async def _authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identity | None:
+    """:func:`authorize_ws` without the admitted mark."""
     if not _ws_origin_allowed(websocket):
         return None  # cross-site / disallowed browser Origin — reject before accept()
     auth: AuthService | None = getattr(websocket.app.state, "auth", None)

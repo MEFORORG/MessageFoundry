@@ -243,6 +243,7 @@ from messagefoundry.api.security import (
     ConfigWriteNotRecorded,
     ExportStopped,
     StandingRefusal,
+    WebSocketAcceptGate,
     alert_sink_for,
     answers_before_body,
     authorize_ws,
@@ -3906,6 +3907,13 @@ _INGRESS_GUARD_STATUS: dict[str, int] = {
     "strict": 422,
 }
 
+#: The edit-resend refusals that spend the step-up proof even before the store write: at least a
+#: target out of scope, an unknown message or target, and a target or origin that cannot take the
+#: write (owner ruling 2026-11-07, #3241 added item 1, which supersedes R1 for these three
+#: statuses). Every other refusal before the write refunds, so a new refusal raised before the
+#: write in ``_edit_resend_core`` is checked against this set.
+_EDIT_RESEND_SPENDING_REFUSALS = frozenset({403, 404, 409})
+
 
 async def _guard_resubmission(
     engine: Engine,
@@ -4853,6 +4861,9 @@ def create_app(
     # through _security_headers, and the outermost floor (registered below) is what covers them.
     app.add_middleware(_security_headers)
     app.add_middleware(_limit_request_body)
+    # Vault BACKLOG #2955: an in-body WebSocket is accepted only once a gate admitted its caller.
+    # Inside the header floor, so its refusal close gets the floor's 403 like a gate's own refusal.
+    app.add_middleware(WebSocketAcceptGate)
 
     @app.get("/health", response_model=Health)
     @public_route("liveness must answer a tokenless probe; the version needs a session")
@@ -8431,7 +8442,9 @@ def create_app(
 
         The step-up proof is spent in this route, after FastAPI has validated the body, so a 422
         costs no proof (owner ruling 2026-10-13, #3241 R1 and R2); a refusal raised before the
-        store write gives the proof back."""
+        store write gives the proof back, except one whose status
+        :data:`_EDIT_RESEND_SPENDING_REFUSALS` names, which spends it (owner ruling 2026-11-07,
+        #3241 added item 1)."""
         await spend_step_up_action(request, STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
         return await _edit_resend_core(
             message_id, body=body, engine=engine, identity=identity, request=request
@@ -8458,10 +8471,11 @@ def create_app(
         The console calls this in-process after its own spend."""
         # Owner ruling 2026-10-13 (#3241 R1): a refusal raised BEFORE the store write gives back the
         # proof the gate spent (ADR 0197 Amendment C), so an edit the engine refused costs the
-        # operator no password and the console can re-open the editor without a re-auth. `written`
-        # turns true just before the store call: a refusal from there on keeps the spend, because the
-        # store may have committed. The console calls this handler in-process after its own spend,
-        # so the refund reaches both planes.
+        # operator no password and the console can re-open the editor without a re-auth, except a
+        # status in _EDIT_RESEND_SPENDING_REFUSALS, which keeps the spend. `written` turns true
+        # just before the store call: a refusal from there on keeps the spend, because the store
+        # may have committed. The console calls this handler in-process after its own spend, so the
+        # refund reaches both planes.
         written = False
         try:
             # 404 (not 403) outside the caller's channel scope (mirrors resend/replay/get_message).
@@ -8473,6 +8487,20 @@ def create_app(
                 if not identity.can_access_channel(body.to):
                     await _audit_channel_denied(engine, identity, body.to, client_ip(request))
                     raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
+                # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
+                # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling). They
+                # read nothing from the target, and where they sit in the order is ADR 0197
+                # Amendment D, "The order of the checks", which says what their refusal tells.
+                admitted = await _guard_resubmission(
+                    engine,
+                    identity,
+                    request,
+                    raw=body.raw,
+                    inbound=None,
+                    action="message_edit_resend_reject",
+                    channel_id=row["channel_id"],
+                    detail={"message_id": message_id, "mode": "direct", "to": body.to},
+                )
                 rr = engine.registry_runner
                 if rr is None or body.to not in rr.registry.outbound:
                     raise HTTPException(404, f"no such outbound connection: {body.to}")
@@ -8494,18 +8522,6 @@ def create_app(
                         raise HTTPException(409, _outbound_down_detail(rr, body.to))
                 except KeyError:
                     raise HTTPException(404, f"no such outbound connection: {body.to}") from None
-                # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
-                # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling).
-                admitted = await _guard_resubmission(
-                    engine,
-                    identity,
-                    request,
-                    raw=body.raw,
-                    inbound=None,
-                    action="message_edit_resend_reject",
-                    channel_id=row["channel_id"],
-                    detail={"message_id": message_id, "mode": "direct", "to": body.to},
-                )
                 _refuse_head_only(message_id, row)
                 client = client_ip(request)
 
@@ -8624,9 +8640,13 @@ def create_app(
                 reroute=True,
                 new_message_id=outcome.new_message_id,
             )
-        except HTTPException:
+        except HTTPException as exc:
             auth = get_auth(request)
-            if not written and auth is not None:
+            if (
+                not written
+                and exc.status_code not in _EDIT_RESEND_SPENDING_REFUSALS
+                and auth is not None
+            ):
                 auth.refund_action_step_up(STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
             raise
 
@@ -10703,7 +10723,9 @@ def create_app(
             identity = await authorize_ws(websocket, Permission.MONITORING_READ)
             token = ws_token(websocket)
         # The three refusals below happen BEFORE accept, so each is the handshake's HTTP answer
-        # (BACKLOG #1120; see header_floor.refuse_websocket).
+        # (BACKLOG #1120; see header_floor.refuse_websocket). The first runs with no gate admitted,
+        # so WebSocketAcceptGate refuses its denial response and the client gets a bodyless 403
+        # (vault BACKLOG #2955); the two 503s run after a gate admitted the caller.
         if identity is None:
             await refuse_websocket(
                 websocket,

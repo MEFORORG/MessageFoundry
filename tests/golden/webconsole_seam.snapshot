@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-a71505053af14cae
+ae0ea5c81cc935b7
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -130,6 +130,7 @@ pending_credential_deadline: (auth: 'AuthService', user: 'UserRecord | None') ->
 pending_credential_deadline_for: (auth: 'AuthService', user_id: 'str') -> 'float | None'
 public_route: (reason: 'str') -> 'Callable[[F], F]'
 record_repeated_credential: (conn: 'Request | WebSocket', credential: 'str') -> 'None'
+record_ws_gate: (websocket: 'HTTPConnection', *, admitted: 'bool') -> 'None'
 
 ## auth.service names imported by the console
 AuthService: class; its members are the AuthService section
@@ -491,4 +492,4 @@ middleware 0: messagefoundry_webconsole._security:UiFetchMetadataMiddleware()
 middleware 1: messagefoundry_webconsole._security:UiSecurityHeadersMiddleware()
 app.state.ui_connections_render: function
 app.state.ui_csp: str
-app.state.ui_ws_authorize: messagefoundry_webconsole._auth:authorize_ui_ws#933026766804()
+app.state.ui_ws_authorize: messagefoundry_webconsole._auth:authorize_ui_ws#ff868ed0a37f()

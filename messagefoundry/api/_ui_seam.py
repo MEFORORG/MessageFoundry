@@ -844,12 +844,30 @@ from typing import Any
 #: the other's change, so neither held for the merged surface. Re-derived with ``--write`` over
 #: both, from ``1cbeb65e0ed8e86d`` and ``2a4589213e5e782c`` to ``a71505053af14cae``.
 #:
+#: Vault BACKLOG #2955: the console imports ``api.security.record_ws_gate``, and
+#: ``authorize_ui_ws`` records with it whether it admitted a handshake, because the engine's
+#: ``WebSocketAcceptGate`` now refuses ``accept()`` on an in-body socket no gate admitted. An older
+#: console on this engine would have its browser socket refused; a newer console on an older
+#: engine would raise ImportError at mount. Both force a bump. Re-derived with ``--write`` (from
+#: 734e7007fb95eb75).
+#:
+#: Merged with main's ``2a4589213e5e782c`` and re-derived with ``--write`` over both, to
+#: ``44d2ecd02c8d2b1b``.
+#:
+#: Vault BACKLOG #2955, review round 5: ``authorize_ui_ws`` records nothing for a native client's
+#: handshake, so it no longer clears the header gate's admission. Its body moved, and with it the
+#: digest, re-derived with ``--write`` from ``44d2ecd02c8d2b1b`` to ``e233fc19966d856a``.
+#:
+#: Merge of the #3192/#3193 entry with main after engine PR 2852 (#2955): each digest was derived
+#: without the other's change, so neither held for the merged surface. Re-derived with ``--write``
+#: over both, from ``a71505053af14cae`` and ``e233fc19966d856a`` to ``ae0ea5c81cc935b7``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "a71505053af14cae"
+ENGINE_UI_SEAM: str = "ae0ea5c81cc935b7"
 
 
 @dataclass(frozen=True, slots=True)

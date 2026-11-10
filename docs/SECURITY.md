@@ -222,7 +222,21 @@ body, the early sign-in check above still answers before it. A route passes in o
   dependency guards by design, such as sign-in. Some web console routes of this kind still read a
   pending session inside the handler, such as `/ui/mfa`. `authorizes_in_body` marks a WebSocket
   that authorizes the caller inside its own body, and `/ws/stats` is the engine route that uses it.
-  On an HTTP route with no gate, that mark does not count, so the route is refused.
+  On an HTTP route with no gate, that mark does not count, so the route is refused. The mark is
+  not trusted on its own (vault BACKLOG #2955): `authorize_ws` records on the handshake whether it admitted the caller,
+  and the web console's `authorize_ui_ws` does so only on a browser handshake (one with an Origin),
+  the latest answer standing. `WebSocketAcceptGate` reads that record before it lets an accept
+  through. When the latest recorded answer is a refusal, it refuses accept on every socket, whatever its route declares. With no
+  recorded answer, a socket passes only where its route declares its authorization another way: a
+  gate dependency or a `public_route` mark. On a socket it refuses, it refuses a denial response
+  the body sends the same way, whatever its status, so none of its status, headers or body goes
+  out. The refusal is a close before accept, which the client gets as a bodyless HTTP
+  403. The web console's cookie gate records nothing for a handshake that sends no Origin, which
+  it leaves to the header path, so an earlier answer stands there. The accept gate writes an ERROR
+  line, `refused accept on WebSocket route`, for each refusal except a refusal status sent after a
+  gate's recorded refusal, at most once a minute for each route the handshake names.
+  Refusals on handshakes that name no route share one count and one line. That count is in
+  memory only; `GET /security/posture` does not report it.
 
 Any other route answers **403** `this route declares no authorization`, and a WebSocket is refused
 before it is accepted. Such a route is a defect in the code that registered it. The engine counts
@@ -3310,10 +3324,14 @@ query is past the 512-character cap on `next` or not ASCII, when the page opens 
 before. The page still re-derives each destination's eligibility from live quiescence, and the
 operator still submits the confirm form.
 A refusal the engine handler raises before its store write gives the proof back (owner ruling
-2026-10-13, #3241 R1; ADR 0197 Amendment C), so the operator resubmits without a new password. A
-refusal from the store call on keeps the spend, because the store may have committed: the next
-submit asks again and re-opens the editor from the stored body, as an expired grant (300 s by
-default) does. The console resend checks
+2026-10-13, #3241 R1; ADR 0197 Amendment C), so the operator resubmits without a new password,
+except a 403, 404 or 409, which keeps the spend (owner ruling 2026-11-07, #3241 added item 1; ADR
+0197 Amendment D). An ingress guard refusal gives the proof back, and ADR 0197 Amendment D,
+*The order of the checks*, says which target checks run before the guard in each mode and so
+what such a refusal still tells the caller. A refusal from the store
+call on keeps the spend too, because the store may have committed. After any refusal that keeps
+the spend, the next submit asks again and re-opens the editor from the stored body, as an
+expired grant (300 s by default) does. The console resend checks
 its own input before it spends the proof too. On both, a double-click asks for no second proof.
 The console marks each request it spends a proof on. Only an identical request rides on that mark.
 For a resend that means the same key, target and source. For an edit-resend it means the same key,
