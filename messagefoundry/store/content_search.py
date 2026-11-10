@@ -62,8 +62,7 @@ class SearchSpec:
         # make_spec clamps; a spec built any other way must already be in range, or SQLite would take
         # `LIMIT 0` / `LIMIT -1` (no limit at all) from fetch_limit and the cap would vanish (#2068).
         # A bool passes the range check (True == 1), so it is refused by type first (#6700).
-        if isinstance(self.scan_limit, bool) or not isinstance(self.scan_limit, int):
-            raise ValueError(f"scan_limit must be an int, not {type(self.scan_limit).__name__}")
+        _require_int(self.scan_limit)
         if not 1 <= self.scan_limit <= MAX_SCAN_LIMIT:
             raise ValueError(f"scan_limit must be in [1, {MAX_SCAN_LIMIT}], got {self.scan_limit}")
 
@@ -90,12 +89,20 @@ def newest_first(rows: Iterable[Any]) -> list[Any]:
 
 class ContentSearchError(ValueError):
     """A malformed content-search request: at least an empty needle, both or neither needle kinds, a
-    ``field_value`` beside a content substring, a bad field path, or a ``scan_limit`` not an ``int``."""
+    ``field_value`` beside a content substring or with no field path, a bad field path, a bad
+    ``target``, or a ``scan_limit`` not an ``int``."""
 
 
 def _sent(value: str | None) -> str | None:
     """``value`` unchanged, or ``None`` when it is empty or only whitespace (counts as not sent)."""
     return value if value and not value.isspace() else None
+
+
+def _require_int(scan_limit: object) -> int:
+    """``scan_limit`` itself, refused unless it is an ``int`` (a ``bool`` is refused too, BACKLOG #6700)."""
+    if isinstance(scan_limit, bool) or not isinstance(scan_limit, int):
+        raise ContentSearchError(f"scan_limit must be an int, not {type(scan_limit).__name__}")
+    return scan_limit
 
 
 def make_spec(
@@ -109,16 +116,20 @@ def make_spec(
     """Validate a content-search request into a :class:`SearchSpec`.
 
     Raises :class:`ContentSearchError` on an empty needle, supplying both a substring and a field path,
-    a ``field_value`` beside a substring (it would otherwise be dropped unread), a malformed HL7 field
-    path, or a ``scan_limit`` that is not an ``int`` (a ``bool`` is refused too). A value of only
-    whitespace counts as not sent; any other needle is kept exactly as given, because leading or
-    trailing spaces narrow a contains-match. ``scan_limit`` is clamped into ``[1, MAX_SCAN_LIMIT]``."""
-    if isinstance(scan_limit, bool) or not isinstance(scan_limit, int):
-        raise ContentSearchError(f"scan_limit must be an integer, not {type(scan_limit).__name__}")
-    limit = max(1, min(scan_limit, MAX_SCAN_LIMIT))
+    a ``field_value`` beside a substring or with no field path (it would otherwise be dropped unread),
+    a malformed HL7 field path, a ``target`` outside :class:`SearchTarget`, or a ``scan_limit`` that
+    is not an ``int`` (a ``bool`` is refused too). A value of only whitespace counts as not sent; any
+    other needle is kept exactly as given, because leading or trailing spaces narrow a contains-match. ``scan_limit`` is clamped into ``[1, MAX_SCAN_LIMIT]``."""
+    limit = max(1, min(_require_int(scan_limit), MAX_SCAN_LIMIT))
+    try:
+        target = SearchTarget(target)
+    except ValueError as exc:
+        raise ContentSearchError("target must be raw, summary or both") from exc
     needle = _sent(content)
     path = field_path.strip() if field_path else ""  # a locator, not a needle: padding is noise
     fv = _sent(field_value)
+    if needle is None and not path and fv is not None:
+        raise ContentSearchError("field_value needs an HL7 field path")
     if (needle is None) == (not path):
         raise ContentSearchError("provide exactly one of a content substring or an HL7 field path")
     if needle is not None:

@@ -80,6 +80,20 @@ def test_a_field_value_beside_content_is_refused_not_dropped() -> None:
         make_spec(content="DOE", field_path=None, field_value="MRN9001")
 
 
+def test_a_field_value_alone_is_refused_by_name() -> None:
+    with pytest.raises(ContentSearchError, match="field_value needs an HL7 field path"):
+        make_spec(content=None, field_path=None, field_value="MRN9001")
+
+
+def test_a_target_outside_the_enum_is_a_content_search_error() -> None:
+    raw = make_spec(content="x", field_path=None, field_value=None, target="raw")  # type: ignore[arg-type]
+    assert (
+        raw.target is SearchTarget.RAW
+    )  # a plain string is normalized, so .value works downstream
+    with pytest.raises(ContentSearchError, match="target"):
+        make_spec(content="x", field_path=None, field_value=None, target="nope")  # type: ignore[arg-type]
+
+
 def test_a_blank_field_value_beside_content_is_still_accepted() -> None:
     """A submitted-but-empty form box is not a value, so it must not refuse the search."""
     for blank in (None, "", "   "):
@@ -93,7 +107,7 @@ def test_a_blank_field_value_beside_content_is_still_accepted() -> None:
 
 @pytest.mark.parametrize("bad", [True, False, "5", "abc", 2.5, None, b"5"])
 def test_a_non_int_scan_limit_is_a_content_search_error(bad: Any) -> None:
-    with pytest.raises(ContentSearchError, match="scan_limit must be an integer"):
+    with pytest.raises(ContentSearchError, match="scan_limit must be an int"):
         make_spec(content="DOE", field_path=None, field_value=None, scan_limit=bad)
 
 
