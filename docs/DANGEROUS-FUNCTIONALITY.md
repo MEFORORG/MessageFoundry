@@ -744,7 +744,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Web console requests | The form bodies a browser posts, and the Content Security Policy reports it sends | `messagefoundry_webconsole/routes/_common.py`, `messagefoundry_webconsole/routes/connection_writes.py`, `messagefoundry_webconsole/routes/core.py`, `messagefoundry_webconsole/routes/monitoring_writes.py`, `messagefoundry_webconsole/routes/oidc.py` |
 | A file from another system | A Corepoint export, read with `defusedxml` (section 2) | `messagefoundry_toolkit/corepoint_import.py` |
 | A backup | The manifest and encrypted blocks `messagefoundry restore` reads. The archive list below says what bounds them. | `pipeline/dr_backup.py`, `store/backup_codec.py` |
-| A config digest another cluster node stored | Unsigned JSON another node wrote to `cluster_config.config_digest` when it bumped the shared config version. A convergence reload reads it back through `shared_digest_of`, which refuses text over 65,536 characters, a repeated key, a value that is not an object, a key outside the digest's own, and a fingerprint, scheme or unreadable-files list of the wrong shape. Nothing authenticates it. | `config/fingerprint.py` |
+| A config digest in the shared cluster store | Unsigned JSON in `cluster_config.config_digest`, which a node writes when it bumps the shared config version. A convergence reload reads it back through `shared_digest_of`, which caps its length before parsing and checks its keys and the types of its values. Nothing authenticates it. | `config/fingerprint.py` |
 
 **Parse sites left out, and why.**
 
