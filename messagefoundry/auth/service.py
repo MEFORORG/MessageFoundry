@@ -540,9 +540,10 @@ def _new_ip_path_field(path: str, seen_text: str | None = None) -> str:
     as the shipped handler filters read it in the pre-#3770 repeat line, read through further
     handlers until a pass changes nothing, and, when that leaves a tab, read again with each tab as
     a space; escaped and bounded; or a placeholder; never seen-address text. So the field does not
-    depend on how many handlers the logger carries; ``logging_setup._settled_reading`` says how. With ``seen_text``, the past-cap line's, that reading is compared with the
-    pre-#3770 past-cap line, and the field is the placeholder by the rule
-    ``logging_setup.redacted_log_field`` states."""
+    depend on how many handlers the logger carries; ``logging_setup._settled_reading`` says how.
+    With ``seen_text``, the past-cap line's, that reading is compared with the pre-#3770 past-cap
+    line, and the field is the placeholder by the rule ``logging_setup.redacted_log_field``
+    states, which also blanks a path longer than ``logging_setup.LOG_FIELD_READ_MAX``."""
     checks = (
         ()
         if seen_text is None

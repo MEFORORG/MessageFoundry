@@ -105,6 +105,7 @@ __all__ = [
     "redact_log_value",
     "redacted_log_field",
     "UNREADABLE_LOG_VALUE",
+    "LOG_FIELD_READ_MAX",
     "SyslogForward",
     "ForwarderStatus",
     "FORWARD_LOSS_COUNTERS",
@@ -411,9 +412,19 @@ def _shipped_filters() -> tuple[logging.Filter, ...]:
 
 
 #: The most handler passes :func:`_settled_reading` runs before it gives up on a line that is still
-#: changing (BACKLOG #3770). The measured lines settle within a few passes; one that does not is
-#: read as unreadable rather than as any one pass's output.
-_SHIPPED_READING_MAX_PASSES = 8
+#: changing (BACKLOG #3770); one that is still changing is read as unreadable rather than as any one
+#: pass's output. Review round-5454441c measured, over 6,000 seeded paths of quote and label
+#: pieces, at most 8 passes that changed the line, so 9 to confirm it; this leaves room above that.
+#: A line stops at the first pass that changes nothing, so the cap costs only a line still changing.
+_SHIPPED_READING_MAX_PASSES = 12
+
+#: The longest text :func:`redacted_log_field` reads through the filters; longer text logs
+#: :data:`UNREADABLE_LOG_VALUE` (BACKLOG #3770). The reading runs up to
+#: :data:`_SHIPPED_READING_MAX_PASSES` passes of the whole chain on the caller's thread, and a field
+#: logs at most its bound of escaped characters anyway, so a longer text costs reading time that no
+#: logged character needs. It is set above the 5,000-character path ``tests/test_admin_new_ip.py``
+#: pins as logging a cut form, so it bounds the cost without blanking that path.
+LOG_FIELD_READ_MAX = 8192
 
 
 def _settled_reading(text: str, filters: tuple[logging.Filter, ...]) -> str | None:
@@ -450,7 +461,8 @@ def _shipped_reading(line: str) -> str | None:
 
 def redact_log_value(text: str, *, before: str = "", after: str = "") -> str | None:
     """``text`` as :func:`_shipped_reading` reads it in the line ``before`` + ``text`` +
-    ``after``, or ``None`` when that line's context did not survive (BACKLOG #3770).
+    ``after``, or ``None`` when that line's context did not survive or the reading did not
+    settle within :data:`_SHIPPED_READING_MAX_PASSES` passes (BACKLOG #3770).
 
     The field's own escape hides its text from every handler, so this value is meant to carry what
     the handlers would have hidden in that line. The filters are the ones
@@ -508,9 +520,9 @@ def redacted_log_field(
 
     Apart from a bound under 16, which gives ``unloggable-ValueError``, and a bound of 16 to 18,
     which gives the cut form :data:`UNREADABLE_LOG_VALUE` states where that value is due, the field
-    is
-    :data:`UNREADABLE_LOG_VALUE` at least when the reading of ``before`` + ``text`` +
-    ``after`` does not keep ``before`` and ``after`` whole at its ends, or when, for a
+    is :data:`UNREADABLE_LOG_VALUE` at least when ``text`` is longer than
+    :data:`LOG_FIELD_READ_MAX`, when the reading of ``before`` + ``text`` + ``after`` does not keep
+    ``before`` and ``after`` whole at its ends, or when, for a
     ``(head, tail)`` of ``checks``, the reading of ``head`` + ``text`` + ``tail`` does not read as
     ``head``, the value, and the tail either as it was or as written alone; or when a reading
     does not settle. This rule is stated here once for callers to link to.
@@ -525,10 +537,14 @@ def redacted_log_field(
     - a path holding a no-break space or a credential shape, as ``/x code=SECRETVALUE``, with a
       seen address holding an encoded HL7 run and a tab, as ``a%7Cb%7Cc``, a tab and ``x``;
     - a path holding a credential matrix parameter, as ``/x;password=abc``, ``;token=``,
-      ``;secret=``, ``;id_token=`` or ``;access_token=``, with any seen address: the repeat line
-      logs the label and the placeholder, and every past-cap line logs
-      :data:`UNREADABLE_LOG_VALUE`."""
+      ``;secret=``, ``;id_token=`` or ``;access_token=``: the repeat line logs the label and the
+      placeholder, and the past-cap line logs :data:`UNREADABLE_LOG_VALUE` with an IPv4 or IPv6
+      seen address and each other seen text the tests name. Not with every seen text: one a pass
+      rewrites ahead of the credential pass, as ``||``, leaves that line readable, the value still
+      replaced by the placeholder."""
     try:
+        if len(text) > LOG_FIELD_READ_MAX:
+            return log_field_token(UNREADABLE_LOG_VALUE, limit)
         value = redact_log_value(text, before=before, after=after)
         if value is None or not all(_reads_as(value, head, text, tail) for head, tail in checks):
             return log_field_token(UNREADABLE_LOG_VALUE, limit)

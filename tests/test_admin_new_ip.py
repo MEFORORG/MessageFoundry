@@ -57,6 +57,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.logging_setup import (
+    LOG_FIELD_READ_MAX,
     UNREADABLE_LOG_VALUE,
     _install_phi_filters,
     redact_log_value,
@@ -1412,14 +1413,15 @@ _CONTROL_HL7_PATHS = tuple(
 #   way; ``_KNOWN_FALSE_RED`` pins two such paths, not the whole class. It runs over the paths main
 #   hid, each with every ``_BASELINE_SEEN`` text; the quote-closing, control-character and
 #   raw-in-line vectors, each with one seen text; and a seeded corpus, each path with one. Only the
-#   raw-in-line vectors reach the check's raw-tail form.
+#   raw-in-line vectors reach the check's raw-tail form. The paths main hid, the third-handler
+#   vectors and a seeded quote-closing corpus also run with three handlers.
 # - An ordinary path stays readable with each ``_REWRITTEN_SEEN`` text, and the two raw-in-line
 #   paths stay readable with the encoded HL7 seen text their line leaves raw.
 # - Over a seeded corpus, a path the repeat line reads blanks on the past-cap line only where main's
 #   own past-cap line was not the repeat value or main's repeat-line span, then the seen text raw
 #   or as written alone. Its seen texts hold no encoded run beside a tab, which blanks a path
 #   while main wrote that form; so it bounds the blanking only for the seen texts it reads.
-# - Not tested, at least: a third handler; a Unicode space separator before an encoded HL7 name,
+# - Not tested, at least: the blanking bound below with three handlers; a Unicode space separator before an encoded HL7 name,
 #   which the pre-#3770 lines printed too; a seen text no vector names; and a pass that, in the
 #   past-cap line, hides the end of the path and writes that end back, followed by exactly
 #   ``seen_ip=`` and the seen text, as it was or as the passes write it alone.
@@ -1730,9 +1732,24 @@ def test_a_reading_still_changing_at_the_cap_logs_the_placeholder(
     path = _THIRD_HANDLER_HID[0]
     # The control: with the shipped cap the path reads, and its name is hidden.
     assert _new_ip_path_field(path) == '"/MEFOR_u005F_X_u003D_<redacted>"'
+    # The path changes on three passes and the fourth confirms it: a cap of exactly four reads it,
+    # and a cap of three, one short, does not.
+    monkeypatch.setattr(logging_setup, "_SHIPPED_READING_MAX_PASSES", 4)
+    assert _new_ip_path_field(path) == '"/MEFOR_u005F_X_u003D_<redacted>"'
     monkeypatch.setattr(logging_setup, "_SHIPPED_READING_MAX_PASSES", 3)
     assert _new_ip_path_field(path) == _UNREADABLE_FIELD
     assert _new_ip_path_field(path, "10.0.0.1") == _UNREADABLE_FIELD
+
+
+def test_a_path_past_the_read_bound_logs_the_placeholder() -> None:
+    """RED when: a path longer than ``LOG_FIELD_READ_MAX`` is read through the filters, whose
+    passes run on the event loop in the branch a replayed token loops on, rather than logged as the
+    placeholder (BACKLOG #3770)."""
+    path = "/" + "a" * (LOG_FIELD_READ_MAX - 1)
+    # The control: a path at the bound reads, cut by the field bound.
+    assert _new_ip_path_field(path) != _UNREADABLE_FIELD
+    assert _new_ip_path_field(path + "a") == _UNREADABLE_FIELD
+    assert _new_ip_path_field(path + "a", "10.0.0.1") == _UNREADABLE_FIELD
 
 
 @pytest.mark.parametrize("label", ("token", "password", "secret", "id_token", "access_token"))
