@@ -126,6 +126,9 @@ def test_every_audit_write_with_a_scope_key_is_narrowed_or_named_whole() -> None
     # that the scan ran over the tree. The ``missing`` check is what shows it still sees audit
     # writers: each narrowed action is written with a scope key in a literal detail.
     assert scanned > 100, f"the scan saw only {scanned} calls; the instrument is broken"
+    # The population the ``unclassified`` walk below draws from: the four narrowed actions and the
+    # four _WHOLE_ROW names, eight measured on 2026-11-10.
+    assert len(found) >= 8, f"the census found only {sorted(found)}; the instrument is broken"
     missing = CHANNEL_LIST_ACTIONS - set(found)
     assert not missing, f"the census no longer sees these narrowed writers: {sorted(missing)}"
     unclassified = {
