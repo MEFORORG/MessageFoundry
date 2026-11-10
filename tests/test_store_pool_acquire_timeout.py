@@ -444,6 +444,8 @@ async def test_sqlserver_clamped_borrow_points_to_the_cluster_paragraph() -> Non
 def test_the_clamped_borrow_advice_points_to_a_paragraph_that_exists() -> None:
     """BACKLOG #5064: the paragraph the advice points to is under [cluster] in
     docs/CONFIGURATION.md, and names each bound a clamped borrow can be cut at."""
+    from messagefoundry.store.sqlserver import CLAMPED_BORROW_ADVICE
+
     doc = (Path(__file__).resolve().parent.parent / "docs" / "CONFIGURATION.md").read_text(
         encoding="utf-8"
     )
@@ -460,6 +462,8 @@ def test_the_clamped_borrow_advice_points_to_a_paragraph_that_exists() -> None:
         "fixed 2 s",
     ):
         assert term in paragraph, term
+    # The paragraph quotes the message's ending exactly.
+    assert f"`retune with {CLAMPED_BORROW_ADVICE}`" in paragraph
     # The paragraph's "fixed 2 s" is stop()'s bound, which no setting changes.
     from messagefoundry.pipeline.cluster import STOP_WRITE_TIMEOUT_SECONDS
 

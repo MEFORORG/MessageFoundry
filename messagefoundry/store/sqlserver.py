@@ -5594,7 +5594,8 @@ class SqlServerStore:
     ) -> AsyncIterator[Any]:
         """The body of :meth:`_acquire`, :meth:`_acquire_after_commit` and :meth:`_acquire_clamped`,
         and the sole place this store borrows from its pool. ``timeout`` is the acquire limit, never
-        ``None``; ``retune`` names the setting a timed-out borrow's message advises."""
+        ``None``; ``retune`` is the advice a timed-out borrow's message ends with
+        (:func:`~messagefoundry.store.base.acquire_pooled`)."""
         t0 = perf_counter()
         conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver", retune=retune)
         self._acquire_wait.record((perf_counter() - t0) * 1000.0)

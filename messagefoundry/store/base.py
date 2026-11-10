@@ -5001,8 +5001,9 @@ class StoreAcquireTimeout(RuntimeError):
     """A store pooled-connection borrow exceeded its limit: at least ``[store].acquire_timeout``,
     a shorter cluster clamp, or the longer post-commit limit. The message names the setting
     its caller passed, ``[store].acquire_timeout`` unless the caller says otherwise. A SQL Server
-    cluster coordinator's clamped borrow advises one fixed text that points to the
-    docs/CONFIGURATION.md [cluster] paragraph (``SqlServerStore._acquire_clamped``, BACKLOG #5064).
+    cluster coordinator's clamped borrow whose clamp is no longer than ``[store].acquire_timeout``
+    advises one fixed text that points to the docs/CONFIGURATION.md [cluster] paragraph instead
+    (``SqlServerStore._acquire_clamped``, BACKLOG #5064).
 
     An ordinary ``Exception`` on purpose, so it lands in the store callers' existing ``except
     Exception`` handling and is treated as a transient stage failure (retry / dead-letter) — never a
@@ -5048,8 +5049,8 @@ async def acquire_pooled(
     pool: Any, *, timeout: float, backend: str, retune: str = "[store].acquire_timeout"
 ) -> Any:
     """Borrow a pooled connection within ``timeout`` seconds, or raise :class:`StoreAcquireTimeout`.
-    ``retune`` names the setting the error advises, for a caller whose limit is not
-    ``[store].acquire_timeout`` alone.
+    ``retune`` is the advice the error ends with, after "retune with": a setting name, or for a
+    caller whose limit is not ``[store].acquire_timeout`` alone, the text that caller passes.
 
     The single bounded chokepoint both server backends' ``_acquire`` helpers go through, so there is
     one place that decides what happens at the limit and the two cannot drift. The caller releases the

@@ -597,7 +597,8 @@ async def test_the_paused_owner_read_is_clamped_at_the_smaller_of_clamp_and_budg
     coord = SqlServerCoordinator(_Store(), "A", monotonic=lambda: 0.0)
     coord._no_claim_until = 10.0
     assert await coord._claim_or_renew_lease() is False
-    assert clamps == [min(coord._renew_timeout, coord._paused_read_budget / 2.0)]
+    assert coord._renew_timeout < coord._paused_read_budget / 2.0, "the renew term must bind here"
+    assert clamps == [coord._renew_timeout]
 
 
 @pytest.mark.parametrize(
