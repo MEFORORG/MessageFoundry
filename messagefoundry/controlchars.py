@@ -190,9 +190,9 @@ def _log_escape(code: int) -> str:
     without ``indent``, such as the off-box audit record, still parses after the scrub. So the
     audit tee need not escape early (vault BACKLOG #3012). On the first handler, the redaction
     filters run before its scrub. They see a character unescaped unless something escaped it
-    before logging, as ``json.dumps`` does to the C0 controls in the audit record. A later
-    handler re-runs them over text the first scrub escaped. ``emit_audit_tee`` lists both as
-    residuals.
+    before logging, as ``json.dumps`` does to the C0 controls in the audit record, which is why
+    the tee scrubs each field before it serialises (BACKLOG #3045). A later handler re-runs them
+    over text the first scrub escaped. ``emit_audit_tee`` lists that as a residual.
     Python's ``ascii`` spelling, used until then, wrote ``\\x7f`` and ``\\U000e0001``, which JSON
     does not define.
 

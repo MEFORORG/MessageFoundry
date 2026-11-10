@@ -30,7 +30,7 @@ import pytest
 from messagefoundry.api.approvals import ApprovalGate
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.controlchars import has_lone_surrogate
-from messagefoundry.logging_setup import build_stderr_handler, configure_logging
+from messagefoundry.logging_setup import build_stderr_handler, configure_logging, scrub_log_field
 from messagefoundry.store import MessageStore, audit_tee
 from messagefoundry.store.audit_tee import emit_audit_tee
 from tests._phi_gate_provisions import AT_REST_OPT_OUT_TOML
@@ -442,25 +442,14 @@ def test_the_redaction_filters_fire_across_an_escaped_character(
     fmt: str, actor: str, needle: str | None, capsys
 ) -> None:
     """The filters run before the scrub and see these characters unescaped, so they redact what
-    follows each exactly as they redact the same text with nothing in front. A C0 control is the
-    exception, because ``json.dumps`` escapes it first; the test below pins that. Synthetic values;
+    follows each exactly as they redact the same text with nothing in front. A C0 control, which
+    ``json.dumps`` escapes first, is covered by the field scrub; the tests below pin that. Synthetic values;
     the helper's ``json.loads`` is the parse check."""
     line, _inner, _record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
     if needle is not None:
         assert needle not in line, line
 
 
-class _C0Leak(Exception):
-    """The one failure the C0 xfail below expects, so a helper assert cannot satisfy it."""
-
-
-@pytest.mark.xfail(
-    strict=True,
-    raises=_C0Leak,
-    reason="KNOWN RESIDUAL, not built here and older than vault BACKLOG #3012: json.dumps escapes a "
-    "C0 control before any filter runs, so a pattern that needs a word boundary or whitespace "
-    "misses the text beside it. See emit_audit_tee's docstring.",
-)
 @pytest.mark.parametrize("fmt", ["text", "json"])
 @pytest.mark.parametrize(
     ("actor", "needle"),
@@ -474,14 +463,133 @@ class _C0Leak(Exception):
         (f"MRN{chr(0x09)}12345678", "12345678"),
     ],
 )
-def test_a_c0_control_still_hides_text_from_the_filters(
+def test_a_c0_control_no_longer_hides_text_from_the_filters(
     fmt: str, actor: str, needle: str, capsys
 ) -> None:
-    """Each case leaks only because of the C0 control: the control test asserts the same text
-    is redacted without it. When a case flips to a pass, take the marker off for it."""
+    """``json.dumps`` escapes a C0 control as ``\\u0001`` or ``\\t``, which ends in a word
+    character, so the handler chain alone missed the text beside it. Each field is now scrubbed
+    raw first (BACKLOG #3045). These were strict xfails until then; the control test below asserts
+    the same text is redacted without the control."""
     line, _inner, _record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
-    if needle in line:
-        raise _C0Leak(line)
+    assert needle not in line, line
+
+
+#: Text the chain redacts with nothing beside it, and the part of it that must not ship.
+_C0_SWEEP_CASES = (
+    ("DOE JANE", "DOE"),
+    ("password=hunter2", "hunter2"),
+    ("05/05/1980", "1980"),
+    ("Bearer abcdefgh", "abcdefgh"),
+    ("MRN 12345678", "12345678"),
+)
+
+
+def _tee_lines(cases: list[dict[str, str | None]], capsys) -> list[str]:
+    """Tee each case through the stdout handler ``serve`` installs, configured once, and return
+    the physical line of each, in order. Not parsed: a line here may legitimately be broken JSON."""
+    with _handlerless_process():
+        configure_logging("INFO", fmt="text")
+        capsys.readouterr()
+        for fields in cases:
+            emit_audit_tee(
+                action="auth.login_failed",
+                ts=1.0,
+                row_id=1,
+                seq=1,
+                row_hash=_HASH,
+                **{"actor": "alice", "channel_id": None, "client": None, "detail": "ok", **fields},
+            )
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if "auth.login_failed" in ln]
+    assert len(lines) == len(cases), lines
+    return lines
+
+
+@pytest.mark.parametrize("field", ["actor", "channel_id", "client", "detail"])
+def test_every_c0_control_on_either_side_of_each_field_is_redacted_beside(
+    field: str, capsys
+) -> None:
+    """The sweep the review of engine PR 2040 used, all 32 C0 code points, on both sides of the
+    text and in every free-text field of the record (BACKLOG #3045). A leak names the code point,
+    the side and the needle."""
+    keys = [
+        (code, before, text, needle)
+        for code in range(0x20)
+        for text, needle in _C0_SWEEP_CASES
+        for before in (True, False)
+    ]
+    cases: list[dict[str, str | None]] = [
+        {field: f"{chr(code)}{text}" if before else f"{text}{chr(code)}"}
+        for code, before, text, _needle in keys
+    ]
+    lines = _tee_lines(cases, capsys)
+    leaks = [
+        (hex(code), before, needle)
+        for (code, before, _text, needle), line in zip(keys, lines, strict=True)
+        if needle in line
+    ]
+    assert not leaks, leaks
+
+
+def test_the_field_scrub_redacts_no_less_than_the_line_chain_alone(capsys, monkeypatch) -> None:
+    """Closing step 3 of BACKLOG #3045: scrubbing each field first must not cost a redaction the
+    handler chain made on its own. Engine PR 2040's first version lost one that way. Each value is
+    teed twice, once with the field scrub switched off, which is the code before #3045, and once
+    as shipped. Every needle the first line hides, the second must hide too. Synthetic values."""
+    separators = [chr(c) for c in range(0x20)] + [" ", "", chr(0x7F), chr(0x85), '"', "|", "\\"]
+    texts = [*_C0_SWEEP_CASES, ("token=abc123xyz", "abc123xyz"), ("PID|1||12345^^^MRN", "12345")]
+    keys: list[tuple[dict[str, str | None], str]] = []
+    for sep in separators:
+        for text, needle in texts:
+            for value in (f"{sep}{text}", f"{text}{sep}", f"x{sep}{text}{sep}y"):
+                keys += [({"actor": value}, needle), ({"detail": value}, needle)]
+    cases = [fields for fields, _needle in keys]
+    real = scrub_log_field
+    monkeypatch.setattr(audit_tee, "scrub_log_field", lambda text: text)
+    before = _tee_lines(cases, capsys)
+    monkeypatch.setattr(audit_tee, "scrub_log_field", real)
+    after = _tee_lines(cases, capsys)
+    compared = list(zip(keys, before, after, strict=True))
+    lost = [
+        (ascii(fields), needle)
+        for (fields, needle), old, new in compared
+        if needle not in old and needle in new
+    ]
+    gained = sum(needle in old and needle not in new for (_f, needle), old, new in compared)
+    # The control: the switch really turns the field scrub off, so the comparison is not vacuous.
+    assert gained, "no value differed between the two runs, so the field scrub never switched off"
+    assert not lost, lost
+
+
+def test_the_field_scrub_runs_the_handler_chains_text_passes_in_its_order() -> None:
+    """``scrub_log_field`` hand-composes the text passes ``_install_phi_filters`` installs. This
+    holds the two together: the chain's filters, less the control-character scrub, must rewrite
+    each value exactly as ``scrub_log_field`` does, so a pass added to one and not the other goes
+    red. Synthetic values."""
+    from messagefoundry.logging_setup import (
+        ControlCharScrubFilter,
+        _install_phi_filters,
+    )
+
+    handler = logging.NullHandler()
+    _install_phi_filters(handler)
+    passes = [f for f in handler.filters if not isinstance(f, ControlCharScrubFilter)]
+    assert len(passes) == len(handler.filters) - 1
+    for text in (
+        "DOE JANE",
+        "password=hunter2",
+        "05/05/1980",
+        "Bearer abcdefgh",
+        "MRN 12345678",
+        "GET /cb?code=abc123&state=xyz",
+        "PID|1||12345^^^MRN",
+        'token=a;password="v w"',
+        "plain words",
+    ):
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, text, (), None)
+        for f in passes:
+            assert isinstance(f, logging.Filter)
+            f.filter(record)
+        assert record.getMessage() == scrub_log_field(text), text
 
 
 @pytest.mark.parametrize("fmt", ["text", "json"])
@@ -497,8 +605,8 @@ def test_a_c0_control_still_hides_text_from_the_filters(
 def test_the_c0_cases_are_redacted_without_the_control(
     fmt: str, actor: str, needle: str, capsys
 ) -> None:
-    """The control for the xfail above: the same text with a space, or nothing, in place of the
-    C0 control is redacted, so the xfail measures the control and not the pattern."""
+    """The control for the C0 tests above: the same text with a space, or nothing, in place of the
+    C0 control is redacted, so those tests measure the control and not the pattern."""
     line, _inner, _record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
     assert needle not in line, line
 

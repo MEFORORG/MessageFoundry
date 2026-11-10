@@ -18,6 +18,15 @@ All notable changes to MessageFoundry are documented here. The format follows
   its path leads to another host, or cannot finish reading the path; see the Generic ODBC section of
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
 
+### Fixed
+- **The off-box audit record no longer lets text beside a C0 control pass the redaction and
+  credential filters.** `json.dumps` escapes a C0 control as `\u0001` or `\t`, which ends in a
+  word character, so on a first deployment a name, a date, a bearer token, an MRN or a
+  `password=` value beside one would have reached the tee line unredacted. The tee now scrubs
+  each text field before it serialises the record, and the handler filters still run over the
+  whole line after. Of the residuals 0.5.2 named for the tee, the C0 one is closed; the other two
+  remain, and the `emit_audit_tee` docstring names them. (`BACKLOG #3045`)
+
 ## [0.5.2] — 2026-10-20 — Early Access
 
 This engine pairs with web console 0.5.0, which is published after it under its own

@@ -39,7 +39,7 @@ import json
 import logging
 from collections.abc import Callable
 
-from messagefoundry.logging_setup import AUDIT_LOGGER_NAME, ensure_logger_sink
+from messagefoundry.logging_setup import AUDIT_LOGGER_NAME, ensure_logger_sink, scrub_log_field
 from messagefoundry.redaction import safe_text
 
 __all__ = [
@@ -90,6 +90,10 @@ audit_logger.setLevel(logging.INFO)
 
 #: Whether this process has logged a tee failure; see the handler in :func:`emit_audit_tee`.
 _TEE_FAILURE_LOGGED = False
+
+
+def _scrubbed(value: str | None) -> str | None:
+    return scrub_log_field(value) if value else value
 
 
 def emit_audit_tee(
@@ -180,8 +184,16 @@ def emit_audit_tee(
     ``\\u007f`` ends in a word character, so ``\\b``-anchored patterns no longer matched the next
     word. ``ensure_ascii=True`` is the same mistake, for every non-ASCII character.
 
-    **At least three residuals remain.** The first can break the JSON a collector receives, or
-    alter it silently. The second can break it. The third leaves text unredacted.
+    **Each text field is scrubbed while it is still raw (BACKLOG #3045).** ``json.dumps`` escapes
+    the 32 C0 controls, each escape ends in a word character, as ``\\u0001`` and ``\\t`` do, and a
+    tab, LF or CR stops being whitespace. So the handler chain alone missed a name, a date, a
+    bearer token, an MRN or a ``password=`` value beside a C0 control. Each text field therefore
+    goes through :func:`~messagefoundry.logging_setup.scrub_log_field` first, the same text passes
+    the handlers run, and the handlers still run over the whole line afterwards. ``ts`` and the
+    anchor fields are engine-generated numbers and digests, and are not scrubbed on their own.
+
+    **At least two residuals remain.** The first can break the JSON a collector receives, or
+    alter it silently. The second can break it.
 
     * The redaction and credential filters rewrite spans of this document as text, and a span can
       take a closing quote with it. A typed name of ``password=`` or ``a|b|c`` does that on every
@@ -193,38 +205,34 @@ def emit_audit_tee(
       run the chain again over the first handler's escaped text (``_install_phi_filters``). Then
       ``x%7Cy%7Cz`` followed by DEL, or by U+2028, parses on stdout and not on the later sinks,
       the forwarder included. ``tests/test_audit_offbox_tee.py`` pins that as a strict xfail.
-    * ``json.dumps`` escapes the 32 C0 controls before any filter runs. Each escape ends in a word
-      character, as ``\\u0001`` and ``\\t`` do. And a tab, LF or CR stops being whitespace. So a
-      pattern that needs a word boundary or whitespace can miss the text beside a C0 control, on
-      either side. Measured cases include a two-word name, a date, a bearer token, an MRN and a
-      ``password=`` value, and they reach the tee line unredacted. This predates vault BACKLOG
-      #3012. ``tests/test_audit_offbox_tee.py`` pins some of these cases as strict xfails.
 
     Running the chain once per record, rather than once per handler, would close the second. The
-    first needs filters that do not rewrite this document as plain text. The third needs the
-    patterns to see each field before ``json.dumps`` escapes it.
+    first needs filters that do not rewrite this document as plain text.
 
     Best-effort: a logging failure must never fail the audit write (already committed), so it is
     caught and logged, not raised. Callers invoke this **after commit** and **outside any write
     lock/transaction**, so a synchronous syslog send can't block the event loop under a lock."""
-    record = {
-        "event": "audit",
-        "ts": ts,
-        "action": action,
-        "actor": actor,
-        "channel_id": channel_id,
-        "client": client,
-        # Anchor fields (BACKLOG #1198): the row's position in the chain and its head hash. Discrete
-        # fields so a SIEM can index them without parsing the redacted blob. See the docstring for
-        # what they close and what the default transport leaves open.
-        "row_id": row_id,
-        "seq": seq,
-        "row_hash": row_hash,
-        # PHI chokepoint: redact HL7-shaped content + bound length before it ships off-box.
-        "detail": safe_text(detail) if detail else None,
-    }
     try:
-        # Inside the guard: a sink that cannot be built must not fail the caller's audit write either.
+        # Inside the guard, since the field scrub runs patterns: a fault there, or a sink that
+        # cannot be built, must not fail the caller's audit write either. It drops the copy rather
+        # than ship an unscrubbed one.
+        record = {
+            "event": "audit",
+            "ts": ts,
+            # Each text field scrubbed raw, before json.dumps escapes a C0 control beside it (#3045).
+            "action": _scrubbed(action),
+            "actor": _scrubbed(actor),
+            "channel_id": _scrubbed(channel_id),
+            "client": _scrubbed(client),
+            # Anchor fields (BACKLOG #1198): the row's position in the chain and its head hash.
+            # Discrete fields so a SIEM can index them without parsing the redacted blob. See the
+            # docstring for what they close and what the default transport leaves open.
+            "row_id": row_id,
+            "seq": seq,
+            "row_hash": row_hash,
+            # PHI chokepoint: redact HL7-shaped content + bound length before it ships off-box.
+            "detail": _scrubbed(safe_text(detail) if detail else None),
+        }
         ensure_logger_sink(audit_logger)
         # Not ensure_ascii, and no escaping here: see "The record survives the scrub" above.
         audit_logger.info(json.dumps(record, ensure_ascii=False))

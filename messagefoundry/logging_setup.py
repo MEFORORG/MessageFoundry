@@ -97,6 +97,7 @@ __all__ = [
     "JsonFormatter",
     "CredentialQueryScrubFilter",
     "CredentialScrubFilter",
+    "scrub_log_field",
     "SyslogForward",
     "ForwarderStatus",
     "FORWARD_LOSS_COUNTERS",
@@ -233,9 +234,9 @@ class RedactionFilter(logging.Filter):
     The "never put PHI in an exception message" convention binds only the engine's own authors, Router
     and Handler authors included, in text they write themselves, and never a remote peer, a library or the runtime (docs/PHI.md
     section 7, *Who the exception-message convention binds*).
-    A message escaped before it reaches this filter is another residual: the audit tee's
-    ``json.dumps`` escapes the C0 controls first, and a name or date beside one can pass. See
-    :func:`~messagefoundry.store.audit_tee.emit_audit_tee`.
+    A message escaped before it reaches this filter is another residual, so a caller that
+    serialises raw values into a message scrubs each one first with :func:`scrub_log_field`, as
+    the audit tee does (BACKLOG #3045).
 
     **EVERY FIELD IS BOUNDED BEFORE IT IS SCANNED (BACKLOG #1576).** This filter had no ceiling at all,
     and it is the worst place in the engine not to have one: a ``logging.Filter`` is synchronous by the
@@ -438,6 +439,21 @@ class CredentialScrubFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         _rewrite_record(record, scrub_credentials)
         return True
+
+
+def scrub_log_field(text: str) -> str:
+    """Run the text passes of :func:`_install_phi_filters`'s chain over one value, in that order:
+    PHI redaction, the credential query scrub, then the credential scrub.
+
+    For a caller that serialises several values into one log message, so each value is scrubbed
+    while it is still raw (BACKLOG #3045). The audit tee needs it: ``json.dumps`` escapes a C0
+    control as ``\\u0001`` or ``\\t``, each escape ends in a word character, and the handler chain
+    then sees no word boundary or whitespace beside it. The handler chain still runs over the whole
+    message after this, so a caller loses nothing by also calling this. The control-character scrub
+    is left to the handler, which runs it last on every sink.
+    ``tests/test_audit_offbox_tee.py`` holds this order to the handler chain's, so a pass added
+    there and not here goes red."""
+    return scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
 
 
 class JsonFormatter(_SafeExcFormatter):
