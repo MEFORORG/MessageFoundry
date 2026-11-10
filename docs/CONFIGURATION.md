@@ -2955,8 +2955,9 @@ lengthen the borrow: raise `[store].acquire_timeout` too. The message's `after N
 that cut the borrow, so compare it with each term below to tell which applied; the claim and the
 paused owner read run in the same maintenance step, so the step name in the log does not tell them
 apart. Where an event-loop timeout ends the call first, the call raises `TimeoutError` instead and
-no such message is logged: always for `stop()`'s writes, and for the paused owner read when its
-budget runs out first (both below). At least these set the clamps:
+no such message is logged. That happens at least for `stop()`'s writes, unless a shorter
+`[store].acquire_timeout` cuts the borrow first, and for the paused owner read when its budget runs
+out first; both are below. At least these set the clamps:
 
 - **The renew clamp**, for the claim and renew, the heartbeat, the config-version refresh and a
   stepdown's release write. It is `lease_renew_timeout_seconds` when set. Left unset, it is derived
