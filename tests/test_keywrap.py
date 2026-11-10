@@ -679,6 +679,170 @@ def test_an_ssl_loader_refuses_a_weak_key_with_a_stray_begin_marker(
     assert _api(cert, approved, _PASSPHRASE) is not None
 
 
+# --- BER forms of an EncryptedPrivateKeyInfo (BACKLOG #5543) ------------------------------------
+#
+# OpenSSL's decoder takes BER, so it decrypts an EncryptedPrivateKeyInfo in forms DER forbids,
+# under a plain PRIVATE KEY label or as raw DER. cryptography's loaders reject them, so the loader
+# tests drive OpenSSL. load_cert_chain reads PEM only; raw DER reaches the check through
+# refuse_weak_key_file callers such as a database driver key.
+
+
+def _der_of(pem_bytes: bytes) -> bytes:
+    return base64.b64decode(b"".join(pem_bytes.strip().splitlines()[1:-1]))
+
+
+def _long_length(tag: bytes, body: bytes) -> bytes:
+    """A TLV whose length is written in five bytes, padded with leading zeros, which BER allows."""
+    return tag + b"\x85" + len(body).to_bytes(5, "big") + body
+
+
+def _to_ber(der: bytes, form: str) -> bytes:
+    """``der``, a DER SEQUENCE, re-encoded in a BER form. The first three forms take any SEQUENCE;
+    the rest take an EncryptedPrivateKeyInfo: an AlgorithmIdentifier, then the ciphertext."""
+    outer = keywrap.read_der_tlv(der, 0, len(der))
+    content = der[outer.start : outer.end]
+    if form == "indefinite-outer":
+        return b"\x30\x80" + content + b"\x00\x00"
+    if form == "long-outer-length":
+        return _long_length(b"\x30", content)
+    if form == "high-tag-outer":
+        return b"\x3f\x10" + seq(content)[1:]
+    if form == "padded-high-tag-outer":
+        return b"\x3f\x80\x80\x80\x10" + seq(content)[1:]
+    if form == "both":
+        return _to_ber(_to_ber(der, "constructed-octets"), "indefinite-outer")
+    if form == "indefinite-algorithm-and-outer":
+        return _to_ber(_to_ber(der, "indefinite-algorithm"), "indefinite-outer")
+    first, second = keywrap.der_children(der, outer)
+    algorithm, algorithm_body = der[outer.start : first.end], der[first.start : first.end]
+    ciphertext = der[second.start : second.end]
+    chunks = octets(ciphertext[:16]) + octets(ciphertext[16:])
+    shapes = {
+        "constructed-octets": seq(algorithm, b"\x24\x80" + chunks + b"\x00\x00"),
+        "definite-constructed-octets": seq(algorithm, tlv(0x24, chunks)),
+        "long-octets-length": seq(algorithm, _long_length(b"\x04", ciphertext)),
+        "high-tag-algorithm": seq(b"\x3f\x10" + seq(algorithm_body)[1:], octets(ciphertext)),
+        "padded-high-tag-algorithm": seq(
+            b"\x3f\x80\x80\x80\x10" + seq(algorithm_body)[1:], octets(ciphertext)
+        ),
+        "high-tag-octets": seq(algorithm, b"\x1f\x04" + octets(ciphertext)[1:]),
+        "indefinite-algorithm": seq(b"\x30\x80" + algorithm_body + b"\x00\x00", octets(ciphertext)),
+    }
+    return shapes[form]
+
+
+#: Forms the check reads far enough to judge on the wrap.
+_JUDGED_BER_FORMS = [
+    "indefinite-outer",
+    "constructed-octets",
+    "definite-constructed-octets",
+    "both",
+]
+#: Forms the check does not walk. Each is refused as unreadable, the approved wrap with the weak.
+_UNWALKED_BER_FORMS = [
+    "long-outer-length",
+    "long-octets-length",
+    "high-tag-outer",
+    "padded-high-tag-outer",
+    "high-tag-algorithm",
+    "padded-high-tag-algorithm",
+    "high-tag-octets",
+    "indefinite-algorithm",
+    "indefinite-algorithm-and-outer",
+]
+
+
+@pytest.mark.parametrize("form", _JUDGED_BER_FORMS)
+def test_a_weak_ber_wrap_is_judged_under_any_label_and_as_raw_der(
+    material: Material, form: str
+) -> None:
+    weak = _to_ber(_der_of(material.wraps["best-available-2048"]), form)
+    approved = _to_ber(_der_of(material.wraps["approved"]), form)
+    for shaped in (weak, pem(weak, "PRIVATE KEY"), pem(weak)):
+        refusal = _check(shaped)
+        assert refusal is not None and "2048 iterations" in refusal
+    # The control: the approved wrap in the same BER form is judged on its wrap and passes.
+    for shaped in (approved, pem(approved, "PRIVATE KEY"), pem(approved)):
+        assert _check(shaped) is None
+
+
+@pytest.mark.parametrize("form", _UNWALKED_BER_FORMS)
+def test_a_ber_wrap_the_check_cannot_walk_is_refused_not_passed(
+    material: Material, form: str
+) -> None:
+    # The default is inverted for bytes the DER reader cannot walk: a SEQUENCE that opens with an
+    # AlgorithmIdentifier is refused, whatever its wrap, rather than passed as an unencrypted key.
+    for wrap in ("best-available-2048", "approved"):
+        ber = _to_ber(_der_of(material.wraps[wrap]), form)
+        for shaped in (ber, pem(ber, "PRIVATE KEY"), pem(ber)):
+            refusal = _check(shaped)
+            assert refusal is not None and "cannot read" in refusal
+
+
+@pytest.mark.parametrize(
+    ("form", "why"),
+    [(form, "2048 iterations") for form in _JUDGED_BER_FORMS]
+    + [(form, "cannot read") for form in _UNWALKED_BER_FORMS],
+)
+def test_an_ssl_loader_refuses_a_weak_ber_wrap_under_a_plain_label(
+    tmp_path: Path, material: Material, form: str, why: str
+) -> None:
+    cert = _write(tmp_path, "cert.pem", material.cert_pem)
+    ber = _to_ber(_der_of(material.wraps["best-available-2048"]), form)
+    weak = _write(tmp_path, "weak.pem", pem(ber, "PRIVATE KEY"))
+    with pytest.raises(KeyWrapRefused, match=why):
+        _api(cert, weak, _PASSPHRASE)
+    # OpenSSL itself decrypts the weak key in this form, so the refusal above is the check's.
+    try:
+        ssl.create_default_context(ssl.Purpose.CLIENT_AUTH).load_cert_chain(cert, weak, _PASSPHRASE)
+    except ssl.SSLError:
+        pytest.skip(f"{ssl.OPENSSL_VERSION} does not load this form")
+    if form in _JUDGED_BER_FORMS:
+        approved_ber = _to_ber(_der_of(material.wraps["approved"]), form)
+        approved = _write(tmp_path, "approved.pem", pem(approved_ber, "PRIVATE KEY"))
+        assert _api(cert, approved, _PASSPHRASE) is not None
+
+
+@pytest.mark.parametrize(
+    "form", ["indefinite-outer", "long-outer-length", "high-tag-outer", "padded-high-tag-outer"]
+)
+def test_an_unencrypted_ber_key_still_passes_and_loads(
+    tmp_path: Path, material: Material, form: str
+) -> None:
+    # The control for the inverted default: an unencrypted PrivateKeyInfo opens with an INTEGER,
+    # so its BER forms are not refused, and OpenSSL still loads one through the real loader.
+    plain = material.key.private_bytes(
+        serialization.Encoding.DER, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    )
+    ber = _to_ber(plain, form)
+    assert _check(ber, given=False) is None
+    assert _check(pem(ber, "PRIVATE KEY"), given=False) is None
+    cert = _write(tmp_path, "cert.pem", material.cert_pem)
+    key = _write(tmp_path, "key.pem", pem(ber, "PRIVATE KEY"))
+    assert _api(cert, key, None) is not None
+
+
+#: A BER PKCS#7 ContentInfo: SEQUENCE { OID data, [0] { OCTET STRING } }, all indefinite.
+_BER_CONTENT_INFO = (
+    b"\x30\x80\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x07\x01\xa0\x80\x04\x00\x00\x00\x00\x00"
+)
+
+
+def test_bytes_that_are_not_a_key_are_still_left_to_the_loader() -> None:
+    # Truncated bytes, an empty BER SEQUENCE and a SEQUENCE that opens with an OID are not the
+    # EncryptedPrivateKeyInfo shape, so the inverted default does not refuse them.
+    for junk in (
+        b"\x30\x80",
+        b"\x30\x80\x30",
+        b"\x30\x80\x02\x01\x00\x00\x00",
+        b"\x30\x05\x30",
+        b"\x30\x80\x00\x00",
+        b"\x3f\x80\x80",
+        _BER_CONTENT_INFO,
+    ):
+        assert _check(junk, given=False) is None
+
+
 @pytest.mark.parametrize("variant", ["crcrlf", "blank-after-begin", "space-line-after-begin"])
 def test_a_reformatted_legacy_pem_is_still_refused(material: Material, variant: str) -> None:
     legacy = material.wraps["legacy-proc-type-pem"]
