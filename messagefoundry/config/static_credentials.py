@@ -167,6 +167,12 @@ def _oauth2(settings: Mapping[str, Any]) -> bool:
     return oauth2_auth_configured(settings)
 
 
+def _digest(settings: Mapping[str, Any]) -> bool:
+    from messagefoundry.transports.http_auth import http_digest_selected
+
+    return http_digest_selected(settings)
+
+
 def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool) -> list[str]:
     """The static credentials an HTTP-family hop actually puts on the wire.
 
@@ -185,7 +191,7 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
             out.append("HTTP Basic")
     # The connector answers a Digest challenge only in http_auth='digest' mode, and refuses to build
     # in that mode with either half missing, so the mode is the predicate, not the credential keys.
-    if str(settings.get("http_auth") or "").lower() == "digest":
+    if _digest(settings):
         out.append("HTTP Digest")
     if ctype is ConnectorType.SOAP:
         # The connector stamps a UsernameToken only when it has a user (``_build_wsse_header``), and

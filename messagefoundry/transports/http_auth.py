@@ -74,6 +74,7 @@ __all__ = [
     "OAuth2ClientCredentialsProvider",
     "bearer_provider_from_settings",
     "digest_handler_from_settings",
+    "http_digest_selected",
     "oauth2_auth_configured",
     "oauth2_cc_provider_from_settings",
     "proxy_auth_handler_from_settings",
@@ -328,6 +329,13 @@ class _ApprovedDigestAuthHandler(_ApprovedDigestMixin, urllib.request.HTTPDigest
     which the proxy 407 handler shares, so the origin and proxy paths cannot drift apart."""
 
 
+def http_digest_selected(s: Mapping[str, Any]) -> bool:
+    """Whether ``http_auth`` selects HTTP Digest. The SINGLE definition, shared by
+    :func:`digest_handler_from_settings`, the REST ECH refusal and the static-credential census
+    (``config.static_credentials._http_static``), so the connector and the posture reader agree."""
+    return str(s.get("http_auth") or "").lower() == "digest"
+
+
 def digest_handler_from_settings(
     s: Mapping[str, Any], *, url: str
 ) -> urllib.request.HTTPDigestAuthHandler | None:
@@ -341,7 +349,7 @@ def digest_handler_from_settings(
     a loopback host lifts it, never ``tls_hop_attested`` or ``cleartext_accepted`` (vault BACKLOG #3533
     item 4). A missing user/password is a loud :class:`HttpAuthError` (fail-closed, never a silent
     no-auth request)."""
-    if str(s.get("http_auth") or "").lower() != "digest":
+    if not http_digest_selected(s):
         return None
     scheme = urllib.parse.urlsplit(url).scheme.lower()
     # The digest response is a credential, so an off-box cleartext hop is refused with no escape

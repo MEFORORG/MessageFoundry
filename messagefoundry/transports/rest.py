@@ -2790,6 +2790,17 @@ class RestDestination(DestinationConnector):
                 "ech_egress and verify_tls=false are mutually exclusive — the ECH sidecar, not the "
                 "engine, makes this connection's TLS connection to the destination (ADR 0139)"
             )
+        # BACKLOG #5529 limb 3 (#2707 closing step 1): the ECH branch below replaces the opener the
+        # Digest handler is folded into, so the connection used to build and deliver with no Digest
+        # auth. Keeping the handler on the ECH opener would not work: its password manager is keyed
+        # on self.url, and the ECH request goes to the sidecar URL, so no challenge would match.
+        from messagefoundry.transports.http_auth import http_digest_selected
+
+        if self._ech_sidecar is not None and http_digest_selected(s):
+            raise HttpAuthError(
+                f"{hop_name_prefix(config.name)}ech_egress and HTTP Digest are mutually exclusive -- "
+                "the Digest handler cannot answer a challenge through the ECH sidecar (ADR 0139)"
+            )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy. None (default, or when
         # ECH is active) → no ProxyHandler and no Proxy-Authorization threaded below → byte-identical.
         self._proxy: ProxyConfig | None = (
