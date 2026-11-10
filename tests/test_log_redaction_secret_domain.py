@@ -994,6 +994,12 @@ def _walk_scan_prefix(
             # require one, and a branch nobody walked is a branch nobody checked.
             required = [step(option, seen=seen) for option in arg[1]]
             seen = bool(required) and all(required)
+        elif op == sre_constants.GROUPREF_EXISTS:
+            # A conditional, ``(?(name)yes|no)``, as BACKLOG #5545's narrowed value classes are: either
+            # branch can run, so both are walked, and an absent "no" requires nothing.
+            _group, yes, no = arg
+            required = [step(option, seen=seen) for option in (yes, no if no is not None else [])]
+            seen = all(required)
         elif op in (sre_constants.ASSERT, sre_constants.ASSERT_NOT):
             step(arg[1], seen=seen)
     return seen
@@ -1023,8 +1029,10 @@ def _unbounded_scan_repeats(source: str) -> tuple[str, ...]:
     exactly as the shipped constant (BACKLOG #5545). Its camelCase half fires at a capital after a
     lower-case letter or a digit, inside a word run, but only where a label word starts there and
     ENDS the run. So a run offers at most one such start per label word that can end it, a constant,
-    and the walk from it is that word and then the separated segments a ``\\b`` start walks too. The
-    same capital start without that lookahead is flagged, which is the control below."""
+    and the walk from it is that word, since the label patterns' start also needs the separator right
+    after it. The pattern opens its label group in front of the start, ``(`` then the start, which is
+    the same position. The same capital start without that lookahead is flagged, which is the control
+    below."""
     parsed = sre_parser.parse(source)
     head = parsed[0] if len(parsed) else (None, None)
     anchored = head[0] == sre_constants.AT and head[1] in (
@@ -1033,7 +1041,11 @@ def _unbounded_scan_repeats(source: str) -> tuple[str, ...]:
         sre_constants.AT_BEGINNING_STRING,
     )
     anchored = anchored or source.removeprefix("(?i)").startswith(
-        (scrub_mod._LABEL_START, scrub_mod._LABEL_OR_CAMEL_START)
+        (
+            scrub_mod._LABEL_START,
+            scrub_mod._LABEL_OR_CAMEL_START,
+            "(" + scrub_mod._LABEL_OR_CAMEL_START,
+        )
     )
     found: list[str] = []
     _walk_scan_prefix(
@@ -1112,7 +1124,19 @@ def test_every_applied_credential_pattern_has_a_contained_scan_prefix() -> None:
     assert scrub_mod._CAMEL_START.endswith(
         r"(?=(?i:" + scrub_mod._alternation(scrub_mod._CAMEL_WORDS) + r")\b)"
     )
-    assert scrub_mod._LABEL_OR_CAMEL_START.endswith(r"|" + scrub_mod._CAMEL_START + r")")
+    # The label patterns' start: the same, with the separator and the value's first character after
+    # the word, which still opens on ``\b``.
+    assert scrub_mod._SAME_LINE_VALUE.startswith(r"\b")
+    assert scrub_mod._CAMEL_LABEL_START.endswith(
+        r"(?=(?i:"
+        + scrub_mod._alternation(scrub_mod._CAMEL_WORDS)
+        + r")"
+        + scrub_mod._SAME_LINE_VALUE
+        + r")"
+    )
+    assert scrub_mod._LABEL_OR_CAMEL_START.endswith(
+        r"|(?P<camel>)" + scrub_mod._CAMEL_LABEL_START + r")"
+    )
     assert not _unbounded_scan_repeats(
         r"(?i)" + scrub_mod._LABEL_OR_CAMEL_START + r"[A-Za-z0-9]+[:=]"
     )
