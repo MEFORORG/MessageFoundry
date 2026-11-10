@@ -69,6 +69,7 @@ from messagefoundry.config.tls_policy import (
     TrustAnchor,
     build_verifying_client_context,
     harden_cipher_suites,
+    hop_name_prefix,
     narrow_to_approved_suites,
     relax_verify_expiry,
 )
@@ -395,6 +396,15 @@ _XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _SCRUB_MIN_LEN = 8
 
 
+def _drop_authorization(headers: dict[str, str]) -> None:
+    """Remove every casing of ``Authorization`` from a static header table, so the credential the
+    connection configures owns the one header (BACKLOG #5526). urllib capitalises names and the last
+    write wins, so the configured value already crossed; the table still held two keys, and the
+    length gate measured both."""
+    for key in [k for k in headers if k.lower() == "authorization"]:
+        del headers[key]
+
+
 def _iso(t: float) -> str:
     """An XSD ``dateTime`` in UTC, e.g. ``2026-06-15T05:30:00Z`` (WS-Security Created/Expires)."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
@@ -445,8 +455,10 @@ class SoapDestination(DestinationConnector):
         self.client_key_password: str | None = s.get("client_key_password") or None
         self.ws_addressing: bool = bool(s.get("ws_addressing", False))
         self.ws_security: bool = bool(s.get("ws_security", False))
-        self.ws_username: str | None = s.get("ws_username") or s.get("basic_user") or None
-        self.ws_password: str | None = s.get("ws_password") or s.get("basic_password") or None
+        # BACKLOG #5526 (ADR 0015 amendment 2026-11-10): no fallback to basic_user/basic_password.
+        # Borrowing the Basic pair sent one password twice, in the Authorization header and the token.
+        self.ws_username: str | None = s.get("ws_username") or None
+        self.ws_password: str | None = s.get("ws_password") or None
         self.ws_password_type: str = str(s.get("ws_password_type", "text"))
         self.ws_timestamp_ttl_seconds: int = count_setting(
             s.get("ws_timestamp_ttl_seconds", 300),
@@ -470,6 +482,7 @@ class SoapDestination(DestinationConnector):
         self._connection_name = config.name
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
+        self._refuse_half_credential_pairs(s)
         self._validate_ws(scheme, s)
 
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
@@ -583,6 +596,8 @@ class SoapDestination(DestinationConnector):
             s, proxy=self._proxy, trust_anchor_policy=config.trust_anchor_policy
         )
         if self._token_provider is not None:
+            # The minted bearer owns the Authorization header _post writes per request (#5526).
+            _drop_authorization(self._headers)
             refuse_cleartext_credentials(
                 scheme,
                 {**self._headers, "Authorization": "Bearer"},
@@ -733,6 +748,25 @@ class SoapDestination(DestinationConnector):
                     text = text.replace(form, "***")
         return text
 
+    def _refuse_half_credential_pairs(self, s: dict[str, Any]) -> None:
+        """A credential pair is both halves or neither (BACKLOG #5526). Read here, on the resolved
+        settings, because the ``Soap()`` factory sees ``env()`` references and cannot tell one that
+        resolves empty from a set value. One half alone would send no HTTP Basic header, or stamp a
+        UsernameToken with an empty password. The message names keys, never a value."""
+        prefix = hop_name_prefix(self._connection_name)
+        if bool(s.get("basic_user")) != bool(s.get("basic_password")):
+            raise HttpAuthError(
+                f"{prefix}SOAP destination basic_user and basic_password must be set together; "
+                "one without the other would send no HTTP Basic credential"
+            )
+        # The token is stamped only with ws_security on, so the pair binds only then. With neither
+        # half, ws_security stamps the Timestamp alone, a profile a mutual-TLS service may ask for.
+        if self.ws_security and bool(self.ws_username) != bool(self.ws_password):
+            raise HttpAuthError(
+                f"{prefix}SOAP destination ws_username and ws_password must be set together with "
+                "ws_security on; the UsernameToken does not use basic_user/basic_password"
+            )
+
     def _validate_ws(self, scheme: str, s: dict[str, Any]) -> None:
         """Runtime validation of the WS-* / mTLS settings (also enforced at wiring time by
         ``build_outbound_connection`` so ``check``/dry-run catches it without a store; the url-scheme
@@ -766,8 +800,8 @@ class SoapDestination(DestinationConnector):
             raise ValueError("SOAP ws_addressing/ws_security require soap_version='1.2' (ADR 0015)")
         # A UsernameToken password over cleartext http is a credential on the wire, refused like the
         # header credentials: only a loopback host lets it cross, never a declaration or the escape
-        # (vault BACKLOG #3533 item 4). Only with ws_security on: without it no token is stamped,
-        # and a basic_user that ws_username falls back to is judged as HTTP Basic instead.
+        # (vault BACKLOG #3533 item 4). Only with ws_security on: without it no token is stamped.
+        # ws_username no longer falls back to basic_user (#5526), which is judged as HTTP Basic.
         if self.ws_security and self.ws_username:
             refuse_cleartext_credential_hop(
                 scheme,
@@ -792,12 +826,15 @@ class SoapDestination(DestinationConnector):
         if isinstance(extra, dict):
             headers.update({str(k): str(v) for k, v in extra.items()})
         token = s.get("bearer_token")
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
         user, password = s.get("basic_user"), s.get("basic_password")
-        if user and password:
-            raw = f"{user}:{password}".encode()
-            headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
+        auth: str | None = None
+        if user and password:  # Basic wins over a static bearer_token, as it always has
+            auth = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+        elif token:
+            auth = f"Bearer {token}"
+        if auth is not None:
+            _drop_authorization(headers)
+            headers["Authorization"] = auth
         return headers
 
     # --- WS-* envelope assembly (all non-deterministic values minted here, in send()) -------------

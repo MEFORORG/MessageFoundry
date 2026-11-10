@@ -171,10 +171,12 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
     """The static credentials an HTTP-family hop actually puts on the wire.
 
     A minted SMART or OAuth2 bearer replaces the ``Authorization`` header, so a static bearer or
-    Basic credential configured beside it never leaves the engine. Basic needs both halves (the
-    connector sends nothing on one). A WS-Security UsernameToken rides in the SOAP body, so token auth
-    does not displace it, but it is stamped only with ``ws_security`` on; its user and password fall
-    back to the Basic pair. ``Soap()`` hoists ``body_secrets`` into ``body_secret_tokens``."""
+    Basic credential configured beside it never leaves the engine. Basic needs both halves: SOAP
+    refuses to build on one, and REST, FHIR and DICOMweb send nothing on one. A WS-Security
+    UsernameToken rides in the SOAP body, so token auth does not displace it, but it is stamped only
+    with ``ws_security`` on. Its user and password are ``ws_username`` and ``ws_password`` alone; they
+    stopped falling back to the Basic pair in BACKLOG #5526. ``Soap()`` hoists ``body_secrets`` into
+    ``body_secret_tokens``."""
     out: list[str] = []
     if not token:
         if settings.get("bearer_token"):
@@ -186,10 +188,9 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
     if str(settings.get("http_auth") or "").lower() == "digest":
         out.append("HTTP Digest")
     if ctype is ConnectorType.SOAP:
-        ws_user = settings.get("ws_username") or settings.get("basic_user")
-        # The connector stamps a UsernameToken only when it has a user (``_build_wsse_header``); a
-        # password with no user puts nothing on the wire.
-        if settings.get("ws_security") and ws_user:
+        # The connector stamps a UsernameToken only when it has a user (``_build_wsse_header``), and
+        # with ws_security on it refuses to build on one half of the pair (#5526).
+        if settings.get("ws_security") and settings.get("ws_username"):
             out.append("WS-Security UsernameToken")
         if settings.get("body_secret_tokens"):
             out.append("body secrets")
