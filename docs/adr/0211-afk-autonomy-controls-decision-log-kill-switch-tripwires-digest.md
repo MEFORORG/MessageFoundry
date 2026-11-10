@@ -611,7 +611,7 @@ cached; the cache that Consequences names for the digest would cut both.
 
 The owner's ruling of 2026-11-09, recorded verbatim in [AUTONOMY-PLAN.md](../AUTONOMY-PLAN.md)
 section 12, replaced the 60-sample owner calibration gate with automated signals and made the
-blind sample optional. Three things change here.
+blind sample optional. At least these things change here.
 
 - **Calibration** (`Get-DecisionCalibration`) is the automated signals over the seat's Class B
   decisions in the trailing 14 days: the reversal rate, and the rates of decisions any `outcome`
@@ -630,7 +630,7 @@ blind sample optional. Three things change here.
   `-Touches`. No path is REVIEW, since an act that changes no file has no git undo. Every path must
   be on the fail-closed allowlist `_decisionlog.ps1` `DecisionFastPathAllow`, and none may be one
   `Get-DecisionClassCPath` names or cannot classify (a `~` segment included); anything else is
-  REVIEW, and so is a symbolic link or a file marked skip-worktree or assume-unchanged. The
+  REVIEW, and so is a symbolic link at a path or above it, a file marked skip-worktree or assume-unchanged, a deleted test, and a git-ignored path `Get-DecisionClassCPath` names or cannot classify, except the two seat files the session-start hooks regenerate. No file under `messagefoundry/parsing/` is on the allowlist. The
   derived paths are the checkout's state at gate time, not the act's, so the session names every
   path the act will change; `-Json` and the record carry the paths classified. The gate answers
   NO-REVIEW only where origin is `MEFORORG/MessageFoundry`, and names on stderr the conditions it
@@ -640,8 +640,9 @@ blind sample optional. Three things change here.
 - **A seat is read through `docs/roles/seats.json`**: an alias shares its seat's calibration and
   budget, and a label the roster does not resolve answers REVIEW. A signal or reversal outcome
   is never a decision's latest outcome and is sticky, so no later outcome cancels it; `reopened`,
-  `rebriefed`, `re-briefed` and `overridden` count as reversals. Items compare as `#4242` equals
+  `rebriefed`, `re-briefed`, `overridden`, `closed`, `abandoned` and `withdrawn` count as reversals. Items compare as `#4242` equals
   `4242` in the chain limit too.
+- **The seat must be the session's own.** NO-REVIEW needs `CLAUDE_CODE_SESSION_ID` set and that session's seat record to name the `-Seat` given; `-Session` cannot borrow another record, the Lander exemption needs the same match, and the Special seat answers REVIEW. `-Log` refuses a record whose `-Seat` differs from the caller's declared seat.
 - **The digest's calibration table** gains the two signal rates.
 
 **Designed, not built:** a writer for any of the three signals. Every input is an `outcome` record
