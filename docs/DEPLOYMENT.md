@@ -931,9 +931,16 @@ does not resolve to a listed `host:port` makes the config **fail at load / reloa
 | `[egress].allowed_syslog` | the off-box log forwarder's collector (`[logging].forward_host`). Checked at start, not at config load; see [CONFIGURATION.md](CONFIGURATION.md#egress) |
 
 **The alert sinks are *not* on this table and are not covered by `[egress]`.** The webhook and SMTP
-*alert* sinks carry no message body, though some alerts carry free-text detail (the [PHI.md logging inventory](PHI.md#logging-inventory-1611--1623) rows for the `[alerts]` webhook and SMTP transports, rows 10 and 11), and keep their **own** host allow-lists —
+*alert* sinks carry no message body field, though some alerts carry free-text detail (the
+[PHI.md logging inventory](PHI.md#logging-inventory-1611--1623) rows for the `[alerts]` webhook
+and SMTP transports, rows 10 and 11), and keep their **own** host allow-lists —
 `[alerts].webhook_allowed_hosts` and `[alerts].smtp_allowed_hosts`. Populate those separately; an
-`[egress].allowed_http` entry does nothing for a webhook alert.
+`[egress].allowed_http` entry does nothing for a webhook alert. *(Note 2026-11-10, BACKLOG #5021:
+this exemption was stated beside the premise that the alert sinks carry no PHI. That premise is
+false in the shipped code, and the exemption is to be re-checked against the off-box alert key
+allowlist once it is built, by the owner ruling recorded in [ADR
+0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s
+note of 2026-11-10.)*
 
 **What `[egress]` does and does not bound — read this before you book it as the exfiltration control.**
 The check validates **declared connector settings** at config load / reload / start. It bounds the
@@ -1166,7 +1173,7 @@ on the shipped posture.
 |---|---|
 | **SQL Server store hop** | `[store].encrypt` defaults **true** and `[store].trust_server_certificate` defaults **false** — and SQL Server is a documented production store. The PostgreSQL store hop *is* gated; its SQL Server twin is not |
 | **`dialect='sqlserver'` DATABASE destination** | `Encrypt=yes` / `TrustServerCertificate=false` defaults |
-| **`[alerts]` SMTP sink** and the **per-user security-event notifier**, **with no `email_username`** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. With no login the hop sends no credential, so it takes no revocation guard by the owner ruling of 2026-10-27, recorded in ADR 0173. That decline does not rest on what the body holds. An alert body is not PHI-free today: the [PHI.md logging inventory](PHI.md#logging-inventory-1611--1623) row for the `[alerts]` SMTP transport (row 11) says what crosses, and the row for the security-event notifier (row 12) what a notice carries. The owner ruled on 2026-11-09, in the session of Manager 30df8519, that the decline stands and that the fix for the body is one key allowlist every off-box alert passes through, which is not built yet. With a login it is gated (above). Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead, for a hop with no login. Beside `email_username` either deviation is refused at settings load, with no escape (vault BACKLOG #3533) |
+| **`[alerts]` SMTP sink** and the **per-user security-event notifier**, **with no `email_username`** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. With no login the hop sends no credential, so it takes no revocation guard by the owner ruling of 2026-10-27, recorded in ADR 0173. That decline does not rest on what the body holds, and an alert body is not PHI-free in the shipped code: [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s note of 2026-11-10 says what crosses and records the owner ruling that the decline stands. With a login it is gated (above). Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead, for a hop with no login. Beside `email_username` either deviation is refused at settings load, with no escape (vault BACKLOG #3533) |
 
 For every hop in that table, revocation is exactly what the ASVS row above calls *delegated* — **your
 PKI's or your egress proxy's job, written into your runbook**. The engine will not make you say so, and

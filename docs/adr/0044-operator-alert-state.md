@@ -8,7 +8,9 @@
   alert state must stay a **side observer**, never gate a disposition) ·
   [ADR 0027](0027-per-connection-retention.md) (the additive-table-across-three-backends + single-pass-audit
   discipline this matches; alert-state pruning rides the **same** purge pass) ·
-  [CLAUDE.md](../../CLAUDE.md) §2 (engine concurrency = asyncio; one-way dependency; no PHI in logs/alerts),
+  [CLAUDE.md](../../CLAUDE.md) §2 (engine concurrency = asyncio; one-way dependency; no PHI in
+  logs/alerts; *note 2026-11-10, BACKLOG #5021: alerts are not PHI-free in the shipped code, as the
+  note under Context says*),
   §9 ([PHI.md](../PHI.md) — metadata-only) ·
   [`pipeline/alerts.py`](../../messagefoundry/pipeline/alerts.py) (`AlertSink` Protocol + `LoggingAlertSink`) ·
   [`pipeline/alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py) (`NotifierAlertSink._emit`, the
@@ -63,7 +65,10 @@ Two [CLAUDE.md](../../CLAUDE.md) invariants bound the design and **must not** be
   longer says this, and the quoted claim was false: some events carry free-text detail. The
   [PHI.md logging inventory](../PHI.md#logging-inventory-1611--1623) rows for the `[alerts]`
   transports say what an event carries, and PHI.md's `alert_instance.reason` at-rest row grades the
-  stored reason **Possibly** PHI at PL-2, so that column is not plain metadata.)*
+  stored reason **Possibly** PHI at PL-2, so that column is not plain metadata. The clause *"like
+  `connection_event`, it sits in the existing metadata tier"* is false too: PHI.md grades
+  `connection_event.reason` the same way, **Possibly** PHI at PL-2 and ciphered when a key is
+  set, so neither reason column sits in a metadata tier.)*
 
 ## Decision
 

@@ -1421,8 +1421,9 @@ where the engine sends, with at least `allowed_mllp` (host / host:port) and `all
 refused reload, logged), so a fat-fingered or hostile destination can't exfiltrate PHI.
 [CONFIGURATION.md](CONFIGURATION.md#egress) states what an empty list does, the audited opt-out, and
 `serve`'s startup gate. The webhook/SMTP alert sinks keep their own `[alerts]` host
-allowlists, which admit every host when unset or empty. They send no message body, but some alerts carry free-text detail; the
-[logging inventory](#logging-inventory-1611--1623) rows for those two transports (rows 10 and 11)
+allowlists; the [logging inventory](#logging-inventory-1611--1623) row for the webhook (row 10)
+says which values admit every host, and row 11 that the SMTP list reads the same way. They send
+no message-body field, but some alerts carry free-text detail; rows 10 and 11 of that inventory
 say what.
 
 ---

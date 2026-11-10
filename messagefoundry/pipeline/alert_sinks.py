@@ -10,7 +10,7 @@ a bounded in-memory queue, and a **background task** drains the queue and perfor
 the other transports still run — alerting is best-effort and never breaks delivery.
 
 Transports use only the **standard library** (``urllib.request`` / ``smtplib``), so wiring real
-notifications adds no dependency. Payloads never carry a message body, but they are **not**
+notifications adds no dependency. Payloads have no message-body field, but they are **not**
 PHI-free: some events still send free-text ``detail``/``reason`` off the box. docs/PHI.md row
 10 names at least some of them, and is not a complete list.
 
@@ -570,11 +570,9 @@ def _refuse_alert_smtp_revocation(
     guards that hop, with ``[tls].crl_file`` or the ``[alerts]`` attestation pair as the levers.
 
     **A hop with no login takes no guard**, by the same ruling, recorded in ADR 0173: it carries no
-    credential. The decline does not rest on what the body holds. An alert body is not PHI-free
-    today: the docs/PHI.md logging-inventory row for the ``[alerts]`` SMTP transport (row 11) says
-    what crosses, and the row for the security-event notifier (row 12) what a notice carries. The
-    owner ruled on 2026-11-09, in the session of Manager 30df8519, that this decline stands and that the fix for the body is one key allowlist every off-box alert passes
-    through, which is not built yet. A hop with ``use_tls`` or ``tls_verify`` off
+    credential. The decline does not rest on what the body holds, and an alert body is not PHI-free
+    in the shipped code: ADR 0173's note of 2026-11-10 says what crosses and records the owner
+    ruling that this decline stands. A hop with ``use_tls`` or ``tls_verify`` off
     builds no verifying context, and a login over one is refused at load and again at each send,
     so there is nothing for this guard to judge.
 

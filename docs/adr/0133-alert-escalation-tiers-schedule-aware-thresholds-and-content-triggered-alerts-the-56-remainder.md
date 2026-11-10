@@ -74,7 +74,9 @@
   [ADR 0001](0001-staged-pipeline-architecture.md) (the at-least-once / **routers-and-transforms-must-be-pure**
   invariant the content-trigger carve-out below claimed to reconcile; it did not, and D3 is retracted) · [ADR 0095](0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)
   (the `Schedule` / `ActiveWindow` model #147 built, **reused** verbatim for schedule-aware rules) ·
-  [CLAUDE.md](../../CLAUDE.md) §2/§9 (PHI-free alerts, no new PHI tier) ·
+  [CLAUDE.md](../../CLAUDE.md) §2/§9 (PHI-free alerts, no new PHI tier; *note 2026-11-10,
+  BACKLOG #5021: alerts are not PHI-free in the shipped code, as the note under the invariants
+  below says*) ·
   [`pipeline/alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py) ·
   [`config/settings.py`](../../messagefoundry/config/settings.py) ·
   [`store/store.py`](../../messagefoundry/store/store.py) (+ `sqlserver.py` / `postgres.py`).

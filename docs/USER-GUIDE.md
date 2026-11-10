@@ -661,7 +661,15 @@ transports = ["webhook"]
 
 The SMTP password is a secret — supply it via `MEFOR_ALERTS_EMAIL_PASSWORD`, never the file. Per-event severity, transport routing, thresholds, suppression, and cooldown are tuned with ordered `[[alerts.rules]]` tables ([ADR 0014](adr/0014-alerting-rules-engine.md)); an event matching no rule notifies every configured transport at `warning`.
 
-**Important:** the *notifications* are **fire-and-forward** — once webhook/email delivery is attempted there is no send log, so for the notification itself you rely on your webhook/email target. The engine does, however, keep **alert state**: an alert instance per `(event type, connection)` that you can query with `GET /alerts/active` and act on with `POST /alerts/{id}/ack` · `/resolve` · `/suspend` · `/resume`, which is what the console's **Alerts** page drives ([ADR 0044](adr/0044-operator-alert-state.md)). `GET /alerts/rules` remains a read-only view of the *loaded* transport config and rule set (secrets and recipients omitted). Instances and payloads never carry a message body, but they are not PHI-free: an alert's free-text detail or reason can echo transport text. The [PHI.md logging inventory](PHI.md#logging-inventory-1611--1623) says what alert text can leave the box: at least its rows for the `[alerts]` webhook and SMTP transports (rows 10 and 11), and the `LoggingAlertSink` fallback (row 13), whose lines go to the general log and leave the box only through a configured log forwarder. Its `alert_instance` row (row 8) says what an instance holds.
+**Important:** the *notifications* are **fire-and-forward** — once webhook/email delivery is attempted there is no send log, so for the notification itself you rely on your webhook/email target. The engine does, however, keep **alert state**: an alert instance per `(event type, connection)` that you can query with `GET /alerts/active` and act on with `POST /alerts/{id}/ack` · `/resolve` · `/suspend` · `/resume`, which is what the console's **Alerts** page drives ([ADR 0044](adr/0044-operator-alert-state.md)). `GET /alerts/rules` remains a read-only view of the *loaded* transport config and rule set (secrets and recipients omitted).
+Instances and payloads have no message-body field, but they are not PHI-free: an alert's
+free-text detail or reason can echo transport text, such as a partner's reply, even after the
+scrub it passes. The [PHI.md logging
+inventory](PHI.md#logging-inventory-1611--1623) says what alert text can leave the box: at least
+its rows for the `[alerts]` webhook and SMTP transports (rows 10 and 11), and the
+`LoggingAlertSink` fallback (row 13), whose lines fold into the general application log (row 1)
+and so go wherever that log goes; at least rows 1 and 14 name those routes. Its `alert_instance`
+row (row 8) says what an instance holds.
 
 ### Common problems
 

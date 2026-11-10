@@ -131,7 +131,14 @@ A first-class field on `InboundConnection` ([wiring.py:2483](../../messagefoundr
 
 #### §7.6 Optional alerting (reuse the AlertSink, no new transport)
 
-A burst of `peer_not_allowlisted` / `framing_error` is operationally interesting (a misconfigured partner, a probe). The `AlertSink` Protocol ([alerts.py:27-56](../../messagefoundry/pipeline/alerts.py)) already carries the right non-PHI shape (connection name + metadata, never a body). §7 **may** add a `connection_error(name, *, kind, detail)` emit method to `AlertSink`/`LoggingAlertSink`/`NotifierAlertSink`, fired from `_capture_connection_event` alongside the store write, keyed `connection_error:<connection>` so `NotifierAlertSink._emit`'s realert throttle ([alert_sinks.py:406-427](../../messagefoundry/pipeline/alert_sinks.py)) collapses a flood to one notification per cooldown. The payload carries only `connection`/`kind`/scrubbed `detail` — the AlertSink's existing "no PHI, connection + shape only" contract holds unchanged. This is **optional and gated by the same `capture_connection_errors` flag**; with it off, no event and no alert. (Whether v1 wires the alert or only the store row is the one genuinely owner-facing knob — see *To resolve*.)
+A burst of `peer_not_allowlisted` / `framing_error` is operationally interesting (a misconfigured partner, a probe). The `AlertSink` Protocol ([alerts.py:27-56](../../messagefoundry/pipeline/alerts.py)) already carries the right non-PHI shape (connection name + metadata, never a body). §7 **may** add a `connection_error(name, *, kind, detail)` emit method to `AlertSink`/`LoggingAlertSink`/`NotifierAlertSink`, fired from `_capture_connection_event` alongside the store write, keyed `connection_error:<connection>` so `NotifierAlertSink._emit`'s realert throttle ([alert_sinks.py:406-427](../../messagefoundry/pipeline/alert_sinks.py)) collapses a flood to one notification per cooldown. The payload carries only `connection`/`kind`/scrubbed `detail` — the AlertSink's existing "no PHI, connection + shape only" contract holds unchanged.
+*(Note 2026-11-10, BACKLOG #5021: that contract was false, and so is the sentence before it for
+`connection_error`. In the shipped code some alerts carry free-text detail off the box, and
+`connection_error` no longer sends its `detail`: it sends the exception class in its place and keeps
+the detail as the stored alert reason only. The [PHI.md logging
+inventory](../PHI.md#logging-inventory-1611--1623) rows for the `[alerts]` transports say what
+crosses.)*
+This is **optional and gated by the same `capture_connection_errors` flag**; with it off, no event and no alert. (Whether v1 wires the alert or only the store row is the one genuinely owner-facing knob — see *To resolve*.)
 
 ## Consequences
 
