@@ -421,7 +421,8 @@ target, no `pickle` import left to mis-suppress:
   > BACKLOG #3135 (ledger ruling R2).
   >
   > - **Record d20261110T144543956-d8f55a:** a stray frame that arrives after a call's check before
-  >   its request and ahead of its answer dead-letters that message. Record
+  >   its request and ahead of its answer fails that message's call, which the
+  >   `[delivery] internal_error` policy then handles. Record
   >   d20261110T193056983-46d125: asked whether acceptance d20261110T144543956-d8f55a covers every
   >   `[delivery] internal_error` policy, the owner answered *"Yes, any policy"*, so the case is
   >   accepted under `internal_error=stop` too.

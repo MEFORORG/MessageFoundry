@@ -1362,7 +1362,8 @@ encode, or one over the frame cap, dead-letters only that message and keeps the 
 of it was written; a worker answer the codec rejects still kills the worker. A stray frame found
 waiting **before** a request kills the worker and retries the message once on a fresh one (owner
 ruling 2026-11-09); [ADR 0187](adr/0187-bound-the-subprocess-sandbox-worker-count-a-shared-pool-or-router-phase-only-isolation.md)
-*Amendment B* lists at least the cases in which that message still dead-letters. A forged answer
+*Amendment B* lists at least the cases in which that message's call still fails, which the
+`[delivery] internal_error` policy then handles. A forged answer
 that carries the request's id can instead be taken as the message's result; see the grandchild
 paragraph below.
 Each worker kill writes one `WARNING` naming the inbound, the phase and a cause token, and no message

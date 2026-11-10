@@ -1289,11 +1289,11 @@ class SandboxSession:
         alive. Letting such a frame sit in the queue is the whole exploit: the next dispatch would
         take it as its own answer. Drop the worker, and :meth:`_kill` reaps that grandchild along
         with the rest of the worker's tree, so it cannot keep writing to the pipe. A frame found
-        **after** an answer dead-letters the message in hand, whose answer it makes untrustworthy.
+        **after** an answer fails the call of the message in hand, whose answer it makes untrustworthy.
         A frame found **before** a request is a different case since the owner's ruling of
         2026-11-09 (vault BACKLOG #3135 step 4): that message never reached the worker, so
         :meth:`_live_worker` retries it once on a fresh worker rather than raise; ADR 0187
-        *Amendment B* lists at least the cases in which it still dead-letters. The frame never answers
+        *Amendment B* lists at least the cases in which its call still fails. The frame never answers
         anything: the fresh worker has a fresh queue (see :meth:`_spawn`).
 
         **The justification is the protocol violation, NOT a claim that fd 1 is unreachable.** An
@@ -1372,20 +1372,20 @@ class SandboxSession:
         about the *new* child. The check runs on every worker, a fresh one included, which can have
         written a stray frame or exited between its boot reply and this check. A leftover EOF
         reaps it (see :meth:`_reject_unsolicited`), so spawn once more rather
-        than dead-letter this message on a peer that merely died.
+        than fail this message's call on a peer that merely died.
 
         A leftover FRAME kills the worker, and this message, which never reached it, is retried
         once on a fresh worker (owner ruling 2026-11-09, vault BACKLOG #3135 step 4). Every fresh
         worker is checked the same way, the one spawned after a leftover EOF included, and a second
         stray frame raises, so the retry happens at most once per dispatch. The spawns are bounded
         too: a worker that keeps exiting, or closing its pipe, before its request fails the call.
-        ADR 0187 *Amendment B* states when such a message dead-letters.
+        ADR 0187 *Amendment B* states when such a message's call fails.
 
         A worker spawned here and found exited by this check is recorded as
         :attr:`KillCause.EXITED_AFTER_BOOT`, whether or not its EOF has reached the queue: the
         check asks the process too. It cannot see an exit that comes after it, so a worker that
         exits as its request is written is recorded under another cause, such as
-        :attr:`KillCause.REQUEST_WRITE` or :attr:`KillCause.CRASH`, and that message dead-letters.
+        :attr:`KillCause.REQUEST_WRITE` or :attr:`KillCause.CRASH`, and that message's call fails.
 
         Liveness is read with :func:`_has_exited`, which leaves a dead worker unreaped so the
         respawn's reap takes the ordinary group kill (see :func:`_has_exited`)."""
@@ -1734,8 +1734,8 @@ class SandboxSession:
         isolation fault (crash / timeout / denial / codec rejection) raises :class:`SandboxError`;
         a plain, still-alive worker survives a *denied* call so the next message reuses it. The one
         thing it does **not** survive is writing a frame nobody asked for
-        (see :meth:`_reject_unsolicited`) — that is a lost worker, and a dead-lettered message when
-        the frame follows its answer; one waiting before the request is retried once instead."""
+        (see :meth:`_reject_unsolicited`) — that is a lost worker, and a failed call when the
+        frame follows its answer; one waiting before the request is retried once instead."""
         with self._lock:
             if self._closed:
                 raise SandboxSessionClosed("sandbox session is closed")
