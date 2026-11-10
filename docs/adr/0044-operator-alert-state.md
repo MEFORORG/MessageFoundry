@@ -72,7 +72,8 @@ Two [CLAUDE.md](../../CLAUDE.md) invariants bound the design and **must not** be
   set, so neither reason column sits in a metadata tier. Where this ADR calls `connection_event`
   or `alert_instance` metadata-only, that does not hold for its `reason` column. The general
   application log is not PHI-free either: PHI.md's logging inventory row 1 says it can contain
-  PHI. When the PHI-free alert claim becomes true again is in
+  PHI. When the PHI-free alert claim becomes true again for the off-box alert copies, and which
+  copies stay outside that, is in
   [ADR 0173](0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s
   note of 2026-11-10.)*
 

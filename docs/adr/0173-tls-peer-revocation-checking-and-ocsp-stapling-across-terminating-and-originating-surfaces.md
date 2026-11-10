@@ -1136,7 +1136,13 @@ one key allowlist. That allowlist is not built in the shipped code; it is the of
 allowlist row, unallocated. The same ruling holds that the PHI-free alert claims in
 [ADR 0133](0133-alert-escalation-tiers-schedule-aware-thresholds-and-content-triggered-alerts-the-56-remainder.md)
 and [ADR 0044](0044-operator-alert-state.md), false in the shipped code, become true again once
-that allowlist is built. Separately, a Manager decision (class B, Manager 30df8519, decision
+that allowlist is built. That can hold only for what the allowlist covers, the off-box alert
+copies. The copies outside it stay as they are: at least the `LoggingAlertSink` line and the
+stored `alert_instance.reason` and `connection_event.reason`. The PHI.md logging inventory rows 7,
+8 and 13 and the [data-at-rest inventory](../PHI.md#2-where-phi-lives--data-at-rest-inventory)
+rows for those two columns say what each holds and where it goes. *(Corrected 2026-11-10: this
+said those claims become true again once the allowlist is built, with no limit; an off-box key
+allowlist cannot make the other copies PHI-free.)* Separately, a Manager decision (class B, Manager 30df8519, decision
 record `d20261110T082816880-1913c6`), not the owner ruling, names two exemptions stated beside,
 or justified by, a PHI-free alert body, to be re-checked against that allowlist once it is built:
 [ADR 0029](0029-email-smtp-destination.md)'s decline to gate the sender domain of the `[alerts]`
