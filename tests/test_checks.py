@@ -796,7 +796,9 @@ def test_expect_reason_joined_without_a_space_is_not_echoed(tmp_path: Path) -> N
 
 def test_invalid_expect_disposition_text_survives_redaction(tmp_path: Path) -> None:
     # BACKLOG #5107: a comma-joined run of upper-case names ("ERROR, FILTERED") reads to the PHI
-    # redaction as a family-comma-given name, so the advice would reach the operator as [redacted].
+    # redaction as a family-comma-given name. check appends this advice to its errors raw and
+    # prints it unredacted today, so this pins that the text stays readable on any path that
+    # redacts it, rather than turning to [redacted] there.
     from messagefoundry.redaction import redact, safe_text
 
     fixture = tmp_path / "m.hl7"
