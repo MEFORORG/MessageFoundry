@@ -322,15 +322,12 @@ def extract_obx_document(message: Message, *, occurrence: int = 1) -> bytes:
     :class:`BinaryCarriageError` too when ``Message._encoding_chars`` cannot read the message's
     delimiters, such as an MSH-2 shorter than four characters or no MSH at all (BACKLOG #2873)."""
     # occurrence < 1 is left to Message.field, which refuses it as the caller's error before it
-    # reads any delimiter. A SegmentGroup from Message.groups() reads fields too and has no
-    # _encoding_chars of its own, so the check is skipped for it and its reads behave as before.
-    if (
-        occurrence >= 1
-        and hasattr(message, "_encoding_chars")
-        and not _delimiters_readable(message)
-    ):
+    # reads any delimiter. A SegmentGroup from Message.groups() reads fields too, through its
+    # parent Message, and has no _encoding_chars of its own, so its parent is the one checked.
+    holder = message if hasattr(message, "_encoding_chars") else getattr(message, "_m", None)
+    if occurrence >= 1 and holder is not None and not _delimiters_readable(holder):
         raise _unreadable_delimiters_refusal(
-            message, "no OBX field can be read; refusing the extract"
+            holder, "no OBX field can be read; refusing the extract"
         )
     obx2 = message.field("OBX-2", occurrence=occurrence)
     if (obx2 or "").upper() != "ED":

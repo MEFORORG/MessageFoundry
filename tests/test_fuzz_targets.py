@@ -644,7 +644,7 @@ def test_the_short_msh2_reproducer_is_refused_by_name_through_the_raw_helpers() 
     with pytest.raises(BinaryCarriageError) as caught:
         extract_obx_document(message)
     assert caught.value.__cause__ is None and caught.value.__context__ is None
-    assert "^~" not in str(caught.value)
+    assert "MSH-1=" not in str(caught.value) and "MSH-2=" not in str(caught.value)
     assert strip_documents(text, pruned_at=0.0) == (text, 0, 0)
     with pytest.raises(UnreadableDelimitersError):
         list(iter_obx_documents(message, received=text))
@@ -666,7 +666,7 @@ def test_the_batch_header_reproducer_is_refused_by_name_through_the_raw_helpers(
     with pytest.raises(BinaryCarriageError, match="^the body has no MSH,") as caught:
         extract_obx_document(message)
     assert caught.value.__cause__ is None and caught.value.__context__ is None
-    assert "^~" not in str(caught.value)
+    assert "MSH-1=" not in str(caught.value) and "MSH-2=" not in str(caught.value)
 
 
 def test_extract_obx_document_lets_a_valueerror_subclass_from_the_delimiter_read_escape(

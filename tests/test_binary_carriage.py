@@ -203,6 +203,17 @@ def test_extract_still_reads_a_segment_group() -> None:
     assert docs == [b"AAA", b"BBB"]
 
 
+def test_extract_refuses_a_segment_group_of_an_unreadable_message() -> None:
+    """A group reads through its parent, so the parent's unreadable MSH-2 is refused by name."""
+    msg = Message.parse(
+        "MSH|^~|A|B|C|D|20260101||ORU^R01|1|P|2.5\rOBR|1\rOBX|1|ED|X||^Application^pdf^Base64^QUFB\r"
+    )
+    (group,) = msg.groups("OBR")
+    with pytest.raises(BinaryCarriageError, match="^its first MSH's MSH-2 is shorter") as caught:
+        extract_obx_document(group)  # type: ignore[arg-type]
+    assert "MSH-1=" not in str(caught.value) and "MSH-2=" not in str(caught.value)
+
+
 @pytest.mark.parametrize("op", sorted(_DELIMITER_GUARDED))
 def test_obx_helpers_name_a_handler_written_msh_1_as_the_cause(op: str) -> None:
     """BACKLOG #2873: a Handler that writes a two-character MSH-1 gets the MSH-1 cause named."""
