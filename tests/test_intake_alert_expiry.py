@@ -141,47 +141,119 @@ async def test_a_raise_between_the_read_and_the_resolve_keeps_the_row_open(
         await store.close()
 
 
-async def test_the_sweep_runs_with_both_bounds_off_only_when_a_sink_is_wired(
-    tmp_path: Path,
-) -> None:
+async def test_the_sweep_runs_on_its_own_task_only_when_a_sink_is_wired(tmp_path: Path) -> None:
     """A stale subject can outlive the config that raised it, so the sweep task starts whenever a
-    sink is wired. With no sink there is nothing to sweep for, and no task."""
+    sink is wired, bounds on or off, and apart from the measuring task, so a slow sweep cannot
+    delay a measurement. With no sink there is nothing to sweep for, and no task."""
     store = await MessageStore.open(tmp_path / "s.db")
     try:
-        with_sink = IntakeBoundMonitor(
-            cast(Store, store),
-            IntakeGate(),
-            alert_sink=cast(AlertSink, NotifierAlertSink([], store=store)),
+        sink = cast(AlertSink, NotifierAlertSink([], store=store))
+        off = IntakeBoundMonitor(cast(Store, store), IntakeGate(), alert_sink=sink)
+        on = IntakeBoundMonitor(
+            cast(Store, store), IntakeGate(), max_staged_depth=10, alert_sink=sink
         )
         without = IntakeBoundMonitor(cast(Store, store), IntakeGate())
-        assert not with_sink.enabled and not without.enabled
-        with_sink.start()
-        without.start()
+        assert not off.enabled and on.enabled and not without.enabled
+        for monitor in (off, on, without):
+            monitor.start()
         try:
-            assert with_sink._task is not None
-            assert without._task is None
+            assert off._task is None and off._sweep_task is not None
+            assert on._task is not None and on._sweep_task is not None
+            assert on._task is not on._sweep_task
+            assert without._task is None and without._sweep_task is None
         finally:
-            await with_sink.stop()
-            await without.stop()
+            for monitor in (off, on, without):
+                await monitor.stop()
+        assert off._sweep_task is None and on._task is None and on._sweep_task is None
     finally:
         await store.close()
 
 
-async def test_a_failed_sweep_changes_nothing_and_warns_once(
+async def test_a_failed_read_changes_nothing_and_warns_once_per_streak(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
     store = await MessageStore.open(tmp_path / "s.db")
     try:
+        stale = intake_alert_subject(DEPTH_REASON, "node:gone")
+        await _raise_pause(store, stale)
         monitor = _sweeper(store, "node:a")
+        assert await monitor.sweep_once() == 0
+        real = store.open_alert_generations
 
         async def broken(**_kw: object) -> list[object]:
             raise RuntimeError("store unavailable")
 
         monkeypatch.setattr(store, "open_alert_generations", broken)
+        clock[0] += STALE_SECONDS
         with caplog.at_level("WARNING", logger="messagefoundry.pipeline.intake_bound"):
             assert await monitor.sweep_once() == 0
             assert await monitor.sweep_once() == 0
-        assert sum("sweep failed" in r.getMessage() for r in caplog.records) == 1
+            monkeypatch.setattr(store, "open_alert_generations", real)
+            assert await _is_open(store, stale), "a failed read resolves nothing"
+            assert await monitor.sweep_once() == 1, "the watch survived the failed reads"
+            monkeypatch.setattr(store, "open_alert_generations", broken)
+            assert await monitor.sweep_once() == 0
+        failures = [r for r in caplog.records if "sweep: the read failed" in r.getMessage()]
+        assert len(failures) == 2, "one WARNING per streak, and a good sweep ends the streak"
+    finally:
+        await store.close()
+
+
+async def test_a_failed_resolve_does_not_stop_the_rest_of_the_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        first = intake_alert_subject(DEPTH_REASON, "node:gone-1")
+        second = intake_alert_subject(DEPTH_REASON, "node:gone-2")
+        await _raise_pause(store, first)
+        await _raise_pause(store, second)
+        [stuck, _other] = await store.open_alert_generations(event_type="intake_paused")
+        monitor = _sweeper(store, "node:a")
+        assert await monitor.sweep_once() == 0
+        real = store.resolve_alert_generation
+
+        async def flaky(*, alert_id: int, through_count: int, now: float | None = None) -> int:
+            if alert_id == stuck.id:
+                raise RuntimeError("writer busy")
+            return await real(alert_id=alert_id, through_count=through_count, now=now)
+
+        monkeypatch.setattr(store, "resolve_alert_generation", flaky)
+        clock[0] += STALE_SECONDS
+        assert await monitor.sweep_once() == 1, "the second subject still expires"
+        assert await _is_open(store, first) and not await _is_open(store, second)
+        monkeypatch.setattr(store, "resolve_alert_generation", real)
+        assert await monitor.sweep_once() == 1, "the failed one stayed watched and expires next"
+        assert not await _is_open(store, first)
+    finally:
+        await store.close()
+
+
+async def test_an_acknowledged_stale_subject_expires_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An acknowledged instance is still live, so it expires like an open one, as any other
+    auto-resolve closes it."""
+    from tests._store_audit import ALERT_AUDIT
+
+    clock = [1000.0]
+    monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        stale = intake_alert_subject(DEPTH_REASON, "node:gone")
+        await _raise_pause(store, stale)
+        [gen] = await store.open_alert_generations(event_type="intake_paused")
+        assert await store.ack_alert_instance(gen.id, actor="op", audit=ALERT_AUDIT)
+        monitor = _sweeper(store, "node:a")
+        assert await monitor.sweep_once() == 0
+        clock[0] += STALE_SECONDS
+        assert await monitor.sweep_once() == 1
+        got = await store.get_alert_instance(gen.id, allowed_channels=None)
+        assert got is not None and got.status == "resolved"
     finally:
         await store.close()
 
