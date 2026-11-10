@@ -18,6 +18,7 @@ import re
 import struct
 import threading
 import time
+import tracemalloc
 import warnings
 import zipfile
 import zlib
@@ -945,31 +946,6 @@ def _central_directory_offset_too_large() -> bytes:
     return bytes(blob)
 
 
-def _second_member_codec_corrupted(compress_type: int) -> bytes:
-    # A compressed member whose first stream bytes are garbage. Neither lzma.LZMAError nor
-    # compression.zstd.ZstdError is an OSError.
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("ok.txt", b"first")
-        zf.writestr(zipfile.ZipInfo(_PHI_NAME), b"second" * 50, compress_type=compress_type)
-    blob = bytearray(buf.getvalue())
-    local = blob.index(b"PK\x03\x04", blob.index(b"PK\x03\x04") + 1)
-    name_len, extra_len = (
-        int.from_bytes(blob[local + 26 : local + 28], "little"),
-        int.from_bytes(blob[local + 28 : local + 30], "little"),
-    )
-    data_at = local + 30 + name_len + extra_len
-    # LZMA: the properties after zipfile's 4-byte version/size prefix. Zstandard: the frame magic.
-    start = 4 if compress_type == zipfile.ZIP_LZMA else 0
-    blob[data_at + start : data_at + start + 5] = b"\xff" * 5
-    return bytes(blob)
-
-
-def _second_member_zstd_corrupted() -> bytes:
-    pytest.importorskip("compression.zstd", reason="this Python build has no Zstandard support")
-    return _second_member_codec_corrupted(zipfile.ZIP_ZSTANDARD)
-
-
 _UNSUPPORTED = "member 2 uses a zip feature this reader does not support"
 
 
@@ -986,14 +962,6 @@ _UNSUPPORTED = "member 2 uses a zip feature this reader does not support"
         ),
         pytest.param(
             _second_member_body_corrupted, r"member 2 is corrupt.*\(BadZipFile\)", id="bad-crc"
-        ),
-        pytest.param(
-            lambda: _second_member_codec_corrupted(zipfile.ZIP_LZMA),
-            r"member 2 is corrupt.*\(LZMAError\)",
-            id="lzma-corrupt",
-        ),
-        pytest.param(
-            _second_member_zstd_corrupted, r"member 2 is corrupt.*\(ZstdError\)", id="zstd-corrupt"
         ),
         pytest.param(
             _second_member_name_not_utf8,
@@ -1184,6 +1152,109 @@ def test_zip_recursion_error_is_labelled_as_recursion(
     assert "does not support" not in str(exc.value)
     assert exc.value.__cause__ is None
     assert exc.value.__context__ is None
+
+
+# --- #5535: only STORED and DEFLATED members are read --------------------------------------------
+
+
+def _has_zstd() -> bool:
+    try:
+        from compression import zstd  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+# zipfile inflates a BZIP2, LZMA or Zstandard chunk in full before a bounded read returns, so these
+# three are refused before any member opens. Zstandard needs a build with compression.zstd.
+_UNBOUNDED_METHODS = [
+    pytest.param(zipfile.ZIP_BZIP2, id="bzip2"),
+    pytest.param(zipfile.ZIP_LZMA, id="lzma"),
+    pytest.param(
+        zipfile.ZIP_ZSTANDARD,
+        id="zstandard",
+        marks=pytest.mark.skipif(
+            not _has_zstd(), reason="this Python build has no Zstandard support"
+        ),
+    ),
+]
+
+
+def _second_member_with_method(method: int, body: bytes) -> bytes:
+    """A two-member archive: a DEFLATED first member, then ``body`` under ``method``, named with
+    the patient-shaped name so a refusal that echoed it would show."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("ok.txt", b"first")
+        info = zipfile.ZipInfo(_PHI_NAME, date_time=(1980, 1, 1, 0, 0, 0))
+        zf.writestr(info, body, compress_type=method)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("ceiling", [1024 * 1024, None], ids=["ceiling", "no-ceiling"])
+@pytest.mark.parametrize("method", _UNBOUNDED_METHODS)
+def test_zip_member_with_an_unbounded_method_is_refused_before_any_member_opens(
+    monkeypatch: pytest.MonkeyPatch, method: int, ceiling: int | None
+) -> None:  # #5535
+    archive = _second_member_with_method(method, b"second" * 50)
+    opened: list[str] = []
+    real_open = zipfile.ZipFile.open
+
+    def _recording_open(self: zipfile.ZipFile, name: Any, *args: Any, **kwargs: Any) -> Any:
+        opened.append(getattr(name, "filename", name))
+        return real_open(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", _recording_open)
+    with pytest.raises(
+        CompressionError,
+        match=(
+            rf"^zip archive {_UNSUPPORTED} "
+            rf"\(compression method {method}; only stored and deflated members are read\)$"
+        ),
+    ) as exc:
+        zip_decompress(archive, max_output_bytes=ceiling)
+    # Refused before the trial pass, so not even the admissible first member was opened.
+    assert opened == []
+    _assert_names_no_member(exc)
+
+
+@pytest.mark.parametrize("method", _UNBOUNDED_METHODS)
+def test_zip_bomb_in_an_unbounded_method_never_expands_in_memory(method: int) -> None:  # #5535
+    # 16 MiB of one byte packs into a few kilobytes at most. On a reader that opened the member,
+    # the first read expands all of it before the 1 MiB ceiling is checked. ADR 0123's #5535
+    # amendment records a 350-byte BZIP2 archive of a 300 MiB member peaking at over 600 MB.
+    archive = _second_member_with_method(method, b"A" * (16 * 1024 * 1024))
+    assert len(archive) < 64 * 1024
+    was_tracing = tracemalloc.is_tracing()
+    if not was_tracing:
+        tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        # Any refusal is caught here, so the peak below is read whichever check fired.
+        with pytest.raises(CompressionError) as exc:
+            zip_decompress(archive, max_output_bytes=1024 * 1024)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        if not was_tracing:
+            tracemalloc.stop()
+    assert peak < 4 * 1024 * 1024
+    assert "only stored and deflated members are read" in str(exc.value)
+
+
+@pytest.mark.parametrize("ceiling", [1024 * 1024, None], ids=["ceiling", "no-ceiling"])
+@pytest.mark.parametrize(
+    "method", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED], ids=["stored", "deflated"]
+)
+def test_zip_stored_and_deflated_members_are_still_read(
+    method: int, ceiling: int | None
+) -> None:  # #5535
+    # Control: the refusal above is the method's, not the helper's, and the two bounded methods
+    # still read under either ceiling setting.
+    archive = _second_member_with_method(method, b"second" * 50)
+    assert zip_decompress(archive, max_output_bytes=ceiling) == {
+        "ok.txt": b"first",
+        _PHI_NAME: b"second" * 50,
+    }
 
 
 # --- #1977: one bounded-inflate primitive, two trailing rules ------------------------------------
