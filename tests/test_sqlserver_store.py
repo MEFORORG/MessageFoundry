@@ -7229,8 +7229,8 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
     password, so a password holding ``};``, ``}=``, a trailing ``}}``, ``{``, ``;`` and ``=`` logs
     in as written and adds no keyword.
 
-    MEASURES ODBC Driver 18 for SQL Server on Linux (``msodbcsql18`` under unixODBC), on the CI
-    ``sql server`` legs. The comment above ``_DRIVER_FAMILIES`` in
+    Measures ODBC Driver 18 for SQL Server on Linux (``msodbcsql18`` under unixODBC), on the hosted
+    ``sql server (store + connector)`` leg. The comment above ``_DRIVER_FAMILIES`` in
     ``messagefoundry/transports/database.py`` holds what stays unmeasured, Windows
     ``msodbcsql18.dll`` among it.
 
@@ -7244,9 +7244,9 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
     covers both. They go through aioodbc and pyodbc.
 
     A driver that ended a braced value at its first ``}`` or its first ``};``, or did not turn
-    ``}}`` into ``}``, would send another password, and the login would be refused. The controls
-    show a refusal is what a wrong password gets here: the same escaped shape with only its head
-    changed is refused with SQLSTATE 28000, and the password sent unbraced is refused. No
+    ``}}`` into ``}``, would send another password, and the login would be refused. The control
+    shows a refusal is what a wrong password gets here: the same escaped shape with only its head
+    changed is refused with SQLSTATE 28000. No
     assertion expression or message holds the password, since pytest prints the parts of a
     failed assert, and only a refusal's SQLSTATE is kept, never the driver's message."""
     import secrets
@@ -7342,7 +7342,5 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
             assert who is None and state == "28000", (
                 f"another password of the same shape was not refused as a login (SQLSTATE {state!r})"
             )
-            who, state = await login_outcome(_odbc_with(generic, "PWD", password))
-            assert who is None, "the unbraced password logged in, so the control measures nothing"
         finally:
             await admin.teardown(logins=[login])

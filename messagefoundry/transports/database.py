@@ -739,7 +739,7 @@ class _DriverFamily(NamedTuple):
     tls_example: tuple[str, str]
     #: Whether the family is on the escape list: its password is always sent braced, with the ODBC
     #: ``}}`` escape (:func:`_odbc_password`). Its own field, so placing a family for its TLS
-    #: keyword never brings an unmeasured escape with it.
+    #: keyword does not put the family on the escape list.
     brace_escape: bool
 
 
@@ -756,11 +756,11 @@ class _DriverFamily(NamedTuple):
 # The escape list is the families with ``brace_escape`` set, whose password is always sent braced
 # with the ODBC ``}}`` escape (:func:`_odbc_password`, BACKLOG #2705): psqlODBC and MySQL, measured
 # on 2026-10-30 to read that escape, and Microsoft's, which the SQL Server preset and the store also
-# rely on. Microsoft's rests on one live test, which the hosted CI ``sql server`` legs run against
-# ODBC Driver 18 on Linux (``msodbcsql18`` under unixODBC):
+# rely on. A test on the hosted ``sql server (store + connector)`` leg measures Microsoft's for ODBC
+# Driver 18 on Linux (``msodbcsql18`` under unixODBC):
 # tests/test_sqlserver_store.py::test_microsoft_odbc_driver_reads_the_braced_password_escape.
 # Unmeasured: at least Windows ``msodbcsql18.dll``, macOS, and every other major the family
-# accepts. selfhosted-win2025-sql.yml would run that test on Windows, and is not known to have run.
+# accepts.
 _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
     "psqlodbc": _DriverFamily(
         "sslmode",
@@ -1434,8 +1434,8 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     ``odbc_params`` value refuses a boolean, and ``sslmode`` takes only the spellings
     :func:`_refuse_unread_sslmode` accepts for the driver. ``odbc_driver`` is braced and
     refuses ``;``, ``{`` and ``}``, and must be on the generic driver allowlist. ``password`` is
-    always braced with the ``}}`` escape, as every family on the list reads it
-    (:func:`_odbc_password`).
+    always braced with the ``}}`` escape (:func:`_odbc_password`; the comment above
+    :data:`_DRIVER_FAMILIES` says which drivers were measured to read it).
 
     **TLS is the operator's responsibility on this path.** MessageFoundry cannot introspect an arbitrary
     driver's TLS posture the way it reads SQL Server's ``Encrypt``/``TrustServerCertificate``, so the
