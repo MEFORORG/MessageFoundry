@@ -17,6 +17,7 @@ import re
 import textwrap
 import time
 from collections.abc import Awaitable, Callable
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1484,6 +1485,20 @@ async def test_a_digest_the_bump_cannot_share_is_stored_as_unknown_and_logged(
             await eng.reload_detail(propagate=True)
         assert "bump after reload failed" in caplog.text, "control: the bump was tried"
         assert "stored it as unknown" not in caplog.text
+
+        # Past a bump that landed, a fault telling why the digest was not shared fails nothing.
+        monkeypatch.undo()
+        monkeypatch.setattr(fingerprint_module, "shared_digest_text", lambda detail: None)
+
+        def _coverage_raises(detail: object) -> None:
+            raise TypeError("not a digest mapping")
+
+        monkeypatch.setattr(fingerprint_module, "digest_coverage", _coverage_raises)
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+            outcome = await eng.reload_detail(propagate=True)
+        assert outcome.config_version == coord.bumps and outcome.failures == ()
+        assert "could not tell why this reload's digest was not shared" in caplog.text
     finally:
         await eng.stop()
 
@@ -1500,17 +1515,38 @@ def test_a_bad_stamp_caches_the_new_version_with_no_digest(backend: str) -> None
     good = {"config_version": 4, "config_digest": "d4", "config_digest_version": 4}
     assert coord._cache_config_row(good) == 4, "control"
     assert coord.config_digest_cached(4) == "d4"
-    for version, bad in enumerate(
-        (
-            {"config_version": 5, "config_digest": "d5"},  # no stamp column
-            {"config_version": 6, "config_digest": "d6", "config_digest_version": "6"},
-            {"config_version": 7, "config_digest": "d7", "config_digest_version": 6},
-        ),
-        start=5,
-    ):
+    rows: tuple[dict[str, object], ...] = (
+        {"config_version": 5, "config_digest": "d5"},  # no stamp column
+        {"config_version": 6, "config_digest": "d6", "config_digest_version": "six"},
+        {"config_version": 7, "config_digest": "d7", "config_digest_version": 6},
+        {"config_version": 8, "config_digest": 8, "config_digest_version": 8},
+    )
+    for version, bad in enumerate(rows, start=5):
         assert coord._cache_config_row(bad) == version
         assert coord.config_version_cached() == version
         assert coord.config_digest_cached(version) is None, bad
+
+
+@pytest.mark.parametrize("backend", ["DbCoordinator", "SqlServerCoordinator"])
+def test_a_stamp_fault_is_logged_once_per_version(
+    backend: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """vault BACKLOG #3109: a fault that voids the digest is logged, once per version however
+    often the tick refreshes, and a stamp naming an older version is no fault."""
+    from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+
+    coord: DbCoordinator | SqlServerCoordinator = (
+        DbCoordinator(None, "n") if backend == "DbCoordinator" else SqlServerCoordinator(None, "n")
+    )
+    bad = {"config_version": 5, "config_digest": "d5", "config_digest_version": "five"}
+    with caplog.at_level("WARNING"):
+        coord._cache_config_row({**bad, "config_digest_version": 4})  # an older stamp: no fault
+        assert "reads as unknown" not in caplog.text, "control"
+        coord._cache_config_row(bad)
+        coord._cache_config_row(bad)  # the next tick's refresh
+        coord._cache_config_row({**bad, "config_version": 6})
+    assert caplog.text.count("reads as unknown") == 2
+    assert "version 5 has a stamp that is not an integer (str)" in caplog.text
 
 
 def test_a_stored_digest_belongs_only_to_the_version_stamped_beside_it() -> None:
@@ -1522,12 +1558,19 @@ def test_a_stored_digest_belongs_only_to_the_version_stamped_beside_it() -> None
         "config_digest": "d",
         "config_digest_version": 4,
     }
-    assert stamped_config_digest(row, 4) == "d", "control: stamped with its own version"
-    assert stamped_config_digest(row, 5) is None, "a later, unstamped bump"
-    assert stamped_config_digest({**row, "config_digest_version": None}, 4) is None
-    assert stamped_config_digest({**row, "config_digest_version": True}, 1) is None, "not an int"
-    assert stamped_config_digest({**row, "config_digest": None}, 4) is None
-    assert stamped_config_digest({"config_version": 4}, 4) is None, "no digest columns"
+    assert stamped_config_digest(row, 4) == ("d", None), "control: stamped with its own version"
+    assert stamped_config_digest(row, 5) == (None, None), "a later, unstamped bump: no fault"
+    assert stamped_config_digest({**row, "config_digest_version": None}, 4) == (None, None)
+    assert stamped_config_digest({**row, "config_digest": None}, 4) == (None, None)
+    # A driver may return the integer column as a Decimal or a numeric string.
+    for integral in (Decimal("4"), Decimal("4.0"), "4", " 4 ", "4.0"):
+        stamped = {**row, "config_digest_version": integral}
+        assert stamped_config_digest(stamped, 4) == ("d", None), integral
+    for bad in (True, 4.0, Decimal("4.5"), Decimal("NaN"), "4.5", "four", b"4"):
+        digest, fault = stamped_config_digest({**row, "config_digest_version": bad}, 4)
+        assert digest is None and fault is not None, bad
+    assert stamped_config_digest({**row, "config_digest": 7}, 4)[1] is not None, "not text"
+    assert stamped_config_digest({"config_version": 4}, 4)[1] is not None, "no digest columns"
 
 
 @pytest.mark.parametrize("seed_first", [True, False], ids=["seeded_before_load", "seeded_at_start"])

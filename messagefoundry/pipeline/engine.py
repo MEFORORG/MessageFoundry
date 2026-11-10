@@ -3645,7 +3645,12 @@ class Engine:
                 failures.append(ReloadStepFailure("cluster_propagate", safe_exc(exc)))
             else:
                 self._applied_config_version = config_version
-                if digest_text is None and digest_coverage(fingerprint) is not None:
+                try:
+                    unshared = digest_text is None and digest_coverage(fingerprint) is not None
+                except Exception:  # noqa: BLE001 - past the swap, a fault here fails no reload
+                    log.exception("cluster: could not tell why this reload's digest was not shared")
+                    unshared = False
+                if unshared:
                     # Said here, since a follower reads the NULL as "the initiator took none".
                     log.warning(
                         "cluster: this reload's digest is not in a shape another node can "

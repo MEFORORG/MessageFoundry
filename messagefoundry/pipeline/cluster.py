@@ -67,6 +67,7 @@ import socket
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -920,25 +921,65 @@ class ClusterCoordinator(Protocol):
         ...
 
 
-def stamped_config_digest(row: Mapping[str, Any], version: int) -> str | None:
-    """A ``cluster_config`` row's ``config_digest``, when its ``config_digest_version`` stamp is
-    ``version``, the row's ``config_version`` as the caller parsed it, else ``None`` (vault
-    BACKLOG #3109).
+def _integral(value: object) -> int | None:
+    """``value`` as an int when it is an integral number other than a bool: an int, or a Decimal
+    or numeric string with an integral value, as a driver may return an integer column. Else
+    ``None``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            value = Decimal(value)
+        except InvalidOperation:
+            return None
+    if isinstance(value, Decimal) and value.is_finite() and value == value.to_integral_value():
+        return int(value)
+    return None
+
+
+def stamped_config_digest(row: Mapping[str, Any], version: int) -> tuple[str | None, str | None]:
+    """A ``cluster_config`` row's ``config_digest`` and the fault that voided it, if any (vault
+    BACKLOG #3109). The digest is returned when its ``config_digest_version`` stamp is
+    ``version``, the row's ``config_version`` as the caller parsed it, else ``None``.
 
     A bump writes the digest and the stamp in the same statement as the version. An engine that
     does not write the digest still moves the version, and leaves the previous bump's digest and
     stamp behind: the stamp then names an older version, so that digest is not set beside the new
-    one. Both coordinators read the pair through here. It never raises: the digest is advisory, so
-    a missing column, a stamp that is not an int, or a digest that is not text reads as unknown
-    and never stops the version from being cached."""
+    one, and that is no fault. Both coordinators read the pair through here. It never raises: the
+    digest is advisory, so a stamp with no integral value, or a digest that is not text, reads as
+    unknown, is named as the fault for :func:`note_stamp_fault`, and never stops the version from
+    being cached."""
     try:
-        stamp = row["config_digest_version"]
+        raw_stamp = row["config_digest_version"]
         digest = row["config_digest"]
-    except KeyError:
-        return None
-    if not isinstance(stamp, int) or isinstance(stamp, bool) or stamp != version:
-        return None
-    return digest if isinstance(digest, str) else None
+    except KeyError as exc:
+        return None, f"has no {exc.args[0]} column"
+    if raw_stamp is None:
+        return None, None
+    stamp = _integral(raw_stamp)
+    if stamp is None:
+        return None, f"has a stamp that is not an integer ({type(raw_stamp).__name__})"
+    if stamp != version:
+        return None, None
+    if digest is None or isinstance(digest, str):
+        return digest, None
+    return None, f"has a digest that is not text ({type(digest).__name__})"
+
+
+def note_stamp_fault(fault: str | None, version: int, warned: int | None) -> int | None:
+    """Log a :func:`stamped_config_digest` fault at WARNING, once per ``version``: ``warned`` is
+    the version last logged, and the return value is the one to keep (vault BACKLOG #3109)."""
+    if fault is None or warned == version:
+        return warned
+    log.warning(
+        "cluster: the cluster_config row for shared config version %d %s, so its initiator's "
+        "digest reads as unknown",
+        version,
+        fault,
+    )
+    return version
 
 
 class NullCoordinator:
@@ -1227,6 +1268,8 @@ class DbCoordinator:
         # The initiator's digest stored with _config_version, read by the same statement and set with
         # it, so the two are always one pair (vault BACKLOG #3109). None when unknown.
         self._config_digest: str | None = None
+        # The version whose stamp fault was last logged, so a refresh every tick logs it once.
+        self._stamp_fault_warned: int | None = None
 
     async def start(self) -> None:
         """Register this node and begin heartbeating. Idempotent: a second call is a no-op while the
@@ -1404,7 +1447,9 @@ class DbCoordinator:
     def _cache_config_row(self, row: Any) -> int:
         """Cache a ``cluster_config`` row's version and digest together, and return the version."""
         version = int(row["config_version"])
-        self._config_version, self._config_digest = version, stamped_config_digest(row, version)
+        digest, fault = stamped_config_digest(row, version)
+        self._stamp_fault_warned = note_stamp_fault(fault, version, self._stamp_fault_warned)
+        self._config_version, self._config_digest = version, digest
         return version
 
     async def cluster_members(self) -> list[ClusterMember]:

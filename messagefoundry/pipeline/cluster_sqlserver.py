@@ -61,6 +61,7 @@ from messagefoundry.pipeline.cluster import (
     default_node_id,
     lease_release_unconfirmed,
     members_from_node_rows,
+    note_stamp_fault,
     paused_read_budget_seconds,
     rows_affected,
     stamped_config_digest,
@@ -196,6 +197,8 @@ class SqlServerCoordinator:
         self._config_version: int = 0
         # The initiator's digest read with _config_version and set with it (vault BACKLOG #3109).
         self._config_digest: str | None = None
+        # The version whose stamp fault was last logged, so a refresh every tick logs it once.
+        self._stamp_fault_warned: int | None = None
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -329,7 +332,9 @@ class SqlServerCoordinator:
     def _cache_config_row(self, row: dict[str, Any]) -> int:
         """Cache a ``cluster_config`` row's version and digest together, and return the version."""
         version = int(row["config_version"])
-        self._config_version, self._config_digest = version, stamped_config_digest(row, version)
+        digest, fault = stamped_config_digest(row, version)
+        self._stamp_fault_warned = note_stamp_fault(fault, version, self._stamp_fault_warned)
+        self._config_version, self._config_digest = version, digest
         return version
 
     # --- observability -------------------------------------------------------
