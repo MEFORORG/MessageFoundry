@@ -401,36 +401,65 @@ def _scrub_credential_query(text: str) -> str:
     return _CREDENTIAL_QUERY_RE.sub(lambda m: f"{m.group(1)}={CREDENTIAL_PLACEHOLDER}", text)
 
 
-def redact_log_value(text: str) -> str:
-    """``text`` through the three text passes :func:`_install_phi_filters` applies, in its order:
-    PHI redaction, the credential query scrub, the credential scrub (BACKLOG #3770). The list is
-    copied from that function by hand; a pass added there must be added here too.
-
-    Then the control-character escape and the three passes again, which is what a second handler
-    reads of a raw value: a pass skips text it cannot read, such as the encoded HL7 run in text that
-    is not printable, so ``/x\\x01DOE%5EJANE%5EQ`` was hidden only by the second handler's passes on
-    the escaped text. The field's own escape later hides that text from every handler, so this
-    value must already carry what the second one would have hidden. A tab, which that escape keeps
-    and which the PHI pass also reads as not printable, becomes a space here; not ``\\t``, which
-    glued a ``t`` to the next word and cost a credential label its word boundary. So a control
-    logs as its escape spelling and a tab as a space, and the field no longer tells either from
-    that text. At least the two-handler reading is matched; a third handler's further round, and
-    a Unicode space separator, which the PHI pass also reads as not printable, are not modelled."""
-
-    def passes(value: str) -> str:
-        return scrub_credentials(_scrub_credential_query(redact_untrusted(value)))
-
-    return passes(scrub_control_chars(passes(text)).replace("\t", " "))
+def _shipped_filters() -> tuple[logging.Filter, ...]:
+    """The filters :func:`_install_phi_filters` puts on a shipped handler, built by that function,
+    so :func:`redact_log_value` cannot drift from it (BACKLOG #3770)."""
+    handler = logging.NullHandler()
+    _install_phi_filters(handler)
+    return tuple(f for f in handler.filters if isinstance(f, logging.Filter))
 
 
-def redacted_log_field(text: str, limit: int) -> str:
+def _through_shipped_handlers(text: str, handlers: int) -> str:
+    """What the last of ``handlers`` shipped handlers writes for a record whose message is ``text``.
+    Each handler runs the whole chain over the one shared record, as on a configured logger."""
+    filters = _shipped_filters()
+    record = logging.LogRecord(__name__, logging.WARNING, __file__, 0, "%s", (text,), None)
+    for _ in range(handlers):
+        for log_filter in filters:
+            log_filter.filter(record)
+    return record.getMessage()
+
+
+def redact_log_value(text: str, *, before: str = "", after: str = "") -> str:
+    """``text`` as the second of two shipped handlers would write it, read in the line it would
+    have stood in on main, ``before`` + ``text`` + ``after``, then once more with each tab written
+    as a space (BACKLOG #3770).
+
+    The field's own escape hides its text from every handler, so this value is meant to carry what
+    main's handlers would have hidden. The filters are the ones :func:`_install_phi_filters`
+    installs, not a copy, and the line's own context is kept because some passes read past a
+    value. The extra round exists because a tab, which the control-character escape keeps, makes
+    the PHI pass read the text as not printable and skip it; it reads text main's two handlers
+    already redacted. What is tested, in ``tests/test_admin_new_ip.py``, is that no word of a path
+    main's last of two handlers hid on either new-address line prints, over named vectors and a
+    seeded corpus. Not tested: a third handler, and a Unicode space separator before an encoded
+    HL7 name, which main printed too.
+
+    ``before`` is removed from the result when it survives at its head, or else its words up to
+    its last space when those do, and ``after`` when it survives at its tail; otherwise the
+    rewritten context stays in the value, which then carries more of the line than ``text`` alone. A control logs as its escape spelling and a tab as a
+    space, so the value no longer tells either from that text."""
+    line = before + text + after
+    out = _through_shipped_handlers(_through_shipped_handlers(line, 2).replace("\t", " "), 1)
+    if before and out.startswith(before):
+        out = out[len(before) :]
+    elif before and out.startswith(head := before[: before.rfind(" ") + 1]):
+        # A pass took the last word of ``before`` with the text, as the HL7 run takes a whole
+        # whitespace-delimited run; the words before it are still the fixed text.
+        out = out[len(head) :]
+    if after and out.endswith(after):
+        out = out[: -len(after)]
+    return out
+
+
+def redacted_log_field(text: str, limit: int, *, before: str = "", after: str = "") -> str:
     """``text`` as one ``key="value"`` field value of a log line: redacted by
-    :func:`redact_log_value`, then escaped and bounded by
+    :func:`redact_log_value` in the context ``before`` and ``after``, then escaped and bounded by
     :func:`~messagefoundry.controlchars.log_field_token` (BACKLOG #3770).
 
     The escape hides most of what the handler filters anchor on, so they read less inside the
-    field than in raw text; redacting first means a PHI or credential value they would have hidden
-    is hidden anyway. The placeholders the passes write are kept as they are, not escaped, so a
+    field than in raw text; redacting first, as main's handlers read the line, means a PHI or
+    credential value they would have hidden is hidden anyway. The placeholders the passes write are kept as they are, not escaped, so a
     search for ``<redacted>`` or ``[redacted]`` still finds the line. The filters still run on the
     whole line afterwards and may rewrite a run inside the field, never past its quotes.
 
@@ -438,7 +467,9 @@ def redacted_log_field(text: str, limit: int) -> str:
     placeholder rather than the value."""
     try:
         return log_field_token(
-            redact_log_value(text), limit, literals=(CREDENTIAL_PLACEHOLDER, PHI_PLACEHOLDER)
+            redact_log_value(text, before=before, after=after),
+            limit,
+            literals=(CREDENTIAL_PLACEHOLDER, PHI_PLACEHOLDER),
         )
     except Exception as exc:  # noqa: BLE001 -- a log argument must never raise
         name = type(exc).__name__

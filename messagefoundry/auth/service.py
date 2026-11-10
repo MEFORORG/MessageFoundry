@@ -523,6 +523,25 @@ _NEW_IP_TEXT_PREFIX = 24
 # (``logging_setup.redacted_log_field``). The path is caller-supplied and bounded only by the HTTP
 # server's request-line limit. The seen address logs as ``_address_log_field``, which is short.
 _NEW_IP_LOG_FIELD_MAX = 256
+# The two new-address WARNINGs up to their first field. The repeat line's head ends "path=" as on
+# main; the past-cap line's head is followed by "path=" on main and by "seen_ip=" here.
+_NEW_IP_REPEAT_HEAD = (
+    "a request from a new client address must re-verify; the address was already flagged since "
+    "the session's last re-verification (audit suppressed): path="
+)
+_NEW_IP_OVER_CAP_HEAD = (
+    "a request from a new client address must re-verify; the address is past the per-session cap "
+    f"of {_NEW_IP_PER_SESSION_MAX} (audit suppressed): "
+)
+
+
+def _new_ip_path_field(path: str, *, before: str, after: str = "") -> str:
+    """The path field of a new-address WARNING (BACKLOG #3770): redacted as main's shipped handlers
+    read it in main's line, ``before`` the path and ``after`` it, then escaped and bounded. Where a
+    handler rewrote the context, the rewritten context stays in the field. What the tests check of
+    it is in ``logging_setup.redact_log_value``."""
+    return redacted_log_field(path, _NEW_IP_LOG_FIELD_MAX, before=before, after=after)
+
 
 # The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). Its baseline is the store's
 # per-account ``known_login_addresses`` record (vault BACKLOG #2145), read at every session mint with
@@ -13987,30 +14006,30 @@ class AuthService:
         if flag == "repeat":
             if _log.isEnabledFor(logging.WARNING):
                 _log.warning(
-                    "a request from a new client address must re-verify; the address was already "
-                    "flagged since the session's last re-verification (audit suppressed): path=%s",
-                    redacted_log_field(path, _NEW_IP_LOG_FIELD_MAX),
+                    _NEW_IP_REPEAT_HEAD + "%s", _new_ip_path_field(path, before=_NEW_IP_REPEAT_HEAD)
                 )
             return True
+        # What the row, the notice and main's past-cap log line carry. Text within
+        # _NEW_IP_TEXT_MAX, which is every address without a long zone id, is unchanged, so a search
+        # by address still finds the row (vault BACKLOG #3197); longer text is bounded, so this
+        # row's client then differs from the raw text other rows of the request carry. Text that
+        # does not parse is its own host key, so its bounded form is reused rather than hashed twice.
+        seen_text = seen_key if host_key == client_ip else _bounded_address_text(client_ip)
         if flag == "over_cap":
             # Past the cap no new-address row is written, so this line carries the address. The
             # address is attacker-supplied text on a proxied hop, so only its parsed form or a
             # digest is logged.
             if _log.isEnabledFor(logging.WARNING):
                 _log.warning(
-                    "a request from a new client address must re-verify; the address is past the "
-                    "per-session cap of %d (audit suppressed): seen_ip=%s path=%s",
-                    _NEW_IP_PER_SESSION_MAX,
+                    _NEW_IP_OVER_CAP_HEAD + "seen_ip=%s path=%s",
                     _address_log_field(client_ip),
-                    redacted_log_field(path, _NEW_IP_LOG_FIELD_MAX),
+                    _new_ip_path_field(
+                        path,
+                        before=_NEW_IP_OVER_CAP_HEAD + "path=",
+                        after=" seen_ip=" + scrub_log_argument(seen_text),
+                    ),
                 )
             return True
-        # What the row and the notice carry. Text within _NEW_IP_TEXT_MAX,
-        # which is every address without a long zone id, is unchanged, so a search by address still
-        # finds the row (vault BACKLOG #3197); longer text is bounded, so this row's client then
-        # differs from the raw text other rows of the request carry. Text that does not parse is its
-        # own host key, so its bounded form is reused rather than hashed twice.
-        seen_text = seen_key if host_key == client_ip else _bounded_address_text(client_ip)
         known_text = _bounded_address_text(session.client)
         detail: dict[str, object] = {
             "path": path,
