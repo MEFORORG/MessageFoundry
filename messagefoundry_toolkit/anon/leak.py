@@ -554,37 +554,48 @@ def _split_shape_hits(line: str, field_sep: str, addresses: Sequence[str | None]
     return hits
 
 
-def _escaped_leaves(value: str, seps: Seps, field_sep: str) -> Iterator[str]:
-    """Each subcomponent of ``value`` that holds the escape character, decoded. A leaf is decoded
-    on its own, after the split, so an escaped separator inside it never makes a new component.
-    A leaf with no escape character is left out: the raw scan of the whole value already read it."""
+def _decoded_parts(value: str, seps: Seps, field_sep: str) -> Iterator[str]:
+    """Each component of ``value`` that holds the escape character, decoded whole, and each of its
+    subcomponents that holds one, decoded on its own. Those are the two readings the engine gives
+    a part: ``Message`` decodes a whole component on a component read and one subcomponent on a
+    subcomponent read, and ``Peek`` decodes a subcomponent. A part is decoded after the split, so
+    an escaped separator inside it never makes a new one. A part with no escape character is left
+    out: the raw scan of the whole value already read it."""
     if not seps.escape or seps.escape not in value:
         return
     for rep in value.split(seps.repetition):
         for comp in rep.split(seps.component):
-            for leaf in comp.split(seps.subcomponent):
-                if seps.escape in leaf:
-                    yield unescape(leaf, seps, field_sep)
+            if seps.escape not in comp:
+                continue
+            yield unescape(comp, seps, field_sep)
+            if seps.subcomponent in comp:
+                for leaf in comp.split(seps.subcomponent):
+                    if seps.escape in leaf:
+                        yield unescape(leaf, seps, field_sep)
 
 
 def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]:
-    """``scan`` run over ``text`` as written, then over :func:`unescaped_message`, so a token
-    written with an HL7 escape sequence is found too (BACKLOG #5532). A reason the second pass
-    finds again is not repeated."""
+    """``scan`` run over ``text`` as written, then over :func:`unescaped_message` decoded a
+    subcomponent at a time and a component at a time, so a token written with an HL7 escape
+    sequence is found in either reading (BACKLOG #5532). A decoding that matches one already
+    scanned is not scanned again, and a reason a later pass finds again is not repeated."""
     hits = scan(text)
-    decoded = unescaped_message(text)
-    if decoded != text:
-        hits.extend(hit for hit in scan(decoded) if hit not in hits)
+    scanned = {text}
+    for by_component in (False, True):
+        decoded = unescaped_message(text, by_component=by_component)
+        if decoded not in scanned:
+            scanned.add(decoded)
+            hits.extend(hit for hit in scan(decoded) if hit not in hits)
     return hits
 
 
 def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
     """True if any repetition of ``value`` is a CX with a non-empty id (component 1) and a whole
     ``MR``/``MRN`` id-type component — an unmapped medical-record number by HL7 structure, far more
-    precise than a bare digit-run heuristic. A fail-closed detector refuses on either form, so
-    each id-type component counts as written or decoded a subcomponent at a time, as the engine's
-    parser decodes it: an id type written ``M\\X52\\`` counts (BACKLOG #5532). The id counts when
-    it is non-empty as written, so one that decodes to nothing, such as ``\\Z98765\\``, counts."""
+    precise than a bare digit-run heuristic. A fail-closed detector refuses on any reading, so an
+    id type counts in each of :func:`_is_mrn_type`'s readings, and one written ``M\\X52\\`` counts
+    (BACKLOG #5532). The id counts when it is non-empty as written, so one that decodes to
+    nothing, such as ``\\Z98765\\``, counts."""
     for rep in value.split(seps.repetition):
         comps = rep.split(seps.component)
         if comps[0] and any(_is_mrn_type(comp, seps, field_sep) for comp in comps):
@@ -593,22 +604,22 @@ def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
 
 
 def _is_mrn_type(comp: str, seps: Seps, field_sep: str) -> bool:
-    """True if ``comp`` is a whole ``MR``/``MRN`` id type as written or decoded. A component that
-    holds a subcomponent separator is never a whole id type, so only a single-leaf component is
-    decoded, which is decoding it a subcomponent at a time."""
-    return comp.upper() in _MRN_TYPES or (
-        seps.subcomponent not in comp and unescape(comp, seps, field_sep).upper() in _MRN_TYPES
-    )
+    """True if ``comp`` is ``MR`` or ``MRN`` as written, decoded whole as a ``Message`` component
+    read decodes it, or as its first subcomponent decoded, which is what ``Peek`` reads for a
+    component that has subcomponents."""
+    first = comp.split(seps.subcomponent, 1)[0]
+    forms = (comp, unescape(comp, seps, field_sep), unescape(first, seps, field_sep))
+    return any(form.upper() in _MRN_TYPES for form in forms)
 
 
 def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:
     """PHI-safe shape labels for one unmapped field value — the SHAPE only, never the value.
 
-    Each shape is looked for in the value as written and in each of its leaves decoded
-    (:func:`_escaped_leaves`), so a shape written with HL7 escape sequences, such as
+    Each shape is looked for in the value as written and in each of its parts decoded
+    (:func:`_decoded_parts`), so a shape written with HL7 escape sequences, such as
     ``123\\X2D\\45\\X2D\\6789``, is found too (BACKLOG #5532)."""
     reasons: list[str] = []
-    forms = [value, *_escaped_leaves(value, seps, field_sep)]
+    forms = [value, *_decoded_parts(value, seps, field_sep)]
     for pattern, reason in _SPLITTABLE_SHAPES:
         if reason not in reasons and any(pattern.search(form) for form in forms):
             reasons.append(reason)

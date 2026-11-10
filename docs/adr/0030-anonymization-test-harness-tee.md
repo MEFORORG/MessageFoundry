@@ -122,9 +122,10 @@
   stay `KEEP` by omission, and `rules.py` names them with the reason. A field of those segments
   that is neither mapped nor named there still has no rule; the coverage report names it.
 - **AMENDED 2026-11-10 (BACKLOG #5532, #5541): the leak-check reads an escaped value decoded.**
-  The structural detectors read each unmapped value as written and each of its subcomponents
-  decoded from its HL7 escape sequences, and the token scan reads the message as written and
-  decoded, by the escape character `MSH-2` declares. `Seps` gains that `escape` character. The
+  The structural detectors read each unmapped value as written and each of its components and
+  subcomponents decoded from its HL7 escape sequences, the parts the engine's `Message` and `Peek`
+  readers decode, and the token scan reads the message as written and decoded both ways, by the
+  escape character `MSH-2` declares. `Seps` gains that `escape` character. The
   tee's token scan reads the guard's tables at each call rather than a copy taken at import, and
   its no-guard reason no longer claims a refusal: `require_live_denylist` stays the opt-in
   that refuses, as the 2026-08-06 bullet above records. [PHI.md](../PHI.md) §9 is the long form.

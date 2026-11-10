@@ -2441,9 +2441,14 @@ the next of kin's mother's maiden name, passes the same way. The detectors stay 
 
 **An escaped value is read decoded too (BACKLOG #5532).** HL7 lets a sender write any character
 as an escape sequence, so `123\X2D\45\X2D\6789` is a dashed SSN and `M\X52\` is the id type
-`MR`. The shape detectors read each unmapped value as written and then each of its subcomponents
-decoded, and the token scan reads the whole message as written and then with each subcomponent
-decoded. The escape
+`MR`. The engine's readers decode a part in two ways: `Message` decodes a whole component on a
+component read and one subcomponent on a subcomponent read, and `Peek` decodes a subcomponent,
+reading the first one where a component has several. An escape can pair across the subcomponent
+separator in the first reading and not in the second, so the check takes both. The shape
+detectors read each unmapped value as written, then each of its components decoded whole and each
+of its subcomponents decoded on its own. The MRN-typed check reads the id type as written,
+decoded whole, and as its first subcomponent decoded. The token scan reads the whole message as
+written, then decoded a subcomponent at a time, then decoded a component at a time. The escape
 character is the one the message's own `MSH-2` declares. Each sequence decodes as the engine's
 own parser reads it: `\F\`, `\S\`, `\T\`, `\R\` and `\E\` become that message's own
 delimiters, `\H\` and `\N\` become `_`, and a hex escape `\Xhh\` becomes the character with
@@ -2455,9 +2460,9 @@ hits: a value the check refuses as written is still refused, so an MRN-typed ide
 is an unmappable sequence such as `\Z98765\`, which decodes to nothing, is refused. At least these
 still pass:
 
-- A subcomponent is decoded on its own, as the engine's parser decodes it, so a shape whose parts
-  sit in different components or subcomponents is not joined, and an escape character with no
-  closing one in a subcomponent never pairs with a sequence in the next.
+- No part wider than a component is decoded, as neither engine reader decodes one, so a shape
+  whose parts sit in different components is not joined, and an escape character with no closing
+  one in a component never pairs with a sequence in the next.
 - The site-code check does not decode, so a site code written with an escape sequence passes it.
 - The check for a shape cut across fields by the field separator does not decode.
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as

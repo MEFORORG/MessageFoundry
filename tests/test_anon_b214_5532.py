@@ -179,8 +179,10 @@ def _guard(leak: ModuleType) -> object:
     [
         ("ZQSYNTH\\T\\PARTNER", "synthetic partner"),
         ("zqsynth\\X65\\state", f"estate token ({_ESTATE})"),
+        # Decoded whole, as a Message component read decodes it, the hex escape reads as the &.
+        ("ZQSYNTH\\X26&\\PARTNER", "synthetic partner"),
     ],
-    ids=["name-with-delimiter", "estate-hex"],
+    ids=["name-with-delimiter", "estate-hex", "name-a-component-read-decodes"],
 )
 # A line with no field separator is all one field, and is decoded too.
 @pytest.mark.parametrize("line", ["ZPD|1|", "note "], ids=["in-a-field", "line-with-no-field"])
@@ -242,10 +244,12 @@ def test_the_decoder_reads_each_escape_as_the_engine_s_parser_does(
 
 @_LEAKS
 def test_an_unclosed_escape_does_not_pair_across_a_separator(leak: ModuleType) -> None:
-    """Each subcomponent is decoded on its own, as the engine decodes it, so the unclosed escape in
-    component 1 does not swallow the escaped delimiter in component 2."""
-    decoded = leak.unescaped_message(f"{_HEAD}\rZPD|1|X\\^ZQSYNTH\\T\\PARTNER")
-    assert decoded.split("\r")[-1] == "ZPD|1|X\\^ZQSYNTH&PARTNER"
+    """Each part is decoded on its own, in both readings, so the unclosed escape in component 1
+    does not swallow the escaped delimiter in component 2."""
+    text = f"{_HEAD}\rZPD|1|X\\^ZQSYNTH\\T\\PARTNER"
+    for by_component in (False, True):
+        decoded = leak.unescaped_message(text, by_component=by_component)
+        assert decoded.split("\r")[-1] == "ZPD|1|X\\^ZQSYNTH&PARTNER"
 
 
 @_LEAKS
@@ -270,24 +274,51 @@ def test_an_id_written_non_empty_is_an_mrn_however_it_decodes(leak: ModuleType, 
 
 @_LEAKS
 @pytest.mark.parametrize(
-    "value",
+    ("value", "head", "reader"),
     [
-        "98765^^^H^M\\X52&\\",  # each leaf unclosed, as the engine reads it: no MR
-        "98765^^^H^MR&X",  # a subcomponent after MR, as written: not a whole MR component
-        "^^^H^M\\X52\\",  # no id
+        # Message decodes a whole component on a component read, so the hex escape pairs across
+        # the subcomponent separator there and reads R.
+        ("98765^^^H^M\\X52&\\", _HEAD, "message"),
+        # Peek reads the first subcomponent of a component that has them.
+        ("98765^^^H^MR&X", _HEAD, "peek"),
+        # Under a subcomponent separator of R, Message decodes the component whole: M, nothing, R.
+        ("98765^^^H^M\\.fi\\R", _HEAD.replace("^~\\&", "^~\\R", 1), "message"),
     ],
-    ids=["unclosed-in-each-leaf", "mr-with-subcomponent", "no-id"],
+    ids=["message-pairs-across-subcomponents", "peek-first-subcomponent", "separator-r"],
 )
-def test_the_id_type_decodes_a_subcomponent_at_a_time(leak: ModuleType, value: str) -> None:
-    """The id type is read as the engine's parser reads it, each subcomponent on its own, so an
-    escape that would pair only across the subcomponent separator decodes nothing, and the false
-    positive budget holds."""
-    assert _hits(leak, value) == []
+def test_an_id_type_any_engine_reader_sees_counts(
+    leak: ModuleType, value: str, head: str, reader: str
+) -> None:
+    """A fail-closed detector refuses on every reading a receiver can take. Each value here reads
+    as the id type MR through one of the engine's own readers, so the check refuses it."""
+    from messagefoundry.parsing.message import Message
+    from messagefoundry.parsing.peek import Peek
+
+    text = f"{head}\rZPD|1|||{value}"
+    parsed = Message.parse(text) if reader == "message" else Peek.parse(text)
+    assert parsed.field("ZPD-4.5") == "MR"
+    hits = _hits(leak, value, head=head)
+    assert any("MRN" in hit and "ZPD-4" in hit for hit in hits), hits
 
 
 @_LEAKS
-def test_a_subcomponent_separator_never_joins_an_id_type(leak: ModuleType) -> None:
-    """Under an MSH-2 whose subcomponent separator is ``R``, the id type below is the two
-    subcomponents ``M`` and an empty one, not ``MR``."""
-    head = _HEAD.replace("^~\\&", "^~\\R", 1)
-    assert _hits(leak, "1^^^H^M\\.fi\\R", head=head) == []
+@pytest.mark.parametrize(
+    ("value", "shape"),
+    [("123\\X2D&\\45-6789", "SSN"), ("555\\X2D&\\555-1212", "phone")],
+    ids=["ssn", "phone"],
+)
+def test_a_shape_a_component_read_decodes_is_a_hit(
+    leak: ModuleType, value: str, shape: str
+) -> None:
+    """The escape pairs across the subcomponent separator only when the component is decoded
+    whole, as a ``Message`` component read decodes it, and that reading is checked too."""
+    from messagefoundry.parsing.message import Message
+
+    assert "-" in (Message.parse(f"{_HEAD}\rZPD|1|||{value}").field("ZPD-4.1") or "")
+    hits = _hits(leak, value)
+    assert any(shape in hit and "ZPD-4" in hit for hit in hits), hits
+
+
+@_LEAKS
+def test_an_id_type_with_no_id_is_no_mrn(leak: ModuleType) -> None:
+    assert _hits(leak, "^^^H^M\\X52\\") == []
