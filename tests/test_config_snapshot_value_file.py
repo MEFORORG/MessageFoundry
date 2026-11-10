@@ -17,6 +17,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -325,9 +326,16 @@ def test_the_reload_snapshot_vets_the_value_file_before_it_reads_it(
 # --- a dual-control release ------------------------------------------------------------------------
 
 
-async def _engine(tmp_path: Path, cfg: Path, *, keyed: bool = True) -> Engine:
+async def _engine(
+    tmp_path: Path,
+    cfg: Path,
+    *,
+    keyed: bool = True,
+    env_values_provider: Callable[[], Mapping[str, Any]] | None = None,
+) -> Engine:
     """An engine reading the default layout's value file, on a store that holds a key unless
-    ``keyed`` is False: only a keyed store can bind the value file to a hold."""
+    ``keyed`` is False: only a keyed store can bind the value file to a hold. ``env_values_provider``
+    replaces ``serve``'s provider."""
     from messagefoundry.__main__ import _environment_values_reader
 
     if keyed:
@@ -342,7 +350,8 @@ async def _engine(tmp_path: Path, cfg: Path, *, keyed: bool = True) -> Engine:
         poll_interval=0.02,
         config_dir=cfg,
         egress_settings=EgressSettings(deny_by_default=False),
-        env_values_provider=_environment_values_reader(
+        env_values_provider=env_values_provider
+        or _environment_values_reader(
             base_dir=tmp_path, dir_name="environments", environment="dev"
         ),
     )
@@ -650,6 +659,69 @@ async def test_an_ungated_reload_refuses_a_value_file_it_cannot_read(
         _fail_value_file_read(monkeypatch, value_file)
         with pytest.raises(WiringError, match="dev.toml"):
             await engine.reload_detail(dry_run=False)
+        assert engine.registry_runner is runner
+        assert cast(Any, engine)._env_values == approved_values
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.parametrize("winerror", [53, 67])
+async def test_an_ungated_reload_with_no_snapshot_refuses_a_value_file_on_a_lost_share(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
+) -> None:
+    """Vault BACKLOG #5120 step 1. With no snapshot, an ungated reload reads the value file from
+    disk. Where the share holding it is lost, ``Path.is_file`` answers ``False`` with nothing
+    raised, so the reload went through with no file's values and every env() default applied."""
+    from messagefoundry.config.environments import load_environment_values
+    from messagefoundry.pipeline import engine as engine_module
+    from tests._share_fault import _share_fault
+
+    cfg, value_file = _layout(tmp_path)
+
+    def _provider() -> dict[str, Any]:
+        # An embedder's provider: not a SnapshotEnvValuesProvider, so the engine wraps its fault.
+        return load_environment_values(
+            base_dir=tmp_path, dir_name="environments", environment="dev", environ={}
+        )
+
+    engine = await _engine(tmp_path, cfg, keyed=False, env_values_provider=_provider)
+    try:
+        approved_values = {"host": "approved.example.invalid"}
+        await engine.reload_detail(dry_run=False)
+        assert cast(Any, engine)._env_values == approved_values
+        runner = engine.registry_runner
+
+        # The share is lost: no stat reaches the file, and an existence test finds nothing there.
+        value_file.unlink()
+        real_stat = Path.stat
+
+        def _stat(self: Path, *args: Any, **kwargs: Any) -> Any:
+            if os.path.normcase(os.path.abspath(self)) == os.path.normcase(value_file):
+                raise _share_fault(winerror)
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", _stat)
+
+        # And the reload's snapshot cannot be read whole, so it is None and the provider reads disk.
+        def _unreadable(*_a: Any, **_k: Any) -> Any:
+            raise OSError(errno.EIO, "the config directory could not be read whole")
+
+        monkeypatch.setattr(engine_module, "read_trusted_snapshot", _unreadable)
+        snapshots: list[Any] = []
+        real_snapshot = Engine._reload_snapshot
+
+        async def _record(self: Engine, path: Path) -> Any:
+            snapshot = await real_snapshot(self, path)
+            snapshots.append(snapshot)
+            return snapshot
+
+        monkeypatch.setattr(Engine, "_reload_snapshot", _record)
+
+        with pytest.raises(
+            WiringError, match="could not re-read this environment's values for the reload"
+        ):
+            await engine.reload_detail(dry_run=False)
+        assert snapshots == [None]
         assert engine.registry_runner is runner
         assert cast(Any, engine)._env_values == approved_values
     finally:
