@@ -2348,7 +2348,10 @@ store. After `crl_max_reloads` reloads of one file, a hop refuses the next and a
 engine also alerts when it refuses a replaced file. Until the file is applied, a revocation added to
 it is not enforced on the hops that hold the old copy. Match the alert in a `[[alerts.rules]]` rule
 with `event_type = "crl_reload_refused"`. It does not depend on `warn_days`. With no `[alerts]`
-transport it is a WARNING in the log, beside the reload's ERROR.
+transport it is a WARNING in the log, beside the reload's ERROR. The `supervise` process reloads
+its own forwarder's CRL too, and never raises this alert, whatever `[alerts]` says: a refusal there
+is only a WARNING line in the supervise process's own log, whose subject ends `@supervisor`, and
+which says that its "restart the engine" means restarting the supervise process (BACKLOG #3314).
 
 | Event field | What it holds |
 |---|---|

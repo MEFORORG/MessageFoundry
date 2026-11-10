@@ -52,6 +52,7 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from messagefoundry.childenv import engine_environment, python_child_argv
 from messagefoundry.config.settings import StoreBackend
@@ -59,6 +60,10 @@ from messagefoundry.config.wiring import Registry, load_config
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.pipeline import _config_preflight
 from messagefoundry.pipeline.sharding import join_shard_names, require_unified_store, shard_ids
+
+if TYPE_CHECKING:
+    from messagefoundry.pipeline.alerts import AlertSink
+    from messagefoundry.pipeline.crl_reload import CrlReloadRunner
 
 logger = logging.getLogger(__name__)
 
@@ -537,10 +542,17 @@ async def supervise(
     While the engine shards run, a :class:`~messagefoundry.pipeline.crl_reload.CrlReloadRunner`
     applies a replaced CRL file to this process's own TLS contexts, as an engine process's runner
     does to its own (BACKLOG #3314). The one that matters is the supervisor's off-box log
-    forwarder: without the runner, a collector certificate revoked after the start stayed trusted
-    by that forwarder until a restart. ``crl_max_reloads`` is ``[cert_monitor].crl_max_reloads``,
-    and ``None`` takes the runner's default. There is no alert store here, so the runner's default
-    sink logs a refused reload.
+    forwarder: without the runner, a collector certificate revoked after the start would have
+    stayed trusted by that forwarder until a restart. The reload changes the context, so the
+    revocation is refused at the forwarder's NEXT handshake; a connection it already holds is not
+    cut, and keeps sending until it fails and the forwarder reconnects. ``crl_max_reloads`` is
+    ``[cert_monitor].crl_max_reloads``, and ``None`` takes the runner's default. There is no alert
+    store here, so a refused reload raises no ``[alerts]`` alert: it is a ``WARNING`` line in the
+    supervisor's own log (:func:`_supervisor_crl_alert_sink`).
+
+    Stopping the runner waits for a pass in flight, for at most its stop timeout. A shutdown
+    signal in that window cuts the wait (:func:`_stop_crl_reload`), so a CRL read hung on a share
+    cannot hold SIGINT/SIGTERM.
     """
     from messagefoundry.config.wiring import WiringError
 
@@ -579,12 +591,88 @@ async def supervise(
     crl_reload = CrlReloadRunner(
         max_reloads=MAX_RELOADS if crl_max_reloads is None else crl_max_reloads,
         node="supervisor",
+        alert_sink=_supervisor_crl_alert_sink(),
     )
     crl_reload.start()
     try:
         return await _run_supervisor(supervisor, specs, install_signal_handlers)
     finally:
-        await crl_reload.stop()
+        await _stop_crl_reload(crl_reload, install_signal_handlers)
+
+
+#: Appended to the supervisor's refused-reload line, whose shared detail speaks of "the engine".
+SUPERVISOR_CRL_REFUSED_NOTE = (
+    "This line comes from the supervise process, which raises no [alerts] alert: there, "
+    "restarting the engine means restarting the supervise process, and the crl_reload ERROR line "
+    "is in the supervise process's own log."
+)
+
+
+def _supervisor_crl_alert_sink() -> AlertSink:
+    """The supervisor runner's alert sink: the default logging sink, with a refused reload's line
+    saying which process wrote it and what its remedy's "engine" means here (BACKLOG #3314)."""
+    from messagefoundry.pipeline.alerts import LoggingAlertSink, crl_reload_refused_detail
+
+    class _SupervisorCrlAlertSink(LoggingAlertSink):
+        def crl_reload_refused(
+            self,
+            name: str,
+            *,
+            path: str,
+            remedy_class: str,
+            stale_contexts: int,
+            remedy: str,
+            start_refuses: bool = False,
+        ) -> None:
+            logger.warning(
+                "ALERT crl_reload_refused: %r CRL file %s: %s %s",
+                name,
+                path,
+                crl_reload_refused_detail(
+                    remedy_class=remedy_class,
+                    stale_contexts=stale_contexts,
+                    remedy=remedy,
+                    start_refuses=start_refuses,
+                ),
+                SUPERVISOR_CRL_REFUSED_NOTE,
+            )
+
+    return _SupervisorCrlAlertSink()
+
+
+async def _stop_crl_reload(crl_reload: CrlReloadRunner, install_signal_handlers: bool) -> None:
+    """Stop ``crl_reload``, and let a shutdown signal cut the wait.
+
+    The handlers :func:`_run_supervisor` installed point at its finished task, so without this a
+    signal sent while a pass hangs would do nothing until the stop timeout ran out. Here they
+    cancel the stop instead, which abandons the pass, and are removed once it ends, so a later
+    signal takes its default action. The abandoned pass's worker thread cannot be cancelled: the
+    process can still wait at exit for that thread to return, as the runner's :meth:`stop` says."""
+    stop = asyncio.ensure_future(crl_reload.stop())
+    loop = asyncio.get_running_loop()
+    retargeted: list[signal.Signals] = []
+    if install_signal_handlers:
+        for sig in _shutdown_signals():
+            try:
+                loop.add_signal_handler(sig, stop.cancel)
+            except (NotImplementedError, ValueError):
+                continue  # unsupported on Windows event loops, as in _run_supervisor
+            retargeted.append(sig)
+    try:
+        await asyncio.wait({stop})
+    except asyncio.CancelledError:
+        stop.cancel()
+        raise
+    finally:
+        for sig in retargeted:
+            loop.remove_signal_handler(sig)
+    if stop.cancelled():
+        logger.warning(
+            "supervise: a shutdown signal cut the wait for the CRL reload to stop; its pass in "
+            "flight is abandoned"
+        )
+        return
+    stop.result()
 
 
 async def _run_supervisor(
