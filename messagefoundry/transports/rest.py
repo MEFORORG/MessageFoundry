@@ -1410,7 +1410,7 @@ def refuse_verify_off(
     comments in ``config/wiring.py`` still restate parts of it; change them with it.
 
     Disabling certificate verification makes the ``https`` hop MITM-able, so it is an insecure hop:
-    an enforcing hop REFUSES, and the CLAMPED
+    an enforcing hop REFUSES, an on-box loopback / per-hop-attested hop is allowed, and the CLAMPED
     global escape (``MEFOR_ALLOW_INSECURE_TLS``, honoured only at ``[security].enforcement = warn``
     and inert under ``enforce``) downgrades a non-enforcing one to a loud WARN. A non-enforcing hop
     without the escape is still refused, and an unknown posture counts as enforcing. Only meaningful

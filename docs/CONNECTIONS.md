@@ -4017,8 +4017,8 @@ the engine cannot see. A TLS-terminating proxy or sidecar in front of the connec
 An isolated segment with its own link-layer encryption is the other. An enforcing refusal of a
 cleartext or verify-off hop then **ALLOWs** it
 ([ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md), owner ruling
-2026-09-24). That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop and a
-weakened database TLS hop. It does **not** reach every
+2026-09-24). That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a
+verify-off HTTP-family egress hop that sets no `ech_egress` and a weakened database TLS hop. It does **not** reach every
 verify-off refusal: at least the MLLP, FTPS and email `tls_verify = false` refusals do not read it.
 Nor does it carry an HTTP-family credential: over cleartext `http` to a host off this machine, or
 over `verify_tls = false`, the credential is refused, attested or not (vault BACKLOG #3533 item 4,
