@@ -1,6 +1,6 @@
 # Proposal: AFK-autonomy mode for the MEFOR fleet
 
-Status: **APPROVED by the owner on 2026-10-21**, as written, through an AskUserQuestion dialog in a Manager session on account 7. Implementation follows section 10. Prepared 2026-10-21 by a Manager session (account 7), revised after two adversarial reviews.
+Status: **APPROVED by the owner on 2026-10-21**, as written, through an AskUserQuestion dialog in a Manager session on account 7. Implementation follows section 10. Prepared 2026-10-21 by a Manager session (account 7), revised after two adversarial reviews. **Amended by the owner's ruling of 2026-11-09 (section 12)**, which adds tier T4 to Class B.
 
 **Owner rulings of 2026-10-21 on section 9:**
 1. **Approve:** "Approve as written (Recommended)".
@@ -65,7 +65,7 @@ It replaces the driver skill's decision process and becomes the default for ever
 | Class | Membership (at least) | What the session does |
 |---|---|---|
 | **A. Mechanical** | Cleanup of resources **you own**: your session made it, or your claim or seat record names it. Moving into your own worktree. One re-run of a red CI leg, with the failed log linked on the PR; a second red on the same leg is a finding, not a re-run. Reads, research, read-only agents. Force-pushing or deleting **your own unshared** branch. | **Act. Never ask, never hand over a command.** Needs three predicates: the resource is yours, a named undo path exists, and live state was read. A failed predicate makes it Class B. |
-| **B. Reversible judgment** | Approach and design choices. Briefing and re-briefing. PR cutting. Fixing or filing a finding. A mechanical re-anchor (same content, moved line). A routine Manager plan. **A hook, gate or settings edit that only tightens an existing control** (closing a fail-open or a bypass, with a test that shows the old code letting the case through), **or that follows mechanically from an edit the owner already approved** (a version bump, prose the approved change made false). Owner correction 2026-10-21: asked about a gate version bump and two fail-open fixes, the owner answered *"those two questions are examples of things I don't need to review"*. | **Act on the bar in R4.** Log it. |
+| **B. Reversible judgment** | Approach and design choices. Briefing and re-briefing. PR cutting. Fixing or filing a finding. A mechanical re-anchor (same content, moved line). A routine Manager plan. **A hook, gate or settings edit that only tightens an existing control** (closing a fail-open or a bypass, with a test that shows the old code letting the case through), **or that follows mechanically from an edit the owner already approved** (a version bump, prose the approved change made false). Owner correction 2026-10-21: asked about a gate version bump and two fail-open fixes, the owner answered *"those two questions are examples of things I don't need to review"*. Since 2026-11-09 (T4, section 12): **filed ledger rows and work an accepted ADR names as its direction**, and a Manager picking and decomposing ledger work; every T4 act takes the adversarial review, and section 12 lists what stays Class C. | **Act on the bar in R4.** Log it. |
 | **C. Owner-reserved** | Legal or regulatory acceptance in your name: a register signature or re-signature, a risk acceptance, a deviation. **"Left to the signer" questions.** Money. Credentials, secrets, account settings. Anything git cannot undo, or that touches someone else's work: deleting another session's worktree, force-pushing a shared branch, a real-store migration, a release tag. Branch protection and required contexts. **Weakening a control or a gate.** **Editing the rules that bind the fleet:** CLAUDE.md sections 0, 5, 9 and 11, SAIDS, SDS, the driver and role skills, korus playbooks, `scripts/hooks/*`, `.claude/settings*.json`, account settings, `.pre-commit-config.yaml`, `.github/workflows/*`, except the tightening and follow-on edits that Class B names. An edit that adds an exemption, loosens a check, or adds a new rule stays here. A re-anchor that changes what the register accepts. Spawning outside the CLAUDE.md section 5 ruling. Publishing outside this repo. New product scope. | **Prepare everything, then ask once.** Bundle open Class C items into one AskUserQuestion with confidence-marked recommendations. Lander and Watchdog post them as a table in the digest instead. |
 | **D. Blocked by the harness** | The classifier or sandbox refuses a Class A or B action. | Use a legitimate route: another worktree, the checked script, plumbing. If none exists, put the command once in the daily digest, not every turn. **Never route around a Class C stop.** |
 
@@ -244,6 +244,24 @@ Target: about 30 to 50 owner prompts a day, mostly to the leads, plus the daily 
 - PHI rules. No `.env`, secrets or real store.
 - Register signatures stay your own act.
 - "Not deployed" never relaxes a rule.
+
+## 12. Amendment: tier T4, ADR-bound scope (owner ruling 2026-11-09)
+
+**The ruling, verbatim**, given in a Manager session's own chat in answer to two AskUserQuestion questions. The tier definitions were the Manager's text, selected by tier name.
+1. Q *"Which autonomy tiers should I adopt?"* A *"T1 fast path,T3 reclaim + spawn,T4 ADR-bound scope"*.
+2. Q *"Ledger ruling R5 freezes new method rules until 2026-12-02. How should this change treat it?"* A *"Exempt this change"*.
+
+**What landed: T4 only.** Delegated decision `d20261110T044924935-4ee4e8`, recorded as *"decided by the Manager under the owner's delegation of 2026-11-09"*. Q, asked after four review rounds did not converge: *"How should I proceed?"* A *"/driver"*. It was decided after an adversarial review that refuted in part: land T4 only, including Managers picking and decomposing ledger work; T1, T3 and the Builder own-fix spawn are deferred and not live.
+
+**T4 as landed.**
+- Filed ledger rows, and work an accepted ADR names as its direction, are Class B.
+- **Every T4 act takes the adversarial decision review in R4.** T4 has no fast path: R4's no-review path, and calibration under section 4.2, never apply to a T4 act.
+- Managers pick and decompose ledger work themselves, under the same rule.
+- **Still Class C:** a genuinely new product direction; any work touching a Class C path or weakening a control; a row that is DEMAND-GATE, declined-by-design, or waiting on an owner ruling; and the owner's in-person acts. Where a row or an ADR's direction would need one of these, that part stays Class C, whatever the row says.
+
+**Deferred, not live:** T1 (the fast path), T3 (reclaiming a dead holder's work, and a Builder spawning for its own fixes). A redesign will go back to the owner and needs its own R5 exemption: T1 as skipping the decision review on a clean `xhigh` code review; T3 as an extension of the Lander's held-PR repair route; spawning only by a Builder in its own session, pushing to a PR it already has open. **T2 was not adopted.**
+
+R4, section 4.2 and calibration are unchanged by this amendment. The R5 exemption covers this change only.
 
 ## Appendix: review record
 
