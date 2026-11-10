@@ -350,7 +350,7 @@ no `caFile` and no local anchor should verify against a CA installed in the OS s
 target never consults the OS store. Nobody has yet run this against a real engine.
 The measurement is the dispatch-only workflow `.github/workflows/ide-os-trust-probe.yml`, which
 runs the extension's client in a real VS Code against a disposable CA in a hosted runner's OS store,
-with the setting on and off. It has not yet run (BACKLOG #4576).
+with the setting on and off.
 
 Where a reverse proxy terminates TLS in front of the engine (`[api].tls_terminated_upstream`), the
 engine mints nothing and speaks plaintext behind the proxy. Point `messagefoundry.engineUrl` at the

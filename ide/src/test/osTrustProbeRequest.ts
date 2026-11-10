@@ -22,12 +22,19 @@ export function getOutcome(
   options: https.RequestOptions,
 ): Promise<Outcome> {
   return new Promise((resolve) => {
-    const req = get(url, options, (res) => {
-      res.resume();
-      const status = res.statusCode ?? 0;
-      const ok = status >= 200 && status < 300;
-      resolve(ok ? TRUSTED : { result: "error", code: `HTTP_${status}` });
-    });
+    let req: ReturnType<typeof https.get>;
+    try {
+      req = get(url, options, (res) => {
+        res.resume();
+        const status = res.statusCode ?? 0;
+        const ok = status >= 200 && status < 300;
+        resolve(ok ? TRUSTED : { result: "error", code: `HTTP_${status}` });
+      });
+    } catch (err) {
+      // A `get` that throws before it returns a request is an outcome too, not a rejection.
+      resolve(outcomeOf(err));
+      return;
+    }
     req.setTimeout(PROBE_TIMEOUT_MS, () =>
       req.destroy(Object.assign(new Error("timed out"), { code: "MF_TIMEOUT" })),
     );

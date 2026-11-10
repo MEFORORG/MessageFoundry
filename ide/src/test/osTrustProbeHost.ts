@@ -74,7 +74,9 @@ export async function run(): Promise<void> {
   setTrustFailureHandler(undefined);
   const url = new URL(target);
   const pin = tlsOptions(url).ca === undefined && pinRefusal(url) === undefined ? "none" : "present";
-  const settingRead: unknown = http.get("systemCertificates");
+  // The user-settings value, not the effective one: the default is true, so the effective value could
+  // not tell a read settings.json from an ignored one on the `on` launch.
+  const settingRead: unknown = http.inspect("systemCertificates")?.globalValue;
 
   // The measurement goes first, so no earlier request to the same server can have left a session or
   // a pooled socket behind for it to reuse.

@@ -19,6 +19,8 @@ set -euo pipefail
 out="${1:?usage: ide_os_trust_probe_ca.sh <out-dir>}"
 mkdir "$out" # fails, and so stops the script, when it already exists
 cd "$out"
+# Removes the CA key on every exit, a failed step's included.
+trap 'rm -f ca.key' EXIT
 
 cat > ca.cnf <<'EOF'
 [req]

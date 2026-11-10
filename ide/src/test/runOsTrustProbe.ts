@@ -38,14 +38,21 @@ const VERSION_RE = /^(stable|\d+\.\d+\.\d+)$/;
 /**
  * Variables that can make a Node TLS client trust the test CA, or skip verification, by a route that
  * is not the setting under test. VS Code inherits the launcher's environment, so each would reach
- * the Extension Host too. At least these; `NODE_OPTIONS` covers the command-line forms.
+ * the Extension Host too. At least these; `NODE_OPTIONS` covers the command-line forms, and
+ * `SSL_CERT_FILE`/`SSL_CERT_DIR` change what Node reads as the system store. VS Code is launched
+ * with `--force-disable-user-env`, so it adds no login-shell environment the launcher cannot see.
  */
 const REFUSED_ENV = [
   "NODE_EXTRA_CA_CERTS",
   "NODE_OPTIONS",
   "NODE_USE_SYSTEM_CA",
   "NODE_TLS_REJECT_UNAUTHORIZED",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
 ];
+
+/** A ceiling on the VS Code download and on each launch, well inside the job's 30 minutes. */
+const STEP_TIMEOUT_MS = 8 * 60_000;
 
 /** The compiled launcher lives at out/test/, so ../../ is the ide/ extension root. */
 const EXTENSION_ROOT = path.resolve(__dirname, "../../");
@@ -57,10 +64,23 @@ function errorText(err: unknown, withStack = false): string {
   return withStack && err.stack !== undefined ? err.stack : err.message;
 }
 
+/** `work`, or a rejection naming `what` once `ms` pass. The timer does not keep the process alive. */
+function withTimeout<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} did not finish in ${ms / 1000} s`)), ms);
+    timer.unref();
+  });
+  return Promise.race([work, expired]).finally(() => clearTimeout(timer));
+}
+
 function listen(server: https.Server): Promise<number> {
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolve((server.address() as AddressInfo).port));
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve((server.address() as AddressInfo).port);
+    });
   });
 }
 
@@ -85,17 +105,22 @@ async function launchOnce(
     fs.writeFileSync(path.join(userData, "User", "settings.json"), JSON.stringify(settings), "utf8");
     fs.rmSync(outFile, { force: true });
     // runTests adds its own fixed flags, `--no-sandbox` among them, to every launch.
-    await runTests({
+    const launched = runTests({
       vscodeExecutablePath,
       extensionDevelopmentPath: EXTENSION_ROOT,
       extensionTestsPath: path.resolve(__dirname, "./osTrustProbeHost"),
-      launchArgs: [`--user-data-dir=${userData}`, `--extensions-dir=${path.join(profile, "extensions")}`],
+      launchArgs: [
+        `--user-data-dir=${userData}`,
+        `--extensions-dir=${path.join(profile, "extensions")}`,
+        "--force-disable-user-env",
+      ],
       extensionTestsEnv: {
         MF_OS_TRUST_PROBE_URL: target,
         MF_OS_TRUST_PROBE_CA: path.join(dir, "ca.pem"),
         MF_OS_TRUST_PROBE_OUT: outFile,
       },
     });
+    await withTimeout(launched, STEP_TIMEOUT_MS, `the ${settingWord(on)} launch`);
   } catch (err) {
     failure = `the VS Code launch failed: ${errorText(err)}`;
   }
@@ -113,8 +138,11 @@ async function launchOnce(
   return { settingWritten: on, report, failure };
 }
 
-/** Everything the run measured and judged, as lines; a setup failure is a problem like any other. */
-async function probe(lines: string[], problems: string[]): Promise<void> {
+/**
+ * Everything the run measured and judged; a setup failure is a problem like any other. `record`
+ * prints each line as soon as it is measured, so a later hang cannot lose it.
+ */
+async function probe(record: (line: string) => void, problems: string[]): Promise<void> {
   const dir = process.env.MF_OS_TRUST_PROBE_DIR;
   if (!dir) {
     problems.push("MF_OS_TRUST_PROBE_DIR is not set");
@@ -149,6 +177,7 @@ async function probe(lines: string[], problems: string[]): Promise<void> {
     },
   );
   const target = `https://127.0.0.1:${await listen(server)}`;
+  server.on("error", (err) => problems.push(`the TLS server failed: ${errorText(err)}`));
   try {
     // No `ca` and no agent: Node's own bundled roots alone decide.
     const plainNode = await getOutcome(https.get, `${target}/health`, { agent: false });
@@ -156,9 +185,13 @@ async function probe(lines: string[], problems: string[]): Promise<void> {
       ["os", process.platform],
       ["node", process.versions.node],
     ];
-    lines.push(probeLine(plainContext, { path: "plain-node-control", pin: "n/a", outcome: plainNode }));
+    record(probeLine(plainContext, { path: "plain-node-control", pin: "n/a", outcome: plainNode }));
 
-    const vscodeExecutablePath = await downloadAndUnzipVSCode(version);
+    const vscodeExecutablePath = await withTimeout(
+      downloadAndUnzipVSCode(version),
+      STEP_TIMEOUT_MS,
+      "the VS Code download",
+    );
     const launches: Launch[] = [];
     for (const on of [true, false]) {
       const launch = await launchOnce(on, dir, target, vscodeExecutablePath);
@@ -167,8 +200,8 @@ async function probe(lines: string[], problems: string[]): Promise<void> {
         ["written", settingWord(on)],
         ...(launch.report?.context ?? []),
       ];
-      for (const record of launch.report?.records ?? []) {
-        lines.push(probeLine(context, record));
+      for (const measured of launch.report?.records ?? []) {
+        record(probeLine(context, measured));
       }
     }
     problems.push(...instrumentProblems(plainNode, launches));
@@ -177,29 +210,34 @@ async function probe(lines: string[], problems: string[]): Promise<void> {
   }
 }
 
-/** Print the lines and the verdict to stdout and, on a runner, to the job summary. */
-function emit(lines: readonly string[], problems: readonly string[]): void {
-  const verdict = `${PROBE_TAG} instrument=${problems.length === 0 ? "sound" : "BROKEN"}`;
-  const text = [...lines, verdict, ...problems.map((p) => `${PROBE_TAG} problem: ${p}`)].join("\n");
-  process.stdout.write(`${text}\n`);
+/** The job summary, on a runner; each write appends, so what was written survives a later hang. */
+function summarize(text: string): void {
   const summary = process.env.GITHUB_STEP_SUMMARY;
   if (summary) {
-    const heading = `### IDE OS trust store probe (${process.platform})`;
-    fs.appendFileSync(summary, `${heading}\n\n\`\`\`\n${text}\n\`\`\`\n`, "utf8");
+    fs.appendFileSync(summary, text, "utf8");
   }
 }
 
 async function main(): Promise<void> {
-  const lines: string[] = [];
   const problems: string[] = [];
+  summarize(`### IDE OS trust store probe (${process.platform})\n\n`);
+  const record = (line: string): void => {
+    process.stdout.write(`${line}\n`);
+    summarize(`    ${line}\n`);
+  };
   try {
-    await probe(lines, problems);
+    await probe(record, problems);
   } catch (err) {
     problems.push(`the probe stopped: ${errorText(err, true)}`);
   }
-  emit(lines, problems);
-  // exitCode, not exit(): stdout may be a pipe still draining the lines above.
+  record(`${PROBE_TAG} instrument=${problems.length === 0 ? "sound" : "BROKEN"}`);
+  for (const p of problems) {
+    record(`${PROBE_TAG} problem: ${p}`);
+  }
+  // exitCode, not exit(): stdout may be a pipe still draining the lines above. A launch that timed
+  // out can leave VS Code running and so the process alive; a last, unref'd timer ends it then.
   process.exitCode = problems.length === 0 ? 0 : 1;
+  setTimeout(() => process.exit(), 10_000).unref();
 }
 
 void main();

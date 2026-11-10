@@ -85,8 +85,9 @@ jobs:
       - name: Install and build the extension and the probe
         working-directory: ide
         # `pretest` is the build `npm test` runs: the bundle, then the compiled tests in out/.
+        # --ignore-scripts: no dependency install script runs in a job that later holds a root CA key.
         run: |
-          npm ci
+          npm ci --ignore-scripts
           npm run pretest
 
       - name: Mint the disposable test CA
@@ -97,21 +98,23 @@ jobs:
           echo "MF_OS_TRUST_PROBE_DIR=$dir" >> "$GITHUB_ENV"
 
       - name: Import the CA into the runner's OS store (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && runner.environment == 'github-hosted'
         # update-ca-certificates rebuilds /etc/ssl/certs/ca-certificates.crt, the bundle VS Code reads
         # on Linux. The verify is the control that the import took.
         run: |
+          if [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; then echo "::error::STOP     this imports a root CA and runs only on a GitHub-hosted runner, but this is '${RUNNER_ENVIRONMENT:-unknown}'; nothing ran"; exit 1; fi
           sudo cp "$MF_OS_TRUST_PROBE_DIR/ca.pem" "$LINUX_CA_FILE"
           sudo update-ca-certificates
           openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt "$MF_OS_TRUST_PROBE_DIR/leaf.pem"
 
       - name: Import the CA into the runner's OS store (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && runner.environment == 'github-hosted'
         # LocalMachine\Root, which every user's Root view includes. CurrentUser\Root would raise a
         # confirmation dialog that a service session cannot answer.
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw "STOP     this imports a root CA and runs only on a GitHub-hosted runner, but this is '$env:RUNNER_ENVIRONMENT'; nothing ran" }
           $cert = Import-Certificate -FilePath (Join-Path $env:MF_OS_TRUST_PROBE_DIR 'ca.cer') -CertStoreLocation Cert:\LocalMachine\Root
           if (-not (Test-Path "Cert:\LocalMachine\Root\$($cert.Thumbprint)")) { throw "the CA is not in LocalMachine\Root after the import" }
           "imported $($cert.Subject) $($cert.Thumbprint)"

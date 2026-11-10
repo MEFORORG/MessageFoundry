@@ -397,6 +397,11 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 #                                 structurally unfit to gate anything: it MEASURES a runner's ingress
 #                                 service rate and exits 0 even when the reconcile fails, because a
 #                                 machine too slow to keep up is the finding, not an error. See #320.
+#   ide-os-trust-probe.yml     -- workflow_dispatch only, so it never reports on a PR. Owner-approved
+#                                 as dispatch-only and never required (decision
+#                                 d20261106T101630309-6b6d34): it imports a disposable root CA into a
+#                                 hosted runner's OS store, and a refused client is a finding that
+#                                 leaves it green.
 #   freethread-smoke.yml       -- a 3.14t canary; informational only.
 #   invariant-mutations.yml    -- schedule/dispatch only, so it never reports on a PR
 #                                 (required-but-absent trap). Advisory by placement, not by
