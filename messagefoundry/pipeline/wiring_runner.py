@@ -10279,6 +10279,7 @@ class RegistryRunner:
         # no send and no disposition. Members are carried VERBATIM (the head too — never re-encoded); only
         # the head is PARSED, for the BHS separators + the BHS-11 control id.
         refused: list[_RefusedMember] = []
+        faulted_member: str | None = None  # the member whose hydration raised an internal error
         try:
             # #149 (ADR 0105 Phase 1b): re-attach each member's detached document VERBATIM before framing
             # the envelope, so a batched streaming feed delivers full inline documents (never a raw
@@ -10288,7 +10289,10 @@ class RegistryRunner:
             # A member whose own payload breaks the re-attach (a permanent NegativeAckError, vault
             # BACKLOG #2809) is refused alone, as the frame split below refuses one. Kept local until
             # every member has hydrated, so a fault that sends the whole batch to an arm below takes
-            # that member with it rather than leaving it in two dispositions.
+            # that member with it rather than leaving it in two dispositions. A refusal that is not
+            # permanent, or one that must stop the lane, is the whole batch's, as in the frame split.
+            # Any other fault, such as a stored CR (ADR 0105), takes the whole batch to the
+            # internal-error arm, which names the member by its outbox id (vault BACKLOG #5100).
             hydrated_items: list[OutboxItem] = []
             hydrated: list[str] = []
             unhydratable: list[_RefusedMember] = []
@@ -10296,7 +10300,12 @@ class RegistryRunner:
                 try:
                     hydrated.append(await self._hydrate_payload(it.payload, it.message_id))
                 except NegativeAckError as exc:
-                    unhydratable.append((it.id, safe_exc(exc), exc.with_traceback(None)))
+                    unhydratable.append(self._refused_member(it.id, exc))
+                except Exception:
+                    # Re-raised as it is. Only the internal-error arm reads this; a DeliveryError
+                    # or a _StoreReadFault goes to its own arm, which re-pends the whole batch.
+                    faulted_member = it.id
+                    raise
                 else:
                     hydrated_items.append(it)
             # ADR 0205 rule 1, per member: one member the frame cannot carry, or that holds more
@@ -10308,10 +10317,15 @@ class RegistryRunner:
                 kept, members, unframeable = self._split_unframeable_members(
                     connector, hydrated_items, hydrated
                 )
-                refused = unhydratable + unframeable
             else:
-                kept, members = hydrated_items, list[Message | str](hydrated)
-                refused = unhydratable
+                kept, members, unframeable = hydrated_items, list[Message | str](hydrated), []
+            # Assigned only once both loops are done, so a fault in either leaves it empty and its
+            # arm takes every member. In claim order, so the refusal lines follow the lane's FIFO:
+            # each list already is, so only a merge of two non-empty ones needs the sort.
+            refused = unhydratable + unframeable
+            if unhydratable and unframeable:
+                position = {it.id: i for i, it in enumerate(items)}
+                refused.sort(key=lambda r: position[r[0]])
             ids = [it.id for it in kept]
             if kept:
                 first = kept[0]  # the envelope's head is the first member that survived
@@ -10380,34 +10394,41 @@ class RegistryRunner:
             # vanished member, and on the retry branch a terminal one); CONTINUE (default)
             # dead-letters the members still present (bad data can never frame/deliver —
             # replayable from the DLQ) so a code bug or a mis-typed feed can't wedge the lane.
+            # A fault one member's re-attach raised names that member by its outbox id, never its
+            # content, in the log, the stored error and the alert (vault BACKLOG #5100).
+            # The refusal lines' own form, "batch member <outbox id>", so one search finds both.
+            member = "" if faulted_member is None else f"; batch member {faulted_member}"
             if (
                 self._internal_error.get(name, self._internal_error_default)
                 is InternalErrorPolicy.STOP
             ):
                 await self._dead_letter_refused(name, refused)  # before the stop, as above
                 log.error(
-                    "delivery worker %r: framing/internal error delivering a batch of %d (%s); STOPPING "
-                    "connection (operator must fix + reload/restart to resume)",
+                    "delivery worker %r: framing/internal error delivering a batch of %d (%s%s); "
+                    "STOPPING connection (operator must fix + reload/restart to resume)",
                     name,
                     len(ids),
                     type(exc).__name__,
+                    member,
                 )
                 failed = await self.store.mark_batch_failed(
-                    ids, f"internal error (connection stopped): {safe_exc(exc)}", retry
+                    ids, f"internal error (connection stopped): {safe_exc(exc)}{member}", retry
                 )
                 _note_stop_dead_letter("delivery worker", name, failed, head.stage)
                 self._alert_sink.connection_stopped(
-                    name, detail=f"{type(exc).__name__} delivering a batch of {len(ids)}"
+                    name, detail=f"{type(exc).__name__} delivering a batch of {len(ids)}{member}"
                 )
                 self._hold_for_operator(name, "outbound")
                 return _ItemOutcome.STOPPED, None
             log.warning(
-                "delivery worker %r: framing/internal error delivering a batch of %d (%s); dead-lettering",
+                "delivery worker %r: framing/internal error delivering a batch of %d (%s%s); "
+                "dead-lettering",
                 name,
                 len(ids),
                 type(exc).__name__,
+                member,
             )
-            await self.store.dead_letter_batch(ids, f"internal error: {safe_exc(exc)}")
+            await self.store.dead_letter_batch(ids, f"internal error: {safe_exc(exc)}{member}")
         else:
             if ids:  # nothing was sent when every member was refused
                 self._note_lane_healthy(name)
@@ -10439,15 +10460,22 @@ class RegistryRunner:
             try:
                 connector.check_frame(payload, rewrite=False)
             except NegativeAckError as exc:
-                if not exc.permanent or self._lane_stopping_fault(exc) is not None:
-                    raise
-                # No traceback: it would hold this frame, and with it every hydrated payload of
-                # the batch, in a cycle until the collector ran.
-                refused.append((item.id, safe_exc(exc), exc.with_traceback(None)))
+                refused.append(self._refused_member(item.id, exc))
             else:
                 kept.append(item)
                 kept_payloads.append(payload)
         return kept, kept_payloads, refused
+
+    def _refused_member(self, outbox_id: str, exc: NegativeAckError) -> _RefusedMember:
+        """The ``(id, error, refusal)`` of a batch member refused alone, by the re-attach or the
+        frame split, which share this one rule (vault BACKLOG #5100). A refusal that is not
+        permanent, or one that must stop the lane, is the whole batch's, so it is re-raised for
+        the batch's own arm, as a send would raise it."""
+        if not exc.permanent or self._lane_stopping_fault(exc) is not None:
+            raise exc
+        # No traceback: it would hold the caller's frame, and with it every hydrated payload of
+        # the batch, in a cycle until the collector ran.
+        return outbox_id, safe_exc(exc), exc.with_traceback(None)
 
     async def _dead_letter_refused(self, name: str, refused: Sequence[_RefusedMember]) -> None:
         """Dead-letter each batch member :meth:`_split_unframeable_members` or the batch re-attach
