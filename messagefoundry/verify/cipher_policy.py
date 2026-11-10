@@ -243,12 +243,15 @@ def _powershell_pins() -> dict[str, str]:
     }
 
 
-def _powershell(command: str) -> subprocess.CompletedProcess[str]:
+def _powershell(
+    command: str, *, timeout: float = _PROBE_TIMEOUT_S
+) -> subprocess.CompletedProcess[str]:
     """Windows PowerShell, by its pinned path, run on ``command`` as the probe runs it.
 
     One start, so the tests that run other text through the real PowerShell take it too, and
     cannot drift from the probe's arguments or environment (BACKLOG #3803 S5). ``command`` is a
-    fixed text of this module's or a test's, never host data."""
+    fixed text of this module's or a test's, never host data. ``timeout`` is the probe's own unless
+    a test, which has no probe error mapping around it, gives a cold runner longer."""
     return subprocess.run(  # nosec B603 - pinned tool, argv list (no shell), fixed arguments
         [
             _system_exe(*_POWERSHELL_HOME, "powershell.exe"),
@@ -264,7 +267,7 @@ def _powershell(command: str) -> subprocess.CompletedProcess[str]:
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=_PROBE_TIMEOUT_S,
+        timeout=timeout,
         check=False,
         creationflags=_NO_WINDOW,
     )

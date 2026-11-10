@@ -817,7 +817,9 @@ handed*, states what each one gets.
 installed in the Python that runs `verify`, found on the import path without being imported. It
 then asks whether the configuration takes such a hop: a `sqlserver` store backend in the service
 settings, or a deployed DATABASE connection, a `DatabaseRef` reference set or a
-`DatabaseLookup` in the `--config` graph whose `odbc_driver` is a Microsoft SQL Server driver. A hop found names itself in the row's evidence. The graph
+`DatabaseLookup` in the `--config` graph on a Microsoft SQL Server driver: every entry on the SQL
+Server preset, which builds only on one, and an entry on another dialect whose `odbc_driver` is
+one. A preset entry whose driver the preset refuses is no hop, since the engine never builds it. A hop found names itself in the row's evidence. The graph
 is loaded only when the store is not already a hop, and loading it runs the config modules, as the
 self smoke does, so `--section host` runs them too. With no hop configured the row SKIPs and names
 what it read, so a host that only has `pyodbc` installed does not fail on a policy nothing of it
@@ -825,8 +827,8 @@ uses.
 
 The answer is unknown where at least one of these holds: the graph did not load or there is no
 `--config` directory; the service settings did not load; the shell that runs `verify` does not set
-`MEFOR_STORE_BACKEND`; or no entry found is on a Microsoft driver, and one names its driver by an
-`env()` reference or uses another vendor's driver, which may bring its own TLS. That variable overrides the service config file, and the service's own
+`MEFOR_STORE_BACKEND`; or no entry found is on a Microsoft driver, and one off the preset names
+its driver by an `env()` reference or uses another vendor's driver, which may bring its own TLS. That variable overrides the service config file, and the service's own
 environment may set it where your shell does not, so a file that says `sqlite` does not show the
 store the service opens, which could be SQL Server. The row then still reads the policy, but
 reports a FAIL or ERROR reading as MANUAL with the reading in its detail. Run `verify` with
@@ -913,7 +915,7 @@ It runs the commands of this step. It differs from them in at least the ways nam
 | FAIL | Any of those does not hold. The row names the suites that are not AEAD. An `Enabled` value that is not set fails too, as on the stock host measured above. On Linux, no OpenSSL file at the path read fails too, because OpenSSL then applies no policy. |
 | ERROR | A reading was attempted and gave no usable answer. At least these: a command ran and failed or timed out; the system TLS module is there but did not import; PowerShell or `openssl` printed a line, or the Group Policy order held an entry, that is not a suite; `openssl version -d` printed other than one `OPENSSLDIR` line; a suite list, enabled or Group Policy, read empty; a registry value could not be read or held the wrong type; the OpenSSL file could not be read. An empty list is a control of 0, so it never reads as healthy. |
 | MANUAL | The row cannot take the reading here. At least these: no Windows PowerShell, no system TLS module folder or no `Get-TlsCipherSuite` cmdlet in it, no `openssl`, an empty `OPENSSL_CONF`, or an OpenSSL file that uses what the row does not follow or holds a line it cannot read (above). Run the commands above by hand. Also a FAIL or ERROR reading on a host whose configuration could not be read, so whether it takes an ODBC hop is not known (above). |
-| SKIP | `pyodbc` is not installed in the Python that runs `verify`, so no ODBC Driver 18 hop can run from it. Or the configuration takes no ODBC hop. Or the host is neither Windows nor Linux. |
+| SKIP | `pyodbc` is not installed in the Python that runs `verify`, so no ODBC hop can run from it. Or the configuration takes no ODBC hop. Or the host is neither Windows nor Linux. |
 
 When readings disagree, the row takes the worst: FAIL, then ERROR, then MANUAL, then PASS. So a
 broken reading never hides a finding. A FAIL or an ERROR makes `verify` exit 1, like any other FAIL

@@ -106,12 +106,13 @@ class OdbcHops:
         return not self.found and self.unknown is None
 
 
-def _census(odbc_hops: Callable[[], OdbcHops]) -> OdbcHops:
-    """``odbc_hops()``, with a failure the census did not foresee read as an unknown answer."""
+def _census(odbc_hops: Callable[[], OdbcHops], rid: str) -> OdbcHops:
+    """``odbc_hops()``, with a failure the census did not foresee read as an unknown answer.
+    ``rid`` names the row whose census it is, in the log."""
     try:
         return odbc_hops()
     except Exception as exc:  # a census failure the census did not foresee: it read nothing
-        _log.warning("verify: the ODBC hop census raised %s", type(exc).__name__)
+        _log.warning("%s: the ODBC hop census raised %s", rid, type(exc).__name__)
         reason = codec_safe_str(exc)[:200]
         return OdbcHops(unknown=f"the hop census raised {type(exc).__name__}: {reason}")
 
@@ -123,14 +124,17 @@ def _no_hop_detail(hops: OdbcHops, hop: str, on: str) -> str:
     )
 
 
-def _as_the_hops_make_it(reading: CheckResult, hops: OdbcHops, subject: str) -> CheckResult:
+def _as_the_hops_make_it(
+    reading: CheckResult, hops: OdbcHops, subject: str, question: str
+) -> CheckResult:
     """``reading`` as counted for a configuration whose hops are ``hops``.
 
     A configuration that takes a hop keeps the reading as it is, FAIL included, and names the hop.
     Where the configuration could not be read, a FAIL or ERROR reading is MANUAL with the reading in
     its detail: it may be wrong, but whether it matters here is not known, and the verifier must not
-    fail a host on a guess. ``subject`` names what was read, in that detail. A configuration known
-    to take no hop is the caller's to report, since the two rows word it differently."""
+    fail a host on a guess. ``subject`` names what was read, and ``question`` what the census could
+    not answer, in that detail. A configuration known to take no hop is the caller's to report,
+    since the two rows word it differently."""
     if hops.found:
         hop_text = "ODBC hops: " + ", ".join(hops.found)
         evidence = f"{hop_text}; {reading.evidence}" if reading.evidence else hop_text
@@ -141,7 +145,7 @@ def _as_the_hops_make_it(reading: CheckResult, hops: OdbcHops, subject: str) -> 
         reading.id,
         reading.title,
         Status.MANUAL,
-        f"whether this host takes an ODBC hop is not known ({hops.unknown}); if it takes one, "
+        f"{question} is not known ({hops.unknown}); if it does, "
         f"{subject} reads {reading.status.value}: {reading.detail}",
         evidence=reading.evidence,
     )
@@ -189,7 +193,7 @@ def check_sqlserver_odbc_driver(odbc_hops: Callable[[], OdbcHops]) -> CheckResul
     reading = _odbc_driver_reading()
     if reading.status not in FAILING:
         return reading
-    hops = _census(odbc_hops)
+    hops = _census(odbc_hops, reading.id)
     if hops.takes_none:
         return CheckResult(
             reading.id,
@@ -200,7 +204,9 @@ def check_sqlserver_odbc_driver(odbc_hops: Callable[[], OdbcHops]) -> CheckResul
             f"{reading.status.value}: {reading.detail}",
             evidence=reading.evidence,
         )
-    return _as_the_hops_make_it(reading, hops, "the driver")
+    return _as_the_hops_make_it(
+        reading, hops, "the driver", "whether a hop here needs ODBC Driver 18"
+    )
 
 
 def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
@@ -227,7 +233,7 @@ def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
     if sys.platform != "win32" and not sys.platform.startswith("linux"):
         # The reading SKIPs here, so the census, which runs config modules, is not taken.
         return cipher_policy.read_host_cipher_policy()
-    hops = _census(odbc_hops)
+    hops = _census(odbc_hops, rid)
     if hops.takes_none:
         return CheckResult(
             rid,
@@ -246,7 +252,7 @@ def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
             Status.ERROR,
             f"the policy read raised {type(exc).__name__}: {codec_safe_str(exc)}",
         )
-    return _as_the_hops_make_it(reading, hops, "the policy")
+    return _as_the_hops_make_it(reading, hops, "the policy", "whether this host takes an ODBC hop")
 
 
 def _asyncpg_has_connect_hook() -> bool | None:

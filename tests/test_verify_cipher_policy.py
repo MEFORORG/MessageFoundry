@@ -21,6 +21,7 @@ from unittest import mock
 
 import pytest
 
+from messagefoundry.config.wiring import WiringError
 from messagefoundry.verify import checks, cipher_policy
 from messagefoundry.verify.cipher_policy import ProbeFailed, ProbeUnavailable
 from messagefoundry.verify.model import CheckResult, Status
@@ -230,6 +231,11 @@ def test_the_command_runs_the_system_tls_modules_own_cmdlet() -> None:
 
 _POWERSHELL = ("WindowsPowerShell", "v1.0", "powershell.exe")
 
+#: These tests' PowerShell timeout. A cold Windows PowerShell 5.1 start with module analysis can
+#: take over the probe's 30 s on a CI runner, and here no probe error mapping turns the timeout
+#: into a reading, so a slow start would fail the test for a reason it does not test.
+_TEST_TIMEOUT_S = 60
+
 
 def _run_powershell(
     text: str, pins: Mapping[str, str] | None = None
@@ -238,9 +244,9 @@ def _run_powershell(
     arguments or environment (BACKLOG #3803 S5). ``pins``, when given, replace the probe's fixed
     ``PATH`` and ``PSModulePath``: ``{}`` is the start-up names alone, as unpinned."""
     if pins is None:
-        return cipher_policy._powershell(text)
+        return cipher_policy._powershell(text, timeout=_TEST_TIMEOUT_S)
     with mock.patch.object(cipher_policy, "_powershell_pins", lambda: dict(pins)):
-        return cipher_policy._powershell(text)
+        return cipher_policy._powershell(text, timeout=_TEST_TIMEOUT_S)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="runs the real Windows PowerShell")
@@ -277,7 +283,8 @@ def test_an_empty_module_folder_exits_not_on_this_host(tmp_path: Path) -> None:
     reads MANUAL (:func:`test_a_host_without_the_tls_cmdlet_is_manual`), never a PASS."""
     empty = tmp_path / "TLS"
     empty.mkdir()
-    text = cipher_policy._SUITES_COMMAND.replace('"$PSHOME\\Modules\\TLS"', f"'{empty}'")
+    quoted = str(empty).replace("'", "''")  # a single-quoted literal doubles its apostrophes
+    text = cipher_policy._SUITES_COMMAND.replace('"$PSHOME\\Modules\\TLS"', f"'{quoted}'")
     assert text != cipher_policy._SUITES_COMMAND
     assert _run_powershell(text).returncode == cipher_policy._NO_CMDLET_EXIT
 
@@ -285,7 +292,7 @@ def test_an_empty_module_folder_exits_not_on_this_host(tmp_path: Path) -> None:
 def test_the_tests_powershell_is_the_probes_start(monkeypatch: pytest.MonkeyPatch) -> None:
     """BACKLOG #3803 S5: the helper that runs other text through the real PowerShell took its own
     arguments and an unpinned environment, so a test could pass on a start the probe never makes.
-    It now takes the probe's start: the same call, but for the text."""
+    It now takes the probe's start: the same call, but for the text and a longer timeout."""
     seen: list[tuple[list[str], dict[str, Any]]] = []
 
     def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -297,6 +304,8 @@ def test_the_tests_powershell_is_the_probes_start(monkeypatch: pytest.MonkeyPatc
     _run_powershell("$PSVersionTable")
     (probe_argv, probe_kwargs), (test_argv, test_kwargs) = seen
     assert probe_argv[:-1] == test_argv[:-1] and test_argv[-1] == "$PSVersionTable"
+    assert test_kwargs.pop("timeout") == _TEST_TIMEOUT_S
+    assert probe_kwargs.pop("timeout") == cipher_policy._PROBE_TIMEOUT_S
     assert probe_kwargs == test_kwargs
 
 
@@ -1727,11 +1736,13 @@ def test_the_graph_is_loaded_once_per_run(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert loads == [True]
 
 
+@pytest.mark.parametrize("raised", [WiringError, SystemExit, OSError])
 def test_a_failed_shared_load_is_read_once_by_both(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raised: type[BaseException]
 ) -> None:
     """The failure path of the one load: the census reads it as unknown and the smoke as a FAIL,
-    and the modules run once."""
+    and the modules run once. A config module that exits at import, or a load that raises what the
+    census tolerates, ends the smoke row and not the verify run (code review round 3, finding 5)."""
     from messagefoundry.config import wiring
     from messagefoundry.verify.runner import run_verify
 
@@ -1742,7 +1753,7 @@ def test_a_failed_shared_load_is_read_once_by_both(
 
     def broken(d: Any, allow_empty: bool = False, **kw: Any) -> Any:
         loads.append(str(d))
-        raise wiring.WiringError("bad graph")
+        raise raised("bad graph")
 
     monkeypatch.setattr(wiring, "load_config", broken)
     _odbc_drivers(monkeypatch, "SQL Server")
@@ -1752,7 +1763,9 @@ def test_a_failed_shared_load_is_read_once_by_both(
     )
     rows = {r.id: r for r in results}
     assert rows["host.odbc"].status is Status.MANUAL and "bad graph" in rows["host.odbc"].detail
-    assert rows["smoke.self"].status is Status.FAIL and "bad graph" in rows["smoke.self"].detail
+    assert "whether a hop here needs ODBC Driver 18 is not known" in rows["host.odbc"].detail
+    assert rows["smoke.self"].status is Status.FAIL
+    assert "config failed to load" in rows["smoke.self"].detail
     assert len(loads) == 1
 
 
@@ -1805,10 +1818,17 @@ def test_the_wiring_reader_names_each_odbc_entry_and_its_driver() -> None:
         # The preset builds only on a Microsoft driver, so an env() driver there still takes the
         # host policy (round two, finding 1); whether it names Driver 18 is not known.
         (None, "env", "found", "unknown"),
-        # A preset entry on another vendor's driver is refused at build: never "its own TLS".
-        (None, "PostgreSQL Unicode", "found", "none"),
-        # The preset sends the name as written, so a padded name is not Driver 18 there.
-        (None, " ODBC Driver 18 for SQL Server ", "found", "none"),
+        # A preset entry on another vendor's driver is refused at build, so nothing dials it and it
+        # is no hop of either row (code review round 3, finding 2).
+        (None, "PostgreSQL Unicode", "none", "none"),
+        # The Driver 18 library named by its path: a Microsoft hop, but pyodbc lists registered
+        # names, not paths, so whether the row's reading applies is not known (round 3, finding 1).
+        (None, "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.3.so.3.1", "found", "unknown"),
+        (None, r"C:\Windows\System32\msodbcsql18.dll", "found", "unknown"),
+        # Another version's library needs no Driver 18.
+        (None, "/opt/microsoft/msodbcsql17/lib64/libmsodbcsql-17.10.so.6.1", "found", "none"),
+        # The preset sends the name as written and refuses a padded one at build, so it is no hop.
+        (None, " ODBC Driver 18 for SQL Server ", "none", "none"),
     ],
 )
 def test_each_row_counts_the_hops_its_driver_question_reaches(
