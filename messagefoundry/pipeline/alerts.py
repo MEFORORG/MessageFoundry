@@ -212,6 +212,14 @@ def sandbox_worker_refused_detail(*, content_only: bool) -> str:
     )
 
 
+def shown_error_class(error_class: str | None) -> str:
+    """The exception class a ``connection_error`` alert shows in the log and off the box, or the
+    fixed token ``unnamed error`` for one that is not a plain identifier (BACKLOG #3210, #5021)."""
+    if error_class is not None and error_class.isascii() and error_class.isidentifier():
+        return error_class
+    return "unnamed error"
+
+
 #: The subject a ``store_restored`` alert is raised under (BACKLOG #2614). No connection can be
 #: named this: the name grammar has no colon.
 STORE_RESTORED_SUBJECT = "store:restored"
@@ -1129,12 +1137,11 @@ class LoggingAlertSink:
     ) -> None:
         """This line is general-log text, so it names the caller's exception class and never reads
         ``detail``, which can echo transport text (BACKLOG #3210)."""
-        plain = error_class is not None and error_class.isascii() and error_class.isidentifier()
         log.warning(
             "ALERT connection_error: outbound %r %s (%s); the reason is not logged",
             name,
             kind,
-            error_class if plain else "unnamed error",
+            shown_error_class(error_class),
         )
 
     def log_write_failed(

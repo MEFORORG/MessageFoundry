@@ -64,6 +64,7 @@ from messagefoundry.pipeline.alerts import (
     intake_pause_detail,
     remote_debug_refused_detail,
     sandbox_worker_refused_detail,
+    shown_error_class,
 )
 from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
 from messagefoundry.transports.base import NegativeAckError
@@ -1209,9 +1210,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         detail: str | None = None,
         error_class: str | None = None,
     ) -> None:
-        # #46: an outbound lane went down. error_class is not sent: the event is unchanged. The shared _emit throttle keys on (type, connection), so a
-        # retry storm on one lane collapses to one notification per cooldown. detail is safe_exc-scrubbed.
-        self._emit({"type": "connection_error", "connection": name, "kind": kind, "detail": detail})
+        # #46: an outbound lane went down. The shared _emit throttle keys on (type, connection), so a
+        # retry storm on one lane collapses to one notification per cooldown. detail can echo a
+        # partner's reply, so it rides under _detail: stored as the alert reason, popped in _handle
+        # before any transport sees the event (BACKLOG #5021). Off-box carries the class instead.
+        self._emit(
+            {
+                "type": "connection_error",
+                "connection": name,
+                "kind": kind,
+                "error_class": shown_error_class(error_class),
+                "_detail": detail,
+            }
+        )
 
     def log_write_failed(
         self, name: str, *, stage: str, reason: str, stopped: int | None = None
@@ -2074,8 +2085,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 )
 
         else:
-            # reason: prefer the safe, PHI-free diagnostic the event already carries (detail/reason).
-            raw_reason = event.get("detail") or event.get("reason")
+            # reason: the diagnostic the event carries. _detail is a reason kept off the wire
+            # (connection_error, BACKLOG #5021); the stored copy is masked until revealed (#2443).
+            raw_reason = event.get("_detail") or event.get("detail") or event.get("reason")
             reason = str(raw_reason) if raw_reason is not None else None
 
             def write() -> Awaitable[Any]:
@@ -2264,6 +2276,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # #146: pop the per-rule EMAIL recipient override BEFORE the fan-out loop so it never reaches the
         # webhook (which serializes the event to JSON); only the email transport consumes it.
         recipients = event.pop("_recipients", None)
+        # #5021: a reason kept off the wire. _record_state already read it in _emit.
+        event.pop("_detail", None)
         # #138: pop the email-template context (rule label + effective cooldown) into a side mapping so the
         # event delivered to every transport is clean (no internal ``_``-keys); only the email uses it.
         context = {
