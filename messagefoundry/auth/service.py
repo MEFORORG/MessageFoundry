@@ -544,9 +544,10 @@ def _new_ip_path_field(path: str, seen_text: str | None = None) -> str:
     to compare; that extra full reading is what the past-cap line costs beyond the repeat line.
 
     It is ``logging_setup.UNREADABLE_LOG_VALUE`` in at least these cases: a pass rewrote the
-    repeat head; or the past-cap reading does not keep the head, the value and the space after it,
-    as when a pass took the seen text into the path, when the seen text made a pass hide more of
-    the path, or when a tab in the seen text set off the extra tab round. The field holds only the
+    repeat head; or the past-cap reading does not give the same value with its head and
+    ``seen_ip=`` with the seen text both whole, as when a pass took the seen text into the path,
+    when the seen text made a pass hide more of the path, or when a pass rewrote the seen text or
+    its key, which a path ending in a credential label, ``/api/auth/bearer`` for one, does. The field holds only the
     path's own text, and the two lines log either the one value or that placeholder. What the
     tests check of it is in
     ``tests/test_admin_new_ip.py``: over named vectors and a seeded corpus, with several seen

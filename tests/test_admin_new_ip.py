@@ -492,9 +492,11 @@ async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings() -> None
     # One path has one spelling, whatever the seen address and the line.
     assert all(len(spellings) == 1 for spellings in fields.values()), fields
     bearer = _FORGING_PATHS.index("/api/auth/bearer")
+    # The repeat line logs it; on the past-cap line a bearer label takes ``seen_ip=`` as its
+    # value, so the seen text is rewritten and the boundary is unknown.
     assert [_logged_fields(line)[-1][1] for line in lines[2 * bearer : 2 * bearer + 2]] == [
         "/api/auth/bearer",
-        "/api/auth/bearer",
+        _UNREADABLE,
     ]
     assert "SECRETVALUE" not in "\n".join(lines)
     assert "JANE" not in "\n".join(lines)
@@ -1433,11 +1435,16 @@ _OVER_HEAD = (
 _BASELINE_SEEN = ("10.0.0.1", *_HOSTILE_SEEN, "2001:DB8:0:0:0:0:0:1")
 
 #: A path that opens a quoted credential value and a seen text that closes it: main's past-cap
-#: line hid the rest of the path as that value, which a reading of the path alone does not.
+#: line hid the rest of the path as that value, which a reading of the path alone does not. The
+#: last three are the review's (round-ea896ecc): the seen text writes the path's own tail back
+#: after the quote, which a check of the value's prefix alone let through.
 _QUOTE_CLOSING_SEEN = (
     ("/x password='hunter2 more words", "x'"),
     ('/x token="abc def ghi', 'q"'),
     ("/x password='hunter2 more", "x' hunter2 more"),
+    ("/x password='hunter2 SECRETTAIL", "x' SECRETTAIL 1"),
+    ("/x password='hunter2 more", "x' more junk"),
+    ("/x password='hunter2 SECRETTAIL", "x' SECRETTAIL seen_ip=1"),
 )
 
 
@@ -1644,8 +1651,9 @@ def test_a_rewritten_context_logs_a_placeholder() -> None:
     assert _new_ip_path_field("/x/password:", "10.0.0.1") == _UNREADABLE_FIELD
     assert _new_ip_path_field("/x/password:") == '"/x/password_u003A_"'
     assert _new_ip_path_field("/plain/path", "10.0.0.1") == '"/plain/path"'
-    for seen in (None, "10.0.0.1", "DOE JANE hunter2"):
-        assert _new_ip_path_field("/api/auth/bearer", seen) == '"/api/auth/bearer"', seen
+    assert _new_ip_path_field("/api/auth/bearer") == '"/api/auth/bearer"'
+    for seen in ("10.0.0.1", "DOE JANE hunter2"):
+        assert _new_ip_path_field("/api/auth/bearer", seen) == _UNREADABLE_FIELD, seen
 
 
 def test_a_cut_checksum_is_never_read_as_a_date() -> None:
