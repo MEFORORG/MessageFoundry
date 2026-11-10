@@ -270,7 +270,7 @@ class RestartReconciliation:
 
     #: Rows this process had claimed in its previous life, now ``interrupted``.
     interrupted: tuple[str, ...]
-    #: Rows this process owns whose move failed. They stay ``executing`` until the next start.
+    #: Rows this process owns whose move raised. The next start tries them again.
     unsettled: tuple[str, ...]
     #: Rows another claim owner holds. Left alone: the owner may be alive and running them.
     foreign: tuple[str, ...]
@@ -719,7 +719,9 @@ class ApprovalGate:
         so such a row can only be left over from a development store.
 
         A move that fails is logged and skipped, and the next start tries again. Writing the status
-        alone would leave an ``interrupted`` row with no audit row saying why. A failed READ raises, for the caller to log."""
+        alone would leave an ``interrupted`` row with no audit row saying why. A failed read of this
+        process's rows raises, for the caller to log. A failed read of other owners' rows is logged,
+        and the moves stand."""
         me = self.claim_owner
         if self._claim_owner_value is None:
             # Not known yet. Sweeping under the default now would move rows of a sibling that
@@ -779,11 +781,31 @@ class ApprovalGate:
                     "approval %s: settled by another caller between the read and the move",
                     approval_id,
                 )
+        # Logged before the sibling read, so a failure there cannot hide the rows already moved.
+        if interrupted:
+            log.warning(
+                "approvals: %d release(s) this process claimed before it restarted never recorded "
+                "an outcome, so they are now 'interrupted'. Check each operation's effects and "
+                "record them through POST /approvals/{id}/resolve; approval ids: %s",
+                len(interrupted),
+                ", ".join(interrupted),
+            )
         foreign: list[str] = []
         # Only logged, never acted on, so this read needs no seal check. Its values are scrubbed,
         # since an unchecked row may carry anything. Filtered in SQL to other owners' rows, so
         # rows of ours that stayed 'executing' cannot fill the cap and hide a sibling's.
-        for other in await self._store.list_executing_approvals(not_claimed_by=me):
+        try:
+            others = await self._store.list_executing_approvals(not_claimed_by=me)
+        except _READ_DEFECTS:
+            raise  # a defect, not an outage, as _read treats it
+        except Exception:  # noqa: BLE001 - every store backend raises its own type
+            # The moves above stand; only the report of other owners' rows is lost.
+            log.exception(
+                "approvals: reading other claim owners' 'executing' releases failed, so they are "
+                "not reported at this start"
+            )
+            others = []
+        for other in others:
             foreign.append(str(other["id"]))
             log.warning(
                 "approval %s: still 'executing' under claim owner %s since %s. This process is "
@@ -795,14 +817,6 @@ class ApprovalGate:
                 scrub_log_argument(str(other["claim_owner"])),
                 scrub_log_argument(str(other["decided_at"])),
                 me,
-            )
-        if interrupted:
-            log.warning(
-                "approvals: %d release(s) this process claimed before it restarted never recorded "
-                "an outcome, so they are now 'interrupted'. Check each operation's effects and "
-                "record them through POST /approvals/{id}/resolve; approval ids: %s",
-                len(interrupted),
-                ", ".join(interrupted),
             )
         return RestartReconciliation(tuple(interrupted), tuple(unsettled), tuple(foreign))
 

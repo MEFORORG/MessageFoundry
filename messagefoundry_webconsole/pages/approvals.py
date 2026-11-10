@@ -214,7 +214,7 @@ _RESOLVE_REFUSALS: dict[int, tuple[str, str]] = {
         "before you request the operation again, because it may already have run.",
     ),
     503: (
-        "Nothing was recorded",
+        "Not confirmed",
         "The engine could not read or record this now, and its message below says why. Reload "
         "the page to see the release's state, and record it again once the cause is fixed.",
     ),

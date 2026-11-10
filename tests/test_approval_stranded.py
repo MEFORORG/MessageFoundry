@@ -184,6 +184,32 @@ async def test_the_restart_scans_siblings_with_the_owner_filter(engine: Engine) 
     assert found.foreign == (sibling,)
 
 
+async def test_a_failed_sibling_read_keeps_the_moved_rows(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The sibling read runs after this process's rows moved. When it fails, those moves are
+    still returned and announced, and the failure is logged on its own."""
+    mine = await _claimed_directly(engine.store, claim_owner="engine", claimed_at=1_000.0)
+    await _claimed_directly(engine.store, claim_owner="shard:b", claimed_at=2_000.0)
+
+    class _SiblingReadFails(_StandingStore):
+        async def list_executing_approvals(self, **kw: Any) -> Any:
+            if "not_claimed_by" in kw:
+                raise OSError("PROBE: sibling read failed")
+            return await self._store.list_executing_approvals(**kw)
+
+    gate = ApprovalGate(
+        _SiblingReadFails(engine.store), ON, resolve_identity=_resolve, claim_owner="engine"
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.approvals"):
+        found = await gate.reconcile_after_restart()
+    assert found.interrupted == (mine,) and found.foreign == ()
+    assert str((await _row(engine, mine))["status"]) == "interrupted"
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("now 'interrupted'" in m and mine in m for m in messages), messages
+    assert any("reading other claim owners" in m for m in messages), messages
+
+
 # --- the restart (residual 6; residual 3 dropped) ------------------------------------------------
 
 

@@ -9146,7 +9146,7 @@ class PostgresStore:
         )
 
     async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
-        """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
+        """Released requests at ``interrupted``, oldest-first (BACKLOG #1562). No expiry filter, and the
         order: the Store protocol says why."""
         return await self._fetchall(
             _PG_APPROVAL_SELECT

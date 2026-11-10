@@ -2995,7 +2995,7 @@ the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resol
   runs the approver check below on the resolver, against the request time. Once the row has moved,
   it writes `approval.approver_provenance` with `act` `resolve` and raises the same alert, keyed
   `approval:<id>:resolve`. A resolve that answers 409 or 503 is not flagged, even where its COMMIT
-  landed despite the error. The check compares against the request time, not the cut-off time,
+  landed despite the error. The check compares against the request time, not `decided_at`,
   so a row left `interrupted` for a long time also flags a routine password change or TOTP
   enrolment made while it waited. This is a seat decision under owner delegation
   2026-10-08, not an owner ruling.

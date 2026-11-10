@@ -2096,7 +2096,7 @@ class AuditStore(Protocol):
         ...
 
     async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
-        """Released requests whose operation was cut off mid-run (status ``interrupted``), OLDEST
+        """Released requests at status ``interrupted``, OLDEST
         first (BACKLOG #1562). Kept apart from :meth:`list_pending_approvals` so "pending" keeps its
         one meaning: awaiting a second approver. An interrupted row is awaiting an operator's record
         of what happened, so no expiry applies to it; it stays listed until it is resolved.
@@ -2106,7 +2106,7 @@ class AuditStore(Protocol):
         a row past the cap appears as the ones before it are resolved.
 
         Projects the same columns as the pending queue, so ``approver`` and ``decided_at`` say who
-        released it and when it was cut off."""
+        released it and when the row last moved."""
         ...
 
     async def decide_pending_approval(
