@@ -4441,6 +4441,7 @@ jobs:
           tests/test_stage_dispatcher.py
           tests/test_pooled_rider.py
           tests/test_uploads_shard_quota_interleave.py
+          tests/test_postgres_cipher_audit.py
 
       - name: Run the connection-scale pool-wait smoke on real Postgres (B11 wall #2, tiny pool)
         env:
