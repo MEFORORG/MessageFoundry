@@ -111,7 +111,7 @@ def _token_unset(platform: str | None = None) -> str:
 
 def _import_hvac() -> Any:
     """Lazily import ``hvac`` (the optional ``[vault]`` extra), failing closed with a
-    :class:`KeyProviderError` that names the extra — mirrors ``keyprovider.py``'s not-built-yet message.
+    :class:`KeyProviderError` that names the extra — mirrors ``keyprovider.py``'s missing-backend message.
     ``ImportError`` (not just ``ModuleNotFoundError``) is caught so a partially-broken install also fails
     closed rather than surfacing a bare import error out of ``open_store``."""
     try:
