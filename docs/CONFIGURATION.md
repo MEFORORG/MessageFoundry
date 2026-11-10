@@ -1521,7 +1521,8 @@ now reaps its whole process tree (a Windows kill-on-close job object / a POSIX p
 a grandchild no longer outlives the kill (BACKLOG #342). That reap is best-effort process hygiene: what
 makes a stray frame *harmless* is still the codec plus the request-answer binding (a live grandchild can
 at least force a respawn and dead-letter the message in flight or the one whose answer its frame
-follows, and a frame waiting before a request costs that message a retry on a fresh worker; it cannot
+follows, when the frame is already queued as that answer is read; a frame found waiting before a
+request, such as one that arrived after that check, costs that message a retry on a fresh worker; it cannot
 make its frame answer a request), not the process teardown.
 The child's **stderr is captured by the engine, not inherited** (ADR 0176): a Handler that prints is
 relayed into the engine's log attributed to the inbound, the child pid and the worker generation, with

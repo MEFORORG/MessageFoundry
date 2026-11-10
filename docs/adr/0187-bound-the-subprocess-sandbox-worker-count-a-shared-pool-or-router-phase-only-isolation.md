@@ -363,7 +363,12 @@ from one added pointer to this amendment, at the end of its paragraph on what a 
   fails; the workers spawned for it keep exiting, or closing their pipe, before its request is
   written; and any fault the request itself meets on the fresh worker, as for any other message,
   such as a worker that exits as its request is written. A frame left after an answer still
-  dead-letters the message it follows.
+  dead-letters the message it follows when it is already queued as `_reject_unsolicited` checks,
+  once, right after that answer is read. One that arrives later, on a worker still kept, is found
+  by `_live_worker`'s check before the next request and costs that message a retry instead, or,
+  arriving after that check, is read as that call's answer and dead-letters it. A length header
+  over the frame cap is new behaviour since #3135: before it, such a header read as a dead peer,
+  and it now counts as a stray frame at either check.
 - **Every kill records a cause from a closed set**, `KillCause` in `messagefoundry/pipeline/sandbox.py`,
   and writes one `WARNING` naming the inbound, the phase and the cause token, never message content.
   A graph refusal writes none, and a shutdown logs at `INFO`. The runner alerts on a graph refusal

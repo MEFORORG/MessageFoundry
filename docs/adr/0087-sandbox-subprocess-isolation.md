@@ -41,8 +41,10 @@ Router/Handler in a **persistent per-inbound worker subprocess**; `mode=off` (th
 in-process, byte-identically and with zero overhead.
 
 - **Approach (B) SUBPROCESS, stdlib-only.** `pipeline/sandbox.py` (`SandboxPolicy`, `SandboxSession`,
-  `run_sandboxed`, `SandboxError`) + `pipeline/_sandbox_worker.py` (the child, launched
-  `python -m messagefoundry.pipeline._sandbox_worker`). No new dependency. **RestrictedPython is
+  `run_sandboxed`, `SandboxError`) + `pipeline/_sandbox_worker.py` (the child, launched with the
+  command line `messagefoundry.childenv.python_child_argv(WORKER_MODULE)` builds: this interpreter
+  with its isolation flags, started through `childenv`'s bootstrap script, which runs the worker
+  module as `python -m` would; it is not a bare `python -m` start). No new dependency. **RestrictedPython is
   rejected** — it is not hard isolation (it restricts an AST but shares the address space) and would
   add a dependency.
 - **Persistent per-inbound worker, never a per-message fork.** The child is spawned lazily on first
@@ -357,9 +359,19 @@ target, no `pickle` import left to mis-suppress:
   > but that frame no longer fails the call: its message never reached the worker, so it is retried
   > once on a fresh worker. It still fails closed in at least the cases
   > [ADR 0187](0187-bound-the-subprocess-sandbox-worker-count-a-shared-pool-or-router-phase-only-isolation.md)
-  > *Amendment B* lists, the fresh worker having a stray frame waiting too among them. A frame left
-  > **after** an answer, or a length header over the frame cap in that slot, still fails the call
-  > closed. Every kill records a cause; ADR 0187 *Amendment B* says which kills write a WARNING.
+  > *Amendment B* lists, the fresh worker having a stray frame waiting too among them. The two
+  > checks run at fixed points. `_live_worker` checks, through `_drop_unsolicited`, before every
+  > request, on every worker it hands out, a fresh one included. `_reject_unsolicited` checks once,
+  > right after the call's answer is read. A frame left **after** an answer still fails the call
+  > closed when it is already queued at that second check. One that arrives later, on a worker
+  > still kept, is found by the next call's check before its request and costs that message a retry
+  > instead; one that arrives after that check is read as that call's answer, fails the
+  > request-answer binding, and dead-letters that message. A length header over the
+  > frame cap is new behaviour since #3135, not a carried-over rule. Before #3135 such a header read
+  > as a dead peer, so the worker was reaped and the answer stood, or the next message went to a
+  > respawn. It now counts as a stray frame at both checks: it fails the call closed after an
+  > answer, and before a request it drops the worker and retries the message. Every kill records a
+  > cause; ADR 0187 *Amendment B* says which kills write a WARNING.
   → `tests/test_sandbox.py::test_a_desynced_or_forged_response_is_rejected`,
   `tests/test_sandbox.py::test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`,
   `tests/test_sandbox.py::test_a_dead_peer_is_not_treated_as_a_forged_frame`,
