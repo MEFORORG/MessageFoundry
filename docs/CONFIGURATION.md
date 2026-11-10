@@ -2948,13 +2948,14 @@ nodes automatically:
 **Which setting sets a clamped SQL Server borrow's bound.** On SQL Server the coordinator's clamped
 statements wait for a pooled connection for at most their clamp floored at 1 s, or
 `[store].acquire_timeout` if that is shorter. When the clamp is the shorter limit, or ties with
-`[store].acquire_timeout`, a borrow that times out raises `StoreAcquireTimeout`, whose message ends
+`[store].acquire_timeout`, a borrow that times out raises `StoreAcquireTimeout`, except in
+`stop()` (last item below), and the message ends
 `retune with its [cluster] clamp's setting, if any (docs/CONFIGURATION.md [cluster])`,
 because no one setting sets every clamp (BACKLOG #5064). At a tie, raising the clamp alone does not
 lengthen the borrow: raise `[store].acquire_timeout` too. The message's `after Ns` is the limit
 that cut the borrow, so compare it with each term below to tell which applied; the claim and the
 paused owner read run in the same maintenance step, so the step name in the log does not tell them
-apart. At least these set the clamps:
+apart. At least these set the clamps, and only the first three can produce this message:
 
 - **The renew clamp**, for the claim and renew, the heartbeat, the config-version refresh and a
   stepdown's release write. It is `lease_renew_timeout_seconds` when set. Left unset, it is derived
@@ -2962,9 +2963,10 @@ apart. At least these set the clamps:
   `lease_renew_timeout_seconds` row above says. Raising the fence timeout narrows the margin that
   derivation reads, so it shortens a derived clamp, unless the derivation's cap or floor holds it.
 - **The paused tick's owner read**, which runs while a stepdown pause holds. Its clamp is the
-  smaller of two terms: the renew clamp, and half the paused-read budget, which is three quarters of
-  `leader_fence_timeout_seconds` ([CLUSTERING.md](CLUSTERING.md), *A slow store during the pause
-  does not block a retried stepdown*). Raising the fence
+  smaller of two terms: the renew clamp, and half the paused-read budget. That budget is three
+  quarters of `leader_fence_timeout_seconds`, so the term is three eighths of it
+  ([CLUSTERING.md](CLUSTERING.md), *A slow store during the pause does not block a retried
+  stepdown*). Raising the fence
   timeout lengthens the budget term but can shorten a derived renew term, so it can shorten this
   clamp rather than lengthen it. An explicit `lease_renew_timeout_seconds` takes the fence timeout
   out of the renew term, but it is still checked against the margin, and the row above says why
@@ -2972,8 +2974,12 @@ apart. At least these set the clamps:
 - **The 1 s floor.** The store runs any clamp under 1 s as 1 s, for the borrow and the statement
   alike. Only a shorter `[store].acquire_timeout` cuts a borrow sooner, and then the message names
   that setting instead. The paused read's own event-loop budget can also end the whole read first.
-- **`stop()`'s two writes**, the lease release and the `left` write. They run at a fixed 2 s
-  shutdown bound that no setting changes, inside an event-loop timeout of the same length.
+- **`stop()`'s two writes**, the lease release and the `left` write. Their clamp is a fixed 2 s
+  shutdown bound that no setting changes, and each write runs inside an event-loop timeout of the
+  same length. That timeout starts before the borrow's, so it fires first: the write raises
+  `TimeoutError`, logged as a failed release or `left` write, and never this message. A shorter
+  `[store].acquire_timeout` can still cut the borrow sooner, and then the message names that
+  setting. So do not compare this message's `after Ns` with the 2 s bound.
 
 #### `[cluster.vip]` — engine-managed virtual IP (ADR 0056, Windows-only)
 
