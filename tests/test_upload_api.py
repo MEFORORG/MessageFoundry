@@ -46,6 +46,7 @@ from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import reproving_transport
 from tests._deadline_capture import DeadlineCapture, capture_deadlines, expect_cut_off
 from tests._log_absence import assert_capture_sees
+from tests._upload_root import upload_entries
 from tests.test_uploads_strict_ciphertext import _BREAKS
 
 PW = "Correct-Horse-Battery-Staple-9"
@@ -1528,7 +1529,7 @@ async def test_a_create_row_that_fails_removes_the_stored_file(
         assert deleted == []
     else:
         assert await us.list_files() == []
-        assert not list((tmp_path / "uploads").iterdir())
+        assert not upload_entries(tmp_path / "uploads")
         assert [row["actor"] for row in deleted] == ["system"]
 
 

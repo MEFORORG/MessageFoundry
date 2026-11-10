@@ -58,6 +58,10 @@ from messagefoundry.config.settings import (
     StorePrivilegePosture,
     StorePrivilegeStatus,
 )
+from messagefoundry.sqlserver_roles import (
+    SQLSERVER_FIXED_DATABASE_ROLES,
+    SQLSERVER_FIXED_SERVER_ROLES,
+)
 from messagefoundry.support.redact import redact_log_line
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -216,33 +220,10 @@ def classify_audit_writes(
 
 
 # --- SQL Server -------------------------------------------------------------------------------
-#: The closed set of SQL Server FIXED SERVER roles, probed by name rather than enumerated from
-#: ``sys.server_principals``: catalog visibility is permission-filtered, so an enumeration that comes
-#: back empty is indistinguishable from "a member of nothing" — the false-clean this control exists to
-#: prevent. ``IS_SRVROLEMEMBER`` answers for the CURRENT login and needs no catalog permission.
-SQLSERVER_FIXED_SERVER_ROLES: tuple[str, ...] = (
-    "sysadmin",
-    "securityadmin",
-    "serveradmin",
-    "setupadmin",
-    "processadmin",
-    "diskadmin",
-    "dbcreator",
-    "bulkadmin",
-)
-
-#: The closed set of SQL Server FIXED DATABASE roles, probed by name for the same reason.
-SQLSERVER_FIXED_DATABASE_ROLES: tuple[str, ...] = (
-    "db_owner",
-    "db_securityadmin",
-    "db_accessadmin",
-    "db_backupoperator",
-    "db_ddladmin",
-    "db_datareader",
-    "db_datawriter",
-    "db_denydatareader",
-    "db_denydatawriter",
-)
+# The closed sets of SQL Server FIXED SERVER and FIXED DATABASE roles live in the leaf
+# :mod:`messagefoundry.sqlserver_roles`, shared with the partner-login probe in ``transports/``
+# (BACKLOG #2617), which may not import this package; its docstring says why they are probed by
+# name. Re-exported here under their old names.
 
 #: The grant the runbooks prescribe (``docs/DEPLOY-SERVER-DB.md`` §1.1) for an engine login that runs
 #: its OWN schema DDL (``[store].schema_management = auto``): row CRUD plus the schema DDL the ADR 0064
