@@ -349,14 +349,14 @@ jobs:
       # compares versions. The packaging copy pip carries parses each requirement, after this
       # step's version of pip's line handling, whose ${VAR} expansion is not pip's (split_line
       # below says how), and pip's own parser reads a line of options with no requirement. A
-      # marker false here, an extra, a URL or path with no name, and an editable line (-e or
-      # --editable, abbreviated or attached as pip allows) are only noted: the lock records no
+      # marker false here, an extra, a URL or path with no name, and an editable line (`-e` or
+      # `--editable`, abbreviated or attached as pip allows) are only noted: the lock records no
       # extras, an unnamed URL has no name to look up, and an editable installs a source tree or
       # checkout that no lock pin holds. A requirement it cannot parse fails, and so does a line of
-      # options with no requirement that pip cannot read. An include or constraint line (-r,
-      # --requirement, -c or --constraint, abbreviated or attached as pip allows, with no editable
-      # on the line) fails too: this step follows no file a line names, and no new lock clears
-      # such a line.
+      # options with no requirement that pip cannot read. An include or constraint line (`-r`,
+      # `--requirement`, `-c` or `--constraint`, abbreviated or attached as pip allows, with no
+      # editable on the line) fails too: this step follows no file a line names, and no new lock
+      # clears such a line.
       - name: Check requirements.lock is not stale against requirements.txt
         if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
         run: |
@@ -488,6 +488,9 @@ def named(group, name):
 
 #: The stale-lock check's own code, after the shared reader. A raw string for the same reason. A line
 #: of options and no requirement is read by the runner's pip's own requirements-line parser.
+#: pip's ``-c`` is in backticks wherever this module's text names it, here and in the workflow's
+#: comments: tests/test_threat_model_doc_drift.py reads an unquoted ``-c`` in a string literal as
+#: a flag that hands a shell its script text, and so as a shell-execution site.
 _CHECK_STALE = r"""
 import optparse, shlex
 
@@ -540,7 +543,7 @@ for group in logical_lines("requirements.lock"):
         exact = [s.version for s in req.specifier if s.operator in ("==", "===")]
         locked.setdefault(canonicalize_name(req.name), set()).update(exact)
 REGENERATE = (
-    "regenerate requirements.lock from requirements.txt, keeping any -c FILE in the lock command"
+    "regenerate requirements.lock from requirements.txt, keeping any `-c FILE` in the lock command"
 )
 # Each error with its remedy, in file order.
 errors = []
@@ -567,7 +570,7 @@ for group in logical_lines("requirements.txt"):
                     f"{line} names a constraints file, which this check does not follow",
                     "remove the line only once its limits apply elsewhere, as the engine's"
                     " docs/ADOPTER-CI.md, Job 3, says: for a file other than requirements.lock,"
-                    " pass -c FILE to every command that writes requirements.lock and keep it in"
+                    " pass `-c FILE` to every command that writes requirements.lock and keep it in"
                     " the README's, and for any file, make every install of requirements.txt"
                     " apply the lock (Job 3 says what the VS Code extension's setup needs), with"
                     " PIP_CONSTRAINT=requirements.lock for that command only or pip install"

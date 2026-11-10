@@ -808,7 +808,7 @@ _INCLUDE = (
 _CONSTRAINT = (
     "names a constraints file, which this check does not follow;"
     " remove the line only once its limits apply elsewhere, as the engine's docs/ADOPTER-CI.md,"
-    " Job 3, says: for a file other than requirements.lock, pass -c FILE to every command that"
+    " Job 3, says: for a file other than requirements.lock, pass `-c FILE` to every command that"
     " writes requirements.lock and keep it in the README's, and for any file, make every install"
     " of requirements.txt apply"
     " the lock (Job 3 says what the VS Code extension's setup needs), with"
@@ -887,7 +887,7 @@ def test_each_error_keeps_its_own_remedy_in_file_order(
     assert errors == [
         f"::error::-c extra.txt {_CONSTRAINT}",
         "::error::acme-hl7-utils is in requirements.txt but not in requirements.lock;"
-        " regenerate requirements.lock from requirements.txt, keeping any -c FILE in the lock command",
+        " regenerate requirements.lock from requirements.txt, keeping any `-c FILE` in the lock command",
     ]
 
 
