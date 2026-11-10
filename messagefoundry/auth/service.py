@@ -256,18 +256,9 @@ _LINEAGE_SIGN_IN_SLACK_SECONDS: Final = 120.0
 _RevocationApplied = Literal["skipped", "quiet", "reported"]
 
 
-@cache
-def _row_write_errors() -> tuple[type[Exception], ...]:
-    """What :meth:`AuthService._write_with_row` catches from a write that carries its audit row,
-    and from that row written on its own: what
-    :func:`~messagefoundry.store.base.audit_write_errors` names, and the defects
-    (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`). Anything else raises at once."""
-    return (*audit_write_errors(), *AUDIT_WRITE_DEFECTS)
-
-
 def _is_held_write_error(exc: BaseException) -> bool:
-    """Whether an error :func:`_row_write_errors` caught from a write with its audit row, or from
-    that row on its own, is held, and raised once the write's own steps have run, rather than
+    """Whether an error :func:`~messagefoundry.store.base.audit_write_errors` caught from a write
+    with its audit row, or from that row on its own, is held, and raised once the write's own steps have run, rather than
     sorted as a store refusal (BACKLOG #2221, #3018 step 4): a defect
     (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`). An error that set does not name is
     not caught, and raises at once. This is the one statement of the rule."""
@@ -276,12 +267,12 @@ def _is_held_write_error(exc: BaseException) -> bool:
 
 def _hold(held: Exception | None, more: Exception | None) -> Exception | None:
     """The error to raise once a write's own steps have run: the first one held, or ``more`` when
-    none was. A second error is named in the first's notes rather than dropped; each was logged
-    with its traceback when it was held."""
+    none was. A second error is named in the first's notes rather than dropped; each is logged
+    with its traceback where it is raised."""
     if held is None:
         return more
     if more is not None and more is not held:
-        held.add_note(f"also held and logged after it: {type(more).__name__}")
+        held.add_note(f"also raised, and logged where it was raised: {type(more).__name__}")
     return held
 
 
@@ -7744,11 +7735,10 @@ class AuthService:
                 detail=_json({"from": sorted(previous), "to": role_ids}),
                 client=client,
             )
-            synced_id = user.id
 
             async def write(with_row: bool) -> None:
                 await self._store.set_user_roles(
-                    synced_id,
+                    user.id,
                     role_ids,
                     assigned_by="ad-sync",
                     audits=(resynced,) if with_row else (),
@@ -7790,7 +7780,7 @@ class AuthService:
                 )
             except Exception as exc:
                 # Raised below, after the notice and the grant's page, since the roles committed.
-                held = _hold(exc, held)
+                held = _hold(held, exc)
             # A directory-pushed privilege change is the same privilege change to the same user as
             # a local one, so notify the affected user out-of-band too (ASVS 6.3.7), matching
             # set_roles(). Best-effort; the change is also visible in the audited
@@ -10686,15 +10676,16 @@ class AuthService:
         sessions. So, in order: the error is sorted by :func:`_is_held_write_error` and logged at
         ERROR, before anything can raise past it; the write is applied again without the row, and
         an error there raises at once, chained to the first; and, where that write landed, the row
-        is written on its own, whatever the first error was. A row refused there too is lost: it
-        is logged at ERROR, ``on_refused`` pages for its action, and the refusal is returned. A
-        row that lands on its own is logged at WARNING. A held error, the first or a defect in
-        the row written on its own, is returned for the caller to raise once its own steps have
-        run: the revoke, the user's notice and the pages. Only what :func:`_row_write_errors`
-        names is caught; anything else raises at once."""
+        is written on its own, whatever the first error was. A row that fails there too is lost
+        and logged at ERROR; a store refusal of it is handed to ``on_refused``, which reports its
+        action for a page, and returned. A row that lands on its own is logged at WARNING. A held
+        error, the first or a defect in the row written on its own, is returned for the caller to raise once its own steps have
+        run: the revoke, the user's notice and the pages. Only what
+        :func:`~messagefoundry.store.base.audit_write_errors` names is caught, the defects
+        included; anything else raises at once."""
         try:
             result = await write(True)
-        except _row_write_errors() as exc:
+        except audit_write_errors() as exc:
             held: Exception | None = exc if _is_held_write_error(exc) else None
             _log.error(
                 "%s: the write behind the %s row for %s raised %s with its row in its "
@@ -10703,7 +10694,8 @@ class AuthService:
                 action,
                 scrub_log_argument(actor),
                 type(exc).__name__,
-                "the error is raised once the write's own steps have run"
+                "the row, where that write lands, is written on its own, and the error is "
+                "raised once the write's own steps have run"
                 if held is not None
                 else "the row, where that write lands, is written on its own",
                 exc_info=exc,
@@ -10719,7 +10711,7 @@ class AuthService:
             await self._audit(
                 alone.action, actor=alone.actor, detail=alone.detail, client=alone.client
             )
-        except _row_write_errors() as lost:
+        except audit_write_errors() as lost:
             if lost.__cause__ is None:
                 lost.__cause__ = first
             _log.error(
@@ -10730,9 +10722,9 @@ class AuthService:
                 type(lost).__name__,
                 exc_info=lost,
             )
-            on_refused(action)
             if _is_held_write_error(lost):
                 return _RowWrite(result, False, retried=True, held=_hold(held, lost), refused=None)
+            on_refused(action)
             return _RowWrite(result, False, retried=True, held=held, refused=lost)
         _log.warning(
             "%s: the %s row for %s was written on its own, after the write it records",
@@ -10817,8 +10809,11 @@ class AuthService:
         the roles moved reads them again**: the first write may have committed with its reply
         lost, so a record already holding these roles counts as written, and is reported and
         recorded once more. A duplicate row and page are the safe direction; a silent miss is not.
-        That read also counts another writer's write of the same roles as this one's. A row lost
-        twice is noted for the pass's ``audit_write_failed`` page."""
+        That read also counts another writer's write of the same roles as this one's, and a store
+        refusal of the read counts as written too. An account gone by then counts as not written.
+        **Not closed:** a first write that committed, then another writer's move to a third set
+        before the read, reads as not written, and this write goes unreported. A row lost twice is
+        noted for the pass's ``audit_write_failed`` page."""
         detail = _json({"from": sorted(previous), "to": sorted(role_ids), "via": "ad-reconcile"})
         resynced = AuditAppend("auth.ad_roles_resynced", actor=revocation.username, detail=detail)
 
@@ -10832,7 +10827,23 @@ class AuthService:
             )
             if written or with_row:
                 return written
-            return set(await self._store.get_user_role_ids(revocation.user_id)) == set(role_ids)
+            try:
+                if await self._store.get_user(revocation.user_id) is None:
+                    return False
+                stored = await self._store.get_user_role_ids(revocation.user_id)
+            except audit_write_errors() as exc:
+                if _is_held_write_error(exc):
+                    raise
+                # Fail toward a report: the first write may have landed, and a revoke skipped on
+                # a refused read would leave its sessions on the old roles.
+                _log.error(
+                    "directory reconcile: the roles of %s could not be read back after a retried "
+                    "write found them moved; the change is counted as written",
+                    scrub_log_argument(revocation.username),
+                    exc_info=exc,
+                )
+                return True
+            return set(stored) == set(role_ids)
 
         return await self._write_with_row(
             write,
@@ -10873,7 +10884,9 @@ class AuthService:
 
         A role change counts only when THIS call's write made it: the write is a compare-and-set on
         the roles this call read (vault BACKLOG #3085), so of two reconcilers that both read the old
-        roles only the first counts it, and the second, ending no session, is quiet. A write whose
+        roles only the first counts it, and the second, ending no session, is quiet, unless its
+        write raised and was retried: a retry that finds the roles already as it would write them
+        counts the change too (:meth:`_write_reconciled_roles`). A write whose
         roles another writer moved to a different set after this call's read writes nothing. **Not
         closed, at least:** a sign-in that wrote between the pass's plan and this call's read, since
         the plan's roles are not carried to compare on; and a newer write of the same set this call

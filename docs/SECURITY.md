@@ -3210,9 +3210,10 @@ with no page.
     `granted_by` set to `<directory>` and `via` naming the route: `directory_sign_in_negotiate`
     for `POST /auth/negotiate`, `directory_sign_in_sso` for `GET /ui/sso`, and
     `directory_sign_in_oidc` for the `/ui/oidc` callback. A sign-in the engine refuses after the
-    sync ran raises it too, because the role was written all the same. A role sync that raises
-    leaves the route no outcome, so the engine raises the alert itself before the sign-in fails,
-    with `via` set to `directory_sign_in`. An account that already
+    sync ran raises it too, because the role was written all the same. When the role sync holds
+    an error until after the revoke and the notice, or the revoke raises, the route gets no
+    outcome, so the engine raises the alert itself before the sign-in fails, with `via` set to
+    `directory_sign_in`. An account that already
     held Administrator raises nothing.
   - **Sooner, when the account holds a live session.** A pass of the
     [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)

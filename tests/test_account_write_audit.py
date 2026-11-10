@@ -17,13 +17,14 @@ import json
 import logging
 import sqlite3
 from collections.abc import AsyncIterator, Sequence
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.pipeline.alerts import AlertSink, directory_sign_in_audit_alert
 from messagefoundry.store.store import AppendedAuditRow, AuditAppend, MessageStore
 from tests._account_write_audit_contract import assert_account_write_audit_contract, sign_in
 from tests._last_admin_store_contract import ADMIN, VIEWER, seed
@@ -443,3 +444,23 @@ async def test_a_sign_in_logs_its_first_role_error_before_the_retry_can_raise(
         and "auth.ad_roles_resynced" in r.getMessage()
         for r in caplog.records
     )
+
+
+def test_the_sign_in_audit_alert_pages_keyed_by_the_action() -> None:
+    """BACKLOG #2221. The callable the API wires as ``sign_in_audit_alert`` raises
+    ``audit_write_failed`` keyed ``directory-sign-in:<action>``, and a sink that raises costs the
+    caller nothing."""
+    calls: list[tuple[str, str]] = []
+
+    class _Sink:
+        def audit_write_failed(self, name: str, *, action: str) -> None:
+            calls.append((name, action))
+
+    directory_sign_in_audit_alert(cast(AlertSink, _Sink()))("auth.ad_roles_resynced")
+    assert calls == [("directory-sign-in:auth.ad_roles_resynced", "auth.ad_roles_resynced")]
+
+    class _Broken:
+        def audit_write_failed(self, name: str, *, action: str) -> None:
+            raise RuntimeError("synthetic: the sink broke its contract")
+
+    directory_sign_in_audit_alert(cast(AlertSink, _Broken()))("auth.ad_roles_resynced")

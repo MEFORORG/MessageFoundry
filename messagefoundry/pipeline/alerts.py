@@ -731,8 +731,9 @@ class AlertSink(Protocol):
         A directory sign-in whose role sync newly grants the role (vault BACKLOG #2610) raises it
         with ``name`` = ``user:<username>`` and ``via`` = ``directory_sign_in_negotiate``,
         ``directory_sign_in_sso`` or ``directory_sign_in_oidc``, naming the route; when that
-        role sync raises, the route has no outcome, and the service raises it with ``via`` =
-        ``directory_sign_in`` instead (BACKLOG #2221). A directory
+        role sync holds an error until after its revoke and notice, or the revoke raises, the
+        route has no outcome, and the service raises it with ``via`` = ``directory_sign_in``
+        instead (BACKLOG #2221). A directory
         reconcile pass whose role re-diff newly grants it (vault BACKLOG #3141) raises it with
         ``name`` = ``user:<username>`` and ``via`` = ``directory_reconcile``. The offline
         ``provision-admin`` command raises it on every Administrator it grants (vault BACKLOG #3849

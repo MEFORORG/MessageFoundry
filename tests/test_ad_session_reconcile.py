@@ -7336,11 +7336,12 @@ async def test_held_errors_are_raised_after_the_notice_and_neither_is_dropped(
         await store.close()
 
 
-async def test_a_role_defect_whose_row_is_refused_on_its_own_too_pages_and_raises(
+async def test_a_role_defect_whose_row_is_refused_on_its_own_too_is_noted_and_raised(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #3018 steps 2 and 4. On the defect path the row is still tried on its own; refused
-    there, it is lost and pages ``audit_write_failed``, and the defect is still raised."""
+    there, it is lost and noted for the pass's ``audit_write_failed`` page, and the defect is still
+    raised. A pass that raises returns no plan, so in a whole pass that note pages nothing."""
     store, _, service, _ = await _scoped_service(_GRP_A)
     try:
         user = await store.get_user_by_username("jdoe")
