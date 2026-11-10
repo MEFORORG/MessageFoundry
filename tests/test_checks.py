@@ -668,6 +668,22 @@ def test_expect_error_does_not_pass_on_a_strict_validation_timeout(
     assert "expected ERROR, got a strict-validation timeout" in dr.detail, dr.detail
 
 
+def test_expect_error_reason_is_not_matched_against_the_timeout_text_on_an_empty_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A late refusal whose text is empty is still the verdict, so the reason is matched against
+    # it, not against the timeout text that stands in the run's error.
+    from messagefoundry.parsing.validate import ValidationResult
+    from messagefoundry.pipeline import dryrun
+
+    _slow_clock(monkeypatch)
+    monkeypatch.setattr(dryrun, "validate", lambda *a, **k: ValidationResult(False, "2.5.1", [""]))
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR timed out")
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert "reason does not match" in dr.detail, dr.detail
+
+
 # The reason form is matched against the validator's verdict, not the timeout text in the error.
 @pytest.mark.parametrize("expect", ["ERROR\n", "ERROR PV1"])
 def test_expect_error_passes_on_a_late_strict_content_refusal(
@@ -725,6 +741,8 @@ def test_expect_error_reason_fails_when_the_error_lacks_it(tmp_path: Path, reaso
     [
         ("FILTERED some reason", "only ERROR takes a reason"),
         ("ERROR first line\nsecond line", "must fit on one line"),
+        ("ERROR\tsome reason", "with one space"),
+        ("ERROR  some reason", "with one space"),
     ],
 )
 def test_expect_reason_form_refuses_a_malformed_sidecar(

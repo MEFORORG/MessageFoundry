@@ -994,9 +994,9 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> _StrictRefusal
     the listener's late-result recovery: a validate that began before the deadline and finished
     after it, but before the listener handled the timeout, is used there as if it had not timed out,
     while a dry run reports any validate past the timeout as timed out. And the preview's clock
-    starts after :func:`~messagefoundry.parsing.validate.warm_validation`, so it never counts the
-    process's cold ``hl7apy`` import, its choice-group probe, the version's library or the
-    structure's reference load (BACKLOG #5107), where the listener's clock counts them on the first
+    starts after :func:`~messagefoundry.parsing.validate.warm_validation`, so it does not count the
+    process's cold ``hl7apy`` import or its choice-group probe, nor, when the warm-up can parse the
+    body's MSH, the version's library or the structure's reference load (BACKLOG #5107), where the listener's clock counts them on the first
     validate of each after a start. Below the timeout the verdict matches; the wall clock, the
     concurrency, that boundary case and a listener's first validate do not."""
     timeout = strict_validate_timeout(ic)

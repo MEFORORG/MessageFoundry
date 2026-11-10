@@ -1812,21 +1812,28 @@ def _expected_disposition(fixture_path: str | Path, *, cap: int) -> _Expectation
     data = read_fixture(
         sidecar,
         cap,
-        advice="an .expect sidecar holds one disposition name",
+        advice="an .expect sidecar holds one disposition name, or ERROR and a reason",
     )
     word, sep, reason = data.decode("utf-8").strip().partition(" ")
+    if any(ch.isspace() for ch in word):
+        # Not echoed: what follows another whitespace separator is a reason, which can quote the
+        # message.
+        raise ValueError("invalid .expect: separate ERROR from its reason with one space")
     raw = word.upper()
     normalized = _DISPOSITION_ALIASES.get(raw, raw)
     if normalized not in _DRYRUN_DISPOSITIONS:
         valid = ", ".join(sorted(_DRYRUN_DISPOSITIONS))
         raise ValueError(
-            f"invalid .expect disposition {raw!r} (use one of {valid}; PROCESSED/ROUTED alias RECEIVED)"
+            f"invalid .expect disposition {raw!r} (use one of {valid}, or ERROR <reason>; "
+            "PROCESSED/ROUTED alias RECEIVED)"
         )
     if not sep:
         return _Expectation(normalized)
     if normalized != "ERROR":
         raise ValueError(f"invalid .expect: only ERROR takes a reason, not {raw!r}")
-    if "\n" in reason or "\r" in reason:
+    if reason[:1].isspace():
+        raise ValueError("invalid .expect: separate ERROR from its reason with one space")
+    if len(reason.splitlines()) != 1:
         raise ValueError("invalid .expect: an ERROR reason must fit on one line")
     return _Expectation(normalized, reason)
 
@@ -1990,7 +1997,9 @@ def _check_dryrun(
                     # Matched against the raw text, never safe_error's: redaction must not decide
                     # whether the gate fails. A strict refusal is matched as the validator's own
                     # verdict, not the timeout text that stands in ``error`` for listener parity.
-                    if expected.reason not in (result.strict_refusal or result.error or ""):
+                    # ``is None``, not ``or``: an empty verdict is still the validator's verdict.
+                    said = result.error if result.strict_refusal is None else result.strict_refusal
+                    if expected.reason not in (said or ""):
                         # Neither text is printed: the error and the reason can both quote the
                         # message, and this detail lands in a CI log.
                         errors.append(
