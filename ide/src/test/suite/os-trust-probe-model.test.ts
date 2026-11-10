@@ -32,7 +32,7 @@ function report(settingRead: unknown, client: Outcome, overrides: Overrides = {}
       outcome: trusted,
     },
   ];
-  return { context: [["os", "linux"]], settingRead, records };
+  return { context: [["os", "linux"]], settingRead, settingEffective: settingRead, records };
 }
 
 function launch(on: boolean, client: Outcome, overrides?: Overrides): Launch {
@@ -90,7 +90,6 @@ suite("OS trust store probe model (BACKLOG #4576)", () => {
   test("either answer for the engine client is a finding, not a broken instrument", () => {
     for (const [on, off] of [
       [trusted, refused],
-      [refused, refused],
       [trusted, trusted],
       [refused, trusted],
     ]) {
@@ -98,7 +97,44 @@ suite("OS trust store probe model (BACKLOG #4576)", () => {
     }
   });
 
-  test("a plain-Node control that is not refused, trusted or failed, makes the run unreadable", () => {
+  test("a run with no trusted no-ca request in VS Code is broken, whichever path is trusted", () => {
+    // The explicit-CA control is trusted in both launches here and does not count: it carries a ca.
+    assert.match(
+      problemsOf(launch(true, refused), launch(false, refused)),
+      /^no request inside VS Code without a ca of its own was trusted in any launch[^\n]*$/,
+    );
+    // A trusted bare-https-control alone is enough, beside a refused engine client.
+    const bareOnly = launch(true, refused, {
+      "bare-https-control": { path: "bare-https-control", pin: "n/a", outcome: trusted },
+    });
+    assert.strictEqual(problemsOf(bareOnly, launch(false, refused)), "");
+    // So is a trusted engine client alone, beside a refused bare control.
+    const clientOnly = launch(false, refused, {
+      "engine-client": { path: "engine-client", pin: "none", outcome: trusted },
+    });
+    assert.strictEqual(problemsOf(launch(true, refused), clientOnly), "");
+  });
+
+  test("a launch whose effective setting differs from the value written is broken", () => {
+    const overridden = launch(false, refused);
+    if (overridden.report !== undefined) {
+      overridden.report.settingEffective = true;
+    }
+    assert.match(
+      problemsOf(launch(true, trusted), overridden),
+      /^http.systemCertificates off: VS Code resolved the setting as true/,
+    );
+    const unresolved = launch(true, trusted);
+    if (unresolved.report !== undefined) {
+      unresolved.report.settingEffective = undefined;
+    }
+    assert.match(
+      problemsOf(unresolved, launch(false, trusted)),
+      /^http.systemCertificates on: VS Code resolved the setting as undefined/,
+    );
+  });
+
+  test("a plain-Node control that was trusted or errored, not refused, makes the run unreadable", () => {
     for (const plain of [trusted, { result: "error", code: "ECONNREFUSED" } as Outcome]) {
       const problems = instrumentProblems(plain, [launch(true, trusted), launch(false, refused)]);
       assert.strictEqual(problems.length, 1);

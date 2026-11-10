@@ -74,9 +74,11 @@ export async function run(): Promise<void> {
   setTrustFailureHandler(undefined);
   const url = new URL(target);
   const pin = tlsOptions(url).ca === undefined && pinRefusal(url) === undefined ? "none" : "present";
-  // The user-settings value, not the effective one: the default is true, so the effective value could
-  // not tell a read settings.json from an ignored one on the `on` launch.
+  // Both values. The user-settings one shows settings.json was read (the default is true, so the
+  // effective value alone could not tell on the `on` launch); the effective one is what VS Code acts
+  // on, and a policy or default override could make it differ.
   const settingRead: unknown = http.inspect("systemCertificates")?.globalValue;
+  const settingEffective: unknown = http.get("systemCertificates");
 
   // The measurement goes first, so no earlier request to the same server can have left a session or
   // a pooled socket behind for it to reuse.
@@ -97,6 +99,7 @@ export async function run(): Promise<void> {
       ["node", process.versions.node],
       ["proxyAgent", proxyAgentVersion()],
       ["http.systemCertificates", String(settingRead)],
+      ["http.systemCertificates.effective", String(settingEffective)],
       ["http.systemCertificatesNode", String(http.get("systemCertificatesNode"))],
       ["http.experimental.systemCertificatesV2", String(http.get("experimental.systemCertificatesV2"))],
       ["http.proxySupport", String(http.get("proxySupport"))],
@@ -107,6 +110,7 @@ export async function run(): Promise<void> {
       ["nodeHttpsIsBuiltin", sameAsBuiltin(nodeHttps.request)],
     ],
     settingRead,
+    settingEffective,
     records: [
       { path: "engine-client", pin, outcome: client },
       { path: "bare-https-control", pin: "n/a", outcome: bare },

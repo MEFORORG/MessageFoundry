@@ -9,9 +9,13 @@
 // target with no `caFile` and no local anchor, with `http.systemCertificates` on? And with it off?
 //
 // WHAT TURNS THE RUN RED, AND WHAT DOES NOT. The answer is a finding, whichever way it falls, so a
-// "refused" for the engine client never fails the run. Only a broken instrument does, at least: a
-// control that went the wrong way, a setting VS Code did not read back, a launch that failed or wrote
-// no report, or a shipped bundle that imports `https` differently from the copy the probe measures.
+// "refused" for the engine client does not by itself fail the run. Only a broken instrument does, at
+// least: a control that went the wrong way, a setting VS Code did not read back (as the user value or
+// as the effective one), a launch that failed or wrote no report, a run in which no request inside
+// VS Code without a `ca` of its own was trusted, or a shipped bundle that imports `https` differently
+// from the copy the probe measures. The no-`ca` rule is the positive control that VS Code saw the
+// imported CA at all: without one trusted no-`ca` request, every refusal could be a CA VS Code never
+// loaded, and the run cannot tell that from a setting that reaches no request.
 // {@link instrumentProblems} and {@link specifierProblems} are the judges, and the launcher adds
 // failures of its own setup. An empty list is the only green.
 
@@ -49,6 +53,10 @@ const HOST_PATHS: readonly ProbePath[] = [
   "explicit-ca-control",
 ];
 
+/** The host paths that carry no `ca` of their own: a trusted one is the server's leaf verified
+ *  through something other than an explicit CA. */
+const NO_CA_HOST_PATHS: readonly ProbePath[] = ["engine-client", "bare-https-control"];
+
 /** How one request ended. `refused` is a certificate the client would not verify; `error` is
  *  anything else, which means the instrument, not the trust decision, failed. */
 export type Outcome = { result: "trusted" } | { result: "refused" | "error"; code: string };
@@ -85,8 +93,11 @@ export interface ProbeRecord {
 export interface HostReport {
   /** Name/value pairs describing where it ran, already in print order. */
   context: Array<[string, string]>;
-  /** `http.systemCertificates` as the Extension Host read it back. */
+  /** `http.systemCertificates` as the user setting the Extension Host read back
+   *  (`inspect().globalValue`). */
   settingRead: unknown;
+  /** `http.systemCertificates` as the Extension Host resolved it, the value VS Code acts on. */
+  settingEffective: unknown;
   records: ProbeRecord[];
 }
 
@@ -172,6 +183,12 @@ export function instrumentProblems(plainNode: Outcome, launches: readonly Launch
           "did not run with the value written",
       );
     }
+    if (report.settingEffective !== launch.settingWritten) {
+      problems.push(
+        `${label}: VS Code resolved the setting as ${fieldValue(report.settingEffective)}, so ` +
+          "something other than the user setting decided the value the launch ran with",
+      );
+    }
     for (const path of HOST_PATHS) {
       const matching = report.records.filter((r) => r.path === path);
       if (matching.length !== 1) {
@@ -193,6 +210,17 @@ export function instrumentProblems(plainNode: Outcome, launches: readonly Launch
         problems.push(`${label}: the engine client held a pin or anchor for the target`);
       }
     }
+  }
+  const noCaTrusted = launches.some((l) =>
+    (l.report?.records ?? []).some(
+      (r) => NO_CA_HOST_PATHS.includes(r.path) && r.outcome.result === "trusted",
+    ),
+  );
+  if (!noCaTrusted) {
+    problems.push(
+      "no request inside VS Code without a ca of its own was trusted in any launch, so nothing " +
+        "shows VS Code saw the imported CA, and no refusal can be credited to the client or the setting",
+    );
   }
   return problems;
 }

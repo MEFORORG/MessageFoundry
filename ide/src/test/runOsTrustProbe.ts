@@ -10,7 +10,8 @@
 // then launches VS Code twice, with `http.systemCertificates` written on and then off in a fresh
 // profile's user settings, running osTrustProbeHost.ts in each. It prints one IDE-OS-TRUST-PROBE line
 // per request, and exits non-zero only when the instrument is broken (osTrustProbeModel.ts says
-// which cases those are). A refused engine client is a finding and exits 0.
+// which cases those are). A refused engine client is a finding and exits 0, as long as some request
+// in VS Code without its own `ca` was trusted.
 //
 // Inputs, all from the environment:
 //   MF_OS_TRUST_PROBE_DIR     a directory holding ca.pem, leaf.pem and leaf.key (the job makes them)
@@ -51,8 +52,12 @@ const REFUSED_ENV = [
   "SSL_CERT_DIR",
 ];
 
-/** A ceiling on the VS Code download and on each launch, well inside the job's 30 minutes. */
-const STEP_TIMEOUT_MS = 8 * 60_000;
+/**
+ * A ceiling on the VS Code download and on each of the two launches: 18 minutes for all three, which
+ * leaves the job's 45-minute `timeout-minutes` in ide-os-trust-probe.yml more than 25 minutes for
+ * checkout, install, build and the CA steps, so a hang ends here, with a problem line, first.
+ */
+const STEP_TIMEOUT_MS = 6 * 60_000;
 
 /** The compiled launcher lives at out/test/, so ../../ is the ide/ extension root. */
 const EXTENSION_ROOT = path.resolve(__dirname, "../../");
