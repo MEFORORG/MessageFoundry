@@ -2880,8 +2880,7 @@ than to one request.
   another caller moved the row, and `unknown` where the read-back cannot tell.
 
 For some failed writes the gate logs at ERROR and pages nothing. At least this one: a restart
-cannot move a leftover `executing` row to `interrupted`. The row stays `executing`, and the next
-start tries again.
+cannot move a leftover `executing` row to `interrupted`. The next start tries again.
 
 An outcome's combined write can fail while the status write that follows finds the row already
 moved. The gate then writes no row alone, and reads the row back (vault BACKLOG #3193 N1). If it
@@ -2973,7 +2972,8 @@ already moved. The gate then writes no row alone and pages, as above.
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
 worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`
 lists `interrupted` rows after the pending ones, each with its `status`, the approver who released it,
-and when it was cut off. Once the operator has checked, `POST /approvals/{id}/resolve` with
+and its `decided_at`. That is the cut-off time for a cancel, and the claim time for a row a restart
+or an operator interrupt moved. Once the operator has checked, `POST /approvals/{id}/resolve` with
 `{"outcome": "effects_applied"}` or `{"outcome": "effects_not_applied"}` records the finding and moves
 the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resolve:
 
@@ -2987,8 +2987,9 @@ the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resol
   the operation afresh, through dual control;
 - answers **409** for a row that is not `interrupted`, including one another operator resolved first;
 - writes `approval.resolved` against the resolver in the same write as the move, naming the
-  requester, the releasing approver, the outcome, the new status and the cut-off time. If that write
-  fails, the resolve answers **503** and the row stays `interrupted`. A resolver who loses a race
+  requester, the releasing approver, the outcome, the new status and the row's earlier `decided_at`
+  as `interrupted_at`. If that write raises anything but a seal refusal, the resolve answers **503**
+  and pages `audit_write_failed`. A resolver who loses a race
   moves nothing and writes no row. The row keeps the releasing approver;
 - flags a resolver whose account changed after the request, and still resolves (BACKLOG #2125). It
   runs the approver check below on the resolver, against the request time. Once the row has moved,
@@ -3017,8 +3018,7 @@ runs once its name is known. Each row is in the same write as its move, written 
 and carries `reason` `engine_restart`, the claim owner and the claim time. The move keeps the row's `decided_at` as the
 claim time, so an `interrupted` row a restart settled shows when it was claimed, not when the
 engine restarted. Nothing re-runs. The operator checks the effects of an `interrupted` row and
-resolves it as above. A move that fails is logged and the row stays `executing` for the next start
-to try again.
+resolves it as above. A move that fails is logged, and the next start tries again.
 
 Engine shards and cluster nodes share one store, so a process touches only its own rows: a
 sibling's `executing` row may be a live release. The owner is:
@@ -3062,9 +3062,8 @@ even for a row this process is not running.
 The move is guarded on `executing` and on the claim owner it judged, so a row that moved or changed
 owner since answers **409** and moves nothing. Its `approval.interrupted` row is in the same write,
 against the operator, with `reason` `operator_interrupt`, the claim owner, the tier as `liveness`,
-and `owner_stopped_attested`. A store fault on that write answers **503** and pages
-`audit_write_failed`; the row does not move, except where a COMMIT lands despite the error, so
-read `GET /approvals/executing` before trying again. The move keeps `decided_at` as the claim time.
+and `owner_stopped_attested`. If that write raises anything but a seal refusal, the call answers
+**503** and pages `audit_write_failed`. The move keeps `decided_at` as the claim time.
 An attestation is the operator's word, and nothing checks it. A row interrupted while its owner was
 in fact still running it is recorded when that owner writes its outcome: the outcome write finds
 the row moved and logs it, and the outcome row is written alone. If that outcome write raised

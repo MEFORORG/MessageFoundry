@@ -89,8 +89,8 @@ _RESOLVE_LABELS: dict[ResolveOutcome, str] = {
 }
 
 _INTERRUPTED_NOTE = (
-    "These releases have no outcome in their status, so the operation may have done none, some or "
-    "all of its work; the audit log may hold its outcome row. Nothing re-runs them. Check the operation's own effects, then record what you found. "
+    "For these releases the engine cannot say whether the operation did none, some or all of its "
+    "work. Nothing re-runs them. Check the operation's own effects, then record what you found. "
     "Recording is final, and it may ask you to prove it is you again first; if it does, you come "
     "back here and choose again. The requester cannot record their own."
 )

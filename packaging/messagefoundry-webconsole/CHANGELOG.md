@@ -253,7 +253,8 @@ this line.**
   which the page never read. (vault `BACKLOG #3192`, `#3193`)
 - **The Interrupted releases table heads its time column "Cut off or claimed".** It read "Cut off",
   but a release a restart or an operator interrupt moved keeps its claim time there, not the time
-  it stopped. No seam changes. (`BACKLOG #1562`)
+  it stopped. Its note no longer says every such release was cut off while it ran: it says the
+  engine cannot tell what the operation did. No seam changes. (`BACKLOG #1562`)
 
 ## [0.5.0] — 2026-10-20 — Early Access
 

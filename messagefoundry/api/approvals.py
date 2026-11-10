@@ -10,8 +10,8 @@ and **both identities** land in the hash-chained audit log. A request older than
 ``[approvals].expiry_hours`` can no longer be approved.
 
 A release claims the row as ``executing`` before it runs the operation, then settles it to
-``approved`` (it ran), ``failed`` (it did not complete) or ``interrupted`` (cancelled mid-run, outcome
-unknown, never retried). BACKLOG #1562; :meth:`ApprovalGate.approve` carries the reasoning. An
+``approved`` (it ran), ``failed`` (it did not complete) or ``interrupted`` (effects unknown, never
+retried). BACKLOG #1562; :meth:`ApprovalGate.approve` carries the reasoning. An
 operator later records an ``interrupted`` row's effects as applied or not applied
 (:meth:`ApprovalGate.resolve_interrupted`), which never re-runs the operation. The claim records
 which engine process owns the release, and at that process's next start
@@ -718,9 +718,8 @@ class ApprovalGate:
         ``claim_owner`` column existed has none. Nothing was deployed then (CLAUDE.md section 0),
         so such a row can only be left over from a development store.
 
-        A move that fails is logged and skipped. The row stays ``executing`` and the next start
-        tries again; writing the status alone would leave an ``interrupted`` row with no audit row
-        saying why. A failed READ raises, for the caller to log."""
+        A move that fails is logged and skipped, and the next start tries again. Writing the status
+        alone would leave an ``interrupted`` row with no audit row saying why. A failed READ raises, for the caller to log."""
         me = self.claim_owner
         if self._claim_owner_value is None:
             # Not known yet. Sweeping under the default now would move rows of a sibling that
@@ -768,7 +767,7 @@ class ApprovalGate:
             except Exception:  # noqa: BLE001 - every store backend raises its own type
                 log.exception(
                     "approval %s: could not mark this process's leftover 'executing' release "
-                    "interrupted; it stays 'executing' and the next start tries again",
+                    "interrupted; the next start tries again",
                     approval_id,
                 )
                 unsettled.append(approval_id)
@@ -1264,7 +1263,7 @@ class ApprovalGate:
         }
 
     async def list_interrupted(self, *, caller_user_id: str | None = None) -> list[dict[str, Any]]:
-        """Releases cut off mid-run and awaiting an operator's record of what happened
+        """Releases at ``interrupted``, awaiting an operator's record of what happened
         (:meth:`resolve_interrupted`). They do not expire. ``caller_user_id`` as for
         :meth:`list_pending`."""
         await self._catch_up_reconcile()
@@ -2465,8 +2464,8 @@ class ApprovalGate:
         an owner ruling.
 
         **The move and its ``approval.resolved`` row are ONE write (vault BACKLOG #2255)**, so a
-        resolved row always names its resolver and the outcome they recorded. If that write fails
-        the call answers 503, pages ``audit_write_failed``, and the row stays ``interrupted``. A
+        resolved row always names its resolver and the outcome they recorded. If that write raises
+        anything but a seal refusal, the call answers 503 and pages ``audit_write_failed``. A
         resolver who loses a race to another moves nothing and writes no row; the row's status, and
         the winner's ``approval.resolved``, say what won.
 
