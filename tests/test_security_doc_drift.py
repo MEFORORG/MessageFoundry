@@ -110,9 +110,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # Vault BACKLOG #3373 added one /ui route and no JSON route: POST /ui/login/passkey, the passkey
 # sign-in's begin leg (ADR 0197 Amendment A wave 2), un-gated like the sign-in it serves.
 # BACKLOG #2614 added one JSON route: DELETE /sessions, users:manage.
-_ROUTES_DEFAULT = 117
-_ROUTES_WITH_DOCS = 121
-_ROUTES_WITH_UI = 245
+# ADR 0207 (vault BACKLOG #2609) added two JSON routes, POST and DELETE
+# /users/{user_id}/enrolment-code (users:manage), and their two /ui twins.
+_ROUTES_DEFAULT = 119
+_ROUTES_WITH_DOCS = 123
+_ROUTES_WITH_UI = 249
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in (with its passkey begin leg),
 #: re-auth and second-factor entry points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate
@@ -1302,6 +1304,12 @@ _UI_JSON_COUNTERPARTS: dict[tuple[str, str], tuple[str, str]] = {
         "/users/{user_id}/federated-identity",
     ),
     ("POST", "/ui/users/{user_id}/reset-mfa"): ("POST", "/users/{user_id}/reset-mfa"),
+    # ADR 0207: a directory account's enrolment code, issued and revoked.
+    ("POST", "/ui/users/{user_id}/enrolment-code"): ("POST", "/users/{user_id}/enrolment-code"),
+    ("POST", "/ui/users/{user_id}/enrolment-code/revoke"): (
+        "DELETE",
+        "/users/{user_id}/enrolment-code",
+    ),
     ("POST", "/ui/users/{user_id}/reset-password"): ("POST", "/users/{user_id}/reset-password"),
     ("POST", "/ui/users/{user_id}/roles"): ("PUT", "/users/{user_id}/roles"),
     ("POST", "/ui/users/{user_id}/revoke-sessions"): ("DELETE", "/users/{user_id}/sessions"),
@@ -2177,8 +2185,9 @@ def test_ungated_routes_are_exactly_the_reviewed_allowlist() -> None:
     # 95 -> 96: BACKLOG #2345's GET /messages/{message_id}/raw, messages:view_raw.
     # 96 -> 97: BACKLOG #2331's GET /users/{user_id}/federated-identity, users:manage.
     # 97 -> 98: BACKLOG #2614's DELETE /sessions, users:manage.
-    assert len(gated) == 98, (
-        f"{len(gated)} permission-gated routes, not 98 — update the doc's totals."
+    # 98 -> 100: ADR 0207's POST and DELETE /users/{user_id}/enrolment-code, users:manage.
+    assert len(gated) == 100, (
+        f"{len(gated)} permission-gated routes, not 100 — update the doc's totals."
     )
 
 
@@ -2923,10 +2932,18 @@ def test_data_plane_mtls_listeners_are_derived_from_the_transports() -> None:
     assert "CERT_REQUIRED" in joined and "tls_ca_file" in joined, (
         "the mTLS data-plane row must name the verify mode and the setting that turns it on"
     )
-    assert "never reaches the accept path" in joined, (
-        "the row must state that the refusal happens at the TLS handshake, before the accept path — "
-        "which is why there is no connection event for it"
+    # BACKLOG #2479: the row used to say an HTTP connection on uvloop "never reaches the accept
+    # path". The MLLP and HTTP listeners now admit every TLS socket before its handshake on every
+    # loop, so what the row must still state is why the refusal writes no session event.
+    assert "the only connection event is a throttled `tls_handshake_failed`" in joined, (
+        "the row must state that a refusal at the TLS handshake opens no session, which is why "
+        "its only connection event is the throttled handshake failure"
     )
+    # And the stale loop scoping is gone, so the row cannot drift back to it unseen.
+    for stale in ("never reaches the accept path", "standard asyncio loop", "BaseEventLoop"):
+        assert stale not in joined, (
+            f"the row scopes the HTTP listener's admission by loop: {stale!r}"
+        )
 
 
 def test_connection_event_capture_defaults_to_on() -> None:

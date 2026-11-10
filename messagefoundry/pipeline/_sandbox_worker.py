@@ -22,9 +22,9 @@ direction, in either process.
    re-establishes the run-scoped context providers for the phase (substituting the boot-carried code
    sets, which the per-dispatch frame deliberately does not repeat), runs the function, and
    **describes** the result back as ``ok`` — or ``fail`` with ``kind`` ``denied`` (forbidden import, a
-   live ``db_lookup``/``fhir_lookup`` at ``mode=subprocess``), ``error`` (a plain handler raise, an
-   undescribable result, or at ``mode=isolated`` a lookup error, the lookup having been asked of the
-   parent through :class:`_Broker` while the Handler ran) or
+   live ``db_lookup``/``fhir_lookup`` at ``mode=subprocess``), ``error`` (a plain handler raise, a
+   ``sys.exit()`` in user code, an undescribable result, or at ``mode=isolated`` a lookup error,
+   the lookup having been asked of the parent through :class:`_Broker` while the Handler ran) or
    ``memory`` (a ``MemoryError``, after which the worker exits so the parent starts a fresh one).
    The reply echoes the request's ``id``, ``phase`` and ``name`` so the parent can prove the frame
    answers the call it made.
@@ -399,6 +399,17 @@ def _run_one(
                 items = handler_result_items(result)
                 if items is not None:
                     result = items
+            elif phase == "router" and result is not None and not isinstance(result, str):
+                # The same for a generator Router: iterate it here, inside the run context and the
+                # arms below, so a raise or a sys.exit() in its body is this Router's error rather
+                # than an escape from the codec's list() in `_respond` that ends the worker (vault
+                # BACKLOG #3134). A non-iterable is left for the codec to refuse with its own text.
+                try:
+                    names = iter(result)
+                except TypeError:
+                    pass
+                else:
+                    result = list(names)
         if phase == "accepts":
             # HandlerAccepts is contractually ``(msg) -> bool`` and the PARENT coerces the verdict with
             # ``bool(...)`` (dryrun._accepted). Coerce HERE too, BEFORE the result is described back: a
@@ -427,6 +438,15 @@ def _run_one(
         return False, None, "denied", str(exc)
     except MemoryError:
         raise  # not a plain handler error: main() answers it and recycles the worker
+    except SystemExit as exc:
+        # Caught deliberately: sys.exit() in user code is a content fault, reported in mode=off's words
+        # (vault BACKLOG #3134; UserCodeCalledSysExit says why config code differs). Uncaught, it ended
+        # the worker, so the message read as a crash and the next paid a respawn. No shutdown of this
+        # worker raises here: the parent closes the pipe (EOF in main()) or kills it. KeyboardInterrupt
+        # and every other BaseException are not converted, as at mode=off.
+        from messagefoundry.pipeline.wiring_runner import UserCodeCalledSysExit
+
+        return False, None, "error", _error_text(UserCodeCalledSysExit.from_exit(exc))
     except Exception as exc:  # noqa: BLE001 — a handler raise is content, reported not crashed
         return False, None, "error", _error_text(exc)
     return True, result, "", ""
@@ -438,13 +458,14 @@ def _error_text(exc: BaseException) -> str:
     attributes, so this boundary must too. An error that HOLDS one, as ``ValueError("bad", exc)``,
     prints that error's repr, the whole input, so it renders the same way (vault BACKLOG #3295).
     Never raises: the error's own __str__ may, and so may the import after untrusted config has
-    run, and either would kill the worker mid-report."""
+    run, and either would kill the worker mid-report. That covers a __str__ calling sys.exit(),
+    which is user code too (vault BACKLOG #3134)."""
     try:
         # cached: logging_setup imported it at load
         from messagefoundry.redaction import codec_safe_line
 
         return codec_safe_line(exc)
-    except Exception:  # noqa: BLE001 — the class name is all that is left to report
+    except (Exception, SystemExit):  # noqa: BLE001 — the class name is all that is left to report
         return type(exc).__name__
 
 
@@ -506,6 +527,11 @@ def main() -> int:
         import messagefoundry.config.db_lookup  # noqa: F401
         import messagefoundry.config.fhir_lookup  # noqa: F401
         import messagefoundry.config.run_context  # noqa: F401
+
+        # _run_one's sys.exit() arm reads UserCodeCalledSysExit from here. The package __init__ has
+        # already imported it, and that import pulls in modules the guard forbids, so name it here
+        # rather than leave the arm resting on the package's side effect (vault BACKLOG #3134).
+        import messagefoundry.pipeline.wiring_runner  # noqa: F401
 
         memory_cap = _apply_resource_caps(boot.mem_mb)
         _install_import_guard(boot.forbidden)

@@ -37,5 +37,6 @@ class X12ValidationError(X12Error):
     (a parseable interchange that violates its implementation guide) is **not** this — it is reported
     as data on :class:`~messagefoundry.parsing.x12.validate.X12ValidationResult` (``valid=False`` +
     structural :class:`~messagefoundry.parsing.x12.validate.X12SegmentError` items + a 997/999 ack), so
-    a Handler can route the *message* to the error path while still emitting the negative ack. Its
-    message is **PHI-safe**: it names only the failure mode, never the input bytes."""
+    a Handler can route the *message* to the error path while still emitting the negative ack (the ack
+    is ``None`` if pyx12 did not complete it). Its message is **PHI-safe**: it names only the failure
+    mode, never the input bytes."""

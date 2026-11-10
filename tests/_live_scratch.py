@@ -103,9 +103,11 @@ class SqlServerAdmin:
         return None if row is None else row[0]
 
     async def run_in(self, database: str, sql: str) -> None:
-        """Run ``sql`` inside ``database`` without moving this session there. ``sql`` holds no single
-        quote: the fixtures' names and passwords are hex and ``token_urlsafe``."""
-        await self.run(f"EXEC [{database}].sys.sp_executesql N'{sql}'")
+        """Run ``sql`` inside ``database`` without moving this session there. Each single quote in
+        ``sql`` is doubled, so it reaches ``sp_executesql`` as written; the store's own DDL, such as
+        the v0.3.2 batch, is full of them."""
+        quoted = sql.replace("'", "''")
+        await self.run(f"EXEC [{database}].sys.sp_executesql N'{quoted}'")
 
     async def kill_sessions(self, login: str) -> None:
         """End every session ``login`` holds, so ``DROP LOGIN`` does not refuse with 15434 ("currently

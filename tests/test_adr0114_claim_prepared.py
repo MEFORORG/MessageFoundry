@@ -107,7 +107,9 @@ class _FakeDedicatedConn:
         self.ops = ops
         self._cur = cur
         if raw:
-            self._conn = SimpleNamespace(timeout=None)  # raw pyodbc conn (STORE-3 target)
+            # The raw pyodbc conn (STORE-3 target). Its close is the one the store's one-shot exit
+            # reaches through the call gate when the holder has no cursor yet (BACKLOG #2394).
+            self._conn = SimpleNamespace(timeout=None, close=self._raw_close)
         self.closed = False
         self.fail_cursor: BaseException | None = None
 
@@ -123,6 +125,9 @@ class _FakeDedicatedConn:
         self.ops.append(("rollback@ded",))
 
     async def close(self) -> None:
+        self.closed = True
+
+    def _raw_close(self) -> None:
         self.closed = True
 
 

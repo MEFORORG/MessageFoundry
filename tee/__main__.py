@@ -142,6 +142,25 @@ def _parse_age(spec: str) -> float:
     return day.timestamp()
 
 
+# The --out help text, stated where an operator reads it (vault BACKLOG #3166 step 4).
+# :func:`_write_owner_only` is the source of record, and docs/TEE-RELAY.md the long form. The
+# POSIX open-in-place sentence is shared by all three commands' --out help.
+_OUT_POSIX_OPEN_IN_PLACE = (
+    "On POSIX, a target that resolves, through any link, to a character device, or to anything "
+    "else that is neither a regular file nor a directory and that this account owns, such as a "
+    "pipe, is opened for writing in place instead of replaced; the open can be refused, for "
+    "example for a socket."
+)
+_OUT_EXPORT_AND_ANONYMIZE = (
+    "Lines end in LF on every OS, Windows included. On POSIX a new file's mode is never wider "
+    "than 0600, and an existing FILE is replaced rather than written into: a read-only (0444) "
+    "FILE is overwritten, a hard link at FILE is broken, and a symbolic link at FILE is "
+    f"replaced. {_OUT_POSIX_OPEN_IN_PLACE} On Windows an existing FILE is written in place, "
+    "through any link, and keeps its access list and owner; one it cannot write is an error, "
+    "never replaced."
+)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tee", description="Standalone MLLP tee relay (backlog #14)"
@@ -233,7 +252,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=None, metavar="N", help="cap to the most recent N rows"
     )
     export.add_argument(
-        "--out", metavar="FILE", default=None, help="write to FILE instead of stdout"
+        "--out",
+        metavar="FILE",
+        default=None,
+        help=f"write to FILE instead of stdout. {_OUT_EXPORT_AND_ANONYMIZE}",
     )
 
     purge = sub.add_parser("purge", help="delete logged rows (and captured bodies) from the DB")
@@ -286,7 +308,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out",
         metavar="FILE",
         default=None,
-        help="write the JSON report to FILE instead of stdout",
+        help=(
+            "write the JSON report to FILE instead of stdout. On POSIX a new file's mode is never "
+            "wider than 0600. compare replaces an existing regular file; the replace can be refused, "
+            "for example for a read-only file on Windows. On Windows the replaced report takes its "
+            "folder's access list, so an access list hardened on the old file is not kept. "
+            f"{_OUT_POSIX_OPEN_IN_PLACE} On Windows compare opens a target that resolves, through "
+            "any link, to anything that is neither a regular file nor a directory, such as NUL or "
+            "CON, for writing in place instead of replacing it; the open can be refused, for "
+            "example for a named pipe."
+        ),
     )
     compare.add_argument(
         "--show-diffs",
@@ -312,7 +343,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     anon.add_argument("--db", required=True, metavar="PATH", help="tee SQLite DB (captured bodies)")
     anon.add_argument(
-        "--out", required=True, metavar="FILE", help="output JSONL of de-identified messages"
+        "--out",
+        required=True,
+        metavar="FILE",
+        help=f"output JSONL of de-identified messages. {_OUT_EXPORT_AND_ANONYMIZE}",
     )
     anon.add_argument(
         "--direction",
@@ -500,10 +534,11 @@ def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> Non
 
     ``in_place_on_windows`` is True for ``export`` and ``anonymize-captures``, and False for
     ``compare``. False keeps ``compare``'s writer on main, unchanged on every OS: newlines are the
-    platform's (CRLF on Windows), a named stream is written through, and anything else is replaced
-    by a ``mkstemp`` file with ``os.replace``, an existing file or link on Windows included. There
-    the report takes the folder's access list, whatever list the old file had, even one that
-    denied this account writing; a link is replaced rather than followed; and the write is atomic.
+    platform's (CRLF on Windows), a target :func:`_is_named_stream` accepts is opened for writing
+    in place, and anything else goes to a ``mkstemp`` file and ``os.replace``, which replaces an
+    existing regular file on Windows too. There the report takes the folder's access list,
+    whatever list the old file had, even one that denied this account writing; a link to a
+    regular file is replaced rather than followed; and the write is atomic.
     A folder's list can itself let another account read the report, and the replace does not stop
     that. The POSIX paragraph below applies to both values; the paragraphs on Windows describe
     True.
@@ -521,10 +556,8 @@ def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> Non
 
     On POSIX an existing ``path`` gets the same treatment: a regular file, or a link, is replaced
     rather than written into, so neither its owner nor its mode carries over, and a reader holding
-    the old file open keeps the old contents. One exception: a stream the caller named on purpose,
-    such as ``/dev/stdout`` or a shell's ``>(...)``, is written through, since replacing it would
-    break it and nothing is created there. That covers a character device, and a pipe or socket
-    this account owns; any other non-regular file falls to the replace.
+    the old file open keeps the old contents. On POSIX, a target :func:`_is_named_stream` accepts
+    is opened for writing in place instead of replaced.
 
     On Windows an existing ``path`` of any kind -- a regular file, one with a second hard link, a
     symlink, even a dangling one -- is opened for writing through ``Path(path)``, as
@@ -582,7 +615,13 @@ def _write_through(target: Path, text: str, newline: str | None) -> None:
 
 
 def _is_named_stream(path: str) -> bool:
-    """Whether ``path`` resolves to a character device, or to a pipe or socket this account owns."""
+    """Whether ``path`` resolves, through any link, to a character device, or to anything else that
+    is neither a regular file nor a directory and that this account owns.
+
+    Such a target is a stream the caller named on purpose, such as ``/dev/stdout`` or a shell's
+    ``>(...)``, and replacing it would break it. The owner check refuses a pipe another account
+    planted at the name. Where ``os`` has no ``geteuid``, as on Windows, the owner is not checked,
+    so there anything that is neither a regular file nor a directory counts."""
     try:
         status = os.stat(path)
     except OSError:
