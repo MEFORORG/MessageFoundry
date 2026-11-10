@@ -2399,8 +2399,10 @@ judge it as that family.
 
 **The password.** For every family on [the allowlist](#the-generic-driver-allowlist) the
 password is **always** sent braced, with the ODBC `}}` escape, whatever it holds: psqlODBC and
-MySQL Connector/ODBC were measured to read the escape, and Microsoft's driver, not probed for this
-item, is relied on for the same escape by the SQL Server preset and the store.
+MySQL Connector/ODBC were measured to read the escape, and Microsoft's driver is relied on for it
+by the SQL Server preset and the store. The comment above `_DRIVER_FAMILIES` in
+`messagefoundry/transports/database.py` names the test for Microsoft's driver and lists at least
+what stays unmeasured (BACKLOG #2705).
 
 Braces matter even for a password with no delimiter in it. psqlODBC URL-decodes an unbraced `PWD`,
 so `+` becomes a space and `%41` becomes `A`, and takes a braced one literally (its
