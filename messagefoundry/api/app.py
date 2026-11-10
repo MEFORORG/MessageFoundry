@@ -3829,7 +3829,9 @@ def _compose_preset_layers(
     ``search_messages`` (ADR 0136 §5, BACKLOG #151). Each metadata scalar
     (``channel_id``/``status``/``message_type``/``control_id``) takes the first non-empty value and
     **rejects a conflicting second** (400). **Exactly one** preset may carry a content needle (a
-    ``content`` substring or a ``field_path``[+``field_value``]); >1 or 0 → 400. Raises
+    ``content`` substring or a ``field_path``[+``field_value``]); >1 or 0 → 400. A lone
+    ``field_value`` counts as a needle too, so ``make_spec`` refuses it (400) rather than the compose
+    dropping it (BACKLOG #6700). Raises
     :class:`HTTPException` (400) on a conflict / missing-or-duplicate needle; the caller maps the
     ``ContentSearchError`` from a malformed field path likewise."""
     meta_keys = ("channel_id", "status", "message_type", "control_id")

@@ -246,13 +246,15 @@ Where each rule lives:
   cannot clash there.
 - Blank values in a content search: `make_spec` counts a value of only spaces as not sent. It
   keeps any other `content` or `field_value` exactly as sent, spaces included, because a leading
-  or trailing space narrows the match. It strips `field_path`, which is a locator. An empty `content` never reaches it: the model refuses that with a 422. On the
-  two one-or-neither routes, a pair holding only spaces gets a 400.
+  or trailing space narrows the match. It strips `field_path`, which is a locator. An empty
+  `content` never reaches it: the model refuses that with a 422. On the two one-or-neither routes,
+  a pair holding only spaces gets a 400, and a `field_value` of only spaces counts as not sent.
 - The console search form: it calls the API's search handler, so a clash gets the same answer.
   With no criteria at all it shows the empty form and does not search.
 - Layered search: `_compose_preset_layers`, in
-  [`messagefoundry/api/app.py`](../messagefoundry/api/app.py). A content term is a `content` value
-  or a `field_path` saved in a preset.
+  [`messagefoundry/api/app.py`](../messagefoundry/api/app.py). A content term is a `content` value,
+  a `field_path` or a `field_value` saved in a preset. A preset holding a `field_value` with no
+  `field_path` counts as one, and the search refuses it with a 400.
 - Edit and resubmit, and the statistics reset: each route itself, in the same file.
 - Password change: the API rule is in the route, in
   [`messagefoundry/api/auth_routes.py`](../messagefoundry/api/auth_routes.py). The API takes no

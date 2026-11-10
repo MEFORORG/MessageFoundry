@@ -505,6 +505,11 @@ async def test_a_lone_field_value_is_refused_not_saved_unread(engine: Engine) ->
             headers=h,
         )
         assert meta_only.status_code == 200, meta_only.text
+        # A content of only spaces is refused, as on origin/main, not saved as a needle never applied.
+        spaces = await c.post(
+            "/search/presets", json={"name": "s", "criteria": {"content": "   "}}, headers=h
+        )
+        assert spaces.status_code == 400, spaces.text
         # A stored lone field_value (saved before the refusal existed) is refused on the layered
         # read rather than dropped by the compose.
         pid = meta_only.json()["id"]

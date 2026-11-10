@@ -1969,3 +1969,7 @@ async def test_a_lone_field_value_on_an_upload_browse_is_refused(
         )
         assert blank.status_code == 200, blank.text
         assert blank.json()["matched"] == 2
+        # A content of only spaces is refused, as on origin/main: it must not browse the whole
+        # file as though it had filtered it.
+        spaces = await c.post(f"/uploads/{fid}/messages/search", json={"content": "   "}, headers=h)
+        assert spaces.status_code == 400, spaces.text
