@@ -872,8 +872,9 @@ from typing import Any
 #: the deliberate bump: it moves the recorded name, so such a console refuses to mount instead.
 #: Re-derived with ``--write``, from ``2a4589213e5e782c`` to ``4f631135c80e1120`` on its own branch.
 #:
-#: Merge of the #3748 entry with main at ``ae0ea5c81cc935b7``: each digest was derived
-#: without the other's change, so neither held for the merged surface. Re-derived with ``--write``
+#: Merge of the #3748 entry with main after engine PR 2851, at seam digest ``ae0ea5c81cc935b7``
+#: (a digest, not a commit): each was derived without the other's change, so neither held for the
+#: merged surface. Re-derived with ``--write``
 #: over both, from ``4f631135c80e1120`` and ``ae0ea5c81cc935b7`` to ``f44b72b2102da33e``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
