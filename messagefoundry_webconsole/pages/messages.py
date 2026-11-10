@@ -640,7 +640,7 @@ def message_resend_unknown(message_id: str) -> Markup:
     )
 
 
-def message_resend_done(message_id: str, to: str, source: str, *, duplicate: bool) -> Markup:
+def message_resend_done(message_id: str, to: str, *, duplicate: bool) -> Markup:
     """The resend OUTCOME page — the GET a completed POST redirects to (post-redirect-get, vault
     BACKLOG #2625), instead of the detail page.
 
@@ -651,13 +651,15 @@ def message_resend_done(message_id: str, to: str, source: str, *, duplicate: boo
     ``duplicate`` is ADR 0090 §4's no-op: the key was already used and NOTHING was queued. Saying
     "queued" for it would be the same lie as answering a refusal with the success response, so the
     two outcomes are worded apart. The ways out are LINKS, not redirects — a role that cannot open
-    the detail page simply does not follow that one."""
-    # An empty `source` names none: the outcome route shows the target alone (vault BACKLOG #3241).
-    copied = f", copied from “{source}”" if source else ""
+    the detail page simply does not follow that one.
+
+    It names the target alone, never the source: the route renders from the store's record of the
+    resend and checks scope on the target only, so a caller scoped to the target learns nothing
+    about the origin channel (vault BACKLOG #3241)."""
     said = (
         "That key was already used, so nothing new was queued. The earlier resend stands."
         if duplicate
-        else f"A new delivery of this message is queued to “{to}”{copied}."
+        else f"A new delivery of this message is queued to “{to}”."
     )
     return page(
         "Resend message",

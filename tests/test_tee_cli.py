@@ -413,6 +413,103 @@ def _write_out(
     return _anonymize_to(tmp_path, monkeypatch, out)
 
 
+def _out_help(command: str) -> str:
+    parser = _build_parser()
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    out = next(a for a in sub.choices[command]._actions if "--out" in a.option_strings)
+    return " ".join((out.help or "").split())
+
+
+@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+def test_out_help_states_what_the_writer_does_to_the_file(command: str) -> None:
+    # Vault BACKLOG #3166 step 4: the accepted behaviour changes are met only when the tee's own
+    # text states them, not the ledger alone.
+    text = _out_help(command)
+    for consequence in (
+        "LF on every OS, Windows included",
+        "never wider than 0600",
+        "a read-only (0444) FILE is overwritten",
+        "a hard link at FILE is broken",
+        "a symbolic link at FILE is replaced",
+        "On Windows an existing FILE is written in place",
+        "keeps its access list and owner",
+    ):
+        assert consequence in text, f"{command} --out help lacks {consequence!r}: {text}"
+
+
+def test_compare_out_help_states_that_an_existing_file_is_replaced() -> None:
+    text = _out_help("compare")
+    assert "never wider than 0600" in text
+    assert (
+        "compare replaces an existing regular file; the replace can be refused, for example for a read-only file on Windows."
+        in text
+    )
+    # The supermanager's decision of 2026-11-09 on PR 2390 notes 7, 8 and 10 keeps the replace on
+    # Windows, met only when the help says the old file's hardened access list is lost.
+    assert (
+        "On Windows the replaced report takes its folder's access list, so an access list hardened on the old file is not kept."
+        in text
+    )
+    assert (
+        "On Windows compare opens a target that resolves, through any link, to anything that is neither a regular file nor a directory, such as NUL or CON, for writing in place instead of replacing it; the open can be refused, for example for a named pipe."
+        in text
+    )
+
+
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
+def test_out_help_states_the_posix_open_in_place_rule(command: str) -> None:
+    # One sentence, shared by all three commands, says which targets are opened rather than replaced.
+    assert (
+        "On POSIX, a target that resolves, through any link, to a character device, or to anything else that is neither a regular file nor a directory and that this account owns, such as a pipe, is opened for writing in place instead of replaced; the open can be refused, for example for a socket."
+        in _out_help(command)
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows device names")
+def test_compare_out_writes_to_nul_in_place_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The compare help says a device such as NUL is opened in place, not replaced. A replace onto
+    # NUL fails (WinError 183), so exit 0 is the assertion that can fail.
+    db = _seed_compare(tmp_path, monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    assert _compare_to(db, "NUL") == 0
+
+
+def test_compare_out_replaces_a_second_hard_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PR 2390 note 9 (vault BACKLOG #3166): compare replaces on every OS, Windows included, so a
+    # second hard link to the old file keeps the old contents.
+    other = tmp_path / "elsewhere.json"
+    other.write_text("untouched\n", encoding="utf-8")
+    out = tmp_path / "out.json"
+    os.link(other, out)
+    assert os.stat(out).st_nlink == 2  # control: the target really has a second link
+    assert _write_out("compare", tmp_path, monkeypatch, out) == 0
+    data = out.read_bytes()
+    assert b"untouched" not in data
+    assert json.loads(data)["summary"]["matched"] == 1
+    assert other.read_text(encoding="utf-8") == "untouched\n"
+    assert os.stat(out).st_nlink == 1
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_compare_out_replaces_a_name_with_a_trailing_separator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PR 2390 note 9 (vault BACKLOG #3166): a trailing separator, which Path drops, still names the
+    # file the report replaces, on every OS.
+    out = tmp_path / "out.json"
+    out.write_text("stale\n", encoding="utf-8")
+    # A str, since Path itself would drop the separator before the CLI saw it.
+    assert _write_out("compare", tmp_path, monkeypatch, str(out) + os.sep) == 0
+    data = out.read_bytes()
+    assert b"stale" not in data
+    assert json.loads(data)["summary"]["matched"] == 1
+    assert not list(tmp_path.glob("*.tmp"))
+
+
 @pytest.mark.parametrize("command", _OUT_COMMANDS)
 def test_out_goes_through_the_owner_only_writer(
     command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -172,8 +172,11 @@ def test_default_policy_context_is_byte_identical_to_no_policy(tmp_path: Path) -
     none_ctx = _mllp_ssl_context(s, server=False, trust_anchor_policy=None)
     sys_ctx = _mllp_ssl_context(s, server=False, trust_anchor_policy=TrustAnchorPolicy())
     assert none_ctx is not None and sys_ctx is not None
-    # Connection's own CA wins under both → exactly that one anchor, no OS roots.
-    assert len(none_ctx.get_ca_certs()) == 1 == len(sys_ctx.get_ca_certs())
+    # Both now build through the anchor (vault BACKLOG #2370), so the reference is the stdlib call
+    # itself: the connection's own CA, exactly that one anchor, no OS roots.
+    historical = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca).get_ca_certs()
+    assert len(historical) == 1
+    assert none_ctx.get_ca_certs() == historical == sys_ctx.get_ca_certs()
 
 
 # --- compose with the existing no-CA / verify-off refusals --------------------
@@ -370,7 +373,7 @@ def test_default_http_hop_still_gets_the_shared_opener_object() -> None:
         ConnectorType.REST,
         {"url": "https://partner.example.org/api", "method": "POST"},
     )
-    assert dest._opener is rest._NO_REDIRECT_OPENER  # type: ignore[attr-defined]
+    assert dest._opener is rest._shared_no_redirect_opener()  # type: ignore[attr-defined]
 
 
 def test_default_http_hop_with_a_system_policy_still_gets_the_shared_opener() -> None:
@@ -388,7 +391,7 @@ def test_default_http_hop_with_a_system_policy_still_gets_the_shared_opener() ->
             {"url": "https://partner.example.org/api", "method": "POST"},
             trust_anchor_policy=policy,
         )
-        assert dest._opener is rest._NO_REDIRECT_OPENER, policy  # type: ignore[attr-defined]
+        assert dest._opener is rest._shared_no_redirect_opener(), policy  # type: ignore[attr-defined]
 
 
 def test_loopback_hop_is_exempt_on_the_http_family_too(tmp_path: Path) -> None:
@@ -398,7 +401,7 @@ def test_loopback_hop_is_exempt_on_the_http_family_too(tmp_path: Path) -> None:
         {"url": "https://127.0.0.1:8443/api", "method": "POST"},
         trust_anchor_policy=_internal_policy(_ca_pem(tmp_path)),
     )
-    assert dest._opener is rest._NO_REDIRECT_OPENER  # type: ignore[attr-defined]
+    assert dest._opener is rest._shared_no_redirect_opener()  # type: ignore[attr-defined]
 
 
 def test_unanchored_opener_context_still_matches_urllibs_own() -> None:
@@ -476,7 +479,7 @@ def test_every_http_family_destination_honours_the_internal_ca(
     ca = _ca_pem(tmp_path, "mefor-org-ca")
     dest = _http_dest(ctype, settings, trust_anchor_policy=_internal_policy(ca))
     opener = dest._opener  # type: ignore[attr-defined]
-    assert opener is not rest._NO_REDIRECT_OPENER
+    assert opener is not rest._shared_no_redirect_opener()
     ctx = _opener_context(opener)
     assert ctx is not None
     assert _ca_subjects(ctx) == {"mefor-org-ca"}
@@ -502,7 +505,7 @@ def test_the_fhir_lookup_executor_default_is_the_shared_opener() -> None:
         {"L": {"url": "https://fhir.example.org/fhir"}},
         egress=EgressSettings(deny_by_default=False),
     )
-    assert ex._opener["L"] is rest._NO_REDIRECT_OPENER
+    assert ex._opener["L"] is rest._shared_no_redirect_opener()
 
 
 # --- the TOKEN hop (#1660) -------------------------------------------------------------------------
@@ -576,7 +579,7 @@ def test_the_token_hop_honours_the_internal_ca(
     )
     assert provider is not None
     opener = _token_opener(provider)
-    assert opener is not rest._NO_REDIRECT_OPENER
+    assert opener is not rest._shared_no_redirect_opener()
     ctx = _opener_context(opener)
     assert ctx is not None
     assert _ca_subjects(ctx) == {"mefor-token-ca"}
@@ -606,7 +609,7 @@ def test_the_token_hop_default_is_the_shared_opener(build_settings: _SettingsFac
     by IDENTITY — so #1660 cannot have moved an unconfigured instance."""
     provider = bearer_provider_from_settings(build_settings())
     assert provider is not None
-    assert _token_opener(provider) is rest._NO_REDIRECT_OPENER
+    assert _token_opener(provider) is rest._shared_no_redirect_opener()
 
 
 def test_the_token_hop_resolves_against_the_token_host(tmp_path: Path) -> None:
@@ -632,7 +635,7 @@ def test_the_token_hop_resolves_against_the_token_host(tmp_path: Path) -> None:
         trust_anchor_policy=policy,
     )
     assert loopback is not None
-    assert _token_opener(loopback) is rest._NO_REDIRECT_OPENER
+    assert _token_opener(loopback) is rest._shared_no_redirect_opener()
 
 
 @pytest.mark.parametrize(
@@ -688,7 +691,7 @@ def test_the_rest_token_hop_resolves_against_the_token_host_not_the_data_host(
     assert _ca_subjects(data_ctx) == {"mefor-rest-host-scoped-ca"}
     provider = dest._token_provider  # type: ignore[attr-defined]
     assert provider is not None
-    assert _token_opener(provider) is rest._NO_REDIRECT_OPENER
+    assert _token_opener(provider) is rest._shared_no_redirect_opener()
 
 
 def test_the_fhir_lookup_token_hop_honours_the_internal_ca(tmp_path: Path) -> None:

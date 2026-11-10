@@ -12,7 +12,7 @@ revoked but unexpired certificate was accepted with no refusal and no record. Th
   pair. A hop with no login takes no guard, a decline recorded in ADR 0173. The security notifier
   rides the same hop and takes the same guard.
 * **(d) the https webhook**, with the ``[alerts].webhook_tls_revocation_attested`` pair as its only
-  lever, on the pattern of ADR 0173 section 12: its opener is built at import and no CRL reaches it.
+  lever, on the pattern of ADR 0173 section 12: its opener is shared and no CRL reaches it.
 
 The arms follow ``tests/test_revocation_guard_remaining_hops.py``: refused under an enforcing posture
 with no lever (the control), admitted with a CRL read off the hop's OWN context, and still refused
@@ -366,7 +366,7 @@ def test_an_off_box_https_webhook_is_refused_when_it_checks_no_revocation() -> N
         WebhookTransport(WEBHOOK, posture=ENFORCING)
     text = str(exc.value)
     assert _WEBHOOK_CELL in text
-    # The attestation is the only lever: no CRL reaches the import-time opener.
+    # The attestation is the only lever: no CRL reaches the shared opener.
     assert "[alerts].webhook_tls_revocation_attested" in text
     assert "Configure [tls].crl_file" not in text
     # The path token, the webhook's credential, never reaches the refusal.
@@ -444,17 +444,19 @@ def test_a_webhook_url_naming_no_host_is_refused_for_its_url() -> None:
     assert "webhook_allowed_hosts" not in str(exc.value)
 
 
-def test_a_refused_cleartext_webhook_never_logs_that_its_hop_was_permitted(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_a_cleartext_webhook_is_refused_before_the_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # An http URL is refused for its scheme (vault BACKLOG #3533 item 5), so the refusal never
+    # sends the operator to fix an allowlist entry the URL could not use.
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    with pytest.raises(ValueError, match="webhook_allowed_hosts"):
+    with pytest.raises(ValueError, match="cleartext http") as exc:
         WebhookTransport(
             "http://hooks.other.test/x",
             allowed_hosts=("hooks.example.test",),
             posture=NOT_ENFORCING,
         )
-    assert "plaintext http; permitted" not in caplog.text
+    assert "webhook_allowed_hosts" not in str(exc.value)
 
 
 class _PassedTheAllowlist(Exception):
@@ -483,7 +485,7 @@ def test_the_build_and_the_send_apply_one_allowlist_test(
     monkeypatch.setattr(alert_sinks, "_refuse_webhook_revocation", lambda *a, **k: None)
     monkeypatch.setattr(alert_sinks, "_refuse_alert_smtp_revocation", lambda *a, **k: None)
     monkeypatch.setattr(alert_sinks, "checked_envelope", stub)
-    monkeypatch.setattr(alert_sinks._NO_REDIRECT_OPENER, "open", stub)
+    monkeypatch.setattr(alert_sinks._shared_no_redirect_opener(), "open", stub)
 
     def builds(build: Callable[[], object]) -> bool:
         try:
@@ -557,15 +559,6 @@ def test_an_https_webhook_built_with_no_posture_is_refused() -> None:
     with _guard_log() as log, active_hop_posture(NOT_ENFORCING):
         WebhookTransport(WEBHOOK)
     assert sum(_WEBHOOK_CELL in m for m in log.messages) == 1, log.state()
-
-
-def test_a_cleartext_webhook_takes_no_revocation_guard(monkeypatch: pytest.MonkeyPatch) -> None:
-    # No certificate, so nothing to revoke; the cleartext refusal owns that hop. The escape lets an
-    # http URL build on a warn instance, which is the only place one builds.
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    with _guard_log() as log:
-        WebhookTransport("http://hooks.example.test/hook", posture=NOT_ENFORCING)
-    assert not log.has(_WEBHOOK_CELL), log.state()
 
 
 def test_the_alerts_settings_pair_reaches_the_webhook_build() -> None:

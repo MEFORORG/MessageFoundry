@@ -40,6 +40,7 @@ from messagefoundry.pipeline.cert_expiry import (
     certs_from_settings,
     client_cert_label,
     crls_from_settings,
+    monitored_files_from_settings,
     peer_cert_expiry,
 )
 from messagefoundry.pipeline.engine import Engine
@@ -709,7 +710,9 @@ def test_every_settings_crl_alerts_under_a_distinct_label(tmp_path: Path) -> Non
     assert len(set(labels)) == 5
 
 
-def test_the_engine_hands_the_settings_crls_to_its_expiry_monitor(tmp_path: Path) -> None:
+def test_the_engine_hands_the_settings_monitored_files_to_its_expiry_monitor(
+    tmp_path: Path,
+) -> None:
     crl = tmp_path / "tls_crl.pem"
     _write_crl(crl, next_update=_REF + datetime.timedelta(days=5))
     watched = crls_from_settings(ServiceSettings(tls=TlsSettings(crl_file=str(crl))))
@@ -717,7 +720,7 @@ def test_the_engine_hands_the_settings_crls_to_its_expiry_monitor(tmp_path: Path
     async def _go() -> list[MonitoredCert]:
         eng = await Engine.create(
             tmp_path / "crl.db",
-            settings_crls=watched,
+            settings_monitored_files=watched,
             egress_settings=EgressSettings(deny_by_default=False),
         )
         try:
@@ -793,3 +796,120 @@ def test_no_store_pin_row_without_a_sqlserver_pin(tmp_path: Path) -> None:
     bundle = tmp_path / "db-ca.pem"
     _write_cert(bundle, not_after=_REF + datetime.timedelta(days=10))
     assert certs_from_settings(_store(StoreBackend.POSTGRES, bundle)) == []
+
+
+def test_monitored_files_from_settings_lists_the_crls_then_the_store_pin(tmp_path: Path) -> None:
+    # BACKLOG #3714 item 5: the one list serve and cert inventory both build.
+    crl = tmp_path / "tls_crl.pem"
+    _write_crl(crl, next_update=_REF + datetime.timedelta(days=5))
+    pin = tmp_path / "db-server.pem"
+    _write_cert(pin, not_after=_REF + datetime.timedelta(days=10))
+    settings = _store(StoreBackend.SQLSERVER, pin).model_copy(
+        update={"tls": TlsSettings(crl_file=str(crl))}
+    )
+    assert monitored_files_from_settings(settings) == [
+        MonitoredCert("tls.crl_file", str(crl), kind="crl"),
+        MonitoredCert("store.ssl_root_cert", str(pin)),
+    ]
+
+
+# --- BACKLOG #296: the OIDC private_key_jwt client certificate is watched ------------------------
+#
+# Each client assertion carries the certificate's x5t#S256 thumbprint. The signer checks its validity
+# window only when the auth service is built at start, so the monitor is what warns ahead of notAfter.
+
+#: A mis-set env() holding a bare base64 body: no header, so the signer's rule reads it as a path.
+_NOT_A_PATH = "MIIBSyntheticBase64BodyNotAPath0123456789abcdefABCDEF"
+
+
+def _oidc(
+    certificate: str | None, *, store: StoreSettings | None = None, **over: Any
+) -> ServiceSettings:
+    """Synthetic settings with OIDC on and the private_key_jwt method. Settings load never reads the
+    key or the certificate, so neither needs to exist for these rows."""
+    fields: dict[str, Any] = {
+        "ad_enabled": True,
+        "ad_server": "ldaps://dc.corp.example",
+        "ad_user_search_base": "DC=corp,DC=example",
+        "ad_bind_dn": "CN=svc,DC=corp,DC=example",
+        "ad_bind_password": "x",
+        "ad_domain": "corp.example",
+        "oidc_enabled": True,
+        "oidc_issuer": "https://idp.example",
+        "oidc_client_id": "mefor-test",
+        "oidc_authorization_endpoint": "https://idp.example/authorize",
+        "oidc_token_endpoint": "https://idp.example/token",
+        "oidc_jwks_uri": "https://idp.example/jwks",
+        "oidc_allowed_endpoints": ["idp.example"],
+        "oidc_token_endpoint_auth_method": "private_key_jwt",
+        "oidc_client_private_key": "oidc-client-key.pem",
+        "oidc_client_certificate": certificate,
+    }
+    return ServiceSettings(
+        auth=AuthSettings(**{**fields, **over}),
+        api=ApiSettings(public_origin="https://ops.example"),
+        store=store if store is not None else StoreSettings(),
+    )
+
+
+def test_the_oidc_client_certificate_is_watched_and_warns_ahead_of_not_after(
+    tmp_path: Path,
+) -> None:
+    cert = tmp_path / "oidc-client.pem"
+    _write_cert(cert, not_after=_REF + datetime.timedelta(days=10))
+    rows = certs_from_settings(_oidc(str(cert)))
+    assert rows == [MonitoredCert("auth.oidc_client_certificate", str(cert))]
+    sink = _RecordingSink()
+    checks = _runner(rows, sink, warn_days=30).run_once()
+    assert [(c.label, c.kind, c.days_remaining) for c in checks] == [
+        ("auth.oidc_client_certificate", "cert", 10)
+    ]
+    # A certificate, so the cert_expiry arm alerts and the CRL arm does not.
+    assert [call[0] for call in sink.cert_calls] == ["auth.oidc_client_certificate"]
+    assert sink.crl_calls == []
+
+
+def test_the_oidc_client_certificate_rides_beside_the_store_pin(tmp_path: Path) -> None:
+    pin = tmp_path / "db-server.pem"
+    _write_cert(pin, not_after=_REF + datetime.timedelta(days=10))
+    cert = tmp_path / "oidc-client.pem"
+    _write_cert(cert, not_after=_REF + datetime.timedelta(days=10))
+    settings = _oidc(str(cert), store=_store(StoreBackend.SQLSERVER, pin).store)
+    assert [mc.label for mc in certs_from_settings(settings)] == [
+        "store.ssl_root_cert",
+        "auth.oidc_client_certificate",
+    ]
+
+
+def test_a_certificate_the_signer_never_loads_adds_no_row(tmp_path: Path) -> None:
+    # An existing file adds no row where nothing sends it: OIDC off, with the private_key_jwt
+    # method and the certificate left behind, which settings load accepts. Only oidc_enabled
+    # differs from the first test above, which is the positive control.
+    cert = tmp_path / "oidc-client.pem"
+    _write_cert(cert, not_after=_REF + datetime.timedelta(days=10))
+    off = AuthSettings(
+        oidc_token_endpoint_auth_method="private_key_jwt", oidc_client_certificate=str(cert)
+    )
+    assert off.oidc_private_key_jwt
+    assert certs_from_settings(ServiceSettings(auth=off)) == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", _NOT_A_PATH],
+)
+def test_an_unset_inline_or_non_file_oidc_client_certificate_adds_no_row(
+    value: str | None,
+) -> None:
+    # Inline PEM names no file and is never handed to open() as a path; neither is a value that
+    # names no file.
+    assert certs_from_settings(_oidc(value)) == []
+
+
+def test_a_mis_set_oidc_client_certificate_is_never_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.DEBUG):
+        rows = certs_from_settings(_oidc(_NOT_A_PATH))
+        _runner(rows, _RecordingSink(), warn_days=30).run_once()
+    assert _NOT_A_PATH not in caplog.text

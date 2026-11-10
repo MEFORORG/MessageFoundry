@@ -32,6 +32,7 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.redaction import safe_text
 from messagefoundry.store import MessageStore
 from messagefoundry.store.store import ConnectionEventWrite
+from tests._log_absence import assert_capture_sees
 
 
 def _event(i: int, **over: object) -> ConnectionEventWrite:
@@ -225,6 +226,7 @@ async def test_undeclared_kinds_are_refused_at_enqueue_and_the_burst_keeps_every
     assert len(refusals) == 2, refusals
     assert all(_UNDECLARED in m for m in refusals)
     assert {"'IB_T0'", "'IB_T1'"} == {m.split()[1] for m in refusals}
+    assert_capture_sees(caplog, wiring_runner.log)
     assert not [r for r in caplog.records if "burst write failed" in r.getMessage()]
 
 

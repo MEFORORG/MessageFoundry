@@ -29,6 +29,7 @@ from messagefoundry.config.settings import (
     _unread_env_notes,
     load_settings,
 )
+from tests._log_absence import assert_capture_sees
 
 _REPO = Path(__file__).resolve().parents[1]
 _NAME = re.compile(r"MEFOR_[A-Z0-9_]*[A-Z0-9]")
@@ -273,6 +274,7 @@ def test_a_clean_environment_logs_no_such_warning(caplog: pytest.LogCaptureFixtu
     """The control for the test above."""
     with caplog.at_level("WARNING", logger="messagefoundry.config.settings"):
         _load({"MEFOR_STORE_PATH": "ok.db", "MEFOR_ALLOW_INSECURE_TLS": "1"})
+    assert_capture_sees(caplog, "messagefoundry.config.settings")
     assert not [r for r in caplog.records if "NOT applied" in r.getMessage()]
 
 

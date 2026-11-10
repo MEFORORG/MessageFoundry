@@ -383,7 +383,7 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
     )
 
 
-#: Identifiers measured ABSENT from the bundle, from three readings recorded in
+#: Identifiers measured ABSENT from the bundle, from the readings recorded in
 #: cla-action-advisories.toml. Each must count 0 in ``dist/index.js``. Removing one needs its
 #: reading redone, not just this edit.
 #:
@@ -400,10 +400,19 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
 #:   chain. The bare name is kept although other packages' names can hold it, such as
 #:   @types/minimatch: a false red only sends someone to redo the reading. The other two still fire
 #:   if that name is gone from the file but these identifiers survive.
+#: - The 2026-11-05 triage (BACKLOG #2492): what it settles is stated in the header paragraph "THE
+#:   2026-11-05 TRIAGE" and in each triaged entry's comment. Re-run here are the probes those
+#:   comments name as re-run. Generic names they measured, such as @babel/helpers'
+#:   ``getDependencies`` and ``minVersion``, are left out. Some package names that ordinary prose
+#:   could hold are kept, as minimatch's is above, for the same reason. "semver" and "braces" are
+#:   not re-run: the words are common in other code's comments. semver's own identifiers below
+#:   stand in for it. braces' stand-in, ``CHAR_ZERO_WIDTH_NOBREAK_SPACE``, is not braces' alone:
+#:   picomatch defines it too, so it fires on either package's code.
 _ABSENT_FROM_BUNDLE = (
     re.compile("sprintf", re.IGNORECASE),  # sprintf-js
     re.compile("ArgumentParser"),  # argparse
-    re.compile("YAMLException|safeLoad"),  # js-yaml
+    re.compile("YAMLException"),  # js-yaml
+    re.compile("safeLoad"),  # js-yaml
     re.compile("Toolkit"),  # actions-toolkit
     re.compile("CHAR_ZERO_WIDTH_NOBREAK_SPACE"),  # braces (and picomatch)
     re.compile("toRegexRange"),  # fill-range
@@ -412,6 +421,21 @@ _ABSENT_FROM_BUNDLE = (
     re.compile("minimatch", re.IGNORECASE),  # minimatch
     re.compile("twoStarNoDot"),  # minimatch
     re.compile("GlobSync"),  # glob
+    re.compile("loadPartialConfig"),  # @babel/core
+    re.compile("NodePath"),  # @babel/traverse
+    re.compile("wrapRegExp"),  # the helper @babel/helpers emits, GHSA-968p-4wvh-cqc8's code
+    re.compile("browserslist", re.IGNORECASE),  # browserslist
+    re.compile("compareIdentifiers"),  # semver
+    re.compile("MAX_SAFE_COMPONENT_LENGTH"),  # semver
+    re.compile("hookChildProcess"),  # cross-spawn
+    re.compile("verifyENOENT"),  # cross-spawn
+    re.compile("joinCmd"),  # execa, cross-spawn's runtime parent
+    re.compile("windowsRelease"),  # windows-release, execa's other parent
+    re.compile("osName"),  # os-name, windows-release's parent
+    re.compile("flatted", re.IGNORECASE),  # flatted
+    re.compile("expandTop"),  # brace-expansion
+    re.compile("picomatch", re.IGNORECASE),  # picomatch
+    re.compile("micromatch", re.IGNORECASE),  # micromatch
 )
 
 #: The control: two @actions/core functions the bundle does carry, so the probes can find code.
@@ -426,7 +450,8 @@ def _probes_found_in(text: str) -> list[str]:
 def test_the_recorded_bundle_reading_still_holds() -> None:
     """The baseline's recorded bundle readings, of the braces and js-yaml chains, still hold.
 
-    So do the later readings of deepmerge, taken 2026-10-28, and minimatch, taken 2026-10-31.
+    So do the later readings of deepmerge, taken 2026-10-28, and minimatch, taken 2026-10-31, and
+    the 2026-11-05 triage (BACKLOG #2492).
 
     The provenance gate lets ``dist/index.js`` change whenever its record changes with it, so a
     re-vendored bundle could carry that code while the baseline still said it was absent. This reds
@@ -456,6 +481,36 @@ def test_the_recorded_bundle_reading_still_holds() -> None:
         ("var twoStarNoDot =", "twoStarNoDot"),
         ("globSync.GlobSync = GlobSync", "GlobSync"),
         ("export class Toolkit", "Toolkit"),
+        # Lines read 2026-11-05 at upstream tags, for the BACKLOG #2492 triage: babel v7.22.17
+        # partial.ts and path/index.ts, browserslist 4.21.10 index.js, node-semver v5.7.1
+        # semver.js, node-cross-spawn v6.0.5 lib/enoent.js, execa v1.0.0, windows-release v3.2.0
+        # and os-name v3.1.0 index.js, flatted v2.0.1 cjs/index.js, brace-expansion v1.1.11
+        # index.js, picomatch 2.3.1 lib/picomatch.js and micromatch 4.0.5 index.js. The flatted and
+        # browserslist lines start upper-case, so they hold those probes' IGNORECASE too.
+        ("export function* loadPartialConfig(", "loadPartialConfig"),
+        ("// NodePath is split across many files.", "NodePath"),
+        # babel v7.22.15 packages/babel-helpers/src/helpers/wrapRegExp.js.
+        ("export default function _wrapRegExp() {", "wrapRegExp"),
+        # The 2026-10-07 probes, planted for the first time on 2026-11-05: braces 3.0.2
+        # lib/constants.js, sprintf-js 1.0.3 src/sprintf.js, argparse 1.0.10
+        # lib/argument_parser.js, js-yaml 3.13.1 lib/js-yaml/exception.js and lib/js-yaml.js.
+        ("CHAR_ZERO_WIDTH_NOBREAK_SPACE: '\\uFEFF' /* \\uFEFF */", "CHAR_ZERO_WIDTH_NOBREAK_SPACE"),
+        ("function sprintf() {", "sprintf"),
+        ("* class ArgumentParser", "ArgumentParser"),
+        ("function YAMLException(reason, mark) {", "YAMLException"),
+        ("module.exports.safeLoad            = loader.safeLoad;", "safeLoad"),
+        ("var BrowserslistError = require('./error')", "browserslist"),
+        ("function compareIdentifiers (a, b) {", "compareIdentifiers"),
+        ("var MAX_SAFE_COMPONENT_LENGTH = 16", "MAX_SAFE_COMPONENT_LENGTH"),
+        ("function hookChildProcess(cp, parsed) {", "hookChildProcess"),
+        ("function verifyENOENT(status, parsed) {", "verifyENOENT"),
+        ("function joinCmd(cmd, args) {", "joinCmd"),
+        ("const windowsRelease = release => {", "windowsRelease"),
+        ("const osName = (platform, release) => {", "osName"),
+        ("var Flatted = (function (Primitive, primitive) {", "flatted"),
+        ("function expandTop(str) {", "expandTop"),
+        ("const picomatch = (glob, options, returnState = false) => {", "picomatch"),
+        ("const micromatch = (list, patterns, options) => {", "micromatch"),
     ],
 )
 def test_the_walk_names_a_chain_probe_on_planted_source(planted: str, pattern: str) -> None:

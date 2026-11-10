@@ -32,12 +32,14 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from messagefoundry.api import security as api_security
 from messagefoundry.api.app import create_app
 from messagefoundry.api.security import (
     authorize_ws,
     authorizes_in_body,
     mark_route_gate,
     public_route,
+    record_ws_gate,
     require,
 )
 from messagefoundry.auth.permissions import Permission
@@ -356,6 +358,87 @@ def test_a_marked_gate_is_read_whatever_its_name() -> None:
     row = _rows_by_key(app)[("GET", "/planted")]
     assert row.gate == "require_lookalike", row
     assert row.permissions == (Permission.MESSAGES_VIEW_RAW.value,), row
+
+
+def test_a_websocket_gate_dependency_taking_a_request_fails_the_walk() -> None:
+    """Vault BACKLOG #2955, engine PR 2390 note 2. FastAPI cannot supply a ``Request`` to a socket,
+    so a ``require()``-shaped gate taking one fails the handshake for every caller. The walk read
+    such a socket as gated; now it refuses to read it. The control: the same factory with a
+    ``WebSocket`` parameter still reads as a gate."""
+    gate = mark_route_gate(require_lookalike(Permission.MONITORING_READ))
+    app = FastAPI()
+    app.add_api_websocket_route("/ws/planted", _dependency_gated, dependencies=[Depends(gate)])
+    with pytest.raises(ValueError, match="takes a Request"):
+        route_gates.route_rows(app)
+    row = _planted_row(
+        _dependency_gated,
+        dependencies=[Depends(require_ws_probe(Permission.MONITORING_READ))],
+    )
+    assert row.gates == ("require_ws_probe",), row
+
+
+async def _records_its_own_admission(websocket: WebSocket) -> None:
+    await authorize_ws(websocket, Permission.MONITORING_READ)
+    api_security.record_ws_gate(websocket, admitted=True)
+    await websocket.accept()
+
+
+async def _records_its_own_admission_bare(websocket: WebSocket) -> None:
+    await authorize_ws(websocket, Permission.MONITORING_READ)
+    record_ws_gate(websocket, admitted=True)
+    await websocket.accept()
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [_records_its_own_admission, _records_its_own_admission_bare],
+    ids=["attribute", "bare"],
+)
+def test_a_websocket_body_that_records_its_own_admission_fails_the_walk(
+    endpoint: Callable[[WebSocket], Awaitable[None]],
+) -> None:
+    """Vault BACKLOG #2955: the admission record is a gate's to write. A body that writes it would
+    pass the engine's accept gate whatever its gate answered, so the walk refuses to vouch for it,
+    whether the call is bare or through an attribute. Only a call by that name is caught."""
+    with pytest.raises(ValueError, match="calls record_ws_gate itself"):
+        route_gates.route_rows(_app_with(endpoint))
+
+
+def _request_reader(request: Request) -> None:
+    return None
+
+
+def _websocket_reader(websocket: WebSocket) -> None:
+    return None
+
+
+@pytest.mark.parametrize("reads_a_request", [True, False], ids=["request", "control-websocket"])
+def test_a_websocket_gate_whose_sub_dependency_takes_a_request_fails_the_walk(
+    reads_a_request: bool,
+) -> None:
+    """Vault BACKLOG #2955: FastAPI cannot supply a ``Request`` anywhere under a socket's gate. The
+    control is the same gate whose sub-dependency takes the ``WebSocket``: its gate and permission
+    are still read."""
+    reader = _request_reader if reads_a_request else _websocket_reader
+
+    def require_reading(*permissions: Permission) -> Callable[..., Awaitable[None]]:
+        async def dependency(websocket: WebSocket, _r: None = Depends(reader)) -> None:
+            assert permissions
+
+        return mark_route_gate(dependency)
+
+    app = FastAPI()
+    app.add_api_websocket_route(
+        "/ws/planted",
+        _dependency_gated,
+        dependencies=[Depends(require_reading(Permission.MONITORING_READ))],
+    )
+    if reads_a_request:
+        with pytest.raises(ValueError, match="takes a Request"):
+            route_gates.route_rows(app)
+    else:
+        (row,) = _ws_rows(app)
+        assert row.gates and row.permissions == ("monitoring:read",), row
 
 
 class _CallableGate:
