@@ -266,9 +266,7 @@ def _root_gone(path: Path, **_: Any) -> Any:
 
 
 def _dangling(path: Path, **_: Any) -> Any:
-    """A pair lock whose open fails ``ENOENT`` while the uploads root is there, as Windows, which
-    has no ``O_NOFOLLOW``, fails it for a link planted at the lock path whose target's directory is
-    missing."""
+    """A pair lock whose open fails ``ENOENT`` while the uploads root is there."""
     lock = lock_path_for(path)
     assert lock.parent.is_dir()
     raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(lock))
@@ -676,8 +674,10 @@ def test_a_reparse_point_at_the_lock_path_is_refused_only_when_it_names_another_
         assert not (root / LOCK_FILE_NAME).exists()
         return
     with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = asyncio.run(_store(root, generate_key(), key).reseal_to_active())
         assert _store(root, key)._discard_cancelled_sync(fids[0]) is True
-    assert len(opened) == 1, opened  # the lock was opened and taken, not refused
+    assert result.resealed == 2 * len(fids) and not result.incomplete
+    assert opened, opened  # the lock was opened and taken, never refused
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
 
 

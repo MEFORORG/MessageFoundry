@@ -2167,6 +2167,9 @@ class UploadStore:
             return ResealResult(root_missing=True)
         if pairs and not os.path.isdir(self._root):
             # The root went after the listing: the BACKLOG #4940 outcome, not N lost bodies.
+            _log.warning(
+                "uploads root %s is gone after it was listed; no uploaded file was read", self._root
+            )
             return ResealResult(root_missing=True)
         gate = _ResealLockCheck(self._root / LOCK_FILE_NAME)
         resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = 0
@@ -2185,14 +2188,12 @@ class UploadStore:
             # keyed store refuses a plaintext value (BACKLOG #1169). Sealing the sidecar first would
             # let an interrupted pass list an upload whose body is still refused.
             body = self._reseal_half(cipher, fid, blob_path, "body", gate=gate)
-            if gate.root_gone():
-                # The root went before the lock check, which runs before the pass's first write, so
-                # nothing was written: the BACKLOG #4940 outcome, as above.
-                return ResealResult(root_missing=True)
             meta = self._reseal_half(
                 cipher, fid, meta_path, "meta", over=(body, blob_path), gate=gate
             )
             if gate.root_gone():
+                # The root went before the lock check, which runs before the pass's first write, so
+                # nothing was written: the BACKLOG #4940 outcome, as above. _pair_lock logged it.
                 return ResealResult(root_missing=True)
             resealed += (body in _WRITTEN) + (meta in _WRITTEN)
             # Once per pair, whichever half failed. A skipped pair counts in sealed_plaintext too
@@ -2338,6 +2339,10 @@ class UploadStore:
                 _log.warning("uploaded file %s (meta): left unsealed, its body was not", fid)
                 return _Half.SKIPPED
         blocked = gate.check()
+        if blocked == "gone":
+            # Not a skip: the pass ends as root_missing once this pair is done, and _pair_lock
+            # logged the gone directory.
+            return _Half.SKIPPED
         if blocked is not None:
             _log.warning(
                 "uploaded file %s (%s): skipped, nothing is written: %s",
@@ -3308,8 +3313,7 @@ def _pair_lock_failure(exc: OSError, root: Path) -> _PairLockFailure:
     the file system refused this account (``atomic_edit._REFUSED``), such as a lock file another
     account owns; ``edit_lock`` also raises ``busy_error`` for a lock path planted as a link,
     chained from the ``ELOOP``, and that is one too, as is what ``_NOT_A_FILE`` names, and a
-    ``FileNotFoundError`` while ``root`` is there, as Windows gives for a link planted at the lock
-    path whose target's directory is missing. ``failed``: any other error, such as ``EIO`` or
+    ``FileNotFoundError`` while ``root`` is there. ``failed``: any other error, such as ``EIO`` or
     ``ESTALE`` from a network file system."""
     if isinstance(exc, _PairLockBusy):
         return "refused" if exc.__cause__ is not None else "busy"
@@ -3496,14 +3500,14 @@ def _refuse_a_planted_link(lock: Path) -> None:
     ``ELOOP``, the shape ``edit_lock`` gives a link its ``O_NOFOLLOW`` open refuses, so
     :func:`_pair_lock_failure` reads it as a refusal. Windows has no ``O_NOFOLLOW``, so there
     ``edit_lock`` follows a planted link and creates or locks its target. A link planted after this
-    ``lstat`` and before that open is still followed there. A lock path that is missing, or that
-    ``lstat`` cannot read, is left to ``edit_lock``."""
+    ``lstat`` and before that open is still followed there. A missing lock path is left to
+    ``edit_lock``; any other ``lstat`` error is raised as it is."""
     try:
         info = lock.lstat()
-    except OSError:
-        # Not logged here: edit_lock opens this same path next, and its own error is classified
-        # and logged by _pair_lock, as it was before this check existed.
-        return
+    except FileNotFoundError:
+        return  # edit_lock creates it, or fails and _pair_lock classifies and logs why
+    # Any other lstat error propagates, so _pair_lock classifies and logs it as it would the open's,
+    # and no open follows a path this could not check.
     reparse = getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT
     if S_ISLNK(info.st_mode) or (
         reparse and getattr(info, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG
