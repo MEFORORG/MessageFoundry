@@ -28,6 +28,7 @@ import re
 from collections.abc import Iterator
 
 from messagefoundry.parsing.x12.delimiters import (
+    _SEGMENT_TERM_OFFSET,
     _SEGMENT_WHITESPACE,
     ISA_SEGMENT_LEN,
     discover_delimiters,
@@ -39,9 +40,6 @@ from messagefoundry.parsing.x12.errors import X12FrameError, X12PeekError
 
 __all__ = ["split", "X12FrameReader", "check_integrity"]
 
-# Offset of the segment terminator within the ISA (mirrors delimiters._SEGMENT_TERM_OFFSET, but kept
-# local so the byte reader needs only this module + the public ISA length).
-_SEGMENT_TERM_OFFSET = 105
 # A segment that is the IEA trailer, after cosmetic whitespace. Matched in place with pos/endpos, so the
 # check never copies a segment, however long.
 _IEA_SEGMENT = re.compile(rb"[ \t\r\n\x0b\x0c]*IEA")
@@ -185,7 +183,8 @@ class X12FrameReader:
             # The walk starts past the ISA's own terminator. The ISA is fixed-width, so a terminator
             # byte inside its element data (a "~IEA" in ISA06) must not end a segment there: that
             # cut the frame at the ISA and dropped the real body as noise (BACKLOG #5536). Such an
-            # ISA is framed whole here and refused when it is parsed.
+            # ISA is framed whole here. The codec refuses it only where something parses it, a
+            # Router or Handler that peeks or parses; this reader does not.
             self._seg_start = self._scan = _SEGMENT_TERM_OFFSET + len(terminator)
         # Walk the segments, resuming where the last feed stopped. The ISA stays at the front of the
         # buffer until its frame is taken or the buffer is cleared, and both reset the resume points,
@@ -263,9 +262,8 @@ def check_integrity(raw: str) -> list[str]:
     def get(fields: list[str], i: int) -> str:
         return fields[i].strip() if i < len(fields) else ""
 
-    isa_seg = segments[0] if segments and segments[0][0] == "ISA" else None
     iea_seg = next((s for s in segments if s[0] == "IEA"), None)
-    if isa_seg is not None and iea_seg is not None:
+    if iea_seg is not None:  # iter_segments always yields the ISA first
         # ISA13 is read by offset (fixed-width); IEA02 from the tokenized IEA segment.
         isa13 = raw[isa + 90 : isa + 99].strip()
         if isa13 != get(iea_seg, 2):

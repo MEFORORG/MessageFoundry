@@ -34,7 +34,12 @@ import time
 from collections.abc import Callable, Mapping
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
-from messagefoundry.parsing.x12.delimiters import DEFAULT_MAX_INTERCHANGE_BYTES
+from messagefoundry.parsing.x12.delimiters import (
+    DEFAULT_MAX_INTERCHANGE_BYTES,
+    ELEMENT_SEP_OFFSETS,
+    ISA_SEGMENT_LEN,
+    find_isa_start,
+)
 from messagefoundry.parsing.x12.errors import X12FrameError, X12PeekError
 from messagefoundry.parsing.x12.interchange import X12FrameReader
 from messagefoundry.parsing.x12.message import X12Message
@@ -93,6 +98,7 @@ _CONTROL_NUMBER_WIDTH = 9
 # How many TA1 segments of one reply are searched for the one naming the interchange sent. Each lookup
 # rescans the reply, so the cap keeps a reply packed with TA1s from stalling the event loop.
 _MAX_TA1_SCANNED = 32
+_ISA13_START, _ISA13_END = 90, 99  # ISA13's fixed span within the ISA
 
 
 def _control_number(value: str | None) -> str | None:
@@ -114,12 +120,26 @@ def _control_number(value: str | None) -> str | None:
 
 def _sent_isa13(payload: str) -> str | None:
     """ISA13 of the interchange this destination sent, space-trimmed (``""`` when blank), or ``None``
-    when the payload has no parseable ISA. Read by fixed offset through the pure codec
-    (:class:`X12Peek`), the same way the codec reads every ISA field."""
+    when the payload has no ISA whose layout reads. Read by fixed offset through the pure codec
+    (:class:`X12Peek`), the same way the codec reads every ISA field.
+
+    The codec also refuses an ISA whose delimiters clash, or whose element data holds a delimiter
+    (BACKLOG #5536). ISA13 still sits at its fixed offset in such an ISA, and a sender upstream may
+    have put the delimiter there, so it is read at that offset anyway: falling back to ``None`` would
+    switch correlation off, and a TA1 naming another interchange would then be acted on."""
     try:
         return X12Peek.parse(payload, max_bytes=None).control_number or ""
     except X12PeekError:
+        pass
+    try:
+        isa = find_isa_start(payload)
+    except X12PeekError:
         return None
+    header = payload[isa : isa + ISA_SEGMENT_LEN]
+    # The layout reads only when the element separator sits at every position the ISA fixes.
+    if len(header) < ISA_SEGMENT_LEN or any(header[o] != header[3] for o in ELEMENT_SEP_OFFSETS):
+        return None
+    return header[_ISA13_START:_ISA13_END].strip()
 
 
 def _names_sent_interchange(ta101: str | None, sent_isa13: str) -> bool:

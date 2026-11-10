@@ -110,18 +110,20 @@ def _dest(port: int) -> X12Destination:
     return X12Destination(Destination(name="out", type=ConnectorType.X12, settings=settings))
 
 
-def test_the_engine_destination_is_not_told_reject_by_an_accepting_sink() -> None:
+@pytest.mark.parametrize("isa13", [_HOSTILE_ISA13, _NON_DIGIT_ISA13])
+def test_the_engine_destination_is_not_told_reject_by_an_accepting_sink(isa13: str) -> None:
     """End to end: the engine's own X12 destination delivers to the harness sink set to accept.
     Before the fix the echoed ISA13 turned the TA1 into TA1-04 R, a permanent NegativeAckError
     (dead-letter). Now the sink stays silent, which a ta1_required destination treats as a
-    retryable DeliveryError -- never as the partner's permanent reject."""
+    retryable DeliveryError -- never as the partner's permanent reject. Each value takes its own
+    withhold arm: the hostile one does not peek, the non-digit one is not nine digits."""
 
     async def deliver(wire: bytes) -> None:
         with X12Sink(ta1="A") as sink:
             await _dest(sink.port).send(wire.decode("ascii"))
 
     with pytest.raises(DeliveryError) as caught:
-        asyncio.run(deliver(_interchange_with_isa13(_HOSTILE_ISA13)))
+        asyncio.run(deliver(_interchange_with_isa13(isa13)))
     assert not isinstance(caught.value, NegativeAckError)
     # Clean control on the same path: a nine-digit ISA13 is acknowledged and accepted.
     asyncio.run(deliver(interchange(fresh_control_number())))

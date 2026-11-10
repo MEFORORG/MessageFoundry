@@ -304,7 +304,8 @@ def test_a_delimiter_in_isa_element_data_is_refused(
     with pytest.raises(X12PeekError, match=f"{element} holds a delimiter character") as caught:
         surface(interchange(**kwargs))
     # The refusal names the element, never its value.
-    assert "SHIFT" not in str(caught.value) and "IEA" not in str(caught.value)
+    value = kwargs.get("sender") or kwargs["receiver"]
+    assert value not in str(caught.value) and "IEA" not in str(caught.value)
 
 
 @pytest.mark.parametrize("surface", _REFUSE_STR_SURFACES)
