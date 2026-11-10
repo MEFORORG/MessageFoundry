@@ -117,6 +117,10 @@ Each call site in `_on_client` maps to exactly one, e.g. [mllp.py:587](../../mes
 - **`peer_host`** — the peer IP from the **socket** (`writer.get_extra_info('peername')`, the same value already logged at [mllp.py:585-589](../../messagefoundry/transports/mllp.py)) — connection metadata, not message payload. An IP is network metadata, not a HIPAA identifier of a patient; it is already WARNING-logged today. Nullable (a UNIX socket / unresolved peer yields `None`, per `_peer_ip`).
 - **`reason`** — a **`safe_text`-scrubbed, bounded** diagnostic (`safe_text(str(exc))[:200]` via [redaction.py:51-61](../../messagefoundry/redaction.py)), the same PHI chokepoint §3 uses. For a pre-message failure the exception is a framing/TLS/IO error (`MLLPFrameError`, `ssl.SSLError`, `OSError`) whose text is transport diagnostics, not field values — but it is scrubbed regardless so a hostile garbage frame that happens to embed HL7-shaped bytes in an error string can never land verbatim. Crucially, the **raw frame is never passed to `record_connection_event`** — only the scrubbed exception text — so there is no body/field-value path at all.
 
+*(Note 2026-11-10, BACKLOG #5021: the heading's "every column is non-PHI" and the schema
+comment's "metadata, not PHI" do not hold for `reason`: [PHI.md](../PHI.md)'s at-rest row for
+`connection_event.reason` grades it otherwise.)*
+
 There is deliberately **no message body, no raw frame, no MSH, no field value** in the schema or any call site.
 
 #### §7.4 Config: per-inbound opt-OUT of a default-ON master switch (mirrors §4's `capture_ack`)
@@ -132,13 +136,13 @@ A first-class field on `InboundConnection` ([wiring.py:2483](../../messagefoundr
 #### §7.6 Optional alerting (reuse the AlertSink, no new transport)
 
 A burst of `peer_not_allowlisted` / `framing_error` is operationally interesting (a misconfigured partner, a probe). The `AlertSink` Protocol ([alerts.py:27-56](../../messagefoundry/pipeline/alerts.py)) already carries the right non-PHI shape (connection name + metadata, never a body). §7 **may** add a `connection_error(name, *, kind, detail)` emit method to `AlertSink`/`LoggingAlertSink`/`NotifierAlertSink`, fired from `_capture_connection_event` alongside the store write, keyed `connection_error:<connection>` so `NotifierAlertSink._emit`'s realert throttle ([alert_sinks.py:406-427](../../messagefoundry/pipeline/alert_sinks.py)) collapses a flood to one notification per cooldown. The payload carries only `connection`/`kind`/scrubbed `detail` — the AlertSink's existing "no PHI, connection + shape only" contract holds unchanged. This is **optional and gated by the same `capture_connection_errors` flag**; with it off, no event and no alert. (Whether v1 wires the alert or only the store row is the one genuinely owner-facing knob — see *To resolve*.)
-*(Note 2026-11-10, BACKLOG #5021: the clauses "The payload carries only
-`connection`/`kind`/scrubbed `detail`" and "the AlertSink's existing 'no PHI, connection + shape
-only' contract holds unchanged" are false in the shipped code. Some alerts carry free-text
-detail off the box, and `connection_error` does not send its `detail`: it sends the exception
-class in its place and keeps the detail as the stored alert reason only. The [PHI.md logging
-inventory](../PHI.md#logging-inventory-1611--1623) rows for the `[alerts]` transports say what
-crosses.)*
+*(Note 2026-11-10, BACKLOG #5021: this paragraph's PHI premise, that the AlertSink shape is
+non-PHI and that its "no PHI, connection + shape only" contract holds, is false in the shipped
+code: some alerts carry free-text detail off the box. The inbound alert this paragraph proposes
+was not built (§7 shipped store-row-only, under *To resolve on acceptance*). The
+`connection_error` alert that did ship is raised for an outbound lane going down, and the
+[PHI.md logging inventory](../PHI.md#logging-inventory-1611--1623) rows for the `[alerts]`
+transports say what it and the other alerts send.)*
 
 ## Consequences
 

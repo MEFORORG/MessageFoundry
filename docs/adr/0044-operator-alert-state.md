@@ -69,8 +69,8 @@ Two [CLAUDE.md](../../CLAUDE.md) invariants bound the design and **must not** be
   stored reason **Possibly** PHI at PL-2, so that column is not plain metadata. The clause *"like
   `connection_event`, it sits in the existing metadata tier"* is false too: PHI.md grades
   `connection_event.reason` the same way, **Possibly** PHI at PL-2 and ciphered when a key is
-  set, so neither reason column sits in a metadata tier. Where this ADR calls the table
-  "metadata-only" below, that holds for its other columns, not for `reason`. The general
+  set, so neither reason column sits in a metadata tier. Where this ADR calls `connection_event`
+  or `alert_instance` metadata-only, that does not hold for its `reason` column. The general
   application log is not PHI-free either: PHI.md's logging inventory row 1 says it can contain
   PHI.)*
 

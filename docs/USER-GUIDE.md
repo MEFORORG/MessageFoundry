@@ -663,7 +663,7 @@ The SMTP password is a secret — supply it via `MEFOR_ALERTS_EMAIL_PASSWORD`, n
 
 **Important:** the *notifications* are **fire-and-forward** — once webhook/email delivery is attempted there is no send log, so for the notification itself you rely on your webhook/email target. The engine does, however, keep **alert state**: an alert instance per `(event type, connection)` that you can query with `GET /alerts/active` and act on with `POST /alerts/{id}/ack` · `/resolve` · `/suspend` · `/resume`, which is what the console's **Alerts** page drives ([ADR 0044](adr/0044-operator-alert-state.md)). `GET /alerts/rules` remains a read-only view of the *loaded* transport config and rule set (secrets and recipients omitted).
 Instances and payloads have no message-body field, but they are not PHI-free: an alert's
-free-text detail or reason can echo transport text, such as a partner's reply, even after the
+free-text detail or reason can echo transport text, such as a partner's reply, even after any
 scrub it passes. The [PHI.md logging
 inventory](PHI.md#logging-inventory-1611--1623) says what alert text can leave the box: at least
 its rows for the `[alerts]` webhook and SMTP transports (rows 10 and 11), and the

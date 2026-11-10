@@ -931,7 +931,7 @@ does not resolve to a listed `host:port` makes the config **fail at load / reloa
 | `[egress].allowed_syslog` | the off-box log forwarder's collector (`[logging].forward_host`). Checked at start, not at config load; see [CONFIGURATION.md](CONFIGURATION.md#egress) |
 
 **The alert sinks are *not* on this table and are not covered by `[egress]`.** The webhook and SMTP
-*alert* sinks carry no message body field, though some alerts carry free-text detail (the
+*alert* sinks carry no message-body field, though some alerts carry free-text detail (the
 [PHI.md logging inventory](PHI.md#logging-inventory-1611--1623) rows for the `[alerts]` webhook
 and SMTP transports, rows 10 and 11), and keep their **own** host allow-lists —
 `[alerts].webhook_allowed_hosts` and `[alerts].smtp_allowed_hosts`. Populate those separately; an

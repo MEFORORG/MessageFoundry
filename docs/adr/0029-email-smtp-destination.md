@@ -79,9 +79,9 @@ standing rule for such decisions, after an adversarial review upheld it. The own
   nor the notifier has a message-body field. The default alert body still carries free-text
   detail (the [PHI.md logging inventory](../PHI.md#logging-inventory-1611--1623) rows for the
   `[alerts]` transports; corrected 2026-11-10, BACKLOG #5021: this read *"limits alert mail to
-  fields with no PHI"*). *(Note 2026-11-10: that premise was the reason given for this decline,
-  and it is false in the shipped code. The decline is to be re-checked against the off-box alert
-  key allowlist once that is built, by the owner ruling recorded in
+  fields with no PHI"*). *(Note 2026-11-10: that retired claim was the reason given for this
+  decline, and it is false in the shipped code. The decline is to be re-checked against the
+  off-box alert key allowlist once that is built, by the owner ruling recorded in
   [ADR 0173](0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s
   note of 2026-11-10.)* DIRECT stays out too: its bounces carry ciphertext
   ([ADR 0085](0085-direct-hisp-smime-connector.md)).
