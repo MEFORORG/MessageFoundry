@@ -16087,9 +16087,6 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
-        # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
-        # revoke went ahead without is audited and paged once it has committed, never inside it.
-        await outcome.report(self.record_audit)
         return result
 
     async def _keep_or_end_session(
@@ -16220,9 +16217,6 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
-        # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
-        # revoke went ahead without is audited and paged once it has committed, never inside it.
-        await outcome.report(self.record_audit)
         return result
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:

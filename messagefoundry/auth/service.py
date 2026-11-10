@@ -211,6 +211,7 @@ from messagefoundry.store.store import (
     VerifiedUser,
     WebAuthnCredential,
     ad_map_seal_ok_async,
+    deferred_revoke_reports,
     judge_totp,
     judge_totp_cell,
     passkey_cell_undecodable,
@@ -11287,26 +11288,29 @@ class AuthService:
         loop = asyncio.get_running_loop()
         give_up_at = loop.time() + _POST_COMMIT_REVOKE_BUDGET_SECONDS
         attempt = 0
-        while True:
-            attempt += 1
-            try:
-                return await self._store.revoke_user_sessions(user_id)
-            except _session_write_errors() as exc:
-                if _is_revoke_defect(exc):
+        # Each attempt's seal refusals are reported once, by the attempt that committed if one
+        # did (decision d20261110T063908944-857965, item 4).
+        async with deferred_revoke_reports():
+            while True:
+                attempt += 1
+                try:
+                    return await self._store.revoke_user_sessions(user_id)
+                except _session_write_errors() as exc:
+                    if _is_revoke_defect(exc):
+                        raise
+                    if attempt < _POST_COMMIT_REVOKE_ATTEMPTS and loop.time() < give_up_at:
+                        await asyncio.sleep(_POST_COMMIT_REVOKE_BACKOFF_SECONDS * attempt)
+                        continue
+                    await self._record_revoke_miss(
+                        user_id,
+                        exc,
+                        change=change,
+                        attempts=attempt,
+                        actor=actor,
+                        client=client,
+                        not_attempted=not_attempted,
+                    )
                     raise
-                if attempt < _POST_COMMIT_REVOKE_ATTEMPTS and loop.time() < give_up_at:
-                    await asyncio.sleep(_POST_COMMIT_REVOKE_BACKOFF_SECONDS * attempt)
-                    continue
-                await self._record_revoke_miss(
-                    user_id,
-                    exc,
-                    change=change,
-                    attempts=attempt,
-                    actor=actor,
-                    client=client,
-                    not_attempted=not_attempted,
-                )
-                raise
 
     async def _record_revoke_miss(
         self,
@@ -11430,10 +11434,12 @@ class AuthService:
         lapse check has passed, so a refusal from the re-key on is this method's, and an exception
         from the lapse check that this method's handlers do not take still reaches the window,
         which revokes the stamped hash (decision d20261109T200352805-599b24, item 1). An
-        Unverifiable answer at the rotation's load or re-key, which the rotation revokes, is
-        written as ``auth.session_rotation_failed`` with reason ``transit_unverifiable``, softly,
-        and then propagates (decision d20261110T042322305-2ffc60). The lapse
-        check's reads are the session's
+        Unverifiable answer is the exception to that: at the lapse check this method revokes the
+        stamped hash itself, shielded, and closes the window first so it is not revoked twice; at
+        the rotation's load or re-key the rotation revokes it. Either way the revoke is written as
+        ``auth.session_rotation_failed`` with reason ``transit_unverifiable``, softly, and then the
+        answer propagates (decisions d20261110T042322305-2ffc60 and d20261110T063908944-857965,
+        item 2). The lapse check's reads are the session's
         and the account's: an Outage on the account record's check revokes the session too, though
         the session's own seal held."""
         window = _STAMP_WINDOW.get()
@@ -11448,21 +11454,28 @@ class AuthService:
             if window is not None:
                 # The rotation owns its refusals from here (:meth:`_stamp_to_rotation`). The lapse
                 # check is before it, so an exception there that no handler below takes (at least
-                # Forged, Unverifiable or a code defect) still reaches the window, which revokes
-                # the stamped hash and re-raises (decision d20261109T200352805-599b24, item 1).
+                # Forged or a code defect) still reaches the window, which revokes the stamped hash
+                # and re-raises (decision d20261109T200352805-599b24, item 1). An Unverifiable
+                # answer there is revoked and recorded by the handler below instead.
                 window.closed = True
             rotated = await self._rotate_session_hash(token_hash, unverifiable=unverifiable)
-        except (TransitSealUnverifiableError, RowSealUnverifiableError):
-            if not unverifiable:
-                # Not the rotation's load or re-key: the lapse check's, which the window answers.
-                raise
-            # Decision d20261110T042322305-2ffc60: the rotation revoked the stamped hash, so the
-            # row records it, softly, before the Unverifiable answer propagates.
+        except (TransitSealUnverifiableError, RowSealUnverifiableError) as exc:
+            if unverifiable:
+                # The rotation's load or re-key, which revoked the stamped hash itself.
+                landed = unverifiable[0]
+            else:
+                # The lapse check's (decision d20261110T063908944-857965, item 2): revoked here,
+                # shielded, and the window closed first, so it does not revoke the hash again.
+                if window is not None:
+                    window.closed = True
+                landed = await self._revoke_stamped_shielded(token_hash, exc)
+            # Decisions d20261110T042322305-2ffc60 and d20261110T063908944-857965: the row records
+            # the revoke, softly, before the Unverifiable answer propagates.
             await self._audit_rotation_failed(
                 ceremony=ceremony,
                 actor=actor,
                 client=client,
-                failure={"reason": "transit_unverifiable", "revokes_landed": unverifiable[0]},
+                failure={"reason": "transit_unverifiable", "revokes_landed": landed},
             )
             raise
         except _RotationStoreError as refused:
@@ -12912,18 +12925,21 @@ class AuthService:
         the caller's own when it ends it, and that one is taken off (``ended_kept``), and on the
         seal-failure path the handler ends it before the counted sweep.
         :meth:`revoke_every_session` counts it in both cases instead."""
-        try:
-            result = await self._store.revoke_user_sessions(
-                identity.user_id, except_token_hash=current_token_hash
-            )
-        except RowSealError:
-            # BACKLOG #2592: the caller's own session failed its seal, so the store wrote nothing.
-            # The caller asked to end every other session and its own is suspect: end them all,
-            # and audit that scope, since the caller's own session is ended too. The handler ends
-            # it before the sweep, so the count and the reply ("signed out N other sessions") stay
-            # the other sessions only.
-            await self._session_seal_failed(current_token_hash)
-            result = await self._store.revoke_user_sessions(identity.user_id)
+        # The retry below reports each seal refusal once (decision d20261110T063908944-857965,
+        # item 4).
+        async with deferred_revoke_reports():
+            try:
+                result = await self._store.revoke_user_sessions(
+                    identity.user_id, except_token_hash=current_token_hash
+                )
+            except RowSealError:
+                # BACKLOG #2592: the caller's own session failed its seal, so the store wrote
+                # nothing. The caller asked to end every other session and its own is suspect: end
+                # them all, and audit that scope, since the caller's own session is ended too. The
+                # handler ends it before the sweep, so the count and the reply ("signed out N other
+                # sessions") stay the other sessions only.
+                await self._session_seal_failed(current_token_hash)
+                result = await self._store.revoke_user_sessions(identity.user_id)
         others = result.others
         scope = "self_others" if result.kept else "self_all"
         if others or not result.kept:
@@ -12996,17 +13012,21 @@ class AuthService:
         path. The count is the rows this call revoked: where the store or the seal-failure path
         ended the caller's own, that one is in it, which :meth:`revoke_other_sessions` leaves out
         of its count."""
-        try:
-            result = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
-        except RowSealError:
-            # The sweep runs first, so the suspect row is counted with the rest: ended first by
-            # the seal-failure handler, the sweep would find it gone and the reply and the audit
-            # row would be one short. The handler still runs if the sweep raises, so the suspect
-            # row is ended either way; its own revoke then matches nothing, and it reports.
+        # The retry below reports each seal refusal once (decision d20261110T063908944-857965,
+        # item 4).
+        async with deferred_revoke_reports():
             try:
-                result = await self._store.revoke_all_sessions()
-            finally:
-                await self._session_seal_failed(keep_token_hash)
+                result = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
+            except RowSealError:
+                # The sweep runs first, so the suspect row is counted with the rest: ended first by
+                # the seal-failure handler, the sweep would find it gone and the reply and the
+                # audit row would be one short. The handler still runs if the sweep raises, so the
+                # suspect row is ended either way; its own revoke then matches nothing, and it
+                # reports.
+                try:
+                    result = await self._store.revoke_all_sessions()
+                finally:
+                    await self._session_seal_failed(keep_token_hash)
         await self._audit(
             "auth.session_revoked",
             actor=actor,
@@ -15031,10 +15051,8 @@ class AuthService:
         # always a plain one (vault BACKLOG #3113): it needs a code from a later step, since this one
         # is spent, and where the enable matched no row (#2224, below) a reset may have cleared the
         # staged secret, so the user starts the enrolment again.
-        # Stamp against the OLD hash, then rotate — never the other way round. The stamp-to-
-        # rotation window, as in verify_mfa (_stamp_to_rotation; decision
-        # d20261110T042322305-2ffc60): an exception from the stamp's write to the rotation revokes
-        # the stamped hash, and a refusal it answers is session_lost, so MFA stays off.
+        # Stamp against the OLD hash, then rotate — never the other way round. Inside the
+        # stamp-to-rotation window (_stamp_to_rotation; decision d20261110T042322305-2ffc60).
         elevation = Elevation(session_lost=True)
         async with self._stamp_to_rotation(
             ceremony="mfa_enroll_confirm", actor=identity.username, client=client
@@ -16958,18 +16976,35 @@ class AuthService:
         elevation = Elevation(session_lost=True)
         async with self._stamp_to_rotation(
             ceremony="webauthn_enroll", actor=identity.username, client=client
-        ):
+        ) as window:
             async with self._sealed_stamp(hash_token(token)):
                 await self._store.mark_session_mfa_verified(hash_token(token))
             elevation = await self._elevated(
                 token, ceremony="webauthn_enroll", actor=identity.username, client=client
             )
-        await self._audit(
-            "auth.webauthn_enrolled",
-            actor=identity.username,
-            detail=_json({"label": label}),
-            client=client,
-        )
+
+        async def enrolled_row() -> None:
+            await self._audit(
+                "auth.webauthn_enrolled",
+                actor=identity.username,
+                detail=_json({"label": label}),
+                client=client,
+            )
+
+        if window.lost or window.rotation_lost:
+            # Decision d20261110T063908944-857965, item 1, as Q1 does for auth.reauth: the
+            # session was lost in the window or at the rotation, so this row is written softly.
+            # The answer, session_lost, is the fail-closed control; the row only records it.
+            await write_audit_soft(
+                enrolled_row,
+                log=_log,
+                message="the auth.webauthn_enrolled row of a registration that lost its session"
+                " could not be written",
+                errors=audit_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
+            )
+        else:
+            await enrolled_row()
         await self._notify_security(
             MFA_ENABLED, username=user.username, email=user.notify_email, client=client
         )

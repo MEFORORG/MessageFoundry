@@ -369,7 +369,9 @@ async def test_an_exception_at_the_lapse_check_still_revokes_the_stamped_hash(
     monkeypatch: pytest.MonkeyPatch, exc: BaseException
 ) -> None:
     """The lapse check runs before the rotation, so an exception there that the rotation's own
-    handlers do not take is still the window's: it revokes the stamped hash, then re-raises."""
+    handlers do not take is still the window's: it revokes the stamped hash, then re-raises. An
+    Unverifiable answer there is revoked by the rotation step itself and recorded softly as
+    ``transit_unverifiable`` (decision d20261110T063908944-857965, item 2)."""
     store, service = await _service()
     try:
         token, secret, t1 = await _pre_mfa(service, monkeypatch)
@@ -381,7 +383,12 @@ async def test_an_exception_at_the_lapse_check_still_revokes_the_stamped_hash(
         with pytest.raises(type(exc)):
             await service.verify_mfa(token, totp.totp(secret, now=t1))
         monkeypatch.undo()
-        await _revoked_unanswered(store, service, token)
+        if isinstance(exc, RowSealUnverifiableError):
+            await _assert_lost(
+                store, service, token, ceremony="mfa_verify", reason="transit_unverifiable"
+            )
+        else:
+            await _revoked_unanswered(store, service, token)
     finally:
         await store.close()
 
@@ -651,8 +658,8 @@ def _ambiguous_stamp(monkeypatch: pytest.MonkeyPatch, store: MessageStore) -> No
 async def test_an_unverifiable_lapse_check_at_enrolment_revokes_the_stamped_hash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An Unverifiable answer at the lapse check of a TOTP enrolment's confirm reaches the window,
-    which revokes the MFA-stamped hash and re-raises; MFA stays off."""
+    """An Unverifiable answer at the lapse check of a TOTP enrolment's confirm revokes the
+    MFA-stamped hash, records it as ``transit_unverifiable`` and re-raises; MFA stays off."""
     store, service = await _service()
     try:
         identity, token, secret, t0 = await _enrolling(service, monkeypatch)
@@ -660,7 +667,9 @@ async def test_an_unverifiable_lapse_check_at_enrolment_revokes_the_stamped_hash
         with pytest.raises(type(exc)):
             await service.confirm_mfa_enrollment(identity, totp.totp(secret, now=t0), token=token)
         monkeypatch.undo()
-        await _revoked_unanswered(store, service, token)
+        await _assert_lost(
+            store, service, token, ceremony="mfa_enroll_confirm", reason="transit_unverifiable"
+        )
         assert await store.list_audit(action="auth.mfa_enrolled") == []
     finally:
         await store.close()
@@ -716,7 +725,8 @@ async def test_a_passkey_registration_revokes_its_stamped_hash(
     monkeypatch: pytest.MonkeyPatch, fault: str
 ) -> None:
     """A passkey registration arms the window as a TOTP enrolment does: an Unverifiable lapse
-    check revokes and re-raises, and a refused stamp answers session_lost with the row."""
+    check revokes, is recorded and re-raises, and a refused stamp answers session_lost with the
+    row."""
     store, service = await _service()
     try:
         identity, enrolling, _password = await login_admin(service)
@@ -726,7 +736,9 @@ async def test_a_passkey_registration_revokes_its_stamped_hash(
             with pytest.raises(type(exc)):
                 await _register(service, identity, token)
             monkeypatch.undo()
-            await _revoked_unanswered(store, service, token)
+            await _assert_lost(
+                store, service, token, ceremony="webauthn_enroll", reason="transit_unverifiable"
+            )
         else:
             _ambiguous_stamp(monkeypatch, store)
             lost = await _register(service, identity, token)
@@ -735,6 +747,26 @@ async def test_a_passkey_registration_revokes_its_stamped_hash(
             await _assert_lost(
                 store, service, token, ceremony="webauthn_enroll", reason="store_error"
             )
+    finally:
+        await store.close()
+
+
+@requires_webauthn
+async def test_a_lost_registration_writes_its_enrolled_row_softly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decision d20261110T063908944-857965, item 1, as Q1 for ``auth.reauth``: a registration
+    whose window answered session_lost writes ``auth.webauthn_enrolled`` softly, so a refused row
+    (the audit MAC's CipherError on a vault_transit store) still answers session_lost, not a 500."""
+    store, service = await _service()
+    try:
+        identity, enrolling, _password = await login_admin(service)
+        _, token = await _enroll_totp(service, identity, enrolling)
+        _ambiguous_stamp(monkeypatch, store)
+        refusals = _refuse_audit(monkeypatch, store, "auth.webauthn_enrolled")
+        lost = await _register(service, identity, token)
+        assert lost.session_lost and lost.token is None
+        assert refusals == ["auth.webauthn_enrolled"]  # attempted, refused, and not raised
     finally:
         await store.close()
 

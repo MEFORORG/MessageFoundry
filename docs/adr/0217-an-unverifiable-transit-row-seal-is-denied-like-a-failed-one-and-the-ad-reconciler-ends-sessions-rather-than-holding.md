@@ -662,6 +662,48 @@ failed before its commit was confirmed and its sessions may not have been ended,
 propagates. That text does not say the revoke rolled back, because an error after a commit landed
 reaches it too. The Outage is still not audited.
 
+**What the branch built after the text above, recorded 2026-11-10 (decisions
+d20261110T042322305-2ffc60 and d20261110T063908944-857965).** Each item says which earlier sentence
+it supersedes, and only where it disagrees; the earlier text is kept as it was.
+
+- **The two enrolment ceremonies arm the stamp window.** `confirm_mfa_enrollment` and
+  `finish_webauthn_registration` run their stamp and rotation inside `_stamp_to_rotation`, as the
+  other four elevation sites do, so a refusal of the enrolment's stamp revokes the stamped hash and
+  answers `session_lost`, and MFA stays off. A registration whose window or rotation was lost
+  writes its `auth.webauthn_enrolled` row softly, as Q1 does for `auth.reauth`. This adds to the
+  window paragraph's "It covers at least ...", which named no enrolment.
+- **An Unverifiable answer at the rotation step writes a row.** At the lapse check,
+  `_elevated_hash` now revokes the stamped hash itself, shielded, after closing the window so the
+  window does not revoke it again; at the rotation's load or re-key, `_rotate_session_hash`
+  revokes it as Q3 says. Either way `auth.session_rotation_failed` is written softly with reason
+  `transit_unverifiable` and `revokes_landed`, and then the answer propagates. This supersedes
+  Q3's "revokes the old hash, best effort and shielded from a cancel as the window's revoke is,
+  then propagates", which wrote no row, and, for an Unverifiable answer at the lapse check only,
+  item 1's "Every other exception is re-raised after the revoke, at least Forged, Unverifiable".
+- **A failed revoke reports its Forged and Unverifiable refusals, not only an Outage.** When a
+  revoke's transaction raises, `RevokeSealOutcome.committing` logs, audits softly and pages every
+  held refusal, with text saying the revoke failed before its commit was confirmed and its sessions
+  may not have been ended; the audit detail carries `committed: false`. This supersedes Q5's "if
+  the transaction raises, a held Outage is paged with its own text", and item 4's "once its
+  transaction has committed writes the row", which held for a committed revoke only. On a clean
+  exit `committing` itself runs the report, so no path between the commit and a later call can
+  skip it; an exit by an exception that cannot await (an interpreter exit, a `GeneratorExit`)
+  writes the log lines and the pages and an ERROR line for the audit rows it could not write.
+- **A retried revoke reports each refusal once.** `AuthService`'s three callers that retry a
+  failed revoke (`_revoke_after_commit`, `revoke_other_sessions`, `revoke_every_session`) open a
+  `deferred_revoke_reports` scope. A failed attempt's report is held for the scope; an attempt that
+  commits reports its own refusals with the committed wording and drops them from the held ones, so
+  the last page an operator sees for a row is accurate. What only a failed attempt met is reported
+  when the scope ends, as failed, or with `retry_committed: true` and text saying a retry then
+  committed.
+- **The held `refused()` log.** `RevokeSealOutcome.refused` no longer logs at refusal time, inside
+  the writer transaction. Its line is held and written once the outcome is known, with the
+  committed or the failed wording, as the skipped-raise count is, which is logged after a commit
+  only. Item 2's "the count of skipped accounts is logged" said nothing of when.
+- **A report that fails is raised.** A failure of the report after a commit is logged at ERROR
+  with its class, its traceback at DEBUG only, and re-raised; a report task that ends cancelled is
+  logged too. A failing revoke's own report never raises, so the revoke's exception stands.
+
 **Slice 1b-iv builds the quiet end at the callers (build ruling 3 of 2026-11-07).** Every
 backend's session writer now raises `RowSealKeyRetiredError` itself, writing nothing. The store's
 `write_kept_session`, which `_keep_or_end_session` runs on all three backends, reads it as

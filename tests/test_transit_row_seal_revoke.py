@@ -1057,3 +1057,153 @@ async def test_a_refusal_is_logged_only_after_the_outcome_is_known(
             " revoke ended the sessions anyway",
         )
     ]
+
+
+# --- decision d20261110T063908944-857965: one report per revoke, on every exit -----------------
+
+
+async def test_a_retried_revoke_reports_each_refusal_once_and_last_accurately(
+    transit: tuple[MessageStore, FakeBackend, Path],
+    pages: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 4: ``revoke_every_session`` retries a revoke whose kept session failed its seal. The
+    Unverifiable account both attempts met is audited and paged once, by the attempt that
+    committed, so the operator's last page for it says the sessions were ended."""
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.config.settings import AuthSettings
+    from messagefoundry.store.row_seal import unverifiable_subject
+
+    store, _, path = transit
+    await _user(store, "u-1")
+    kept = await _session(store, "u-1")
+    await _session(store, "u-1")
+    _plant(path, "users", "authz_seal", "id", "u-1")
+    write_session = store._write_session
+    calls: list[str] = []
+
+    async def forged_once(token_hash: str, change: Any) -> Any:
+        calls.append(token_hash)
+        if len(calls) == 1:
+            raise RowSealError("session", "")
+        return await write_session(token_hash, change)
+
+    monkeypatch.setattr(store, "_write_session", forged_once)
+    service = AuthService(store, AuthSettings())
+    count, was_kept = await service.revoke_every_session(
+        actor="synthetic-admin", keep_token_hash=hash_token(kept)
+    )
+    assert not was_kept and _live(path, "u-1") == 0
+    rows = await _audits(store, "integrity.authority_seal_unverifiable")
+    assert len(rows) == 1 and "committed" not in rows[0]
+    mine = [p for p in pages if p.split("|", 1)[0] == unverifiable_subject("user", "u-1")]
+    assert len(mine) == 1 and mine[0].endswith("the revoke ended the sessions anyway")
+
+
+async def test_a_refusal_only_a_failed_attempt_met_is_reported_as_retried(
+    transit: tuple[MessageStore, FakeBackend, Path],
+    pages: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 4, the other half: what only the failed attempt met is still reported once, when the
+    scope ends, with text saying a retry then committed."""
+    from messagefoundry.store.store import deferred_revoke_reports
+
+    store, _, path = transit
+    await _user(store, "u-1")
+    kept = await _session(store, "u-1")
+    _plant(path, "users", "authz_seal", "id", "u-1")
+    _forged_kept_session(monkeypatch, store)
+    async with deferred_revoke_reports():
+        with pytest.raises(RowSealError):
+            await store.revoke_user_sessions("u-1", except_token_hash=hash_token(kept))
+        assert pages == []  # held for the scope
+        monkeypatch.undo()
+        await _user(store, "u-2")  # a later attempt, which meets no refusal, commits
+        await store.revoke_user_sessions("u-2")
+    (detail,) = await _audits(store, "integrity.authority_seal_unverifiable")
+    assert detail["committed"] is False and detail["retry_committed"] is True
+    assert len(pages) == 1 and pages[0].endswith("a retry of the revoke then committed")
+
+
+async def test_a_report_failure_is_logged_with_its_class_and_re_raised(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 5: a defect in the report after a commit is logged at ERROR, naming its class, and
+    re-raised, as ``report`` did before; a report task that ends cancelled is logged too."""
+    import asyncio
+    import logging
+
+    from messagefoundry.store.row_seal import SealPager
+    from messagefoundry.store.store import _RevokeSealRefusal
+
+    async def no_audit(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    for fault in (LookupError("synthetic report defect"), asyncio.CancelledError()):
+
+        def broken(*_args: Any, fault: BaseException = fault, **_kwargs: Any) -> Any:
+            raise fault
+
+        monkeypatch.setattr(RevokeSealOutcome, "_entry", broken)
+        outcome = RevokeSealOutcome(SealPager())
+        outcome.refusals.append(_RevokeSealRefusal(True, "user", "u-1", 2, 3))
+        caplog.clear()
+        caplog.set_level(logging.DEBUG, logger="messagefoundry.store.store")
+        with pytest.raises(type(fault)):
+            await outcome.report(no_audit)
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        if isinstance(fault, LookupError):
+            assert any("report failed (LookupError)" in m for m in errors), errors
+            assert "synthetic report defect" not in " ".join(errors)
+        else:
+            assert any("was cancelled before it finished" in m for m in errors), errors
+
+
+async def test_held_refusals_are_reported_on_every_exit(caplog: pytest.LogCaptureFixture) -> None:
+    """Item 6: a clean exit reports with no separate ``report`` call, and an exit by an exception
+    that cannot await still writes the log line and the page, with an ERROR line for the audit
+    row it could not write."""
+    import logging
+
+    from messagefoundry.store.row_seal import SealPager
+
+    written: list[str] = []
+
+    async def record(action: str, **_kwargs: Any) -> None:
+        written.append(action)
+
+    for exit_by in (None, SystemExit(3)):
+        seen: list[str] = []
+        pager = SealPager()
+
+        def take(subject: str, reason: str, seen: list[str] = seen) -> None:
+            seen.append(reason)
+
+        pager.arm(take)
+        outcome = RevokeSealOutcome(pager)
+        outcome.refused(
+            RowSealUnverifiableError("user", ""),
+            what="an account's session epoch raise",
+            kind="user",
+            ident="u-1",
+        )
+        caplog.clear()
+        caplog.set_level(logging.DEBUG, logger="messagefoundry.store.store")
+        written.clear()
+        if exit_by is None:
+            async with outcome.committing(record):
+                pass
+            assert written == ["integrity.authority_seal_unverifiable"] and len(seen) == 1
+        else:
+            with pytest.raises(SystemExit):
+                async with outcome.committing(record):
+                    raise exit_by
+            assert written == [] and len(seen) == 1
+            assert "may not have been ended" in seen[0]
+            messages = [(r.levelno, r.getMessage()) for r in caplog.records]
+            assert any("was refused (RowSealUnverifiableError)" in m for _, m in messages)
+            assert any(
+                lvl >= logging.ERROR and "were not written" in m and "SystemExit" in m
+                for lvl, m in messages
+            )

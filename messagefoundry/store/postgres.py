@@ -11208,9 +11208,6 @@ class PostgresStore:
                     now,
                     outcome,
                 )
-        # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
-        # revoke went ahead without is audited and paged once it has committed, never inside it.
-        await outcome.report(self.record_audit)
         return result
 
     async def _keep_or_end_session(
@@ -11268,9 +11265,6 @@ class PostgresStore:
         outcome = RevokeSealOutcome(self._seal_pager)
         async with outcome.committing(self.record_audit):
             result = await self._revoke_all_sessions_on(except_token_hash, now, outcome)
-        # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
-        # revoke went ahead without is audited and paged once it has committed, never inside it.
-        await outcome.report(self.record_audit)
         return result
 
     async def _revoke_all_sessions_on(

@@ -1550,6 +1550,25 @@ class _RevokeSealRefusal:
     probe_version: int = 0
 
 
+#: How a held refusal's report reads, by what became of the revoke that held it: committed; failed
+#: before its commit was confirmed; or failed, after which a retry in the same
+#: :func:`deferred_revoke_reports` scope committed.
+_RevokeEnd = Literal["committed", "failed", "retried"]
+
+_REVOKE_END_TEXT: Final[dict[str, str]] = {
+    "committed": "the revoke ended the sessions anyway",
+    "failed": "the revoke then failed before its commit was confirmed; its sessions may not have"
+    " been ended",
+    "retried": "that revoke attempt then failed before its commit was confirmed, and a retry of"
+    " the revoke then committed",
+}
+
+
+def _refusal_key(refusal: _RevokeSealRefusal) -> tuple[object, ...]:
+    """What makes two held refusals one report: the same answer for the same stored row."""
+    return ("refusal", refusal.unverifiable, refusal.kind, refusal.ident)
+
+
 @dataclass
 class RevokeSealOutcome:
     """What one revoke's sealed writes met (decision d20261109T200352805-599b24 on ADR 0217, items
@@ -1557,7 +1576,7 @@ class RevokeSealOutcome:
     calls Transit (``skipped`` counts them), every session is still marked revoked, and the kept
     session's re-stamp is not attempted, so it is ended with the rest. A Forged or Unverifiable
     answer does not trip it, so the accounts after it still call Transit; each is held in
-    ``refusals`` until :meth:`report` writes its audit row and page after the revoke commits.
+    ``refusals`` until :meth:`committing` reports it, once the revoke's outcome is known.
 
     ``pager`` is the store's :class:`~messagefoundry.store.row_seal.SealPager` (item 5); ``None``
     pages nothing."""
@@ -1567,81 +1586,98 @@ class RevokeSealOutcome:
     skipped: int = 0
     refusals: list[_RevokeSealRefusal] = field(default_factory=list)
     outages: list[str] = field(default_factory=list)
-    #: Each refusal's log line, ``(what, class name)``, written once the outcome is known.
-    refused_log: list[tuple[str, str]] = field(default_factory=list)
+    #: Each refusal's log line, ``(what, class name, key)``, written once the outcome is known.
+    #: ``key`` is :func:`_refusal_key`'s, or ``("outage", what)`` for an Outage.
+    refused_log: list[tuple[str, str, tuple[object, ...]]] = field(default_factory=list)
 
     @asynccontextmanager
     async def committing(
         self, record_audit: Callable[..., Awaitable[object]]
     ) -> AsyncIterator[None]:
-        """Wrap a revoke's transaction. If it raises, everything the revoke held is reported with
-        text saying the revoke failed before its commit was confirmed, rather than that it went
-        ahead, and the exception propagates (decision d20261110T004916856-814db8, Q5, and decision
-        d20261110T042322305-2ffc60): a held Outage is paged, and each held Forged or Unverifiable
-        refusal is logged, audited softly and paged, as :meth:`report` does after a commit. The
-        text does not claim the revoke rolled back: an error after a commit landed reaches here too.
+        """Wrap a revoke's transaction, and report everything the revoke held once its outcome is
+        known, on every exit (decision d20261110T063908944-857965, item 6).
 
-        The report never raises, so the transaction's exception is the one the caller sees. It runs
-        to completion through a cancel, as :meth:`report` does; a cancel that lands meanwhile is
-        raised in place of a transaction exception that was not itself a cancel. An exception that
-        is neither an ``Exception`` nor a cancel (an interpreter exit, a ``GeneratorExit``) cannot
-        await, so it pages the Outages only, as before."""
+        **On a clean exit** the revoke has committed, and :meth:`report` runs here, so no path
+        between the commit and a separate call can skip it.
+
+        **If the transaction raises**, the report says the revoke failed before its commit was
+        confirmed, rather than that it went ahead, and the exception propagates (decision
+        d20261110T004916856-814db8, Q5, and decision d20261110T042322305-2ffc60): a held Outage is
+        paged, and each held Forged or Unverifiable refusal is logged, audited softly and paged.
+        The text does not claim the revoke rolled back: an error after a commit landed reaches here
+        too. Inside a :func:`deferred_revoke_reports` scope, which a caller that retries a failed
+        revoke opens, the report is held for the scope instead, so a retry that meets the same
+        refusals reports each once (decision d20261110T063908944-857965, item 4). That report never
+        raises, so the transaction's exception is the one the caller sees; it runs to completion
+        through a cancel, and a cancel that lands meanwhile is raised in place of a transaction
+        exception that was not itself a cancel.
+
+        **An exception that is neither an ``Exception`` nor a cancel** (an interpreter exit, a
+        ``GeneratorExit``) may not await, so the log lines and the pages are written at once and
+        the audit rows are not, which an ERROR line records."""
         try:
             yield
         except (Exception, asyncio.CancelledError) as exc:
-            cancelled = await _run_to_completion(
-                functools.partial(self._report, record_audit, committed=False)
+            carry = _REVOKE_CARRY.get()
+            if carry is not None and not carry.closed:
+                carry.held.append((self, record_audit))
+                raise
+            cancelled, _failure = await _run_to_completion(
+                functools.partial(self._report, record_audit, end="failed")
             )
             if cancelled and not isinstance(exc, asyncio.CancelledError):
                 raise asyncio.CancelledError from exc
             raise
-        except BaseException:
-            self._page_outages(committed=False)
+        except BaseException as exc:
+            self._report_unawaited(exc, end="failed")
             raise
+        carry = _REVOKE_CARRY.get()
+        if carry is not None and not carry.closed:
+            carry.covered_by(self)
+        await self.report(record_audit)
 
     def refused(self, exc: Exception, *, what: str, kind: str, ident: str) -> None:
         """Take one refusal :func:`revoke_seal_refusals` names, which the revoke goes ahead without.
         Its log line, which names its class only, is held with it and written once the outcome is
         known (decision d20261110T042322305-2ffc60), as the skipped-raise count is: "the revoke
         ended the sessions anyway" is true only after the commit. An Outage trips the outcome and
-        is held too: :meth:`report` pages ``authority-seal-transit`` once the revoke has committed,
-        and :meth:`committing` sends a page of its own if it never does (decision
-        d20261110T004916856-814db8, Q5). A Forged or Unverifiable answer is held for the same two."""
-        self.refused_log.append((what, type(exc).__name__))
+        is held too. :meth:`committing` reports everything held, on every exit."""
         if isinstance(exc, TransitSealUnavailableError):
             self.tripped = True
             self.outages.append(what)
+            self.refused_log.append((what, type(exc).__name__, ("outage", what)))
             return
         if isinstance(exc, RowSealError):
-            self.refusals.append(_RevokeSealRefusal(False, kind, ident))
-            return
-        self.refusals.append(
-            _RevokeSealRefusal(
+            refusal = _RevokeSealRefusal(False, kind, ident)
+        else:
+            refusal = _RevokeSealRefusal(
                 True,
                 kind,
                 ident,
                 getattr(exc, "stored_version", 0),
                 getattr(exc, "probe_version", 0),
             )
-        )
+        self.refusals.append(refusal)
+        self.refused_log.append((what, type(exc).__name__, _refusal_key(refusal)))
 
     def log_skipped(self) -> None:
-        """Log how many accounts went without their raise because of the Outage, if any."""
-        if self.skipped:
+        """Log how many accounts went without their raise because of the Outage, if any, once."""
+        skipped, self.skipped = self.skipped, 0
+        if skipped:
             log.warning(
                 "a revoke met a Vault transit outage; %d further account epoch raise(s) were "
                 "skipped without calling Transit, and every session is still ended",
-                self.skipped,
+                skipped,
             )
 
     async def report(self, record_audit: Callable[..., Awaitable[object]]) -> None:
         """After the revoke commits, write each held refusal's audit row, softly, and page it
         (decision d20261109T200352805-599b24, item 4): ``integrity.authority_seal_unverifiable``
         under the row's capped subject for Unverifiable, ``integrity.authority_seal_failed`` under
-        ``AUTHORITY_SEAL_SUBJECT`` for Forged. ``record_audit`` is the store's own, so the row is
-        never inside the revoke's writer transaction. A failed audit write, a defect included, is
-        logged at ERROR and the page still goes: the revoke has committed, so a raise here would
-        report it as failed and drop the pages after it.
+        ``AUTHORITY_SEAL_SUBJECT`` for Forged. :meth:`committing` calls it on a clean exit.
+        ``record_audit`` is the store's own, so the row is never inside the revoke's writer
+        transaction. A failed audit write, a defect included, is logged at ERROR and the page still
+        goes.
 
         The detail keys match ``AuthService``'s rows of the same actions: a user by its whole id
         (``user_id``), a session by its 12-character ref (``session``), never a token hash.
@@ -1652,72 +1688,90 @@ class RevokeSealOutcome:
         **A cancel cannot drop a page.** The revoke has committed, so the loop runs as a task
         awaited through :func:`asyncio.shield`, and awaited again after each cancel, as
         ``auth/service.py``'s ``_write_through_cancellation`` runs a refused sign-in's rows; the
-        cancel is re-raised once every row is written and every page sent."""
-        if await _run_to_completion(functools.partial(self._report, record_audit, committed=True)):
+        cancel is re-raised once every row is written and every page sent. A failure of the report
+        itself is logged at ERROR with its class and then re-raised (decision
+        d20261110T063908944-857965, item 5)."""
+        cancelled, failure = await _run_to_completion(
+            functools.partial(self._report, record_audit, end="committed")
+        )
+        if cancelled:
             raise asyncio.CancelledError
+        if failure is not None:
+            raise failure
 
-    def _page_outages(self, *, committed: bool) -> None:
-        """Page each held Outage once, with text that says whether the revoke committed."""
+    def _page_outages(self, *, end: _RevokeEnd) -> None:
+        """Page each held Outage once, with text that says what became of the revoke."""
         outages, self.outages = self.outages, []
         if self.pager is None:
             return
         for what in outages:
             self.pager.outage(
                 f"{what} met a Vault transit outage; the revoke went ahead without it"
-                if committed
-                else f"{what} met a Vault transit outage, and the revoke then failed before its"
-                " commit was confirmed; its sessions may not have been ended"
+                if end == "committed"
+                else f"{what} met a Vault transit outage, and {_REVOKE_END_TEXT[end]}"
             )
 
-    async def _report(
-        self, record_audit: Callable[..., Awaitable[object]], *, committed: bool
-    ) -> None:
-        """The body of :meth:`report` and of :meth:`committing`'s failure path, run to completion.
-        ``committed`` picks the wording. The held log lines and the skipped-raise count are written
-        here, once the outcome is known; the count only after a commit, since its "every session is
-        still ended" is true only then."""
-        after = (
-            "the revoke ended the sessions anyway"
-            if committed
-            else "the revoke then failed before its commit was confirmed; its sessions may not"
-            " have been ended"
-        )
+    def _log_held(self, *, end: _RevokeEnd) -> None:
+        """Write the held refusals' log lines, and after a commit the skipped-raise count."""
         refused_log, self.refused_log = self.refused_log, []
-        for what, cls in refused_log:
-            log.warning("%s was refused (%s); %s", what, cls, after)
-        if committed:
+        for what, cls, _key in refused_log:
+            log.warning("%s was refused (%s); %s", what, cls, _REVOKE_END_TEXT[end])
+        if end == "committed":
             self.log_skipped()
-        self._page_outages(committed=committed)
+
+    def _entry(self, refusal: _RevokeSealRefusal, *, end: _RevokeEnd) -> tuple[str, str, str]:
+        """One held refusal's audit action, detail JSON and page reason."""
+        ref = seal_row_ref(refusal.kind, refusal.ident)
+        after = _REVOKE_END_TEXT[end]
+        detail: dict[str, object] = {"kind": refusal.kind, "during": "revoke"}
+        if end != "committed":
+            detail["committed"] = False
+        if end == "retried":
+            detail["retry_committed"] = True
+        if refusal.kind == SESSION_KIND:
+            detail["session"] = ref  # the same form the page names it by
+        else:
+            detail["user_id"] = refusal.ident
+        if refusal.unverifiable:
+            detail["stored_version"] = refusal.stored_version
+            detail["probe_version"] = refusal.probe_version
+            return (
+                AUTHORITY_SEAL_UNVERIFIABLE_AUDIT_ACTION,
+                json.dumps(detail, sort_keys=True),
+                f"a {refusal.kind} row's integrity seal could not be verified by Vault transit"
+                f" during a revoke ({refusal.kind} {ref}); {after}",
+            )
+        return (
+            AUTHORITY_SEAL_FAILED_AUDIT_ACTION,
+            json.dumps(detail, sort_keys=True),
+            f"a {refusal.kind} row failed its integrity check during a revoke"
+            f" ({refusal.kind} {ref}); {after}",
+        )
+
+    def _page(self, refusal: _RevokeSealRefusal, reason: str) -> None:
+        if self.pager is None:
+            return
+        if refusal.unverifiable:
+            self.pager.unverifiable(refusal.kind, refusal.ident, reason)
+        else:
+            self.pager.forged(reason)
+
+    async def _report(
+        self, record_audit: Callable[..., Awaitable[object]], *, end: _RevokeEnd
+    ) -> None:
+        """The awaited report, run to completion: the held log lines (and, after a commit, the
+        skipped-raise count), the Outage pages, then each refusal's soft audit row and page."""
+        self._log_held(end=end)
+        self._page_outages(end=end)
         if not self.refusals:
             return
         from messagefoundry.audit_write import write_audit_soft
 
         refusals, self.refusals = self.refusals, []
         for refusal in refusals:
-            ref = seal_row_ref(refusal.kind, refusal.ident)
-            detail: dict[str, object] = {"kind": refusal.kind, "during": "revoke"}
-            if not committed:
-                detail["committed"] = False
-            if refusal.kind == SESSION_KIND:
-                detail["session"] = ref  # the same form the page names it by
-            else:
-                detail["user_id"] = refusal.ident
-            if refusal.unverifiable:
-                action = AUTHORITY_SEAL_UNVERIFIABLE_AUDIT_ACTION
-                detail["stored_version"] = refusal.stored_version
-                detail["probe_version"] = refusal.probe_version
-                reason = (
-                    f"a {refusal.kind} row's integrity seal could not be verified by Vault transit"
-                    f" during a revoke ({refusal.kind} {ref}); {after}"
-                )
-            else:
-                action = AUTHORITY_SEAL_FAILED_AUDIT_ACTION
-                reason = (
-                    f"a {refusal.kind} row failed its integrity check during a revoke"
-                    f" ({refusal.kind} {ref}); {after}"
-                )
+            action, detail, reason = self._entry(refusal, end=end)
             await write_audit_soft(
-                functools.partial(record_audit, action, detail=json.dumps(detail, sort_keys=True)),
+                functools.partial(record_audit, action, detail=detail),
                 log=log,
                 message="the %s audit row for a revoke's refused authority row could not be written",
                 args=(action,),
@@ -1725,29 +1779,144 @@ class RevokeSealOutcome:
                 errors=(Exception,),
                 defects=(),
             )
-            if self.pager is None:
-                continue
-            if refusal.unverifiable:
-                self.pager.unverifiable(refusal.kind, refusal.ident, reason)
-            else:
-                self.pager.forged(reason)
+            self._page(refusal, reason)
+
+    def _report_unawaited(self, cause: BaseException, *, end: _RevokeEnd) -> None:
+        """The report for an exit that may not await (an interpreter exit, a ``GeneratorExit``):
+        the log lines and the pages now, and an ERROR line for the audit rows not written."""
+        self._log_held(end=end)
+        self._page_outages(end=end)
+        refusals, self.refusals = self.refusals, []
+        for refusal in refusals:
+            _action, _detail, reason = self._entry(refusal, end=end)
+            self._page(refusal, reason)
+        if refusals:
+            log.error(
+                "%d audit row(s) for a revoke's refused authority rows were not written: the"
+                " revoke was ended by %s, which cannot wait for a write; each was logged and paged",
+                len(refusals),
+                type(cause).__name__,
+            )
 
 
-async def _run_to_completion(body: Callable[[], Awaitable[None]]) -> bool:
+@dataclass
+class _RevokeCarry:
+    """The failed revoke attempts one :func:`deferred_revoke_reports` scope holds, with their
+    stores' ``record_audit``. ``committed`` says a later attempt in the scope committed;
+    ``closed`` says the scope has reported, so a late attempt reports for itself."""
+
+    held: list[tuple[RevokeSealOutcome, Callable[..., Awaitable[object]]]] = field(
+        default_factory=list
+    )
+    committed: bool = False
+    closed: bool = False
+
+    def covered_by(self, outcome: RevokeSealOutcome) -> None:
+        """A revoke attempt committed: drop from every held failed attempt what it will report,
+        so each refusal, Outage and log line is reported once, by the attempt that committed."""
+        self.committed = True
+        keys = {_refusal_key(r) for r in outcome.refusals} | {
+            ("outage", w) for w in outcome.outages
+        }
+        for held, _record_audit in self.held:
+            held.refusals = [r for r in held.refusals if _refusal_key(r) not in keys]
+            held.outages = [w for w in held.outages if ("outage", w) not in keys]
+            held.refused_log = [e for e in held.refused_log if e[2] not in keys]
+
+    async def _report(self) -> None:
+        end: _RevokeEnd = "retried" if self.committed else "failed"
+        for held, record_audit in self.held:
+            await held._report(record_audit, end=end)
+
+    async def flush(self) -> tuple[bool, BaseException | None]:
+        """Report every held attempt once, run to completion; never raises."""
+        self.closed = True
+        return await _run_to_completion(self._report)
+
+    def flush_unawaited(self, cause: BaseException) -> None:
+        self.closed = True
+        end: _RevokeEnd = "retried" if self.committed else "failed"
+        for held, _record_audit in self.held:
+            held._report_unawaited(cause, end=end)
+
+
+#: The open :func:`deferred_revoke_reports` scope, if any.
+_REVOKE_CARRY: ContextVar[_RevokeCarry | None] = ContextVar("mefor_revoke_carry", default=None)
+
+
+@asynccontextmanager
+async def deferred_revoke_reports() -> AsyncIterator[None]:
+    """Hold the report of each revoke attempt that fails inside this scope until the scope ends,
+    for a caller that retries a failed revoke (decision d20261110T063908944-857965, item 4).
+
+    A retry that commits reports its own refusals with the committed wording, and this scope drops
+    those from the failed attempts it holds, so one refusal is audited and paged once and the last
+    page an operator sees for it is accurate. What only a failed attempt met is reported when the
+    scope ends: as having failed, or, when a later attempt committed, as an attempt whose retry
+    committed. The report runs on every exit and never raises out of a failing scope; on a clean
+    exit a failure of the report is re-raised, as :meth:`RevokeSealOutcome.report` does. A nested
+    scope joins the outer one. A revoke that fails after the scope has reported, in a task that
+    inherited it, reports for itself."""
+    if _REVOKE_CARRY.get() is not None:
+        yield
+        return
+    carry = _RevokeCarry()
+    reset = _REVOKE_CARRY.set(carry)
+    try:
+        try:
+            yield
+        except (Exception, asyncio.CancelledError) as exc:
+            cancelled, _failure = await carry.flush()
+            if cancelled and not isinstance(exc, asyncio.CancelledError):
+                raise asyncio.CancelledError from exc
+            raise
+        except BaseException as exc:
+            carry.flush_unawaited(exc)
+            raise
+        cancelled, failure = await carry.flush()
+        if cancelled:
+            raise asyncio.CancelledError
+        if failure is not None:
+            raise failure
+    finally:
+        _REVOKE_CARRY.reset(reset)
+
+
+async def _run_to_completion(
+    body: Callable[[], Awaitable[None]],
+) -> tuple[bool, BaseException | None]:
     """Run ``body`` as a task awaited through :func:`asyncio.shield`, awaited again after each
-    cancel, so a cancel cannot cut it short. Returns whether a cancel landed meanwhile, for the
-    caller to re-raise. Never raises: a failure of ``body`` is logged at ERROR."""
+    cancel, so a cancel cannot cut it short. Returns whether a cancel landed meanwhile, and the
+    body's own failure, for the caller to re-raise or not. Never raises. A failure is logged at
+    ERROR with its class, and its traceback at DEBUG only, since a defect's message may carry a
+    row value (CLAUDE.md section 9). A body that ends cancelled is logged too, and returned as a
+    ``CancelledError`` (decision d20261110T063908944-857965, item 5)."""
     task = asyncio.ensure_future(body())
     cancelled = False
     while not task.done():
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
-            # Recorded first, so a cancel landing in the turn the loop ends is still raised.
-            cancelled = True
-    if not task.cancelled() and task.exception() is not None:
-        log.error("a revoke's seal report failed", exc_info=task.exception())
-    return cancelled
+            # A cancel of this caller, recorded first, so a cancel landing in the turn the loop
+            # ends is still raised; the body's own cancel is read below instead.
+            if not task.cancelled():
+                cancelled = True
+        except BaseException:  # noqa: BLE001 -- the body's own failure, read from the task below
+            pass
+    if task.cancelled():
+        log.error(
+            "a revoke's seal report was cancelled before it finished; its remaining audit rows"
+            " and pages were not sent"
+        )
+        return cancelled, asyncio.CancelledError()
+    failure = task.exception()
+    if failure is not None:
+        log.error(
+            "a revoke's seal report failed (%s); its remaining audit rows and pages were not sent",
+            type(failure).__name__,
+        )
+        log.debug("a revoke's seal report failure", exc_info=failure)
+    return cancelled, failure
 
 
 async def raise_account_epoch(
@@ -19979,9 +20148,6 @@ class MessageStore:
                     outcome,
                 )
             await self._commit()
-        # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
-        # revoke went ahead without is audited and paged once it has committed, never inside it.
-        await outcome.report(self.record_audit)
         return result
 
     async def _keep_or_end_session(
@@ -20035,9 +20201,6 @@ class MessageStore:
         async with outcome.committing(self.record_audit), _writer_txn(self._db, self._lock):
             result = await self._revoke_all_sessions_in_txn(except_token_hash, now, outcome)
             await self._commit()
-        # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
-        # revoke went ahead without is audited and paged once it has committed, never inside it.
-        await outcome.report(self.record_audit)
         return result
 
     async def _revoke_all_sessions_in_txn(
@@ -20148,9 +20311,6 @@ class MessageStore:
             await self._db.execute("DELETE FROM restore_marker")
             await self._commit()
         tee_audits((audit,), appended, ts=now)
-        # Decision d20261109T200352805-599b24, item 4: a Forged or Unverifiable answer this
-        # revoke went ahead without is audited and paged once it has committed, never inside it.
-        await outcome.report(self.record_audit)
         return record
 
     async def _global_session_epoch(self) -> int:
