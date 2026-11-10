@@ -5553,6 +5553,8 @@ def _supervise(args: argparse.Namespace) -> int:
             env=args.env,
             service_config=args.service_config,
             project_root=args.project_root,
+            # BACKLOG #3314: the cap for the supervisor's own CRL reload, as an engine shard's.
+            crl_max_reloads=settings.cert_monitor.crl_max_reloads,
             registry_guard=_chain_registry_guards(
                 refuse_keep_forever_overrides,
                 _fleet_connection_key_file_refusal(
