@@ -1017,7 +1017,14 @@ def _unbounded_scan_repeats(source: str) -> tuple[str, ...]:
     text. A class that cannot span a word boundary holds no "%", so a run of it reaches past at most
     the two hex digits of the escape before it: each run is entered from a constant number of start
     positions, which is the word-boundary route's own argument with one more start per run. Any other
-    lookbehind in that place is not read as an anchor, so it is flagged."""
+    lookbehind in that place is not read as an anchor, so it is flagged.
+
+    SO DOES THE CAMELCASE START, ``secretscrub._LABEL_OR_CAMEL_START``, and again only spelled
+    exactly as the shipped constant (BACKLOG #5545). Its camelCase half fires at a capital after a
+    lower-case letter or a digit, inside a word run, but only where a label word starts there and
+    ENDS the run. So a run offers at most one such start per label word that can end it, a constant,
+    and the walk from it is that word and then the separated segments a ``\\b`` start walks too. The
+    same capital start without that lookahead is flagged, which is the control below."""
     parsed = sre_parser.parse(source)
     head = parsed[0] if len(parsed) else (None, None)
     anchored = head[0] == sre_constants.AT and head[1] in (
@@ -1025,7 +1032,9 @@ def _unbounded_scan_repeats(source: str) -> tuple[str, ...]:
         sre_constants.AT_BEGINNING,
         sre_constants.AT_BEGINNING_STRING,
     )
-    anchored = anchored or source.removeprefix("(?i)").startswith(scrub_mod._LABEL_START)
+    anchored = anchored or source.removeprefix("(?i)").startswith(
+        (scrub_mod._LABEL_START, scrub_mod._LABEL_OR_CAMEL_START)
+    )
     found: list[str] = []
     _walk_scan_prefix(
         parsed,
@@ -1096,6 +1105,14 @@ def test_every_applied_credential_pattern_has_a_contained_scan_prefix() -> None:
     assert _unbounded_scan_repeats(r"(?i)(?:\b|(?<=[0-9A-Fa-f]{2}))[A-Za-z0-9]+[:=]"), (
         "a lookbehind that fires inside a word run is not the label start, and is not containment"
     )
+    # THE CAMELCASE START (BACKLOG #5545), both ways: shipped, it is contained; the same capital
+    # start without the lookahead that makes the label word end the run is flagged.
+    assert not _unbounded_scan_repeats(
+        r"(?i)" + scrub_mod._LABEL_OR_CAMEL_START + r"[A-Za-z0-9]+[:=]"
+    )
+    assert _unbounded_scan_repeats(
+        r"(?i)(?:" + scrub_mod._LABEL_START + r"|(?-i:(?<=[a-z0-9])(?=[A-Z])))[A-Za-z0-9]+[:=]"
+    ), "a capital start with no label-word lookahead fires all through a word run"
 
     checked: list[str] = []
     excused: set[str] = set()

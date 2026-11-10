@@ -215,6 +215,12 @@ def test_the_phi_passes_see_the_text_they_saw_before(line: str) -> None:
 #: later pass reads: a separator the PHI pass counts ("&", "^", "%5E", "%26"), a later label
 #: (``state=``, ``?code=``, ``Token=``, ``MEFOR_X=``), a segment ID, a DICOM element, the userinfo
 #: opener, or the length of a base64 run. The word mask keeps each, so none may print.
+#:
+#: A key in these shapes and the mask-rule shapes below is spelled with no camelCase capital on its
+#: credential word (``;Accesstoken=``, ``;KeyStorepwd=``). Since BACKLOG #5545 the label patterns
+#: read ``;AccessToken=`` and ``;KeyStorePwd=`` at the capital and hide the value before the member
+#: pass runs, so that spelling no longer reaches the word mask these shapes exist to exercise. The
+#: spelling with no capital reaches it exactly as ``;AccessToken=`` did before that change.
 _SHAPES_A_SECOND_PASS_PRINTED = (
     ";sslpassword=%2Cpassword=&state=,;f6q",
     'password":;xpass=&state=[REDACTED];}%7Cb2q',
@@ -227,7 +233,7 @@ _SHAPES_A_SECOND_PASS_PRINTED = (
     ";sslpassword=\\Token='\r\nc3q",
     "a1q;xpass=PID|1||\n&state=' d4q%7C{b2qpassword=19800505",
     "&<redacted>19800505;xpass=nonnumeric port: '\nc3q%5E.@hpassword=MEFOR_X=",
-    "&b2qf6q;AccessToken=%5E,QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB/secret: xprivate_key=",
+    "&b2qf6q;Accesstoken=%5E,QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB/secret: xprivate_key=",
 )
 
 #: Lines a seeded run of the differential below found printing a value ``origin/main`` hid, once
@@ -259,9 +265,9 @@ _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED = (
 #: to a letter, which under a JSON ``name`` the PHI pass no longer read as an operator's value.
 _SHAPES_THE_WORD_MASK_PRINTED = (
     ";xpass=Patient%7CBearer #=\nc3qd4qBasic ",
-    "MRN: %26PID\x0ba1qkey=;KeyStorePwd={%41MSHstate=Jane Doemfb64:v1:mfb64:v1:ABC|Basic ",
+    "MRN: %26PID\x0ba1qkey=;KeyStorepwd={%41MSHstate=Jane Doemfb64:v1:mfb64:v1:ABC|Basic ",
     "Digest {~\x0cb2qe5q;xpass=%41%41MEFOR_X=[%5E05/05/1980/",
-    "mfb64:v1:==mfb64:v1:;sslpassword=givenmfb64:v1:mfb64:v1:auth=;AccessToken=-birthDate\x0c"
+    "mfb64:v1:==mfb64:v1:;sslpassword=givenmfb64:v1:mfb64:v1:auth=;Accesstoken=-birthDate\x0c"
     "Zm9vYmFy+/Zm9vd4qstate=",
     '"name":;sslpassword=%3B\r\n/\x85tokene5qmfb64:v1:QUJD:v1:',
 )
@@ -307,7 +313,7 @@ _RULE_CONTROLS = (
             "mrn", "name", "address", "0010", "patient", "medicalrecordlocator",
             "responsibleperson",
         ),
-        'e5q;AccessToken="name": %26\na1qcode=d4qe5q123-45-6789[redacted]',
+        'e5q;Accesstoken="name": %26\na1qcode=d4qe5q123-45-6789[redacted]',
     ),
     (
         "label tail",
@@ -349,7 +355,7 @@ _RULE_CONTROLS = (
         "mask keeps a long base64 run long",
         "_masked_word",
         lambda _word, _after=False: "x",
-        "&b2qf6q;AccessToken=%5E,QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB/secret: xprivate_key=",
+        "&b2qf6q;Accesstoken=%5E,QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB/secret: xprivate_key=",
     ),
     (
         "mask keeps where the marker's base64 run ended",
@@ -361,7 +367,7 @@ _RULE_CONTROLS = (
         "scheme word before a space",
         "_MEMBER_SPACED_WORD",
         _NEVER,
-        ";AccessToken=Bearer <redacted>\na1qencryption_key={ x%26session=DOE^JOHN",
+        ";Accesstoken=Bearer <redacted>\na1qencryption_key={ x%26session=DOE^JOHN",
     ),
     (
         "segment ID",
@@ -373,7 +379,7 @@ _RULE_CONTROLS = (
         "DICOM tag",
         "_MEMBER_VALUE_UNIT",
         re.compile(_UNIT.replace(r"|\([0-9A-Fa-f]{4}, ?[0-9A-Fa-f]{4}\)", "")),
-        ",a1q;AccessToken=(0010,1000)=\na1qb2qMRN\t",
+        ",a1q;Accesstoken=(0010,1000)=\na1qb2qMRN\t",
     ),
     (
         "userinfo opener",
@@ -716,7 +722,7 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
         (";xpass=a1q QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB", ";xpass=x0x " + "X" * 32),
         # A kept word only stays where a later pass reads it: here it is a password or a token.
         (";sslpassword=Passw0rd!2024;", ";sslpassword=xxxxx0xx!0000;"),
-        (";AccessToken=aaa.sig-key_jwt.aaa;", ";AccessToken=xxx.xxx-xxx_xxx.xxx;"),
+        (";Accesstoken=aaa.sig-key_jwt.aaa;", ";Accesstoken=xxx.xxx-xxx_xxx.xxx;"),
         (";xpass=Monkey123 Codename9;", ";xpass=xxxxxx000 xxxxxxxx0;"),
         # A segment ID stays only before a "|", and never with a prefix. A name-token piece keeps
         # its capitals, for the PHI pass's name run.

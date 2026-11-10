@@ -260,6 +260,41 @@ _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 # ``tests/test_log_redaction_secret_domain.py`` reads 0 printed.
 _LABEL_START = r"(?:\b|(?<=%[0-9A-Fa-f]{2}))"
 
+#: The label words a camelCase start may open on (BACKLOG #5545): every family's.
+_CAMEL_WORDS = _CREDENTIAL_WORDS + _TOKEN_WORDS + _KEY_MATERIAL_WORDS
+
+# A second place a label may start: at a camelCase boundary, a capital right after a lower-case
+# letter or a digit, where the label word runs from that capital to the end of the word (BACKLOG
+# #5545). ``accessToken=``, ``clientSecret=``, ``refreshToken:`` and ``userPassword=`` are how OAuth
+# token responses and JSON configuration spell a credential, and none of them has a ``\b``, a
+# "%XX" escape or a "._-" separator in front of its keyword. So every label
+# pattern below missed them, and the value would print in the write-time log on first deployment,
+# while :func:`_camel_tail` already read the same spellings as credentials in a URL query.
+#
+# CASE-SENSITIVE INSIDE A ``(?i)`` PATTERN, which is why it is an inline ``(?-i:...)`` group. Under the
+# patterns' global fold, ``[a-z]`` and ``[A-Z]`` would both match every letter, and every position
+# inside a word would become a start.
+#
+# THE KEYWORD MUST END THE WORD, by the lookahead, and that is what keeps the scan linear. Without it
+# every capital in a long mixed-case run, such as a base64 token, would be a start, and each would
+# walk ``_LABEL_PREFIX``'s first segment to the end of the run: the quadratic ``_LABEL_PREFIX``'s bound
+# exists to stop. With it, a start needs a label word followed by a character that is not a word
+# character, so one word run offers at most one start per label word that can end it, and the prefix
+# walk from that start is the label word and then at most six "._-" segments, as from a ``\b`` start.
+# The growth test in ``tests/test_secretscrub_camelcase_label.py`` times it against a control without
+# the lookahead. It is also what keeps a camelCase start to a whole label: ``accessTokenValue=`` is not
+# read, exactly as ``access_token_value=`` is not, since both patterns end the keyword with ``\b``.
+#
+# AT LEAST THESE ARE NOT READ, and each is a residual: an all-capitals run before the keyword
+# (``SASToken=``, where the capital follows a capital), a keyword spelled with a fold character such
+# as U+017F as its first letter (the case-sensitive class reads only ASCII capitals), and a label word
+# glued on with no capital at all (``accesstoken=``), which no start can find inside a word.
+_CAMEL_START = r"(?-i:(?<=[a-z0-9])(?=[A-Z]))(?=(?i:" + _alternation(_CAMEL_WORDS) + r")\b)"
+#: Where the three LABEL patterns may start: :data:`_LABEL_START` or :data:`_CAMEL_START`.
+#: ``_AUTH_SCHEME`` keeps :data:`_LABEL_START` alone, since a scheme word glued on by a capital, as
+#: in ``isBearer token``, is no ``Authorization`` header.
+_LABEL_OR_CAMEL_START = r"(?:" + _LABEL_START + r"|" + _CAMEL_START + r")"
+
 # A QUOTED value span, for the two quoting forms a credential value actually arrives in (BACKLOG
 # #1685). Both exist for one reason: a value is quoted PRECISELY so it may carry the characters that
 # would otherwise end it -- ";", "=" and spaces -- and those are exactly what a plain value class
@@ -811,7 +846,13 @@ _PLAIN_SCHEME_VALUE = (
 # family's is, so the JSON shape is not kept. It takes no braced value: ``{"session": {"u": 1}}``
 # loses only its "{", exactly as ``session={"u": 1}`` does.
 _BEARER = re.compile(
-    r"(?i)" + _LABEL_START + r"(" + _LABEL_PREFIX + r"(?:" + _alternation(_TOKEN_WORDS) + r"))\b"
+    r"(?i)"
+    + _LABEL_OR_CAMEL_START
+    + r"("
+    + _LABEL_PREFIX
+    + r"(?:"
+    + _alternation(_TOKEN_WORDS)
+    + r"))\b"
     r"(?:['\"]\s*:|\s*[:=])\s*(?:(?:bearer|basic|digest)\s+)?"
     r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _PLAIN_VALUE + r")"
 )
@@ -924,7 +965,7 @@ _MEFOR_SECRET = re.compile(
 # change closed, and its residuals are the shapes the conditions refuse, which print as before it.
 _CREDENTIAL_KV = re.compile(
     r"(?i)"
-    + _LABEL_START
+    + _LABEL_OR_CAMEL_START
     + r"("
     + _LABEL_PREFIX
     + r"(?:"
@@ -960,7 +1001,7 @@ _CREDENTIAL_KV = re.compile(
 # on ``_CREDENTIAL_KV``'s residuals.
 _KEY_MATERIAL = re.compile(
     r"(?i)"
-    + _LABEL_START
+    + _LABEL_OR_CAMEL_START
     + r"("
     + _LABEL_PREFIX
     + r"(?:"
