@@ -38,6 +38,8 @@ from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.notifications import NEW_ADDRESS_REVERIFY, SecurityEvent
 from messagefoundry.auth.service import (
+    _NEW_IP_LOG_PATH_MAX,
+    _NEW_IP_LOG_PATH_PREFIX,
     _NEW_IP_PER_SESSION_MAX,
     _NEW_IP_TEXT_MAX,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
@@ -47,7 +49,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
-from messagefoundry.controlchars import scrub_log_argument
+from messagefoundry.controlchars import quote_log_text
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
@@ -268,12 +270,61 @@ async def test_each_refused_request_writes_its_own_warning(
         assert sum("already flagged" in line for line in warnings) == repeats
         over = [line for line in warnings if "past the per-session" in line]
         assert [line.rsplit("seen_ip=", 1)[1] for line in over] == [
-            scrub_log_argument(seen) for seen in past_cap
+            quote_log_text(seen) for seen in past_cap
         ]
         assert not any("\n" in line for line in over)
         assert await _new_ip_rows(store) == reported
         assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == len(
             reported
+        )
+    finally:
+        await store.close()
+
+
+def _logged_fields(line: str) -> dict[str, str]:
+    """The ``key=value`` fields after the colon of a new-address WARNING, each value one JSON
+    string, read as a log reader would: the key up to ``=``, then one JSON string as its value."""
+    fields: dict[str, str] = {}
+    rest = line.split(": ", 1)[1]
+    while rest:
+        key, rest = rest.split("=", 1)
+        value, end = json.JSONDecoder().raw_decode(rest)
+        fields[key] = value
+        rest = rest[end:].removeprefix(" ")
+    return fields
+
+
+async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """RED when: the request path is logged unquoted, so a path holding a space and ``seen_ip=``
+    or ``held_back=`` writes a field of its own, or unbounded (BACKLOG #3770)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        forged = '/users seen_ip=10.6.6.6 held_back=99 "x\\'
+        for i in range(_NEW_IP_PER_SESSION_MAX + 1):
+            assert await service.flag_new_client_ip(token, f"10.3.3.{i}", path="/users") is True
+        long_path = "/u" + "x" * 5000
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            assert await service.flag_new_client_ip(token, "10.3.3.0", path=forged) is True
+            assert await service.flag_new_client_ip(token, "10.9.9.9", path=forged) is True
+            assert await service.flag_new_client_ip(token, "10.9.9.8", path=long_path) is True
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.getMessage().startswith("a request from a new client address must re-verify")
+        ]
+        assert len(lines) == 3
+        repeat, over, over_long = (_logged_fields(line) for line in lines)
+        assert repeat == {"path": forged}
+        assert over == {"path": forged, "seen_ip": "10.9.9.9"}
+        assert over_long["seen_ip"] == "10.9.9.8"
+        assert over_long["path"] == _bounded_address_text(
+            long_path, _NEW_IP_LOG_PATH_MAX, _NEW_IP_LOG_PATH_PREFIX
         )
     finally:
         await store.close()
@@ -557,7 +608,7 @@ async def test_long_address_text_is_bounded_in_the_dedupe_and_the_past_cap_recor
             if r.levelno == logging.WARNING and "past the per-session" in r.getMessage()
         ]
         assert [line.rsplit("seen_ip=", 1)[1] for line in over] == [
-            _bounded_address_text(texts[-1])
+            quote_log_text(_bounded_address_text(texts[-1]))
         ]
     finally:
         await store.close()

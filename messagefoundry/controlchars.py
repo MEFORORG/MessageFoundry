@@ -73,6 +73,7 @@ THE POINT IS THE COPYING PRACTICE, not the seven known lines. If you need this t
 
 from __future__ import annotations
 
+import json
 import unicodedata
 
 #: The Unicode general categories a reader of TEXT may act on rather than show: the C0 and C1
@@ -312,3 +313,17 @@ def scrub_log_argument(text: str) -> str:
     return scrub_control_chars(
         text.replace("\r", _CTRL_TRANSLATION[0x0D]).replace("\n", _CTRL_TRANSLATION[0x0A])
     )
+
+
+def quote_log_text(text: str) -> str:
+    """``text`` as one double-quoted token that its own content cannot close or extend.
+
+    JSON string quoting escapes every quote, backslash and C0 control, so a value cannot end its
+    token and write a separator, a second field or a mark after it. ``ensure_ascii`` also writes
+    every non-ASCII character as ``\\uXXXX``, so a lookalike quote such as U+02BA or U+FF02, or a
+    right-to-left letter, cannot fake that end for a human reader. :func:`scrub_log_argument` then
+    covers DEL, the one ASCII control JSON leaves raw (vault BACKLOG #3139); its line-break
+    ``replace`` never fires on JSON output, and is there because CodeQL's ``py/log-injection``
+    accepts it as the neutraliser (see :func:`scrub_log_argument`). For a caller-supplied
+    value logged beside other ``key=value`` fields, such as a request path (BACKLOG #3770)."""
+    return scrub_log_argument(json.dumps(text))
