@@ -2021,8 +2021,8 @@ where the connection is declared, code-first or in `connections.toml`, so the co
 load and `messagefoundry check`'s required `validate` fails, with or without a
 `messagefoundry.toml`. Every other case is refused when the connection is built: that fails a
 dry run, a reload and the required `build-check` where it runs (it skips with no
-`messagefoundry.toml` and no `MEFOR_AI_ENVIRONMENT`), and in the live build at `serve` start it
-fails that connection. The `[egress].allowed_db` check refuses the same name, whatever its entry for
+`messagefoundry.toml` and no `check --env` or `MEFOR_AI_ENVIRONMENT`), and in the live build at
+`serve` start it fails that connection. The `[egress].allowed_db` check refuses the same name, whatever its entry for
 the host says. An `env()` `dialect` or `odbc_driver` is resolved when the connection is built,
 and refused unless the driver resolves to a name above. `messagefoundry check` reads the graph
 without the values, so its advisory `generic-db-driver` line lists such a hop as possibly
@@ -2085,7 +2085,7 @@ each runs:
 
 - For `Database`, `DatabasePoll` and `DatabaseLookup`, both run when the engine starts or
   reloads. They also run in `messagefoundry check` where its build leg runs, with a
-  `messagefoundry.toml` or `MEFOR_AI_ENVIRONMENT`.
+  `messagefoundry.toml`, `check --env` or `MEFOR_AI_ENVIRONMENT`.
 - For a `DatabaseRef`, both run at each sync, and the first sync runs at start. The build also
   runs at a reload, a dry run included, and in that `messagefoundry check` leg, once its `env()`
   values resolve. So each case below still fails there. The egress check runs only at sync.
@@ -3223,8 +3223,8 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 | `interaction` | `create` | `create` (`POST {base}/{ResourceType}`) / `update` (`POST {base}` with a one-entry `transaction` `Bundle` whose entry is `PUT {ResourceType}/{id}`; see [the id stays out of the URL](#an-update-keeps-the-resource-id-out-of-the-url)) / `transaction` / `batch` (`POST {base}` with a `Bundle`) |
 | `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware update, sent like `update` with the ETag in the entry, or in an `If-Match` header with `update_url_form="path"`) |
 | `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`) |
-| `update_url_form` | `transaction` | how an `update` or `if-match` is sent. `transaction` keeps the id out of the URL. `path` is the plain `PUT {base}/{ResourceType}/{id}` with the ETag in an `If-Match` header, for a server with no `transaction` interaction. `path` is a **listed loosening**; see [vendor compatibility](#vendor-compatibility-and-the-path-form-opt-in) |
-| `allowed_entry_methods` | — (**required** on `transaction`/`batch`) | (vault BACKLOG #2804) the verbs a Bundle entry may carry, from `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, spelled in upper case. There is no default: a `transaction` or `batch` connection without it does not load. Refused on any other interaction. Both lists take an `env()` for the whole list: its default is checked at load, and the value it resolves to when the connection is built. A bad item is named by position, never quoted. See [A Bundle connection screens every entry](#a-bundle-connection-screens-every-entry) |
+| `update_url_form` | `transaction` | how an `update` or `if-match` is sent. `transaction` keeps the id out of the URL. `path` is the plain `PUT {base}/{ResourceType}/{id}` with the ETag in an `If-Match` header, for a server with no `transaction` interaction. `path` is a **listed loosening**; see [vendor compatibility](#vendor-compatibility-and-the-path-form-opt-in) An `env()` value is read by `check` and `GET /security/posture` as [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#update_url_form--path-on-a-fhir-connection--the-resource-id-in-the-request-url) says |
+| `allowed_entry_methods` | — (**required** on `transaction`/`batch`) | (vault BACKLOG #2804) the verbs a Bundle entry may carry, from `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, spelled in upper case. There is no default: a `transaction` or `batch` connection without it does not load, or, where `interaction` is an `env()`, does not build. Refused on any other interaction. Both lists take an `env()` for the whole list: its default is checked at load, and the value it resolves to when the connection is built. A bad item is named by position, never quoted. See [A Bundle connection screens every entry](#a-bundle-connection-screens-every-entry) |
 | `allowed_entry_types` | — (any type) | (vault BACKLOG #2804) `transaction`/`batch` only: the resource types an entry's `request.url` may name, such as `["Patient", "Encounter"]`. Unset means any type. Refused on any other interaction |
 | `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `bearer_token` | — | `Authorization: Bearer …` (SMART/OAuth — a **secret**, via `env()`) |
@@ -3396,14 +3396,14 @@ With `update_url_form="path"`, an `update` or `if-match` is sent as `PUT {base}/
 - The `if-match` ETag goes in the `If-Match` header, and a static `If-Match` in `headers` stays on the
   request.
 - The reply is the plain resource, so capture and `capture_response_headers` work as on any `PUT`.
-- The setting applies only to `update` and `if-match`. Set on any other connection, it is refused at load,
+- The setting applies only to `update` and `if-match`. Set on any other connection, it is refused,
   because it would do nothing.
 
 **It puts each message's resource id back in the request URL**, and so in the receiving server's access
 logs. That relaxes owner ruling R3 (ASVS 14.2.1), so it is a listed loosening in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#update_url_form--path-on-a-fhir-connection--the-resource-id-in-the-request-url).
-The engine logs a WARNING naming the connection at every construction, and `messagefoundry check` names
-every connection that sets it. Set it only on the connection that needs it. FHIR is not a
+The engine logs a WARNING naming the connection at every construction, and `messagefoundry check` and
+`GET /security/posture` name it, except in the cases its SECURITY-LOOSENING.md entry lists as left off or not reported. Set it only on the connection that needs it. FHIR is not a
 `connections.toml` transport, so the setting is a `FHIR()` keyword only. This is vault BACKLOG #2550.
 
 **OperationOutcome & delivery semantics.** A 2xx is **delivered** (a returned `OperationOutcome` is captured,

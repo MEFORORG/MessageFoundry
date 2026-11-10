@@ -222,7 +222,21 @@ body, the early sign-in check above still answers before it. A route passes in o
   dependency guards by design, such as sign-in. Some web console routes of this kind still read a
   pending session inside the handler, such as `/ui/mfa`. `authorizes_in_body` marks a WebSocket
   that authorizes the caller inside its own body, and `/ws/stats` is the engine route that uses it.
-  On an HTTP route with no gate, that mark does not count, so the route is refused.
+  On an HTTP route with no gate, that mark does not count, so the route is refused. The mark is
+  not trusted on its own (vault BACKLOG #2955): `authorize_ws` records on the handshake whether it admitted the caller,
+  and the web console's `authorize_ui_ws` does so only on a browser handshake (one with an Origin),
+  the latest answer standing. `WebSocketAcceptGate` reads that record before it lets an accept
+  through. When the latest recorded answer is a refusal, it refuses accept on every socket, whatever its route declares. With no
+  recorded answer, a socket passes only where its route declares its authorization another way: a
+  gate dependency or a `public_route` mark. On a socket it refuses, it refuses a denial response
+  the body sends the same way, whatever its status, so none of its status, headers or body goes
+  out. The refusal is a close before accept, which the client gets as a bodyless HTTP
+  403. The web console's cookie gate records nothing for a handshake that sends no Origin, which
+  it leaves to the header path, so an earlier answer stands there. The accept gate writes an ERROR
+  line, `refused accept on WebSocket route`, for each refusal except a refusal status sent after a
+  gate's recorded refusal, at most once a minute for each route the handshake names.
+  Refusals on handshakes that name no route share one count and one line. That count is in
+  memory only; `GET /security/posture` does not report it.
 
 Any other route answers **403** `this route declares no authorization`, and a WebSocket is refused
 before it is accepted. Such a route is a defect in the code that registered it. The engine counts
@@ -294,13 +308,15 @@ host that file names. A bind host given only as `serve --host` is not in that fi
 check judges the file's host. The shipped service installer always passes `--host`, so on that path
 the check and `serve` can disagree on the bind host. With
 no file and no `--service-config`, it reads the environment instead. That needs
-`MEFOR_AI_ENVIRONMENT` to name the instance, and the line says so. At least these cases keep the
-skip. A `--service-config` naming a missing file is one, because `serve` refuses that file.
-Another is `--project-root` with no `--service-config`, no file under the root or the config
-directory, and a `messagefoundry.toml` in a working directory that is not the root. The line
-names that file. A third is no file and no `MEFOR_AI_ENVIRONMENT`. So a terminator set through
-`MEFOR_API_*` variables alone, for example on a site that names its environment only with
-`serve --env`, still reaches `serve` and not the check.
+`check --env` or `MEFOR_AI_ENVIRONMENT` to name the instance, and the line says which.
+`check --env` names the environment as `serve --env` does, above the file and the variable.
+A `--service-config` naming a missing file fails the check, as it stops `serve`.
+At least these cases keep the skip. One is `--project-root` with no `--service-config`, no file
+under the root or the config directory, and a `messagefoundry.toml` in a working directory that is
+not the root. The line names that file. Another is no file, no `check --env` and no
+`MEFOR_AI_ENVIRONMENT`. So a
+terminator set through `MEFOR_API_*` variables alone, on a site that names its environment only
+with `serve --env`, reaches the check only when `check` is given the same `--env`.
 
 **What else a proxy in front owes.** `serve` checks these after the refusals above, whether the hop
 is plaintext or TLS, and `--allow-insecure-bind` covers none of them.
@@ -3298,10 +3314,14 @@ query is past the 512-character cap on `next` or not ASCII, when the page opens 
 before. The page still re-derives each destination's eligibility from live quiescence, and the
 operator still submits the confirm form.
 A refusal the engine handler raises before its store write gives the proof back (owner ruling
-2026-10-13, #3241 R1; ADR 0197 Amendment C), so the operator resubmits without a new password. A
-refusal from the store call on keeps the spend, because the store may have committed: the next
-submit asks again and re-opens the editor from the stored body, as an expired grant (300 s by
-default) does. The console resend checks
+2026-10-13, #3241 R1; ADR 0197 Amendment C), so the operator resubmits without a new password,
+except a 403, 404 or 409, which keeps the spend (owner ruling 2026-11-07, #3241 added item 1; ADR
+0197 Amendment D). An ingress guard refusal gives the proof back, and ADR 0197 Amendment D,
+*The order of the checks*, says which target checks run before the guard in each mode and so
+what such a refusal still tells the caller. A refusal from the store
+call on keeps the spend too, because the store may have committed. After any refusal that keeps
+the spend, the next submit asks again and re-opens the editor from the stored body, as an
+expired grant (300 s by default) does. The console resend checks
 its own input before it spends the proof too. On both, a double-click asks for no second proof.
 The console marks each request it spends a proof on. Only an identical request rides on that mark.
 For a resend that means the same key, target and source. For an edit-resend it means the same key,
@@ -3877,15 +3897,19 @@ the enrol-first confinement does not reach the TOTP removal. Nor does the last-f
 such a TOTP as a factor beside the last passkey, and such a TOTP does not escalate the sign-in
 lock; a discoverable passkey under the configured relying party beside it still does
 (BACKLOG #3937).
-The census names an account holding one beside a working
-discoverable passkey in both lists, and says that a factor reset would remove that passkey: the
+The census names an account holding one beside a passkey that may still sign it in,
+whatever the requirement covers, and says that a factor reset would remove that passkey (BACKLOG
+#3948 finding 11). For a local account that is a passkey its combined passkey sign-in accepts; for
+a directory account, a passkey its second factor accepts, discoverable or not. The next list says
+which passkey each counts. A non-discoverable passkey a local account uses as its second factor
+after its password is not counted, so the census does not warn that a reset would remove it. The
 cure is the holder removing the authenticator app and enrolling it again. **Only a KNOWN refusal
 changes a decision.** A TOTP the engine cannot judge, because its cell does not open (a store-key
 fault, or a cipher service such as Transit that does not answer) or its value will not compute, is
 **unknown**: every gate then applies the plain enabled-TOTP rule, so it still counts as a way past
 and as a factor, its removal is refused as before, and the sign-in lock still escalates. The census
 names such an account as unknown, never as refused, and still says when a factor reset would remove
-its discoverable passkey; its lock notice names the passkey sign-in beside the code sign-in. The
+its passkey; its lock notice names the passkey sign-in beside the code sign-in. The
 lock escalation's own judgement of the TOTP, which under Transit is a decrypt, runs only for the
 wrong password that sets a lock past the first of its cycle count, so a wrong password below the
 threshold costs that path no cell open; the combined sign-in still opens the cell per attempt.
@@ -3908,9 +3932,13 @@ write races.
   account keeps its TOTP, removing any discoverable passkey needs a TOTP that is a way past, and
   a passkey-only account must enrol TOTP before it rotates and is named in `no_way_past`. That is
   the shipped default on a loopback bind. The census's reset warning
-  (`reset_would_remove_a_passkey`) counts a passkey under the configured `rp_id` too, and any
-  discoverable passkey when none is configured, since it asks whether a reset would remove one that
-  may sign the holder in. After a change from one configured origin to another
+  (`reset_would_remove_a_passkey`) counts a passkey under the configured `rp_id` too, and one
+  under any `rp_id` when none is configured, since it asks whether a reset would remove one that
+  may sign the holder in. It counts only a passkey stored under today's credential-id hash
+  scheme, the only key the sign-in finds one by; for a local account the passkey must also be
+  recorded as discoverable, and for a directory account it need not be, since its second factor
+  names the credential itself. At least these are not counted for either: a passkey under
+  another configured `rp_id`, and one the start-up rehash has not moved to today's scheme. After a change from one configured origin to another
   ([ADR 0068 section 7](adr/0068-browser-webauthn-passkeys-offloopback.md) makes such a passkey
   visibly unusable) a passkey under the old `rp_id` no longer counts at the gates, so the census
   names an account whose only way past it was.
@@ -5676,9 +5704,10 @@ revoked. A pass with any referral audits `auth.ad_reconcile_referred` and raises
 acknowledging or suspending one does not silence the other. An `[alerts]` rule keyed on the event
 type alone matches at least the breaker, the referral, the probe fault, the configuration refusal,
 each paging refusal, the lasting outage and each account the directory keeps failing to answer for
-while it answers others (`directory-reconciler-unreached:<username>`, reason `account_unreachable`,
-audited as `auth.ad_reconcile_unreached`, vault BACKLOG #3100; where more than five such accounts
-stand at once, those entering page once, under the bare `directory-reconciler-unreached` source),
+(`directory-reconciler-unreached:<username>`, reason `account_unreachable`,
+audited as `auth.ad_reconcile_unreached`, vault BACKLOG #3100; on a rolled-up pass, those entering
+page once, under the bare `directory-reconciler-unreached` source; the `ad_reconcile_outage_passes`
+row of [CONFIGURATION.md](CONFIGURATION.md) states when),
 and so does a source glob such as `directory-reconciler*`, which also matches the hold's
 `ad_reconcile_held`. To mute only the referral, a rule names its source exactly. The alert's text
 names `ad_user_search_base`, `ad_group_search_base` and `ad_bind_dn`. A bind response that carries a
@@ -5880,8 +5909,16 @@ the console, through `POST /ui/reauth/webauthn`, because the JSON plane has no p
 JSON-only client cannot rotate it. Before this change such a client could rotate it and then do
 nothing else. Its next sign-in was pending, with no way to prove a passkey there. Under
 `[security].require_mfa` a covered passkey-only account rotates only once it holds a way past
-the sign-in lock: `_has_way_past` counts TOTP or a passkey recorded as discoverable under the
-configured `rp_id` (ADR 0197 Amendment A, wave 2; BACKLOG #3937). One whose passkeys are not discoverable must also enrol a factor that is
+the sign-in lock. The route's courtesy check, `must_enrol_before_rotating`, asks before the
+current password: `_has_way_past` counts TOTP or a passkey recorded as discoverable under the
+configured `rp_id` (ADR 0197 Amendment A, wave 2; BACKLOG #3937). The rotation itself asks in
+the same order before it hashes. It judges the TOTP first. Only where that TOTP is no way past and
+a passkey can count does this early check read the passkey set, through the verified read
+`_has_way_past` uses. It refuses an account with neither. The store's conditional write judges
+the TOTP again itself before its lock, counts that judgement under the lock only for the cell it
+judged (BACKLOG #3948), and reads the passkey set under its lock on every conditional rotation.
+Without the `[webauthn]` extra the write counts no passkey, as `_has_way_past` counts none.
+One whose passkeys are not discoverable must also enrol a factor that is a way past
 before it rotates, so after the passkey it goes to the enrolment page, and only then to the password
 page. Such an account exists only where its passkey came before the requirement covered it, or
 before wave 2: a store from before ADR 0197 Amendment A, a site that turned `require_mfa` on or
