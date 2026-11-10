@@ -1448,7 +1448,9 @@ def _best_effort_kill_pid(pid: int) -> None:
 
 def _wait_exited(proc: Any) -> None:
     """Wait for ``proc`` to exit WITHOUT reaping it on POSIX, as the session's own check reads it.
-    A reaped pid can be reused, and the session's reap then signals that pid's group."""
+    Reaping it here would send the session's reap down its already-reaped path,
+    ``proctree.kill_reaped_leader_group``, which signals nothing and writes a WARNING if the pid
+    has been reused meanwhile, rather than the group kill a worker that died on its own gets."""
     deadline = time.monotonic() + 10.0
     while not sandbox_mod._has_exited(proc):
         assert time.monotonic() < deadline, "the worker did not exit"

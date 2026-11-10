@@ -368,7 +368,9 @@ from one added pointer to this amendment, at the end of its paragraph on what a 
   and writes one `WARNING` naming the inbound, the phase and the cause token, never message content.
   A graph refusal writes none, and a shutdown logs at `INFO`. The runner alerts on a graph refusal
   only when it is against the graph the engine serves; one against a graph a reload has replaced
-  writes no line anywhere. This
+  writes no line anywhere. The reap after a kill can add lines of its own, at least those
+  [`docs/CONFIGURATION.md`](../CONFIGURATION.md) `[sandbox]` lists for a worker already reaped or
+  a process group that could not be signalled, so one kill is not always one line. This
   is the kill-cause record design point 1 of *Amendment A* puts ahead of any kill budget; the budget
   itself is still unbuilt.
 

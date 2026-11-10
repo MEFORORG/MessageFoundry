@@ -1368,9 +1368,14 @@ content, except a graph refusal, which writes none, and a shutdown, logged at `I
 on a graph refusal against the graph the engine serves; one against a graph a reload has replaced
 writes no line. The line says the worker was `killed`, or that it `exited` for a cause recorded only
 once the worker is seen gone (a crash, an exit during boot or right after it), which may still be a
-signal from outside the engine. On POSIX a second `WARNING`, naming the inbound and the pid, says a
-worker that was already reaped could not have its process group signalled safely, so a process it
-started may survive.
+signal from outside the engine. The reap that ends a worker can write more lines, kill or not. On
+POSIX a `WARNING` naming the inbound and the pid says a worker that was already reaped could not have
+its process group signalled safely, so a process it started may survive. At least these cases
+differ: after a kill that writes a line, it follows that line; after a reap that is not a kill, such as closing
+a session whose worker had already died, it is the only line naming the inbound; and when the signal
+itself failed, such as `EPERM`, a line naming the process group and the error, but not the inbound,
+comes before it. That unattributed line is also written when a live worker's group cannot be
+signalled, and the kill then falls back to the worker alone.
 **Read once at engine start — a `/config/reload` does NOT re-read it (restart to change).**
 
 **`mode` is engine-wide — there is no per-connection sandbox setting.** One policy is rendered for the
