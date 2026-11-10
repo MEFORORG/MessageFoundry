@@ -727,6 +727,9 @@ def reply_seconds(s: Mapping[str, Any], key: str) -> float:
 _FORWARDED_FOR = "x-forwarded-for"
 #: A port after an ``X-Forwarded-For`` hop, which some proxies write (``a.b.c.d:port``, ``[v6]:port``).
 _HOP_PORT_RE = re.compile(r"[0-9]{1,5}")
+#: The most listed hops the walk reads before it gives up and keys on the socket peer. A real proxy
+#: chain is a handful of hops; the bound keeps a padded header from costing the event loop more.
+_MAX_FORWARDED_HOPS = 32
 
 _ProxyNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 _HopAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
@@ -752,29 +755,52 @@ def trusted_proxy_networks(value: Any) -> tuple[_ProxyNetwork, ...]:
             "e.g. trusted_proxies=['10.0.0.5']"
         )
     networks: list[_ProxyNetwork] = []
-    for entry in value:
+    for index, entry in enumerate(value):
         if not isinstance(entry, str):
+            raise ValueError(f"Http trusted_proxies item {index} must be a string (value withheld)")
+        parsed = _parsed_proxy_or_none(entry)
+        if parsed is None:
+            # Raised outside the parse's handler and never quoted: _parse_trusted_proxy's message
+            # echoes the entry, and no factory refusal may quote a configured value (vault BACKLOG
+            # #3249, #3765). Its advice is also the API's, about uvicorn, which this listener is not.
             raise ValueError(
-                "Http trusted_proxies entries must be strings: an address or a network"
+                f"Http trusted_proxies item {index} {_refused_entry_reason(entry)}; it is refused "
+                "by the rule [api].trusted_proxies follows (value withheld)"
             )
-        try:
-            parsed = _parse_trusted_proxy(entry)
-        except ValueError as exc:
-            raise ValueError(
-                "Http trusted_proxies refuses an entry by the rule it shares with "
-                "[api].trusted_proxies. That rule's message follows; its remarks about uvicorn "
-                f"and [security] concern the API only: {exc}"
-            ) from exc
         networks.append(_ipv4_meaning(ipaddress.ip_network(parsed)))
     whole_family, _ = _classify_proxy_entries(value)
     if whole_family:
         raise ValueError(
-            f"Http trusted_proxies entries {', '.join(whole_family)} together trust a whole "
-            "address family, as the refused '*' does, so every client would count as a proxy "
-            "and could choose its own failed-attempt budget key. List the reverse proxy's exact "
-            "address(es) instead."
+            "Http trusted_proxies entries together trust a whole address family, as the refused "
+            "'*' does, so every client would count as a proxy and could choose its own "
+            "failed-attempt budget key. List the reverse proxy's exact address(es) instead "
+            "(values withheld)."
         )
     return tuple(networks)
+
+
+def _parsed_proxy_or_none(entry: str) -> _HopAddress | _ProxyNetwork | None:
+    """``_parse_trusted_proxy(entry)``, or ``None`` where it refuses. The caller raises its own
+    refusal outside this handler, so the parse's message, which quotes the entry, is not its
+    ``__context__``."""
+    try:
+        return _parse_trusted_proxy(entry)
+    except ValueError:
+        return None
+
+
+def _refused_entry_reason(entry: str) -> str:
+    """Why ``_parse_trusted_proxy`` refused ``entry``, in words that never quote it. A refusal names
+    the form only; the parse that decided it is ``_parse_trusted_proxy``'s, not this one's."""
+    if entry == "*":
+        return "is '*', which trusts every peer"
+    if "%" in entry:
+        return "is an IPv6 entry with a zone, which no peer address carries"
+    try:
+        ipaddress.ip_network(entry, strict=False)
+    except ValueError:
+        return "is not a valid IP address or CIDR network"
+    return "has host bits set; list the proxy's own address, or the range's network address"
 
 
 def _hop_address(text: str) -> _HopAddress | None:
@@ -1043,6 +1069,16 @@ class HttpSource(SourceConnector):
             if self.intake_auth == "mtls_subject"
             else None
         )
+        ranges = sum(1 for network in self._trusted_proxies if network.num_addresses > 1)
+        if ranges:
+            # The [api] list's ranges are named as a loosening at serve; this list's are warned
+            # about here, counted and never quoted (BACKLOG #5525).
+            logger.warning(
+                "HTTP source %s: trusted_proxies holds %d range(s); every host inside one is "
+                "trusted as a proxy and may choose its own failed-attempt budget key",
+                self._log_name,
+                ranges,
+            )
         if self.max_body_bytes is None:
             # Turning the body cap off is documented, so it is allowed, but never silent (BACKLOG
             # #2749, as FileSource does for its caps). Logged after every check in this constructor,
@@ -1530,18 +1566,22 @@ class HttpSource(SourceConnector):
         peer = _hop_address(peer_host)
         if peer is None or not self._is_trusted_proxy(peer):
             return None
-        # rpartition, not split: the walk usually stops at the right-most hop, and a client behind
-        # the proxy may pad the header up to max_header_bytes.
-        remaining = head.forwarded_header
-        while True:
-            remaining, more, hop = remaining.rpartition(",")
-            address = _hop_address(hop)
+        # Read hop by hop from the right with rfind, so each hop is scanned once and nothing left of
+        # the client is touched, and stop after _MAX_FORWARDED_HOPS: a host inside a listed range
+        # may pad the header with listed hops up to max_header_bytes, on the event loop.
+        header = head.forwarded_header
+        end = len(header)
+        for _ in range(_MAX_FORWARDED_HOPS):
+            start = header.rfind(",", 0, end)
+            address = _hop_address(header[start + 1 : end])
             if address is None:
                 return None
             if not self._is_trusted_proxy(address):
                 return str(address)
-            if not more:
+            if start < 0:
                 return None
+            end = start
+        return None
 
     def _is_trusted_proxy(self, address: _HopAddress) -> bool:
         # A network of the other IP version never contains an address, so no spelling crosses over.

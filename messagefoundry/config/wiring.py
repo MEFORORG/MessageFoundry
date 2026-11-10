@@ -3086,7 +3086,8 @@ def Http(
     | None = INTAKE_AUTH_RATE_LIMIT_DEFAULT,  # FAILED intake-auth attempts per minute per peer (0/None disables)
     intake_auth_rate_limit_global: int
     | None = INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,  # FAILED intake-auth attempts per minute across all peers
-    trusted_proxies: Sequence[str] = (),  # api_key/bearer: proxies whose X-Forwarded-For is read
+    trusted_proxies: Sequence[str]
+    | EnvRef = (),  # api_key/bearer: proxies whose X-Forwarded-For is read
     # --- Synchronous captured-downstream reply (ADR 0154 D4) — reply_from's presence is the switch ---
     reply_from: str
     | None = None,  # names the outbound whose CAPTURED reply becomes this request's HTTP body
@@ -3248,12 +3249,19 @@ def Http(
     _validate_sync_reply(settings)
     # BACKLOG #5525, owner ruling 2026-11-10 ("Per-connection proxies"). Read by the listener's own
     # reader, so the factory and the listener cannot disagree on an entry; never [api].trusted_proxies.
-    from messagefoundry.transports.http_listener import trusted_proxy_networks
+    # The list refusal runs first, as its rule requires. A whole-setting env() is read by the
+    # listener once resolved, which is the only place its entries exist.
+    _reject_envref_in_lists("Http", trusted_proxies=trusted_proxies)
+    if not isinstance(trusted_proxies, EnvRef):
+        from messagefoundry.transports.http_listener import trusted_proxy_networks
 
-    try:
-        trusted_proxy_networks(trusted_proxies)
-    except ValueError as exc:
-        raise WiringError(str(exc)) from exc
+        refusal: str | None = None
+        try:
+            trusted_proxy_networks(trusted_proxies)
+        except ValueError as exc:
+            refusal = str(exc)  # withholds every value; raised below, outside this handler
+        if refusal is not None:
+            raise WiringError(refusal)
     if trusted_proxies and intake_auth not in _INTAKE_KEY_MODES:
         raise WiringError(
             f"Http sets trusted_proxies but intake_auth={intake_auth!r}; it keys the failed-attempt "
@@ -3262,13 +3270,17 @@ def Http(
             "Remove the setting; a control that is configured but never consulted reads as "
             "protection that does not exist"
         )
-    if trusted_proxies and not (intake_auth_rate_limit or intake_auth_rate_limit_global):
+    if trusted_proxies and not intake_auth_rate_limit_global:
+        # Once each forwarded client keys its own per-peer budget, the global budget is the only
+        # bound on guessing across every client behind the proxy, so it may not be off.
         raise WiringError(
-            "Http sets trusted_proxies but both intake_auth_rate_limit and "
-            "intake_auth_rate_limit_global are off, so no failed-attempt budget exists for it to "
-            "key. Set a budget, or remove the setting"
+            "Http sets trusted_proxies but intake_auth_rate_limit_global is off. Each client "
+            "behind a listed proxy keys its own per-peer budget, so the global budget is the only "
+            "bound on guessing across them. Set intake_auth_rate_limit_global, or remove the setting"
         )
-    settings["trusted_proxies"] = list(trusted_proxies or ())
+    settings["trusted_proxies"] = (
+        trusted_proxies if isinstance(trusted_proxies, EnvRef) else list(trusted_proxies or ())
+    )
     return ConnectionSpec(ConnectorType.HTTP, settings)
 
 

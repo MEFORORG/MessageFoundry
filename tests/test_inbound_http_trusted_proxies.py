@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.wiring import Http, WiringError, env
+from messagefoundry.config.wiring import EnvRef, Http, WiringError, env, resolve_env_settings
 from messagefoundry.pipeline.wiring_runner import _IntakeRateLimiter
 from messagefoundry.transports.http_listener import HttpSource, trusted_proxy_networks
 from tests.test_inbound_http_intake_auth import (
@@ -227,7 +227,7 @@ def test_the_setting_is_refused_outside_the_header_modes(mode: str) -> None:
 @pytest.mark.parametrize(
     ("entry", "why"),
     [
-        ("*", "EVERY peer"),
+        ("*", "every peer"),
         ("0.0.0.0/0", "whole address family"),
         ("::/0", "whole address family"),
         ("::ffff:0:0/96", "whole address family"),
@@ -238,10 +238,53 @@ def test_the_setting_is_refused_outside_the_header_modes(mode: str) -> None:
     ],
 )
 def test_an_entry_the_api_list_refuses_is_refused_here(entry: str, why: str) -> None:
-    with pytest.raises(WiringError, match=why):
+    """Refused by ``_parse_trusted_proxy``, named by form and index, and never quoted: no factory
+    refusal may echo a configured value (vault BACKLOG #3249, #3765)."""
+    with pytest.raises(WiringError, match=why) as excinfo:
         Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), trusted_proxies=[entry])
+    if entry != "*":  # '*' is a form the refusal names, not a value it could echo
+        assert entry not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
     with pytest.raises(ValueError, match=why):
         trusted_proxy_networks([entry])
+
+
+def test_a_whole_setting_env_is_read_by_the_listener_once_resolved() -> None:
+    spec = Http(
+        port=8080, intake_auth="api_key", intake_api_key=env("k"), trusted_proxies=env("proxies")
+    )
+    assert isinstance(spec.settings["trusted_proxies"], EnvRef)
+    resolved = resolve_env_settings(spec.settings, {"k": "x", "proxies": ["10.0.0.5"]})
+    assert resolved["trusted_proxies"] == ["10.0.0.5"]
+    defaulted = Http(
+        port=8080,
+        intake_auth="api_key",
+        intake_api_key=env("k"),
+        trusted_proxies=env("proxies", default=["10.0.0.6"]),
+    )
+    assert resolve_env_settings(defaulted.settings, {"k": "x"})["trusted_proxies"] == ["10.0.0.6"]
+
+
+def test_a_padded_header_is_read_no_further_than_the_hop_bound() -> None:
+    """A host inside a listed range may pad the header with listed hops. The walk stops at the
+    bound and keys on the socket peer rather than reading on, on the event loop."""
+    from messagefoundry.config.models import ConnectorType, Source
+    from messagefoundry.transports.http_listener import _MAX_FORWARDED_HOPS, HttpRequest
+
+    source = HttpSource(
+        Source(
+            type=ConnectorType.HTTP,
+            settings={"port": 0, "intake_auth": "api_key", "trusted_proxies": ["10.0.0.0/8"]},
+        )
+    )
+
+    def key(hops: list[str]) -> str | None:
+        head = HttpRequest("POST", "/", {}, b"", frozenset(), ",".join(hops))
+        return source._forwarded_client(head, "10.0.0.1")
+
+    listed = ["10.0.0.2"] * (_MAX_FORWARDED_HOPS - 1)
+    assert key([CLIENT_A, *listed]) == CLIENT_A  # the client is the bound's last hop
+    assert key([CLIENT_A, "10.0.0.2", *listed]) is None  # one more listed hop: socket peer
 
 
 def test_entries_that_together_span_a_family_are_refused() -> None:
@@ -258,17 +301,19 @@ def test_none_reads_as_unset() -> None:
     assert spec.settings["trusted_proxies"] == []
 
 
-def test_the_setting_is_refused_with_no_budget_to_key() -> None:
-    with pytest.raises(WiringError, match="no failed-attempt budget"):
+@pytest.mark.parametrize("glob", [0, None])
+def test_the_setting_is_refused_with_the_global_budget_off(glob: int | None) -> None:
+    """Each client behind the proxy keys its own per-peer budget, so the global budget is the only
+    bound on guessing across them."""
+    with pytest.raises(WiringError, match="intake_auth_rate_limit_global is off"):
         Http(
             port=8080,
             intake_auth="api_key",
             intake_api_key=env("k"),
             trusted_proxies=["10.0.0.5"],
-            intake_auth_rate_limit=0,
-            intake_auth_rate_limit_global=None,
+            intake_auth_rate_limit_global=glob,
         )
-    # One budget is enough for the key to matter.
+    # The per-peer budget alone may be off; the global one still bounds the total.
     Http(
         port=8080,
         intake_auth="api_key",

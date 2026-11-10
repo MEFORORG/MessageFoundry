@@ -547,8 +547,9 @@ def client_ip(conn: HTTPConnection) -> str | None:
 
     **It parses no forwarding header, ever, and must not start.** The
     ``[security].allowed_client_networks`` gate decides on this value (``api/client_networks.py``),
-    so a header read here would let any caller spoof its way past that gate. uvicorn is the one
-    ``X-Forwarded-For`` trust point (ADR 0151, D-1).
+    so a header read here would let any caller spoof its way past that gate. uvicorn is the API's one
+    ``X-Forwarded-For`` trust point (ADR 0151, D-1); the inbound HTTP listener's own, for its
+    failed-attempt budget only, never reaches this value (BACKLOG #5525).
 
     It reads ``scope["client"][0]`` itself, the item the gate judged before BACKLOG #2289, rather
     than starlette's ``conn.client``: that builds ``Address(*scope["client"])`` and raises
