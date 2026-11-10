@@ -22,7 +22,7 @@ import logging
 import random
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 import httpx
@@ -1486,16 +1486,19 @@ def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1") -> list[str]:
     main's two WARNING lines. Main's lines are its own two formats, with the seen address as main
     logged it. Main's path span is its line after its head and, on the past-cap line, before
     ``seen_ip=`` and the seen text, as main logged it or as two handlers write it alone. Where
-    neither tail is found whole, the span runs to the end of the line and the larger of the two
-    tails' counts of the word is taken off, so main gets no credit for a word only its own tail
-    printed, which a tail the line left raw and the passes rewrite alone would give it."""
+    neither tail is found whole, main wrote its tail a third way: the span runs to the end of the
+    line, and the count taken off is the larger of the two tails' counts of the word, capped by
+    its count in the line from the first `` seen_ip=`` on, which holds all of that third tail
+    while its `` seen_ip=`` survives. So main gets no credit for a word only its own tail printed,
+    nor loses a path word its tail did not print."""
+    seen_text = _bounded_address_text(seen)
     repeat = _new_ip_path_field(path)
-    over = _new_ip_path_field(path, _bounded_address_text(seen))
-    main_seen = scrub_log_argument(_bounded_address_text(seen))
+    over = _new_ip_path_field(path, seen_text)
+    main_tail = _seen_tail(seen_text)
     pairs = (
         (_sink_lines(_REPEAT_HEAD + "%s", path), _sink_lines(_REPEAT_HEAD + "%s", repeat)),
         (
-            _sink_lines(_OVER_HEAD + "path=%s seen_ip=%s", path, main_seen),
+            _sink_lines(_OVER_HEAD + "path=%s%s", path, main_tail),
             _sink_lines(_OVER_HEAD + "seen_ip=%s path=%s", _address_log_field(seen), over),
         ),
     )
@@ -1504,17 +1507,15 @@ def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1") -> list[str]:
     opening = "a request from a new client address must re-verify; the address "
     assert all(line.startswith(opening) for pair in pairs for side in pair for line in side)
     words = set(re.findall(r"[A-Za-z0-9]{3,}", path))
-    raw_tail = _seen_tail(_bounded_address_text(seen))
-    tails = (raw_tail, _last_sink_line("%s", raw_tail))
+    tails = (main_tail, _last_sink_line("%s", main_tail))
     shown = []
     for (main, ours), head, after in zip(
         pairs, (_REPEAT_HEAD, _OVER_HEAD + "path="), (("",), tails), strict=True
     ):
-        span, extra, unfound = _main_span(main[-1], head, opening, after)
+        span, taken_off = _main_span(main[-1], head, opening, after)
         fields = [_unescaped(_path_value(line)) for line in ours]
         for word in sorted(words):
-            in_tail = max((t.count(word) for t in unfound), default=0)
-            in_main_span = max(0, span.count(word) - extra.count(word) - in_tail)
+            in_main_span = max(0, span.count(word) - taken_off(word))
             if any(field.count(word) > in_main_span for field in fields):
                 shown.append(word)
     return shown
@@ -1522,10 +1523,12 @@ def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1") -> list[str]:
 
 def _main_span(
     line: str, head: str, opening: str, tails: tuple[str, ...]
-) -> tuple[str, str, tuple[str, ...]]:
-    """Main's path span in ``line``; the rest of ``head`` where a pass took part of it, whose counts
-    the caller takes off; and ``tails`` where none of them is found whole at the line's end, whose
-    larger count the caller takes off."""
+) -> tuple[str, Callable[[str], int]]:
+    """Main's path span in ``line``, and how many of a word in it the caller takes off: the rest
+    of ``head`` where a pass took part of it; and, where no tail of ``tails`` is found whole at the
+    line's end, so main wrote its tail a third way, the larger of the tails' counts, capped by the
+    count in the span from its first `` seen_ip=`` on, which holds all of that third tail while its
+    `` seen_ip=`` survives."""
     line = line.rstrip("\n")
     extra = ""
     if line.startswith(head):
@@ -1534,8 +1537,17 @@ def _main_span(
         line, extra = line[len(opening) :], head[len(opening) :]
     for tail in tails:
         if line.endswith(tail):
-            return line[: len(line) - len(tail)], extra, ()
-    return line, extra, tails
+            return line[: len(line) - len(tail)], extra.count
+    cut = line.find(" seen_ip=")
+    region = line[cut:] if cut >= 0 else None
+
+    def taken_off(word: str) -> int:
+        in_tail = max(tail.count(word) for tail in tails)
+        if region is not None:
+            in_tail = min(in_tail, region.count(word))
+        return extra.count(word) + in_tail
+
+    return line, taken_off
 
 
 def _path_value(line: str) -> str:
@@ -1543,6 +1555,27 @@ def _path_value(line: str) -> str:
     the seen address field of an unparsed address is a digest under a key drawn per process, and
     could hold a path word."""
     return dict(_logged_fields(line.rstrip("\n")))["path"]
+
+
+#: Paths whose past-cap line main wrote with its tail a third way, the encoded run raw and the
+#: date redacted, while the path's own date printed (round-5aa03c4b).
+_THIRD_WAY_TAIL = (
+    "//codemrn/1980-01-01SECRET\t|",
+    "/'.:\t1980-01-01Authorization: 123-45-6789",
+)
+
+
+@pytest.mark.parametrize("path", _THIRD_WAY_TAIL)
+def test_a_tail_main_wrote_a_third_way_takes_off_only_what_it_printed(path: str) -> None:
+    """RED when: the baseline takes a path word off main's span for a seen text whose raw form
+    holds it, though main's own tail, written a third way, did not print it, so a field printing
+    the word no more often than main reads as a leak (BACKLOG #3770)."""
+    seen = "a%7Cb%7Cc 1980-01-01"
+    line = _last_sink_line(_OVER_HEAD + "path=%s%s", path, _seen_tail(_bounded_address_text(seen)))
+    # The control: main's tail is neither raw nor as written alone, and the path's date printed.
+    assert line.endswith(" seen_ip=a%7Cb%7Cc [redacted]") and "1980" in line, ascii(line)
+    assert "1980" in _unescaped(_new_ip_path_field(path, _bounded_address_text(seen)))
+    assert not _hides_no_less_than_main(path, seen), ascii(path)
 
 
 @pytest.mark.parametrize(("path", "seen"), _QUOTE_CLOSING_SEEN)
@@ -1572,7 +1605,7 @@ def test_the_path_field_hides_no_less_than_main(path: str) -> None:
 
 
 #: What the seeded corpora build paths from: labels, separators, encoded separators, controls,
-#: a no-break space and words.
+#: words, a no-break space and a credential shape. The last two turn a pass off for a whole line.
 _CORPUS_PIECES = (
     "password",
     "Bearer",
@@ -1744,6 +1777,19 @@ def test_a_seen_text_left_raw_in_the_line_leaves_the_path_readable(path: str, se
     field = _new_ip_path_field(path, seen_text)
     assert field == _new_ip_path_field(path) != _UNREADABLE_FIELD, (ascii(path), seen, field)
     assert not _hides_no_less_than_main(path, seen), (ascii(path), seen)
+
+
+@pytest.mark.parametrize("seen", ["a%7Cb%7Cc\tx", "a%7Cb%7Cc 1980-01-01", "a%7Cb%7Cc DOE JANE"])
+@pytest.mark.parametrize("path", [path for path, _ in _RAW_IN_LINE_SEEN])
+def test_a_raw_run_beside_another_rewritten_shape_blanks_a_switch_off_path(
+    path: str, seen: str
+) -> None:
+    """RED when: the case ``redacted_log_field`` and ``_new_ip_path_field`` name, a path that turns
+    a pass off for its whole line with a seen text holding a raw encoded run beside a tab, a date
+    or a name, stops logging the placeholder (BACKLOG #3770). It fails closed; a change that makes
+    it readable must also change both docstrings, and still pass the hides-no-less tests."""
+    assert _new_ip_path_field(path, _bounded_address_text(seen)) == _UNREADABLE_FIELD
+    assert _new_ip_path_field(path) != _UNREADABLE_FIELD
 
 
 def test_the_past_cap_line_blanks_a_path_only_where_main_wrote_neither_tail_form() -> None:

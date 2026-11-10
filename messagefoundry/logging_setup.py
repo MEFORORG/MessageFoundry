@@ -484,10 +484,10 @@ def redacted_log_field(
       reading also fails when the line writes ``after`` neither as it was nor as it is written
       alone. That happens at least when ``text`` ends in a credential label that takes ``after``
       as its value; and when ``text`` turns a pass off for the whole line, a no-break space or a
-      credential shape for example, and ``after`` holds a tab, which the reading's tab round
-      respells, or a shape a pass still on rewrites, a date or a name for example, beside one
-      the line leaves. A pass rewriting ``after`` alike in both readings, a date or a tab in it
-      for example, fails nothing; nor does a line that leaves ``after`` exactly as it was.
+      credential shape for example, and ``after`` holds a raw encoded run beside another
+      rewritten shape (a tab, a date, a name). A pass rewriting ``after`` alike in both
+      readings, a date or a tab in it for example, fails nothing; nor does a line that leaves
+      ``after`` exactly as it was.
 
     Each check is one more full reading, and one of ``after`` alone unless that reading is
     exactly ``before``, the value and ``after`` as it was. Readings stop at the first check that

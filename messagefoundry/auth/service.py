@@ -561,12 +561,13 @@ def _new_ip_path_field(path: str, seen_text: str | None = None) -> str:
     that line leaves raw. Over a seeded corpus, a path the repeat line reads blanks on the
     past-cap line only where main's own past-cap line, written by two shipped handlers, was not
     the repeat value followed by the seen text raw or as written alone; that bounds the blanking
-    by those two forms, not by what main hid. Such a path still blanks, at least, with a seen
-    text holding a tab or a second rewritten shape beside the raw one. Not tested, at least: a
-    third handler; a Unicode space separator before an encoded HL7 name, which the pre-#3770
-    lines printed too; a seen text no vector names; and a pass that, in the past-cap line, hides
-    the end of the path and writes that end back, followed by exactly ``seen_ip=`` and the seen
-    text, as it was or as the passes write it alone."""
+    by those two forms, not by what main hid. A path that turns a pass off for the whole line
+    still blanks, at least, with a seen text that holds a raw encoded run beside another
+    rewritten shape (a tab, a date, a name). Not tested, at least: a third handler; a Unicode
+    space separator before an encoded HL7 name, which the pre-#3770 lines printed too; a seen
+    text no vector names; and a pass that, in the past-cap line, hides the end of the path and
+    writes that end back, followed by exactly ``seen_ip=`` and the seen text, as it was or as the
+    passes write it alone."""
     checks = (
         ()
         if seen_text is None
