@@ -487,3 +487,77 @@ async def test_a_later_teardown_step_that_raises_still_closes_the_store(
     assert closed == [True], "the store closed although a later teardown step raised"
     logged = any("failed after the stop was cancelled" in r.getMessage() for r in caplog.records)
     assert logged is monitor_cancels, "the error the cancel replaces is logged, and only then"
+
+
+async def test_one_failed_read_costs_a_watch_only_that_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lander hold on engine PR 2863, item 4: a failed read cleared every watch, so one transient
+    failure threw away all the staleness already counted. It now keeps the watch and discounts
+    only the gap from the last good read to the next one."""
+    clock = [1000.0]
+    monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        stale = intake_alert_subject(DEPTH_REASON, "node:gone")
+        await _raise_pause(store, stale)
+        monitor = _sweeper(store, "node:a")
+        assert await monitor.sweep_once() == 0  # watched from t=1000
+        clock[0] += STALE_SECONDS - 10
+        assert await monitor.sweep_once() == 0  # S-10 counted
+        real = store.open_alert_generations
+
+        async def broken(**_kw: object) -> list[object]:
+            raise RuntimeError("store unavailable")
+
+        monkeypatch.setattr(store, "open_alert_generations", broken)
+        clock[0] += 5
+        assert await monitor.sweep_once() == 0
+        monkeypatch.setattr(store, "open_alert_generations", real)
+        clock[0] += 5
+        assert await monitor.sweep_once() == 0, "the 10s gap around the failure is not counted"
+        assert await _is_open(store, stale)
+        clock[0] += 10
+        assert await monitor.sweep_once() == 1, (
+            "the S-10 counted before the failure still counts: the watch was not cleared"
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_store_close_that_raises_does_not_replace_the_deferred_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Lander hold on engine PR 2863, item 4: with a cancel deferred from the monitor's stop, a
+    store close that raised propagated in its place, so the caller never saw its cancel."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.engine import Engine
+
+    engine = await Engine.create(
+        tmp_path / "engine.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
+    await engine.start()
+    assert engine._intake_monitor is not None
+    real_monitor: IntakeBoundMonitor = engine._intake_monitor
+
+    class _CancelledStop:
+        async def stop(self) -> None:
+            await real_monitor.stop()
+            raise asyncio.CancelledError
+
+    engine._intake_monitor = cast(IntakeBoundMonitor, _CancelledStop())
+    real_close = engine.store.close
+
+    async def failing_close() -> None:
+        await real_close()
+        raise RuntimeError("synthetic close fault")
+
+    monkeypatch.setattr(engine.store, "close", failing_close)
+    with (
+        caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.engine"),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await engine.stop()
+    assert any(
+        "store close failed after the stop was cancelled" in r.getMessage() for r in caplog.records
+    ), "the close error the cancel replaces is logged"

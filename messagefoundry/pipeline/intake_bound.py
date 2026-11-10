@@ -269,6 +269,10 @@ class IntakeBoundMonitor:
         # BACKLOG #3269, the expiry sweep: per instance id, the count it last saw and the monotonic
         # time it first saw that count.
         self._watched: dict[int, tuple[int, float]] = {}
+        # The monotonic time of the last sweep whose read succeeded, and whether a read has failed
+        # since: the next good read moves every watch's start forward by the whole gap.
+        self._last_read: float | None = None
+        self._read_gap = False
         self._sweep_task: asyncio.Task[None] | None = None
         # The sweep steps ("read", "resolve") in a failing streak: one WARNING per step per streak.
         self._sweep_failing: set[str] = set()
@@ -420,9 +424,11 @@ class IntakeBoundMonitor:
         the instance at its current count, so no other process's clock enters it. The resolve is
         bounded by that count (``resolve_alert_generation``): a reminder that lands between the read
         and the write moves the count past it, and the row stays open. A subject this process owns
-        is skipped, since its own measurement raises and clears it. A failed read forgets every
-        watch, so an outage that also stopped a live process's reminders cannot expire its alert
-        when the store returns: staleness counts only time between sweeps that read. A failed
+        is skipped, since its own measurement raises and clears it. A failed read keeps every
+        watch, and the next good read moves each one's start forward by the whole time since the
+        last good read, so an outage that also stopped a live process's reminders cannot expire its
+        alert when the store returns: staleness counts only time between two good reads in a row,
+        and a single failed read costs a watch that one gap, not what it had already counted. A failed
         resolve keeps that instance watched and the pass goes on to the rest. Each step's failure
         is logged once per failing streak.
 
@@ -434,11 +440,13 @@ class IntakeBoundMonitor:
             )
         except Exception:
             # Broad on purpose, as in _check_depth: an advisory read must not kill the sweep task.
-            self._watched = {}
+            self._read_gap = True
             self._sweep_failed("read")
             return 0
         self._sweep_failing.discard("read")
         now = _monotonic()
+        gap = now - self._last_read if self._read_gap and self._last_read is not None else 0.0
+        self._last_read, self._read_gap = now, False
         watched: dict[int, tuple[int, float]] = {}
         expired = 0
         failed = False
@@ -446,7 +454,7 @@ class IntakeBoundMonitor:
             if gen.connection in self._own_subjects:
                 continue
             prev = self._watched.get(gen.id)
-            since = prev[1] if prev is not None and prev[0] == gen.count else now
+            since = prev[1] + gap if prev is not None and prev[0] == gen.count else now
             if now - since < STALE_SECONDS:
                 watched[gen.id] = (gen.count, since)
                 continue

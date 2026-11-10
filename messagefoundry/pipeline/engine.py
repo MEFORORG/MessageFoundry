@@ -3998,6 +3998,12 @@ class Engine:
                 log.exception("an engine stop step failed after the stop was cancelled")
             raise
         finally:
-            await self.store.close()
+            try:
+                await self.store.close()
+            except Exception:
+                # A close that raises must not take the deferred cancel's place.
+                if not monitor_cancelled:
+                    raise
+                log.exception("the store close failed after the stop was cancelled")
             if monitor_cancelled:
                 raise asyncio.CancelledError
