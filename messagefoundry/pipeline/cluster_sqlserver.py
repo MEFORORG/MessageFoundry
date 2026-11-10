@@ -139,12 +139,13 @@ class SqlServerCoordinator:
         self._on_demote: Callable[[], None] | None = None
         self._fence_timeout = leader_fence_timeout_seconds
         # ADR 0157 Inc 0: the clamp on at least the maintenance loop's heartbeat, claim/renew and
-        # config-version refresh (not the engine's start-up seed, which keeps
-        # [store].command_timeout), and on the stepdown's release write, as
-        # DbCoordinator._call_tick bounds them (BACKLOG #5064, #6472): each runs in series with the renew or under _leadership_lock, so
-        # [store].command_timeout there would delay the renew. SqlServerStore._fetchone_clamped
-        # says how it is applied, why one costs up to about twice the clamp, three times when its
-        # rollback runs, and why the COMMIT is outside it. The clamp bounds each statement, not
+        # config-version refresh, and on the stepdown's release write, as DbCoordinator._call_tick
+        # bounds them (BACKLOG #5064, #6472). Unlike _call_tick, it is not on the engine's start-up
+        # seed, which keeps [store].command_timeout (config_version). Each clamped one runs in
+        # series with the renew or under _leadership_lock, so [store].command_timeout there would
+        # delay the renew. SqlServerStore._fetchone_clamped says how it is applied, why one costs
+        # up to about twice the clamp, three times when its rollback runs, and why the COMMIT is
+        # outside it. The clamp bounds each statement, not
         # the tick: nothing checks that the heartbeat interval plus the loop's statements fit
         # inside the fence, on either backend. The paused tick's owner read takes the smaller of
         # the clamp and half its own budget (_paused_read_budget), and stop()'s release its own bound.
@@ -314,12 +315,11 @@ class SqlServerCoordinator:
     async def config_version(self) -> int:
         """Read (seeding to 0 if absent) and cache the cluster-wide config-reload version, with the
         initiator's digest from the same statement (vault BACKLOG #3109). Under
-        ``[store].command_timeout``: the engine's start-up seed calls this, and a seed runs once,
-        off the renew path, so it keeps the bound it had before the renew clamp. The maintenance
-        loop refreshes through :meth:`_refresh_config_version` instead."""
-        row = await self._store._fetchone(self._CONFIG_VERSION_UPSERT, (time.time(),))
-        assert row is not None, "cluster_config upsert returned no row"
-        return self._cache_config_row(row)
+        ``[store].command_timeout``, not the renew clamp: the engine's start-up seed calls this,
+        before the first load and, when that read failed, again in :meth:`Engine.start` while
+        the maintenance loop already runs. The loop refreshes through
+        :meth:`_refresh_config_version` instead."""
+        return await self._read_config_version(None)
 
     async def _refresh_config_version(self) -> int:
         """:meth:`config_version` under the renew clamp, for the maintenance loop, which runs it in
@@ -327,9 +327,16 @@ class SqlServerCoordinator:
         there the borrow and statement share one deadline, while here each gets the clamp, so the
         call can take about twice it, three times when a rollback runs, plus a COMMIT nothing is
         known to bound (SqlServerStore._fetchone_clamped)."""
-        row = await self._store._fetchone_clamped(
-            self._CONFIG_VERSION_UPSERT, (time.time(),), timeout_clamp=self._renew_timeout
-        )
+        return await self._read_config_version(self._renew_timeout)
+
+    async def _read_config_version(self, clamp: float | None) -> int:
+        params = (time.time(),)
+        if clamp is None:
+            row = await self._store._fetchone(self._CONFIG_VERSION_UPSERT, params)
+        else:
+            row = await self._store._fetchone_clamped(
+                self._CONFIG_VERSION_UPSERT, params, timeout_clamp=clamp
+            )
         assert row is not None, "cluster_config upsert returned no row"
         return self._cache_config_row(row)
 

@@ -231,7 +231,7 @@ async def test_a_bump_that_writes_no_digest_leaves_none_beside_its_version(store
 async def test_config_convergence_runner_reloads_from_real_db(store) -> None:
     """HA-16 clause 2 (sibling reload propagation) over a REAL coordinator: a ConfigConvergenceRunner
     on node B converges when a SECOND coordinator A bumps the shared ``cluster_config`` token in the DB
-    and B's cache is refreshed by an actual DB round-trip (the maintenance step, cluster_sqlserver.py:399).
+    and B's cache is refreshed by an actual DB round-trip (the maintenance step, SqlServerCoordinator._refresh_config_version).
 
     The unit test in tests/test_cluster.py scripts ``config_version_cached`` on a fake coordinator; this
     exercises the full live chain the fake can't — A bumps the DB row → B refreshes its cache from the
@@ -271,8 +271,9 @@ async def test_config_convergence_runner_reloads_from_real_db(store) -> None:
     assert await runner.converge_once() is False
     assert reloads == []
 
-    # B's maintenance tick refreshes the cached version from the REAL DB (the config_version() step).
-    assert await b.config_version() == 1
+    # B's maintenance tick refreshes the cached version from the REAL DB (the clamped
+    # _refresh_config_version step, the one the loop runs).
+    assert await b._refresh_config_version() == 1
     assert b.config_version_cached() == 1
     # Now B is behind → it reloads ONCE and advances applied to 1.
     assert await runner.converge_once() is True

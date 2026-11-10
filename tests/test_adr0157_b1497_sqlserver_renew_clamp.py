@@ -767,6 +767,7 @@ async def test_the_maintenance_loop_refreshes_through_the_clamped_method() -> No
 
     async def seed() -> int:
         calls.append("seed")
+        coord._stop.set()
         return 0
 
     coord.heartbeat_once = noop  # type: ignore[method-assign]
@@ -778,8 +779,8 @@ async def test_the_maintenance_loop_refreshes_through_the_clamped_method() -> No
 
 
 async def test_the_start_up_seed_runs_under_command_timeout_not_the_renew_clamp() -> None:
-    """The engine's start-up seed calls config_version(), which keeps main's bound,
-    [store].command_timeout, rather than the renew clamp the tick refresh takes. Under the clamp
+    """The engine's start-up seed calls config_version(), which runs under
+    [store].command_timeout rather than the renew clamp the tick refresh takes. Under the clamp
     the fake below would record [3]."""
     conn = _Conn()
     conn.columns = ("config_version",)
