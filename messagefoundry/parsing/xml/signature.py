@@ -43,13 +43,12 @@ class XmlSignatureResult:
     """The outcome of an XML-DSig verification.
 
     ``verified`` is True iff the signature is valid against the supplied certificate/CA, its key
-    clears the strength floor, AND it covers the whole document (vault BACKLOG #2315). ``reason`` is a
-    PHI-safe failure category when not (``None`` on success).
+    clears the strength floor, AND it covers the whole document outside the ``ds:Signature`` element
+    (vault BACKLOG #2315). ``reason`` is a PHI-safe failure category when not (``None`` on success).
 
     ``signed_content`` is the content the signature covers, as the signer canonicalized it: the
-    document without its ``ds:Signature`` element. It is ``None`` unless ``verified``. **Read the
-    message from these bytes, not from the document you passed in.** These bytes are what the
-    cryptography actually checked; :func:`verify` says what else a verified document may carry.
+    document without its ``ds:Signature`` element. It is ``None`` unless ``verified``. These bytes
+    are what the cryptography actually checked; :func:`verify` says why a Handler reads only them.
     """
 
     verified: bool
@@ -344,17 +343,20 @@ def verify(
     whose key cannot be read fails with :data:`UNREADABLE_SIGNING_KEY` (BACKLOG #1166).
 
     **Only a signature over the whole document verifies** (vault BACKLOG #2315). A document holding
-    anything the signature does not cover fails with :data:`UNSIGNED_CONTENT`: for example a signed
-    element under a new document element, content inside the ``ds:Signature`` element, or a comment
-    the signature excluded.
+    content the signature does not cover fails with :data:`UNSIGNED_CONTENT`: for example a signed
+    element under a new document element, an element or comment inside the ``ds:Signature`` element
+    that the next paragraph does not admit, or a comment the signature excluded.
 
     **``verified=True`` vouches for ``signed_content`` and nothing else, so read the message from
     ``signed_content``, never from your own parse of ``document``** (vault BACKLOG #5538, reviewed
-    not-a-bug). Nothing in ``ds:KeyInfo`` is signed. Free text in a ``ds:KeyInfo`` leaf, such as
-    ``ds:KeyName``, ``ds:MgmtData`` or ``ds:X509SubjectName``, is still admitted on purpose, because
-    signers emit those elements and refusing them would refuse real partners; it verifies, and it is
-    not in ``signed_content``. When ``x509_cert`` pins the signer, signxml checks the signature
-    against that certificate and does not read the certificates in ``ds:X509Data``, so even a
+    not-a-bug). Inside ``ds:Signature``, only ``ds:SignedInfo`` is signed, and a verified document
+    may still carry unsigned text there. That includes at least free text in a ``ds:KeyInfo`` leaf,
+    such as ``ds:KeyName``, ``ds:MgmtData`` or ``ds:X509SubjectName``, and the ``Id`` attribute of
+    ``ds:Signature`` or ``ds:SignatureValue``. The ``ds:KeyInfo`` leaves are admitted on purpose, as
+    a set, so that a signer emitting standard key data such as a key name or subject name is not
+    refused; none of that text is in ``signed_content``. Do not take the signer's identity from
+    ``ds:KeyInfo`` either: the anchor you pass is what checks the signer. When ``x509_cert`` pins
+    it, signxml does not read the certificates in ``ds:X509Data`` at all, so even a
     ``ds:X509Certificate`` there is unchecked text.
 
     Raises :class:`ValueError` if no anchor is supplied,
