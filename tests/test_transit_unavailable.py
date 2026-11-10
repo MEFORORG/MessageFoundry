@@ -71,10 +71,10 @@ def _malformed_head() -> requests.exceptions.ConnectionError:
         return exc
 
 
-def _tls_error(*inner: BaseException) -> requests.exceptions.SSLError:
+def _tls_error(ssl_exc: BaseException, *beside: BaseException) -> requests.exceptions.SSLError:
     """The shape requests raises for a TLS failure: urllib3's ``SSLError`` in ``args``, the ``ssl``
-    error inside that, and anything else ``inner`` names beside it."""
-    return requests.exceptions.SSLError(urllib3.exceptions.SSLError(inner[0]), *inner[1:])
+    error inside that, and ``beside`` next to it."""
+    return requests.exceptions.SSLError(urllib3.exceptions.SSLError(ssl_exc), *beside)
 
 
 def _cut_off() -> TruncatedResponseError:

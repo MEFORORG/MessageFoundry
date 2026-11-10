@@ -291,7 +291,7 @@ def is_vault_bad_request(exc: BaseException) -> bool:
 
 #: The ``ssl`` errors that are a TLS session the peer closed, not a refusal of the hop (BACKLOG
 #: #3734). Named rather than imported, so this module adds no ``ssl`` use to the crypto inventory.
-_TLS_SESSION_DROPS = frozenset({"SSLEOFError", "SSLZeroReturnError"})
+_TLS_SESSION_DROPS = ("SSLEOFError", "SSLZeroReturnError")
 
 
 def is_vault_unavailable(exc: BaseException) -> bool:
@@ -320,6 +320,7 @@ def is_vault_unavailable(exc: BaseException) -> bool:
     from messagefoundry.exception_origin import (  # noqa: PLC0415
         ExceptionChainTooLong,
         exception_chain,
+        is_ssl_error,
     )
     from messagefoundry.transports.bounded_read import (  # noqa: PLC0415
         EgressReplyError,
@@ -337,15 +338,16 @@ def is_vault_unavailable(exc: BaseException) -> bool:
     except ExceptionChainTooLong:
         return False
     if isinstance(exc, requests.exceptions.SSLError) and not any(
-        type(link).__module__ == "ssl" and type(link).__name__ in _TLS_SESSION_DROPS
-        for link in chain
+        is_ssl_error(link, name) for link in chain for name in _TLS_SESSION_DROPS
     ):
         return False  # a certificate or protocol the hop refuses is refused again on the next try
-    return not any(
-        isinstance(link, (EgressReplyError, InsecureHopRefused))
-        and not isinstance(link, TruncatedResponseError)
-        for link in chain
-    )
+
+    def refuses(link: BaseException) -> bool:
+        if isinstance(link, TruncatedResponseError):
+            return False  # a cut-off reply is the one EgressReplyError that is not a refusal
+        return isinstance(link, (EgressReplyError, InsecureHopRefused))
+
+    return not any(refuses(link) for link in chain)
 
 
 # --- Transit key-TYPE validation (BACKLOG #1166, owner ruling 2026-08-22, ASVS 11.2.3) -------------

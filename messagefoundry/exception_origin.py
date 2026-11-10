@@ -69,6 +69,13 @@ class ExceptionChainTooLong(Exception):
     """:func:`exception_chain` passed :data:`_CHAIN_LIMIT` links, so what it read is not all there is."""
 
 
+def is_ssl_error(exc: BaseException, name: str) -> bool:
+    """Whether ``exc`` is the stdlib ``ssl`` module's class ``name`` or a subclass of it. Read off
+    the class's MRO, so a caller reads an exception's type without importing ``ssl``, which the
+    crypto inventory gate counts as a crypto use (``scripts/security/crypto_inventory_check.py``)."""
+    return any(c.__module__ == "ssl" and c.__name__ == name for c in type(exc).__mro__)
+
+
 def exception_chain(exc: BaseException) -> Iterator[BaseException]:
     """``exc`` and at least these it wraps: its cause and context, an exception group's members, and
     the exceptions urllib3 and requests keep in ``args``, ``reason`` and ``original_error``. Each is
