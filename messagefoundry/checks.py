@@ -1772,7 +1772,8 @@ def _check_validate(config_dir: str | Path, *, allow_empty: bool = False) -> Che
 # but delivered nothing), ``NOT_DEPLOYED`` (a handler ran and every Send it produced addressed a
 # present-but-not-deployed destination — #233, BACKLOG #1690), or ``ERROR`` (parse/validate/
 # router-handler failure). ``PROCESSED``/``ROUTED`` are live-only post-delivery states, so they alias
-# to ``RECEIVED`` for authoring ergonomics. A strict-validation timeout never satisfies ``ERROR``.
+# to ``RECEIVED`` for authoring ergonomics. A strict-validation timeout satisfies ``ERROR`` only when
+# the validate, though late, returned a content refusal; a late pass or a late raise does not.
 _DRYRUN_DISPOSITIONS = frozenset({"RECEIVED", "UNROUTED", "FILTERED", "NOT_DEPLOYED", "ERROR"})
 _DISPOSITION_ALIASES = {
     "PROCESSED": "RECEIVED",
@@ -1954,10 +1955,12 @@ def _check_dryrun(
                 if actual != expected:
                     got = safe_error(result.error) or actual
                     errors.append(f"{label} @ {ic_name}: expected {expected}, got {got}")
-                elif result.strict_timed_out:
-                    # A timeout is the validator's wall clock, not the message, so it never proves a
-                    # fixture that expects ERROR (BACKLOG #5107). The detail names the refusal
-                    # kind only: the timeout text carries no message content.
+                elif result.strict_timed_out and result.strict_late_refusal is None:
+                    # A timeout is the validator's wall clock, not the message, so on its own it
+                    # never proves a fixture that expects ERROR (BACKLOG #5107). A content refusal
+                    # the validate returned after the timeout does: the verdict is the message's,
+                    # only its arrival was slow. The detail names the refusal kind only: the
+                    # timeout text carries no message content.
                     errors.append(
                         f"{label} @ {ic_name}: expected {expected}, got a strict-validation "
                         "timeout, which does not show the content is invalid"

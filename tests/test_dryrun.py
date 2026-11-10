@@ -225,6 +225,45 @@ def test_strict_validation_timing_starts_after_the_warm_up(monkeypatch: pytest.M
     assert result.strict_timed_out is False
 
 
+@pytest.mark.parametrize(
+    ("outcome", "late"),
+    [("refuse", "missing PV1"), ("pass", None), ("raise", None)],
+)
+def test_strict_timeout_keeps_a_late_content_refusal(
+    monkeypatch: pytest.MonkeyPatch, outcome: str, late: str | None
+) -> None:
+    """BACKLOG #5107: past the timeout ``error`` is the listener's timeout text whatever the
+    validate did, and ``strict_late_refusal`` keeps only a content refusal it returned. Fake clock:
+    every read advances 31 s past the timeout."""
+    import itertools
+    import time
+    from types import SimpleNamespace
+
+    from messagefoundry.parsing.validate import ValidationResult
+    from messagefoundry.pipeline import dryrun
+
+    def slow_validate(*args: Any, **kwargs: Any) -> ValidationResult:
+        if outcome == "raise":
+            raise RuntimeError("validator fault")
+        return ValidationResult(outcome == "pass", "2.5.1", [late] if late else [])
+
+    ticks = itertools.count()
+    monkeypatch.setattr(
+        dryrun, "time", SimpleNamespace(time=time.time, monotonic=lambda: next(ticks) * 31.0)
+    )
+    monkeypatch.setattr(dryrun, "warm_validation", lambda text: None)
+    monkeypatch.setattr(dryrun, "validate", slow_validate)
+
+    result = dry_run(
+        _registry(lambda m: ["h"], {"h": lambda m: Send("out", m)}, strict=True), ADT_A01
+    )
+
+    assert result.disposition is MessageStatus.ERROR
+    assert result.strict_timed_out is True
+    assert result.error is not None and result.error.startswith("strict-validation timed out")
+    assert result.strict_late_refusal == late
+
+
 def test_warm_validation_fills_what_a_first_validate_loads_lazily() -> None:
     """The warm-up leaves the probe and the structure's reference table cached, so the timed
     validate after it loads neither. Cleared first, so a cache another test filled proves nothing."""

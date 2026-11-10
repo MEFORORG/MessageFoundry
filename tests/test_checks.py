@@ -636,16 +636,49 @@ def _slow_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _late_validate(monkeypatch: pytest.MonkeyPatch, outcome: str) -> None:
+    """Replace the dry run's strict validate with one that passes (``"pass"``) or raises
+    (``"raise"``); with :func:`_slow_clock` it then finishes after the timeout either way."""
+    from messagefoundry.parsing.validate import ValidationResult
+    from messagefoundry.pipeline import dryrun
+
+    def late(*args: object, **kwargs: object) -> ValidationResult:
+        if outcome == "raise":
+            raise RuntimeError("validator fault")
+        return ValidationResult(True, "2.5.1", [])
+
+    monkeypatch.setattr(dryrun, "validate", late)
+
+
+@pytest.mark.parametrize("outcome", ["pass", "raise"])
 def test_expect_error_does_not_pass_on_a_strict_validation_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
     # BACKLOG #5107: a timeout is the validator's clock, not the message, so a fixture that expects
-    # ERROR must not pass on one. ADT_A01 has no PV1, so un-timed it would be refused as content.
+    # ERROR must not pass on one whose validate, late, found nothing wrong or raised.
     _slow_clock(monkeypatch)
+    _late_validate(monkeypatch, outcome)
     cfg = _strict_config(tmp_path)
     msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR\n")
     dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
     assert "expected ERROR, got a strict-validation timeout" in dr.detail, dr.detail
+
+
+def test_expect_error_passes_on_a_late_strict_content_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5107: a slow runner must not fail a correct fixture. ADT_A01 has no PV1, so the real
+    # validate refuses its content; on the fake clock that refusal arrives after the timeout, and
+    # it still satisfies ERROR.
+    _slow_clock(monkeypatch)
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR\n")
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+    # The control: the run did time out, so without an .expect it fails on the timeout text.
+    Path(f"{msgs / 'IB_X' / 'a.hl7'}.expect").unlink()
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert "timed out" in dr.detail, dr.detail
 
 
 def test_expect_error_passes_on_a_strict_validation_content_refusal(tmp_path: Path) -> None:

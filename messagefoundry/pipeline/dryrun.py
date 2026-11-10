@@ -841,6 +841,12 @@ class DryRunResult:
     # from every other ERROR without matching its text (BACKLOG #5107): ``check`` refuses to let a
     # timeout satisfy a fixture that expects ERROR, since it says nothing about the message.
     strict_timed_out: bool = False
+    # A strict-validation content refusal that arrived only after the timeout, so ``error`` reports
+    # the timeout, as the listener would, while this keeps the validator's own verdict (BACKLOG
+    # #5107). ``None`` unless ``strict_timed_out`` is set and the late validate returned a refusal;
+    # a late pass or a late raise leaves it ``None``. **PHI, under the same obligation as
+    # ``error``:** it is the joined hl7apy errors, which can quote the message.
+    strict_late_refusal: str | None = None
 
 
 class NoInboundError(ValueError):
@@ -955,10 +961,12 @@ def _dry_run_raw(
 
 
 class _StrictRefusal(NamedTuple):
-    """A strict-validation refusal: the listener's text, and whether it is the timeout."""
+    """A strict-validation refusal: the listener's text, whether it is the timeout, and on a
+    timeout the content refusal the validate returned late, if it returned one."""
 
     text: str
     timed_out: bool
+    late_refusal: str | None = None
 
 
 def _strict_validation_error(text: str, ic: InboundConnection) -> _StrictRefusal | None:
@@ -970,7 +978,8 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> _StrictRefusal
     function is synchronous, so it validates **inline and measures**: when the validate took longer
     than that timeout, the result is the listener's text word for word (the parity test compares the
     two), whatever the validate returned or raised, since the listener had usually given up on it by
-    then (the exception is below). A
+    then (the exception is below). A content refusal the late validate did return is kept beside
+    that text as ``late_refusal``, so ``check`` can still count it (BACKLOG #5107). A
     validate inside the timeout reports as before: its own refusal, or its raise. With the backstop
     disabled (``strict_timeout_s <= 0``) nothing times out.
 
@@ -1008,11 +1017,22 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> _StrictRefusal
                 "dry-run strict validation raised %s after its timeout; reported as timed out",
                 type(fault).__name__,
             )
-        return _StrictRefusal(f"strict-validation timed out after {timeout}s", timed_out=True)
+        # Kept beside the timeout, not in place of it: the listener would have answered the
+        # timeout, but a refusal the validator did return says the content is invalid, which a
+        # slow runner must not hide from ``check`` (BACKLOG #5107).
+        late = None if fault is not None or result.ok else _refusal_text(result.errors)
+        return _StrictRefusal(
+            f"strict-validation timed out after {timeout}s", timed_out=True, late_refusal=late
+        )
     if fault is not None:
         raise fault
     # On ``ok`` alone, as the listener refuses: a fault's text can be empty.
-    return None if result.ok else _StrictRefusal("; ".join(result.errors)[:200], timed_out=False)
+    return None if result.ok else _StrictRefusal(_refusal_text(result.errors), timed_out=False)
+
+
+def _refusal_text(errors: list[str]) -> str:
+    """The listener's refusal text for a failed strict validate."""
+    return "; ".join(errors)[:200]
 
 
 @runs_author_code
@@ -1115,6 +1135,7 @@ def dry_run(
             summary=summ,
             error=refused.text,
             strict_timed_out=refused.timed_out,
+            strict_late_refusal=refused.late_refusal,
         )
 
     try:
