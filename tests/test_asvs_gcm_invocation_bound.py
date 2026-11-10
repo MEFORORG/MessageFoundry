@@ -49,7 +49,6 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.gcm_bound import (
     GCM_RESERVE_BLOCK,
-    SETTLE_WAIT_SECONDS,
     bounded_cipher,
     checkpoint_invocations,
     settle_at_close,
@@ -699,7 +698,8 @@ async def test_a_writer_lock_held_past_the_wait_closes_the_bound_unsettled(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The close runs as a step engine.stop() never cuts, so its wait for the writer lock is
-    bounded: past it the bound is closed without a settlement, logged, and the close goes on."""
+    bounded: past it the bound is closed with no settlement, logged, and the close goes on. Here
+    the reserve is unspent, so nothing is refunded: an over-count."""
     store, cipher = await _keyed_store(tmp_path / "busy.db")
     await store._lock.acquire()
     try:
@@ -711,11 +711,11 @@ async def test_a_writer_lock_held_past_the_wait_closes_the_bound_unsettled(
     assert any("without refunding" in r.getMessage() for r in caplog.records)
 
 
-async def test_a_close_that_times_out_refunds_nothing_and_charges_an_overspend(
-    tmp_path: Path,
+async def test_a_close_that_times_out_overspent_returns_in_time_and_names_the_under_count(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Past the settle's wait the bound closes with no refund, an over-count of at most a block,
-    and an overspent reserve is still charged once the writer frees: never an under-count."""
+    """A busy writer plus an overspent reserve: the close still returns within its wait, and the
+    ERROR line names the exact amount the persisted total under-counts by."""
     db = tmp_path / "overspent.db"
     store, cipher = await _keyed_store(db)
     key_id = cipher.invocation_key_id
@@ -723,14 +723,20 @@ async def test_a_close_that_times_out_refunds_nothing_and_charges_an_overspend(
     # Spend the whole reserve and 5 more, as a refill that fell behind would leave it.
     cipher.grant_invocations(-cipher._reserve_remaining - 5, reserved)
     await store._lock.acquire()
-    close = asyncio.ensure_future(store.close())
     try:
-        await asyncio.sleep(SETTLE_WAIT_SECONDS * 3)
-        assert cipher.invocation_bound_closed and not close.done()
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.store.gcm_bound"):
+            began = asyncio.get_running_loop().time()
+            await asyncio.wait_for(store.close(), 10)
+            elapsed = asyncio.get_running_loop().time() - began
     finally:
         store._lock.release()
-        await asyncio.wait_for(close, 10)
-    assert await _persisted(db, key_id) == reserved + 5
+    assert cipher.invocation_bound_closed
+    assert elapsed < 2.0, f"the close took {elapsed:.2f}s"
+    assert any("under-counts by 5" in r.getMessage() for r in caplog.records), [
+        r.getMessage() for r in caplog.records
+    ]
+    assert not any("over-count" in r.getMessage() for r in caplog.records)
+    assert await _persisted(db, key_id) == reserved
 
 
 async def test_a_close_that_times_out_with_an_unspent_reserve_keeps_the_block(

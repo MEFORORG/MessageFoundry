@@ -160,10 +160,12 @@ def _wake(waiter: asyncio.Future[None]) -> None:
 _IN_FLIGHT: weakref.WeakKeyDictionary[AesGcmCipher, _InFlight] = weakref.WeakKeyDictionary()
 
 #: The longest the close waits, for reservations under way and for the store's ``hold``, before it
-#: closes the bound without a refund (:func:`_close_without_refund`). A reservation that lands after
-#: the settlement is a block persisted but never spent, an over-count. Bounded because the close runs as a step engine.stop() never
-#: cuts, whose floor counts this wait (``pipeline/engine.py`` ``_STORE_CLOSE_FLOOR``). A reservation
-#: or a queued write takes milliseconds; one that takes longer is stuck, as behind a cut graph.
+#: closes the bound with no settlement (:func:`_close_unsettled`). A reservation that lands after the
+#: settlement is a block persisted but never spent, an over-count. Bounded because the close runs as
+#: a step engine.stop() never cuts, whose floor counts this wait (``pipeline/engine.py``
+#: ``_STORE_CLOSE_FLOOR``). Entering ``hold`` is bounded by it except for ``_writer_guard``'s own
+#: entry rollback of a transaction a cut writer abandoned. A reservation or a queued write takes
+#: milliseconds; one that takes longer is stuck, as behind a cut graph.
 SETTLE_WAIT_SECONDS = 0.1
 
 
@@ -264,19 +266,19 @@ async def settle_at_close(
 
     It waits until no reservation or settlement is under way on this cipher, then enters ``hold``
     and checks again, so none lands outside the figure; a store with a writer lock passes it as
-    ``hold``, so a writer holding it, or queued for it first, that finishes within the wait below
-    is counted first. Then
+    ``hold``, so a writer holding it, or queued for it first, that finishes within the wait below is
+    counted first. Then
     :meth:`AesGcmCipher.close_invocation_bound` reads the settlement and closes the bound under one
     hold of the cipher's counter lock, so the cipher raises
     :class:`~messagefoundry.store.crypto.CipherError` on every later encrypt rather than seal a value
     the persisted total leaves out. The settlement counts itself as under way, so an overlapping
     close waits for it and then finds nothing to correct, or retries one the DB refused.
 
-    Both waits share :data:`SETTLE_WAIT_SECONDS`. Past it the bound is closed with no refund
-    (:func:`_close_without_refund`): the persisted total keeps this handle's whole reservation, an
-    over-count of at most a block, and an overspent reserve is still charged. A writer still waiting
-    for ``hold`` then meets the closed bound and fails before it commits. A settlement the DB refuses
-    is logged, and the bound stays closed. ``add`` runs inside ``hold``. Returns the cumulative
+    Both waits share :data:`SETTLE_WAIT_SECONDS`. Past it the bound is closed with no settlement
+    (:func:`_close_unsettled`): an unspent reserve stays persisted, an over-count of at most a block,
+    and an overspent one is not charged, an under-count its ERROR line names. A writer still waiting
+    for ``hold`` that then encrypts meets the closed bound and fails before it commits. A settlement
+    the DB refuses is logged, and the bound stays closed. ``add`` runs inside ``hold``. Returns the cumulative
     total, or ``None`` when the cipher carries no bound."""
     bound = bounded_cipher(cipher)
     if bound is None:
@@ -297,7 +299,7 @@ async def settle_at_close(
                         async with asyncio.timeout_at(deadline):
                             await stack.enter_async_context(hold())
                     except TimeoutError:
-                        await _close_without_refund(bound, add, hold)
+                        _close_unsettled(bound)
                         return bound.cumulative_invocations()
                 # A reservation that began while this waited for ``hold`` is queued behind it, so
                 # release and wait again, unless the wait has run out.
@@ -325,35 +327,31 @@ async def settle_at_close(
             bound.close_invocation_bound()
 
 
-async def _close_without_refund(
-    bound: AesGcmCipher,
-    add: AddInvocations,
-    hold: Callable[[], AbstractAsyncContextManager[object]],
-) -> None:
-    """Close the bound after ``hold`` stayed busy past the settle's wait, never under-counting.
+def _close_unsettled(bound: AesGcmCipher) -> None:
+    """Close the bound when ``hold`` stayed busy past :data:`SETTLE_WAIT_SECONDS`, and log what the
+    persisted total then misses.
 
-    An unspent reserve is not refunded: it is already persisted, so the total over-counts by at most
-    that block, the direction this bound may drift in. An overspent reserve is still charged, since
-    leaving it out would under-count. That charge needs ``hold``, so it waits for it with no bound.
-    It happens only when the refill fell behind and a writer still holds the store at close."""
+    No settlement is written, since writing one needs ``hold``. An unspent reserve stays persisted,
+    so the total over-counts by at most that block, the direction this bound may drift in. An
+    overspent reserve cannot be charged within the wait, so the total under-counts by exactly the
+    overspend, and the ERROR line names it. Waiting longer for ``hold`` would hold a close
+    engine.stop() never cuts, and a kill at NSSM's window loses the same charge."""
     need = bound.close_invocation_bound()
-    log.error(
-        "the store's writer stayed busy past %.2fs at close, so the AES-GCM invocation bound was "
-        "closed without refunding this handle's reservation, an over-count of at most %d",
-        SETTLE_WAIT_SECONDS,
-        max(-need, 0),
-    )
-    if need <= 0:
-        return
-    with _counted(bound):
-        async with hold():
-            await _apply(
-                bound,
-                need,
-                add,
-                "could not charge an overspent AES-GCM invocation reserve at close; the bound is "
-                "closed, so the cipher encrypts nothing more under its key",
-            )
+    if need > 0:
+        log.error(
+            "the store's writer stayed busy past %.2fs at close, so an overspent AES-GCM invocation "
+            "reserve of %d could not be charged: the persisted total under-counts by %d",
+            SETTLE_WAIT_SECONDS,
+            need,
+            need,
+        )
+    else:
+        log.error(
+            "the store's writer stayed busy past %.2fs at close, so the AES-GCM invocation bound was "
+            "closed without refunding this handle's reservation, an over-count of %d",
+            SETTLE_WAIT_SECONDS,
+            -need,
+        )
 
 
 def reopen_invocation_bound(cipher: Cipher | None) -> None:
