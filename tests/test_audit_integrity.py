@@ -1520,17 +1520,18 @@ async def _verify_on_start(
 
 
 def test_prefix_break_marker_appears_in_a_real_prefix_failure() -> None:
-    """The marker is the phrase the comparator actually emits, and no chain break's.
+    """The marker is the phrase the comparator actually emits, and no break's own text.
 
     The engine no longer classifies on it (vault BACKLOG #3054, item 11): it reads
-    `AuditVerdict.prefix_break`, pinned by the tests below. The phrase stays the operator-facing text
-    of a truncation, so it is still held to that.
+    `AuditVerdict.prefix_break`, pinned by the tests below, because a break's message can quote a
+    database value that carries the phrase. The phrase stays the operator-facing text of a
+    truncation, so it is still held to that.
     """
     ok, msg = audit_prefix_verdict((3, "a" * 64), None, 2)
     assert ok is False
     assert msg is not None and AUDIT_PREFIX_BREAK_MARKER in msg
     # And it must NOT match the other verdict, or the discriminator calls everything a truncation.
-    assert AUDIT_PREFIX_BREAK_MARKER not in "audit chain broken at row id=4"
+    assert AUDIT_PREFIX_BREAK_MARKER not in "audit chain broken at seq=4, row id=4"
 
 
 async def test_startup_anchor_passes_when_the_log_only_grew(tmp_path: Path) -> None:
@@ -1607,10 +1608,9 @@ async def test_startup_chain_break_keeps_its_own_alert_subject(tmp_path: Path) -
 
 async def _averify_with_prefix(db: Path, prefix: str) -> AuditVerdict:
     """``verify_audit_chain`` over ``db`` with ``prefix`` (an anchor's ``COUNT:HEAD``) as the prefix."""
-    count, head = prefix.split(":")
     store = await MessageStore.open(db)
     try:
-        return await store.verify_audit_chain(expected_prefix=(int(count), head))
+        return await store.verify_audit_chain(expected_prefix=parse_audit_anchor(prefix))
     finally:
         await store.close()
 
@@ -1619,8 +1619,8 @@ async def test_the_walk_sets_prefix_break_on_a_cut_tail_and_never_on_a_break(
     tmp_path: Path,
 ) -> None:
     """The flag the engine classifies on comes from the comparator, not from the message (vault
-    BACKLOG #3054, item 11). A cut tail sets it; an edited row, which returns before the comparator
-    runs, does not; a clean anchored walk does not."""
+    BACKLOG #3054, item 11). A cut tail sets it; a clean anchored walk does not; an edited row WITH a
+    cut tail does not either, because a break outranks it and the comparator never runs."""
     db = tmp_path / "flag.db"
     await _aseed_audit_rows(db, 5)
     anchor = await _aread_anchor(db)
@@ -1637,15 +1637,15 @@ async def test_the_walk_sets_prefix_break_on_a_cut_tail_and_never_on_a_break(
     with contextlib.closing(sqlite3.connect(edited)) as conn:
         conn.execute("UPDATE audit_log SET actor='HACKED' WHERE id=2")
         conn.commit()
+    await _atruncate_audit_tail(edited, keep=3)  # alone, this would fail the comparator
     broken = await _averify_with_prefix(edited, anchor)
-    assert not broken[0] and not broken.prefix_break, broken
+    assert not broken[0] and "broken at seq=2" in (broken[1] or ""), broken
+    assert not broken.prefix_break, broken
 
 
 async def _subject_for_verdict(tmp_path: Path, verdict: AuditVerdict) -> str:
     """The alert subject the startup check files ``verdict`` under, with the walk stubbed out."""
-    db = tmp_path / "stub.db"  # the walk is stubbed, so one store serves every call
-    await _aseed_audit_rows(db, 1)
-    sink, _cap = await _verify_on_start(db, None, verdict)
+    sink, _cap = await _verify_on_start(tmp_path / "stub.db", None, verdict)
     assert len(sink.events) == 1, sink.events
     return sink.events[0][0]
 
@@ -1669,6 +1669,29 @@ async def test_startup_check_classifies_truncation_by_the_flag_not_the_text(
 
     agreed = AuditVerdict(False, f"audit log {AUDIT_PREFIX_BREAK_MARKER}", prefix_break=True)
     assert await _subject_for_verdict(tmp_path, agreed) == "audit-chain-truncated"
+
+
+async def test_a_planted_row_quoting_the_prefix_phrase_is_still_a_chain_break(
+    tmp_path: Path,
+) -> None:
+    """The real path of vault BACKLOG #3054, item 11: a database writer plants the prefix phrase as a
+    row's text ``seq``, the walk quotes it in its break reason, and the substring classifier filed
+    that break as a truncation. The flag keeps it under the chain-break subject."""
+    db = tmp_path / "planted.db"
+    await _aseed_audit_rows(db, 3)
+    anchor = await _aread_anchor(db)
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        # The newest row: a text seq sorts after every integer, so the walk meets it last.
+        conn.execute("UPDATE audit_log SET seq=? WHERE id=3", (AUDIT_PREFIX_BREAK_MARKER,))
+        conn.commit()
+    anchor_file = tmp_path / "anchor.txt"
+    anchor_file.write_text(anchor, encoding="utf-8")
+    sink, _cap = await _verify_on_start(db, anchor_file)
+
+    assert len(sink.events) == 1, sink.events
+    subject, reason, _ = sink.events[0]
+    assert AUDIT_PREFIX_BREAK_MARKER in reason and "broken at seq=3" in reason, reason
+    assert subject == "audit-chain", "a planted phrase turned a chain break into a truncation"
 
 
 async def test_startup_check_with_no_key_still_alerts_on_a_chain_that_names_a_key(

@@ -6068,9 +6068,10 @@ class AuditVerdict(tuple[bool, str | None]):
 
     ``prefix_break`` says the ``expected_prefix`` comparator failed: the tail was truncated, or the
     chain rewritten at or before the anchored row. It is set only with ``ok`` false, and only by that
-    comparator, so a caller tells a truncation from a chain break by this flag, never by matching the
-    message (vault BACKLOG #3054, item 11). A chain break returns before the comparator runs, so a
-    break with a cut tail still reads as a break alone.
+    comparator, so a caller that passed ``expected_prefix`` tells that failure from a chain break by
+    this flag, never by matching the message (vault BACKLOG #3054, item 11), since a break's message
+    can quote database values. The ``expected_anchor`` and ``expected_rows`` comparators also catch
+    a truncation and do NOT set it. A chain break outranks it, as :func:`verify_audit_rows` says.
 
     ``==`` and ``hash`` are the tuple's and ignore the flags and ``rows``; ``__reduce__`` keeps them
     all through a copy."""
