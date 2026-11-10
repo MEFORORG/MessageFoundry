@@ -8,8 +8,8 @@ each ``pending`` one, through the same engine handlers as ``POST /approvals/{id}
 ``/reject``, so the gate's own refusals (self-approval, too new, expired, requester no longer
 authorized) stay the engine's to make.
 
-**An ``interrupted`` row offers the resolve, never approve or reject** (BACKLOG #2460). Its release
-never recorded an outcome, so the engine answers approve and reject with 409. The resolve
+**An ``interrupted`` row offers the resolve, never approve or reject** (BACKLOG #2460). Only a
+``pending`` row can be approved or rejected, so the engine answers both with 409. The resolve
 records whether its effects were applied, through the same handler as
 ``POST /approvals/{id}/resolve``, and its route asks for the same fresh step-up.
 
@@ -89,8 +89,8 @@ _RESOLVE_LABELS: dict[ResolveOutcome, str] = {
 }
 
 _INTERRUPTED_NOTE = (
-    "These releases never recorded an outcome, so the operation may have done none, some or all of "
-    "its work. Nothing re-runs them. Check the operation's own effects, then record what you found. "
+    "These releases have no outcome in their status, so the operation may have done none, some or "
+    "all of its work; the audit log may hold its outcome row. Nothing re-runs them. Check the operation's own effects, then record what you found. "
     "Recording is final, and it may ask you to prove it is you again first; if it does, you come "
     "back here and choose again. The requester cannot record their own."
 )

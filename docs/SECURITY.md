@@ -3062,8 +3062,9 @@ even for a row this process is not running.
 The move is guarded on `executing` and on the claim owner it judged, so a row that moved or changed
 owner since answers **409** and moves nothing. Its `approval.interrupted` row is in the same write,
 against the operator, with `reason` `operator_interrupt`, the claim owner, the tier as `liveness`,
-and `owner_stopped_attested`. If that write fails the call answers **503** and pages
-`audit_write_failed`. The move keeps `decided_at` as the claim time.
+and `owner_stopped_attested`. A store fault on that write answers **503** and pages
+`audit_write_failed`; the row does not move, except where a COMMIT lands despite the error, so
+read `GET /approvals/executing` before trying again. The move keeps `decided_at` as the claim time.
 An attestation is the operator's word, and nothing checks it. A row interrupted while its owner was
 in fact still running it is recorded when that owner writes its outcome: the outcome write finds
 the row moved and logs it, and the outcome row is written alone. If that outcome write raised
