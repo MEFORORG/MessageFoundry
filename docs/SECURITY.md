@@ -2369,9 +2369,17 @@ the same permission set on the same method reds CI until it is listed here.
 >   `users:manage` holder, the tier `GET /users/{user_id}/channel-scope` reads on. Everyone else
 >   gets null for both and `channel_scope_withheld: true`, so a null there means "not shown". The
 >   console's user list reads that flag and drops both scope columns for such a reader. On the
->   same rule, `GET /audit`, its console page and `GET /audit/export` show such a reader a
->   `user.channel_scope_changed` or `auth.ad_scope_resynced` row with its detail cut to the
->   account's `user_id`, where it has one, and `"channels": "withheld"` (vault BACKLOG #3748).
+>   same rule, `GET /audit`, its console page and `GET /audit/export` narrow, for such a reader,
+>   the detail of the four audit actions a census of the writers on 2026-11-09 found naming a
+>   channel list or who owns a scope: `user.channel_scope_changed` and `auth.ad_scope_resynced`
+>   read as the account's `user_id`, where the row has one, and `"channels": "withheld"`;
+>   `auth.ad_session_revoked` reads `scope_from` and `scope_to` as `"withheld"` and keeps
+>   `scope_changed`; and `user.channel_scope_change_refused` reads `owner`, `read_source`,
+>   `expected_source` and `reason` as `"withheld"` (vault BACKLOG #3748). Each rule is an
+>   allowlist, so a key a later writer adds to one of those four is withheld, but a NEW action
+>   whose detail names a scope is shown whole until it is added to `CHANNEL_LIST_ACTIONS` in
+>   `messagefoundry/auth/audit_visibility.py`. `GET /logs/tail` gives such a reader no audit copies
+>   at all.
 > - `POST /config/reload` refuses a scoped caller 403, a dry run included, because a reload loads
 >   the whole graph and a dry run's reply describes it. So a deployer needs the all-channels grant.
 >   The refusal writes one `auth.channel_denied` row naming no channel. The approval gate refuses

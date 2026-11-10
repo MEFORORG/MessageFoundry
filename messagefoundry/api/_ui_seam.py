@@ -833,12 +833,20 @@ from typing import Any
 #: ``348fe2ce7f78d903`` (to ``4b8f0c19e6301e96`` on its own branch). Merged with main's ``bfae7aa7c6c809e6`` and re-derived with ``--write`` over
 #: both, to ``2a4589213e5e782c``.
 #:
+#: Vault BACKLOG #3748 item 5: the ``AdminHandlers`` projection ``user_summary`` was renamed
+#: ``user_summary_scoped``, because it now withholds the channel scope unless its caller passes the
+#: REQUIRED keyword ``show_scope``. A console built before that calls it without the keyword and
+#: would raise TypeError on the user pages at request time, which the handshake would not catch,
+#: since an ``AdminHandlers`` field is recorded by name only (the #3259 blind spot). The rename is
+#: the deliberate bump: it moves the recorded name, so such a console refuses to mount instead.
+#: Re-derived with ``--write``, from ``2a4589213e5e782c`` to ``4f631135c80e1120``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "2a4589213e5e782c"
+ENGINE_UI_SEAM: str = "4f631135c80e1120"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1001,7 +1009,7 @@ class AdminHandlers:
     my_security_events: Callable[..., Awaitable[Any]]
     # Sync DTO projections (kept engine-side so the console never imports store.UserRecord — the
     # ``user`` arg stays opaque/Any across the seam).
-    user_summary: Callable[..., Any]
+    user_summary_scoped: Callable[..., Any]
     current_user: Callable[..., Any]
     # BACKLOG #1143 (ADR 0184 slice B): one account's stored (issuer, sub) plus the issuer a bind
     # would use, for the federated-identity screen. Takes the store row and the AuthService.

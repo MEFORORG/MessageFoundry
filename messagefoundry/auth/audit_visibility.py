@@ -60,9 +60,9 @@ branch refused, and the answer still goes out on its slot.
 no visible stand-in row: only a holder of the account's session or ticket causes one, and that
 holder's unrefused attempt would differ anyway (``auth.mfa_verified``, ``auth.login_success``).
 
-**One detail is narrowed, not the row** (vault BACKLOG #3748 item 6): the channel lists on a
-scope change, through :func:`audit_detail_for`, on ``GET /audit``, its console page and the CSV
-export.
+**Some details are narrowed, not the row** (vault BACKLOG #3748 item 6): the channel lists and
+scope sources on the rows :data:`CHANNEL_LIST_ACTIONS` names, through :func:`audit_detail_for`, on
+``GET /audit``, its console page and the CSV export.
 
 ``/me/security-events`` is not filtered. It selects rows by the caller's own username, so it shows
 the holder their own lock and never another account's.
@@ -72,6 +72,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Final
 
 from messagefoundry.auth.identity import Identity
@@ -82,9 +85,13 @@ from messagefoundry.store.audit_exclusion import AuditExclusion
 __all__ = [
     "ACCOUNT_LOCKED_ACTION",
     "ADMIN_UNLOCKED_ACTION",
+    "AD_SCOPE_RESYNCED_ACTION",
+    "AD_SESSION_REVOKED_ACTION",
     "AUDIT_WITHHELD_HEADER",
     "CHANNELS_WITHHELD",
     "CHANNEL_LIST_ACTIONS",
+    "CHANNEL_SCOPE_CHANGED_ACTION",
+    "CHANNEL_SCOPE_CHANGE_REFUSED_ACTION",
     "DIRECTORY_LOCKED_REFUSAL_DETAIL",
     "DIRECTORY_LOGIN_LOCKED_ACTION",
     "HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE",
@@ -148,43 +155,89 @@ HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE: Final = AuditExclusion(
 )
 
 
-#: The rows whose detail names an account's channel list (vault BACKLOG #3748 item 6). Every
-#: account's scope goes only to a ``users:manage`` holder, the tier ``GET /users`` shows it to
-#: (BACKLOG #3189), so a reader without it reads these rows with the list withheld. The row itself
-#: stays visible: who changed whose scope, and when, is not the scope.
-CHANNEL_LIST_ACTIONS: Final[frozenset[str]] = frozenset(
-    {"user.channel_scope_changed", "auth.ad_scope_resynced"}
+#: The actions whose rows carry an account's channel scope or who owns it. The writers in
+#: :mod:`messagefoundry.auth.service` use these constants, so the written action and the narrowed
+#: one cannot drift apart.
+CHANNEL_SCOPE_CHANGED_ACTION: Final = "user.channel_scope_changed"
+CHANNEL_SCOPE_CHANGE_REFUSED_ACTION: Final = "user.channel_scope_change_refused"
+AD_SCOPE_RESYNCED_ACTION: Final = "auth.ad_scope_resynced"
+AD_SESSION_REVOKED_ACTION: Final = "auth.ad_session_revoked"
+
+
+@dataclass(frozen=True, slots=True)
+class _Narrowed:
+    """How a reader without ``users:manage`` reads one action's detail. ``shown`` keys keep their
+    value. ``always`` keys read :data:`CHANNELS_WITHHELD` whether or not the row holds them, so
+    the row's shape cannot say what was stored. ``if_present`` keys read it where the row holds
+    them. Every other key is dropped: an allowlist, so a key a later writer adds is withheld until
+    someone decides it holds no scope."""
+
+    shown: tuple[str, ...] = ()
+    always: tuple[str, ...] = ()
+    if_present: tuple[str, ...] = ()
+
+
+#: The rows narrowed for a reader without ``users:manage`` (vault BACKLOG #3748 item 6). Every
+#: account's scope and its source go only to a ``users:manage`` holder, the tier ``GET /users``
+#: shows them to (BACKLOG #3189). The row itself stays visible: who acted on whose scope, and when,
+#: is not the scope. These are the audit actions whose detail names a channel list or a scope's
+#: source, by a census of the writers on 2026-11-09:
+#:
+#: * ``user.channel_scope_changed`` -- the new list in ``channels``.
+#: * ``auth.ad_scope_resynced`` -- the list a sign-in wrote, or the one it withdrew in
+#:   ``withdrawn``. Read as ``channels`` alone, so a withdrawal reads as a set does.
+#: * ``auth.ad_session_revoked`` -- the reconciler's ``scope_from`` and ``scope_to`` on a scope
+#:   delta. ``scope_changed`` stays, so the row still says a scope moved.
+#: * ``user.channel_scope_change_refused`` -- no list, but ``owner``, ``read_source``,
+#:   ``expected_source`` and ``reason`` each say or imply who owns the scope.
+#:
+#: Checked and left whole: at least ``ad_group_scope_map.updated`` (a count), the session-revoke
+#: rows' ``scope`` word (which sessions, not which channels) and ``auth.channel_denied`` (one
+#: channel id the caller itself asked for). The census is not a control: a NEW action whose detail
+#: names a scope is shown whole until it is added here.
+_NARROWED: Final[Mapping[str, _Narrowed]] = MappingProxyType(
+    {
+        CHANNEL_SCOPE_CHANGED_ACTION: _Narrowed(shown=("user_id",), always=("channels",)),
+        AD_SCOPE_RESYNCED_ACTION: _Narrowed(always=("channels",)),
+        AD_SESSION_REVOKED_ACTION: _Narrowed(
+            shown=("reason", "sessions", "roles", "scope_changed"),
+            if_present=("scope_from", "scope_to"),
+        ),
+        CHANNEL_SCOPE_CHANGE_REFUSED_ACTION: _Narrowed(
+            shown=("user_id", "username"),
+            if_present=("reason", "expected_source", "read_source", "owner"),
+        ),
+    }
 )
-#: The detail keys of those rows that are shown as written. An allowlist, so a key a later writer
-#: adds is withheld until someone decides it holds no scope.
-_SHOWN_KEYS: Final = ("user_id",)
-#: What a withheld list reads as. A string, so it cannot be read as a stored ``null``, which
+CHANNEL_LIST_ACTIONS: Final[frozenset[str]] = frozenset(_NARROWED)
+#: What a withheld value reads as. A string, so it cannot be read as a stored ``null``, which
 #: denies, or as a list.
 CHANNELS_WITHHELD: Final = "withheld"
 
 
 def narrows_scope_rows_for(identity: Identity) -> bool:
-    """Whether ``identity`` reads :data:`CHANNEL_LIST_ACTIONS` rows with their lists withheld:
-    every reader without ``users:manage``, the permission ``GET /users`` shows a scope to."""
+    """Whether ``identity`` reads :data:`CHANNEL_LIST_ACTIONS` rows narrowed: every reader
+    without ``users:manage``, the permission ``GET /users`` shows a scope to."""
     return not identity.has(Permission.USERS_MANAGE)
 
 
 def audit_detail_for(identity: Identity, action: str, detail: str | None) -> str | None:
-    """``detail`` as ``identity`` may read it. For a reader :func:`narrows_scope_rows_for`
-    names, a :data:`CHANNEL_LIST_ACTIONS` row reads as its :data:`_SHOWN_KEYS` and ``"channels"``
-    set to :data:`CHANNELS_WITHHELD`, whatever else it held. So every such row has one shape, and a
-    withdrawn scope, which adds a ``withdrawn`` key, cannot be told from a set one. A detail that
-    is not a JSON object, or that does not parse, depth limit included, reads the same way, with no
-    shown keys. Every other row is unchanged."""
-    if action not in CHANNEL_LIST_ACTIONS or detail is None or not narrows_scope_rows_for(identity):
+    """``detail`` as ``identity`` may read it: for a reader :func:`narrows_scope_rows_for`
+    names, a :data:`CHANNEL_LIST_ACTIONS` row reads as its action's :class:`_Narrowed` rule says.
+    A detail that is not a JSON object, or that does not parse, depth limit included, reads as
+    its ``always`` keys alone. Every other row is unchanged."""
+    rule = _NARROWED.get(action)
+    if rule is None or detail is None or not narrows_scope_rows_for(identity):
         return detail
     parsed, _refusal = json_loads_or_refusal(detail)
-    shown = (
-        {key: parsed[key] for key in _SHOWN_KEYS if key in parsed}
-        if isinstance(parsed, dict)
-        else {}
+    stored: dict[str, object] = parsed if isinstance(parsed, dict) else {}
+    return json.dumps(
+        {
+            **{key: stored[key] for key in rule.shown if key in stored},
+            **{key: CHANNELS_WITHHELD for key in rule.if_present if key in stored},
+            **dict.fromkeys(rule.always, CHANNELS_WITHHELD),
+        }
     )
-    return json.dumps({**shown, "channels": CHANNELS_WITHHELD})
 
 
 def audit_exclusion_for(identity: Identity) -> AuditExclusion | None:

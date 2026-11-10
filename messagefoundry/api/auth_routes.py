@@ -2617,7 +2617,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         list_audit=_audit_ui_list,
         export_audit=export_audit,
         my_security_events=my_security_events,
-        user_summary=_console_user_summary,
+        user_summary_scoped=_console_user_summary,
         federated_identity_view=_federated_identity_view,
         current_user=_current_user,
     )
