@@ -520,11 +520,14 @@ def redacted_log_field(
     bounded by :func:`~messagefoundry.controlchars.log_field_token`; or
     :data:`UNREADABLE_LOG_VALUE`, escaped and bounded by ``limit``; or ``unloggable-`` and an
     exception type when a reading or the bound raises, since a log argument must never raise. A
-    ``checks`` pair is read only to compare with, never logged, so its text never reaches the
-    field. The placeholders the passes write are kept as they are, not escaped, so a search for
-    ``<redacted>`` or ``[redacted]`` finds a value they wrote unless the bound cuts it off; a
-    search for redactions also needs :data:`UNREADABLE_LOG_VALUE`, which a limit under 19 cuts,
-    and the ``unloggable-`` spelling.
+    ``checks`` pair is read only to compare with, never logged, so its text never reaches the field.
+    The placeholders the passes write are kept as they are, not escaped, so a search for
+    ``<redacted>`` or ``[redacted]`` finds a value they wrote unless the bound cuts it off; a search
+    for redactions also needs :data:`UNREADABLE_LOG_VALUE`, which a limit under 19 cuts, and the
+    ``unloggable-`` spelling. The reading sees only the context it is given, so a caller passes the
+    line text around the field as ``before`` and ``after``: with the empty defaults, at least an XML
+    element's value, a URL password after ``user:`` and a JSON ``name`` value that the shipped
+    filters redact in the raw line log as escaped text instead (review round-de8e127b).
 
     The reading is the one every later shipped handler leaves, not a fixed number of handler
     passes, so the field hides what the last sink of a logger with any number of handlers would

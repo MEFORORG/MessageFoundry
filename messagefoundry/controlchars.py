@@ -47,8 +47,8 @@ allowlist rather than by the predicate; its bullet below gives the encoding. The
     that output holds no character of the alphabet outside a string. A document with a CR or LF
     between tokens, an indented one for example, does not, because ``\\n`` is not JSON there.
   * QUOTE -- one ``key=value`` field of a log line,
-    :func:`messagefoundry.logging_setup.redacted_log_field`, which redacts first and then escapes
-    with :func:`log_field_token`. ESCAPE keeps a value on one line but leaves its spaces, quotes and
+    :func:`messagefoundry.logging_setup.redacted_log_field`, passing the line text around the field
+    as ``before`` and ``after``. ESCAPE keeps a value on one line but leaves its spaces, quotes and
     ``=`` alone, so a value logged before another field can still write a field of its own. QUOTE
     writes everything but a safe alphabet as ``_uXXXX_`` and wraps the result in quotes, so the
     value holds no space, quote, ``:`` or ``=`` with which to end its field or write another, nor
@@ -344,7 +344,8 @@ def quote_log_text(text: str) -> str:
     NOT FOR ANY TEXT A CONFIGURED HANDLER'S FILTERS READ, WHEREVER IT SITS IN THE LINE. At least the
     credential scrub and the redaction filters can close the token early or erase its closing quote,
     and the text after it then reads as fields of its own (BACKLOG #3770). For a logged field, use
-    :func:`messagefoundry.logging_setup.redacted_log_field`."""
+    :func:`messagefoundry.logging_setup.redacted_log_field`, passing the line text around the field
+    as ``before`` and ``after``."""
     # Imported here, not at the top: the remote-debug guard imports this module before its hook
     # goes in, and json, with re and enum under it, would lengthen that window.
     import json
