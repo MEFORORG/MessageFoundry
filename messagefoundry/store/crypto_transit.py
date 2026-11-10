@@ -102,11 +102,11 @@ _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
 #: Texts Transit's ``hmac`` endpoint answers a refused key VERSION with, lower-cased (BACKLOG #6707).
 #: Read on 2026-11-10 from Vault ``builtin/logical/transit/path_hmac.go`` and
 #: ``sdk/helper/keysutil/policy.go`` (``HMACKey``, ``safeGetKeyEntry``) at commit cbc874e2358f, and
-#: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59. They choose only the label of
-#: the error, never whether the row is a break, and are read only inside an ``errors`` value that is
-#: a list (:func:`_names_no_version_reason`): a list entry holding one is labelled a refused version
+#: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59. They never decide whether
+#: the row is a break, and are read only inside an ``errors`` value that is a list
+#: (:func:`_names_no_version_reason`): a list entry holding one keeps the refused-version label,
 #: even beside a reason in :data:`_NOT_VERSION_TEXTS`. One anywhere else, such as in a bare JSON
-#: list or a string ``errors`` value, is not read, and that reply is labelled unconfirmed.
+#: list or a string ``errors`` value, is not read.
 _VERSION_REFUSAL_TEXTS = (
     "key version does not exist",
     "no such key version",
@@ -114,9 +114,10 @@ _VERSION_REFUSAL_TEXTS = (
     "no hmac key exists for that key version",
 )
 #: Whole Vault error texts, lower-cased, that say a pinned ``hmac`` 400 is NOT about the version
-#: (BACKLOG #6707), from the same Vault source. Matched whole, never as a substring. Kept short on
-#: purpose: :meth:`TransitCipher.audit_hmac` sends base64 it encoded and a fixed algorithm, so at
-#: least the input-encoding and algorithm 400s are not reachable from it.
+#: (BACKLOG #6707), from the same Vault source. Matched whole once stripped and lower-cased, never
+#: as a substring. Kept short on purpose: :meth:`TransitCipher.audit_hmac` sends base64 it encoded
+#: and a fixed algorithm, so at least the input-encoding and algorithm 400s are not reachable from
+#: it.
 _NOT_VERSION_TEXTS = frozenset({"missing input for hmac", "encryption key not found"})
 
 
@@ -125,9 +126,9 @@ def _names_no_version_reason(exc: Exception) -> bool:
     ``errors`` value that is a list is read. With none, this is True whatever the reply says: at
     least a proxy or WAF page, text that is not JSON, a bare JSON list, and a string or object
     ``errors`` value. A list is True only when it is non-empty, every entry is text whose whole
-    value is in :data:`_NOT_VERSION_TEXTS`, and no entry holds a :data:`_VERSION_REFUSAL_TEXTS`
-    text; any other list, an empty one, one with a non-text entry and unknown Vault wording
-    included, is False. A True 400 may still be a refusal of the version, so this chooses only the
+    value, stripped and lower-cased, is in :data:`_NOT_VERSION_TEXTS`, and no entry holds a
+    :data:`_VERSION_REFUSAL_TEXTS` text; any other list, an empty one, one with a non-text entry
+    and unknown Vault wording included, is False. A True 400 may still be a refusal of the version, so this chooses only the
     error's text: :class:`~messagefoundry.store.crypto.AuditKeyVersionUnverifiedError` rather than
     its parent.
 
