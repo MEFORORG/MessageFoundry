@@ -441,7 +441,7 @@ target, no `pickle` import left to mis-suppress:
   > BACKLOG #3135 (ledger ruling R2).
   >
   > - On Linux, a forged answer from a same-UID process that opened the worker's `/proc/<pid>/fd/0`
-  >   and `/proc/<pid>/fd/1`, since the engine reads answers from the worker's stdout.
+  >   or `/proc/<pid>/fd/1`, since the engine reads answers from the worker's stdout.
   > - On Windows, a forged answer from a same-user process that duplicated the worker's pipe handles.
   > - A forged lookup at `mode=isolated`, read after a call's check before its request and ahead of
   >   its answer.
