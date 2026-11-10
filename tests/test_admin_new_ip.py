@@ -55,7 +55,11 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.controlchars import scrub_log_argument
-from messagefoundry.logging_setup import _install_phi_filters, redacted_log_field
+from messagefoundry.logging_setup import (
+    UNREADABLE_LOG_FIELD,
+    _install_phi_filters,
+    redacted_log_field,
+)
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
@@ -315,6 +319,7 @@ _FORGING_PATHS = (
     "/x token=",
     "/x password:",
     "/x/password:",
+    "/api/auth/bearer",
     "/x password='a seen_ip=10.6.6.6 '",
     "/x code=a&state=b seen_ip=10.6.6.6",
     "/x code=SECRETVALUE",
@@ -346,12 +351,13 @@ _FORGING_PATHS = (
 #: #3770). The first two are the review's: ``%20`` read as a label start by the credential scrub,
 #: which took the closing quote and the ``path=`` key, and ``a|b c|d``, which the ``%XX`` escape
 #: joined into one HL7 run that erased ``seen_ip=`` with its value.
-#: A seen address over ``_NEW_IP_TEXT_MAX`` whose bounded text a pass rewrites in main's past-cap
-#: line: at 9dc628aa47 its prefix and its plain digest reached the path field.
+#: A seen text over ``_NEW_IP_TEXT_MAX`` that holds a tab. The shipped handlers leave its bounded
+#: text unchanged; at 9dc628aa47 the extra tab-to-space round rewrote it in the past-cap context,
+#: so its prefix and its plain digest reached the path field.
 _LONG_SEEN = "hunter2\tpw" + "x" * 70
 
-#: Seen texts that do not parse and that a credential or PHI pass rewrites in main's past-cap line,
-#: the last over ``_NEW_IP_TEXT_MAX``.
+#: Seen texts that do not parse: one with a tab, which only that tab round rewrites; a name, which
+#: the PHI pass rewrites; and ``_LONG_SEEN``.
 _HOSTILE_SEEN = ("hunter2\tpw", "DOE JANE hunter2", _LONG_SEEN)
 
 _FORGING_SEEN = (
@@ -376,6 +382,10 @@ _PATHS_FOR_EVERY_SEEN = ("/users", "/a b", "/x/password:", "/x code=SECRETVALUE"
 _PATH_FIELD = r"(?:[A-Za-z0-9./-]|_u[0-9A-F]{4}_|<redacted>|\[redacted\])*(?:_%crc32x[0-9a-f]{8})?"
 
 
+#: The path field's value when it cannot be read apart from its context, unquoted.
+_UNREADABLE = UNREADABLE_LOG_FIELD[1:-1]
+
+
 def _unescaped(text: str) -> str:
     return re.sub(r"_u([0-9A-F]{4})_", lambda m: chr(int(m.group(1), 16)), text)
 
@@ -384,6 +394,8 @@ def _seen_leaks(seen: str, path: str, field: str) -> list[str]:
     """What of ``seen`` the path ``field`` holds that ``path`` does not: a word of three or more
     letters or digits, the ``seen_ip`` key, or a plain SHA-256 prefix of the text. The placeholders
     are the field's own spelling, so their words do not count."""
+    if field == _UNREADABLE:
+        return []
     decoded = _unescaped(field).replace("<redacted>", " ").replace("[redacted]", " ")
     words = set(re.findall(r"[A-Za-z0-9]{3,}", seen)) - set(re.findall(r"[A-Za-z0-9]+", path))
     leaks = [word for word in sorted(words) if word in decoded]
@@ -462,20 +474,27 @@ async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings() -> None
         repeat, over = (_logged_fields(line) for line in lines[2 * i : 2 * i + 2])
         assert [key for key, _ in over] == ["seen_ip", "path"], lines[2 * i + 1]
         assert [key for key, _ in repeat] == ["path"], lines[2 * i]
-        # Both lines spell the path alike, in the escape's alphabet, and the seen address
-        # reaches no part of it.
-        assert repeat[0][1] == over[1][1], (lines[2 * i], lines[2 * i + 1])
-        assert re.fullmatch(_PATH_FIELD, over[1][1]), lines[2 * i + 1]
-        assert not _seen_leaks(seen, path, over[1][1]), lines[2 * i + 1]
-        fields.setdefault(path, set()).add(over[1][1])
+        # The past-cap line logs the repeat line's path field or the unreadable placeholder, in
+        # the escape's alphabet, and the seen address reaches no part of it.
+        assert over[1][1] in (repeat[0][1], _UNREADABLE), (lines[2 * i], lines[2 * i + 1])
+        for field in (repeat[0][1], over[1][1]):
+            assert re.fullmatch(_PATH_FIELD, field) or field == _UNREADABLE, field
+            assert not _seen_leaks(seen, path, field), lines[2 * i + 1]
+            if field != _UNREADABLE:
+                fields.setdefault(path, set()).add(field)
         logged_ip = over[0][1]
         if want is None:
             assert re.fullmatch("unparsed-sha256-[0-9a-f]{16}", logged_ip), lines[2 * i + 1]
         else:
             assert logged_ip.startswith(want), lines[2 * i + 1]
         assert len(over[1][1]) <= _NEW_IP_LOG_FIELD_MAX
-    # The path field does not change with the seen address.
+    # One path has one spelling, whatever the seen address and the line.
     assert all(len(spellings) == 1 for spellings in fields.values()), fields
+    bearer = _FORGING_PATHS.index("/api/auth/bearer")
+    assert [_logged_fields(line)[-1][1] for line in lines[2 * bearer : 2 * bearer + 2]] == [
+        "/api/auth/bearer",
+        "/api/auth/bearer",
+    ]
     assert "SECRETVALUE" not in "\n".join(lines)
     assert "JANE" not in "\n".join(lines)
     plain = _FORGING_PATHS.index("/plain/path-with.dots-and-hyphens")
@@ -486,8 +505,9 @@ async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings() -> None
     # Placeholders keep their spelling, so a search for them finds the line.
     token_line = lines[2 * _FORGING_PATHS.index("/x code=SECRETVALUE") + 1]
     assert _logged_fields(token_line)[1][1] == "/x_u0020_code_u003D_<redacted>"
+    # The HL7 pass takes ``path=`` with the path, so the boundary is unknown.
     hl7_line = lines[2 * _FORGING_PATHS.index("/a|b|c") + 1]
-    assert _logged_fields(hl7_line)[1][1] == "[redacted]"
+    assert _logged_fields(hl7_line)[1][1] == _UNREADABLE
     longest = _FORGING_PATHS.index("/u" + "x" * 5000)
     assert "_%crc32x" in _logged_fields(lines[2 * longest + 1])[1][1]
 
@@ -1407,9 +1427,16 @@ _OVER_HEAD = (
 )
 
 
-#: Seen addresses the baseline reads main's past-cap line with: two addresses, two texts a
-#: credential or PHI pass rewrites, and one over ``_NEW_IP_TEXT_MAX``.
+#: Seen addresses the baseline reads main's past-cap line with: two addresses and
+#: ``_HOSTILE_SEEN``.
 _BASELINE_SEEN = ("10.0.0.1", *_HOSTILE_SEEN, "2001:DB8:0:0:0:0:0:1")
+
+#: A path that opens a quoted credential value and a seen text that closes it: main's past-cap
+#: line hid the rest of the path as that value, which a reading of the path alone does not.
+_QUOTE_CLOSING_SEEN = (
+    ("/x password='hunter2 more words", "x'"),
+    ('/x token="abc def ghi', 'q"'),
+)
 
 
 def _sink_lines(fmt: str, *args: object) -> list[str]:
@@ -1436,16 +1463,16 @@ def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1") -> list[str]:
     """The words of ``path`` that main's last handler hid on one of main's two WARNING lines and
     that a sink of this branch's matching line prints, read with its escapes decoded. Main's lines
     are its own two formats, with the seen address as main logged it."""
-    field = _new_ip_path_field(path)
+    repeat = _new_ip_path_field(path)
+    over = _new_ip_path_field(path, _bounded_address_text(seen))
     main_seen = scrub_log_argument(_bounded_address_text(seen))
     pairs = (
-        (_sink_lines(_REPEAT_HEAD + "%s", path), _sink_lines(_REPEAT_HEAD + "%s", field)),
+        (_sink_lines(_REPEAT_HEAD + "%s", path), _sink_lines(_REPEAT_HEAD + "%s", repeat)),
         (
             _sink_lines(_OVER_HEAD + "path=%s seen_ip=%s", path, main_seen),
-            _sink_lines(_OVER_HEAD + "seen_ip=%s path=%s", _address_log_field(seen), field),
+            _sink_lines(_OVER_HEAD + "seen_ip=%s path=%s", _address_log_field(seen), over),
         ),
     )
-    # The control: every sink wrote the WARNING, not some other line.
     # The control: every sink wrote the WARNING. Its opening words, since main's own line can lose
     # ``path=`` to a run of the path.
     opening = "a request from a new client address must re-verify; the address "
@@ -1456,9 +1483,24 @@ def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1") -> list[str]:
     shown = []
     for main, ours in pairs:
         for word in sorted(words):
-            if word not in main[-1] and any(word in _unescaped(line) for line in ours):
+            if word not in main[-1] and any(word in _unescaped(_path_value(ln)) for ln in ours):
                 shown.append(word)
     return shown
+
+
+def _path_value(line: str) -> str:
+    """The value of a line's ``path`` field. Only that field is read: the seen address field of an
+    unparsed address is a digest under a key drawn per process, and could hold a path word."""
+    match = re.search(r' path="([^"]*)"|: path="([^"]*)"', line)
+    assert match, line
+    return match.group(1) if match.group(1) is not None else match.group(2)
+
+
+@pytest.mark.parametrize(("path", "seen"), _QUOTE_CLOSING_SEEN)
+def test_a_seen_address_that_closes_a_quote_hides_the_path(path: str, seen: str) -> None:
+    """RED when: the past-cap line's path field prints words of the path that main's past-cap line
+    hid only because the seen text after the path closed a quote the path opened (BACKLOG #3770)."""
+    assert not _hides_no_less_than_main(path, seen), (path, seen)
 
 
 @pytest.mark.parametrize("path", _CONTROL_HL7_PATHS)
@@ -1579,15 +1621,21 @@ def test_redact_log_value_follows_the_shipped_filter_chain(
 
 def test_a_rewritten_context_logs_a_placeholder() -> None:
     """RED when: a pass that rewrites the line's fixed context around the value leaves that context
-    in the value, or the two new-address lines log one path differently (BACKLOG #3770).
+    in the value; or a seen text a pass takes into the path is not caught; or an ordinary path
+    after a credential label's word logs as unreadable; or no context raises (BACKLOG #3770).
     ``/x/password:`` before ``seen_ip=`` reads as a label whose value is the next field."""
     from messagefoundry.logging_setup import UNREADABLE_LOG_FIELD, redact_log_value
 
+    assert UNREADABLE_LOG_FIELD not in ('"<redacted>"', '"[redacted]"')
     assert redact_log_value("/x/password:", after=" seen_ip=0.0.0.0") is None
-    after = ((("", " seen_ip=0.0.0.0")),)
-    assert redacted_log_field("/x/password:", 64, contexts=after) == UNREADABLE_LOG_FIELD
-    assert _new_ip_path_field("/x/password:") == UNREADABLE_LOG_FIELD
-    assert _new_ip_path_field("/plain/path") == '"/plain/path"'
+    contexts = (("", " seen_ip=0.0.0.0"),)
+    assert redacted_log_field("/x/password:", 64, contexts=contexts) == UNREADABLE_LOG_FIELD
+    assert redacted_log_field("/a", 64, contexts=()) == '"/a"'
+    assert _new_ip_path_field("/x/password:", "10.0.0.1") == UNREADABLE_LOG_FIELD
+    assert _new_ip_path_field("/x/password:") == '"/x/password_u003A_"'
+    assert _new_ip_path_field("/plain/path", "10.0.0.1") == '"/plain/path"'
+    for seen in (None, "10.0.0.1", "DOE JANE hunter2"):
+        assert _new_ip_path_field("/api/auth/bearer", seen) == '"/api/auth/bearer"', seen
 
 
 def test_a_cut_checksum_is_never_read_as_a_date() -> None:

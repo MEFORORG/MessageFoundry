@@ -421,47 +421,63 @@ def _through_shipped_handlers(text: str, handlers: int) -> str:
     return record.getMessage()
 
 
+def _shipped_reading(line: str) -> str:
+    """``line`` as the second of two shipped handlers writes it, then, when that holds a tab, once
+    more with each tab written as a space: a tab, which the control-character escape keeps, makes
+    the PHI pass read the text as not printable and skip it (BACKLOG #3770)."""
+    out = _through_shipped_handlers(line, 2)
+    if "\t" in out:
+        out = _through_shipped_handlers(out.replace("\t", " "), 1)
+    return out
+
+
 def redact_log_value(text: str, *, before: str = "", after: str = "") -> str | None:
-    """``text`` as the second of two shipped handlers would write it, read in the line
-    ``before`` + ``text`` + ``after``, or ``None`` when that line's context did not survive
-    (BACKLOG #3770).
+    """``text`` as :func:`_shipped_reading` reads it in the line ``before`` + ``text`` +
+    ``after``, or ``None`` when that line's context did not survive (BACKLOG #3770).
 
     The field's own escape hides its text from every handler, so this value is meant to carry what
-    main's handlers would have hidden. The filters are the ones :func:`_install_phi_filters`
-    installs, not a copy, and the context is kept because some passes read past a value. When the
-    result holds a tab, it runs once more with each tab written as a space: a tab, which the
-    control-character escape keeps, makes the PHI pass read the text as not printable and skip it.
+    the handlers would have hidden in that line. The filters are the ones
+    :func:`_install_phi_filters` installs, not a copy, and the context is kept because some passes
+    read past a value.
 
     The value is what lies between ``before`` and ``after``, each found exactly at its end of the
     result. When a pass rewrote either, the boundary is unknown, so this returns ``None`` rather
     than a value that may carry the context's text; a caller logs a fixed placeholder then. A
     control logs as its escape spelling and a tab as a space, so the value no longer tells either
     from that text."""
-    line = before + text + after
-    out = _through_shipped_handlers(line, 2)
-    if "\t" in out:
-        out = _through_shipped_handlers(out.replace("\t", " "), 1)
+    out = _shipped_reading(before + text + after)
     if len(out) < len(before) + len(after) or not (out.startswith(before) and out.endswith(after)):
         return None
     return out[len(before) : len(out) - len(after)]
 
 
 #: The field :func:`redacted_log_field` logs when its value cannot be read apart from its context.
-UNREADABLE_LOG_FIELD = f'"{PHI_PLACEHOLDER}"'
+#: Spelled apart from the two placeholders, so it does not read as a credential or PHI redaction,
+#: and only from characters the escape keeps, so no filter rewrites it.
+UNREADABLE_LOG_FIELD = '"unreadable-redacted"'
 
 
 def redacted_log_field(
-    text: str, limit: int, *, contexts: tuple[tuple[str, str], ...] = (("", ""),)
+    text: str,
+    limit: int,
+    *,
+    contexts: tuple[tuple[str, str], ...] = (),
+    checks: tuple[tuple[str, str], ...] = (),
 ) -> str:
     """``text`` as one ``key="value"`` field value of a log line: redacted by
-    :func:`redact_log_value` in each ``(before, after)`` of ``contexts``, then escaped and bounded
-    by :func:`~messagefoundry.controlchars.log_field_token` (BACKLOG #3770). When a pass rewrote a
-    context, or two contexts read the text differently, it is :data:`UNREADABLE_LOG_FIELD`, so one
-    field serves every line the caller names.
+    :func:`redact_log_value` in each ``(before, after)`` of ``contexts``, or with no context when
+    there is none, then escaped and bounded by
+    :func:`~messagefoundry.controlchars.log_field_token` (BACKLOG #3770).
+
+    It is :data:`UNREADABLE_LOG_FIELD` when a pass rewrote a context, when two contexts read the
+    text differently, or when a ``(before, after)`` of ``checks`` does not read as ``before``, the
+    value and the first character of ``after``. A check is read only to compare, never logged, so
+    its ``after`` may be caller text: it is the line the value stood in, whose text a pass can
+    take into a value of ``text``. Readings stop at the first that fails.
 
     The escape hides most of what the handler filters anchor on, so they read less inside the
     field than in raw text; redacting first, in each line the caller names, is meant to hide what
-    the handlers would have hidden there. Each context reads the raw text: a second reading of an
+    the handlers would have hidden there. Each reading is of the raw text: a second reading of an
     already redacted value can miss what the same reading of the raw text hid. The placeholders
     the passes write are kept as they are, not escaped, so a search for ``<redacted>`` or
     ``[redacted]`` still finds the line. The filters still run on the whole line afterwards and
@@ -470,12 +486,16 @@ def redacted_log_field(
     A log argument must never raise, as in :class:`RedactionFilter`: a failing pass gives a fixed
     placeholder rather than the value."""
     try:
-        readings = {
-            redact_log_value(text, before=before, after=after) for before, after in contexts
-        }
-        value = readings.pop()
-        if value is None or readings:
+        (first_before, first_after), *rest = contexts or (("", ""),)
+        value = redact_log_value(text, before=first_before, after=first_after)
+        if value is None:
             return UNREADABLE_LOG_FIELD
+        for before, after in rest:
+            if redact_log_value(text, before=before, after=after) != value:
+                return UNREADABLE_LOG_FIELD
+        for before, after in checks:
+            if not _shipped_reading(before + text + after).startswith(before + value + after[:1]):
+                return UNREADABLE_LOG_FIELD
         return log_field_token(value, limit, literals=(CREDENTIAL_PLACEHOLDER, PHI_PLACEHOLDER))
     except Exception as exc:  # noqa: BLE001 -- a log argument must never raise
         name = type(exc).__name__
