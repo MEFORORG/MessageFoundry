@@ -184,7 +184,7 @@ at ingress. The third runs in a Router or Handler. The HL7 conventions for engin
 expects:
 
 - a body that opens with an `MSH` segment, after any leading whitespace;
-- a first line of at least 5 characters, long enough to read its encoding characters;
+- a first line of at least 5 characters;
 - a size and a segment count inside the caps `enforce_size_limits` applies;
 - escape sequences that cannot expand past the budget `enforce_expansion_budget` applies.
 
