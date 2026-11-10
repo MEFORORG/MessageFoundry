@@ -148,8 +148,20 @@ class FieldRule:
 # MRG fields are scrubbed with the SAME kinds as their PID counterparts (MRG-1 with PID-3, MRG-4
 # with PID-5) and keyed on the same value, so an A40 merge's old-to-new linkage is preserved across
 # the surrogate mapping.
+#
+# BACKLOG #5533 mapped the identifier, name, location and contact fields that were still unmapped
+# inside segments this map already scrubs: PID-2/21/23, NK1-13/30/31/32/33/37, GT1-2 and
+# PV1-6/11/42/43. The coded fields of those segments stay unmapped ON PURPOSE, because a table code
+# names no one and tests route on it: PID-8 sex, PID-10 race, PID-15 language, PID-16 marital
+# status, PID-17 religion, PID-22 ethnic group, PID-24/25 multiple birth, PID-26 citizenship,
+# PID-27 veteran status, PID-28 nationality, PID-30 death indicator, NK1-3 relationship, NK1-14/15
+# marital status and sex, and PV1-2/4/10 patient class, admission type and hospital service. Any
+# other field of these segments that is neither listed here nor mapped below, such as NK1-12
+# employee number, NK1-26 mother's maiden name or GT1-19 guarantor employee id, has no rule yet:
+# only the coverage report names it, and require_full_coverage refuses it.
 DEFAULT_RULES: tuple[FieldRule, ...] = (
     # PID — patient identity
+    FieldRule("PID-2", SurrogateKind.MRN),  # patient id (external), a CX like PID-3
     FieldRule("PID-3", SurrogateKind.MRN),
     FieldRule("PID-4", SurrogateKind.ID),
     FieldRule("PID-5", SurrogateKind.NAME),
@@ -165,6 +177,8 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("PID-18", SurrogateKind.ID),
     FieldRule("PID-19", SurrogateKind.SSN),
     FieldRule("PID-20", SurrogateKind.ID),
+    FieldRule("PID-21", SurrogateKind.MRN),  # mother's identifier, a CX
+    FieldRule("PID-23", SurrogateKind.FREETEXT),  # birth place, free text that names a place
     FieldRule("PID-29", SurrogateKind.DATE),  # death date/time
     # MRG — merge (A40); keep linkage to the PID kinds above
     FieldRule("MRG-1", SurrogateKind.MRN),
@@ -177,8 +191,15 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("NK1-5", SurrogateKind.PHONE),
     FieldRule("NK1-6", SurrogateKind.PHONE),
     FieldRule("NK1-7", SurrogateKind.PHONE),
+    FieldRule("NK1-13", SurrogateKind.NAME),  # organization name, an XON, as IN1-11
     FieldRule("NK1-16", SurrogateKind.DOB),  # contact's date of birth
+    FieldRule("NK1-30", SurrogateKind.NAME),  # contact person's name
+    FieldRule("NK1-31", SurrogateKind.PHONE),  # contact person's telephone
+    FieldRule("NK1-32", SurrogateKind.ADDRESS),  # contact person's address
+    FieldRule("NK1-33", SurrogateKind.ID),  # next of kin's identifiers, a CX
+    FieldRule("NK1-37", SurrogateKind.SSN),  # contact person's social security number
     # GT1 — guarantor
+    FieldRule("GT1-2", SurrogateKind.ID),  # guarantor number, a CX
     FieldRule("GT1-3", SurrogateKind.NAME),
     FieldRule("GT1-5", SurrogateKind.ADDRESS),
     FieldRule("GT1-6", SurrogateKind.PHONE),
@@ -207,11 +228,15 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("EVN-6", SurrogateKind.DATE),
     # PV1/PD1 — visit + providers
     FieldRule("PV1-3", SurrogateKind.FREETEXT),  # assigned location, see PID-12
+    FieldRule("PV1-6", SurrogateKind.FREETEXT),  # prior patient location, a PL like PV1-3
     FieldRule("PV1-7", SurrogateKind.PROVIDER),
     FieldRule("PV1-8", SurrogateKind.PROVIDER),
     FieldRule("PV1-9", SurrogateKind.PROVIDER),
+    FieldRule("PV1-11", SurrogateKind.FREETEXT),  # temporary location, a PL
     FieldRule("PV1-17", SurrogateKind.PROVIDER),
     FieldRule("PV1-19", SurrogateKind.ID),
+    FieldRule("PV1-42", SurrogateKind.FREETEXT),  # pending location, a PL
+    FieldRule("PV1-43", SurrogateKind.FREETEXT),  # prior temporary location, a PL
     FieldRule("PV1-44", SurrogateKind.DATE),  # admit date/time
     FieldRule("PV1-45", SurrogateKind.DATE),  # discharge date/time
     FieldRule("PD1-4", SurrogateKind.PROVIDER),

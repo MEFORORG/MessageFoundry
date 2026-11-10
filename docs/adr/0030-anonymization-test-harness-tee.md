@@ -112,6 +112,14 @@
   > ratified, until that sign-off is recorded in this bullet. This builds nothing either way: the
   > package is still at `messagefoundry/anon/`, and every path in this ADR describes the tree until
   > ADR 0201 slice 6 moves it."*
+- **AMENDED 2026-11-10 (BACKLOG #5533): fourteen more default rules, inside segments the map
+  already scrubbed.** The default map adds `PID-2` and `PID-21` as `MRN`, `PID-23` (birth place) as
+  `FREETEXT`, `NK1-13` and `NK1-30` as `NAME`, `NK1-31` as `PHONE`, `NK1-32` as `ADDRESS`, `NK1-33`
+  and `GT1-2` as `ID`, `NK1-37` as `SSN`, and the prior, temporary, pending and prior temporary
+  locations `PV1-6`, `PV1-11`, `PV1-42` and `PV1-43` as `FREETEXT`, like `PV1-3`. **This adds to
+  the §3 field list and changes none of its ratified choices:** the coded fields of those segments
+  stay `KEEP` by omission, and `rules.py` names them with the reason. A field of those segments
+  that is neither mapped nor named there still has no rule; the coverage report names it.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
@@ -289,7 +297,9 @@ merge linkage survives. **MSH-7/9/10/12 are `KEEP`** so tee correlation + parity
 routing/validation realism survive, and the coded clinical segments (DG1/AL1/PR1) are `KEEP`.
 *(AMENDED 2026-09-28, #2248: the event, visit, order and observation dates plus `PID-12` and `PV1-3`
 were added to this list; see the status banner. AMENDED 2026-10-05, #2330: eight more date fields
-were added, `PR1-5` among them, and the PR1 codes are still `KEEP`.)*
+were added, `PR1-5` among them, and the PR1 codes are still `KEEP`. AMENDED 2026-11-10, #5533:
+`PID-2/21/23`, `NK1-13/30/31/32/33/37`, `GT1-2` and `PV1-6/11/42/43` were added; see the status
+banner.)*
 
 **Free-text default = full redaction.** `OBX-5` and `NTE-3` carry narrative that *commonly embeds
 identifiers* (name/MRN/DOB/phone) which field-level surrogation cannot reach, and the leak-check (§5) only

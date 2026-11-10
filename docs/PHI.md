@@ -2429,8 +2429,8 @@ known; it does not prove there are no others.
 
 **Everything else in a field no rule maps passes.** That includes a name, a date, an undashed SSN,
 a bare ten-digit phone number, an account number and a free-text note. A Z-segment is the common
-case, since no default rule names one. A name in `PV1-11`, the temporary location, passes the same
-way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
+case, since no default rule names one. A name in a standard field no rule maps, such as `NK1-26`,
+the next of kin's mother's maiden name, passes the same way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
 
 **A shape cut across fields by the message's own field separator is refused, but not in every
 form.** Under a field separator of `-`, the line `ZZZ-1-123-45-6789` holds the number as three
@@ -2607,6 +2607,8 @@ and fills the rest of the value at the same width. BACKLOG #2248 added it.
 | `GT1-8`, `IN1-18`, `NK1-16` | Dates of birth of the guarantor, the insured and a contact | `dob`, a fabricated date, like `PID-7`. A time after the eight date digits keeps its width as zeros, and an offset becomes `+0000` (vault BACKLOG #2767). Anything else after them is dropped |
 | `PID-12` | County code | `freetext`, the whole field becomes `[REDACTED]` |
 | `PV1-3` | Assigned patient location | `freetext`, the whole field becomes `[REDACTED]` |
+| `PV1-6`, `PV1-11`, `PV1-42`, `PV1-43` | Prior, temporary, pending and prior temporary patient locations (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]` |
+| `PID-23` | Birth place (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]` |
 
 What the `date` kind does to a value:
 
@@ -2767,8 +2769,8 @@ after the store read, so a run on an empty store prints neither.
 came from `messagefoundry-toolkit generate --count 2 --seed 1710`, run for every type: 186 messages. With
 the switch on, all 186 refused. Mapping the dates and locations above did not change that count.
 It removed 6 of the 72 undecided field addresses, and 553 of the 2,115 undecided fields across the
-corpus. These counts predate the rules BACKLOG #2330 and #2645 added, and nobody has measured them
-again. Every message still carries at least one coded field that needs a rule or a `keep`:
+corpus. These counts predate the rules BACKLOG #2330, #2645 and #5533 added, and nobody has
+measured them again. Every message still carries at least one coded field that needs a rule or a `keep`:
 
 | Undecided field | Messages |
 | --- | --- |
