@@ -114,7 +114,9 @@ _AI_HOP_CELL = "[ai] engine AI broker (verified TLS, no revocation check)"
 #: ``create_app``, setting it would change nothing. No connection's attestation is offered either:
 #: the endpoint is not a connection. Naming either would be a remedy the operator cannot perform.
 _AI_CRL_LEVER = (
-    "Set [tls].crl_file to a CRL file that covers the issuer of the AI endpoint's certificate, or "
+    "Set [tls].crl_file to a CRL file that covers the issuer of the AI endpoint's certificate (it "
+    "is instance-wide: every non-loopback hop it reaches then needs its issuer's CRL in that file, "
+    "or its handshake fails), or "
 )
 _AI_ATTESTATION_LEVER = (
     "set [ai].endpoint_revocation_attested = true with an "
@@ -177,7 +179,9 @@ def _endpoint_opener(
     endpoint: str, policy: TrustAnchorPolicy | None
 ) -> urllib.request.OpenerDirector:
     """The opener the broker dials ``endpoint`` through, under the instance ``[tls]`` ``policy``
-    (BACKLOG #5527). ``None`` is the empty policy.
+    (BACKLOG #5527). ``None``, no policy reached the broker, resolves as the empty policy does:
+    the OS trust store and no CRL. The two differ only in the refusal's text, which offers
+    ``[tls].crl_file`` only where a policy reached the broker (``crl_reachable``).
 
     The anchor is resolved by ``rest.http_family_trust_anchor``, as for every HTTP-family hop, here
     with no ``tls_ca_file`` of its own: ``[tls].internal_ca_file`` under ``augment`` or ``pinned``,
@@ -200,7 +204,12 @@ def _endpoint_opener(
     )
     if not anchor.narrows:
         return _shared_no_redirect_opener()
+    # Read without the lock first, as the shared opener's getter does: a hit, every request after
+    # the first, takes no lock. The tuple is replaced whole, never mutated.
     global _anchored_opener
+    held = _anchored_opener
+    if held is not None and held[0] == anchor:
+        return held[1]
     with _anchored_opener_lock:
         held = _anchored_opener
         if held is not None and held[0] == anchor:
@@ -580,8 +589,8 @@ def ai_broker_from_settings(
     enforcing there: :func:`_refuse_an_unrevoked_ai_hop` says why. It no longer reaches the
     cleartext-http refusal, which takes no escape in any posture since vault BACKLOG #3533 item 5.
 
-    ``trust_anchor_policy`` is the instance ``[tls]`` policy (BACKLOG #5527), and ``None`` is the
-    empty policy: the OS trust store and no CRL. :func:`_endpoint_opener` says what it reaches."""
+    ``trust_anchor_policy`` is the instance ``[tls]`` policy (BACKLOG #5527), or ``None`` where
+    none reached the caller. :func:`_endpoint_opener` says what each reaches."""
     return AiBroker(
         endpoint=ai.endpoint or "",
         api_key=ai.api_key or "",

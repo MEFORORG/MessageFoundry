@@ -28,7 +28,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from messagefoundry.api import create_app
-from messagefoundry.config import tls_policy
+from messagefoundry.config import loaded_crls, tls_policy
 from messagefoundry.config.ai_policy import AiMode
 from messagefoundry.config.settings import (
     AiSettings,
@@ -54,6 +54,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.transports import ai_broker as ai_broker_mod
+from messagefoundry.transports import rest
 from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.rest import _shared_no_redirect_opener, opener_tls_context
 from tests.test_revocation_guard_remaining_hops import _guard_log
@@ -74,7 +75,8 @@ def _fresh_crossings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     # raising=False only so this file fails on its assertions, not in setup, where the set is
     # absent; the once-per-process tests below go red if it is renamed.
     monkeypatch.setattr(ai_broker_mod, "_LOGGED_CROSSINGS", set(), raising=False)
-    monkeypatch.setattr(ai_broker_mod, "_anchored_opener", None, raising=False)
+    # raising=True: a renamed slot must fail here, or held openers would leak across tests.
+    monkeypatch.setattr(ai_broker_mod, "_anchored_opener", None, raising=True)
     monkeypatch.delenv(TLS_REVOCATION_ATTESTED_ENV, raising=False)
     yield
 
@@ -632,6 +634,7 @@ def test_a_broker_handed_a_tls_policy_offers_the_crl_lever(ai_log: list[str]) ->
         _broker(posture=_ENFORCING, policy=TrustAnchorPolicy())
     message = str(info.value)
     assert "Set [tls].crl_file" in message
+    assert "instance-wide" in message  # the CRL reaches every other hop too
     assert _PAIR in message
     _broker(posture=_WARN, policy=TrustAnchorPolicy())
     assert len(ai_log) == 1
@@ -647,6 +650,14 @@ def test_the_anchored_opener_is_held_across_requests(pki: _Pki) -> None:
     first = _broker(posture=_ENFORCING, policy=crl)
     second = _broker(posture=_ENFORCING, policy=crl)
     assert second._opener is first._opener
+    # Held, the context is recorded as a live copy of the CRL, which is what the expiry monitor
+    # judges and crl_reload brings current.
+    held = _context(first)
+    assert any(ctx is held for ctx, _ in loaded_crls.held_contexts())
+    # ADR 0135 AC-7: the anchored opener refuses redirects as the shared one does.
+    # `handlers` is set in OpenerDirector.__init__ but absent from typeshed's stub.
+    handlers = vars(first._opener)["handlers"]
+    assert any(isinstance(h, rest._NoRedirectHandler) for h in handlers)
     pinned = TrustAnchorPolicy(internal_ca_file=pki.ca_file, mode="pinned", crl_file=pki.crl_file)
     third = _broker(posture=_ENFORCING, policy=pinned)
     assert third._opener is not first._opener
