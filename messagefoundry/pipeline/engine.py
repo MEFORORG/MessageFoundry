@@ -118,6 +118,7 @@ from messagefoundry.pipeline.wiring_runner import (
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.crypto import Cipher
+from messagefoundry.store.gcm_bound import SETTLE_WAIT_SECONDS
 from messagefoundry.store.store import (
     AUDIT_PREFIX_BREAK_MARKER,
     REINGRESS_TARGET_PREFIX,
@@ -177,15 +178,20 @@ _GRAPH_SUPERVISOR_STOP_SECONDS = 10.0
 
 #: The background runners' step's floor in :meth:`Engine._stop_steps`.
 _BACKGROUND_RUNNERS_FLOOR = 0.2
-#: The store's close step's floor: the close itself, plus the longest that step can wait for the
-#: audit row of a convergence reload the runners' step was cut beside. That row's wait began when
-#: the runners' step did, and a step is cut no sooner than its floor plus the cut grace, so that much
-#: of the wait is already spent (BACKLOG #3191).
-_STORE_CLOSE_FLOOR = 0.5 + max(
-    0.0,
-    ROW_CANCEL_WAIT_SECONDS
-    + ROW_UNWIND_MARGIN_SECONDS
-    - (_BACKGROUND_RUNNERS_FLOOR + CUT_GRACE_SECONDS),
+#: The store's close step's floor: the close itself, its wait to settle the AES-GCM bound
+#: (``SETTLE_WAIT_SECONDS``), plus the longest that step can wait for the audit row of a convergence
+#: reload the runners' step was cut beside. That row's wait began when the runners' step did, and a
+#: step is cut no sooner than its floor plus the cut grace, so that much of the wait is already
+#: spent (BACKLOG #3191).
+_STORE_CLOSE_FLOOR = (
+    0.5
+    + SETTLE_WAIT_SECONDS
+    + max(
+        0.0,
+        ROW_CANCEL_WAIT_SECONDS
+        + ROW_UNWIND_MARGIN_SECONDS
+        - (_BACKGROUND_RUNNERS_FLOOR + CUT_GRACE_SECONDS),
+    )
 )
 
 

@@ -10241,7 +10241,6 @@ class MessageStore:
                     raise
                 # A store closed earlier on this cipher left its bound closed (BACKLOG #3191).
                 reopen_invocation_bound(cipher)
-                store._bound_opened = True
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
@@ -10267,6 +10266,10 @@ class MessageStore:
             await store._open_read_pool(str(path))  # dedicated read-only WAL pool (lockfree-reads)
             if store._group_commit is not None:
                 store._group_commit.start()  # spin the committer coroutine (needs the running loop)
+            # Only an open that finished settles at its close: a failed one's cleanup close must not
+            # close the bound of another handle serving on the same cipher (BACKLOG #3191). Its
+            # reservation is then forfeited, an over-count.
+            store._bound_opened = not read_only
             return store
         except BaseException:
             # Close the store when one was constructed — it owns the read pool's connections too,

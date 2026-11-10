@@ -128,8 +128,8 @@ class _InFlight:
         if self.count == 0:
             waiters, self.waiters = self.waiters, []
             for waiter in waiters:
-                if not waiter.done():
-                    waiter.set_result(None)
+                # Through the waiter's own loop, which may run on another thread.
+                waiter.get_loop().call_soon_threadsafe(_wake, waiter)
 
     async def idle(self, timeout: float) -> bool:
         """Wait until nothing is under way, for at most ``timeout``; whether it got there."""
@@ -141,16 +141,29 @@ class _InFlight:
                 return False
             waiter = loop.create_future()
             self.waiters.append(waiter)
-            await asyncio.wait({waiter}, timeout=left)
+            try:
+                await asyncio.wait({waiter}, timeout=left)
+            finally:
+                if not waiter.done():
+                    waiter.cancel()
+                    if waiter in self.waiters:
+                        self.waiters.remove(waiter)
         return True
+
+
+def _wake(waiter: asyncio.Future[None]) -> None:
+    if not waiter.done():
+        waiter.set_result(None)
 
 
 _IN_FLIGHT: weakref.WeakKeyDictionary[AesGcmCipher, _InFlight] = weakref.WeakKeyDictionary()
 
-#: How long the close waits for reservations under way before it settles without them. One that
-#: lands after the settlement is a block persisted but never spent: an over-count, the direction the
-#: bound may drift in. Bounded because the close runs as a step engine.stop() never cuts.
-_SETTLE_WAIT_SECONDS = 1.0
+#: The longest the close waits, for reservations under way and for the store's ``hold``, before it
+#: closes the bound without them. A reservation that lands after the settlement is a block persisted
+#: but never spent, an over-count. Bounded because the close runs as a step engine.stop() never
+#: cuts, whose floor counts this wait (``pipeline/engine.py`` ``_STORE_CLOSE_FLOOR``). A reservation
+#: or a queued write takes milliseconds; one that takes longer is stuck, as behind a cut graph.
+SETTLE_WAIT_SECONDS = 0.1
 
 
 def _in_flight(bound: AesGcmCipher) -> _InFlight:
@@ -248,48 +261,71 @@ async def settle_at_close(
 ) -> int | None:
     """The store's close: settle the bound exactly and close it, in one step (BACKLOG #3191).
 
-    It waits, for up to :data:`_SETTLE_WAIT_SECONDS`, until no reservation or settlement is under
-    way on this cipher, then enters ``hold`` and checks again, so none lands outside the figure; a
-    store with a writer lock passes it as ``hold``, so writers queued ahead of the close finish, and
-    are counted, first. Then :meth:`AesGcmCipher.close_invocation_bound` reads the settlement and
-    closes the bound under one hold of the cipher's counter lock, so the cipher raises
+    It waits until no reservation or settlement is under way on this cipher, then enters ``hold``
+    and checks again, so none lands outside the figure; a store with a writer lock passes it as
+    ``hold``, so writers queued ahead of the close finish, and are counted, first. Then
+    :meth:`AesGcmCipher.close_invocation_bound` reads the settlement and closes the bound under one
+    hold of the cipher's counter lock, so the cipher raises
     :class:`~messagefoundry.store.crypto.CipherError` on every later encrypt rather than seal a value
-    the persisted total leaves out. A bound already closed, by a close that overlaps this one, is
-    left to that close. Same failure contract as :func:`checkpoint_invocations`: a settlement the DB
-    refuses is logged, and the bound stays closed. ``add`` runs inside ``hold``. Returns the
-    cumulative total, or ``None`` when the cipher carries no bound."""
+    the persisted total leaves out. The settlement counts itself as under way, so an overlapping
+    close waits for it and then finds nothing to correct, or retries one the DB refused.
+
+    Both waits share :data:`SETTLE_WAIT_SECONDS`. Past it, or when ``hold`` cannot be entered, the
+    bound is closed without a settlement and that is logged: the persisted total keeps this
+    handle's reservation, an over-count unless the reserve was overspent. A settlement the DB refuses
+    is logged too, and the bound stays closed. ``add`` runs inside ``hold``. Returns the cumulative
+    total, or ``None`` when the cipher carries no bound."""
     bound = bounded_cipher(cipher)
     if bound is None:
         return None
     if not bound.invocation_bound_enabled:
         bound.enable_invocation_bound()
     entry = _in_flight(bound)
+    if bound.invocation_bound_closed and not entry.count and not bound.invocation_settlement():
+        return bound.cumulative_invocations()  # an earlier close settled it
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + _SETTLE_WAIT_SECONDS
-    while True:
-        settled = await entry.idle(max(0.0, deadline - loop.time()))
-        async with hold() if hold is not None else contextlib.nullcontext():
-            # A reservation that began while this waited for ``hold`` is queued behind it, so
-            # release and wait again, unless the wait has run out.
-            if entry.count and loop.time() < deadline:
-                continue
-            if not settled or entry.count:
-                log.warning(
-                    "an AES-GCM invocation reservation was still under way at close; settling "
-                    "without it, so a block it persists later is an over-count"
-                )
-            if bound.invocation_bound_closed:
+    deadline = loop.time() + SETTLE_WAIT_SECONDS
+    try:
+        while True:
+            await entry.idle(max(0.0, deadline - loop.time()))
+            async with contextlib.AsyncExitStack() as stack:
+                if hold is not None:
+                    try:
+                        async with asyncio.timeout_at(deadline):
+                            await stack.enter_async_context(hold())
+                    except TimeoutError:
+                        bound.close_invocation_bound()
+                        log.error(
+                            "the AES-GCM invocation bound was closed unsettled: the store's "
+                            "writer stayed busy past %.2fs at close, so the persisted total keeps "
+                            "this handle's reservation",
+                            SETTLE_WAIT_SECONDS,
+                        )
+                        return bound.cumulative_invocations()
+                # A reservation that began while this waited for ``hold`` is queued behind it, so
+                # release and wait again, unless the wait has run out.
+                if entry.count and loop.time() < deadline:
+                    continue
+                if entry.count:
+                    log.warning(
+                        "an AES-GCM invocation reservation was still under way at close; settling "
+                        "without it, so a block it persists later is an over-count"
+                    )
+                with _counted(bound):
+                    need = bound.close_invocation_bound()
+                    if need:
+                        await _apply(
+                            bound,
+                            need,
+                            add,
+                            "could not settle the AES-GCM invocation bound at close; the bound is "
+                            "closed, so the cipher encrypts nothing more under its key",
+                        )
                 return bound.cumulative_invocations()
-            need = bound.close_invocation_bound()
-            if need:
-                await _apply(
-                    bound,
-                    need,
-                    add,
-                    "could not settle the AES-GCM invocation bound at close; the bound is closed, "
-                    "so the cipher encrypts nothing more under its key",
-                )
-            return bound.cumulative_invocations()
+    finally:
+        # Whatever ended the wait, entering ``hold`` raising included, the bound ends closed.
+        if not bound.invocation_bound_closed:
+            bound.close_invocation_bound()
 
 
 def reopen_invocation_bound(cipher: Cipher | None) -> None:

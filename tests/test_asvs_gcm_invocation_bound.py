@@ -26,6 +26,7 @@ import asyncio
 import base64
 import inspect
 import io
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -656,17 +657,34 @@ async def test_a_writer_queued_ahead_of_the_close_lands_and_is_counted(tmp_path:
     db = tmp_path / "queued.db"
     store, cipher = await _keyed_store(db)
     await store._lock.acquire()
+    write = asyncio.ensure_future(store.enqueue_ingress(channel_id="c", raw=_MSG.format(i=1)))
+    close: asyncio.Future[None] | None = None
     try:
-        write = asyncio.ensure_future(store.enqueue_ingress(channel_id="c", raw=_MSG.format(i=1)))
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.02)
         close = asyncio.ensure_future(store.close())
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.02)
         assert not write.done() and not close.done(), "the control: both wait on the lock"
     finally:
         store._lock.release()
-    await asyncio.wait_for(write, 10)
-    await asyncio.wait_for(close, 10)
+        await asyncio.wait_for(write, 10)
+        await asyncio.wait_for(close if close is not None else store.close(), 10)
     assert await _persisted(db, cipher.invocation_key_id) == cipher._invocations
+
+
+async def test_a_writer_lock_held_past_the_wait_closes_the_bound_unsettled(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The close runs as a step engine.stop() never cuts, so its wait for the writer lock is
+    bounded: past it the bound is closed without a settlement, logged, and the close goes on."""
+    store, cipher = await _keyed_store(tmp_path / "busy.db")
+    await store._lock.acquire()
+    try:
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.store.gcm_bound"):
+            await asyncio.wait_for(store.close(), 10)
+    finally:
+        store._lock.release()
+    assert cipher.invocation_bound_closed
+    assert any("closed unsettled" in r.getMessage() for r in caplog.records)
 
 
 async def test_a_failed_open_leaves_a_live_handle_s_bound_open(

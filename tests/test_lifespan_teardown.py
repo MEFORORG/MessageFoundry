@@ -307,7 +307,7 @@ def test_the_shutdown_budget_fits_the_nssm_stop_window() -> None:
     assert [step.label for step in engine_steps if not step.bounded] == ["the store's close"]
     engine_worst = sum(step.floor for step in engine_steps)
     engine_worst += sum(step.bounded for step in engine_steps) * grace
-    assert engine_worst <= app_module._ENGINE_STOP_RESERVE_SECONDS, engine_worst
+    assert engine_worst <= app_module._ENGINE_STOP_RESERVE_SECONDS + 1e-9, engine_worst
 
     app_steps = _every_managed_step(harness=False)
     floors = sum(step.floor for step in app_steps)

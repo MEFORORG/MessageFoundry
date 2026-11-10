@@ -1310,7 +1310,7 @@ _SHUTDOWN_BUDGET_SECONDS: Final = 10.0
 #: from here: it ends in store.close(), and a store left open keeps a non-daemon worker thread alive,
 #: which is the hang BACKLOG #2087 fixed. It must cover engine.stop()'s own floors and cut graces,
 #: which tests/test_lifespan_teardown.py checks against the real steps.
-_ENGINE_STOP_RESERVE_SECONDS: Final = 3.7
+_ENGINE_STOP_RESERVE_SECONDS: Final = 3.8
 #: The part of the long-operations drain's share it spends waiting before it cancels, the rest being
 #: the grace for the rollback arms. A policy, not derived from the drain's defaults (vault BACKLOG
 #: #3740 item 17): their ratio, 0.5 s to 6 s, would leave the wait about 0.2 s under the shipped
