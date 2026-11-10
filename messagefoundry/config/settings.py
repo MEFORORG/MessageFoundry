@@ -65,7 +65,7 @@ from pydantic import (
 )
 
 from messagefoundry.api_tls_source import api_tls_source
-from messagefoundry.childenv import outside_engine_namespace
+from messagefoundry.childenv import pass_environment_refusal
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -520,15 +520,15 @@ def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = 
     ``MEFOR_ALLOW_INSECURE_TLS`` has its own clamp, honoured only on an instance at
     ``[security].enforcement = warn`` (:func:`weakened_tls_escape_permitted`).
 
-    **Why the dial is read from the environment and not from loaded settings.** The check runs inside
-    ``load_config``, in every process that executes config: ``serve``, a reload, the sandbox worker's
-    boot load, and offline commands. At least ``check`` and ``dryrun`` load config before they read
-    any settings, and the worker never reads a settings file. A posture handed down by each caller
-    would be missed by the caller nobody remembered (the lesson of vault BACKLOG #2354). The escape is
-    an environment variable, so the dial that unlocks it is read from the same place, the same way in
-    every one of those processes. The sandbox worker's environment is an allowlist, so
-    ``pipeline/sandbox.py`` carries both into it by name: the escape, and every spelling of the dial
-    that :func:`security_enforcement_env_names` finds. The worker then reads what the engine read.
+    **Why the dial is read from the environment and not from loaded settings.** The check runs in every
+    process that reads a config directory, through ``load_config`` or ``read_trusted_snapshot``:
+    ``serve``, a reload, a sandbox session that reads its own directory, and offline commands. At least ``check`` and ``dryrun``
+    load config before they read any settings. A posture handed down by each caller would be missed
+    by the caller nobody remembered (the lesson of vault BACKLOG #2354). The escape is an environment
+    variable, so the dial that unlocks it is read from the same place, the same way in every one of
+    those processes. The sandbox worker is not one of them: it loads the snapshot its parent read
+    and checked, sent in the boot frame (vault BACKLOG #2596), so neither variable is in its
+    environment (vault BACKLOG #2587).
 
     **Where "never under enforce" holds.** For a process whose settings come from
     :func:`load_settings` over this same environment, which is ``serve``, ``supervise`` and every CLI
@@ -560,8 +560,7 @@ def security_enforcement_env_names(environ: Mapping[str, str] | None = None) -> 
 
     ``_env_overrides`` lowercases what follows the prefix, so ``MEFOR_SECURITY_enforcement`` is the
     same setting as :data:`SECURITY_ENFORCEMENT_ENV`, and on a case-sensitive platform both can be
-    set. The sandbox hands exactly these names to its worker, beside the escape, so the worker's
-    config-source check reads what the engine's read."""
+    set. The escape's clamp reads every one of them."""
     env = os.environ if environ is None else environ
     key = SECURITY_ENFORCEMENT_ENV[len(_ENV_PREFIX) :].lower()
     return tuple(
@@ -2515,8 +2514,9 @@ def _checked_pass_environment(names: tuple[str, ...], key: str, receiver: str) -
     For the two ``pass_environment`` settings: ``[sandbox]``'s, read by the sandbox worker, and
     ``[dr]``'s, read by the DR hooks. Each child gets an allowlist
     (:mod:`messagefoundry.childenv`), and this keeps the engine's own names off both lists: no
-    ``MEFOR_*`` variable at all, and no secret a library reads on the engine's behalf
-    (:func:`messagefoundry.childenv.outside_engine_namespace`, reused so the two cannot drift).
+    ``MEFOR_*`` variable at all, no secret a library reads on the engine's behalf, and no
+    interpreter variable that starts a console
+    (:func:`messagefoundry.childenv.pass_environment_refusal`, reused so the rules cannot drift).
     Refusing the whole namespace, not a list of secret names, cannot go stale when a secret is
     added. The text never echoes an entry that is not a name, since ``NAME=value`` typed by
     mistake would carry the value (vault BACKLOG #2600). Nor does it number one: the env form drops
@@ -2525,16 +2525,9 @@ def _checked_pass_environment(names: tuple[str, ...], key: str, receiver: str) -
     A secret reference under ``[secrets].provider = "env"`` is refused once the model is built,
     by :func:`_reject_passed_secret_references`, which sees every section."""
     for name in names:
-        if not (name.isascii() and name.isidentifier()):
-            raise ValueError(
-                f"{key}: an entry is not an environment variable name; "
-                "list names only, never NAME=value"
-            )
-        if not outside_engine_namespace(name):
-            raise ValueError(
-                f"{key}: {name} is one of the engine's own variables; "
-                f"it may not be passed to {receiver}"
-            )
+        refusal = pass_environment_refusal(name)
+        if refusal:
+            raise ValueError(f"{key}: {refusal}; it may not be passed to {receiver}")
     return names
 
 
