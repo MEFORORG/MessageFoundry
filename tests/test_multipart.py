@@ -302,3 +302,67 @@ def test_realistic_part_header_is_well_under_the_cap() -> None:
         max_file_bytes=1024,
     )
     assert file.filename == "acme.hl7"
+
+
+# --- part-count and text-field caps (BACKLOG #5522) -----------------------------------------------
+
+
+def _field(name: str, value: bytes) -> bytes:
+    return f'Content-Disposition: form-data; name="{name}"'.encode() + b"\r\n\r\n" + value
+
+
+_FILE_PART = b'Content-Disposition: form-data; name="file"; filename="a.hl7"\r\n\r\nMSH|body'
+
+
+def test_too_many_parts_is_refused_before_any_part_is_parsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One part over ``_MAX_PARTS`` is refused with the 400 base error, and no part header is read.
+
+    The sentinel on ``_disposition`` is what makes "refused" mean "refused up front": a cap that
+    parsed the first ``_MAX_PARTS`` parts and then stopped would still raise, but only after it had
+    done the per-part work the cap exists to bound."""
+
+    def _no_parse(head: bytes) -> tuple[str | None, str | None]:
+        raise AssertionError("the part-count cap should refuse before any part header is parsed")
+
+    monkeypatch.setattr(multipart, "_disposition", _no_parse)
+    parts = [_FILE_PART] + [_field(f"f{i}", b"v") for i in range(multipart._MAX_PARTS)]
+    with pytest.raises(MultipartError, match="more parts than the limit") as caught:
+        parse_multipart_form(
+            f"multipart/form-data; boundary={_B}", _body(parts), max_file_bytes=1024
+        )
+    # 400, not 413: the handler maps the base class to 400 and only the subclass to 413.
+    assert type(caught.value) is MultipartError
+
+
+def test_a_body_at_the_part_cap_still_parses() -> None:
+    """Positive control for the cap above: exactly ``_MAX_PARTS`` parts is admitted, so the count
+    includes the closing delimiter correctly and the refusal is not off by one."""
+    parts = [_FILE_PART] + [_field(f"f{i}", b"v") for i in range(multipart._MAX_PARTS - 1)]
+    form = parse_multipart_form(
+        f"multipart/form-data; boundary={_B}", _body(parts), max_file_bytes=1024
+    )
+    assert len(form.files) == 1
+    assert len(form.fields) == multipart._MAX_PARTS - 1
+
+
+def test_an_oversized_text_field_is_refused_as_too_large() -> None:
+    """A non-file field past ``_MAX_FIELD_BYTES`` is refused with the 413 subclass. Before the cap a
+    text field was bounded only by the body cap and decoded whole into a ``str``."""
+    big = _field("note", b"x" * (multipart._MAX_FIELD_BYTES + 1))
+    with pytest.raises(MultipartTooLargeError, match="text field"):
+        parse_single_file_upload(
+            f"multipart/form-data; boundary={_B}", _body([_FILE_PART, big]), max_file_bytes=1024
+        )
+
+
+def test_a_text_field_at_the_cap_still_parses() -> None:
+    """Positive control: a field of exactly ``_MAX_FIELD_BYTES`` is kept, decoded, beside the file."""
+    value = b"x" * multipart._MAX_FIELD_BYTES
+    form = parse_multipart_form(
+        f"multipart/form-data; boundary={_B}",
+        _body([_FILE_PART, _field("note", value)]),
+        max_file_bytes=1024,
+    )
+    assert form.fields["note"] == value.decode()

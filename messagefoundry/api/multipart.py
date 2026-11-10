@@ -23,9 +23,11 @@ from dataclasses import dataclass, field
 # Without it, ``(\w+)="…"`` is quadratic on a hostile Content-Disposition line: the scan restarts at
 # every offset inside a word run, and at each one ``\w+`` walks the rest of the run before failing —
 # O(n^2) on a header of n word characters. That header block is attacker-supplied and bounded only by
-# ``[store].max_upload_bytes`` (25 MiB default), and it is parsed synchronously on the asyncio event
-# loop, so a single request could wedge the whole engine for days. The lookbehind is O(1) and fails
-# every offset *inside* a run immediately, leaving one ``\w+`` walk per run — O(n) overall.
+# ``[store].max_upload_bytes`` (25 MiB default), and a single scan would wedge the whole engine for
+# days. Running the parse in a worker thread (BACKLOG #5522) does not change that: one ``re`` scan is
+# a single C call that holds the GIL throughout, so the event loop stalls with it. The lookbehind is
+# O(1) and fails every offset *inside* a run immediately, leaving one ``\w+`` walk per run — O(n)
+# overall.
 #
 # It removes no match: ``=`` is not a word character, so ``\w+`` starting anywhere inside a run can
 # only ever succeed at that run's end — i.e. an interior offset matches iff the run's first offset
@@ -38,11 +40,24 @@ _DISPOSITION_PARAM = re.compile(r'(?<!\w)(\w+)="([^"]*)"')
 #: client sends. Without it the block is bounded only by the request body cap — ``[store]
 #: .max_upload_bytes``, 25 MiB by default and up to 512 MiB — because that cap is applied to a part's
 #: *content*, only after its header has already been parsed. The scan is linear (see the guard above),
-#: but it runs synchronously on the asyncio event loop that also drives every listener and worker, and
+#: but it ran synchronously on the asyncio event loop that also drives every listener and worker, and
 #: linear is not free at that size: a single request would block the engine for ~0.35 s at 25 MiB and
-#: ~7 s at the ceiling. Bounding the header keeps the cost microseconds and, incidentally, gives the
-#: ReDoS analysis a length-bounded source instead of an attacker-sized one.
+#: ~7 s at the ceiling (the worker thread since BACKLOG #5522 does not help a single scan; see the
+#: guard above). Bounding the header keeps the cost microseconds and, incidentally, gives the ReDoS analysis a length-bounded source instead
+#: of an attacker-sized one.
 _MAX_PART_HEADER_BYTES = 16 * 1024
+
+#: Cap on the number of parts in one body. Both upload surfaces send one file part, and the console
+#: form carries no other field, so 16 is generous. Without it the part count is bounded only by the
+#: body cap: a 25 MiB body of empty parts is about 2.9 million segments, each one split, copied and
+#: header-parsed. Measured 2026-11-10 on a dev box, that took about 2 s with a peak near 150 MiB, about
+#: six times the body. The split is bounded, so an over-cap body never builds the long list.
+_MAX_PARTS = 16
+
+#: Cap on one non-file field's bytes. ``max_file_bytes`` bounds only file parts, so a text field was
+#: bounded by the body cap alone and was decoded into a ``str`` of up to the whole body. No upload
+#: surface reads a text field today, so this only has to admit a short form value.
+_MAX_FIELD_BYTES = 16 * 1024
 
 
 class MultipartError(ValueError):
@@ -50,7 +65,7 @@ class MultipartError(ValueError):
 
 
 class MultipartTooLargeError(MultipartError):
-    """A file part exceeds the caller's byte cap."""
+    """A file part exceeds the caller's byte cap, or a text field exceeds ``_MAX_FIELD_BYTES``."""
 
 
 @dataclass(frozen=True)
@@ -107,14 +122,24 @@ def parse_multipart_form(
 ) -> MultipartForm:
     """Parse a ``multipart/form-data`` body into file parts + text fields.
 
-    Raises :class:`MultipartError` if the Content-Type is not multipart or the body is malformed, and
-    :class:`MultipartTooLargeError` if a file part exceeds ``max_file_bytes``. The boundary is trusted
-    not to appear inside a part body (the RFC-2046 invariant every multipart parser relies on)."""
+    Raises :class:`MultipartError` if the Content-Type is not multipart, the body is malformed, or it
+    holds more than ``_MAX_PARTS`` parts, and :class:`MultipartTooLargeError` if a file part exceeds
+    ``max_file_bytes`` or a text field exceeds ``_MAX_FIELD_BYTES``. The boundary is trusted not to
+    appear inside a part body (the RFC-2046 invariant every multipart parser relies on).
+
+    The function is synchronous and walks the whole body, so an async caller runs it in a worker
+    thread rather than on the event loop."""
     boundary = parse_boundary(content_type)
     if boundary is None:
         raise MultipartError("Content-Type is not multipart/form-data with a boundary")
     delim = b"--" + boundary
-    segments = body.split(delim)
+    # One delimiter opens each part and one more closes the body, so an admissible body splits into at
+    # most _MAX_PARTS + 2 segments (preamble, parts, terminator). The bounded split is one pass that
+    # never builds a long list, and a further segment means too many parts. Refuse rather than parse
+    # the first _MAX_PARTS: a body this shape is never a real upload form.
+    segments = body.split(delim, _MAX_PARTS + 2)
+    if len(segments) > _MAX_PARTS + 2:
+        raise MultipartError(f"multipart body has more parts than the limit of {_MAX_PARTS}")
     # segments[0] is the (usually empty) preamble; the terminator segment starts with b"--".
     form = MultipartForm()
     for segment in segments[1:]:
@@ -142,6 +167,10 @@ def parse_multipart_form(
                 )
             form.files.append(FilePart(name=name or "file", filename=filename, data=content))
         elif name is not None:
+            if len(content) > _MAX_FIELD_BYTES:
+                raise MultipartTooLargeError(
+                    f"multipart text field is {len(content)} bytes; the limit is {_MAX_FIELD_BYTES}"
+                )
             form.fields[name] = content.decode("utf-8", "replace")
     return form
 
