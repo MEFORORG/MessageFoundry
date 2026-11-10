@@ -224,6 +224,40 @@ def test_ordinary_key_info_shapes_still_verify(anchor: bytes, replacement: bytes
     assert result.verified, f"an ordinary KeyInfo shape was refused: {result.reason}"
 
 
+_KEY_INFO_TEXT = b"UNSIGNED-KEY-INFO-TEXT"
+
+
+@pytest.mark.parametrize(
+    ("anchor", "replacement"),
+    [
+        (b"<ds:KeyInfo>", b"<ds:KeyInfo><ds:KeyName>" + _KEY_INFO_TEXT + b"</ds:KeyName>"),
+        (b"<ds:KeyInfo>", b"<ds:KeyInfo><ds:MgmtData>" + _KEY_INFO_TEXT + b"</ds:MgmtData>"),
+        (
+            b"</ds:X509Data>",
+            b"<ds:X509SubjectName>" + _KEY_INFO_TEXT + b"</ds:X509SubjectName></ds:X509Data>",
+        ),
+    ],
+    ids=["key-name", "mgmt-data", "x509-subject-name"],
+)
+def test_key_info_leaf_text_verifies_but_is_not_signed_content(
+    anchor: bytes, replacement: bytes
+) -> None:
+    """The contract ``verify()``'s docstring states (vault BACKLOG #5538, reviewed not-a-bug).
+
+    Free text in a ``ds:KeyInfo`` leaf is admitted, so the document verifies. Nothing signs that text,
+    and it is absent from ``signed_content``. The verify half overlaps the positive control above,
+    which is frozen by that ruling; this test adds the ``signed_content`` half.
+    """
+    signed = _sign(_BODY)
+    edited = signed.replace(anchor, replacement)
+    assert _KEY_INFO_TEXT in edited, "the anchor did not match, so no text was placed"
+    result = _verify(edited)
+    assert result.verified, f"a KeyInfo leaf with text was refused: {result.reason}"
+    assert result.signed_content is not None
+    assert b"SYNTHETIC-WIDGET" in result.signed_content, "signed_content lost the signed body"
+    assert _KEY_INFO_TEXT not in result.signed_content
+
+
 def test_an_xml_declaration_is_not_a_node_outside_the_document_element() -> None:
     """POSITIVE CONTROL for the sibling rule below: a declaration is not a sibling of the root."""
     result = _verify(b'<?xml version="1.0" encoding="UTF-8"?>\n' + _sign(_BODY))

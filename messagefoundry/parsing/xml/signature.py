@@ -48,8 +48,8 @@ class XmlSignatureResult:
 
     ``signed_content`` is the content the signature covers, as the signer canonicalized it: the
     document without its ``ds:Signature`` element. It is ``None`` unless ``verified``. **Read the
-    message from these bytes, not from the document you passed in.** A verified document matches
-    them, but these bytes are what the cryptography actually checked.
+    message from these bytes, not from the document you passed in.** These bytes are what the
+    cryptography actually checked; :func:`verify` says what else a verified document may carry.
     """
 
     verified: bool
@@ -253,6 +253,8 @@ def _signature_holds_unsigned_content(signature: Any) -> bool:
     and their attributes, and text only inside one with no children, such as a certificate or a key
     name. It refuses a comment or processing instruction anywhere in the element, because no
     signature covers one there.
+
+    Admitted leaf text is still unsigned; see :func:`verify`.
     """
 
     def blank(text: str | None) -> bool:
@@ -344,8 +346,18 @@ def verify(
     **Only a signature over the whole document verifies** (vault BACKLOG #2315). A document holding
     anything the signature does not cover fails with :data:`UNSIGNED_CONTENT`: for example a signed
     element under a new document element, content inside the ``ds:Signature`` element, or a comment
-    the signature excluded. On success, read the message from ``signed_content``. Raises
-    :class:`ValueError` if no anchor is supplied,
+    the signature excluded.
+
+    **``verified=True`` vouches for ``signed_content`` and nothing else, so read the message from
+    ``signed_content``, never from your own parse of ``document``** (vault BACKLOG #5538, reviewed
+    not-a-bug). Nothing in ``ds:KeyInfo`` is signed. Free text in a ``ds:KeyInfo`` leaf, such as
+    ``ds:KeyName``, ``ds:MgmtData`` or ``ds:X509SubjectName``, is still admitted on purpose, because
+    signers emit those elements and refusing them would refuse real partners; it verifies, and it is
+    not in ``signed_content``. When ``x509_cert`` pins the signer, signxml checks the signature
+    against that certificate and does not read the certificates in ``ds:X509Data``, so even a
+    ``ds:X509Certificate`` there is unchecked text.
+
+    Raises :class:`ValueError` if no anchor is supplied,
     :class:`~messagefoundry.parsing.xml.errors.XmlError` if the input is unparseable, and
     :class:`RuntimeError` if the ``[xml]`` extra is absent."""
     if x509_cert is None and ca_pem_file is None:
