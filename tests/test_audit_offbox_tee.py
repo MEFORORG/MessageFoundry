@@ -805,9 +805,13 @@ def test_a_long_backslash_run_is_scanned_in_linear_time() -> None:
     run = "x " + "\\" * 3000
 
     def took(fn) -> float:
-        start = time.perf_counter()
-        fn()
-        return time.perf_counter() - start
+        """The fastest of five runs, so one scheduler stall cannot decide the comparison."""
+        best = float("inf")
+        for _ in range(5):
+            start = time.perf_counter()
+            fn()
+            best = min(best, time.perf_counter() - start)
+        return best
 
     old_t = took(lambda: old.sub(" ", run))
     new_t = took(lambda: audit_tee._LINE_ESCAPE.sub(" ", run))
@@ -830,6 +834,7 @@ def test_a_fault_on_a_json_detail_ships_a_json_string(monkeypatch) -> None:
         raise RuntimeError("synthetic")
 
     monkeypatch.setattr(audit_tee, "scrub_log_text", boom)
+    monkeypatch.setattr(audit_tee, "_FIELD_SCRUB_FAULT_LOGGED", False)
     out = audit_tee._scrub_field(json.dumps({"error": "a\nb"}), detail=True)
     assert json.loads(out) == "[redacted]"
 

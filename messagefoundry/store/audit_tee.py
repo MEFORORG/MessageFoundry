@@ -216,7 +216,8 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
     writers hand ``detail`` over, each JSON escape that spells a C0 control is decoded to the
     control first and encoded again after, read left to right so an escaped backslash is never
     half of one. Such a ``detail`` that the passes leave unparseable ships as the JSON string
-    ``"[redacted]"``. A fault here ships the field as :data:`_FIELD_REDACTED`.
+    ``"[redacted]"``, as it does on a fault; any other field ships as :data:`_FIELD_REDACTED` on a
+    fault.
     :func:`emit_audit_tee` states what this covers and what it leaves."""
     if value is None:
         return None
