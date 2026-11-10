@@ -8,8 +8,11 @@
   alert state must stay a **side observer**, never gate a disposition) ·
   [ADR 0027](0027-per-connection-retention.md) (the additive-table-across-three-backends + single-pass-audit
   discipline this matches; alert-state pruning rides the **same** purge pass) ·
-  [CLAUDE.md](../../CLAUDE.md) §2 (engine concurrency = asyncio; one-way dependency; no PHI in logs/alerts),
-  §9 ([PHI.md](../PHI.md) — metadata-only) ·
+  [CLAUDE.md](../../CLAUDE.md) §2 (engine concurrency = asyncio; one-way dependency; no PHI in
+  logs/alerts),
+  §9 ([PHI.md](../PHI.md) — metadata-only) · *(Note 2026-11-10, BACKLOG #5021: neither the
+  general log nor alerts are PHI-free in the shipped code, and the stored alert reason is not
+  metadata-only; the note under Context says why.)* ·
   [`pipeline/alerts.py`](../../messagefoundry/pipeline/alerts.py) (`AlertSink` Protocol + `LoggingAlertSink`) ·
   [`pipeline/alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py) (`NotifierAlertSink._emit`, the
   `(event['type'], event['connection'])` key, `AlertRuleSet`) ·
@@ -59,7 +62,21 @@ Two [CLAUDE.md](../../CLAUDE.md) invariants bound the design and **must not** be
   "the connection name + queue shape only — **no PHI**" ([`alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py)
   module docstring); the alert-instance row stores only those same metadata fields (type, connection, severity,
   a `safe_text`-scrubbed reason), so it introduces **no** new PHI classification — like `connection_event`,
-  it sits in the existing metadata tier.
+  it sits in the existing metadata tier. *(Note 2026-11-10, BACKLOG #5021: the quoted docstring no
+  longer says this, and the quoted claim was false: some events carry free-text detail. The
+  [PHI.md logging inventory](../PHI.md#logging-inventory-1611--1623) rows for the `[alerts]`
+  transports say what an event carries, and PHI.md's `alert_instance.reason` at-rest row grades the
+  stored reason **Possibly** PHI at PL-2, so that column is not plain metadata. The clause *"like
+  `connection_event`, it sits in the existing metadata tier"* is false too: PHI.md grades
+  `connection_event.reason` the same way, **Possibly** PHI at PL-2 and ciphered when a key is
+  set, so neither reason column sits in a metadata tier. Where this ADR calls `connection_event`
+  or `alert_instance` metadata-only, that does not hold for its `reason` column. The general
+  application log is not PHI-free either: PHI.md's logging inventory row 1 says it can contain
+  PHI. The off-box alert key allowlist the owner ruled for would not restore this ADR's claim
+  about the stored alert-instance reason, which stays outside it. Which alert copies it can make
+  PHI-free is in
+  [ADR 0173](0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s
+  note of 2026-11-10.)*
 
 ## Decision
 
