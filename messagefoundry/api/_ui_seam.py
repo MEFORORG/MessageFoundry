@@ -849,8 +849,7 @@ from typing import Any
 #: ``WebSocketAcceptGate`` now refuses ``accept()`` on an in-body socket no gate admitted. An older
 #: console on this engine would have its browser socket refused; a newer console on an older
 #: engine would raise ImportError at mount. Both force a bump. Re-derived with ``--write`` (from
-#: 734e7007fb95eb75). This note and the two below it ran on main's own branch, beside the
-#: #3192/#3193 entry above, not after it; the merge note that follows them joins the two chains.
+#: 734e7007fb95eb75).
 #:
 #: Merged with main's ``2a4589213e5e782c`` and re-derived with ``--write`` over both, to
 #: ``44d2ecd02c8d2b1b``.
@@ -861,7 +860,8 @@ from typing import Any
 #:
 #: Merge of the #3192/#3193 entry with main after engine PR 2852 (#2955): each digest was derived
 #: without the other's change, so neither held for the merged surface. Re-derived with ``--write``
-#: over both, from ``a71505053af14cae`` and ``e233fc19966d856a`` to ``ae0ea5c81cc935b7``.
+#: over both, from ``a71505053af14cae`` and ``e233fc19966d856a`` to ``ae0ea5c81cc935b7``. The
+#: three #2955 entries just above are engine PR 2852's, kept once.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
