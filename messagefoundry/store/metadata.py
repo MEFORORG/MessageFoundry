@@ -9,7 +9,8 @@ sub-key, the operator/handler-attached bag written by :class:`~messagefoundry.co
 
 These two functions are the ONLY places that shape that split, shared by every store backend (so the
 merge can never drift across SQLite / Postgres / SQL Server) and by the API (so the internal keys never
-leak). They are pure: no I/O, no crypto — the caller decrypts before and encrypts after.
+leak). They are pure: no I/O beyond a content-free WARNING for an unreadable cell, no crypto — the
+caller decrypts before and encrypts after.
 """
 
 from __future__ import annotations
@@ -69,13 +70,15 @@ def encode_reference_value(value: Any) -> str:
     (BACKLOG #6711): ``json.dumps``' default would write the bare ``NaN`` token, which is not JSON."""
     try:
         return json.dumps(value, default=_reference_json_default, allow_nan=False)
-    except ValueError:
-        # Content-free: a reference value may be PHI for a patient-keyed set. json raises ValueError
-        # for at least a non-finite float, a circular value and an int too long to print.
-        raise TypeError(
-            "reference snapshot cannot serialize this value to JSON (ValueError: at least a "
-            "non-finite float, a circular value or an oversized int)"
-        ) from None
+    except (ValueError, RecursionError):
+        # Raised below, OUTSIDE this handler: json's error carries notes naming the dict keys on the
+        # path, and a reference key may be PHI, so it must ride neither __cause__ nor __context__.
+        # ValueError covers at least a non-finite float, a circular value and an int too long to print.
+        pass
+    raise TypeError(
+        "reference snapshot cannot serialize this value to JSON (at least a non-finite float, a "
+        "circular value, an oversized int or one nested too deep)"
+    )
 
 
 def encode_response_headers(headers: Mapping[str, str] | None) -> str | None:
@@ -99,12 +102,13 @@ def _load_object(text: str | None) -> dict[str, Any]:
 
     It decodes a ``str`` through :func:`~messagefoundry.redaction.json_loads_or_refusal`, so json's
     depth-limit ``RecursionError`` on deeply nested input reads as malformed like any other decode
-    failure (BACKLOG #6712). A refusal is logged with json's content-free hint, never the text."""
-    if not text:
+    failure (BACKLOG #6712). A refusal is logged with json's content-free hint, never the text. A
+    value that is not a ``str`` reads as ``{}`` too, as the ``TypeError`` arm this replaced did."""
+    if not isinstance(text, str) or not text:
         return {}
     value, refusal = json_loads_or_refusal(text)
     if refusal is not None:
-        log.warning("stored metadata JSON is unreadable (%s); read as empty", refusal)
+        log.warning("a stored JSON cell is unreadable (%s); read as empty", refusal)
         return {}
     return value if isinstance(value, dict) else {}
 
@@ -117,7 +121,7 @@ def _dumps_or_none(value: Any) -> str | None:
     try:
         return json.dumps(value)
     except RecursionError:
-        log.warning("stored metadata JSON is too deeply nested to re-encode; read as empty")
+        log.warning("a stored JSON cell is too deeply nested to re-encode")
         return None
 
 
@@ -137,8 +141,9 @@ def merge_user_metadata(existing_json: str | None, meta_ops: Sequence[tuple[str,
 
     Any non-``user`` keys already present (ADR 0013 correlation lineage) are preserved untouched. Within
     one message the same key is last-writer-wins. ``existing_json`` may be ``None``/empty (no metadata
-    yet) or a non-object (defensively treated as empty). Caller passes decrypted JSON in and encrypts the
-    result out — this function does neither."""
+    yet) or a non-object (defensively treated as empty), and so may a non-object ``"user"`` bag. An
+    existing object that decodes but is too deep to re-encode raises ``ValueError``. Caller passes
+    decrypted JSON in and encrypts the result out — this function does neither."""
     parsed = _load_object(existing_json)
     existing_user = parsed.get("user")
     user: dict[str, Any] = dict(existing_user) if isinstance(existing_user, dict) else {}
@@ -146,8 +151,11 @@ def merge_user_metadata(existing_json: str | None, meta_ops: Sequence[tuple[str,
         user[key] = value
     parsed["user"] = user
     encoded = _dumps_or_none(parsed)
-    # Too deep to write back: the same outcome as unreadable existing metadata, the ops alone.
-    return encoded if encoded is not None else json.dumps({"user": dict(meta_ops)})
+    if encoded is None:
+        # Refused, not written back as the ops alone: the caller persists the result over the cell,
+        # which would erase the readable engine-internal keys (correlation lineage, refused-body record).
+        raise ValueError("existing message metadata is too deeply nested to re-encode; not merged")
+    return encoded
 
 
 def user_metadata(metadata_json: str | None) -> str | None:

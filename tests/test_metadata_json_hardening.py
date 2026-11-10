@@ -54,9 +54,24 @@ def _strict_loads(text: str) -> Any:
 def test_a_non_finite_float_is_refused_as_unencodable(value: Any) -> None:
     with pytest.raises(TypeError, match="non-finite") as info:
         encode_reference_value(value)
-    # Content-free and unchained: a reference value may be PHI for a patient-keyed set.
+    # Unchained: json's ValueError carries notes naming the dict keys on the path, and a reference
+    # key may be PHI for a patient-keyed set.
     assert info.value.__cause__ is None
-    assert info.value.__suppress_context__
+    assert info.value.__context__ is None
+
+
+def test_a_nested_value_too_deep_to_encode_is_refused_as_unencodable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dry-run catches only TypeError, so json's RecursionError must arrive as one too."""
+
+    def overflow(value: Any, **kwargs: Any) -> str:
+        raise RecursionError("maximum recursion depth exceeded while encoding a JSON object")
+
+    monkeypatch.setattr(json, "dumps", overflow)
+    with pytest.raises(TypeError, match="nested too deep") as info:
+        encode_reference_value({"a": 1})
+    assert info.value.__context__ is None
 
 
 @pytest.mark.parametrize("value", [1.5, 0.0, -2.25, 1e308, {"x": [1.5, None, True]}])
@@ -74,10 +89,16 @@ def test_a_non_finite_decimal_encodes_as_valid_json(value: Decimal) -> None:
     assert _strict_loads(encode_reference_value(value)) == str(value)
 
 
-async def test_a_toml_nan_fails_the_sync_and_writes_no_snapshot(tmp_path: Path) -> None:
-    """End to end: a ``nan`` in a reference TOML is refused at the sink, so the set is not committed."""
+@pytest.mark.parametrize(
+    ("rate", "outcome"), [("nan", (0, 1)), ("inf", (0, 1)), ("1.5", (1, 0))], ids=str
+)
+async def test_a_toml_nan_fails_the_sync_and_writes_no_snapshot(
+    tmp_path: Path, rate: str, outcome: tuple[int, int]
+) -> None:
+    """End to end: a ``nan`` in a reference TOML is refused at the sink, so the set is not committed.
+    The finite twin syncs, so the sink, not some other refusal, is what failed the others."""
     src = tmp_path / "rates.toml"
-    src.write_text("[acme]\nrate = nan\n", encoding="utf-8")
+    src.write_text(f"[acme]\nrate = {rate}\n", encoding="utf-8")
     store = await MessageStore.open(tmp_path / "r.db")
     try:
         runner = ReferenceSyncRunner(
@@ -87,8 +108,8 @@ async def test_a_toml_nan_fails_the_sync_and_writes_no_snapshot(tmp_path: Path) 
             egress=EgressSettings(deny_by_default=False),
         )
         result = await runner.sync_all()
-        assert (result.synced, result.failed) == (0, 1)
-        assert "rates" not in store.reference_view()
+        assert (result.synced, result.failed) == outcome
+        assert ("rates" in store.reference_view()) is (outcome == (1, 0))
     finally:
         await store.close()
 
@@ -133,12 +154,32 @@ def test_user_metadata_reads_a_bag_too_deep_to_re_encode_as_none(
     assert user_metadata(stored) is None
 
 
-def test_merge_user_metadata_falls_back_to_the_ops_when_existing_will_not_re_encode(
+def test_merge_user_metadata_refuses_when_existing_will_not_re_encode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Refused rather than written back as the ops alone, which would erase the readable lineage."""
     stored = json.dumps({"correlation_id": "c", "user": {"old": "x"}})
     _encoder_overflows_once(monkeypatch)
-    assert json.loads(merge_user_metadata(stored, [("k", "a"), ("k", "b")])) == {"user": {"k": "b"}}
+    with pytest.raises(ValueError, match="too deeply nested") as info:
+        merge_user_metadata(stored, [("k", "v")])
+    assert info.value.__context__ is None
+
+
+def test_a_non_str_cell_reads_as_empty() -> None:
+    """The TypeError arm the old decoders carried: a non-str cell still reads as no metadata."""
+    cell: Any = memoryview(b'{"user": {"k": "v"}}')
+    assert decode_response_headers(cell) == {}
+    assert user_metadata(cell) is None
+    assert json.loads(merge_user_metadata(cell, [("k", "v")])) == {"user": {"k": "v"}}
+
+
+def test_an_unreadable_cell_is_logged_without_its_content(caplog: pytest.LogCaptureFixture) -> None:
+    marker = "SYNTHETIC-MRN-5550199"
+    with caplog.at_level("WARNING", logger="messagefoundry.store.metadata"):
+        assert user_metadata('{"user": {"k": "' + marker + '"') is None
+        assert user_metadata("[" * 200_000 + '"' + marker) is None
+    assert len(caplog.records) == 2
+    assert all(marker not in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.parametrize("bag", ['"xyz"', "5", '[["a", "b"]]', "null"])
