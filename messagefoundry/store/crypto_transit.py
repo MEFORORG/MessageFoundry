@@ -46,12 +46,12 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import json
 import logging
 import os
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.store.crypto import (
     _V3_PREFIX,
     AUDIT_TRANSIT_HASH_ALGO,
@@ -98,47 +98,48 @@ _ENV_TRANSIT_KEY = "MEFOR_STORE_TRANSIT_KEY"
 #: :data:`~messagefoundry.store.keyprovider_vault.TRANSIT_KEY_TYPES_AUDIT` (BACKLOG #1166); a shared key
 #: is held to the narrower data-key set, because it has to do both jobs.
 _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
-#: The texts Transit's ``hmac`` endpoint answers a refused key VERSION with, lower-cased (BACKLOG
-#: #6707). Read on 2026-11-10 from Vault ``builtin/logical/transit/path_hmac.go`` and
+#: Texts Transit's ``hmac`` endpoint answers a refused key VERSION with, lower-cased (BACKLOG #6707).
+#: Read on 2026-11-10 from Vault ``builtin/logical/transit/path_hmac.go`` and
 #: ``sdk/helper/keysutil/policy.go`` (``HMACKey``, ``safeGetKeyEntry``) at commit cbc874e2358f, and
-#: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59: a version above the latest or
-#: below zero, one the key no longer holds, one below ``min_encryption_version``, and one with no HMAC
-#: key. At least the other 400s read there, such as an input that is not base64 or a missing key, are
-#: not about the version. A refusal whose text is missing here reads as plain CipherError, never as a
-#: refused version: the startup walk then logs a check that could not run and raises no chain-break
-#: alert, and a genesis row refuses the open. So re-read these texts on a Vault or OpenBao upgrade.
+#: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59. The alarm never REQUIRES one
+#: of these: unknown Vault wording still reads as a refused version. A reply naming one of these is
+#: read as a refused version even beside a reason in :data:`_NOT_VERSION_TEXTS`.
 _VERSION_REFUSAL_TEXTS = (
     "key version does not exist",
     "no such key version",
     "version is too old (disallowed by policy)",
     "no hmac key exists for that key version",
 )
+#: Whole Vault error texts, lower-cased, that say a pinned ``hmac`` 400 is NOT about the version
+#: (BACKLOG #6707), from the same Vault source. Matched whole, never as a substring. Kept short on
+#: purpose: :meth:`TransitCipher.audit_hmac` always sends base64 it encoded and a fixed algorithm, so
+#: no request-level 400 is reachable from it, and an unlisted text keeps the alarm.
+_NOT_VERSION_TEXTS = frozenset({"missing input for hmac", "encryption key not found"})
 
 
-def _names_a_version_refusal(exc: Exception) -> bool:
-    """Whether Vault's own error list on ``exc``, which hvac carries on ``exc.errors``, names only a
-    refused key version (BACKLOG #6707). A missing or empty list, or any entry that is not text, not
-    a version refusal, or holds several lines (a joined multi-error), is not evidence, so the caller
-    raises :class:`CipherError`.
+def _not_a_version_refusal(exc: Exception) -> bool:
+    """Whether a pinned ``hmac`` 400 is affirmatively NOT Transit refusing the version (BACKLOG
+    #6707), so it must not read as one. Only two things say so: no Vault JSON ``errors`` list at
+    all (a proxy or WAF page, or text that is not JSON), or a list every entry of which is a whole
+    text in :data:`_NOT_VERSION_TEXTS` and none of which names a refused version. Anything else,
+    unknown Vault wording included, stays a refused version, as before this check existed.
 
-    hvac parses the reply into ``errors`` only when its Content-Type is exactly ``application/json``,
+    hvac fills ``exc.errors`` only when the reply's Content-Type is exactly ``application/json``,
     so a proxy that adds a charset leaves the same JSON in ``exc.text``; that is read the same way."""
     errors: object = getattr(exc, "errors", None)
     body: object = getattr(exc, "text", None)
     if errors is None and isinstance(body, str):
-        with contextlib.suppress(ValueError, RecursionError):
-            parsed: object = json.loads(body)
-            if isinstance(parsed, dict):
-                errors = parsed.get("errors")
-    if not isinstance(errors, list) or not errors:
+        parsed, refused = json_loads_or_refusal(body)
+        if refused is None and isinstance(parsed, dict):
+            errors = parsed.get("errors")
+    if not isinstance(errors, list):
+        return True  # no Vault error list: this 400 did not come from Transit's version check
+    texts = [text.strip().lower() for text in errors if isinstance(text, str)]
+    if any(known in text for text in texts for known in _VERSION_REFUSAL_TEXTS):
         return False
-    for text in errors:
-        if not isinstance(text, str) or "\n" in text:
-            return False
-        lowered = text.lower()
-        if not any(known in lowered for known in _VERSION_REFUSAL_TEXTS):
-            return False
-    return True
+    return (
+        bool(errors) and len(texts) == len(errors) and all(t in _NOT_VERSION_TEXTS for t in texts)
+    )
 
 
 #: The fixed input of the probe that tells a refused key version from an outage (BACKLOG #2337).
@@ -298,19 +299,20 @@ class TransitCipher(_UnmarkedPolicy):
         raises another class, so none of those reads as a refused version. A 400 can also mean the
         key itself is missing, so a probe under the latest version, over FIXED input, must succeed
         too. Fixed input keeps a row's own content from deciding the answer. The probe must also
-        name a different version, or the refusal was not about the version. A 400 about the request
-        must not pass once a rotation moves the latest version, so Vault's own error text must name
-        a refused version too (:func:`_names_a_version_refusal`, BACKLOG #6707).
+        name a different version, or the refusal was not about the version. Once a rotation moves
+        the latest version the probe always differs, so a 400 that is affirmatively not Transit's
+        version check (:func:`_not_a_version_refusal`, BACKLOG #6707) is not read as one either.
 
         This infers the cause from the reply; it does not read the key's version range. So a node
         whose copy of the key lags a rotation can refuse a real, newer version and still pass."""
         if not is_vault_bad_request(exc):
             return False
-        if not _names_a_version_refusal(exc):
+        if _not_a_version_refusal(exc):
             # Vault's own text stays out of the log, as it stays out of the error.
             log.warning(
-                "Transit answered an audit HMAC pinned to key version %d with HTTP 400 whose reply "
-                "does not name a refused version, so it is not read as one (key=%r)",
+                "An audit HMAC pinned to key version %d got HTTP 400 that is not Transit refusing "
+                "the version (no Vault error list, or a reason that is not the version), so it is "
+                "not read as one (key=%r)",
                 key_version,
                 self._audit_key,
             )

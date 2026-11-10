@@ -479,11 +479,15 @@ async def test_a_transient_failure_of_a_pinned_call_is_not_a_planted_version(
 
 #: Vault's own text for a pinned ``hmac`` call refused for its version, as hvac carries it.
 _VERSION_400 = ("key version does not exist; latest key version is 2",)
+#: A proxy's or WAF's own 400 page: no Vault JSON at all.
+_PROXY_PAGE = "<html><body><h1>400 Bad Request</h1></body></html>"
 
 
-def _pinned_refusal(answer: Any, errors: Any = _VERSION_400) -> CipherError:
-    """What the cipher raises when a pinned call gets Transit's 400 carrying ``errors`` (hvac's
-    ``errors`` list) and the probe gets ``answer`` (a reply, or an exception to raise)."""
+def _pinned_refusal(
+    answer: Any, errors: Any = _VERSION_400, *, text: str | None = None
+) -> CipherError:
+    """What the cipher raises when a pinned call gets a 400 carrying ``errors`` (hvac's ``errors``
+    list) and body ``text``, and the probe gets ``answer`` (a reply, or an exception to raise)."""
     _needs_hvac()
     from hvac.exceptions import InvalidRequest
 
@@ -493,9 +497,8 @@ def _pinned_refusal(answer: Any, errors: Any = _VERSION_400) -> CipherError:
     class _Transit(_FakeTransit):
         def generate_hmac(self, **kw: Any) -> dict[str, Any]:
             if kw.get("key_version") is not None:
-                raise InvalidRequest(
-                    "bad request", errors=list(errors) if errors is not None else None
-                )
+                listed = list(errors) if errors is not None else None
+                raise InvalidRequest("bad request", errors=listed, text=text)
             if isinstance(answer, Exception):
                 raise answer
             return {"data": {"hmac": answer}}
@@ -528,91 +531,92 @@ def test_a_pinned_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: A
 
 
 @pytest.mark.parametrize(
-    "text",
+    ("errors", "text"),
     [
-        "key version does not exist; latest key version is 2",
-        "no such key version",
-        "cannot generate HMAC: version is too old (disallowed by policy)",
-        "no HMAC key exists for that key version",
+        pytest.param(["no such key version"], None, id="known-refusal-text"),
+        pytest.param(
+            ["cannot generate HMAC: version is too old (disallowed by policy)"],
+            None,
+            id="known-policy-refusal",
+        ),
+        pytest.param(["key version 3 is not held by this key"], None, id="unknown-wording"),
+        pytest.param(
+            ["no such key version", "missing input for HMAC"], None, id="refusal-beside-non-version"
+        ),
+        pytest.param(
+            ["missing input for HMAC: and more"], None, id="non-version-only-as-substring"
+        ),
+        pytest.param([], None, id="empty-vault-list"),
+        pytest.param(None, '{"errors": ["no such key version"]}', id="vault-json-in-text-only"),
+        pytest.param(None, '{"errors": ["reworded refusal"]}', id="unknown-wording-in-text-only"),
     ],
 )
-def test_each_vault_version_refusal_text_is_a_refused_version(text: str) -> None:
-    """Every text Vault's hmac path answers a refused version with reads as one (BACKLOG #6707)."""
+def test_a_pinned_vault_400_not_affirmatively_about_the_request_is_a_refused_version(
+    errors: Any, text: str | None
+) -> None:
+    """BACKLOG #6707: a 400 carrying Vault's JSON error list stays a refused version, the tamper
+    alarm, unless it is affirmatively not one. Unknown Vault wording must alarm, so a reworded
+    refusal on an upgraded Vault never turns a planted version into a check that could not run.
+    hvac fills ``errors`` only for a Content-Type of exactly ``application/json``, so the same JSON
+    in the body (a charset-tagged reply) must read the same way."""
     from messagefoundry.store.crypto import AuditKeyVersionRefusedError
 
-    refused = _pinned_refusal("vault:v2:AAAA", [text])
+    refused = _pinned_refusal("vault:v2:AAAA", errors, text=text)
     assert isinstance(refused, AuditKeyVersionRefusedError)
 
 
 @pytest.mark.parametrize(
-    "errors",
+    ("errors", "text"),
     [
-        pytest.param(
-            ["unable to decode input as base64: illegal base64 data at input byte 4"],
-            id="payload-400",
-        ),
-        pytest.param(None, id="no-vault-text"),
-        pytest.param([], id="empty-list"),
-        pytest.param(["no such key version", "missing input for HMAC"], id="mixed"),
-        pytest.param(
-            ["2 errors occurred:\n\t* no such key version\n\t* missing input for HMAC"],
-            id="joined-multi-error",
-        ),
+        pytest.param(None, _PROXY_PAGE, id="proxy-page"),
+        pytest.param(None, None, id="no-body"),
+        pytest.param(None, '["no such key version"]', id="json-but-not-vault-shaped"),
+        pytest.param(None, '{"message": "bad request"}', id="json-without-errors"),
+        pytest.param(["missing input for HMAC"], None, id="known-non-version-text"),
+        pytest.param(["  Encryption key not found "], None, id="known-non-version-any-case"),
     ],
 )
-def test_a_pinned_400_vault_does_not_name_as_a_version_refusal_is_a_plain_cipher_error(
-    errors: Any,
+def test_a_pinned_400_affirmatively_not_about_the_version_is_a_plain_cipher_error(
+    errors: Any, text: str | None
 ) -> None:
     """BACKLOG #6707: after a rotation the probe answers under a newer version, so the probe alone
-    cleared ANY pinned 400 as a refused version. A 400 about the request, or one with no Vault text,
-    must stay a check that could not run, never a break planted at this row."""
+    cleared ANY pinned 400 as a refused version. A 400 that did not come from Transit's version
+    check (no Vault error list) or that Vault says is about something else must stay a check that
+    could not run, never a break planted at this row."""
     from messagefoundry.store.crypto import AuditKeyVersionRefusedError
 
-    refused = _pinned_refusal("vault:v2:AAAA", errors)
+    refused = _pinned_refusal("vault:v2:AAAA", errors, text=text)
     assert not isinstance(refused, AuditKeyVersionRefusedError)
     assert "Transit audit HMAC failed" in str(refused)
 
 
-def test_vault_text_is_read_from_the_body_when_hvac_did_not_parse_it() -> None:
-    """hvac fills ``errors`` only for a Content-Type of exactly ``application/json``; behind a proxy
-    that adds a charset the same JSON sits in ``text``, and must still be read (BACKLOG #6707)."""
+def test_a_non_text_entry_in_vault_errors_keeps_the_alarm() -> None:
+    """A Vault error list holding an entry that is not text is not affirmatively about the request,
+    and a refusal text beside it wins (BACKLOG #6707)."""
     _needs_hvac()
     from hvac.exceptions import InvalidRequest
 
-    from messagefoundry.store.crypto_transit import _names_a_version_refusal
+    from messagefoundry.store.crypto_transit import _not_a_version_refusal
 
-    def bad_request(text: str) -> Exception:
-        return InvalidRequest(text, text=text)
-
-    assert _names_a_version_refusal(bad_request('{"errors": ["no such key version"]}'))
-    assert not _names_a_version_refusal(bad_request('{"errors": ["missing input for HMAC"]}'))
-    assert not _names_a_version_refusal(bad_request("no such key version"))  # not Vault's JSON
-    assert not _names_a_version_refusal(bad_request('["no such key version"]'))
+    exc = InvalidRequest(errors=["missing input for HMAC"])
+    exc.errors = ["missing input for HMAC", 7]  # hvac's constructor joins entries, so set it after
+    assert not _not_a_version_refusal(exc)
+    exc.errors = ["no such key version", 7]
+    assert not _not_a_version_refusal(exc)
 
 
-def test_a_non_text_entry_in_vault_errors_is_not_a_version_refusal() -> None:
-    _needs_hvac()
-    from hvac.exceptions import InvalidRequest
-
-    from messagefoundry.store.crypto_transit import _names_a_version_refusal
-
-    exc = InvalidRequest(errors=["no such key version"])
-    exc.errors = ["no such key version", 7]  # hvac's constructor joins entries, so set it after
-    assert not _names_a_version_refusal(exc)
-
-
-async def test_a_request_400_on_a_pinned_call_after_a_rotation_is_not_a_planted_version(
+async def test_a_proxy_400_on_a_pinned_call_after_a_rotation_is_not_a_planted_version(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #6707 at the walk: after a rotation the probe answers under a newer version, so a
-    400 about the request on a pinned call must still read as a check that could not run, never as
-    a tampered row."""
+    400 that is not Transit's at all (a proxy's own page) on a pinned call must still read as a
+    check that could not run, never as a tampered row."""
     _needs_hvac()
     from hvac.exceptions import InvalidRequest
 
     transit = _RotatingTransit()
     _use_fake(monkeypatch, transit)
-    db = tmp_path / "request-400.db"
+    db = tmp_path / "proxy-400.db"
     store = await _transit_store(db)
     await store.record_audit("test.clean", actor="cli:tester")
     transit.latest = 2  # rows stay under v1; the probe now answers vault:v2:
@@ -620,7 +624,7 @@ async def test_a_request_400_on_a_pinned_call_after_a_rotation_is_not_a_planted_
 
     def refuse_pinned(**kw: Any) -> dict[str, Any]:
         if kw.get("key_version") is not None:
-            raise InvalidRequest(errors=["unable to decode input as base64: illegal base64 data"])
+            raise InvalidRequest(_PROXY_PAGE, text=_PROXY_PAGE)
         return real(**kw)
 
     monkeypatch.setattr(transit, "generate_hmac", refuse_pinned)
