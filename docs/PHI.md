@@ -2140,12 +2140,8 @@ docstrings link here rather than restate it. Two independent mechanisms cover it
 
 **Off-box (vault BACKLOG #2356 subject 3).** Neither mechanism is a forwarder: the child has **no
 off-box forwarder of its own**, so whatever of its stderr leaves the host does so as the parent's
-records. Its stderr is not the only child text the parent logs: at least the error text a sandboxed
-Router or Handler reports across the frame protocol becomes part of a parent record above `DEBUG`
-(§7's `safe_exc()` paragraph covers that text), and such a record is forwarded like any other. The
-`WARNING` count
-notice above is an ordinary engine log record on stream 1, so where the parent's off-box forwarder
-is installed (stream 4, `[logging].forward_*`, ADR 0200) the notice is forwarded off-box like any
+records. The `WARNING` count notice above is an ordinary engine log record on stream 1, so where
+the parent's off-box forwarder is installed (stream 4, `[logging].forward_*`, ADR 0200) the notice is forwarded off-box like any
 other record, through the same filter chain. **The owner ruled on 2026-11-05 that this count notice
 is the off-box path for the child's stderr** (*"Count notice is enough"*). ADR 0176's rule is
 unchanged: no call site turns child stderr content into a record above `DEBUG`, so the content
