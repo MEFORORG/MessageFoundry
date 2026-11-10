@@ -6220,8 +6220,7 @@ def _cert_inventory(args: argparse.Namespace) -> int:
     CRL files get their own rows, marked ``"kind": "crl"``, with the soonest ``nextUpdate`` in the
     file under ``not_after``: an inbound
     connection's ``tls_crl_file`` from ``--config``, and the settings-level CRL files from
-    ``--service-config``. Those and the SQL Server store pin, a certificate row, come from
-    ``monitored_files_from_settings`` (BACKLOG #299, vault #2223), the same rows the expiry monitor
+    ``--service-config`` (``crls_from_settings``, BACKLOG #299), the same set the expiry monitor
     watches.
 
     ``--service-config`` additionally makes ``--json`` emit an ``api_tls`` object -- the scheme the
