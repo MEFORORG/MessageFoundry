@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import datetime
 import ftplib
+import inspect
 import ipaddress
 import logging
 import posixpath
@@ -1374,7 +1375,7 @@ class _LoopbackTlsServer:
     the client closes it, so it never resets one with unread data.
 
     Used as a context manager. Leaving it closes every client socket the test appended to
-    ``clients``, so a failing assert does not leave the thread waiting. ``error`` holds what the
+    ``clients``, so a failing assert does not leave the thread waiting. ``error`` holds whatever the
     serving thread raised, and ``finished`` whether it ended."""
 
     def __init__(
@@ -1386,20 +1387,22 @@ class _LoopbackTlsServer:
         garbage: bool = False,
         num_tickets: int = 2,
     ) -> None:
-        cert_pem, key_pem = pki.make_self_signed("localhost", [], 1)
-        directory.mkdir()
-        self.ca_file, key_file = directory / "srv-c.pem", directory / "srv-k.pem"
-        self.ca_file.write_bytes(cert_pem)
-        key_file.write_bytes(key_pem)
         self._context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        self._context.load_cert_chain(self.ca_file, key_file)
-        self._context.minimum_version = self._context.maximum_version = version
-        self._context.num_tickets = num_tickets
+        self.ca_file = directory / "srv-c.pem"
+        if not garbage:  # a server that never handshakes needs no certificate
+            cert_pem, key_pem = pki.make_self_signed("localhost", [], 1)
+            directory.mkdir()
+            key_file = directory / "srv-k.pem"
+            self.ca_file.write_bytes(cert_pem)
+            key_file.write_bytes(key_pem)
+            self._context.load_cert_chain(self.ca_file, key_file)
+            self._context.minimum_version = self._context.maximum_version = version
+            self._context.num_tickets = num_tickets
         self._count = count
         self._garbage = garbage
         self.reused: list[bool] = []
         self.clients: list[socket.socket] = []
-        self.error: OSError | None = None
+        self.error: Exception | None = None
         self.finished = False
         self._listener = socket.create_server(("127.0.0.1", 0))
         self._listener.settimeout(5)
@@ -1431,7 +1434,7 @@ class _LoopbackTlsServer:
                 held[-1] = conn
                 self.reused.append(bool(conn.session_reused))
                 conn.sendall(b"x")
-        except OSError as exc:
+        except Exception as exc:  # recorded for the test to assert on, never dropped
             self.error = exc
         finally:
             for sock in held:
@@ -1575,6 +1578,21 @@ def test_a_failed_data_handshake_closes_the_raw_socket(
         assert closed == [True]  # and closed it when the handshake failed
     assert tls.finished and tls.error is None
     assert junk.finished and junk.error is None
+
+
+def test_stdlib_ftp_tls_ntransfercmd_is_the_body_the_override_replaces() -> None:
+    # Tripwire: _SessionReusingFtpTls calls ftplib.FTP.ntransfercmd directly and repeats the stdlib
+    # FTP_TLS wrap with a session added. A CPython change to that method (native reuse, a close on a
+    # failed wrap, a check after it) would be skipped by the override, so it fails here instead.
+    body = inspect.getsource(ftplib.FTP_TLS.ntransfercmd)
+    assert [line.strip() for line in body.splitlines()] == [
+        "def ntransfercmd(self, cmd, rest=None):",
+        "conn, size = super().ntransfercmd(cmd, rest)",
+        "if self._prot_p:",
+        "conn = self.context.wrap_socket(conn,",
+        "server_hostname=self.host)",
+        "return conn, size",
+    ]
 
 
 def test_ftps_connect_builds_the_session_reusing_class(monkeypatch: pytest.MonkeyPatch) -> None:

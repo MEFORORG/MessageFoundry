@@ -1854,8 +1854,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.minimum_version = TLSv1_2",
             "tls_context:.verify_mode = CERT_NONE",
             # BACKLOG #5530: the FTPS data channel is wrapped with the control channel's own context,
-            # so it takes that channel's verify posture, and offers the control channel's session so
-            # a reuse-requiring server accepts it.
+            # so it takes that channel's verify posture, and offers the control channel's session
+            # for reuse. Reuse is best-effort under TLS 1.3; _SessionReusingFtpTls says when.
             "tls_context:.wrap_socket()",
             "tls_context:via messagefoundry.config.tls_policy",
             "tls_context:via messagefoundry.keywrap",

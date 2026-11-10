@@ -1091,19 +1091,20 @@ class _SessionReusingFtpTls(ftplib.FTP_TLS):
     def ntransfercmd(
         self, cmd: str, rest: int | str | None = None
     ) -> tuple[socket.socket, int | None]:
-        # Read before the data connection opens, so nothing between it and the wrap can raise and
-        # strand the raw socket. A control channel that is not TLS yields None, a full handshake.
-        session = self.sock.session if isinstance(self.sock, ssl.SSLSocket) else None
         conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
         if self._prot_p:
+            # Read after the PASV and transfer replies, so a TLS 1.3 ticket they carried counts. The
+            # getter does not raise, so nothing can strand the raw socket before the wrap takes it.
+            # A control channel that is not TLS yields None, a full handshake.
+            session = self.sock.session if isinstance(self.sock, ssl.SSLSocket) else None
             conn = self.context.wrap_socket(conn, server_hostname=self.host, session=session)
         return conn, size
 
 
 class _FtpClient(_RemoteClient):
     """FTP / FTPS client over the stdlib ``ftplib``. ``tls`` selects ``FTP_TLS`` (explicit TLS, with
-    ``PROT P`` so the data channel is encrypted too, resuming the control channel's TLS session; see
-    :class:`_SessionReusingFtpTls`) over plain ``FTP``. For FTPS a verifying
+    ``PROT P`` so the data channel is encrypted too, offering the control channel's TLS session for
+    reuse; see :class:`_SessionReusingFtpTls`) over plain ``FTP``. For FTPS a verifying
     :class:`ssl.SSLContext` is built at construction (fail-fast) so the server certificate and hostname
     are validated — ftplib's default no-verify stdlib context is never used."""
 
