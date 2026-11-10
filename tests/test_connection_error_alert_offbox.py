@@ -17,7 +17,12 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.tls_policy import HopPosture
-from messagefoundry.pipeline.alert_sinks import EmailTransport, NotifierAlertSink, WebhookTransport
+from messagefoundry.pipeline.alert_sinks import (
+    EmailTransport,
+    NotifierAlertSink,
+    WebhookTransport,
+    _shared_no_redirect_opener,
+)
 from messagefoundry.pipeline.alerts import shown_error_class
 from tests.test_alert_state import _RecordingStore
 
@@ -61,7 +66,7 @@ def _wire(monkeypatch: pytest.MonkeyPatch) -> tuple[list[bytes], list[str]]:
         def send_message(self, msg: Any, **envelope: Any) -> None:
             bodies.append(msg.get_body(preferencelist=("plain",)).get_content())
 
-    monkeypatch.setattr("messagefoundry.pipeline.alert_sinks._NO_REDIRECT_OPENER.open", fake_open)
+    monkeypatch.setattr(_shared_no_redirect_opener(), "open", fake_open)
     monkeypatch.setattr("messagefoundry.pipeline.alert_sinks.smtplib.SMTP", _FakeSMTP)
     return posts, bodies
 

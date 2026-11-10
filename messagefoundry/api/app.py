@@ -78,6 +78,7 @@ from messagefoundry.api.approvals import (
     ApprovalError,
     ApprovalGate,
     IdentityResolver,
+    held_fingerprint,
     named_requester,
 )
 from messagefoundry.api.auth_routes import add_auth_routes
@@ -1828,14 +1829,15 @@ def _build_approval_gate(
                 "name who ran it; it was not run",
             )
         # Vault BACKLOG #2596, step 3: the release loads only the bytes the approval named. A hold
-        # whose params carry no digest (none is filed that way now) binds to None, which matches
-        # nothing, so it is refused as a mismatch once its directory resolves. On a store that holds
-        # a key the params are sealed with the rest of the request, so a writer to pending_approvals
-        # who changes the digest leaves a request the gate refuses (vault BACKLOG #2592).
-        approved = p.get("fingerprint")
-        approval = ApprovedConfig(
-            approved if isinstance(approved, str) else None, p.get("value_file")
-        )
+        # with no usable digest (held_fingerprint) binds to None, which matches nothing. The gate
+        # refuses such a hold before its claim (requires_fingerprint below, release_blocked
+        # 'params_no_fingerprint', vault BACKLOG #3192), so None reaches this only if that flag is
+        # dropped. It is then refused, with reason no_approved_digest where the release reaches
+        # the digest check.
+        # On a store that holds a key the params are sealed with the rest of the request, so a
+        # writer to pending_approvals who changes the digest leaves a request the gate refuses
+        # (vault BACKLOG #2592).
+        approval = ApprovedConfig(held_fingerprint(p), p.get("value_file"))
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
         # swapped the graph and then failed a follow-on step must report the same degraded outcome
         # the inline path reports, or dual control would be the quieter of the two.
@@ -1910,6 +1912,7 @@ def _build_approval_gate(
         permission=Permission.CONFIG_DEPLOY,
         in_scope=lambda identity, _p: _cross_channel_in_scope(identity),
         requires_requester=True,
+        requires_fingerprint=True,
     )
     return gate
 
@@ -2665,9 +2668,11 @@ async def _audit_refused_reload(
     filter sees both, and ``invalid_config`` otherwise. A trust-anchor check the store stopped, by
     refusing its audit read or write, writes reason ``store_unavailable`` and answers 503 (BACKLOG
     #3091); it is neither a refused anchor nor a bad graph. A released reload whose config is not the
-    one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch``, or
-    ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
-    BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
+    one its approval named writes ``config_reload_failed`` with ``approved_fingerprint`` and
+    ``current_fingerprint`` and reason ``digest_mismatch``, or ``no_approved_digest`` when the hold
+    carries no usable digest (:func:`held_fingerprint`), whose ``approved_fingerprint`` is then
+    null, and answers 422 (vault BACKLOG #2596); only the
+    executor meets it. One whose digest could not be taken now writes
     reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
     request whose digest cannot be taken is refused the same way, with no hold filed. A release
     refused before its digest check (:class:`ConfigRefusedBeforeApprovalCheck`) keeps its reason
@@ -2724,7 +2729,7 @@ async def _audit_refused_reload(
         action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
     elif isinstance(exc, ConfigDigestMismatch):
-        # A hold that took no digest is told apart, so nobody goes looking for an edit that
+        # A hold with no usable digest is told apart, so nobody goes looking for an edit that
         # never happened.
         unbound = exc.approved is None
         warn(
@@ -4794,6 +4799,13 @@ def create_app(
 
         return middleware
 
+    def _refuse_body(request: Request, status: int, detail: str, what: str) -> JSONResponse:
+        _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
+        # `Connection: close` makes the server drop the connection after every refusal, so bytes
+        # it framed one way and a proxy another (RFC 9112 §6.1, §6.3), or a refused body the
+        # client never sent, are never read as a next request.
+        return JSONResponse({"detail": detail}, status_code=status, headers={"Connection": "close"})
+
     def _body_refusal(request: Request) -> JSONResponse | None:
         """The response refusing ``request``'s body before any route runs, or None to admit it."""
         # The HTTP API carries only small JSON (HL7 payloads arrive via MLLP/file, not here), so a
@@ -4801,39 +4813,45 @@ def create_app(
         # Rejections are logged (ASVS 16.3.3) — these are control-bypass attempts (a pre-auth memory
         # DoS probe) and were previously dropped silently. We log to the rotating general log rather
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
-        client = client_ip(request)
-        length = request.headers.get("content-length")
-        transfer_encoding = request.headers.get("transfer-encoding", "").lower()
-        # A request carrying BOTH Content-Length and Transfer-Encoding is ambiguously framed (RFC 9112
-        # §6.1 — TE overrides CL) and is the classic CL.TE request-smuggling vector (ASVS 4.2.1). Under
-        # serve the pinned llhttp parser refuses the pair with its own 400 before this runs (BACKLOG
-        # #1125, protocol_headers.pinned_http_protocol_base). This check covers any other server that
-        # hosts the app: h11, for one, frames the pair by Transfer-Encoding and passes it on.
-        if length is not None and "chunked" in transfer_encoding:
-            _log.warning(
-                "rejected request with both Content-Length and Transfer-Encoding on %s from %s",
-                request.url.path,
-                client,
-            )
-            return JSONResponse(
-                {
-                    "detail": "ambiguous framing: Content-Length with Transfer-Encoding is not accepted"
-                },
-                status_code=400,
-            )
-        if length is None:
-            # No Content-Length means a chunked body (HTTP/1.1 requires one or the other), which the
-            # Content-Length cap can't bound up front — Starlette would buffer it unbounded, a pre-auth
-            # memory DoS. We only accept small JSON, so require a Content-Length (review M-19).
-            if "chunked" in transfer_encoding:
-                _log.warning(
-                    "rejected chunked request body on %s from %s", request.url.path, client
+        lengths = request.headers.getlist("content-length")
+        # The API takes only Content-Length bodies, so ANY Transfer-Encoding is refused, by presence
+        # on any line and whatever its value, and the connection is closed. Beside a Content-Length
+        # the request is ambiguously framed (RFC 9112 §6.1, the CL.TE smuggling vector, ASVS 4.2.1).
+        # Under serve llhttp refuses most such pairs itself (BACKLOG #1125); h11, for one, passes
+        # them on. Without a Content-Length, a coding list that does not end in `chunked` leaves the
+        # body length undetermined (§6.3 rule 4), and a chunked body has no length the cap can
+        # bound up front (review M-19).
+        te_lines = request.headers.getlist("transfer-encoding")
+        if te_lines:
+            if lengths:
+                return _refuse_body(
+                    request,
+                    400,
+                    "ambiguous framing: Content-Length with Transfer-Encoding is not accepted",
+                    "request with both Content-Length and Transfer-Encoding",
                 )
-                return JSONResponse(
-                    {"detail": "chunked request bodies are not accepted; send a Content-Length"},
-                    status_code=411,
+            codings = [c.strip(" \t").lower() for line in te_lines for c in line.split(",")]
+            # RFC 9112 §7: chunked is the final coding and is applied once.
+            if codings[-1] != "chunked" or "chunked" in codings[:-1]:
+                return _refuse_body(
+                    request,
+                    400,
+                    "invalid framing: Transfer-Encoding must end in a single chunked",
+                    "Transfer-Encoding not ending in a single chunked",
                 )
+            return _refuse_body(
+                request,
+                411,
+                "Transfer-Encoding is not accepted; send a Content-Length",
+                "chunked request body",
+            )
+        if not lengths:
             return None
+        # One line holding `1*DIGIT` (RFC 9112 §6.2), not int(): int() takes `+2`, `-5` and `0_2`,
+        # and a repeated line is a second framing claim (an invalid length closes, §6.3 item 5).
+        value = lengths[0].strip(" \t")
+        if len(lengths) > 1 or not (value.isascii() and value.isdigit()):
+            return _refuse_body(request, 400, "invalid Content-Length", "invalid Content-Length")
         # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
         upload_store = getattr(request.app.state, "upload_store", None)
         cap = (
@@ -4841,14 +4859,10 @@ def create_app(
             if upload_store is not None and request.url.path in _UPLOAD_BODY_PATHS
             else _MAX_REQUEST_BODY_BYTES
         )
-        try:
-            too_big = int(length) > cap
-        except ValueError:
-            _log.warning("rejected invalid Content-Length on %s from %s", request.url.path, client)
-            return JSONResponse({"detail": "invalid Content-Length"}, status_code=400)
-        if too_big:
-            _log.warning("rejected oversized request body on %s from %s", request.url.path, client)
-            return JSONResponse({"detail": "request body too large"}, status_code=413)
+        # Digit count first: int() raises past 4300 digits, and a longer number is over any cap.
+        digits = value.lstrip("0") or "0"
+        if len(digits) > len(str(cap)) or int(digits) > cap:
+            return _refuse_body(request, 413, "request body too large", "oversized request body")
         return None
 
     # add_middleware inserts at index 0, so registering in this order keeps _limit_request_body
@@ -4959,8 +4973,10 @@ def create_app(
         # the broker's revocation refusal. An off-box endpoint with no [ai].endpoint_revocation_attested
         # pair is refused under enforce, and a None posture counts as enforcing there. The cleartext-
         # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
+        # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
+        # context that reads the system trust store, under a lock a worker thread may hold.
         try:
-            broker = ai_broker_from_settings(ai, posture=_phi_read_posture)
+            broker = await asyncio.to_thread(ai_broker_from_settings, ai, posture=_phi_read_posture)
         except AiBrokerError as exc:
             _log.warning("engine AI broker misconfigured: %s", exc)
             raise HTTPException(503, "engine-brokered AI assistance is not available") from exc
@@ -7301,7 +7317,7 @@ def create_app(
             # BACKLOG #1111 -- without this the route answers a degraded apply as clean success.
             if req.dry_run:
                 outcome = await engine.reload_detail(req.config_dir, dry_run=True, propagate=False)
-                failures = [f.step for f in outcome.failures]
+                failures = outcome.failed_steps
             else:
                 outcome, failures = await _reload_and_record(
                     engine, req.config_dir, actor=user.username, client=client_ip(request)
@@ -11045,7 +11061,7 @@ def create_app(
     # ASVS 3.4.4/3.4.5 — registered LAST, so Starlette makes it the OUTERMOST user middleware
     # (add_middleware inserts at index 0; the stack is built from reversed(user_middleware)) and its
     # response-path send wrapper runs after every other emitter. That position is the whole point:
-    # _security_headers is the INNERMOST user middleware, so the body cap's four short-circuits above
+    # _security_headers is the INNERMOST user middleware, so the body cap's short-circuits above
     # shipped with no baseline headers at all, and both middlewares that hand-copy the baseline
     # (client_networks._DENIAL_HEADERS, request_timeout._TIMEOUT_HEADERS) omit HSTS. The floor
     # setdefaults, never assigns, so the attachment sandbox CSP re-asserted above and every other
@@ -11921,7 +11937,7 @@ def create_managed_app(
     api_tls_cert_file: str | None = None,
     api_tls_replacements: Sequence[GeneratedPairReplaced] = (),
     api_tls_client_cert_files: Sequence[str] = (),
-    settings_crls: Sequence[MonitoredCert] = (),
+    settings_monitored_files: Sequence[MonitoredCert] = (),
     api_listener: tuple[str, int] | None = None,
     reference_settings: ReferenceSettings | None = None,
     egress_settings: EgressSettings,
@@ -12335,8 +12351,8 @@ def create_managed_app(
             engine_version=__version__,
             api_tls_cert_file=api_tls_cert_file,
             api_tls_client_cert_files=api_tls_client_cert_files,
-            # BACKLOG #299: the settings-level CRL files, mostly outbound, for the same expiry scan.
-            settings_crls=settings_crls,
+            # BACKLOG #299, vault #2223: the settings-level CRL and pin files, for the same scan.
+            settings_monitored_files=settings_monitored_files,
             api_listener=api_listener,
             reference_settings=reference_settings,
             egress_settings=egress_settings,

@@ -4838,7 +4838,7 @@ def alert_revocation_attestations(
     """Each ``[alerts]`` revocation attestation that is set: its switch name, the hop it covers,
     what that hop's own handshake can check, and its reason (BACKLOG #2193). The ``[alerts]``
     sibling of :func:`vault_revocation_attestations`, read by :func:`security_loosenings`. A CRL
-    reaches the SMTP hop's context; none can reach the webhook's import-time opener."""
+    reaches the SMTP hop's context; none can reach the webhook's shared opener."""
     pairs = (
         (
             "alerts.email_tls_revocation_attested",
@@ -5557,6 +5557,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # `approval:listing` (vault BACKLOG #3747). Since vault BACKLOG #2254 also an
         # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
         "audit_write_failed",
+        # vault BACKLOG #3193 N1: an approval audit row whose write the gate read back as
+        # committed, whose off-box copy was never sent. Keyed `approval:<id>`, as above.
+        "audit_offbox_copy_missing",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
         # a pass left accounts unrevoked, and one principal's sessions were revoked. The first is
         # raised for at least a breaker trip, a referral (BACKLOG #2538), a configuration refusal
@@ -5896,7 +5899,7 @@ class AlertsSettings(_Section):
     # the webhook host's certificate is covered outside the engine. The POST carries the webhook's
     # path token over https the engine verifies and checks no CRL or OCSP on, so an off-box https
     # webhook on an enforcing instance is refused at build unless this is true, with its mandatory
-    # reason. It is the only way across: the webhook rides one opener built at import, which no CRL
+    # reason. It is the only way across: the webhook rides one shared opener, which no CRL
     # can reach. A loosening, named in security_loosenings(). It never lifts the cleartext refusal.
     webhook_tls_revocation_attested: bool = False
     webhook_tls_revocation_attested_reason: str | None = None

@@ -505,7 +505,7 @@ def test_rest_oauth2_unsendable_token_is_a_retryable_failure_not_a_nak() -> None
 def test_digest_handler_built_and_folded_into_opener() -> None:
     spec = with_http_digest(Rest(url=URL), user="u", password="p")
     dest = _rest_from(spec.settings)
-    # The per-connection opener carries a digest handler (never the shared _NO_REDIRECT_OPENER).
+    # The per-connection opener carries a digest handler (never the shared opener).
     handlers = dest._opener.handlers  # type: ignore[attr-defined]  # typeshed omits it
     assert any(isinstance(h, urllib.request.HTTPDigestAuthHandler) for h in handlers)
 

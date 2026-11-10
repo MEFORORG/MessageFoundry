@@ -38,6 +38,7 @@ import http.client
 import logging
 import re
 import ssl
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -459,8 +460,8 @@ def _no_redirect_opener(
 ) -> urllib.request.OpenerDirector:
     """A PER-CONNECTION verifying, no-redirect opener carrying ``extra_handlers`` (a forward-proxy
     ``ProxyHandler``, a reactive ``ProxyDigestAuthHandler``, …) — used in place of the shared
-    :data:`_NO_REDIRECT_OPENER` whenever a connection needs a handler the shared one lacks, so the shared
-    opener is **never** mutated (ADR 0126). Passing a ``ProxyHandler`` here also suppresses urllib's
+    :func:`_shared_no_redirect_opener` whenever a connection needs a handler the shared one lacks, so
+    the shared opener is **never** mutated (ADR 0126). Passing a ``ProxyHandler`` here also suppresses urllib's
     default env-reading ProxyHandler (``build_opener`` skips a default whose class a supplied handler
     already covers), so there is never a competing double-proxy. So ``ProxyHandler({})`` builds an
     opener that uses no proxy at all, which is what the ECH sidecar hop passes.
@@ -486,7 +487,35 @@ def _no_redirect_opener(
 # identical to the previous `build_opener(_NoRedirectHandler)`: build_opener would have added an
 # HTTPSHandler of its own, and this supplies the same class built the same way. build_strict_opener
 # then swaps both HTTP handlers for strict subclasses on the same context (BACKLOG #2052).
-_NO_REDIRECT_OPENER = _no_redirect_opener()
+_shared_opener: urllib.request.OpenerDirector | None = None
+_shared_opener_lock = threading.Lock()
+
+
+def _shared_no_redirect_opener() -> urllib.request.OpenerDirector:
+    """The shared verifying, no-redirect opener, built on first use and the same object after.
+
+    Built on first use, not at import (BACKLOG #2484): an OpenSSL build that refuses a list the engine
+    sets on every TLS context raises ``EngineTlsListRefused`` from the build, and at import that
+    surfaced as a failed import of every module that names this opener, not as a configuration
+    refusal. A build that raises caches nothing, so the next caller is refused the same way.
+
+    Callers compare an opener to this one by identity to learn whether it is shared and so must never
+    be mutated, which is why the build is under a lock: two threads racing the first call must not
+    each get an opener of their own."""
+    global _shared_opener
+    opener = _shared_opener
+    if opener is not None:
+        return opener
+    with _shared_opener_lock:
+        if _shared_opener is None:
+            _shared_opener = _no_redirect_opener()
+        return _shared_opener
+
+
+def _is_shared_no_redirect_opener(opener: urllib.request.OpenerDirector) -> bool:
+    """Whether ``opener`` is the shared one, answered without building it, so a connection that
+    never dials the shared opener does not build it to ask."""
+    return opener is _shared_opener
 
 
 def _insecure_opener(
@@ -1595,8 +1624,9 @@ def refuse_unrevoked_verified_hop(
     revocation_attested_reason: str | None = None,
     opener: urllib.request.OpenerDirector | None,
     ways_across: str | None = None,
+    expiry_relaxed: bool = False,
     connection: str | None,
-    description: str = "delivers over verified https but performs no certificate revocation checking",
+    description: str | None = None,
 ) -> None:
     """Refuse a VERIFYING ``https`` hop that does no certificate revocation checking (#201, ADR 0078 amend).
 
@@ -1622,7 +1652,7 @@ def refuse_unrevoked_verified_hop(
     carries a CRL would then be refused and told to configure the CRL it has (vault BACKLOG #2188).
     Pass ``None`` on purpose, in at least these cases:
 
-    - A caller whose hop rides the shared import-time opener, which can carry no CRL. Passing that
+    - A caller whose hop rides the shared opener, which can carry no CRL. Passing that
       opener gives the same answer.
     - A hop re-addressed to an ECH sidecar (ADR 0139). ``None`` is required there: the engine dials
       the loopback sidecar and the sidecar verifies the real peer, so no context the engine holds
@@ -1642,11 +1672,18 @@ def refuse_unrevoked_verified_hop(
     :data:`ECH_HOP_WAYS_ACROSS`, so its refusal offers only a lever that can cross it. ``None``
     keeps the default.
 
+    ``expiry_relaxed`` is passed through to :meth:`RevocationHopGuard.capture`. A hop whose opener
+    sets ``tls_allow_expired`` passes it true, beside ``opener=None``, so its refusal names
+    ``tls_allow_expired`` and offers :data:`~messagefoundry.config.tls_policy.EXPIRY_RELAXED_WAYS_ACROSS`
+    rather than a ``[tls].crl_file``, which cannot admit that hop (vault BACKLOG #2977 item 2). With
+    no opener the guard credits no CRL either way. The record's lead then drops "no revocation check", as on MLLP and the DICOM SCU: a CRL that
+    reaches such a hop still refuses a leaf it lists, and the relaxed record says what it lacks.
+
     ``connection`` is the declaring connection's name, recorded in the audit line logged when an
     attestation crosses the refusal, so the record leads back to the declaration (ADR 0173).
 
-    ``description`` says what the hop does over verified https, in the refusal's own words. The
-    default fits a destination. A hop that only reads, such as the ``FhirLookup`` read path, passes
+    ``description`` says what the hop does over verified https, in the refusal's own words.
+    ``None`` is the destination's wording. A hop that only reads, such as the ``FhirLookup`` read path, passes
     its own, so its refusal does not say it delivers (BACKLOG #2987). The refusal appends
     ``to <host>`` to it.
 
@@ -1654,15 +1691,21 @@ def refuse_unrevoked_verified_hop(
     BACKLOG #1924)."""
     if scheme != "https":
         return
+    if description is None:
+        description = "delivers over verified https" + (
+            "" if expiry_relaxed else " but performs no certificate revocation checking"
+        )
     RevocationHopGuard.capture(
         host=_hop_guard_host(url, cell=connector),
-        cell=f"{connector} (verified TLS, no revocation check)",
+        cell=f"{connector} (verified TLS"
+        + (", tls_allow_expired)" if expiry_relaxed else ", no revocation check)"),
         description=description,
         attested=revocation_attested,
         attested_reason=revocation_attested_reason,
         connection=connection,
         context=None if opener is None else opener_tls_context(opener, connector=connector),
         ways_across=ways_across,
+        expiry_relaxed=expiry_relaxed,
     ).enforce_construction()
 
 
@@ -1830,7 +1873,7 @@ def enforce_signature_header_limits(signer: object | None, *, connector: str) ->
 #
 # A per-connection forward proxy for the whole stdlib HTTP family (REST/SOAP/FHIR/fhir_lookup/DICOMweb +
 # the OAuth2/SMART token endpoints). Built into a per-connection ``ProxyHandler`` threaded through EVERY
-# opener path (the shared _NO_REDIRECT_OPENER is NEVER mutated), plus the pre-emptive tunnel-header Basic
+# opener path (the shared opener is NEVER mutated), plus the pre-emptive tunnel-header Basic
 # credential the reactive stdlib handlers cannot supply for an https destination. Off by default →
 # byte-identical.
 
@@ -2840,7 +2883,7 @@ class RestDestination(DestinationConnector):
                 # shared opener stays.
                 self._opener = _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
             else:
-                self._opener = _NO_REDIRECT_OPENER
+                self._opener = _shared_no_redirect_opener()
         else:
             # verify_tls=false makes the https hop MITM-able — an insecure hop decided by the instance
             # posture (#200): an enforcing hop REFUSES, a non-enforcing one refuses unless the clamped
@@ -2862,7 +2905,7 @@ class RestDestination(DestinationConnector):
             )
             self._opener = _insecure_opener(*proxy_handlers)
         # #65: HTTP Digest (RFC 7616) — fold the challenge-answering handler into a PER-CONNECTION opener
-        # (never mutate the shared _NO_REDIRECT_OPENER). urllib answers the 401 + retries within
+        # (never mutate the shared opener). urllib answers the 401 + retries within
         # opener.open(). None (default) → byte-identical. Mutually exclusive with a bearer provider.
         from messagefoundry.transports.http_auth import digest_handler_from_settings
 
@@ -2873,7 +2916,7 @@ class RestDestination(DestinationConnector):
                     "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
                     "(mutually exclusive — configure exactly one)"
                 )
-            if self._opener is _NO_REDIRECT_OPENER:
+            if _is_shared_no_redirect_opener(self._opener):
                 # Rebuild a per-connection verifying opener so add_handler never touches the shared one.
                 # Through _no_redirect_opener, not a bare build_opener: the bare form lets urllib
                 # fill in an HTTPSHandler whose context the engine never names, so the forward-secrecy
@@ -2902,9 +2945,8 @@ class RestDestination(DestinationConnector):
             #
             # Last in __init__, below every statement that builds or replaces `self._opener`, and no
             # opener with an ECH sidecar or tls_allow_expired: see refuse_unrevoked_verified_hop.
-            no_crl_evidence = self._ech_sidecar is not None or bool(
-                s.get("tls_allow_expired", False)
-            )
+            allow_expired = bool(s.get("tls_allow_expired", False))
+            no_crl_evidence = self._ech_sidecar is not None or allow_expired
             refuse_unrevoked_verified_hop(
                 scheme,
                 self.url,
@@ -2913,6 +2955,9 @@ class RestDestination(DestinationConnector):
                 revocation_attested_reason=config.tls_revocation_attested_reason,
                 opener=None if no_crl_evidence else self._opener,
                 ways_across=ECH_HOP_WAYS_ACROSS if self._ech_sidecar is not None else None,
+                # The sidecar, not the engine, dials the partner on an ECH hop, so the relaxation
+                # never reaches it there and the ECH remedy above stands.
+                expiry_relaxed=self._ech_sidecar is None and allow_expired,
                 connection=config.name,
             )
         if self._ech_sidecar is not None and ech_sidecar_is_cleartext(self._ech_sidecar):
