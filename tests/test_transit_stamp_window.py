@@ -536,3 +536,46 @@ async def test_a_reproof_budget_exhaustion_row_stays_hard(
             await service.reauth(identity, "synthetic-wrong-password", token=token)
     finally:
         await store.close()
+
+
+# --- decision d20261110T004916856-814db8, Q3: an Unverifiable answer at the rotation revokes -----
+
+
+@pytest.mark.parametrize("site", ["load", "rekey"])
+async def test_an_unverifiable_answer_at_the_rotation_revokes_the_stamped_hash(
+    monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    """``TransitSealUnverifiableError`` at the rotation's load, or ``RowSealUnverifiableError`` at
+    its re-key, arrives after the window has closed; the rotation itself revokes the stamped old
+    hash, then re-raises."""
+    from messagefoundry.store.row_seal import TransitSealUnverifiableError
+
+    store, service = await _service()
+    try:
+        token, secret, t1 = await _pre_mfa(service, monkeypatch)
+        exc: Exception
+        if site == "rekey":
+            exc = RowSealUnverifiableError("session", "")
+            monkeypatch.setattr(store, "rotate_session", _raising(exc))
+        else:
+            exc = TransitSealUnverifiableError("session", 2, 3)
+            rotating: list[bool] = []
+            load_session = service._load_session
+
+            async def lapsed(*_args: object, **_kwargs: object) -> bool:
+                rotating.append(True)
+                return False
+
+            async def load(token_hash: str) -> Any:
+                if rotating:
+                    raise exc
+                return await load_session(token_hash)
+
+            monkeypatch.setattr(service, "_rotation_lapsed", lapsed)
+            monkeypatch.setattr(service, "_load_session", load)
+        with pytest.raises(type(exc)):
+            await service.verify_mfa(token, totp.totp(secret, now=t1))
+        monkeypatch.undo()
+        await _revoked_unanswered(store, service, token)
+    finally:
+        await store.close()

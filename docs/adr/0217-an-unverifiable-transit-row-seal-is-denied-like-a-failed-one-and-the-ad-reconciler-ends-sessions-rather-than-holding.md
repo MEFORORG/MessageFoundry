@@ -234,6 +234,13 @@ re-key answers `session_lost`, and `reauth` and the federated re-auth callback w
 `Elevation.session_lost`: a failed re-proof that spends the session's budget sets that too, and
 its row stays hard. `auth.login_after_failures` stays hard (decision d20261110T004922661-14430e).
 
+**An Unverifiable answer at the rotation revokes the stamped hash, decided 2026-11-10 (decision
+d20261110T004916856-814db8, Q3).** It arrives after the window has closed, so the window does not
+revoke for it. `_rotate_session_hash` now does: `TransitSealUnverifiableError` at the load, or
+`RowSealUnverifiableError` at the re-key's write check, revokes the old hash, best effort and
+shielded from a cancel as the window's revoke is, then propagates. The re-key wrote nothing, so
+there is no new hash to revoke.
+
 ## Context
 
 Engine `main` seals identity and authorization rows (sessions, users with their role grants, custom

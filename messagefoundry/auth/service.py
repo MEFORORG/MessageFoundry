@@ -165,6 +165,7 @@ from messagefoundry.store.row_seal import (
     AnyRowSealer,
     RowSealError,
     RowSealKeyRetiredError,
+    RowSealUnverifiableError,
     SealFailureThrottle,
     TransitSealUnavailableError,
     TransitSealUnverifiableError,
@@ -293,8 +294,10 @@ def _session_write_errors() -> tuple[type[Exception], ...]:
     A session rotation adds the Outage type through :func:`_rotation_store_errors`, at the lapse
     check in :meth:`AuthService._elevated_hash` and at the load and re-key in
     :meth:`AuthService._rotate_session_hash` (owner ruling 2026-11-08, "Revoke both"). The slice
-    1b-iv catch census (vault #4739 step 6) read the other such sites and changed none, since each
-    fails closed; at least the Unverifiable type still escapes them, a question its report raises."""
+    1b-iv catch census (vault #4739 step 6) read the other such sites and changed none. The
+    rotation's load and re-key also revoke the old hash on an Unverifiable answer, then re-raise
+    (decision d20261110T004916856-814db8 on ADR 0217, Q3); at least the census's other sites still
+    let the Unverifiable type escape."""
     return store_open_errors()
 
 
@@ -10424,9 +10427,10 @@ class AuthService:
         hash exists yet; at the re-key, both are. Each revoke is best effort, as above, and the
         audit row names ``transit_unavailable`` rather than ``store_error``. On the elevation path
         :meth:`_elevated_hash`'s lapse check loads the session first, takes the same Outage, and
-        usually leaves this load a cache hit. An Unverifiable session seal is not covered: it still
-        escapes, failing closed, and the 1b-iv catch census left it so, as a question its report
-        raises. A session under a retired key at the re-key is ended quietly (build ruling 3).
+        usually leaves this load a cache hit. An Unverifiable answer, ``TransitSealUnverifiableError``
+        at the load or ``RowSealUnverifiableError`` at the re-key, revokes the old hash, best effort
+        and shielded from a cancel, then propagates (decision d20261110T004916856-814db8 on ADR
+        0217, Q3). A session under a retired key at the re-key is ended quietly (build ruling 3).
 
         A cancellation is not an ``Exception``, so it skips this branch and propagates with the old
         hash unrotated and unrevoked. The longer post-commit wait widens the window for one."""
@@ -10437,6 +10441,11 @@ class AuthService:
                 await self._revoke_unrotated(old_hash, None, exc),
                 reason=_rotation_failure_reason(exc),
             ) from exc
+        except TransitSealUnverifiableError as exc:
+            # Decision d20261110T004916856-814db8 on ADR 0217, Q3: the stamp is on this hash, so it
+            # is revoked, best effort and shielded, then the Unverifiable answer propagates.
+            await self._revoke_stamped_shielded(old_hash, exc)
+            raise
         if session is None:
             return None
         # Under the account's re-proof lock (BACKLOG #1138), so no rotation lands while a password
@@ -10462,6 +10471,11 @@ class AuthService:
                     await self._revoke_unrotated(old_hash, hash_token(new_token), exc),
                     reason=_rotation_failure_reason(exc),
                 ) from exc
+            except RowSealUnverifiableError as exc:
+                # Decision d20261110T004916856-814db8, Q3: the re-key's write check could not
+                # verify the row and wrote nothing, so only the stamped old hash exists to revoke.
+                await self._revoke_stamped_shielded(old_hash, exc)
+                raise
             if not rotated:
                 return None
             self._rekey_token_state(old_hash, hash_token(new_token))
