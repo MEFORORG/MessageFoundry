@@ -615,22 +615,30 @@ blind sample optional. Three things change here.
 
 - **Calibration** (`Get-DecisionCalibration`) is the automated signals over the seat's Class B
   decisions in the trailing 14 days: the reversal rate, and the rates of decisions any `outcome`
-  record marks `red-after-merge` or `held`, each a breach above 5 percent. No decisions in the
-  window is no breach. Owner ratings still count when given: any trailing window of up to 60
+  record marks `red-after-merge` or `held`, each a breach above 5 percent. Decisions answered
+  HALT, left PENDING or marked `dropped` are not in the denominator. Fewer than 20 decisions with a
+  resolved outcome in the window is not calibrated, so an empty history is not (Manager decision
+  2026-11-09, plan section 12). Owner ratings still count when given: any trailing window of up to 60
   holding more than 3 disagreements is a breach, with the 60 fresh ratings to recover. Fewer than
   60 ratings no longer holds a class back, so AC-7's *"calibrated only at 60 rated samples"* and
   the gate section's *"Today it answers REVIEW (or HALT) for every seat"* are superseded.
-- **The gate needs the act to name every path it changes**, with `-Touches`. No path is REVIEW,
-  since an act that changes no file has no git undo, and so is a path `Get-DecisionClassCPath`
-  names or cannot classify. The paths are the session's own statement and the list is a denylist
-  naming at least the paths plan R3 lists, not every security path, so a NO-REVIEW still never
-  shows the act is not a security control. The record schema gains `touches`, still version 1,
-  filled empty for an older record.
+- **The gate derives the paths the act changes from git**: the branch's diff against
+  `origin/main`, the uncommitted and staged changes and the untracked files, joined with any
+  `-Touches`. No path is REVIEW, since an act that changes no file has no git undo. Every path must
+  be on the fail-closed allowlist `_decisionlog.ps1` `DecisionFastPathAllow`, and none may be one
+  `Get-DecisionClassCPath` names or cannot classify (a `~` segment included); anything else is
+  REVIEW. The gate answers NO-REVIEW only where origin is `MEFORORG/MessageFoundry`, and names on
+  stderr the conditions it did not check, so a NO-REVIEW still never shows the act is not a
+  security control. The record schema gains `touches`, still version 1, filled empty for an older
+  record.
 - **A seat is read through `docs/roles/seats.json`**: an alias shares its seat's calibration and
-  budget, and a label the roster does not resolve answers REVIEW. A signal outcome is never a
-  decision's latest outcome, so a hold or red logged after a reversal does not hide it.
+  budget, and a label the roster does not resolve answers REVIEW. A signal or reversal outcome
+  is never a decision's latest outcome and is sticky, so no later outcome cancels it; `reopened`,
+  `rebriefed`, `re-briefed` and `overridden` count as reversals. Items compare as `#4242` equals
+  `4242` in the chain limit too.
 - **The digest's calibration table** gains the two signal rates.
 
 **Designed, not built:** a writer for any of the three signals. Every input is an `outcome` record
-a seat logs by hand, so a seat that logs none reads clean. The UNKNOWN cost reading still
+a seat logs by hand, a Lander and Manager duty, so the resolved-outcome floor holds the fast path
+closed until outcomes are logged. The UNKNOWN cost reading still
 answers REVIEW, and the kill switch, the reversal budget and the chain limit are unchanged.
