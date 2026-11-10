@@ -229,7 +229,8 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     WALL_CAP_LOOKUPS = "wall_cap_lookups"
     #: The worker exited while a dispatch was running.
     CRASH = "crash"
-    #: The worker's answer was forged, desynchronized or out of sequence.
+    #: The worker's answer was forged, desynchronized or out of sequence, or a length header it
+    #: wrote, answer or stray, was over the frame cap.
     INVALID_FRAME = "invalid_frame"
     #: The engine itself failed while serving a brokered lookup (``mode=isolated``).
     LOOKUP_FAULT = "lookup_fault"
@@ -423,6 +424,22 @@ class _Eof:
 
 
 _EOF: Final = _Eof()
+
+
+class _Oversize:
+    """The sentinel the reader thread enqueues for a length header over the frame cap.
+
+    Like :data:`_EOF`, parent-private with no wire form, and the reader stops after it. Unlike
+    :data:`_EOF` it is not a dead peer: only a writer on fd 1 can produce the header, so the worker
+    may still be alive, and the consumers kill it as an invalid frame (vault BACKLOG #3135)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return "<sandbox oversize frame>"
+
+
+_OVERSIZE: Final = _Oversize()
 
 
 # --- child stderr relay (BACKLOG #343, ADR 0176) ------------------------------
@@ -631,12 +648,21 @@ def _read_frame_bytes(stream: Any) -> bytes | None:
     ``except`` catches only ``OSError`` — a rejection raised there would kill the reader silently and
     the dispatch would HANG to the wall cap instead of failing closed. Decoding happens on the
     dispatch thread, inside its existing ``try``."""
+    body = _read_frame_or_oversize(stream)
+    return (
+        None if isinstance(body, _Oversize) else body
+    )  # a corrupt/hostile length: a dead peer here
+
+
+def _read_frame_or_oversize(stream: Any) -> bytes | _Oversize | None:
+    """:func:`_read_frame_bytes`, but a length header over the cap returns :data:`_OVERSIZE`
+    rather than ``None``, so the parent's reader can tell it from a closed pipe."""
     header = _read_exact(stream, _LEN.size)
     if header is None:
         return None
     (length,) = _LEN.unpack(header)
     if length > _MAX_FRAME:
-        return None  # a corrupt/hostile length — treat as a dead peer
+        return _OVERSIZE
     return _read_exact(stream, length)
 
 
@@ -946,6 +972,11 @@ class SandboxSession:
         if frame is _EOF:
             self._kill(proc, KillCause.BOOT_EXIT, phase)
             raise SandboxError("sandbox worker exited during bootstrap")
+        if frame is _OVERSIZE:
+            self._kill(proc, KillCause.BOOT_REPLY_REJECTED, phase)
+            raise SandboxError(
+                "sandbox worker bootstrap frame was rejected: its length is over the frame cap"
+            )
         try:
             worker_graph, detail = codec.decode_boot_reply(frame)
         except SandboxError as exc:
@@ -1007,11 +1038,13 @@ class SandboxSession:
         reader's writes are harmlessly ignored."""
         try:
             while True:
-                body = _read_frame_bytes(stdout)
+                body = _read_frame_or_oversize(stdout)
                 if body is None:
                     sink.put(_EOF)
                     return
                 sink.put(body)
+                if body is _OVERSIZE:
+                    return  # the stream is out of step, so nothing after the header is a frame
         except OSError:
             sink.put(_EOF)
 
@@ -1135,7 +1168,8 @@ class SandboxSession:
         self, proc: subprocess.Popen[bytes] | None, when: str, phase: str
     ) -> bool:
         """:meth:`_reject_unsolicited`'s check without the raise: True when a stray FRAME killed
-        the worker, False when nothing was waiting or a queued EOF only reaped a dead one."""
+        the worker (or an over-cap length header did), False when nothing was waiting or a queued EOF
+        only reaped a dead one."""
         try:
             stray = self._responses.get_nowait()
         except queue.Empty:
@@ -1143,7 +1177,10 @@ class SandboxSession:
         if stray is _EOF:
             self._reap(proc)  # the peer is already gone
             return False
-        self._kill(proc, _UNSOLICITED[when], phase)
+        # An over-cap length header is a stray write too, from a worker that may still be alive.
+        self._kill(
+            proc, KillCause.INVALID_FRAME if stray is _OVERSIZE else _UNSOLICITED[when], phase
+        )
         return True
 
     def _live_worker(self, phase: str) -> subprocess.Popen[bytes]:
@@ -1205,6 +1242,14 @@ class SandboxSession:
                 served = expected_seq - 1
                 after = f", after {served} brokered lookup(s)" if served else ""
                 raise SandboxError(f"sandbox worker crashed while running {phase} {name!r}{after}")
+            if frame is _OVERSIZE:
+                # Only a writer on fd 1 produces this header, so the worker may be alive: an
+                # invalid frame, not a crash.
+                self._kill(proc, KillCause.INVALID_FRAME, phase)
+                raise SandboxError(
+                    f"sandbox {phase} {name!r} returned an invalid frame: its length is over the "
+                    "frame cap"
+                )
             try:
                 # Decoding happens HERE, on the dispatch thread, inside this try — not on the daemon
                 # reader thread, where a rejection would be a silent reader death and a wall-cap hang.

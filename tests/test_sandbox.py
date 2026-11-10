@@ -13,6 +13,7 @@ answer a later dispatch, and the engine's code-set tables — not the child's ow
 from __future__ import annotations
 
 import dataclasses
+import io
 import logging
 import math
 import os
@@ -155,6 +156,16 @@ def h_forge(msg):
         request_id="guess:1", phase="transform", name="h_ok", result=Send("OB_T", "FORGED")
     )
     os.write(1, len(frame).to_bytes(4, "big") + frame)
+    return Send("OB_T", "REAL")
+
+
+@handler("h_oversize")
+def h_oversize(msg):
+    # Write a length header over the frame cap straight onto fd 1, then answer normally. The
+    # worker stays alive: only its stream is out of step (vault BACKLOG #3135).
+    import os
+
+    os.write(1, (0xFFFFFFFF).to_bytes(4, "big"))
     return Send("OB_T", "REAL")
 
 
@@ -2176,6 +2187,59 @@ def test_an_oserror_while_encoding_is_wrapped_and_keeps_the_worker(
         assert session._proc is proc
     finally:
         session.close()
+
+
+def test_an_over_cap_length_header_from_a_live_worker_is_an_invalid_frame(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A length header over the cap is written by the worker, which may still be alive, so the
+    kill is recorded as an invalid frame, not as a crash (vault BACKLOG #3135, finding 2).
+
+    FALSIFICATION: have the reader enqueue ``_EOF`` for the over-cap header again and the kill is
+    recorded as ``crash``."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    try:
+        with pytest.raises(SandboxError, match="invalid frame: its length is over the frame cap"):
+            _deliveries(registry, "h_oversize", sandbox=session, run_context=RunContext())
+        assert session.last_kill_cause is KillCause.INVALID_FRAME
+        assert [r.args for r in _kill_warnings(caplog)] == [("IB_T", "transform", "invalid_frame")]
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == (
+            _deliveries(registry, "h_ok")
+        )
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_a_queued_over_cap_header_kills_as_an_invalid_frame(
+    graph: tuple[Registry, str], when: str
+) -> None:
+    """Between dispatches the same header is a stray write from a worker that may be alive, so it
+    kills the worker as an invalid frame, where a queued EOF only reaps a dead one with no cause."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        proc = session._proc
+        assert proc is not None
+        session._responses.put(sandbox_mod._OVERSIZE)
+        assert session._drop_unsolicited(proc, when, "transform") is True
+        assert session._proc is None
+        assert proc.poll() is not None
+        assert session.last_kill_cause is KillCause.INVALID_FRAME
+    finally:
+        session.close()
+
+
+def test_the_reader_tells_an_over_cap_header_from_a_closed_pipe() -> None:
+    """The parent's reader returns the over-cap sentinel; the child's ``_read_frame_bytes`` keeps
+    reading it as a dead peer."""
+    header = (sandbox_mod._MAX_FRAME + 1).to_bytes(4, "big")
+    assert sandbox_mod._read_frame_or_oversize(io.BytesIO(header)) is sandbox_mod._OVERSIZE
+    assert sandbox_mod._read_frame_bytes(io.BytesIO(header)) is None
+    assert sandbox_mod._read_frame_or_oversize(io.BytesIO(b"")) is None
 
 
 def test_a_request_write_that_fails_still_kills_the_worker(
