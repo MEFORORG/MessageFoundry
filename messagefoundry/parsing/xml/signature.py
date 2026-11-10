@@ -43,9 +43,10 @@ class XmlSignatureResult:
     """The outcome of an XML-DSig verification.
 
     ``verified`` is True iff the signature is valid against the supplied certificate/CA, its key
-    clears the strength floor, AND it covers the whole document outside the ``ds:Signature`` element
-    (vault BACKLOG #2315), AND that element holds nothing :func:`verify` refuses there. ``reason``
-    is a PHI-safe failure category when not (``None`` on success).
+    clears the strength floor, it covers the whole document outside the ``ds:Signature`` element,
+    AND that element holds nothing :func:`verify` refuses there, though it may hold unsigned content
+    verify admits (vault BACKLOG #2315, #5538). ``reason`` is a PHI-safe failure category when not
+    (``None`` on success).
 
     ``signed_content`` is the content the signature covers, as the signer canonicalized it: the
     document without its ``ds:Signature`` element. It is ``None`` unless ``verified``. These bytes
@@ -348,8 +349,9 @@ def verify(
     fails with :data:`UNSIGNED_CONTENT`: for example a signed element under a new document element,
     or a comment the signature excluded. Inside ``ds:Signature``, no comment or processing
     instruction is admitted anywhere, and neither is any element, attribute or text that
-    :func:`_signature_holds_unsigned_content` does not admit. Each of those fails with
-    :data:`UNSIGNED_CONTENT`, or raises first where signxml's own schema check rejects the shape.
+    :func:`_signature_holds_unsigned_content` does not admit. Each of those is refused: with
+    :data:`UNSIGNED_CONTENT` unless an earlier check refuses it first, such as the key floor, the
+    cryptography, or signxml's own schema check, which raises rather than returning a result.
 
     **``verified=True`` vouches for ``signed_content`` and nothing else, so read the message from
     ``signed_content``, never from your own parse of ``document``** (vault BACKLOG #5538, reviewed
@@ -358,19 +360,20 @@ def verify(
 
     - free text in a ``ds:KeyInfo`` leaf, such as ``ds:KeyName``, ``ds:MgmtData``,
       ``ds:X509SubjectName`` or ``ds:X509Certificate``;
-    - the ``Id`` attribute of ``ds:Signature`` or ``ds:SignatureValue``;
+    - attributes the schema allows on ``ds:Signature`` and ``ds:SignatureValue``, which are not
+      checked here: at least an ``Id``, and an ``xsi:`` attribute such as ``xsi:schemaLocation``;
     - the ``Id``, ``URI`` and ``Algorithm`` attributes :data:`_KEY_INFO_ATTRIBUTES` admits on
       ``ds:KeyInfo`` and its descendants, wherever the schema defines one, such as the ``Id`` of
       ``ds:KeyInfo``, the ``URI`` of ``dsig11:KeyInfoReference`` or the ``Algorithm`` of
-      ``dsig11:X509Digest``.
+      ``dsig11:X509Digest``;
+    - a namespace declaration, such as one on ``ds:KeyInfo``, whose URI is free text.
 
     An unsigned ``Id`` there may repeat an ``Id`` the payload carries, so a ``//*[@Id=...]`` lookup
     on your own parse can return an element nobody signed. The ``ds:KeyInfo`` leaves and their
     attributes are admitted on purpose, as a set, so that a signer emitting standard key data such
     as a key name or subject name is not refused; none of that content is in ``signed_content``. Do
-    not take the signer's identity from ``ds:KeyInfo`` either: the anchor you pass is what checks
-    the signer. When ``x509_cert`` pins it, signxml does not read the certificates in
-    ``ds:X509Data``, so do not treat even a ``ds:X509Certificate`` there as checked.
+    not take the signer's identity from ``ds:KeyInfo`` either, and do not treat a
+    ``ds:X509Certificate`` there as checked: the anchor you pass is what checks the signer.
 
     Raises :class:`ValueError` if no anchor is supplied,
     :class:`~messagefoundry.parsing.xml.errors.XmlError` if the input is unparseable, and

@@ -2,9 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """XML-DSig ``verify()`` trusts a document only when the signature covers all of it (vault BACKLOG #2315).
 
-"All of it" means the document outside its ``ds:Signature`` element. The unsigned content a
-verified document may still carry inside that element is listed on ``verify()``, and the tests
-after the KeyInfo positive control pin it (vault BACKLOG #5538).
+"All of it" means the document outside its ``ds:Signature`` element. ``verify()`` lists at least
+some of the unsigned content a verified document may still carry inside that element, and the
+tests after the KeyInfo positive control pin the listed cases only (vault BACKLOG #5538).
 
 ``verify()`` used to return a bare ``verified=True`` and drop the subtree signxml reported as signed.
 A Handler then read its own parse of the whole document. So a document that carried a genuinely
@@ -231,7 +231,7 @@ def test_ordinary_key_info_shapes_still_verify(anchor: bytes, replacement: bytes
 
 #: Letters only, so it is also a well-formed base64 value where the schema wants one.
 _UNSIGNED_TEXT = b"UNSIGNEDXSIGNATUREXTEXTX"
-_DSIG11_DECL = f'xmlns:dsig11="{sigmod._DSIG11_NS}"'.encode()
+_DSIG11_DECL = b'xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"'
 
 
 @pytest.mark.parametrize(
@@ -307,7 +307,11 @@ def test_a_certificate_under_a_pinned_signer_is_not_signed_content() -> None:
         count=1,
     )
     assert _UNSIGNED_TEXT in edited, "the pattern did not match, so no text was placed"
-    assert _UNSIGNED_TEXT not in (_verify(edited).signed_content or b"")
+    result = _verify(edited)
+    if result.verified:
+        assert result.signed_content is not None
+        assert b"SYNTHETIC-WIDGET" in result.signed_content, "signed_content lost the signed body"
+    assert _UNSIGNED_TEXT not in (result.signed_content or b"")
 
 
 def test_an_unsigned_key_info_id_may_repeat_a_payload_id() -> None:
