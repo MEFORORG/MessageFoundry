@@ -742,12 +742,11 @@ Postgres runtime tests. It adds the two NOCOUNT tests and both recovery-closure 
   connection rather than recycling it (BACKLOG #5066). That bound frees the caller, not the
   server: the discarded session keeps its open transaction and its locks until its close lands or
   the server ends it, and the rollback keeps its executor thread until the driver returns.
-  At least these are not clamped either: the start-up
-  `_register`, `_ensure_tables` and config-version seed. **CORRECTED 2026-11-09 (BACKLOG #5064):**
-  this list also named the heartbeat, config-version and release statements. The heartbeat, the config-version
-  refresh and a stepdown's release now run under the clamp; `stop()`'s release and `left` write run under its own shutdown bound
-  (`STOP_WRITE_TIMEOUT_SECONDS`), at the driver too. The
-  claim's borrow is now bounded by the clamp rather than `[store].acquire_timeout` alone, so a
+  At least these are not clamped either: the start-up `_register`, `_ensure_tables` and
+  config-version seed. **CORRECTED 2026-11-09 (BACKLOG #5064):** this list also named the
+  heartbeat, config-version and release statements. The heartbeat, the config-version refresh and
+  a stepdown's release now run under the clamp; `stop()`'s release and `left` write run under its
+  own shutdown bound (`STOP_WRITE_TIMEOUT_SECONDS`), at the driver too. The claim's borrow is now bounded by the clamp rather than `[store].acquire_timeout` alone, so a
   leader whose pool is busy but healthy can self-fence sooner.
 - If D1 fails and no node ever acquires the lease again, the row stays INFLIGHT. No node is leading
   then either, so nothing else moves.
