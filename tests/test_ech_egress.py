@@ -225,12 +225,13 @@ def test_ech_and_verify_off_refused_at_construction_whatever_attested(
         _build_attested(
             posture, ech_egress=True, ech_sidecar="http://127.0.0.1:8123", verify_tls=False
         )
-    assert "ATTESTED" not in caplog.text
     assert "DISABLED" not in caplog.text
-    # CONTROL 1: the same attested verify-off hop with no sidecar builds and logs both lines, so the
-    # absence above is the refusal's placement and not a log this capture cannot see.
+    if enforcing:  # the verify-off gate logs an attested crossing only on an enforcing instance
+        assert "ATTESTED" not in caplog.text
+    # CONTROL 1: the same attested verify-off hop with no sidecar builds and logs the same lines, so
+    # the absence above is the refusal's placement and not a log this capture cannot see.
     caplog.clear()
-    _build_attested(posture, verify_tls=False, url="https://203.0.113.10/ingest")
+    _build_attested(posture, verify_tls=False)
     assert "DISABLED" in caplog.text
     if enforcing:
         assert "ATTESTED" in caplog.text

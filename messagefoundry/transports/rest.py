@@ -2737,7 +2737,8 @@ class RestDestination(DestinationConnector):
         # the revocation guard below, which runs only on the verify-ON branch. Refused here, above
         # refuse_verify_off, so that gate logs no attested crossing and no DISABLED warning for a
         # connection that never builds. No attestation crosses it, as with proxy_url above.
-        if self._ech_sidecar is not None and not bool_setting(s, "verify_tls", default=True):
+        verify = bool_setting(s, "verify_tls", default=True)
+        if self._ech_sidecar is not None and not verify:
             raise ValueError(
                 "ech_egress and verify_tls=false are mutually exclusive — the ECH sidecar, not the "
                 "engine, makes this connection's TLS connection to the destination (ADR 0139)"
@@ -2827,7 +2828,6 @@ class RestDestination(DestinationConnector):
                 credentials=(),
                 connection=config.name,
             )
-        verify = bool_setting(s, "verify_tls", default=True)
         if verify:
             # #129 (ADR 0094): granular expiry-only relaxation — verify the chain's signatures + hostname
             # but tolerate an expired server cert, and at least the other chain certificates' and a CRL's
