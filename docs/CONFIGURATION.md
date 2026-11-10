@@ -1358,7 +1358,7 @@ per-inbound worker child** (never a per-message fork), enforcing a forbidden-imp
 (socket/store/crypto) and the resource caps below. An isolation denial (forbidden op, cap overrun,
 worker crash, an invalid answer or one forged without the request's id) fails that message's call as
 an internal error **post-ACK** (no NAK, never dropped), which the `[delivery] internal_error` policy
-then handles. At least two cases differ (vault BACKLOG #3135). A request the engine cannot
+then handles. A request the engine cannot
 encode, or one over the frame cap, keeps the worker, since no byte
 of it was written; a worker answer the codec rejects still kills the worker. A stray frame found
 waiting **before** a request kills the worker and retries the message once on a fresh one (owner
