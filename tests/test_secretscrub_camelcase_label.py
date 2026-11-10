@@ -186,6 +186,74 @@ def test_the_swallow_lines_print_without_the_split_walk(monkeypatch: pytest.Monk
     assert len(printed) >= len(lines) // 2, f"only {len(printed)} of {len(lines)} printed"
 
 
+# --- The compound key-material words: AccountKey, SharedAccessKey and the like ----------------------
+
+#: Synthetic Azure-shaped connection strings and SDK settings, each with its key value in the middle.
+_COMPOUND_KEY_LINES = (
+    f"DefaultEndpointsProtocol=https;AccountName=zqacct;AccountKey={_VALUE};EndpointSuffix=x.invalid",
+    f"Endpoint=sb://zq.example.invalid/;SharedAccessKeyName=RootManage;SharedAccessKey={_VALUE}",
+    f"storage init failed: storageAccountKey={_VALUE}",
+    f'{{"accessKey": "zqid", "secretKey": "{_VALUE}"}}',
+    f"cfg AUTHKEY={_VALUE}",
+)
+
+
+@pytest.mark.parametrize("line", _COMPOUND_KEY_LINES)
+def test_a_compound_key_label_loses_its_value_on_every_surface(line: str) -> None:
+    printed = [name for name, apply in _SURFACES if _VALUE in apply(line)]
+    assert not printed, (line, printed)
+
+
+def test_the_compound_key_lines_print_without_the_compound_words(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL: with ``_KEY_MATERIAL`` reading only ``_KEY_MATERIAL_WORDS`` again, every
+    line above prints its value on the credential scrub."""
+    pattern = secretscrub._KEY_MATERIAL
+    words = secretscrub._alternation(secretscrub._KEY_LABEL_WORDS)
+    assert pattern.pattern.count(words) == 1
+    old = pattern.pattern.replace(words, secretscrub._alternation(secretscrub._KEY_MATERIAL_WORDS))
+    monkeypatch.setattr(secretscrub, "_KEY_MATERIAL", re.compile(old, pattern.flags))
+    printed = [line for line in _COMPOUND_KEY_LINES if _VALUE in scrub_credentials(line)]
+    assert printed == list(_COMPOUND_KEY_LINES)
+
+
+def test_the_compound_key_words_stay_clear_of_the_query_exclusions() -> None:
+    """``_QUERY_NOT_CREDENTIAL_TAILS`` names keys that are not secrets, such as ``partitionKey``. No
+    compound word may end one of them, or be ended by one, and each key exclusion, written in
+    camelCase as a whole word and after a lower-case word, keeps its value. Driven by both tuples, so
+    a word added to either is checked."""
+    exclusions = secretscrub._QUERY_NOT_CREDENTIAL_TAILS
+    for word in secretscrub._COMPOUND_KEY_WORDS:
+        for excluded in exclusions:
+            assert not word.endswith(excluded) and not excluded.endswith(word), (word, excluded)
+    key_exclusions = [word for word in exclusions if word.endswith("key")]
+    assert len(key_exclusions) >= 5, key_exclusions
+    for excluded in key_exclusions:
+        camel = excluded[:-3] + "Key"
+        line = f"lookup {camel}={_VALUE} and x{camel.capitalize()[:-3]}Key={_VALUE}"
+        assert scrub_credentials(line) == line, line
+
+
+def test_a_key_name_that_only_names_a_key_keeps_its_value() -> None:
+    """A compound word must END the label: ``SharedAccessKeyName`` names a key and holds none."""
+    line = "SharedAccessKeyName=RootManage;accessKeyId=zqid"
+    assert scrub_credentials(line) == line
+
+
+def test_every_compound_key_word_is_a_stop_label() -> None:
+    """The stop and the run-on read the compound words too, so a plain value stops before one whose
+    value is quoted, as it does before ``private_key``."""
+    quoted = re.compile(secretscrub._QUOTED_LABEL)
+    run_on = re.compile(secretscrub._RUN_ON_LABEL)
+    for word in secretscrub._COMPOUND_KEY_WORDS:
+        for spelling in (word, word.upper()):
+            assert quoted.match(f'{spelling}="v w"'), spelling
+            assert run_on.match(f"{spelling}= "), spelling
+        line = f"token=x;{word}='{_VALUE} {_VALUE}'"
+        assert _VALUE not in scrub_credentials(line), line
+
+
 #: The length span and the growth allowed across it, as ``tests/test_log_redaction_secret_domain.py``
 #: sets them for the label patterns' other growth arms: 8x the length, linear near 8.
 _SPAN = (2048, 16384)

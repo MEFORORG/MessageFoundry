@@ -189,6 +189,27 @@ _KEY_MATERIAL_WORDS = (
     "intake_api_key_next",
 )
 
+#: Key MATERIAL labels written as ONE compound word, the way Azure and cloud SDKs spell a key secret:
+#: ``AccountKey=`` in a storage connection string, ``SharedAccessKey=`` in a Service Bus or Event Hubs
+#: one, and ``accessKey`` or ``secretKey`` in an SDK's configuration (BACKLOG #5545).
+#:
+#: A NAMED LIST, NOT A ``key`` RULE, because bare ``key`` is deliberately absent from every family here
+#: (the comment on :data:`_CREDENTIAL_WORDS` says why), and a camelCase ``Key`` tail would read
+#: ``partitionKey``, ``rowKey`` and ``publicKey`` as credentials. The URL query detector's
+#: :data:`_QUERY_NOT_CREDENTIAL_TAILS` names those exclusions, and
+#: ``tests/test_secretscrub_camelcase_label.py`` holds this list clear of every one of them. Each
+#: word must END the label, as every keyword here must, so ``SharedAccessKeyName=``, which names a
+#: key rather than holding one, keeps its value.
+#:
+#: Read by :data:`_KEY_MATERIAL`, as a whole word (``AccountKey=``) or after a camelCase capital
+#: (``StorageAccountKey=``). NOT added to :data:`_KEY_MATERIAL_WORDS`: that list is BACKLOG #1475's
+#: measured set of engine settings, and ``redaction``'s glued-label pattern and the query detector
+#: both read it.
+_COMPOUND_KEY_WORDS = ("sharedaccesskey", "accountkey", "accesskey", "secretkey", "authkey")
+
+#: Every word :data:`_KEY_MATERIAL` reads as a label.
+_KEY_LABEL_WORDS = _KEY_MATERIAL_WORDS + _COMPOUND_KEY_WORDS
+
 #: The environment-variable prefix every MessageFoundry secret arrives under. ``resolve_env_settings``
 #: echoes the NAME and the VALUE together on a cast failure -- ``setting 'password' (env
 #: 'MEFOR_VALUE_PW'='<value>')`` -- and that error text reaches the general log.
@@ -261,7 +282,7 @@ _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 _LABEL_START = r"(?:\b|(?<=%[0-9A-Fa-f]{2}))"
 
 #: The label words a camelCase start may open on (BACKLOG #5545): every family's.
-_CAMEL_WORDS = _CREDENTIAL_WORDS + _TOKEN_WORDS + _KEY_MATERIAL_WORDS
+_CAMEL_WORDS = _CREDENTIAL_WORDS + _TOKEN_WORDS + _KEY_LABEL_WORDS
 
 # A second place a label may start: at a camelCase boundary, a capital right after a lower-case
 # letter or a digit, where the label word runs from that capital to the end of the word (BACKLOG
@@ -595,14 +616,14 @@ _RUN_UNIT = r"(?-i:[A-Z]++[a-z0-9]*+|[a-z0-9]++)"
 #: The first letters of every label keyword. A one-character gate in front of the keyword alternation:
 #: a case-folded alternation is tried branch by branch, and most runs start with none of these.
 _KEYWORD_INITIALS = "".join(
-    sorted({word[0] for word in _CREDENTIAL_WORDS + _KEY_MATERIAL_WORDS + _TOKEN_WORDS})
+    sorted({word[0] for word in _CREDENTIAL_WORDS + _KEY_LABEL_WORDS + _TOKEN_WORDS})
 )
 #: A label up to where its value starts: the keyword, an optional quote, the ":" or "=", and an auth
 #: scheme word after a token label. A token label takes the quote only before ":"; ``_BEARER`` says
 #: why.
 _LABEL_HEAD = (
     r"(?=(?i:[" + _KEYWORD_INITIALS + r"]))"
-    r"(?:(?i:" + _alternation(_CREDENTIAL_WORDS + _KEY_MATERIAL_WORDS) + r")\b['\"]?\s*+[:=]\s*+"
+    r"(?:(?i:" + _alternation(_CREDENTIAL_WORDS + _KEY_LABEL_WORDS) + r")\b['\"]?\s*+[:=]\s*+"
     r"|(?i:" + _alternation(_TOKEN_WORDS) + r")\b(?:['\"]\s*+:|\s*+[:=])\s*+"
     r"(?:(?i:bearer|basic|digest)\s++)?"
     r")"
@@ -743,7 +764,7 @@ _NOT_BEFORE_QUOTED_LABEL = (
 #: cross a line or end on a ``'label'=`` echo's own quote.
 _RUN_ON_LABEL = (
     r"(?:(?=(?i:[" + _KEYWORD_INITIALS + r"]))"
-    r"(?:(?i:" + _alternation(_CREDENTIAL_WORDS + _KEY_MATERIAL_WORDS) + r")\b"
+    r"(?:(?i:" + _alternation(_CREDENTIAL_WORDS + _KEY_LABEL_WORDS) + r")\b"
     r"[^\S\r\n]*+[:=][^\S\r\n]*+"
     r"|(?i:" + _alternation(_TOKEN_WORDS) + r")\b[^\S\r\n]*+[:=][^\S\r\n]*+"
     r"(?:(?i:bearer|basic|digest)[^\S\r\n]++)?)"
@@ -1038,7 +1059,7 @@ _KEY_MATERIAL = re.compile(
     + r"("
     + _LABEL_PREFIX
     + r"(?:"
-    + _alternation(_KEY_MATERIAL_WORDS)
+    + _alternation(_KEY_LABEL_WORDS)
     + r"))\b"
     r"['\"]?\s*[:=]\s*"
     r"(?:"
@@ -1543,7 +1564,7 @@ def _folded(words: tuple[str, ...]) -> tuple[str, ...]:
 _CREDENTIAL_HINT = _folded(_CREDENTIAL_WORDS)
 _TOKEN_HINT = _folded(_TOKEN_WORDS)
 _MEMBER_EXTRA_HINT = _folded(_MEMBER_EXTRA_WORDS)
-_KEY_MATERIAL_HINT = _folded(_KEY_MATERIAL_WORDS)
+_KEY_MATERIAL_HINT = _folded(_KEY_LABEL_WORDS)
 _SCHEME_HINT = _folded(("bearer",))
 _ENV_HINT = _folded((_ENV_PREFIX,))
 _DSN_HINT = (_DSN_MARKER,)
@@ -1551,8 +1572,9 @@ _DSN_HINT = (_DSN_MARKER,)
 #: The union of every per-pass gate, reduced by SUBSUMPTION: a word containing another word of the set
 #: is dropped, because any text holding it holds the shorter one too. Derived, so it cannot drift from
 #: the tuples above -- ``pass`` subsumes ``password``/``passwd``/``passphrase``, ``encryption_key``
-#: subsumes ``encryption_keys_retired``, ``api_key`` subsumes ``intake_api_key_next``. One scan of 15
-#: members instead of 20, and it rejects the overwhelmingly common record: the one carrying no
+#: subsumes ``encryption_keys_retired``, ``api_key`` subsumes ``intake_api_key_next``, ``accesskey``
+#: subsumes ``sharedaccesskey``. One scan of 18 members instead of 25 (counted since BACKLOG #5545's
+#: compound key words), and it rejects the overwhelmingly common record: the one carrying no
 #: credential word at all. The member pass's own words (:data:`_MEMBER_EXTRA_HINT`) are in it too,
 #: so a word added there and nowhere else still admits the record (BACKLOG #5030).
 _ANY_HINT = tuple(
