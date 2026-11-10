@@ -595,6 +595,28 @@ _PIP_AUDIT_SHORT_VALUE_OPTIONS = {
 #: This module's own options, which argparse hands to pip-audit when they come after the lock.
 _OWN_OPTIONS = ("--skip-private", "--pass-environment")
 
+#: pip-audit options that end it with exit 0 without auditing what the auditor hands it: a dry
+#: run, a fix that rewrites the copy, help and version. After the lock each is refused, so the gate
+#: cannot read clean with nothing audited.
+_FAIL_OPEN_LONG = ("--dry-run", "--fix", "--help", "--version")
+_FAIL_OPEN_SHORT = frozenset("dhV")
+
+
+def _opens_the_gate(head: str) -> bool:
+    """Whether ``head``, a word up to any ``=``, is one of :data:`_FAIL_OPEN_LONG` or an
+    abbreviation of one, or a cluster of short flags that holds one of :data:`_FAIL_OPEN_SHORT`
+    before any short option that takes a value."""
+    if head.startswith("--"):
+        return len(head) > 2 and any(option.startswith(head) for option in _FAIL_OPEN_LONG)
+    if not head.startswith("-"):
+        return False
+    for letter in head[1:]:
+        if letter in _FAIL_OPEN_SHORT:
+            return True
+        if f"-{letter}" in _PIP_AUDIT_SHORT_VALUE_OPTIONS:
+            return False
+    return False
+
 
 def _names_own_option(head: str) -> bool:
     """Whether ``head`` is one of :data:`_OWN_OPTIONS` or an abbreviation of it that is no
@@ -623,7 +645,15 @@ def _after_lock_refusal(pip_audit_args: Sequence[str]) -> str | None:
     for position, word in enumerate(pip_audit_args, 1):
         head, equals, value = word.partition("=")
         if _names_own_option(head):
-            return f"word {position} after the lock is this auditor's own option; it goes before the lock"
+            return (
+                f"word {position} after the lock is this auditor's own option; it goes before "
+                "the lock"
+            )
+        if _opens_the_gate(head):
+            return (
+                f"word {position} after the lock would end pip-audit with no audit (a dry run, a "
+                "fix, help or version); it is not passed on"
+            )
         if not equals:
             continue
         option = _PIP_AUDIT_SHORT_VALUE_OPTIONS.get(head, head)
