@@ -62,6 +62,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as _dc_fields
 from enum import Enum, StrEnum
@@ -79,6 +80,7 @@ from typing import (
     TypedDict,
     assert_never,
     cast,
+    overload,
     runtime_checkable,
 )
 from uuid import uuid4
@@ -160,6 +162,7 @@ from messagefoundry.store.gcm_bound import (
     counts_under_dek,
     reserve_invocations_ahead,
 )
+from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_reference_value,
@@ -405,8 +408,18 @@ async def _writer_guard(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIt
 
 
 @asynccontextmanager
-async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIterator[None]:
+async def _writer_txn(
+    db: aiosqlite.Connection, lock: asyncio.Lock, *, immediate: bool = False
+) -> AsyncIterator[None]:
     """Run the block inside ONE writer transaction, holding ``lock``, unwinding on **BaseException**.
+
+    ``immediate`` opens it with ``BEGIN IMMEDIATE``, which takes SQLite's write lock at the
+    ``BEGIN``, waiting out another process's writer under ``busy_timeout``, so nothing another
+    process commits can land between the block's first read and its write. The deferred default
+    takes it at the first write, and a writer in another process that committed after the block's
+    read then fails that write with ``SQLITE_BUSY_SNAPSHOT`` rather than wait (BACKLOG #3078 F5).
+    The ``asyncio`` lock already serializes this process, so only a block that must decide on a
+    read across processes needs it: the first-administrator grant.
 
     **Every writer that opens an EXPLICIT transaction goes through here** — ``execute("BEGIN")``
     appears nowhere else on ``self._db``, and ``tests/test_writer_txn_is_the_only_begin.py`` keeps it
@@ -434,7 +447,10 @@ async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIter
     ``rollback()`` itself first or it leaves the transaction open for the next writer."""
     async with lock:
         try:
-            await db.execute("BEGIN")
+            if immediate:
+                await db.execute("BEGIN IMMEDIATE")
+            else:
+                await db.execute("BEGIN")
             yield
         except BaseException as exc:
             await _unwind_and_raise(db, exc, role="writer")
@@ -1652,6 +1668,19 @@ class AlertInstance:
 
 
 @dataclass(frozen=True)
+class AlertGeneration:
+    """Which raise a live alert instance is at: its ``id`` and its occurrence ``count`` (BACKLOG
+    #3269). ``count`` only grows on a live row and a new row gets a new ``id``, so the pair names one
+    point in the instance's life without reading any clock. A resolve bounded by it
+    (:meth:`~messagefoundry.store.base.QueueStore.resolve_alert_generation`) cannot close a raise
+    that landed after the pair was read. Metadata only, never a reason or a message body."""
+
+    id: int
+    connection: str
+    count: int
+
+
+@dataclass(frozen=True)
 class AlertSummary:
     """The whole-of-scope aggregate over **active** (open + acknowledged) alert instances (BACKLOG
     #1564) — what the nav bell needs, and the one thing a page of rows cannot give it.
@@ -1895,17 +1924,17 @@ class AdminGrant(StrEnum):
     #: written. ``provision_first_administrator`` counts only one that signs in with a local
     #: password (vault BACKLOG #2711 step 1).
     ADMIN_EXISTS = "admin_exists"
-    #: The account no longer holds the credentials the caller wrote, holds a role already, or is
-    #: disabled or gone, so nothing was written.
+    #: The account no longer holds the credentials the caller wrote, holds a role or a passkey
+    #: already, or is disabled or gone, so nothing was written.
     ACCOUNT_CHANGED = "account_changed"
 
 
 #: How many times the SQLite store runs the first-administrator grant's transaction when SQLite
-#: answers busy (BACKLOG #3078). ``provision-admin`` is a process of its own, and the writer's
-#: deferred ``BEGIN`` means a writer in another process that committed after this one's read makes
-#: the write fail with ``SQLITE_BUSY_SNAPSHOT`` rather than wait. The re-run re-reads, so the
-#: committed write decides. Bounded, and a busy that outlasts it is raised, never read as a refusal:
-#: an unrelated engine write can be what was busy.
+#: answers busy (BACKLOG #3078). ``provision-admin`` is a process of its own. Its ``BEGIN IMMEDIATE``
+#: (F5) waits out another process's writer for ``busy_timeout`` before answering busy, so a re-run
+#: follows a writer that held the lock past that wait, such as a long engine transaction. The re-run
+#: re-reads, so the committed write decides. Bounded, and a busy that outlasts it is raised, never
+#: read as a refusal: an unrelated engine write can be what was busy.
 _ADMIN_GRANT_BUSY_ATTEMPTS: Final = 5
 _ADMIN_GRANT_BUSY_BACKOFF_SECONDS: Final = 0.05
 
@@ -2124,6 +2153,13 @@ class UserRecord:
     # one, and a session resolves only while its own ``user_epoch`` equals it. Both copies are
     # sealed: the session's in the session seal, this one in the account's own seal.
     session_epoch: int = 0
+    # THE DIRECTORY ACCOUNT'S ENROLMENT CODE (ADR 0207). The ``hash_token`` digest of the one code
+    # outstanding, when it expires, and the issuing Administrator's account id (``None`` for
+    # one the host command issued). All three are NULL with no code outstanding, and every write that
+    # clears the digest clears the other two (``enrolment_code_cleared``). Never the code itself.
+    enrolment_code_digest: str | None = None
+    enrolment_code_expires_at: float | None = None
+    enrolment_code_issuer: str | None = None
     # THE STORE'S GLOBAL SESSION EPOCH as this read found it (BACKLOG #5091), which a session's own
     # ``global_epoch`` must equal too. Not a column of this row and not in its seal: every user reader
     # selects it beside the row (``USER_READ_SQL``). ``GLOBAL_SESSION_EPOCH_SQL`` says why.
@@ -2197,6 +2233,11 @@ class UserRecord:
             # Hard subscript (BACKLOG #2592): a missing key would decode as epoch 0, which every
             # session minted before a revoke also carries, so it is the OPEN direction.
             session_epoch=int(d["session_epoch"]),
+            # ``.get()``s (ADR 0207): a missing key decodes as "no code outstanding", which refuses
+            # every code shown -- the closed direction.
+            enrolment_code_digest=d.get("enrolment_code_digest"),
+            enrolment_code_expires_at=_opt_float(d.get("enrolment_code_expires_at")),
+            enrolment_code_issuer=d.get("enrolment_code_issuer"),
             # Hard subscript for the same reason: every user reader is ``USER_READ_SQL``, and a
             # mapping without the global epoch fails here rather than decode one nobody read.
             global_session_epoch=global_epoch_or_refuse(d["global_session_epoch"]),
@@ -2445,6 +2486,16 @@ USER_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType(
     }
 )
 
+#: The ``users`` columns a user seal covers only while they hold a value (ADR 0207 Amendment A). A
+#: field encoded as ``None`` would still change the sealed bytes, so adding these as plain fields
+#: would break the seal of every account sealed before they existed, and rotate-key's re-seal pass
+#: refuses a record that fails. Left out while NULL, an account that never held a code keeps the
+#: seal it was sealed under; a value planted outside the store still fails the seal, as
+#: :func:`passkey_digest` treats ``discoverable``.
+USER_SEAL_WHEN_SET: Final[frozenset[str]] = frozenset(
+    {"enrolment_code_digest", "enrolment_code_expires_at", "enrolment_code_issuer"}
+)
+
 #: The ``webauthn_credentials`` columns the passkey digest leaves out, each with its reason.
 PASSKEY_DIGEST_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -2498,6 +2549,11 @@ class UserRow:
     session_epoch: int
     #: A digest of the account's passkeys (:func:`passkey_digest`), ``""`` with none.
     cred_digest: str
+    #: The enrolment code's digest, expiry and issuer (ADR 0207), each ``None`` with no code. Each
+    #: enters the seal only while it holds a value (:data:`USER_SEAL_WHEN_SET`).
+    enrolment_code_digest: str | None
+    enrolment_code_expires_at: float | None
+    enrolment_code_issuer: str | None
     #: The seal (``mfseal:v1:...``) over everything else. ``""`` on a keyless store.
     authz_seal: str
 
@@ -2540,6 +2596,9 @@ class UserRow:
             password_generated=bool(d["password_generated"]),
             session_epoch=int(d["session_epoch"]),
             cred_digest=str(d["cred_digest"] or ""),
+            enrolment_code_digest=_opt_str(d["enrolment_code_digest"]),
+            enrolment_code_expires_at=_opt_float(d["enrolment_code_expires_at"]),
+            enrolment_code_issuer=_opt_str(d["enrolment_code_issuer"]),
             authz_seal=str(d["authz_seal"] or ""),
         )
 
@@ -2607,11 +2666,13 @@ class UserAuthzRecord:
 
     def seal_fields(self) -> tuple[tuple[str, object], ...]:
         """The ``(name, value)`` pairs a user seal covers: every :class:`UserRow` field not in
-        :data:`USER_SEAL_EXCLUDED`, then the role rows, counted."""
+        :data:`USER_SEAL_EXCLUDED`, and none of :data:`USER_SEAL_WHEN_SET` while it is ``None``,
+        then the role rows, counted."""
         out: list[tuple[str, object]] = [
             (f.name, getattr(self.row, f.name))
             for f in _dc_fields(self.row)
             if f.name not in USER_SEAL_EXCLUDED
+            and not (f.name in USER_SEAL_WHEN_SET and getattr(self.row, f.name) is None)
         ]
         out.append(("roles", len(self.roles)))
         for grant in self.roles:
@@ -2775,8 +2836,9 @@ _USER_INSERT: Final = (
     " totp_enabled, totp_enrolled_at, totp_recovery_codes, last_totp_step, oidc_issuer,"
     " oidc_subject, directory_object_id, password_claimed_at, channel_scope_source, lock_cycles,"
     " second_step_failed_attempts, second_step_locked_until, second_step_lock_cycles,"
-    " password_generated, session_epoch, cred_digest, authz_seal)"
-    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    " password_generated, session_epoch, cred_digest, enrolment_code_digest,"
+    " enrolment_code_expires_at, enrolment_code_issuer, authz_seal)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 _USER_RESEAL: Final = (
     "UPDATE users SET username=?, auth_provider=?, display_name=?, email=?, notify_email=?,"
@@ -2786,7 +2848,8 @@ _USER_RESEAL: Final = (
     " last_totp_step=?, oidc_issuer=?, oidc_subject=?, directory_object_id=?,"
     " password_claimed_at=?, channel_scope_source=?, lock_cycles=?,"
     " second_step_failed_attempts=?, second_step_locked_until=?, second_step_lock_cycles=?,"
-    " password_generated=?, session_epoch=?, cred_digest=?, authz_seal=?"
+    " password_generated=?, session_epoch=?, cred_digest=?, enrolment_code_digest=?,"
+    " enrolment_code_expires_at=?, enrolment_code_issuer=?, authz_seal=?"
     " WHERE id=? AND authz_seal=?"
 )
 _USER_ROLES_CLEAR: Final = "DELETE FROM user_roles WHERE user_id=?"
@@ -2902,6 +2965,9 @@ def new_user_record(
         password_generated=bool(password_generated),
         session_epoch=0,
         cred_digest="",
+        enrolment_code_digest=None,
+        enrolment_code_expires_at=None,
+        enrolment_code_issuer=None,
         authz_seal="",
     )
     return UserAuthzRecord(row=row)
@@ -3086,22 +3152,17 @@ def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
     under today's credential-id hash scheme, the only key the sign-in looks a passkey up by (BACKLOG
     #3423). A row the start-up rehash has not moved (a bare digest), or one it refused (an unknown
     tag, a malformed value), can never sign in, so it is no way past however it is recorded. The one
-    statement of the per-passkey rule: the store's conditional writes, the census, the service's
-    gates, the sign-in path and the lock notice all ask it."""
+    statement of the per-passkey way-past rule: at least the store's conditional writes, the census,
+    the service's gates, the sign-in path and the lock notice ask it. The census's reset list asks
+    only its hash-scheme half for a directory account's second factor, which needs no discoverable
+    record (:func:`~messagefoundry.auth.tokens.credential_id_hash_is_current`)."""
     if not cred.discoverable:
         return False
     # Lazy: a leaf module of the auth package (stdlib only), imported where the rule is asked so
     # the store module takes no import-time dependency on the auth package.
-    from messagefoundry.auth.tokens import (
-        CREDENTIAL_ID_HASH_SCHEME,
-        CredentialHashSchemeError,
-        credential_id_hash_scheme,
-    )
+    from messagefoundry.auth.tokens import credential_id_hash_is_current
 
-    try:
-        return credential_id_hash_scheme(cred.credential_id_hash) == CREDENTIAL_ID_HASH_SCHEME
-    except CredentialHashSchemeError:
-        return False
+    return credential_id_hash_is_current(cred.credential_id_hash)
 
 
 #: The caller's rule for which passkey counts as a way past at a factor-drop gate (BACKLOG #3937):
@@ -3152,12 +3213,19 @@ TotpUsable = Callable[[str | None], TotpState]
 TotpCounts = Callable[[UserAuthzRecord], bool]
 
 
-def require_totp_rule(require_way_past: bool, usable: TotpUsable | None) -> None:
-    """Refuse a conditional way-past write that brought no TOTP rule: without one an enrolment the
-    engine cannot compute with would count as a way past, which is the failure this rule exists to
-    stop (BACKLOG #3422). Raises :class:`ValueError`; every backend calls it first."""
-    if require_way_past and usable is None:
-        raise ValueError("a conditional way-past write needs totp_usable")
+def conditional_way_past(require_way_past: TotpUsable | None) -> bool:
+    """Whether a write's ``require_way_past`` makes it conditional on a way past the sign-in lock
+    (ADR 0197 Amendment A). The parameter IS the caller's TOTP rule (:data:`TotpUsable`, BACKLOG
+    #3422), so a conditional write that brings no rule cannot be written, where a flag beside an
+    optional rule allowed it (BACKLOG #3948 finding 14). A flag where the rule belongs, the old
+    ``require_way_past=True`` from a caller typed ``Any``, raises :class:`TypeError`: judged as
+    no rule, a TOTP the engine cannot compute with would count as a way past. Every backend's
+    conditional write calls it first."""
+    if require_way_past is None:
+        return False
+    if not callable(require_way_past):
+        raise TypeError("require_way_past takes the caller's TOTP rule (TotpUsable), not a flag")
+    return True
 
 
 #: When each account's TOTP cell was last logged as not opening (monotonic seconds), so a gate
@@ -3184,43 +3252,77 @@ def log_unopened_totp(user_id: str) -> None:
     )
 
 
+@overload
+async def judge_totp(
+    opener: Callable[[str, str | None], str | None],
+    usable: TotpUsable,
+    user: UserRecord | None,
+) -> TotpJudgement: ...
+
+
+@overload
 async def judge_totp(
     opener: Callable[[str, str | None], str | None],
     usable: TotpUsable | None,
     user: UserRecord | None,
-) -> TotpCounts | None:
-    """The :data:`TotpCounts` a backend passes to :func:`holds_way_past`,
-    :func:`removal_keeps_way_past`, :func:`totp_removal` and :func:`lockout_increment`.
+) -> TotpJudgement | None: ...
 
-    ``user`` is the account as read BEFORE the write takes its lock, so the cell is opened with
+
+async def judge_totp(
+    opener: Callable[[str, str | None], str | None],
+    usable: TotpUsable | None,
+    user: UserRecord | None,
+) -> TotpJudgement | None:
+    """The :data:`TotpCounts` a backend passes to the conditional-write rules, at least
+    :func:`removal_keeps_way_past`, :func:`totp_removal`, :func:`lockout_increment` and
+    :func:`password_change`. A caller outside a backend may call it too, with no lock to confirm
+    the cell under, and then reads only the judgement's ``state``.
+
+    ``user`` is the account as the caller read it, with no lock held, so the cell is opened with
     ``opener`` (the backend's ``open_totp_secret``) and judged by ``usable`` OFF THE EVENT LOOP and
     with no lock held: a Transit cipher's decrypt is a blocking HTTP call (CLAUDE.md section 6), and
-    holding SQLite's writer lock or a row lock across it would stall every other write. Under the
-    lock the verdict holds only for that exact cell (:meth:`TotpJudgement.moved`); each caller says
-    what a moved cell means for it. A cell that does not open is ``"unknown"``
-    (:func:`log_unopened_totp`), never a refusal. ``None`` for no ``usable``."""
+    holding SQLite's writer lock or a row lock across it would stall every other write. Under a
+    backend's lock the verdict holds only for that exact cell (:meth:`TotpJudgement.moved`); each
+    caller says what a moved cell means for it. The cell is judged by :func:`judge_totp_cell`.
+    ``None`` for no ``usable``."""
     if usable is None:
         return None
-    rule = usable
     cell = (
         None if user is None or user.row is None or not user.totp_enabled else user.row.totp_secret
     )
     state: TotpState = "refused"  # no cell: no TOTP to count
     if user is not None and cell is not None:
-
-        def judge(user_id: str, stored: str) -> TotpState:
-            return rule(opener(user_id, stored))
-
-        try:
-            state = await asyncio.to_thread(judge, user.id, cell)
-        except CipherError:
-            log_unopened_totp(user.id)
-            state = "unknown"
-        if state not in ("usable", "refused", "unknown"):
-            # A bool rule (the old shape) would read False as "not refused", which fails open.
-            raise TypeError(f"totp_usable answered {state!r}, not a TotpState")
-
+        state = await judge_totp_cell(opener, usable, user.id, cell)
     return TotpJudgement(cell=cell, state=state)
+
+
+async def judge_totp_cell(
+    opener: Callable[[str, str | None], str | None],
+    usable: TotpUsable,
+    user_id: str,
+    cell: str,
+) -> TotpState:
+    """What one stored TOTP ``cell`` is (:data:`TotpState`): opened with ``opener`` (a backend's
+    ``open_totp_secret``) and judged by ``usable``, both OFF THE EVENT LOOP, since a Transit
+    cipher's decrypt is a blocking HTTP call (CLAUDE.md section 6). A cell that does not open
+    (:class:`CipherError`) is ``"unknown"``, logged by :func:`log_unopened_totp`, never a refusal.
+
+    The one statement of the judgement (BACKLOG #3948 finding 17): :func:`judge_totp`, for the
+    store's conditional writes and the lock escalation, and the auth service's way-past gates
+    both ask it, so the two cannot drift apart."""
+
+    def judge() -> TotpState:
+        return usable(opener(user_id, cell))
+
+    try:
+        state = await asyncio.to_thread(judge)
+    except CipherError:
+        log_unopened_totp(user_id)
+        return "unknown"
+    if state not in ("usable", "refused", "unknown"):
+        # A bool rule (the old shape) would read False as "not refused", which fails open.
+        raise TypeError(f"the TOTP rule answered {state!r}, not a TotpState")
+    return state
 
 
 async def escalation_verdict(
@@ -3277,6 +3379,16 @@ def sets_a_later_sign_in_lock(row: UserRecord | UserRow, threshold: int, now: fl
 _SQLITE_DECODE_FAILURE = "Could not decode to UTF-8 column"
 
 
+def passkey_cell_undecodable(exc: BaseException) -> bool:
+    """Whether ``exc`` is a driver failing to decode a passkey cell while fetching, before any row
+    is parsed: pyodbc's ``UnicodeDecodeError``, or sqlite3's ``OperationalError`` told apart only by
+    its message (:func:`escalation_passkeys`). Every reader that counts such a set for nothing
+    asks it."""
+    if isinstance(exc, UnicodeDecodeError):
+        return True
+    return isinstance(exc, sqlite3.OperationalError) and str(exc).startswith(_SQLITE_DECODE_FAILURE)
+
+
 async def escalation_passkeys(
     counter: LockoutCounter,
     *,
@@ -3310,10 +3422,13 @@ async def escalation_passkeys(
         return None
     try:
         return await read_passkeys()
-    except (PasskeyRowMalformed, UnicodeDecodeError) as exc:
+    except PasskeyRowMalformed as exc:
         failure = type(exc).__name__
+    except UnicodeDecodeError:
+        # No name is bound: a decode error's message quotes the cell, so none is rendered.
+        failure = "UnicodeDecodeError"
     except sqlite3.OperationalError as exc:
-        if not str(exc).startswith(_SQLITE_DECODE_FAILURE):
+        if not passkey_cell_undecodable(exc):
             raise
         failure = type(exc).__name__
     # The class name only: a decode error's message and arguments quote the cell.
@@ -3526,6 +3641,15 @@ def lockout_increment(
         )
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord:
+        # The verdict the escalation reads below, where it judged the cell this locked row holds.
+        judged = (
+            totp_counts
+            if counter == "sign_in"
+            and isinstance(totp_counts, TotpJudgement)
+            and r.row.totp_enabled
+            and not totp_counts.moved(r)
+            else None
+        )
         state = next_lockout_state(
             failed_attempts=int(getattr(r.row, attempts_col)),
             locked_until=getattr(r.row, until_col),
@@ -3537,17 +3661,19 @@ def lockout_increment(
             escalate=lockout_escalates(
                 counter,
                 auth_provider=r.row.auth_provider,
-                totp_enabled=r.row.totp_enabled
-                and not (
-                    counter == "sign_in"
-                    and isinstance(totp_counts, TotpJudgement)
-                    and totp_counts.refuses(r)
-                ),
+                totp_enabled=r.row.totp_enabled and not (judged is not None and judged.refuses(r)),
                 passkey_way_past=passkey_way_past(r),
             ),
             lockable=lockout_arms(counter, password_generated=r.row.password_generated),
         )
-        out.append(LockoutIncrement(state.attempts, state.just_locked, state.cycles))
+        out.append(
+            LockoutIncrement(
+                state.attempts,
+                state.just_locked,
+                state.cycles,
+                None if judged is None else judged.state,
+            )
+        )
         return r.changed(
             **{
                 attempts_col: state.attempts,
@@ -3610,6 +3736,161 @@ def totp_enable(
         )
 
     return apply
+
+
+# --- ADR 0207: the directory account's single-use enrolment code ----------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class EnrolmentCodeOutcome:
+    """What one conditional enrolment-code write found in the record it replaced (ADR 0207).
+
+    :attr:`replaced` is whether an unexpired code was outstanding, which an issue reports.
+    :attr:`issuer_id` is the issuer of the code a spend cleared (Amendment A, A5), captured from
+    the record ``_write_user`` read under the account's lock, never from a separate read, so a
+    re-issue between a read and the write cannot make it name the wrong Administrator."""
+
+    replaced: bool = False
+    issuer_id: str | None = None
+
+
+def enrolment_code_outstanding(row: UserRow, now: float) -> bool:
+    """Whether ``row`` holds a code that has not expired at ``now``."""
+    return (
+        row.enrolment_code_digest is not None
+        and row.enrolment_code_expires_at is not None
+        and now < row.enrolment_code_expires_at
+    )
+
+
+def enrolment_code_cleared(r: UserAuthzRecord) -> UserAuthzRecord:
+    """``r`` with no code: the digest, the expiry and the issuer go together, so no issuer outlives
+    the code it named."""
+    return r.changed(
+        enrolment_code_digest=None, enrolment_code_expires_at=None, enrolment_code_issuer=None
+    )
+
+
+def _takes_a_first_code(row: UserRow) -> bool:
+    """Whether a code may be issued for, or spent on, ``row``: an enabled directory account holding
+    no engine factor. ``cred_digest`` is written in the same transaction as every passkey write,
+    under the account's lock, so it is the in-row answer to "holds a passkey"."""
+    return (
+        row.auth_provider == "ad"
+        and not row.disabled
+        and not row.totp_enabled
+        and row.cred_digest == ""
+    )
+
+
+def _code_matches(row: UserRow, code_digest: str, now: float) -> bool:
+    return (
+        enrolment_code_outstanding(row, now)
+        and row.enrolment_code_digest is not None
+        and hmac.compare_digest(row.enrolment_code_digest, code_digest)
+    )
+
+
+class EnrolmentCodeChange:
+    """A :data:`UserChange` for one enrolment-code write that keeps the record it was applied to,
+    as :class:`EpochBump` does, so :meth:`outcome` reports what that write replaced."""
+
+    def __init__(self, apply: UserChange, now: float) -> None:
+        self._apply = apply
+        self._now = float(now)
+        self._before: UserRow | None = None
+
+    def __call__(self, record: UserAuthzRecord) -> UserAuthzRecord | None:
+        self._before = record.row
+        return self._apply(record)
+
+    def outcome(self, updated: UserAuthzRecord | None) -> EnrolmentCodeOutcome | None:
+        """``None`` when the write wrote nothing: no row, a condition that did not hold, or a
+        compare lost to a concurrent write."""
+        before = self._before
+        if updated is None or before is None:
+            return None
+        return EnrolmentCodeOutcome(
+            replaced=enrolment_code_outstanding(before, self._now),
+            issuer_id=before.enrolment_code_issuer,
+        )
+
+
+def enrolment_code_issue(
+    *, code_digest: str, expires_at: float, issuer_id: str | None, now: float
+) -> EnrolmentCodeChange:
+    """What ``issue_enrolment_code`` writes (ADR 0207 sections 4 and 6): the digest, expiry and
+    issuer, replacing any outstanding code, only where the account is an enabled directory account
+    holding no engine factor. The conditions are judged on the record the write replaces."""
+    if not code_digest:
+        raise ValueError("an enrolment code digest is required")
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if not _takes_a_first_code(r.row):
+            return None
+        return r.changed(
+            enrolment_code_digest=code_digest,
+            enrolment_code_expires_at=float(expires_at),
+            enrolment_code_issuer=issuer_id,
+            updated_at=float(now),
+        )
+
+    return EnrolmentCodeChange(apply, now)
+
+
+def enrolment_code_revoke(now: float) -> UserChange:
+    """What ``revoke_enrolment_code`` writes: no code, only where one is held (expired or not), so a
+    revoke of nothing writes nothing and reports so."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if r.row.enrolment_code_digest is None:
+            return None
+        return enrolment_code_cleared(r).changed(updated_at=float(now))
+
+    return apply
+
+
+def enrolment_code_spend(*, code_digest: str, now: float) -> EnrolmentCodeChange:
+    """The passkey finish's spend (ADR 0207 Amendment A, A3 step 10): clear the code only where its
+    digest still matches and has not expired, the account is enabled, TOTP is still off and the
+    account holds no passkey. Only a write that changed a row spends, so two racing ceremonies
+    cannot both spend one code."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if not _takes_a_first_code(r.row) or not _code_matches(r.row, code_digest, now):
+            return None
+        return enrolment_code_cleared(r).changed(updated_at=float(now))
+
+    return EnrolmentCodeChange(apply, now)
+
+
+def totp_enable_spending_code(
+    recovery_code_hashes: Sequence[str],
+    now: float,
+    *,
+    expected_secret_cell: str | None,
+    code_digest: str,
+) -> EnrolmentCodeChange:
+    """The TOTP confirm's enable with the code's spend folded into it (ADR 0207 Amendment A, A3):
+    one write that turns TOTP on and clears the code, only where :func:`totp_enable`'s conditions
+    hold and the account is an enabled directory account with no passkey whose code still matches
+    and has not expired. A confirm whose enable matches no row therefore spends nothing."""
+    enable = totp_enable(recovery_code_hashes, now, expected_secret_cell=expected_secret_cell)
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if not _takes_a_first_code(r.row) or not _code_matches(r.row, code_digest, now):
+            return None
+        enabled = enable(r)
+        return None if enabled is None else enrolment_code_cleared(enabled)
+
+    return EnrolmentCodeChange(apply, now)
+
+
+def user_disabled_change(r: UserAuthzRecord, *, disabled: bool, now: float) -> UserAuthzRecord:
+    """What ``set_user_disabled`` writes. A disable clears an outstanding enrolment code in the same
+    write (ADR 0207 section 3), so re-enabling the account inside the code's life revives nothing."""
+    out = r.changed(disabled=bool(disabled), updated_at=float(now))
+    return enrolment_code_cleared(out) if disabled else out
 
 
 def first_admin_grant(
@@ -3856,6 +4137,28 @@ def without_role(role_id: str) -> UserChange:
         if role_id not in r.role_ids:
             return None
         return replace(r, roles=tuple(g for g in r.roles if g.role_id != role_id))
+
+    return apply
+
+
+def roles_if_held(
+    role_ids: Sequence[str],
+    *,
+    expected_role_ids: Iterable[str],
+    assigned_by: str | None,
+    now: float,
+) -> UserChange:
+    """``set_user_roles_if_held``'s compare-and-set (vault BACKLOG #3085): the account's roles
+    replaced with ``role_ids``, only while the record still holds exactly ``expected_role_ids``,
+    compared as sets. Each backend runs it on the record its write read under the row's lock, so
+    a write decided from an older read of the roles writes nothing once another writer has moved
+    them."""
+    expected = frozenset(expected_role_ids)
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if frozenset(r.role_ids) != expected:
+            return None
+        return r.with_roles(role_ids, assigned_by=assigned_by, now=now)
 
     return apply
 
@@ -4560,21 +4863,9 @@ AUDIT_CHAIN_KEYLESS_ROWS = (
 )
 
 
-#: The phrase :func:`audit_prefix_verdict` puts in its failure message, exported so a CALLER can tell a
-#: TRUNCATED/REWRITTEN TAIL from a BROKEN CHAIN without walking the log twice (BACKLOG #328).
-#:
-#: ``verify_audit_chain`` folds both verdicts into one ``(ok, message)`` pair and reports the chain break
-#: FIRST, returning before the prefix comparator runs. So a caller holding only ``ok=False`` cannot say
-#: which fired -- and the two want different handling: a break names a row an operator can go and read,
-#: while a truncation names rows that are no longer there to read. ``Engine._verify_audit_chain_on_start``
-#: routes them to DIFFERENT alert subjects on the strength of this marker, so they throttle and route
-#: independently.
-#:
-#: IT IS A SHARED CONSTANT RATHER THAN A STRING THE CALLER RESTATES, and that is the whole point: a
-#: restated copy drifts silently the day this message is reworded, and the caller then quietly
-#: reclassifies every truncation as a chain break. Substring-matching a message is a weak seam either
-#: way; making the producer and the consumer read the SAME name is what stops the seam rotting
-#: unobserved. Pinned by ``test_prefix_break_marker_appears_in_a_real_prefix_failure``.
+#: The phrase :func:`audit_prefix_verdict` puts in its failure message (BACKLOG #328): the operator-
+#: facing text of a truncated or rewritten tail. A caller classifies on
+#: :attr:`AuditVerdict.prefix_break`, never on this text (vault BACKLOG #3054, item 11).
 AUDIT_PREFIX_BREAK_MARKER = "is not an extension of the recorded prefix"
 
 
@@ -5255,34 +5546,54 @@ _AUDIT_STORE_ID_FIELD: Final = "store_id"
 #: is a literal, not interpolated, so the ReDoS scanner in tests/test_security_static.py reads the
 #: pattern; a test pins it to the constant.
 _AUDIT_STORE_ID_HEX: Final = re.compile("[0-9a-f]{32}")
+#: A genesis record keeps the recovery wrap (vault BACKLOG #3411; the key custody draft, rule 4) as
+#: the lowercase hex of its bytes, 65 of them in version 1 of the wrap; a test pins the width to
+#: ``store.custody``. The wrap is not secret.
+_AUDIT_RECOVERY_WRAP_FIELD: Final = "recovery_wrap"
+_AUDIT_RECOVERY_WRAP_HEX: Final = re.compile("[0-9a-f]{130}")
 _ABSENT: Final = object()
 
 
-def audit_genesis_detail(key_id: str, store_id: bytes = NO_STORE_ID) -> str:
+def audit_genesis_detail(
+    key_id: str, store_id: bytes = NO_STORE_ID, recovery_wrap: bytes = b""
+) -> str:
     """The ``detail`` of the genesis row: a typed record naming the key the first range is MAC'd
     under, and the scheme it is sealed with (BACKLOG #3420). JSON, so a later field can be added
     beside them.
 
     ``store_id``, when minted, is recorded as a label (vault BACKLOG #3411): the row MAC covers it,
-    and no key is derived from it. :data:`NO_STORE_ID`, the default, records none, so the record has
-    today's shape; no caller passes one yet. Raises ``ValueError`` for any other store id that is
-    not :data:`STORE_ID_BYTES` long."""
+    and no key is derived from it. :data:`NO_STORE_ID`, the default, records none. A store opened
+    under the ``host`` key provider records the host blob's current store id
+    (:class:`StorePin`). Raises ``ValueError`` for any other store id that is not
+    :data:`STORE_ID_BYTES` long.
+
+    ``recovery_wrap``, the master key under the recovery key (not a secret), is kept beside the
+    store id when the store is minted, so the recovery key opens something held in the store and in
+    every backup of it (draft rule 4). Raises ``ValueError`` for one with no store id, or not 65
+    bytes long."""
     record: dict[str, object] = {"genesis": 1, "key_id": key_id}
     record.update(_audit_scheme_fields(audit_scheme_for(key_id)))
     if store_id != NO_STORE_ID:
         if len(store_id) != STORE_ID_BYTES:
             raise ValueError(f"a store id is {STORE_ID_BYTES} bytes, not {len(store_id)}")
         record[_AUDIT_STORE_ID_FIELD] = store_id.hex()
+    if recovery_wrap:
+        if store_id == NO_STORE_ID or not _AUDIT_RECOVERY_WRAP_HEX.fullmatch(recovery_wrap.hex()):
+            raise ValueError("a recovery wrap is 65 bytes, and kept only beside a store id")
+        record[_AUDIT_RECOVERY_WRAP_FIELD] = recovery_wrap.hex()
     return json.dumps(record, sort_keys=True)
 
 
 _AUDIT_GENESIS_FIELDS: Final = frozenset({"genesis", "key_id"})
 
 
-def _parse_audit_genesis(detail: object) -> tuple[str, AuditScheme | None, bytes | None] | None:
-    """``(key_id, scheme, store_id)`` from a genesis row's ``detail``; see
+def _parse_audit_genesis(
+    detail: object,
+) -> tuple[str, AuditScheme | None, bytes | None, bytes | None] | None:
+    """``(key_id, scheme, store_id, recovery_wrap)`` from a genesis row's ``detail``; see
     :func:`parse_audit_genesis_record`. ``store_id`` is ``None`` when the record carries none, or
-    carries one that is refused.
+    carries one that is refused, and ``recovery_wrap`` likewise. A recovery wrap that is malformed,
+    or that sits on a record with no store id, is refused as a malformed store id is.
 
     A ``store_id`` field that is not the lowercase hex of :data:`STORE_ID_BYTES` bytes, or that sits
     on a record naming no scheme (no release wrote one there: the field postdates BACKLOG #3420),
@@ -5299,6 +5610,7 @@ def _parse_audit_genesis(detail: object) -> tuple[str, AuditScheme | None, bytes
     if not isinstance(obj, dict):
         return None
     raw_store_id = obj.pop(_AUDIT_STORE_ID_FIELD, _ABSENT)
+    raw_wrap = obj.pop(_AUDIT_RECOVERY_WRAP_FIELD, _ABSENT)
     try:
         scheme = _audit_record_scheme(obj, _AUDIT_GENESIS_FIELDS)
     except ValueError:
@@ -5308,15 +5620,20 @@ def _parse_audit_genesis(detail: object) -> tuple[str, AuditScheme | None, bytes
         return None
     if not isinstance(key_id, str) or not key_id:
         return None
-    if raw_store_id is _ABSENT:
-        return key_id, scheme, None
+    if raw_store_id is _ABSENT and raw_wrap is _ABSENT:
+        return key_id, scheme, None, None
+    wrap_ok = raw_wrap is _ABSENT or (
+        isinstance(raw_wrap, str) and _AUDIT_RECOVERY_WRAP_HEX.fullmatch(raw_wrap) is not None
+    )
     if (
         scheme is not None
+        and wrap_ok
         and isinstance(raw_store_id, str)
         and _AUDIT_STORE_ID_HEX.fullmatch(raw_store_id)
     ):
-        return key_id, scheme, bytes.fromhex(raw_store_id)
-    return key_id, _AuditStoreIdRefused(mac="", kdf="", named=scheme), None
+        wrap = None if raw_wrap is _ABSENT else bytes.fromhex(str(raw_wrap))
+        return key_id, scheme, bytes.fromhex(raw_store_id), wrap
+    return key_id, _AuditStoreIdRefused(mac="", kdf="", named=scheme), None, None
 
 
 def parse_audit_genesis_record(detail: object) -> tuple[str, AuditScheme | None] | None:
@@ -5343,6 +5660,8 @@ class AuditGenesisStoreId(NamedTuple):
     #: none beside a store id, or its store id is malformed. So a caller comparing labels never
     #: reads such a record as one with none.
     refused: bool
+    #: The recovery wrap kept beside the store id, or ``None`` when the record keeps none.
+    recovery_wrap: bytes | None = None
 
 
 def parse_audit_genesis_store_id(detail: object) -> AuditGenesisStoreId | None:
@@ -5351,10 +5670,202 @@ def parse_audit_genesis_store_id(detail: object) -> AuditGenesisStoreId | None:
     parsed = _parse_audit_genesis(detail)
     if parsed is None:
         return None
-    key_id, scheme, store_id = parsed
+    key_id, scheme, store_id, wrap = parsed
     if audit_scheme_refusal(key_id, scheme) is not None:
         return AuditGenesisStoreId(store_id=None, refused=True)
-    return AuditGenesisStoreId(store_id=store_id, refused=False)
+    return AuditGenesisStoreId(store_id=store_id, refused=False, recovery_wrap=wrap)
+
+
+class StorePin(NamedTuple):
+    """The store ids a host blob names (vault BACKLOG #3411; the key custody draft, rules 1 and 4),
+    which every open of a store under the ``host`` key provider holds the store to.
+
+    ``current`` is the id a new genesis record is written with. ``accepted`` is every id the blob
+    names, the current one and the earlier ones: an earlier id is the one a store restored under a
+    new id still carries in its genesis record (draft rule 4, *What a restore does*).
+    ``recovery_wrap`` is the wrap a minting command writes into a new genesis record beside the
+    current id; empty for every other open, which writes a genesis record only into an empty chain
+    no command minted for."""
+
+    current: bytes
+    accepted: frozenset[bytes]
+    recovery_wrap: bytes = b""
+
+
+class StoreIdPinRefused(KeyProviderError):
+    """The store's audit genesis record does not name a store id the host blob names, so the key
+    custody host blob belongs to another store, or the store to no host blob (vault BACKLOG #3411).
+    A :class:`~messagefoundry.store.keyprovider.KeyProviderError`, so every command that treats an
+    unresolved store key as "could not start" treats this the same way. The message names store ids,
+    which are not secret, and never a key."""
+
+
+class StoreIdPinRefusedBeforeWrite(StoreIdPinRefused):
+    """The pin refused the store before the open wrote anything to it: raised by
+    :func:`check_open_store_pin`, ahead of the salt bind. Any other :class:`StoreIdPinRefused`
+    may follow the open's at-open writes, so a caller that must know nothing was written (a
+    minting command deciding whether to remove the key it minted) asks for this class."""
+
+
+class StoreChainNeverStarted(StoreIdPinRefusedBeforeWrite):
+    """The store's audit chain was never started, and this writable open holds no recovery wrap,
+    which alone may start it. Raised by :func:`check_open_store_pin` before any write. A command
+    that can name the host blob in the way (``provision-admin``, PR 2804) asks for this class."""
+
+
+class StoreCreateBatchFailedBeforeKeyUse(Exception):
+    """A minting open's create batch failed before its commit (PR 2804 hold 17). The batch is one
+    transaction on each server backend, and nothing is sealed under the store key before it commits:
+    the first seal follows ``bind_store_salt``, after the batch and the pin check, which only reads.
+    So nothing was sealed under the key, and a minting command may remove the key
+    it minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the batch's own error,
+    also the cause. Raised only on a minting open (:func:`minting_open`), so no other caller sees a
+    new class; a failure at or after the commit is never this."""
+
+    def __init__(self, failure: Exception) -> None:
+        # The failure itself is the one argument, so a copy or an unpickle rebuilds it whole.
+        super().__init__(failure)
+        self.failure = failure
+
+
+#: The pin of the store open in progress, set by ``store.base.open_store`` around the backend open
+#: and read by :func:`_load_audit_chain`, which all three backends share. A context variable rather
+#: than a parameter of each backend's open, as the hop posture is held during connector
+#: construction; ``None`` for every open that is not under the ``host`` key provider.
+OPEN_STORE_PIN: ContextVar[StorePin | None] = ContextVar("mefor_open_store_pin", default=None)
+
+
+def minting_open() -> bool:
+    """Whether the open in progress is a minting command's, the one open that carries a recovery
+    wrap for a new genesis record (PR 2804 hold 17)."""
+    pin = OPEN_STORE_PIN.get()
+    return pin is not None and bool(pin.recovery_wrap)
+
+
+def create_batch_failure(raised: Exception, translated: Exception | None = None) -> Exception:
+    """What a server backend raises for ``raised``, caught inside its create batch before the
+    commit: ``translated`` (a lock timeout the backend names) when given, chained to ``raised``,
+    else ``raised``; wrapped as :class:`StoreCreateBatchFailedBeforeKeyUse` on a minting open (PR
+    2804 hold 17). Shared, so both backends answer the same way."""
+    failure = raised
+    if translated is not None:
+        translated.__cause__ = raised
+        failure = translated
+    if not minting_open():
+        return failure
+    wrapped = StoreCreateBatchFailedBeforeKeyUse(failure)
+    wrapped.__cause__ = failure
+    return wrapped
+
+
+def store_pin_problem(genesis: Mapping[str, Any] | None, pin: StorePin) -> str | None:
+    """Why the audit row at sequence number 1, ``genesis`` (``None`` when there is none), does not
+    hold the store to ``pin``, or ``None`` when it names an id the pin accepts.
+
+    Refused: no row there, a row that is not a genesis record, a genesis record the walk refuses, one
+    that names no store id, and one that names an id the host blob does not. Total over
+    attacker-written rows: every answer is a string or ``None``. Whether the row is authentic is
+    :func:`_store_pin_refusal`'s question, not this one's."""
+    if genesis is None:
+        return (
+            "the store's audit chain has no genesis record, so the store id the host blob names "
+            "cannot be compared with the store's"
+        )
+    try:  # a driver row (sqlite3.Row among them) is read by key, and has no .get
+        detail = genesis["detail"]
+    except (KeyError, IndexError):
+        detail = None
+    label = parse_audit_genesis_store_id(detail)
+    if label is None:
+        return "the row at the start of the store's audit chain is not a genesis record"
+    if label.refused:
+        return "the store's audit genesis record is one this engine refuses"
+    if label.store_id is None:
+        return (
+            "the store's audit genesis record names no store id, so the store was not created "
+            "under this host blob"
+        )
+    if label.store_id in pin.accepted:
+        return None
+    return (
+        f"the store's audit genesis record names store id {label.store_id.hex()}, and the host "
+        f"blob names {pin.current.hex()}"
+        + (f" and {len(pin.accepted) - 1} earlier id(s)" if len(pin.accepted) > 1 else "")
+        + ": the host blob belongs to another store"
+    )
+
+
+#: Why a writable open refuses to start an empty chain under a pin that carries no recovery wrap.
+_PIN_NEEDS_THE_WRAP: Final = (
+    "the store's audit chain was never started, and only the command that minted its key, which "
+    "holds its recovery wrap, may start it: a chain started without the recovery wrap would leave "
+    "the recovery key opening nothing kept in the store. The engine cannot tell whose key the "
+    "host blob here is, so keep it and the store: run `messagefoundry provision-admin`, which "
+    "names the way on"
+)
+
+
+class _PinRefusal(NamedTuple):
+    """Why the chain does not hold the store to a pin, and whether that is a chain never started
+    (:class:`StoreChainNeverStarted`), told by this flag rather than by the text."""
+
+    text: str
+    never_started: bool = False
+
+
+async def _store_pin_refusal(
+    host: AuditRangeHost, first: Mapping[str, Any] | None, pin: StorePin, *, writable: bool
+) -> _PinRefusal | None:
+    """Why the chain does not hold the store to ``pin``, or ``None``.
+
+    An EMPTY chain passes a read-only open, which writes nothing, and a writable open whose pin
+    carries the recovery wrap: the minting command's, which writes the genesis record with the pin
+    and the wrap before it asks again. A writable open whose pin carries no wrap is refused there,
+    so no chain under a host blob is ever started without the wrap its recovery key opens. A
+    genesis record must name an id the pin accepts AND verify under a key this handle holds, which
+    is derived from the host blob, so a database writer without the key cannot name the blob's id
+    on another store's chain."""
+    if first is None and not await host._audit_rows(limit=1):
+        if writable and not pin.recovery_wrap:
+            return _PinRefusal(_PIN_NEEDS_THE_WRAP, never_started=True)
+        return None
+    problem = store_pin_problem(first, pin)
+    if problem is not None or first is None:
+        return None if problem is None else _PinRefusal(problem)
+    genesis = _audit_genesis(first)
+    secret = (
+        None
+        if genesis is None
+        else _audit_secret_for(genesis[0], host._audit_mac_keys, host._audit_mac_fn)
+    )
+    expected: str | None = None
+    if secret is not None:
+        with suppress(AuditKeyVersionRefusedError):
+            expected = _audit_row_mac(first, "", secret[0], secret[1])
+    if expected is None or not hmac.compare_digest(
+        audit_mac_bytes(first["row_hash"]), audit_mac_bytes(expected)
+    ):
+        return _PinRefusal(
+            "the store's audit genesis record does not verify under the key the host blob "
+            "holds, so the store id it names cannot be trusted"
+        )
+    return None
+
+
+async def check_open_store_pin(host: AuditRangeHost) -> None:
+    """Refuse a store the open's host blob does not name, before the open writes to it (vault
+    BACKLOG #3411). Each backend's writable open calls this once its schema is in place and BEFORE
+    it binds a salt, reserves a cipher block or seals a row, so a blob that is not this store's
+    writes nothing under its key. An empty chain passes here; :func:`_load_audit_chain` writes its
+    genesis record with the pin and checks it there. A no-op when no pin is set."""
+    pin = OPEN_STORE_PIN.get()
+    if pin is None:
+        return
+    refusal = await _store_pin_refusal(host, await host._audit_genesis_row(), pin, writable=True)
+    if refusal is None:
+        return
+    refused = StoreChainNeverStarted if refusal.never_started else StoreIdPinRefusedBeforeWrite
+    raise refused(f"refusing to open the store: {refusal.text}")
 
 
 def parse_audit_genesis(detail: object) -> str | None:
@@ -5568,11 +6079,19 @@ class AuditVerdict(tuple[bool, str | None]):
     It is set only with ``ok`` true. A caller whose settings require a key must not report it as a
     pass: ``audit-verify`` exits 5, "not checked", on it (vault BACKLOG #3054).
 
-    ``==`` and ``hash`` are the tuple's and ignore both flags and ``rows``; ``__reduce__`` keeps all three through a
-    copy."""
+    ``prefix_break`` says the ``expected_prefix`` comparator failed: the tail was truncated, or the
+    chain rewritten at or before the anchored row. It is set only with ``ok`` false, and only by that
+    comparator, so a caller that passed ``expected_prefix`` tells that failure from a chain break by
+    this flag, never by matching the message (vault BACKLOG #3054, item 11), since a break's message
+    can quote database values. The ``expected_anchor`` and ``expected_rows`` comparators also catch
+    a truncation and do NOT set it. A chain break outranks it, as :func:`verify_audit_rows` says.
+
+    ``==`` and ``hash`` are the tuple's and ignore the flags and ``rows``; ``__reduce__`` keeps them
+    all through a copy."""
 
     key_unavailable: bool
     keyless_walk: bool
+    prefix_break: bool
     #: How many rows the walk covered, on a clean verdict; -1 where it does not say. Read from the
     #: walk itself, so a caller needs no second query that could fail or see other rows.
     rows: int
@@ -5584,17 +6103,26 @@ class AuditVerdict(tuple[bool, str | None]):
         key_unavailable: bool = False,
         keyless_walk: bool = False,
         rows: int = -1,
+        prefix_break: bool = False,
     ) -> Self:
         verdict = super().__new__(cls, (ok, message))
         verdict.key_unavailable = key_unavailable and not ok
         verdict.keyless_walk = keyless_walk and ok
         verdict.rows = rows
+        verdict.prefix_break = prefix_break and not ok
         return verdict
 
     def __reduce__(self) -> tuple[Any, ...]:
         return (
             type(self),
-            (self[0], self[1], self.key_unavailable, self.keyless_walk, self.rows),
+            (
+                self[0],
+                self[1],
+                self.key_unavailable,
+                self.keyless_walk,
+                self.rows,
+                self.prefix_break,
+            ),
         )
 
 
@@ -5846,6 +6374,7 @@ def verify_audit_rows(
     # returned and each failing one is reported. A break still hides them, as it always hid the
     # prefix: the break is reported first, at its own row.
     failures: list[str] = []
+    prefix_break = False
     if expected_anchor is not None:
         exp_count, exp_head = expected_anchor
         # Evaluate the head compare UNCONDITIONALLY (not behind `or`): the anchor head is a MAC too,
@@ -5859,7 +6388,8 @@ def verify_audit_rows(
             )
     if prefix_pair is not None:
         ok, msg = audit_prefix_verdict(prefix_pair, witness_heads.get(prefix_pair[0]), count)
-        if not ok:  # its own message: the engine routes on its marker (#328)
+        if not ok:  # the engine routes on the flag this sets (#328, vault BACKLOG #3054)
+            prefix_break = True
             failures.append(msg or f"audit log {AUDIT_PREFIX_BREAK_MARKER}")
     missing = 0
     first: tuple[int, str] | None = None
@@ -5883,7 +6413,7 @@ def verify_audit_rows(
             + " — truncated or rewritten"
         )
     if failures:
-        return AuditVerdict(False, "; ".join(failures))
+        return AuditVerdict(False, "; ".join(failures), prefix_break=prefix_break)
     if key_unavailable:
         # Last, after every check that needs no key has passed: a break those checks found is a
         # break, and outranks "could not check".
@@ -6023,8 +6553,12 @@ async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
     host._audit_range_keys = []
     host._audit_ranges_trusted = True
     active_id = audit_active_key_id(host._audit_mac_key, host._audit_mac_fn)
+    pin = OPEN_STORE_PIN.get()
     first = await host._audit_genesis_row()
     if first is None and active_id is not None and not read_only:
+        if pin is not None and not pin.recovery_wrap:
+            # Vault BACKLOG #3411: never start a chain under a host blob without its recovery wrap.
+            raise StoreIdPinRefused(f"refusing to open the store: {_PIN_NEEDS_THE_WRAP}")
         # The append requires an EMPTY log, so it writes nothing when any row is there. Suppressed:
         # another process started the chain between the read and the append, or the log holds rows
         # and none at seq 1. The re-read below tells the two apart.
@@ -6032,10 +6566,22 @@ async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
             await host.record_audit(
                 AUDIT_KEY_EPOCH_ACTION,
                 actor=AUDIT_GENESIS_ACTOR,
-                detail=audit_genesis_detail(active_id),
+                detail=(
+                    audit_genesis_detail(active_id)
+                    if pin is None
+                    else audit_genesis_detail(active_id, pin.current, pin.recovery_wrap)
+                ),
                 expect_prev="",
             )
         first = await host._audit_genesis_row()
+    if (
+        pin is not None
+        and (refusal := await _store_pin_refusal(host, first, pin, writable=not read_only))
+        is not None
+    ):
+        # Vault BACKLOG #3411: at EVERY open under the host key provider, the host blob's store id
+        # must be the one the store was created under, or an earlier one of the same blob.
+        raise StoreIdPinRefused(f"refusing to open the store: {refusal.text}")
     genesis = _audit_genesis(first) if first is not None else None
     if first is None or genesis is None:
         # No genesis row at seq 1. On an empty log that is a chain nobody has started, and a
@@ -6948,8 +7494,11 @@ async def _secure_file_async(path: Path) -> None:
 # The data directory already names the right set. install-service.ps1 removes its inheritance and
 # grants SYSTEM, BUILTIN\Administrators and the run-as account. So where the store's directory is
 # HARDENED like that, every open writes the SAME explicit, protected DACL on the trio: SYSTEM and
-# Administrators full control, and the one per-service account Modify. It does not depend on who
-# opens, so the second opener finds it already exact and needs no WRITE_DAC; it is protected, so a
+# Administrators full control, and the one run-as account Modify. That account is a per-service
+# virtual account, or one named user account the host resolves (a local user, or a gMSA only if it
+# resolves to a user account, which is unmeasured; the -ServiceAccount install; BACKLOG #3760,
+# #2234, owner ruling 2026-11-05). It does not depend on who opens, so the second opener finds it
+# already exact and needs no WRITE_DAC; it is protected, so a
 # later edit to the directory does not reach the store. Anywhere else -- a developer checkout, a temp
 # directory, a directory admitting anyone else, one reached through a link, or one this code cannot
 # read -- the owner-only rewrite applies exactly as before. Every test below is an ALLOW-list.
@@ -6960,20 +7509,33 @@ _SDDL_SID_ALIASES: Mapping[str, str] = MappingProxyType({"SY": "S-1-5-18", "BA":
 _STORE_DIR_TRUSTED_SIDS = ("S-1-5-18", "S-1-5-32-544")
 #: One per-service virtual account, NT SERVICE\<name>: S-1-5-80 plus exactly five sub-authorities.
 #: NT SERVICE\ALL SERVICES is S-1-5-80-0 and does NOT match, because it admits every service.
-_SERVICE_SID = re.compile(r"S-1-5-80-\d+-\d+-\d+-\d+-\d+")
+_SERVICE_SID = re.compile(r"S-1-5-80-\d+-\d+-\d+-\d+-\d+", re.ASCII)
+#: A machine- or domain-relative account SID: S-1-5-21, the three sub-authorities naming the machine
+#: or the domain, then the RID. A local user, a domain user and a gMSA all have this shape; so do
+#: their groups, which is why the shape alone admits nothing (see :func:`_account_type_refusal`).
+#: ASCII digits only, here and in :data:`_SERVICE_SID`: ``\d`` alone also matches other scripts'
+#: digits, which ``int`` accepts.
+_ACCOUNT_SID = re.compile(r"S-1-5-21-\d+-\d+-\d+-(\d+)", re.ASCII)
+#: The lowest RID Windows hands an account or group it creates. Below it sit the built-in ones: at
+#: least Administrator (500), Guest (501), krbtgt (502), DefaultAccount (503) and the well-known
+#: domain groups from 512, Domain Users (513) among them.
+_FIRST_ASSIGNED_RID = 1000
+#: SidTypeUser, the SID_NAME_USE LookupAccountSidW reports for a user account. A group reports
+#: SidTypeGroup (2) or SidTypeAlias (4), a well-known SID SidTypeWellKnownGroup (5).
+_SID_TYPE_USER = 1
 _SDDL_DENY_TYPES = frozenset({"D", "OD", "XD"})
 _SDDL_ACE = re.compile(r"\(([^()]*)\)")
 _SDDL_OWNER = re.compile(r"O:(S-[0-9-]+|[A-Z]{2})")
 #: The SDDL right for each principal of the trio: full control (FA) for SYSTEM and Administrators,
-#: and Modify (0x1301bf, what install-service.ps1 grants the run-as account) for the service.
+#: and Modify (0x1301bf, what install-service.ps1 grants the run-as account) for that account.
 _TRIO_RIGHTS: Mapping[str, str] = MappingProxyType({"S-1-5-18": "FA", "S-1-5-32-544": "FA"})
-_SERVICE_RIGHTS = "0x1301bf"
+_RUN_AS_RIGHTS = "0x1301bf"
 
 
 def _trio_right(sid: str) -> str:
     """The one SDDL right the trio carries for ``sid``, upper-cased as the parser keeps rights. The
     writer and both checks use this, so they cannot drift apart."""
-    return _TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS).upper()
+    return _TRIO_RIGHTS.get(sid, _RUN_AS_RIGHTS).upper()
 
 
 @dataclass(frozen=True)
@@ -7025,7 +7587,29 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
 
 
 def _hardening_refusal(directory: _SddlDacl) -> str | None:
-    """Why ``directory`` is NOT hardened, or ``None`` when it is (see :func:`_hardened_trio_grants`).
+    """Why ``directory`` is NOT hardened, or ``None`` when it is.
+
+    Hardened means the directory is exactly what install-service.ps1 writes (Set-SecureDataDirAcl,
+    then Set-DataDirOwner): inheritance blocked; every ACE an allow with the installer's own
+    inheritance (``OICI``) and rights -- full control (``FA``) for SYSTEM and Administrators, both
+    present, and Modify (``0x1301bf``) for at most ONE run-as account -- and nothing else; no deny
+    ACE, because the trio's DACL does not carry denies over; and an owner of SYSTEM or
+    Administrators, or of the run-as account when it is a per-service virtual account, because an
+    owner keeps WRITE_DAC over the directory. The run-as account is a per-service virtual account,
+    or one user account this host resolves with a RID of 1000 or more (:func:`_account_shape_refusal`,
+    :func:`_account_type_refusal`). A user never qualifies as the OWNER: any standard user can own a
+    directory she made and grant herself the installer's shape, while install-service.ps1 makes
+    Administrators the owner (Set-DataDirOwner, which only warns when it cannot, and the directory is
+    then refused), and no standard user can own a directory as a virtual account.
+
+    NOT pure: for a user run-as it calls ``LookupAccountSidW``, which may block on a domain
+    controller and logs nothing itself. Call it once per decision (:func:`_hardening_verdict`), and
+    never on an event loop.
+
+    The RIGHTS and FLAGS are part of the test, not only the principals, because the trio is always
+    written with FA/Modify: a directory granting Administrators read, or a service container-only,
+    or a different service read, would otherwise produce a store WIDER than its directory. Any shape
+    but the installer's falls back to the owner-only rewrite.
 
     The first failing condition, in a fixed order, as one operator-readable sentence. The checks read
     the whole DACL, so a directory that fails two ways is refused whichever entry comes first."""
@@ -7034,55 +7618,95 @@ def _hardening_refusal(directory: _SddlDacl) -> str | None:
     if not directory.aces:  # defence in depth: the both-built-ins check below also refuses this
         return "its DACL is empty"
     named: set[str] = set()
-    services: set[str] = set()
+    run_as: set[str] = set()
     for ace_type, flags, rights, sid in directory.aces:
         trusted = sid in _STORE_DIR_TRUSTED_SIDS
-        service = not trusted and bool(_SERVICE_SID.fullmatch(sid))
         if ace_type != "A":
             return f"it carries a {ace_type} entry for {sid}, which the trio would not carry over"
-        if not (trusted or service):
-            return f"it grants {sid}, which is not SYSTEM, Administrators or one service account"
+        if not trusted and not _SERVICE_SID.fullmatch(sid):
+            refusal = _account_shape_refusal(sid)
+            if refusal is not None:
+                return refusal
         if _sddl_flag_set(flags) != {"OI", "CI"} or rights != _trio_right(sid):
             return (
                 f"it grants {sid} ({flags};{rights}), not the installer's shape "
                 f"(OICI;{_trio_right(sid)})"
             )
-        (named if trusted else services).add(sid)
+        (named if trusted else run_as).add(sid)
     # Both built-in principals are required, as the installer always writes them: without
     # Administrators among the grants, a file it owns could never be made exact, and would be
     # rewritten -- and warned about -- on every start.
     if named != set(_STORE_DIR_TRUSTED_SIDS):
         return "it does not grant both SYSTEM and Administrators"
-    if len(services) > 1:
-        return "it grants more than one service account"
+    # At most ONE run-as principal, of either kind: two service accounts, two users, or a service
+    # account beside a user are all refused. The installer grants one, or none for LocalSystem.
+    if len(run_as) > 1:
+        return f"it grants more than one service or user account ({', '.join(sorted(run_as))})"
+    services = {sid for sid in run_as if _SERVICE_SID.fullmatch(sid)}
     if directory.owner is None or (
         directory.owner not in _STORE_DIR_TRUSTED_SIDS and directory.owner not in services
     ):
         return f"it is owned by {directory.owner}, which keeps WRITE_DAC over it"
+    # Last, because it is the one check that can leave the host: a gMSA's SID resolves through a
+    # domain controller. Every cheaper refusal has had its chance first.
+    user = next(iter(run_as - services), None)  # at most one, by the check above
+    return None if user is None else _account_type_refusal(user)
+
+
+def _account_shape_refusal(sid: str) -> str | None:
+    """Why ``sid`` cannot be the trio's one named run-as user account by its SHAPE alone, or ``None``
+    when it may be one, pending :func:`_account_type_refusal`.
+
+    The owner ruling of 2026-11-05 (BACKLOG #3760, #2234) admits one principal beyond SYSTEM,
+    Administrators and a per-service virtual account, and only a user account with a RID of 1000 or
+    more: the account ``install-service.ps1 -ServiceAccount`` grants, such as a local user, or a
+    gMSA only if it resolves to a user account, which is unmeasured. The SID must be machine- or
+    domain-relative (``S-1-5-21-...``), whose last sub-authority is the RID of an account or group
+    that machine or domain holds; the regex admits no other family, so a BUILTIN alias
+    (``S-1-5-32-...``), whose last sub-authority is also a RID, is refused by shape. Any alias the
+    SDDL writer emits (``NS``, ``LA``, ``DU``) is not of this shape either, so it is refused too. A RID
+    under 1000 is a built-in account or group, refused without a lookup: at least the built-in Administrator (500), Guest (501) and Domain Users (513)."""
+    match = _ACCOUNT_SID.fullmatch(sid)
+    if match is None:
+        return (
+            f"it grants {sid}, which is not SYSTEM, Administrators, one service account or one "
+            "user account"
+        )
+    if int(match.group(1)) < _FIRST_ASSIGNED_RID:
+        return (
+            f"it grants {sid}, a built-in account or group (a RID below {_FIRST_ASSIGNED_RID}), "
+            "not one user account"
+        )
     return None
 
 
-def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...] | None:
-    """The principals the trio is granted when ``directory`` is HARDENED, else ``None``.
+def _account_type_refusal(sid: str) -> str | None:
+    """Why ``sid``, already of the account shape, is not a USER account on this host, or ``None``
+    when ``LookupAccountSidW`` resolves it to SidTypeUser. Refused when the lookup fails, and when it
+    returns any other type: a group or alias with an assigned RID has the same shape as a user, and
+    granting one Modify must not widen the store to every member."""
+    kind, status = _lookup_sid_type(sid)
+    if kind is None:
+        return (
+            f"it grants {sid}, which this host could not resolve to an account (Win32 status "
+            f"{status})"
+        )
+    if kind != _SID_TYPE_USER:
+        return f"it grants {sid}, which resolves to SID type {kind}, not a user account"
+    return None
 
-    Hardened means the directory is exactly what install-service.ps1 writes (Set-SecureDataDirAcl,
-    then Set-DataDirOwner): inheritance blocked; every ACE an allow with the installer's own
-    inheritance (``OICI``) and rights -- full control (``FA``) for SYSTEM and Administrators, both
-    present, and Modify (``0x1301bf``) for at most ONE per-service account -- and nothing else; no
-    deny ACE, because the trio's DACL does not carry denies over; and an owner of SYSTEM,
-    Administrators or that service account, because an owner keeps WRITE_DAC over the directory.
 
-    The RIGHTS and FLAGS are part of the test, not only the principals, because the trio is always
-    written with FA/Modify: a directory granting Administrators read, or a service container-only,
-    or a different service read, would otherwise produce a store WIDER than its directory. Any shape
-    but the installer's falls back to the owner-only rewrite. The answer names only principals the
-    directory allows, never who happens to be opening."""
-    if _hardening_refusal(directory) is not None:
-        return None
-    services = sorted(
-        sid for _t, _f, _r, sid in directory.aces if sid not in _STORE_DIR_TRUSTED_SIDS
-    )
-    return (*_STORE_DIR_TRUSTED_SIDS, *dict.fromkeys(services))
+def _hardening_verdict(directory: _SddlDacl) -> tuple[tuple[str, ...] | None, str | None]:
+    """``(grants, None)`` when ``directory`` is HARDENED, else ``(None, refusal)``: one check, so the
+    account lookup :func:`_hardening_refusal` may make runs once, and the grants are never built for
+    a directory that was not checked. The grants are SYSTEM, Administrators, then the run-as account
+    if the directory names one: only principals the directory allows, never who happens to be
+    opening."""
+    refusal = _hardening_refusal(directory)
+    if refusal is not None:
+        return None, refusal
+    run_as = (sid for _t, _f, _r, sid in directory.aces if sid not in _STORE_DIR_TRUSTED_SIDS)
+    return (*_STORE_DIR_TRUSTED_SIDS, *dict.fromkeys(run_as)), None
 
 
 def _sddl_flag_set(flags: str) -> set[str]:
@@ -7171,6 +7795,71 @@ def _read_dacl_sddl(path: Path, *, owner: bool = False) -> str | None:
         kernel32.LocalFree(descriptor)
 
 
+def _lookup_sid_type(sid: str) -> tuple[int | None, int]:
+    """``(SID_NAME_USE, 0)`` for what ``LookupAccountSidW`` reports for ``sid`` on this host, or
+    ``(None, Win32 status)`` when the lookup fails, and ``(None, 0)`` off Windows. A seam for tests,
+    so the decision runs anywhere.
+
+    A domain account's SID resolves through a domain controller, or through the LSA's lookup cache
+    when none answers. On every failure the directory is refused as not hardened, and each store
+    file takes the fallback restricted by :func:`_secure_file` (see ADR 0163,
+    *Note (2026-11-05)*; decision d20261106T140017335-d24848). Why ERROR_NONE_MAPPED (1332) does
+    not prove the SID names no account, and what that fallback leaves on each file, are stated
+    once, in ADR 0163, *Note (2026-11-05)*, *Left open*. Nothing is logged here: the status goes
+    into the refusal, which the caller logs once, beside the directory it refused."""
+    if sys.platform != "win32":
+        return None, 0
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    convert = advapi32.ConvertStringSidToSidW
+    convert.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    convert.restype = wintypes.BOOL
+    lookup = advapi32.LookupAccountSidW
+    lookup.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.c_void_p,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    lookup.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    psid = ctypes.c_void_p()
+    if not convert(sid, ctypes.byref(psid)):
+        return None, ctypes.get_last_error()
+    try:
+        name_len, domain_len = wintypes.DWORD(256), wintypes.DWORD(256)
+        status = 0
+        # A name longer than the first buffers fails with ERROR_INSUFFICIENT_BUFFER (122) and sets
+        # both lengths to what is needed, so one retry at those lengths is enough.
+        for _attempt in range(2):
+            name = ctypes.create_unicode_buffer(name_len.value)
+            domain = ctypes.create_unicode_buffer(domain_len.value)
+            use = ctypes.c_int()
+            if lookup(
+                None,
+                psid,
+                name,
+                ctypes.byref(name_len),
+                domain,
+                ctypes.byref(domain_len),
+                ctypes.byref(use),
+            ):
+                return use.value, 0
+            status = ctypes.get_last_error()
+            if status != 122:
+                break
+        return None, status
+    finally:
+        kernel32.LocalFree(psid)
+
+
 def _is_windows() -> bool:
     """A seam the tests patch, instead of patching the process-wide ``os.name``."""
     return os.name == "nt"
@@ -7200,9 +7889,9 @@ def _reaches_through_a_link(path: Path) -> bool:
 
 
 def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
-    """The trio grants for a store in ``directory`` (see :func:`_hardened_trio_grants`), or ``None``
-    for the owner-only rewrite: off Windows, through a link, or when the DACL cannot be read or
-    parsed."""
+    """The trio grants for a store in ``directory`` (see :func:`_hardening_verdict`), or ``None``
+    for the owner-only rewrite: off Windows, through a link, when the DACL cannot be read or parsed,
+    or when the directory is refused as not hardened, a failed account lookup included."""
     if not _is_windows() or _reaches_through_a_link(directory):
         return None
     sddl = _read_dacl_sddl(directory, owner=True)
@@ -7211,7 +7900,7 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
     parsed = _parse_sddl_dacl(sddl)
     if parsed is None:
         return None
-    reason = _hardening_refusal(parsed)
+    grants, reason = _hardening_verdict(parsed)
     if reason is not None:
         # A locked-down directory (inheritance off) that still fails the test is the case an operator
         # needs to hear about: the fallback brings back the Wave 0 lockout, whose only other symptom
@@ -7222,15 +7911,14 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
         if parsed.protected and not any(sid == "OW" for _t, _f, _r, sid in parsed.aces):
             log.warning(
                 "%s is locked down but %s, so the store there is restricted owner-only; the service "
-                "account and an operator's provision-admin cannot then both open it (ADR 0163 note "
-                "of 2026-09-24)",
+                "account and an operator's provision-admin cannot then both open it (ADR 0163 notes "
+                "of 2026-09-24 and 2026-11-05)",
                 directory,
                 reason,
             )
         else:
             log.debug("%s is not a hardened store directory: %s", directory, reason)
-        return None
-    return _hardened_trio_grants(parsed)
+    return grants
 
 
 def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = None) -> bool:
@@ -7250,7 +7938,7 @@ def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = N
     from ctypes import wintypes
 
     # Written in the canonical SDDL spelling (lower-case ``0x`` hex); only COMPARISONS upper-case.
-    aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS)};;;{sid})" for sid in grants)
+    aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _RUN_AS_RIGHTS)};;;{sid})" for sid in grants)
     sddl = (f"O:{owner}" if owner else "") + f"D:P{aces}"
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -8210,11 +8898,20 @@ class LockoutState:
 
 class LockoutIncrement(NamedTuple):
     """What ``increment_login_failure`` returns: the counter's new failure count, whether this
-    attempt set the lock, and the counter's cycle count after it (the notice reports it)."""
+    attempt set the lock, and the counter's cycle count after it (the notice reports it).
+
+    ``totp_state`` is the TOTP verdict the SIGN-IN lock's escalation used (:func:`judge_totp`), on
+    the cell the locked row still holds, or ``None`` where it used none: at least the second-step
+    counter, a cell that moved since the judgement, and a failure whose pre-lock read said it sets
+    no later-cycle lock. The judgement runs on that pre-lock read, so a racing write can leave a
+    verdict on a failure that sets a first lock or none: read it beside ``just_locked``, never as
+    proof of a later-cycle lock. The lock notice reads it, so it tells the owner what the
+    escalation decided on rather than judging the cell again (BACKLOG #3948 finding 16)."""
 
     attempts: int
     just_locked: bool
     cycles: int
+    totp_state: TotpState | None = None
 
 
 def next_lockout_state(
@@ -8733,7 +9430,8 @@ CREATE TABLE IF NOT EXISTS alert_instance (
     acked_at    REAL,
     resolved_at REAL,                 -- when it resolved (NULL while open/acknowledged)
     suspended_until REAL,             -- #143: windowed NOTIFICATION mute end-epoch (NULL/past = not suspended)
-    escalation_tier INTEGER NOT NULL DEFAULT 0  -- #81: highest occurrence-driven escalation tier reached (0=base)
+    escalation_tier INTEGER NOT NULL DEFAULT 0, -- #81: highest occurrence-driven escalation tier reached (0=base)
+    raised_by   TEXT                  -- #4916: the notifier that wrote the newest raise (a per-process random id)
 );
 -- One LIVE (non-resolved) instance per throttle key; resolved rows leave the index so the key re-opens.
 CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_instance_open
@@ -8951,6 +9649,9 @@ CREATE TABLE IF NOT EXISTS users (
     password_generated   INTEGER NOT NULL DEFAULT 0,  -- ADR 0197 Amendment A: 1 while the credential in force is engine-generated; wrong passwords arm no sign-in lock then. NO COMMA in this comment
     session_epoch        INTEGER NOT NULL DEFAULT 0,  -- BACKLOG #2592: raised by every whole-account session revoke; a session minted under an older epoch resolves to nothing. NO COMMA in this comment
     cred_digest          TEXT NOT NULL DEFAULT '',  -- BACKLOG #2592: digest of the account's passkeys; the user seal covers it. NO COMMA in this comment
+    enrolment_code_digest TEXT,                -- ADR 0207: hash_token digest of the outstanding enrolment code; NULL = none. NO COMMA in this comment
+    enrolment_code_expires_at REAL,            -- ADR 0207: when that code expires; NULL with no code. NO COMMA in this comment
+    enrolment_code_issuer TEXT,                -- ADR 0207 Amendment A5: the issuing Administrator's account id; NULL for a host-issued code. NO COMMA in this comment
     authz_seal           TEXT NOT NULL DEFAULT ''  -- BACKLOG #2592: integrity seal over the account's row and role rows. NO COMMA in this comment
 );
 
@@ -9555,6 +10256,7 @@ class MessageStore:
             )
             store._read_only = read_only
             if not read_only:
+                await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
@@ -10899,6 +11601,12 @@ class MessageStore:
             # `report_unsealed_users` names the count at open.
             ("cred_digest", "TEXT NOT NULL DEFAULT ''"),
             ("authz_seal", "TEXT NOT NULL DEFAULT ''"),
+            # ADR 0207: the enrolment code's digest, expiry and issuer. NULL on an existing row is
+            # "no code outstanding", and a NULL column stays out of the seal
+            # (USER_SEAL_WHEN_SET), so the add re-seals nobody.
+            ("enrolment_code_digest", "TEXT"),
+            ("enrolment_code_expires_at", "REAL"),
+            ("enrolment_code_issuer", "TEXT"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -11046,6 +11754,10 @@ class MessageStore:
             await db.execute(
                 "ALTER TABLE alert_instance ADD COLUMN escalation_tier INTEGER NOT NULL DEFAULT 0"
             )
+        # #4916: NULL on an existing row = no fencing writer raised it, so only its seen count can
+        # close it, which is what an unfenced writer's raise needs.
+        if alert_cols and "raised_by" not in alert_cols:
+            await db.execute("ALTER TABLE alert_instance ADD COLUMN raised_by TEXT")
         # #306: a pre-existing search_presets table (from #151/ADR 0136) predates last_used_at — ALTER
         # it in. NULL on every existing row is CORRECT: those presets were never recall-stamped, so the
         # purge's null-safe MAX falls back to updated_at and their window is byte-identical to before
@@ -15644,6 +16356,7 @@ class MessageStore:
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
+        raised_by: str | None = None,
     ) -> None:
         # Pure observer (ADR 0044 D2): a single short upsert under the write lock — NO queue row, NO
         # finalizer call (alert_instance is invisible to _maybe_finalize_message's `FROM queue` scan), so
@@ -15667,17 +16380,26 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET last_seen=?, count=count+1, severity=?, reason=?,"
-                " escalation_tier=MAX(escalation_tier, ?)"
+                " escalation_tier=MAX(escalation_tier, ?), raised_by=?"
                 " WHERE event_type=? AND connection=? AND status!='resolved'",
-                (now, severity, reason_enc, escalation_tier, event_type, connection),
+                (now, severity, reason_enc, escalation_tier, raised_by, event_type, connection),
             )
             if cur.rowcount == 0:
                 await self._db.execute(
                     "INSERT INTO alert_instance"
                     " (event_type, connection, severity, status, first_seen, last_seen, count, reason,"
-                    " escalation_tier)"
-                    " VALUES (?,?,?,'open',?,?,1,?,?)",
-                    (event_type, connection, severity, now, now, reason_enc, escalation_tier),
+                    " escalation_tier, raised_by)"
+                    " VALUES (?,?,?,'open',?,?,1,?,?,?)",
+                    (
+                        event_type,
+                        connection,
+                        severity,
+                        now,
+                        now,
+                        reason_enc,
+                        escalation_tier,
+                        raised_by,
+                    ),
                 )
             await self._commit()
 
@@ -15854,6 +16576,65 @@ class MessageStore:
                 "UPDATE alert_instance SET status='resolved', resolved_at=?"
                 " WHERE event_type=? AND connection=? AND status!='resolved'",
                 (now, event_type, connection),
+            )
+            await self._commit()
+            return int(cur.rowcount)
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = None
+    ) -> list[AlertGeneration]:
+        # BACKLOG #3269: the live instances of one alert type, for one subject or all, as
+        # (id, connection, count) only. Lockfree read; no reason cell is read or decrypted.
+        # status!='resolved' is ux_alert_instance_open's own filter, so the read seeks that index.
+        where = ["event_type=?", "status!='resolved'"]
+        params: list[Any] = [event_type]
+        if connection is not None:
+            where.append("connection=?")
+            params.append(connection)
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, connection, count FROM alert_instance WHERE "
+                + " AND ".join(where)
+                + " ORDER BY id",
+                params,
+            )
+            rows = await cur.fetchall()
+        return [AlertGeneration(int(r[0]), str(r[1]), int(r[2])) for r in rows]
+
+    async def resolve_alert_instances_fenced(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        raised_by: str,
+        seen: AlertGeneration | None,
+        now: float | None = None,
+    ) -> int:
+        # BACKLOG #4916: close the key's live instance only when its newest raise is one this writer
+        # saw at the clear (seen_id/seen_count) or is this writer's own (raised_by). Clock-free.
+        now = time.time() if now is None else now
+        seen_id, seen_count = (seen.id, seen.count) if seen is not None else (-1, -1)
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE alert_instance SET status='resolved', resolved_at=?"
+                " WHERE event_type=? AND connection=? AND status!='resolved'"
+                " AND (raised_by=? OR (id=? AND count<=?))",
+                (now, event_type, connection, raised_by, seen_id, seen_count),
+            )
+            await self._commit()
+            return int(cur.rowcount)
+
+    async def resolve_alert_generation(
+        self, *, alert_id: int, through_count: int, now: float | None = None
+    ) -> int:
+        # BACKLOG #3269: resolve one live instance only while no raise has folded into it past
+        # through_count. Clock-free, so a later raise from any process keeps the row open.
+        now = time.time() if now is None else now
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE alert_instance SET status='resolved', resolved_at=?"
+                " WHERE id=? AND count<=? AND status!='resolved'",
+                (now, alert_id, through_count),
             )
             await self._commit()
             return int(cur.rowcount)
@@ -17235,17 +18016,16 @@ class MessageStore:
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        require_totp_rule(require_way_past, totp_usable)
+        conditional = conditional_way_past(require_way_past)
         # The TOTP judged before the writer lock (judge_totp), confirmed under it by its cell.
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
         async with _writer_guard(self._db, self._lock):
@@ -17254,9 +18034,9 @@ class MessageStore:
                 password_hash=password_hash,
                 password_generated=password_generated,
                 must_change_password=must_change_password,
-                require_way_past=require_way_past,
+                require_way_past=conditional,
                 now=now,
-                passkeys=await self._account_passkeys(user_id) if require_way_past else (),
+                passkeys=await self._account_passkeys(user_id) if conditional else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
                 passkey_counts=passkey_counts,
@@ -17283,7 +18063,7 @@ class MessageStore:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._write_user(
-                user_id, lambda r: r.changed(disabled=bool(disabled), updated_at=float(now))
+                user_id, lambda r: user_disabled_change(r, disabled=disabled, now=now)
             )
             await self._commit()
 
@@ -17345,11 +18125,16 @@ class MessageStore:
         return None if written is None else sealed
 
     async def get_totp_secret(self, user_id: str) -> str | None:
-        """The user's decrypted base32 TOTP secret, or ``None`` when not enrolled/staged."""
+        """The user's decrypted base32 TOTP secret, or ``None`` when not enrolled/staged. The cell
+        is opened OFF THE EVENT LOOP (BACKLOG #3929): under a Transit cipher the decrypt is a
+        blocking HTTP call, and the lockable-account census reads every enrolled account through
+        here."""
         async with self._read() as db:
             cur = await db.execute("SELECT totp_secret FROM users WHERE id=?", (user_id,))
             row = await cur.fetchone()
-        return self.open_totp_secret(user_id, row["totp_secret"] if row else None)
+        return await asyncio.to_thread(
+            self.open_totp_secret, user_id, row["totp_secret"] if row else None
+        )
 
     def open_totp_secret(self, user_id: str, cell: str | None) -> str | None:
         """``cell``, a ``users.totp_secret`` value the caller already read, decrypted (BACKLOG
@@ -17373,6 +18158,64 @@ class MessageStore:
             written = await self._write_user(user_id, change)
             await self._commit()
         return written is not None
+
+    # --- ADR 0207: the directory account's enrolment code (Store protocol states the contract) ---
+
+    async def _write_code(
+        self, user_id: str, change: EnrolmentCodeChange
+    ) -> EnrolmentCodeOutcome | None:
+        async with _writer_guard(self._db, self._lock):
+            written = await self._write_user(user_id, change)
+            await self._commit()
+        return change.outcome(written)
+
+    async def issue_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        code_digest: str,
+        expires_at: float,
+        issuer_id: str | None,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = enrolment_code_issue(
+            code_digest=code_digest, expires_at=expires_at, issuer_id=issuer_id, now=now
+        )
+        return await self._write_code(user_id, change)
+
+    async def revoke_enrolment_code(self, user_id: str, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        async with _writer_guard(self._db, self._lock):
+            written = await self._write_user(user_id, enrolment_code_revoke(now))
+            await self._commit()
+        return written is not None
+
+    async def spend_enrolment_code(
+        self, user_id: str, *, code_digest: str, now: float | None = None
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        return await self._write_code(
+            user_id, enrolment_code_spend(code_digest=code_digest, now=now)
+        )
+
+    async def enable_totp_spending_enrolment_code(
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        code_digest: str,
+        now: float | None = None,
+    ) -> EnrolmentCodeOutcome | None:
+        now = time.time() if now is None else now
+        change = totp_enable_spending_code(
+            recovery_code_hashes,
+            now,
+            expected_secret_cell=expected_secret_cell,
+            code_digest=code_digest,
+        )
+        return await self._write_code(user_id, change)
 
     async def replace_totp_enrolment(
         self,
@@ -17425,19 +18268,19 @@ class MessageStore:
         user_id: str,
         *,
         now: float | None = None,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes). With
-        ``require_way_past``, a TOTP that is a way past (``totp_usable``) goes only while a
-        discoverable passkey remains, read under the same writer lock (:func:`totp_removal`).
+        ``require_way_past``, the caller's TOTP rule, a TOTP that is a way past by it goes only
+        while a discoverable passkey remains, read under the same writer lock
+        (:func:`totp_removal`).
         Returns whether a row was written."""
         now = time.time() if now is None else now
-        require_totp_rule(require_way_past, totp_usable)
+        conditional = conditional_way_past(require_way_past)
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
         async with _writer_guard(self._db, self._lock):
@@ -17446,8 +18289,8 @@ class MessageStore:
             # repaired by ``provision-admin`` could use to block the repair.
             change = totp_removal(
                 now,
-                require_way_past=require_way_past,
-                passkeys=await self._account_passkeys(user_id) if require_way_past else (),
+                require_way_past=conditional,
+                passkeys=await self._account_passkeys(user_id) if conditional else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
                 passkey_counts=passkey_counts,
@@ -17573,23 +18416,22 @@ class MessageStore:
         user_id: str,
         credential_id_hash: str,
         *,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
         account is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592).
         With ``require_way_past``, only while a way past remains after it, judged under the same
-        writer lock (:func:`removal_keeps_way_past`, TOTP counted by ``totp_usable``)."""
-        require_totp_rule(require_way_past, totp_usable)
+        writer lock (:func:`removal_keeps_way_past`, TOTP counted by that rule)."""
+        conditional = conditional_way_past(require_way_past)
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
         async with _writer_guard(self._db, self._lock):
-            if require_way_past:
+            if conditional:
                 current = await self._read_user_record(user_id)
                 if current is None or not removal_keeps_way_past(
                     current,
@@ -17727,7 +18569,7 @@ class MessageStore:
                     return False
             if change is AdminRemoval.DISABLE:
                 await self._write_user(
-                    user_id, lambda r: r.changed(disabled=True, updated_at=float(now))
+                    user_id, lambda r: user_disabled_change(r, disabled=True, now=now)
                 )
             elif change is AdminRemoval.DELETE:
                 await self._delete_user_rows(user_id)
@@ -17755,8 +18597,13 @@ class MessageStore:
     ) -> AdminGrant:
         """The first-administrator guard and its grant in one transaction (BACKLOG #3078); see
         ``AuthStore``. The writer lock serializes it in this process. Another process is serialized
-        by SQLite's single writer: a write that lost to one committed after this read fails busy,
-        and the transaction runs again so the re-read decides (:data:`_ADMIN_GRANT_BUSY_ATTEMPTS`)."""
+        by ``BEGIN IMMEDIATE`` (BACKLOG #3078 F5): the transaction takes SQLite's write lock before
+        its read, waiting out another writer under ``busy_timeout``, so no other process commits
+        between the read and the write. A busy that outlasts that wait is run again so the re-read
+        decides (:data:`_ADMIN_GRANT_BUSY_ATTEMPTS`). Before, the deferred ``BEGIN`` let an engine
+        write in another process land after the read, and then this write failed busy at once, so a
+        busy ``serve`` could exhaust the re-runs. The account write that follows the guard read
+        also checks that no passkey is on the row (F2), as the server backends do."""
         now = time.time() if now is None else now
         change = first_admin_grant(
             admin_role_id,
@@ -17767,7 +18614,7 @@ class MessageStore:
         )
         for attempt in range(1, _ADMIN_GRANT_BUSY_ATTEMPTS + 1):
             try:
-                async with _writer_txn(self._db, self._lock):
+                async with _writer_txn(self._db, self._lock, immediate=True):
                     cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
                     holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
                     _, others = await admin_guard_counts(
@@ -17781,6 +18628,13 @@ class MessageStore:
                         await self._db.rollback()
                         return AdminGrant.ADMIN_EXISTS
                     if await self._write_user(user_id, change) is None:
+                        await self._db.rollback()
+                        return AdminGrant.ACCOUNT_CHANGED
+                    # BACKLOG #3078 F2: a passkey on the row is an earlier holder's, enrolled in the
+                    # repair window, since this command enrols none. Read after the write, on this
+                    # transaction's connection, so it sees every passkey committed before it.
+                    passkey = await self._db.execute(_WEBAUTHN_ANY_FOR_USER, (user_id,))
+                    if await passkey.fetchone() is not None:
                         await self._db.rollback()
                         return AdminGrant.ACCOUNT_CHANGED
                     await self._commit()
@@ -17875,8 +18729,8 @@ class MessageStore:
         BACKLOG #3422). The passkey half of the escalation is :func:`escalation_passkeys`
         (BACKLOG #3937 item 8). The count itself stays atomic.
 
-        Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
-        caller that reached here on a missing account has already refused it."""
+        Returns ``LockoutIncrement(0, False, 0)`` for an unknown user -- there is no row to count
+        against, and a caller that reached here on a missing account has already refused it."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
         totp_counts = await escalation_verdict(
@@ -18121,6 +18975,35 @@ class MessageStore:
             appended = await self._append_audits(audits, now=now)
             await self._commit()
         tee_audits(audits, appended, ts=now)
+
+    async def set_user_roles_if_held(
+        self,
+        user_id: str,
+        role_ids: Sequence[str],
+        *,
+        expected_role_ids: Iterable[str],
+        assigned_by: str | None = None,
+        now: float | None = None,
+        audits: Sequence[AuditAppend],
+    ) -> bool:
+        """The compare-and-set role write (vault BACKLOG #3085); see ``AuthStore``. Under the one
+        writer lock, so no other write to the row lands between the compare and the write.
+        ``audits`` are appended only when it writes, before the one commit (BACKLOG #3018 step 4).
+        """
+        now = time.time() if now is None else now
+        change = roles_if_held(
+            role_ids, expected_role_ids=expected_role_ids, assigned_by=assigned_by, now=now
+        )
+        appended: list[AppendedAuditRow] = []
+        async with _writer_txn(self._db, self._lock):
+            written = await self._write_user(user_id, change)
+            if written is not None:
+                appended = await self._append_audits(audits, now=now)
+            await self._commit()
+        if written is None:
+            return False
+        tee_audits(audits, appended, ts=now)
+        return True
 
     async def set_user_channel_scope(
         self,
@@ -18901,6 +19784,29 @@ class MessageStore:
                 audit=await self._count(db, "audit_log"),
                 synchronous=self.synchronous,
             )
+
+    async def table_occupancy(self) -> dict[str, bool]:
+        """See :meth:`Store.table_occupancy`: the main schema's tables in ``sqlite_master`` less
+        virtual tables, as ``schema_verify`` skips them (a probe of one whose module is not loaded
+        raises), and less SQLite's own ``sqlite_*`` tables, each probed for one row. The names
+        come from the file, so each is quoted as an identifier, never interpolated bare."""
+        from messagefoundry.store.base import seed_filter_clause
+
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT name FROM main.sqlite_master WHERE type = 'table'"
+                " AND (sql IS NULL OR sql NOT LIKE 'CREATE VIRTUAL TABLE%')"
+                " AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+            )
+            names = [str(row[0]) for row in await cur.fetchall()]
+            occupancy: dict[str, bool] = {}
+            for name in names:
+                quoted = '"' + name.replace('"', '""') + '"'
+                cur = await db.execute(
+                    f"SELECT 1 FROM main.{quoted}{seed_filter_clause(name)} LIMIT 1"
+                )
+                occupancy[name] = await cur.fetchone() is not None
+            return occupancy
 
     def pool_status(self) -> PoolStatus | None:
         """No connection pool on SQLite (a single writer + lockfree read connections, not a contended

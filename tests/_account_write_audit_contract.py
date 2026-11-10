@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cross-backend store contract: an account write commits its audit row, or neither lands.
 
-BACKLOG #2221 and #3018 step 4. ``set_user_roles`` and ``remove_unless_last_admin`` take
+BACKLOG #2221 and #3018 step 4. ``set_user_roles``, ``set_user_roles_if_held`` and ``remove_unless_last_admin`` take
 ``audits``, and ``revoke_user_sessions`` takes an ``audit`` built from its result. Each appends in
 the write's own transaction, so a landed write leaves exactly one row and a failed append leaves
 neither the change nor the row. ``remove_unless_last_admin`` appends only when it applies the
@@ -79,6 +79,19 @@ async def assert_account_write_audit_contract(store: Any) -> None:
     assert await store.get_user_role_ids("c") == [ADMIN], "the roles outlived their failed row"
     assert await _rows(store) == ["roles c"]
 
+    # --- set_user_roles_if_held: appended only when the compare-and-set writes ----------------
+    cas = store.set_user_roles_if_held
+    with _refused_append(store) as refusal, pytest.raises(RuntimeError) as raised:
+        await cas("c", [VIEWER], expected_role_ids=[ADMIN], audits=(_row("cas lost"),))
+    assert raised.value is refusal
+    assert await store.get_user_role_ids("c") == [ADMIN], "the roles outlived their failed row"
+    assert not await cas("c", [VIEWER], expected_role_ids=[VIEWER], audits=(_row("cas moved"),))
+    assert await _rows(store) == ["roles c"], "a compare-and-set that wrote nothing was audited"
+    assert await cas("c", [ADMIN, VIEWER], expected_role_ids=[ADMIN], audits=(_row("cas c"),))
+    assert await store.get_user_role_ids("c") == [ADMIN, VIEWER]
+    assert await _rows(store) == ["cas c", "roles c"]
+    await store.set_user_roles("c", [ADMIN], audits=())
+
     # --- remove_unless_last_admin, applied --------------------------------------------------
     guard = store.remove_unless_last_admin
     assert await guard(
@@ -90,7 +103,7 @@ async def assert_account_write_audit_contract(store: Any) -> None:
     d = await store.get_user("d")
     assert d is not None and d.disabled
     assert await store.get_user("e") is None
-    assert await _rows(store) == ["delete", "disable", "roles c", "set"]
+    assert await _rows(store) == ["cas c", "delete", "disable", "roles c", "set"]
 
     # --- remove_unless_last_admin, refused by the guard: no change and no row -----------------
     assert await guard("b", AdminRemoval.DISABLE, admin_role_id=ADMIN, audits=()) is True
@@ -103,7 +116,9 @@ async def assert_account_write_audit_contract(store: Any) -> None:
         role_ids=[VIEWER],
         audits=(_row("refused"),),
     )
-    assert await _rows(store) == ["delete", "disable", "roles c", "set"], "a refusal was audited"
+    assert await _rows(store) == ["cas c", "delete", "disable", "roles c", "set"], (
+        "a refusal was audited"
+    )
 
     # --- remove_unless_last_admin, a failed append rolls the change back ---------------------
     await store.set_user_disabled("b", disabled=False)
@@ -118,7 +133,7 @@ async def assert_account_write_audit_contract(store: Any) -> None:
         b = await store.get_user("b")
         assert b is not None and not b.disabled, f"{change} outlived its failed row"
         assert await store.get_user_role_ids("b") == [ADMIN], f"{change} outlived its failed row"
-    assert await _rows(store) == ["delete", "disable", "roles c", "set"]
+    assert await _rows(store) == ["cas c", "delete", "disable", "roles c", "set"]
 
     # --- revoke_user_sessions: the row is built from the count, in the revoke's transaction --
     await sign_in(store, "c")

@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -57,6 +57,10 @@ from messagefoundry.config.settings import (
     StoreBackend,
     StorePrivilegePosture,
     StorePrivilegeStatus,
+)
+from messagefoundry.sqlserver_roles import (
+    SQLSERVER_FIXED_DATABASE_ROLES,
+    SQLSERVER_FIXED_SERVER_ROLES,
 )
 from messagefoundry.support.redact import redact_log_line
 
@@ -216,33 +220,10 @@ def classify_audit_writes(
 
 
 # --- SQL Server -------------------------------------------------------------------------------
-#: The closed set of SQL Server FIXED SERVER roles, probed by name rather than enumerated from
-#: ``sys.server_principals``: catalog visibility is permission-filtered, so an enumeration that comes
-#: back empty is indistinguishable from "a member of nothing" — the false-clean this control exists to
-#: prevent. ``IS_SRVROLEMEMBER`` answers for the CURRENT login and needs no catalog permission.
-SQLSERVER_FIXED_SERVER_ROLES: tuple[str, ...] = (
-    "sysadmin",
-    "securityadmin",
-    "serveradmin",
-    "setupadmin",
-    "processadmin",
-    "diskadmin",
-    "dbcreator",
-    "bulkadmin",
-)
-
-#: The closed set of SQL Server FIXED DATABASE roles, probed by name for the same reason.
-SQLSERVER_FIXED_DATABASE_ROLES: tuple[str, ...] = (
-    "db_owner",
-    "db_securityadmin",
-    "db_accessadmin",
-    "db_backupoperator",
-    "db_ddladmin",
-    "db_datareader",
-    "db_datawriter",
-    "db_denydatareader",
-    "db_denydatawriter",
-)
+# The closed sets of SQL Server FIXED SERVER and FIXED DATABASE roles live in the leaf
+# :mod:`messagefoundry.sqlserver_roles`, shared with the partner-login probe in ``transports/``
+# (BACKLOG #2617), which may not import this package; its docstring says why they are probed by
+# name. Re-exported here under their old names.
 
 #: The grant the runbooks prescribe (``docs/DEPLOY-SERVER-DB.md`` §1.1) for an engine login that runs
 #: its OWN schema DDL (``[store].schema_management = auto``): row CRUD plus the schema DDL the ADR 0064
@@ -489,8 +470,12 @@ class StorePrivilegeReport:
         deviations arrive there as plain names)."""
         return StorePrivilegePosture(status=self.status, excess=self.excess, detail=self.detail)
 
-    def summary(self) -> str:
-        """One operator-readable line. The three statuses read differently ON PURPOSE."""
+    def summary(self, *, quote: Callable[[str], str] = repr) -> str:
+        """One operator-readable line. The three statuses read differently ON PURPOSE.
+
+        ``quote`` writes the principal and database names; ``repr`` by default. A caller that
+        escapes the whole line itself passes a quote that escapes no control character, or a
+        control in a name would be escaped twice (BACKLOG #2891)."""
         if self.status is StorePrivilegeStatus.NOT_APPLICABLE:
             return (
                 f"store privilege preflight: not applicable on {self.backend.value} — {self.detail}"
@@ -501,15 +486,16 @@ class StorePrivilegeReport:
                 f"principal's effective privileges — {self.detail}. This is NOT a clean result: the "
                 "documented least-privilege grant is UNVERIFIED on this instance"
             )
+        who = f"{quote(self.principal)} on {quote(self.database)}"
         if self.excess:
             return (
                 f"store privilege preflight: the {self.backend.value} store principal "
-                f"{self.principal!r} on {self.database!r} holds {len(self.excess)} privilege(s) "
+                f"{who} holds {len(self.excess)} privilege(s) "
                 f"BEYOND the documented least-privilege grant: {', '.join(self.excess)}"
             )
         return (
             f"store privilege preflight: OBSERVED the {self.backend.value} store principal "
-            f"{self.principal!r} on {self.database!r} — no privilege beyond the documented grant "
+            f"{who} — no privilege beyond the documented grant "
             f"(server roles: {', '.join(self.server_roles) or 'none'}; database roles: "
             f"{', '.join(self.database_roles) or 'none'})"
         )

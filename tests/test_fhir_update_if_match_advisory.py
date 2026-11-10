@@ -109,6 +109,22 @@ def test_an_env_headers_table_is_named_with_the_reason(tmp_path: Path) -> None:
     assert note.startswith("its headers are an env() reference, which check does not resolve; ")
 
 
+def test_an_env_form_and_an_env_conditional_are_named_with_the_reason(tmp_path: Path) -> None:
+    """Vault BACKLOG #2571: a connection that may take the path form, and one whose conditional is
+    unread, are each named, with what this reader could not resolve at the head of the note."""
+    body = (
+        'outbound("OB_FORM", FHIR(url=_BASE, interaction="update", update_url_form=env("f")))\n'
+        'outbound("OB_COND", FHIR(url=_BASE, interaction="update", update_url_form="path",\n'
+        '         conditional=env("c")))\n'
+    )
+    notes = dict(_read(tmp_path, body))
+    assert notes["OB_FORM"].startswith("possibly: an env() value")
+    assert notes["OB_COND"].startswith(
+        "possibly: an env() value this reading could not resolve; its conditional is an env() "
+        "reference"
+    )
+
+
 def test_a_literal_header_named_env_is_not_an_env_reference(tmp_path: Path) -> None:
     # `{"env": ...}` is the shape of a connections.toml reference. Here it is a real header table.
     body = (
@@ -128,7 +144,7 @@ def test_the_set_is_a_subset_of_the_path_form_reader(tmp_path: Path) -> None:
     registry = load_config(_config(tmp_path, body))
     named = [name for name, _ in path_form_fhir_updates_without_if_match(registry)]
     assert named == ["OB_A_PLAIN", "OB_PLAIN"]  # sorted, as the path-form reader is
-    assert set(named) < set(path_form_fhir_updates(registry))
+    assert set(named) < {name for name, _ in path_form_fhir_updates(registry)}
 
 
 def test_check_names_the_connection_and_says_both_limits(tmp_path: Path) -> None:
@@ -166,7 +182,7 @@ def test_check_says_there_is_nothing_to_read_when_no_update_takes_the_path_form(
     r = _line(_config(tmp_path, 'outbound("OB", FHIR(url=_BASE, interaction="update"))\n'))
     assert r.ok and not r.skipped
     assert r.detail == (
-        "no FHIR connection sets update_url_form='path', so there is no update to read"
+        "no FHIR connection sends updates in the path form, or may, so there is no update to read"
     )
 
 

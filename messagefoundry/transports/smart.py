@@ -70,17 +70,18 @@ from messagefoundry.transports.bounded_read import (
 # Reuse rest.py's hardened opener + URL redaction (no new HTTP plumbing) — exactly as fhir.py/soap.py
 # do. rest.py imports this module's provider LAZILY (inside __init__) so there is no import cycle.
 from messagefoundry.transports.rest import (
-    _NO_REDIRECT_OPENER,
     ECH_HOP_WAYS_ACROSS,
     HttpAuthError,
     ProxyConfig,
     _no_redirect_opener,
     _redact_url,
+    _shared_no_redirect_opener,
     auth_challenge_refused,
     ech_readdressed_request,
     enforce_outbound_length_limits,
     hop_declarations_from_settings,
     http_family_trust_anchor,
+    is_refused_proxy_digest_tunnel,
     refuse_cleartext_credential_hop,
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
@@ -146,7 +147,7 @@ def request_token(
     still raises its own ``ValueError``, as it did before BACKLOG #2054. ``connector`` names the hop
     in a refusal of the reply body, and holds no URL (BACKLOG #2060). A web proxy's Digest challenge
     the engine will not answer raises the subclass ``rest.auth_challenge_refused`` builds, a
-    permanent configuration fault (BACKLOG #2989)."""
+    permanent configuration fault (BACKLOG #2989), on an ``http`` or an ``https`` token endpoint."""
     body = _read_token_reply(opener, req, timeout=timeout, endpoint=endpoint, connector=connector)
     return _parse_token_reply(body, endpoint=endpoint)
 
@@ -171,6 +172,10 @@ def _read_token_reply(
     except urllib.error.HTTPError as exc:
         raise DeliveryError(f"{endpoint} returned HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
+        if is_refused_proxy_digest_tunnel(opener, exc):
+            # BACKLOG #2989: an https:// token endpoint's Digest proxy 407 arrives here, not in
+            # the HttpAuthError arm below; the predicate says why no retry can clear it.
+            raise auth_challenge_refused(endpoint) from exc
         raise DeliveryError(f"{endpoint} unreachable: {exc.reason}") from exc
     except (TimeoutError, OSError) as exc:
         raise DeliveryError(f"{endpoint} failed: {exc}") from exc
@@ -181,7 +186,7 @@ def _read_token_reply(
         # refusal names the peer's own algorithm token, which stays on the cause only.
         # BACKLOG #2989: the same classification the delivery hop gives this refusal. A plain
         # DeliveryError here retried a refusal that no retry can clear. Only an http:// token
-        # endpoint reaches this arm: through a CONNECT tunnel urllib raises the 407 as an OSError.
+        # endpoint reaches this arm; the https:// one's 407 is the URLError arm above.
         raise auth_challenge_refused(endpoint) from exc
     except EgressReplyError:
         # A bare CR in the reply head raises MalformedReplyHeadError, which is an HTTPException as
@@ -343,7 +348,7 @@ class _TokenEndpointProvider(abc.ABC):
                 trust_anchor=trust_anchor,
             )
             if token_proxy is not None or trust_anchor.narrows
-            else _NO_REDIRECT_OPENER
+            else _shared_no_redirect_opener()
         )
         # #1498, #2112 (ADR 0173 §4.3): the revocation twin of the cleartext refusal, and the same
         # one-statement call its HTTP-family siblings make. The token hop VERIFIES the authorization

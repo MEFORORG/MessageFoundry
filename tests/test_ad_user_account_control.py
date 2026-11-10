@@ -242,6 +242,8 @@ def _install_directory(monkeypatch: pytest.MonkeyPatch, directory: _Directory) -
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             self.entries: list[_Entry] = []
             self.result: dict[str, Any] | None = None  # no referral
+            # Read by doubles layered over this one, to tell the service account's bind apart.
+            self._bind_dn: str | None = kwargs.get("user")
 
         def __enter__(self) -> FakeConnection:
             return self
@@ -1587,17 +1589,16 @@ async def test_a_resolve_the_store_failed_to_write_once_lands_in_the_same_pass(
         directory.uac.update({"u1": ABSENT, "u2": ABSENT})
         assert (await _alerted_pass(service, sink)).hold
         directory.uac.update({"u1": ENABLED, "u2": ENABLED})
-        real = store.resolve_alert_instances_for
+        # The notifier's resolve writes through resolve_alert_instances_fenced (BACKLOG #4916).
+        real = store.resolve_alert_instances_fenced
         failures = [sqlite3.OperationalError("synthetic: database is locked")]
 
-        async def failing_once(
-            *, event_type: str, connection: str, now: float | None = None
-        ) -> int:
+        async def failing_once(*, event_type: str, **kwargs: Any) -> int:
             if event_type == "ad_reconcile_held" and failures:
                 raise failures.pop()
-            return await real(event_type=event_type, connection=connection, now=now)
+            return await real(event_type=event_type, **kwargs)
 
-        monkeypatch.setattr(store, "resolve_alert_instances_for", failing_once)
+        monkeypatch.setattr(store, "resolve_alert_instances_fenced", failing_once)
         assert (await _alerted_pass(service, sink)).hold_clear
         assert not failures, "the synthetic failure never fired"
         assert await _open_alerts(store) == set()
@@ -1616,20 +1617,19 @@ async def test_a_resolve_the_store_never_wrote_is_retried_on_the_next_pass(
         directory.uac.update({"u1": ABSENT, "u2": ABSENT})
         assert (await _alerted_pass(service, sink)).hold
         directory.uac.update({"u1": ENABLED, "u2": ENABLED})
-        real = store.resolve_alert_instances_for
+        # The notifier's resolve writes through resolve_alert_instances_fenced (BACKLOG #4916).
+        real = store.resolve_alert_instances_fenced
         failing = True
         attempts = 0
 
-        async def failing_while_set(
-            *, event_type: str, connection: str, now: float | None = None
-        ) -> int:
+        async def failing_while_set(*, event_type: str, **kwargs: Any) -> int:
             nonlocal attempts
             if event_type == "ad_reconcile_held" and failing:
                 attempts += 1
                 raise sqlite3.OperationalError("synthetic: database is locked")
-            return await real(event_type=event_type, connection=connection, now=now)
+            return await real(event_type=event_type, **kwargs)
 
-        monkeypatch.setattr(store, "resolve_alert_instances_for", failing_while_set)
+        monkeypatch.setattr(store, "resolve_alert_instances_fenced", failing_while_set)
         assert (await _alerted_pass(service, sink)).hold_clear
         assert attempts == len(zeros) + 1  # every attempt failed, and the resolve gave up
         assert await _open_alerts(store) == {HELD}, "the failed resolve went through after all"
@@ -2781,7 +2781,10 @@ async def test_a_hold_forfeited_before_it_ever_held_does_not_say_it_held_again(
             directory.uac.update({"v1": ABSENT, "v2": ABSENT})
             assert (await _alerted_pass(service, sink)).hold
             assert _said(caplog, _HELD_AGAIN) == 1
-            assert _said(caplog, "engaged again") == 0
+            # BACKLOG #3083 C6: "engaged again" is in no line, so that assert could never fail.
+            # The forfeit line is what may say this process held, and it must not.
+            assert _said(caplog, "before any pass here had held") == 1
+            assert _said(caplog, "before this process released its hold") == 0
 
 
 async def test_a_forfeited_breaker_logs_a_trip_of_new_accounts_after_nobody_was_signed_in(
@@ -2813,6 +2816,11 @@ async def test_a_forfeited_breaker_logs_a_trip_of_new_accounts_after_nobody_was_
                 directory.delete(name)
             assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
             assert _said(caplog, _TRIPPED_AGAIN) == 1
+            # BACKLOG #3083 C7: "this process gave up" must not read as though another engine
+            # would resolve it, where none resolves one itself. The give-up line says so too, and
+            # neither may say a restart would resolve it.
+            assert _said(caplog, "engine of more than one engine shard resolves none itself") == 2
+            assert _said(caplog, "until it restarts") == 0
 
 
 async def test_a_forfeited_referral_is_not_said_while_a_rotating_sample_misses_it(

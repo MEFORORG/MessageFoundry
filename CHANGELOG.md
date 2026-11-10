@@ -18,6 +18,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   its path leads to another host, or cannot finish reading the path; see the Generic ODBC section of
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
 
+### Fixed
+- **The `supervise` process's own TLS log forwarder now picks up a replaced CRL without a
+  restart.** An engine process applied a replaced `[logging].forward_tls_crl_file` to its running
+  forwarder, but the supervisor builds no engine, so nothing in it did. On a first deployment a
+  collector certificate revoked after the start would have been accepted by every later handshake
+  of the supervisor's forwarder until a restart. `supervise` now runs the same CRL reload while its
+  engine shards run, capped by `[cert_monitor].crl_max_reloads`. The revocation is refused at the
+  forwarder's next handshake; a connection it already holds is not cut, and keeps sending until it
+  fails and the forwarder reconnects. The supervisor raises no `[alerts]` alert for a refused
+  reload: it is a WARNING line in the supervisor's own log. A shutdown signal sent while a reload
+  pass is stuck cuts the supervisor's wait on that pass; the process can still wait at exit for
+  the stuck read's worker thread to return. (`BACKLOG #3314`)
+
 ## [0.5.2] — 2026-10-20 — Early Access
 
 This engine pairs with web console 0.5.0, which is published after it under its own

@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import errno
+import inspect
 import ipaddress
 import json
 import logging
@@ -31,6 +32,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from fastapi import HTTPException
 from pydantic import ValidationError
 from starlette.requests import Request
+from uvicorn.main import run as _uvicorn_run
 
 from messagefoundry.__main__ import main
 from messagefoundry.api import create_app
@@ -515,10 +517,10 @@ def _serve_capturing(
     return handed, captured
 
 
-def test_serve_hands_the_settings_crls_to_the_expiry_monitor(
+def test_serve_hands_the_settings_monitored_files_to_the_expiry_monitor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #299: ``settings_crls`` is the only route an outbound CRL takes to
+    """BACKLOG #299: ``settings_monitored_files`` is the only route an outbound CRL takes to
     ``Engine._monitored_certs``. Without it a stale ``[tls].crl_file`` raised no alert."""
     ca_key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "crl-ca")])
@@ -538,7 +540,7 @@ def test_serve_hands_the_settings_crls_to_the_expiry_monitor(
     # that one to the monitor too, after [tls].crl_file.
     import os
 
-    assert list(handed["settings_crls"]) == [
+    assert list(handed["settings_monitored_files"]) == [
         MonitoredCert("tls.crl_file", str(crl_path), kind="crl"),
         MonitoredCert(
             "logging.forward_tls_crl_file",
@@ -546,6 +548,21 @@ def test_serve_hands_the_settings_crls_to_the_expiry_monitor(
             kind="crl",
         ),
     ]
+
+
+def test_serve_hands_the_monitored_files_helper_output_to_the_expiry_monitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3714 item 5: serve passes exactly what ``monitored_files_from_settings`` returns,
+    the helper ``cert inventory`` also calls. The CRL test above runs on SQLite, where the helper
+    and ``crls_from_settings`` agree, so only a sentinel tells a call to the helper apart."""
+    sentinel = [MonitoredCert("sentinel.row", str(tmp_path / "absent.pem"))]
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.cert_expiry.monitored_files_from_settings",
+        lambda _settings: sentinel,
+    )
+    handed, _captured = _serve_capturing(tmp_path, monkeypatch, _SYNTHETIC_LOOPBACK_TOML)
+    assert list(handed["settings_monitored_files"]) == sentinel
 
 
 def test_the_generated_api_certificate_is_watched_by_the_expiry_monitor(
@@ -1303,6 +1320,14 @@ def test_serve_forwarded_allow_ips_empty_when_no_proxy(
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
     # Trust nothing by default (override uvicorn's loopback default), so XFF can't spoof the source IP.
     assert captured["forwarded_allow_ips"] == []
+    # Vault BACKLOG #3764 item 6: the premise of tests/test_api_listener_ipv6_only.py. serve names
+    # no loop, so uvicorn.run's own "auto" default runs it on uvloop wherever that imports, and it
+    # binds by host and port, so the loop's create_server makes the socket that file reads.
+    # uvicorn.run is stubbed here, so the default is read off the unpatched function.
+    premise = "the premise of tests/test_api_listener_ipv6_only.py no longer holds"
+    assert "loop" not in captured, premise
+    assert inspect.signature(_uvicorn_run).parameters["loop"].default == "auto", premise
+    assert "fd" not in captured and "uds" not in captured, premise
     # WP-L3-07 (ASVS 13.4.6): the `Server: uvicorn` banner is suppressed.
     assert captured["server_header"] is False
     # BACKLOG #3256: the connection drain before the lifespan teardown is bounded.
@@ -5481,6 +5506,9 @@ def test_supervise_renews_once_before_it_spawns_any_shard(
         # Not handed to the engine shards: the supervisor calls it on the graph it loads (vault
         # BACKLOG #2368), and build_shard_specs never sees it.
         "registry_guard",
+        # Not handed to the engine shards either: the cap for the supervisor's own CRL reload
+        # (BACKLOG #3314); each engine shard reads its own from its settings.
+        "crl_max_reloads",
     }  # nothing new handed to the shards
     _load_pair(cert, tmp_path / "api-generated-key.pem")
 

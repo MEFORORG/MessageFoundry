@@ -365,11 +365,16 @@ async def _create_race(service: AuthService, store: MessageStore, mp: pytest.Mon
 
 
 #: BACKLOG #3728 item 5: the sign-in refusal arms the item named as untested. Each is
-#: ``(setup, audit action, the row's reason, the outcome's reason)``; the login_error row has no
-#: reason, and the inline local conflict returns none.
+#: ``(setup, audit action, the row's reason, the outcome's reason)``; the inline local conflict
+#: returns none.
 _ArmSetup = Callable[[AuthService, MessageStore, pytest.MonkeyPatch], Awaitable[None]]
 _SIGN_IN_ARMS: dict[str, tuple[_ArmSetup, str, str | None, str | None]] = {
-    "login_error": (_directory_down, "auth.login_error", None, "directory_unavailable"),
+    "login_error": (
+        _directory_down,
+        "auth.login_error",
+        "directory_error",
+        "directory_unavailable",
+    ),
     "binding_changed": (
         _binding_changed,
         "auth.login_failed",

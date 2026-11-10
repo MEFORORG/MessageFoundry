@@ -239,8 +239,10 @@ async def test_sqlserver_rotate_reads_its_output_rowset_not_the_row_count(
     seen: list[tuple[str, tuple[Any, ...]]] = []
     store = _nocount_store(seen, output_rows)
     assert await store.rotate_session(_HASH, new_token_hash=_OTHER) is bool(output_rows)
-    # The read comes first (BACKLOG #2592); the rewrite is the statement that reports.
-    assert "OUTPUT inserted.token_hash" in seen[1][0]
+    # The read comes right before the rewrite (BACKLOG #2592); the rewrite is the statement that
+    # reports. What runs ahead of the read, the account lock, is the next test's.
+    read = next(i for i, (sql, _) in enumerate(seen) if _reads_session_row(sql))
+    assert "OUTPUT inserted.token_hash" in seen[read + 1][0]
     # The lineage link follows the rewrite only when the rowset says it landed (vault BACKLOG
     # #3028), so a refused rotation links nothing.
     links = [sql for sql, _ in seen if sql.startswith("INSERT INTO session_lineage")]
@@ -248,6 +250,45 @@ async def test_sqlserver_rotate_reads_its_output_rowset_not_the_row_count(
     # The generic placeholder test never lands a rotation, so the link's binding is checked here.
     for sql, params in seen:
         assert sql.count("?") == len(params), f"{len(params)} parameters for:\n{sql}"
+
+
+_OWNER_READ = "SELECT user_id FROM sessions WHERE token_hash=?"
+_ACCOUNT_LOCK = "SELECT id FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?"
+
+
+@pytest.mark.parametrize("owner", [None, "u"])
+async def test_sqlserver_rotate_locks_the_account_row_before_the_session_row(
+    owner: str | None,
+) -> None:
+    """BACKLOG #4974: the re-key takes its account's ``users`` row under ``UPDLOCK, ROWLOCK``
+    before it reads its session row under the same hint, the order every whole-account sweep
+    takes them in, so a sweep cannot meet the row mid-move. Where the session has no row, there is
+    no account to lock, and nothing is locked: the control."""
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    store = _mssql_store(seen)
+
+    class _OwnerCursor(_MssqlCursor):
+        def _other_rows(self) -> list[Any]:
+            return [(owner,)] if owner is not None and self._last == _OWNER_READ else []
+
+    class _OwnerConn(_MssqlConn):
+        async def cursor(self) -> _MssqlCursor:
+            return _OwnerCursor(self._seen)
+
+    @asynccontextmanager
+    async def _acquire() -> AsyncIterator[_MssqlConn]:
+        yield _OwnerConn(seen)
+
+    store._acquire_after_commit = _acquire
+    await store.rotate_session(_HASH, new_token_hash=_OTHER)
+    statements = [sql for sql, _ in seen]
+    assert seen[0] == (_OWNER_READ, (_HASH,))
+    if owner is None:
+        assert _ACCOUNT_LOCK not in statements
+        assert _reads_session_row(statements[1])
+    else:
+        assert seen[1] == (_ACCOUNT_LOCK, (owner,))
+        assert statements[2].startswith("SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK)")
 
 
 @pytest.mark.parametrize("revoked", [0, 3])

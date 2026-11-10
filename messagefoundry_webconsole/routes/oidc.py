@@ -68,9 +68,9 @@ from .. import pages
 from .._auth import (
     allow_reauth_attempt,
     assert_same_origin,
+    claim_continuation,
     clear_oidc_flow_cookie,
-    consume_continuation,
-    continues_after_reauth,
+    hold_claim_for_flow,
     is_unlock_action,
     login_redirect_response,
     lookup_ui_action,
@@ -80,6 +80,8 @@ from .._auth import (
     session_token,
     set_oidc_flow_cookie,
     set_session_cookie,
+    settle_flow_claim,
+    take_flow_claim,
 )
 from .._external import display_host, is_allowlisted, is_external, is_idn_disguised
 
@@ -157,9 +159,12 @@ def _step_up_refusal(
     (#2764), so a fresh flow started from this page continues only to an unlock target; the page
     says so. (After a state mismatch the original flow is still staged and its real return would
     still continue -- the conservative wording errs toward "nothing will run".) An action-bound
-    unlock page arrives here as return_to only when the start leg found it issued, and that leg
-    leaves its issue unspent (owner ruling 2026-10-13, #3241 R3), so the retry this page offers
-    still continues to it.
+    unlock page arrives here as return_to only when the start leg found it issued. That leg holds
+    the issue for its flow, and the callback gives it back to the session when the flow ends
+    refused (owner ruling 2026-10-13, #3241 R3; vault BACKLOG #3241, added items 7 and 9), so the
+    retry this page offers continues to it only while the issue has not lapsed. Once it has, the
+    put-back drops it and the retry continues to nothing, though this page still names the action
+    as one that runs.
     """
     next_ = _step_up_target(return_to)
     return reauth_idp_response(
@@ -419,10 +424,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Vault BACKLOG #2764: an auto-retry action is staged as the flow's continuation only when
         # a step-up gate issued it to this session. Anything else still re-proves at the IdP, and
         # returns to the console with nothing run and no grant minted for the named action.
-        continues = continues_after_reauth(action, token, next_)
+        # Vault BACKLOG #3241, added item 9: TAKEN now, before the await below, so a second start (or
+        # a password re-auth) racing this one for the same issue mints nothing. Every exit that
+        # stages no flow puts it back; a staged flow holds it until its callback resolves.
+        claim = claim_continuation(action, token, next_)
+        continues = claim.continues
         return_to = next_ if continues else reauth_landing(identity)
         client = client_ip(request)
         if not allow_reauth_attempt(auth, identity):  # per-ACTOR, not the sign-in budget
+            claim.restore()
             return reauth_idp_response(
                 deps,
                 auth,
@@ -434,6 +444,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         public_origin = getattr(request.app.state, "public_origin", None)
         if not public_origin:
             # The redirect_uri comes from public_origin, never from the Host header.
+            claim.restore()
             return reauth_idp_response(
                 deps,
                 auth,
@@ -451,6 +462,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 public_origin=public_origin,
             )
         except FlowCacheFullError:
+            claim.restore()
             _log.warning("federated flow cache is full; refusing step-up for %s", client or "?")
             return reauth_idp_response(
                 deps,
@@ -463,14 +475,19 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except FlowError:
             # Federation off, or a session the federated login did not mint. Neither falls back to
             # a password: GET /ui/reauth is where a non-OIDC session gets its own form.
+            claim.restore()
             return RedirectResponse("/ui", status_code=303)
-        # Spent only once the flow is staged, so a refusal above leaves it for a retry. From here
-        # the single-use flow is the binding; the callback cannot read this session's cookie.
-        # An unlock page's issue is left in place (owner ruling 2026-10-13, #3241 R3): spending it
-        # here would strand the retry the IdP's refusal page offers. It cannot mint a second grant
-        # after a success, because the callback rotates the token without re-keying this table.
-        if not is_unlock_action(next_):
-            consume_continuation(token, next_)
+        except BaseException:
+            claim.restore()
+            raise
+        # From here the single-use flow is the binding; the callback cannot read this session's
+        # cookie. An auto-retry action's issue stays spent. An unlock page's issue is held for the
+        # flow (owner ruling 2026-10-13, #3241 R3; vault BACKLOG #3241, added items 7 and 9): the
+        # callback puts it back when the flow ends refused, so the retry the refusal page offers
+        # continues only while the issue has not lapsed, and drops it on a success, so one issue
+        # mints one grant.
+        if action.unlock:
+            hold_claim_for_flow(flow_id, claim)
         resp = RedirectResponse(authorization_url, status_code=303)
         set_oidc_flow_cookie(resp, flow_id, request=request, max_age=auth.oidc_flow_ttl_seconds)
         return resp
@@ -538,22 +555,38 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if staged is not None:
             # BACKLOG #296: the IdP is returning from a STEP-UP of a live session, not a sign-in.
             # The service pops the flow and re-checks its kind, so this branch only picks the leg.
-            step_up = (
-                await auth.abandon_oidc_step_up(
-                    flow_id,
-                    # Checked before the flow is consumed, so a forged error= cannot cancel it.
-                    state=state,
-                    reason="idp_error" if error is not None else "malformed_callback",
-                    client=client,
+            # Vault BACKLOG #3241, added items 7 and 9: the issue the start leg held for this flow
+            # is pinned to it before the await, and a flow whose issue another re-auth took mints
+            # no grant, so one issue mints at most one. An exception in the await loses the issue,
+            # which costs only that continuation.
+            claim, mint_grant = take_flow_claim(flow_id, staged.return_to)
+            try:
+                step_up = await (
+                    auth.abandon_oidc_step_up(
+                        flow_id,
+                        # Checked before the flow is consumed, so a forged error= cannot cancel it.
+                        state=state,
+                        reason="idp_error" if error is not None else "malformed_callback",
+                        client=client,
+                    )
+                    if error is not None or not code or not state
+                    else auth.complete_oidc_step_up(
+                        flow_id=flow_id,
+                        state=state,
+                        code=code,
+                        client=client,
+                        public_origin=getattr(request.app.state, "public_origin", "") or "",
+                        mint_grant=mint_grant,
+                    )
                 )
-                if error is not None or not code or not state
-                else await auth.complete_oidc_step_up(
-                    flow_id=flow_id,
-                    state=state,
-                    code=code,
-                    client=client,
-                    public_origin=getattr(request.app.state, "public_origin", "") or "",
-                )
+            except BaseException:
+                settle_flow_claim(flow_id, claim, consumed=None, minted=False)
+                raise
+            settle_flow_claim(
+                flow_id,
+                claim,
+                consumed=step_up.flow_consumed,
+                minted=step_up.elevation.token is not None,
             )
             return _step_up_landing(request, deps, auth, step_up)
         if error is not None or not code or not state:

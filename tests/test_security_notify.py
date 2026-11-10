@@ -41,6 +41,7 @@ from messagefoundry.pipeline.security_notify import (
     _subject,
     security_notifier_from_settings,
 )
+from tests._log_absence import assert_capture_sees
 
 # The module's own logger, named once so the capture filter and the module cannot drift apart.
 _NOTIFY_LOGGER = "messagefoundry.pipeline.security_notify"
@@ -407,6 +408,7 @@ def test_a_dropped_name_is_logged_not_silent(caplog: pytest.LogCaptureFixture) -
                 detail={"old_username": "jdoe", "new_username": "jdoe-new", "source": "directory"},
             )
         )
+        assert_capture_sees(caplog, _NOTIFY_LOGGER)
         assert [r for r in caplog.records if r.name == _NOTIFY_LOGGER] == []
         _build_body(
             SecurityEvent(

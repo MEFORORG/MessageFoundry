@@ -124,7 +124,7 @@ async def test_the_requester_cannot_approve_their_own_hold(engine: Engine) -> No
 
 async def test_a_hold_dual_control_no_longer_gates_offers_only_reject(engine: Engine) -> None:
     """Held while dual control was on, listed after it was turned off: the engine marks the row
-    ``gated`` False and the page offers Reject, with why, but no Approve the gate would refuse."""
+    ``release_blocked`` ``not_gated`` and the page offers Reject, with why, but no Approve the gate would refuse."""
     service, _maker, _checker = await _two_approvers(engine)
     async with _client(engine, service, _ON) as maker:
         await cookie_login(maker, "maker")
@@ -675,6 +675,33 @@ def test_params_that_did_not_parse_or_are_empty_say_so() -> None:
     assert "requester: other" in differs
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [None, "", " ", "7", 7, "a" * 63, "A" * 64, "g" * 64, "a" * 64 + "\n", ["a" * 64]],
+    ids=["none", "empty", "space", "int-text", "int", "short", "upper", "not-hex", "nl", "list"],
+)
+def test_a_held_reload_with_no_usable_digest_reads_as_the_engines_refusal(bad: object) -> None:
+    """Vault BACKLOG #3192: every digest the engine refuses to approve on reads as that refusal,
+    never as its raw value, which could pass for a digest; a well-formed one is shown as it is."""
+    from messagefoundry_webconsole.pages import approvals as page_module
+
+    def _page(digest: object, operation: str, blocked: ReleaseBlocked | None) -> str:
+        row = _row(
+            "e" * 32, operation=operation, params={"fingerprint": digest}, release_blocked=blocked
+        )
+        return str(pages.approvals_page(ApprovalList(approvals=[row])))
+
+    html = _page(bad, "config_reload", "params_no_fingerprint")
+    assert f"fingerprint: {page_module._NO_DIGEST}" in html
+    assert "will refuse this release" not in html
+    # The control: an unblocked reload row, as the engine lists one, shows its digest and Approve.
+    good = _page("c" * 64, "config_reload", None)
+    assert f"fingerprint: {'c' * 64}" in good and page_module._NO_DIGEST not in good
+    assert 'action="/ui/approvals/' + "e" * 32 + '/approve"' in good
+    # Only a held reload binds a digest; another operation's param of that name is not judged.
+    assert page_module._NO_DIGEST not in _page(bad, "dead_letter_replay", None)
+
+
 def test_a_notice_code_selects_a_sentence_and_never_supplies_one() -> None:
     empty = ApprovalList(approvals=[])
     assert "Request rejected" in str(pages.approvals_page(empty, notice="rejected"))
@@ -770,3 +797,17 @@ async def test_a_stale_window_lands_the_approver_back_on_the_page(engine: Engine
         assert await _status(engine, approval_id) == "pending"
         landed = await checker.get("/ui/approvals?m=approve_again")
         assert "Nothing was released" in landed.text
+
+
+def test_the_not_authorized_note_names_a_deleted_requester_and_an_unbound_auth_service() -> None:
+    """Vault BACKLOG #3748 item 4 and L5: the engine marks a request ``requester_not_authorized``
+    for a deleted or disabled requester and when no auth service is bound to check one, as well as
+    for a lost permission or scope. The note said only that the requester's authority could be
+    restored, which is never so for a deleted account and is no fault of the requester's when
+    nothing can check it."""
+    from messagefoundry_webconsole.pages import approvals as page_module
+
+    note = page_module._BLOCKED["requester_not_authorized"]
+    assert "deleted" in note and "no auth service is bound" in note
+    assert "never for a deleted account" in note
+    assert "{verb}" in note

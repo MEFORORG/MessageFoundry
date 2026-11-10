@@ -57,7 +57,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence  # noqa: E402
 from pathlib import (  # noqa: E402
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
-from typing import TYPE_CHECKING, Any, NamedTuple, cast  # noqa: E402
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast  # noqa: E402
 
 from messagefoundry import __version__  # noqa: E402
 from messagefoundry.cli_common import (  # noqa: E402  # the shared CLI shell and helpers (ADR 0201 slice 1)
@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
+    from messagefoundry.store.custody_host import MintedCustody
     from messagefoundry.store.store import UserRecord
 
 
@@ -424,8 +425,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         description="Run validate + dryrun (+ advisory ruff/mypy) as a commit/CI gate. The dryrun "
         "sub-check previews under [pipeline].snapshot_on_send (copy-on-Send, ADR 0104) resolved "
         "best-effort from the settings the posture check reads: this instance's "
-        "messagefoundry.toml, or with no file, the MEFOR_* environment when MEFOR_AI_ENVIRONMENT "
-        "names the instance. When no settings load, the preview falls back to the "
+        "messagefoundry.toml, or with no file, the MEFOR_* environment when --env or "
+        "MEFOR_AI_ENVIRONMENT names the instance. When no settings load, the preview falls back to the "
         "setting's own default (ON) — matching the default engine, never a silent OFF (#230). "
         "Under --project-root with no --service-config, check reads the project root's "
         "messagefoundry.toml, else the config dir's, while serve with the same flags reads the "
@@ -437,7 +438,14 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "reaches it, fails the settings checks, as it stops serve.",
     )
     check.add_argument("--config", default="samples/config", help="config modules directory")
-    _add_anchor_flags(check)
+    _add_anchor_flags(
+        check,
+        env_help="active environment NAME, read as serve --env reads it (ADR 0050 AC-6): it selects "
+        "environments/<env>.toml values and overrides [ai].environment, above the file and "
+        "MEFOR_AI_ENVIRONMENT, so the settings checks apply serve's posture refusal to that name, and "
+        "with no messagefoundry.toml they grade that instance instead of skipping. With no --env, "
+        "check adopts no required-env refusal.",
+    )
     check.add_argument(
         "--messages", default=None, help="HL7 fixtures dir (dryrun gates when it has *.hl7)"
     )
@@ -638,7 +646,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "inventory",
         help="read-only certificate inventory: print subject / issuer / notAfter / SAN / days-remaining "
         "/ expired per cert, and issuer / nextUpdate / days-remaining per CRL file. Sources: --cert "
-        "PATH (repeatable), the [api] TLS material and settings-level CRL files of "
+        "PATH (repeatable), the [api] TLS material, settings-level CRL files and SQL Server store "
+        "pin of "
         "--service-config, and/or the wired TLS certs and inbound CRLs of --config",
     )
     cert_inventory.add_argument(
@@ -720,6 +729,33 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
 
+    # ADR 0207 section 6: a site whose every enabled Administrator is a directory account with no
+    # engine factor has nobody who can issue an enrolment code. This is the host's exit, on
+    # admin-unlock's gate, for any directory account.
+    issue_enrolment_code = sub.add_parser(
+        "issue-enrolment-code",
+        help="issue a directory account's one-time enrolment code from the host (offline)",
+        description="Issue the single-use enrolment code a directory account needs to bind its "
+        "first engine factor, for a site where no Administrator can issue one from the console. "
+        "Runs against the store directly, on the same host gate as admin-unlock. On SQLite it "
+        "refuses while another connection holds the store, and when it cannot tell; on a server "
+        "store it cannot tell, so run it with the engine stopped. It prints the code once; hand it "
+        "over after confirming who is asking, never through the account's own mail or chat. It "
+        "refuses a local account, a disabled account and an account that holds a factor.",
+    )
+    issue_enrolment_code.add_argument(
+        "--username", required=True, help="the directory account the code is for"
+    )
+    issue_enrolment_code.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    issue_enrolment_code.add_argument(
+        "--db", default=None, help="store path (overrides [store].path)"
+    )
+    issue_enrolment_code.add_argument("--json", action="store_true", help="emit JSON")
+
     # BACKLOG #2614. DELETE /sessions ends sessions in bulk through the API; this is the same act
     # from the host, for when the API itself is what is not trusted. Same host gate as admin-unlock.
     admin_revoke_sessions = sub.add_parser(
@@ -776,6 +812,16 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--no-totp",
         action="store_true",
         help="do not enrol an authenticator app (refused while [security].require_mfa is on)",
+    )
+    # Vault BACKLOG #3411 (key custody S3): under [store].key_provider = 'host' this command mints
+    # the store key. Without this option it keeps the key for the account running it; with it, it
+    # writes the machine-scope handoff the named service account converts on its first start.
+    provision_admin.add_argument(
+        "--service-account",
+        default=None,
+        help="under [store].key_provider = 'host', mint the store key for this Windows service "
+        "account (such as 'NT SERVICE\\MessageFoundry') as a handoff it converts on its first "
+        "start; without it the key is kept for the account running this command",
     )
 
     # ADR 0183 Amendment A, Wave 1c (BACKLOG #1136). An enabled Administrator with no address is
@@ -1319,13 +1365,16 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     return parser, _DISPATCH
 
 
-def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
+def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str | None = None) -> None:
     """Add the project-root / active-env / service-config trio to an OFFLINE subcommand (ADR 0050 §3).
 
     ``validate``/``graph``/``dryrun``/``check`` carried only ``--config`` before, so the commit/CI gate
     could resolve a DIFFERENT environment view than ``serve`` (review C3). These flags let the gate
     anchor the same bundle root and select the same active environment ``serve`` does — value
     resolution only, WITHOUT adopting serve's required-active-env / explicit-posture refusal (AC-6).
+    ``check`` is the exception for ``--env``, by ADR 0050's amended AC-6: its settings legs read it
+    as ``serve --env`` does, so its ``posture`` leg judges that name (vault BACKLOG #2355).
+    ``env_help`` replaces the ``--env`` help for it.
     """
     p.add_argument(
         "--project-root",
@@ -1337,7 +1386,8 @@ def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--env",
         default=None,
-        help="active environment NAME (selects environments/<env>.toml values). With no --env the gate "
+        help=env_help
+        or "active environment NAME (selects environments/<env>.toml values). With no --env the gate "
         "behaves exactly as before (no env values loaded); it never adopts serve's required-env refusal.",
     )
     p.add_argument(
@@ -1348,7 +1398,9 @@ def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
     )
 
 
-def _resolve_offline_anchor(args: argparse.Namespace) -> tuple[str, str | None] | int:
+def _resolve_offline_anchor(
+    args: argparse.Namespace, *, defer_missing_service_config: bool = False
+) -> tuple[str, str | None] | int:
     """Apply the ADR 0050 project-root anchor to an offline subcommand's paths, and fail loud on the
     one scoped missing-value-file case. Returns ``(config_dir, service_config)`` resolved under the
     root, or a non-zero exit code (already reported to stderr) on the hard failure.
@@ -1381,7 +1433,18 @@ def _resolve_offline_anchor(args: argparse.Namespace) -> tuple[str, str | None] 
     # Fail loud only under an EXPLICIT root with an env name AND an env-referencing graph AND no file
     # (ADR 0050 §2, ratified). Without --env there is no value file to require; without --project-root
     # the silent-empty default is preserved; a zero-env() graph is never failed.
-    if args.project_root is not None and args.env is not None and root is not None:
+    #
+    # defer_missing_service_config is check's: a --service-config that is no file stops serve before
+    # its value-file check, and check's settings legs fail on it in serve's words. The value-file
+    # check here would name a guessed directory instead, so it is left to them.
+    # exists(), not is_file(): serve's load_settings tests exists(), so it reads a device such as
+    # NUL as an empty file, and the value-file check still applies there.
+    deferred = (
+        defer_missing_service_config
+        and service_config is not None
+        and not Path(service_config).exists()
+    )
+    if args.project_root is not None and args.env is not None and root is not None and not deferred:
         env_dir = _env_dir_name(service_config)
         rc = _check_env_file_present(config_dir, root, args.env, env_dir)
         if rc is not None:
@@ -1395,7 +1458,16 @@ def _env_dir_name(service_config: str | None) -> str:
     Read from the resolved ``service_config`` TOML (a tiny, settings-free tomllib read) so the offline
     AC-3 check honors a CUSTOM ``dir = "envs"`` instead of false-positive-failing on the hardcoded
     literal. Best-effort: no/unreadable/malformed file -> the default. The full ``load_settings`` is
-    deliberately avoided here (the offline gate stays settings-free, like validate/graph/dryrun)."""
+    deliberately avoided here (the offline gate stays settings-free, like validate/graph/dryrun).
+
+    ``MEFOR_ENVIRONMENTS_DIR`` beats the file, as it does in ``serve``'s ``load_settings`` (vault
+    BACKLOG #2355). The file read is ``service_config`` alone: under ``--project-root`` with no root
+    file, ``check``'s settings legs read the config dir's file, which this does not."""
+    from messagefoundry.config.settings import environments_dir_named_by_env
+
+    named = environments_dir_named_by_env()
+    if named is not None:
+        return named
     if service_config is None:
         return "environments"
     try:
@@ -1406,7 +1478,8 @@ def _env_dir_name(service_config: str | None) -> str:
     env_section = data.get("environments")
     if isinstance(env_section, dict):
         name = env_section.get("dir")
-        if isinstance(name, str) and name:
+        if isinstance(name, str):
+            # A blank dir is taken as given, as serve's loader takes it.
             return name
     return "environments"
 
@@ -1432,9 +1505,8 @@ def _check_env_file_present(config_dir: str, root: Path, env_name: str, env_dir:
     if not env_file.is_file():
         print(
             f"error: the graph references env() but no value file was found at {env_file} under the "
-            f"explicit --project-root {str(root)!r} for --env {env_name!r}. Create "
-            f"{env_dir}/{env_name}.toml under the project root (or drop --project-root to use the "
-            "working directory).",
+            f"explicit --project-root {str(root)!r} for --env {env_name!r}. Create that file (or drop "
+            "--project-root to use the working directory).",
             file=sys.stderr,
         )
         return 2
@@ -1814,14 +1886,20 @@ def _load_service_settings(
         return None, settings_error_detail(exc)
 
 
-def _post_write_settings_check(refusal: type[ValueError]) -> Callable[[Path], None]:
+def _post_write_settings_check(
+    refusal: type[ValueError], *, keep: list[ServiceSettings] | None = None
+) -> Callable[[Path], None]:
     """The ``validate`` callback ``security set`` and ``alert add``/``remove`` hand their editor.
 
     It loads the editor's candidate exactly as the engine loads the file, so a bad edit fails at
     edit time and never replaces the file, rather than the engine refusing at the next start. That
     load is the WHOLE file plus the environment layer, not the JSON the operator typed, so its failure goes through
     :func:`_load_service_settings` and is raised as ``refusal`` already rendered (vault BACKLOG
-    #2760); the editor modules stay outside the settings import graph and cannot render it."""
+    #2760); the editor modules stay outside the settings import graph and cannot render it.
+
+    ``keep``, when given, receives the settings each accepted candidate loaded to, so a caller can
+    report on what was saved without loading the file a second time. It is filled before the
+    replace that follows, which can still fail, so read it only once the edit has returned."""
 
     def validate(settings_path: Path) -> None:
         settings, detail = _load_service_settings(str(settings_path))
@@ -1830,6 +1908,8 @@ def _post_write_settings_check(refusal: type[ValueError]) -> Callable[[Path], No
                 "the settings do not load with this edit applied (the file plus any MEFOR_* "
                 f"environment overrides), so the edit was not saved: {detail}"
             )
+        if keep is not None:
+            keep.append(settings)
 
     return validate
 
@@ -2582,7 +2662,8 @@ def _remote_debug_refused(
     """True, with the reason printed, when :func:`messagefoundry.remotedebug.remote_debug_refusal`
     refuses ``posture`` and nothing lifts it (vault BACKLOG #2700). ``what`` is what is refused.
     Where the acceptance lifts it, the :func:`_remote_debug_audit` line is logged instead. The
-    caller logs it again once its log handlers exist, as BACKLOG #1989 does for its audit lines."""
+    caller logs it again once its log handlers exist, as BACKLOG #1989 does for its audit lines.
+    A refusal with the engine's hook missing also logs the ``remote_debug_unguarded`` entry."""
     audit = _remote_debug_audit(settings, posture, enforcing=enforcing, what=what)
     if audit is not None:
         logging.getLogger(__name__).warning("%s", audit)
@@ -2590,6 +2671,13 @@ def _remote_debug_refused(
     refused = remote_debug_refusal(posture) if enforcing else None
     if refused is None:
         return False
+    # Vault BACKLOG #3795: the residual line follows this gate, so without this a refused start
+    # would not say that the engine's hook did not answer. The relaunch the refusal names turns
+    # the interface off, and would leave what stopped the hook unreported.
+    if not posture.guard_installed and (unguarded := remote_debug_loosening(posture)) is not None:
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *unguarded
+        )
     print(f"error: refusing to {what}: {refused}.", file=sys.stderr)
     return True
 
@@ -2646,7 +2734,7 @@ def _serve(args: argparse.Namespace) -> int:
     )
     from messagefoundry.crashdump import suppress_crash_dumps
     from messagefoundry.keywrap import KeyWrapRefused
-    from messagefoundry.pipeline.cert_expiry import certs_from_settings, crls_from_settings
+    from messagefoundry.pipeline.cert_expiry import monitored_files_from_settings
     from messagefoundry.store.crypto import memory_locking_available
 
     # ADR 0152 Phase 0 — in-USE PHI hygiene, applied before anything can put PHI in this address
@@ -4895,7 +4983,7 @@ def _serve(args: argparse.Namespace) -> int:
         # [api] client), so a CRL going stale on an OUTBOUND hop alerts before it fails a handshake.
         # Vault BACKLOG #2223: plus the SQL Server store pin, whose expiry the engine watches itself
         # (why: the `ssl_root_cert` row of docs/CONFIGURATION.md).
-        settings_crls=[*crls_from_settings(settings), *certs_from_settings(settings)],
+        settings_monitored_files=monitored_files_from_settings(settings),
         # Reserve the engine's own API listener so no inbound can be wired onto it (it would collide
         # with uvicorn at bind); surfaced as a clear PortConflictError at check/start instead.
         api_listener=(settings.api.host, settings.api.port),
@@ -5176,17 +5264,6 @@ def _supervise(args: argparse.Namespace) -> int:
     # forwarder (BACKLOG #2356).
     configure_logging("INFO")
 
-    # The supervisor has no API and builds no loosening list, so its own reading is reported here.
-    # Each shard reports its own through `serve`.
-    security_lines: list[tuple[str, str]] = []
-    remote_debug_reading = remote_debug_posture()
-    remote_debug = remote_debug_loosening(remote_debug_reading)
-    if remote_debug is not None:
-        security_lines.append(remote_debug)
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
-        )
-
     # ADR 0050 AC-9: anchor the discovery --config and the --db base under the project root HERE, before
     # discover_shard_specs runs load_config() — so `supervise --project-root R --config <relative>` from a
     # non-root CWD discovers shards under R, and each shard's <stem>_<shard>.db composes under R in the
@@ -5252,8 +5329,8 @@ def _supervise(args: argparse.Namespace) -> int:
 
     # Vault BACKLOG #2701: the start-up code check each engine shard's `serve` makes, for the same
     # reason as the gates around it, and because the supervisor's own interpreter ran that code
-    # too. The supervisor builds no loosening list, so its own reading is logged here, like the
-    # remote-debugging one above. Each engine shard reports its own through `serve`. The reading
+    # too. The supervisor builds no loosening list, so its own reading is logged below, once the
+    # start-file gate has passed. Each engine shard reports its own through `serve`. The reading
     # also searches the import path the engine shards inherit, so a module only they would run
     # refuses here.
     from messagefoundry.config.ai_policy import SecurityEnforcement
@@ -5271,10 +5348,23 @@ def _supervise(args: argparse.Namespace) -> int:
         return 2
     # Vault BACKLOG #2700: the supervisor's OWN process. Its engine shards start with the
     # interface off (messagefoundry/childenv.py), so none of them would refuse on it.
+    remote_debug_reading = remote_debug_posture()
     if _remote_debug_refused(
         settings, remote_debug_reading, enforcing=enforcing, what="start the fleet"
     ):
         return 2
+    # The supervisor has no API and builds no loosening list, so its own reading is reported here,
+    # and only after the refusal above (vault BACKLOG #3795 item 8): a fleet refused on the
+    # reading does not first log it as a residual. One exception: where the engine's hook did not
+    # answer, _remote_debug_refused logs `remote_debug_unguarded` before its refusal, on the log
+    # stream (stdout here), while the refusal goes to stderr.
+    security_lines: list[tuple[str, str]] = []
+    remote_debug = remote_debug_loosening(remote_debug_reading)
+    if remote_debug is not None:
+        security_lines.append(remote_debug)
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
+        )
     if settings.security.allow_remote_debugging:
         accepted = REMOTE_DEBUG_ACCEPTANCE_LOOSENING
         security_lines.append(accepted)
@@ -5411,13 +5501,8 @@ def _supervise(args: argparse.Namespace) -> int:
     if forwarder_installed:
         # The readings above were logged before a forwarder existed. Log them once more so the
         # off-box copy has them. With no forwarder installed this writes nothing.
-        for security_line in security_lines:
-            logging.getLogger(__name__).warning(
-                "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
-                "forwarder.)",
-                *security_line,
-            )
-        # Vault BACKLOG #2700: the AUDIT line the remote-debugging gate logged above, if any.
+        # Vault BACKLOG #2700: the AUDIT line the remote-debugging gate logged above, if any. First,
+        # because the gate logged it ahead of every line in security_lines (vault BACKLOG #3795).
         if (
             fleet_audit := _remote_debug_audit(
                 settings, remote_debug_reading, enforcing=enforcing, what="start the fleet"
@@ -5425,6 +5510,12 @@ def _supervise(args: argparse.Namespace) -> int:
         ) is not None:
             logging.getLogger(__name__).warning(
                 "%s (Logged again for the off-box forwarder.)", fleet_audit
+            )
+        for security_line in security_lines:
+            logging.getLogger(__name__).warning(
+                "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
+                "forwarder.)",
+                *security_line,
             )
 
     try:
@@ -5470,6 +5561,8 @@ def _supervise(args: argparse.Namespace) -> int:
             env=args.env,
             service_config=args.service_config,
             project_root=args.project_root,
+            # BACKLOG #3314: the cap for the supervisor's own CRL reload, as an engine shard's.
+            crl_max_reloads=settings.cert_monitor.crl_max_reloads,
             registry_guard=_chain_registry_guards(
                 refuse_keep_forever_overrides,
                 _fleet_connection_key_file_refusal(
@@ -6153,8 +6246,7 @@ def _cert_inventory(args: argparse.Namespace) -> int:
     from messagefoundry.pipeline.cert_expiry import (
         MonitoredCert,
         certs_from_registry,
-        certs_from_settings,
-        crls_from_settings,
+        monitored_files_from_settings,
     )
 
     explicit = args.cert or []
@@ -6166,15 +6258,15 @@ def _cert_inventory(args: argparse.Namespace) -> int:
         )
 
     # Rows to read — explicit --cert first (label = the path), then the wired TLS certs, then the
-    # settings-level CRL files. A row's `kind` picks the parser: a CRL read as a certificate is a
-    # parse error, which is what the inbound CRLs from the registry used to produce here.
+    # settings-level CRL and pin files. A row's `kind` picks the parser: a CRL read as a certificate
+    # is a parse error, which is what the inbound CRLs from the registry used to produce here.
     rows: list[MonitoredCert] = [MonitoredCert(p, p) for p in explicit]
 
     api_plan: ApiTlsPlan | None = None
     cert_present = False
     served: str | None = None
     client_certs: Sequence[str] = ()
-    settings_crls: list[MonitoredCert] = []
+    settings_monitored_files: list[MonitoredCert] = []
     if args.service_config:
         # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
         settings, detail = _load_service_settings(args.service_config)
@@ -6197,10 +6289,9 @@ def _cert_inventory(args: argparse.Namespace) -> int:
             served = api_plan.cert_file
         # ASVS 6.4.5: inventory the service-caller certs the operator listed, too.
         client_certs = settings.api.tls_client_cert_files
-        # BACKLOG #299: the same settings-level CRL files the engine's expiry monitor watches.
-        settings_crls = crls_from_settings(settings)
-        # Vault BACKLOG #2223: and the SQL Server store pin, which the monitor watches too.
-        settings_crls.extend(certs_from_settings(settings))
+        # BACKLOG #299, vault #2223: the same settings-level CRL and pin files the engine's expiry
+        # monitor watches, from the one helper serve calls.
+        settings_monitored_files = monitored_files_from_settings(settings)
 
     reg = None
     if args.config:
@@ -6215,7 +6306,7 @@ def _cert_inventory(args: argparse.Namespace) -> int:
             return _cert_fail(f"cannot load --config: {exc}", as_json=args.json)
 
     rows.extend(certs_from_registry(reg, served, client_certs))
-    rows.extend(settings_crls)
+    rows.extend(settings_monitored_files)
 
     now = time.time()
     entries: list[dict[str, object]] = []
@@ -6680,10 +6771,11 @@ def _host_gated_store_settings(
 ) -> ServiceSettings | int:
     """The host gate's settings for a command that acts on an EXISTING store, or an exit code.
 
-    Shared by ``admin-unlock``, ``admin-set-notify-email``, ``admin-reset-totp`` and
-    ``admin-revoke-sessions`` (BACKLOG #2614) so the gate is stated once (ADR 0171 and its
-    Amendment B, ADR 0183 Amendment A Wave 1c). ``provision-admin`` does not use it: it
-    legitimately creates the store, so it cannot carry the M-31 guard below.
+    Shared by ``admin-unlock``, ``admin-set-notify-email``, ``admin-reset-totp``,
+    ``admin-revoke-sessions`` (BACKLOG #2614) and ``issue-enrolment-code`` (ADR 0207) so the gate
+    is stated once (ADR 0171 and its Amendment B, ADR 0183 Amendment A Wave 1c).
+    ``provision-admin`` does not use it: it legitimately creates the store, so it cannot carry the
+    M-31 guard below.
     ``store attest-transit-bound`` and ``withdraw-transit-bound`` use it too (BACKLOG #2337). Each
     passes ``false_finding``, the result a fresh empty store would wrongly report for it.
 
@@ -6851,6 +6943,170 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         print(
             f"OK: cleared lockout for {args.username!r} ({states}; {cycles}, {kept}); "
             "the password is UNCHANGED"
+        )
+    return 0
+
+
+#: The 16-byte header every SQLite database file starts with.
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _starts_as_sqlite(path: str) -> bool:
+    """Whether ``path`` is empty or begins with the SQLite header. An empty file is the probe's
+    ``not_a_store`` case, so it is let through to that refusal; an unreadable one is the probe's
+    ``unchecked`` case."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(len(_SQLITE_HEADER))
+    except OSError:
+        return True
+    return head == b"" or head == _SQLITE_HEADER
+
+
+def _enrolment_code_host_refusal(settings: ServiceSettings) -> str | None:
+    """Why ``issue-enrolment-code`` refuses the store before it opens it, or ``None`` (ADR 0207
+    Amendment A, A4). On SQLite: another connection holds it, it is not a SQLite database, it holds
+    no store, or the probe cannot tell; a command that issues a credential fails closed when it
+    cannot tell, which is stricter than ``rotate-key``. A server store has no probe, so it proceeds
+    and the caller prints a note; the audit append there is serialized by the chain's own lock."""
+    from messagefoundry.config.settings import StoreBackend
+
+    if settings.store.backend != StoreBackend.SQLITE:
+        return None
+    where = _shown_path(settings.store.path)
+    probe = _sqlite_store_held_elsewhere(settings.store.path)
+    if probe.held:
+        return f"another connection holds the store at {where}; stop the engine and re-run"
+    if not _starts_as_sqlite(settings.store.path):
+        # The probe answers all-clear on a file SQLite cannot read as a database at all and leaves
+        # it to the store open, which rotate-key relies on. Here it is refused first (A4).
+        return f"{where} is not a SQLite database; check --db / [store].path"
+    if probe.not_a_store:
+        return (
+            f"{where} holds no MessageFoundry store; refusing to create one and issue a code into "
+            "it (check --db / [store].path)"
+        )
+    if probe.unchecked is not None:
+        return (
+            f"could not check whether an engine holds the store at {where}: {probe.unchecked}. "
+            "Stop the engine, make the store readable and writable by this account in WAL mode, "
+            "and re-run"
+        )
+    return None
+
+
+def _issue_enrolment_code(args: argparse.Namespace) -> int:
+    """Issue a directory account's single-use enrolment code from the host (ADR 0207 section 6).
+
+    THE GATE IS ``admin-unlock``'s HOST GATE (ADR 0171): whoever holds the service config, the store
+    and its key already holds the database. It issues for any directory account, not only an
+    Administrator, since host access already grants everything. It refuses a local account, a
+    disabled one and one that holds an engine factor, and its write is the same conditional sealed
+    write the route makes, so a disable or a factor that lands meanwhile leaves no code. It writes
+    the route's ``auth.enrolment_code_issued`` row, with ``via`` ``host``, the actor naming the OS
+    user, and no issuer, so a spend of it notifies nobody. Never logs the code; prints it once."""
+    import getpass
+
+    from messagefoundry.auth.notifications import deadline_utc
+    from messagefoundry.auth.service import (
+        ENROLMENT_CODE_ISSUE_REFUSALS,
+        enrolment_code_issue_refusal,
+        enrolment_code_issued_detail,
+        holds_engine_factor,
+        write_enrolment_code,
+    )
+    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal
+    from messagefoundry.last_resort import run_guarded
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+    )
+    from messagefoundry.store.row_seal import RowSealError
+
+    settings = _host_gated_store_settings(args)
+    if isinstance(settings, int):
+        return settings
+    refusal = _enrolment_code_host_refusal(settings)
+    if refusal is not None:
+        _emit_error(refusal, as_json=args.json)
+        return 2
+    if settings.store.backend != StoreBackend.SQLITE:
+        print(
+            f"note: a {settings.store.backend.value} store cannot be checked for a serving engine; "
+            "run this with the engine stopped",
+            file=sys.stderr,
+        )
+    posture = _command_hop_posture(settings)
+
+    async def run() -> tuple[str, dict[str, Any]]:
+        _warn_on_an_unrevoked_store_hop(settings)
+        store = await _open_store_or_refuse(
+            open_store(
+                settings.store,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
+        )
+        try:
+            user = await store.get_user_by_username(args.username)
+            if user is None:
+                return ("no-such-user", {})
+            reason = enrolment_code_issue_refusal(
+                user, holds_factor=await holds_engine_factor(store, user)
+            )
+            if reason is not None:
+                return (reason, {})
+            _refuse_an_unauditable_write(store)  # before the issue's write, not after it
+            issued = await write_enrolment_code(store, user, issuer_id=None)
+            if issued is None:
+                return ("changed", {})
+            await store.record_audit(
+                "auth.enrolment_code_issued",
+                actor=f"cli:{getpass.getuser()}",
+                detail=enrolment_code_issued_detail(user, issued, via="host"),
+            )
+            return (
+                "issued",
+                {"code": issued.code, "expires_at": issued.expires_at, "replaced": issued.replaced},
+            )
+        finally:
+            await store.close()
+
+    try:
+        outcome, report = run_guarded(run())
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _UnauditableWrite,
+        _StoreOpenRefused,
+    ) as exc:
+        _emit_error(str(exc), as_json=args.json)
+        return 2
+    except RowSealError:
+        return _emit_error(
+            _seal_refusal(args.username, "enrolment code issue") + ". Nothing was written",
+            as_json=args.json,
+        )
+    except sqlite3.DatabaseError as exc:
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    if outcome == "no-such-user":
+        return _emit_error(f"no account named {args.username!r}", as_json=args.json)
+    if outcome != "issued":
+        return _emit_error(
+            f"no enrolment code issued for {args.username!r}: "
+            f"{ENROLMENT_CODE_ISSUE_REFUSALS[outcome]}",
+            as_json=args.json,
+        )
+    if args.json:
+        print(json.dumps({"ok": True, "username": args.username, **report}))
+    else:
+        replaced = " It replaces the code issued before it." if report["replaced"] else ""
+        print(
+            f"Enrolment code for {args.username!r}, shown once: {report['code']}\n"
+            f"It expires at {deadline_utc(report['expires_at']) or 'its 24-hour limit'}."
+            f"{replaced} Hand it over "
+            "after confirming who is asking, never through the account's own mail or chat."
         )
     return 0
 
@@ -7033,6 +7289,121 @@ def _enrol_totp_at_terminal(
         "uses SHA-256 (add the account by its URI) and that the device's clock is right, then run "
         "the command again."
     )
+
+
+class _RecoveryKeyConsole:
+    """The console ``provision-admin`` shows a new store's recovery key on and reads it back from
+    (vault BACKLOG #3411): the console device itself for what is shown, never stdout, stderr or a
+    log, and the entry read without echo. Either raises ``OSError`` when the console is gone."""
+
+    def show(self, text: str) -> None:
+        _show_on_terminal(text)
+
+    def read(self) -> str:
+        import getpass
+
+        # Without echo, as the password is read, so the key typed back is not left on the screen.
+        return getpass.getpass("")
+
+
+#: The step a failed-mint warning gives for removing the key file this run minted, once the store
+#: holds no data under it and no run can start a store under it (PR 2804 eleventh hold). It
+#: promises no re-run: a store made at that address meanwhile refuses one (fourteenth hold).
+_REMOVE_THE_VOID_KEY = "remove that file"
+
+
+def _handoff_kept_step(store: StoreSettings, service_account: str) -> str:
+    """The way on for a handoff kept over a store that may have been started under it: a run here
+    cannot convert it, so a re-run over it never carries on (PR 2804 twelfth hold, item 2)."""
+    from messagefoundry.store.custody_host import keep_the_key_step
+
+    return (
+        "The service converts it into its host blob when it first starts as its own account, but "
+        "this command cannot provision the Administrator from a handoff under --service-account. "
+        + keep_the_key_step(store, new_store=True, service_account=service_account)
+    )
+
+
+def _discard_minted_custody(
+    path: Path,
+    store: StoreSettings,
+    failure: BaseException,
+    *,
+    service_account: str | None = None,
+) -> Path | None:
+    """Remove the host blob or handoff ``provision-admin`` minted when the store it was minted for
+    could not be created, so a second run can mint again, but only where this run can prove the
+    open wrote nothing under it: the store id pin refused before the open's first write
+    (:class:`~messagefoundry.store.store.StoreIdPinRefusedBeforeWrite`; a pin refusal raised later,
+    once the salt bind may have run, does not count), a server create batch that failed before its
+    commit (:class:`~messagefoundry.store.store.StoreCreateBatchFailedBeforeKeyUse`, PR 2804 hold
+    17), or a SQLite store whose file was never made.
+
+    Otherwise the file is kept, and the warning names it and says to keep it and the recovery key
+    shown, deleting neither: the store may hold data sealed under it, and no check this run or an
+    operator can make proves it does not (PR 2804 thirteenth and fourteenth holds). Returns the
+    kept file's path, so the closing line names it rather than say nothing was written, or
+    ``None`` when nothing is kept. Neither text carries the key."""
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.store.base import _absent_sqlite_store
+    from messagefoundry.store.custody_host import keep_the_key_step
+    from messagefoundry.store.store import (
+        StoreCreateBatchFailedBeforeKeyUse,
+        StoreIdPinRefusedBeforeWrite,
+    )
+
+    nothing_written = isinstance(
+        failure, (StoreIdPinRefusedBeforeWrite, StoreCreateBatchFailedBeforeKeyUse)
+    ) or (store.backend is StoreBackend.SQLITE and _absent_sqlite_store(store) is not None)
+    if not nothing_written:
+        if service_account is None:
+            # A re-run with the host file in place carries on with a store started under it, and
+            # otherwise names a way on that keeps the file.
+            then = (
+                "Run the command again with that file in place: if a store was started under it, "
+                "the run carries on with it, and if not, it names a way on that keeps the file"
+            )
+        else:
+            then = _handoff_kept_step(store, service_account)
+        print(
+            "WARNING: the store could not be created, and this run cannot prove that no store "
+            f"was started under the store key minted for it, so that key is kept in {path}. No "
+            "Administrator was provisioned into it. The store at that address may hold data "
+            "sealed under that key, and that file and the recovery key shown may be its only "
+            "keys. Keep both, and do not delete either: if a store was started under that key, "
+            "either one opens it. A run here stops at that file rather than mint over it. "
+            f"{then}",
+            file=sys.stderr,
+        )
+        return path
+    try:
+        path.unlink()
+        print(
+            f"The store key minted for it was removed from {path}, so the recovery key shown is "
+            "void; the next run mints a new one.",
+            file=sys.stderr,
+        )
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        # Void: nothing was written under it, so the closing line's "nothing was written"
+        # stays true, and it is not named there as a key to keep.
+        # A new store location only where the pin refused: a store another key made is there.
+        step = keep_the_key_step(
+            store,
+            new_store=isinstance(failure, StoreIdPinRefusedBeforeWrite),
+            service_account=service_account,
+        )
+        print(
+            f"WARNING: the store could not be created, and the store key minted for it in {path} "
+            f"could not be removed ({exc.strerror or type(exc).__name__}). This run minted it and "
+            "nothing was written under it, so it is no store's key and the recovery key shown "
+            "opens nothing; while it is there, a run here stops at it rather than mint over it. "
+            "No run can start a store under it, since only this run held its recovery wrap, so "
+            f"once it can be, {_REMOVE_THE_VOID_KEY}. {step}",
+            file=sys.stderr,
+        )
+    return None
 
 
 def _read_new_password(prompt: str) -> str:
@@ -7634,8 +8005,9 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
 
     Under ``vault_transit`` a local key counts whichever provider is pinned, as it did before #2077:
     the store's cipher never resolves ``key_provider`` there, so an ignored local key cannot make the
-    store open plaintext. The DR backup and ``rotate-key`` paths DO resolve it, and refuse an ignored
-    key there through ``store.base._checked_active_key``."""
+    store open plaintext. The DR backup path DOES resolve it, and refuses an ignored key there
+    through ``store.base._checked_active_key``. ``rotate-key`` refuses this mode before it resolves
+    a key (BACKLOG #2109)."""
     from messagefoundry.store.keyprovider import provider_reads_a_configured_key
 
     store = settings.store
@@ -8391,16 +8763,45 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     return left
 
 
-def _provision_open_refusal(exc: BaseException, store: StoreSettings) -> str:
+def _provision_open_refusal(
+    exc: BaseException, store: StoreSettings, *, kept: Path | None = None
+) -> str:
     """``provision-admin``'s text for a refused store open: the refusal, then what it left
     behind (:func:`_open_refusal_left_behind`, BACKLOG #5067). Through ``codec_safe_str``, as
     every other command prints an open refusal: a key source's codec error quotes a byte of what
-    it decoded (BACKLOG #2532)."""
+    it decoded (BACKLOG #2532). ``kept`` is the store key a failed create kept: the text then
+    names it, and never says nothing was written (PR 2804 fourteenth hold)."""
     from messagefoundry.redaction import codec_safe_str
 
     left = _open_refusal_left_behind(exc, store)
-    tail = _NOTHING_PROVISIONED if left is None else f"Refusing to provision. {left}"
+    if kept is not None:
+        held = (
+            "No Administrator was provisioned, and the store key minted for it is kept at "
+            f"{kept} (see the warning on stderr)"
+        )
+        tail = (
+            f"Refusing to provision. {held}"
+            if left is None
+            else (f"Refusing to provision. {_sentence(left)} {held}")
+        )
+    else:
+        tail = _NOTHING_PROVISIONED if left is None else f"Refusing to provision. {left}"
     return f"{_sentence(codec_safe_str(exc))} {tail}"
+
+
+def _never_started_refusal(store: StoreSettings, service_account: str | None) -> str:
+    """``provision-admin``'s text when the host blob here opens a store whose audit chain was
+    never started (PR 2804 hold 2 and fourth hold): a mint that failed before its genesis record,
+    or a blob another store in a shared directory owns. The engine cannot tell which, so the text
+    keeps the key and the store and gives the fallback way on. Names no key."""
+    from messagefoundry.store.custody_host import keep_the_key_step
+
+    step = keep_the_key_step(store, new_store=True, service_account=service_account)
+    return (
+        "the store's audit chain was never started, and only the run that minted this store's "
+        "key, holding its recovery wrap, may start it. The engine cannot tell whose key the host "
+        f"blob here holds, so it leaves it and the store in place. {step}"
+    )
 
 
 def _sentence(message: object) -> str:
@@ -8658,16 +9059,191 @@ def _provision_admin(args: argparse.Namespace) -> int:
             store_slot.current = None
             await store.close()
 
+    async def server_store_absent() -> bool:
+        """Under the host key provider with no blob here: whether the server database holds no
+        store yet (vault BACKLOG #3411): no store at all, or an empty audit chain over a store
+        that holds no data either, is absent; a chain with a genesis record, or data under an empty
+        chain, is a store this mint must not take. Connection and hop refusals surface here, before
+        the prompts, as the ordinary pre-check's do."""
+        return await server_store_found() != "held"
+
+    async def no_store_anywhere() -> Literal["none"]:
+        """``none`` once the server database's catalog shows no table under a store table name in
+        the schemas the open resolves (PR 2804 fourteenth and fifteenth holds). An open's "no
+        store" is only what its login may see there, so a store it cannot see reads the same.
+        Raises :class:`HostCustodyRefused` for such a table there, whoever made it, and for a
+        catalog it cannot show, a search_path it cannot
+        read included: neither is minted over. What the catalog read cannot see, at least, is in
+        :func:`~messagefoundry.store.base.server_store_schema_found_anywhere`."""
+        from messagefoundry.store import base as store_base
+        from messagefoundry.store.base import store_connect_errors, store_driver_errors
+        from messagefoundry.store.custody_host import HostCustodyRefused
+
+        try:
+            anywhere = await store_base.server_store_schema_found_anywhere(
+                settings.store, posture=posture
+            )
+        except (*store_driver_errors(), *store_connect_errors()) as unread:
+            # The class only: a driver's text can quote a value.
+            raise HostCustodyRefused(
+                "whether the database holds a store this login cannot see could not be read "
+                f"({type(unread).__name__}), so no key was minted. Check that this login can "
+                "read the database's catalog and that the server answers, then run the command "
+                "again"
+            ) from unread
+        if anywhere is None:
+            if settings.store.backend is StoreBackend.POSTGRES:
+                why = (
+                    "the search_path names no schema, or a schema name this check does not read, "
+                    "or the catalog returned no answer, so no key was minted. Set "
+                    "[store].db_schema, or the role's search_path when it is not set, to a plain "
+                    "lower-case schema name, then run the command again"
+                )
+            else:
+                why = (
+                    "the view definition permission on the login's default schema and on dbo is "
+                    "not shown as held, or the catalog returned no answer, so no key was minted. "
+                    "Grant this login that permission on both, or run with a login that holds "
+                    "it, then run the command again"
+                )
+            raise HostCustodyRefused(
+                "this login reads no store in the database, but cannot show that none is there: "
+                f"{why}"
+            )
+        if anywhere:
+            raise HostCustodyRefused(
+                "the schemas this login resolves already hold objects under names this store "
+                "creates, so no key was minted. Point [store] at a new database or schema, or "
+                "grant this login the store's schema if they are a store it cannot reach, then "
+                "run the command again"
+            )
+        return "none"
+
+    async def server_store_found() -> Literal["none", "empty", "held"]:
+        """What the server database holds, read as :func:`server_store_absent` reads it: ``none``,
+        no store schema in the schemas the open resolves, read whole by
+        :func:`no_store_anywhere`; ``empty``, an empty audit chain over a store that holds no data;
+        ``held``, anything else. Opened read-only under a throwaway blob nothing is written with,
+        so the store id pin answers. Raises what the open and the census raise, as
+        :class:`HostCustodyRefused` for at least a census it cannot complete or read, and for what
+        :func:`no_store_anywhere` refuses."""
+        from messagefoundry.store.base import (
+            TableCensusIncomplete,
+            store_connect_errors,
+            store_driver_errors,
+        )
+        from messagefoundry.store.custody import HostBlob, MasterKey, StoreId
+        from messagefoundry.store.custody_host import HostCustodyRefused, store_holds_data
+        from messagefoundry.store.store import StoreIdPinRefused
+
+        throwaway = HostBlob(MasterKey.mint(), StoreId.mint())
+        try:
+            store = await open_store(
+                settings.store,
+                read_only=True,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+                custody=throwaway,
+            )
+        except StoreNotFoundError:
+            return await no_store_anywhere()
+        except (StoreIdPinRefused, CipherError):
+            return "held"
+        try:
+            # An empty chain may be a store that ran keyless: one that holds data is not absent.
+            return "held" if await store_holds_data(store) else "empty"
+        except TableCensusIncomplete as incomplete:
+            # Fail closed, and say why: "the store already holds data" would send the operator to
+            # a new store when the store may hold nothing, and the fix is a grant.
+            raise HostCustodyRefused(f"{incomplete}, then run the command again") from incomplete
+        except (*store_driver_errors(), *store_connect_errors()) as unread:
+            # A table the census listed could not be read, or the server stopped answering
+            # mid-census: fail closed rather than end at the dispatch floor. The class only: a
+            # driver's text can quote a cell value.
+            raise HostCustodyRefused(
+                f"whether the store already holds data could not be read ({type(unread).__name__}),"
+                " so no key is minted over it. Check that this login can select every table in the"
+                " store's schema and that the server answers, then run the command again"
+            ) from unread
+        finally:
+            await store.close()
+
     # The store key could not be resolved. The texts of these classes name settings, environment
     # variables and files, never a key (see `_key_unresolved`). Exit 2, as `rotate-key` exits on
     # the same errors: the store could not be opened, so the command could not start. Before
     # BACKLOG #2081 they escaped to the dispatch floor, and a malformed key did until #3054.
     key_unresolved = _key_unresolved()
+    # Vault BACKLOG #3411: under [store].key_provider = 'host' a new store's key is minted here.
+    from messagefoundry.store.custody_host import (
+        HOST_PROVIDER,
+        HostCustodyMissing,
+        HostCustodyRefused,
+        keep_the_key_step,
+        mint_target,
+    )
+    from messagefoundry.store.store import (
+        StoreChainNeverStarted,
+        StoreCreateBatchFailedBeforeKeyUse,
+    )
+
+    host_custody = settings.store.key_provider == HOST_PROVIDER
+    if args.service_account is not None and not host_custody:
+        return _emit_error(
+            "--service-account mints a store key, which only [store].key_provider = 'host' does",
+            as_json=args.json,
+        )
+    mint_custody = False
 
     try:
         service = _build_provision_auth_service(settings, store_slot, posture=posture)
-        absent, exists = run_guarded(administrator_exists())
-        if absent and settings.store.backend is StoreBackend.SQLITE:
+        try:
+            absent, exists = run_guarded(administrator_exists())
+        except HostCustodyMissing as missing:
+            # A SQLite store that exists has no key here, and minting one cannot open it. A server
+            # database is asked, under a throwaway pin, whether it holds a store already.
+            if settings.store.backend is StoreBackend.SQLITE or not run_guarded(
+                server_store_absent()
+            ):
+                # On a server the probe refused only a store with a genesis record or with data.
+                held = "exists" if settings.store.backend is StoreBackend.SQLITE else "holds data"
+                step = keep_the_key_step(
+                    settings.store, new_store=True, service_account=args.service_account
+                )
+                raise HostCustodyRefused(
+                    f"the store already {held}, and {missing}. A new key cannot open a store "
+                    "another key made: run with the custody directory that holds the store's host "
+                    "blob, MEFOR_SECRETS_DIRECTORY set as the store's service has it, or unset for "
+                    "a SQLite store whose blob sits beside its file. If that blob is lost, the "
+                    f"store stays in place. {step}"
+                ) from missing
+            absent, exists = True, None
+        except StoreChainNeverStarted as unstarted:
+            # A mint that failed before its genesis record kept its key file (PR 2804 hold 2), or
+            # the blob here is another store's: the engine cannot tell, so the key is kept.
+            raise HostCustodyRefused(
+                _never_started_refusal(settings.store, args.service_account)
+            ) from unstarted
+        if host_custody and absent:
+            # Checked before the prompts, so a refused or repeated mint asks for nothing. The mint
+            # itself, and the recovery key it shows, come last, once nothing else can refuse.
+            mint_custody = True
+            if not sys.stdin.isatty():
+                return _emit_error(
+                    "refusing to provision without a terminal: the store's recovery key is shown "
+                    "once and entered back interactively. Run this from a console.",
+                    as_json=args.json,
+                )
+            mint_target(
+                settings.store,
+                service_account=args.service_account,
+                enforcing=posture.enforcing,
+            )
+        elif args.service_account is not None:
+            return _emit_error(
+                "--service-account mints a new store's key, and this store already exists",
+                as_json=args.json,
+            )
+        elif absent and settings.store.backend is StoreBackend.SQLITE:
             # `open_store` refuses an absent SQLite file before it resolves the key, so a key that
             # cannot be resolved (Vault with no Vault environment in this shell) would otherwise
             # first fail at the write, after the prompt. Resolved now and discarded; the write
@@ -8705,6 +9281,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
         return _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    except FileExistsError as exc:
+        # Vault BACKLOG #3411: a host blob or a handoff is already in the custody directory.
+        _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
+        return 2
     if exists is not None:
         return _emit_error(exists, as_json=args.json)
 
@@ -8774,6 +9354,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     # Set just before the service's write, which stores the seed (BACKLOG #5067).
     write_started = False
+    # Vault BACKLOG #3411: the minted blob, held in memory for the store's creation, and the file
+    # it was written to, removed if the store cannot be created.
+    minted: MintedCustody | None = None
 
     def after_the_key(refusal: str, before_write: str) -> str:
         """The text for a refusal the write's arms catch, after the key was shown (BACKLOG #5067).
@@ -8796,19 +9379,43 @@ def _provision_admin(args: argparse.Namespace) -> int:
             return before_write
         return (
             f"{_sentence(before_write)} If you added the entry this run showed to the "
-            "authenticator app, delete it: its seed was never stored, and a run that succeeds "
-            "shows a new key."
+            "authenticator app, delete it: its seed was never stored."
         )
 
+    # The store key a failed create kept, for the closing line (PR 2804 fourteenth hold).
+    kept_key: Path | None = None
+    # A create batch that failed before its commit (PR 2804 hold 17): no write started, so its
+    # error is never read as a refused write.
+    batch_failed = False
+
     async def run() -> tuple[ProvisionedAdministrator, str]:
-        nonlocal write_started
+        nonlocal write_started, kept_key, batch_failed
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
-        store = await open_store(
-            settings.store,
-            create=True,
-            posture=posture,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-        )
+        # Under the host key provider the store is created with the blob minted above, so its
+        # genesis record carries that blob's store id (vault BACKLOG #3411).
+        batch_failure: Exception | None = None
+        try:
+            store = await open_store(
+                settings.store,
+                create=True,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+                custody=None if minted is None else minted.blob,
+                recovery_wrap=b"" if minted is None else minted.recovery_wrap,
+            )
+        except BaseException as exc:
+            if minted is not None:
+                kept_key = _discard_minted_custody(
+                    minted.path, settings.store, exc, service_account=args.service_account
+                )
+            if not isinstance(exc, StoreCreateBatchFailedBeforeKeyUse):
+                raise
+            # The key is dealt with (PR 2804 hold 17); the batch's own error is what the operator
+            # is told, raised outside this arm so its own cause is kept.
+            batch_failure = exc.failure
+            batch_failed = True
+        if batch_failure is not None:
+            raise batch_failure
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:
                 # BACKLOG #1905: the settings name a key but the store opened keyless. Refuse before
@@ -8883,6 +9490,36 @@ def _provision_admin(args: argparse.Namespace) -> int:
             as_json=args.json,
         )
 
+    if mint_custody:
+        # Vault BACKLOG #3411: last before the write, so nothing after it can refuse for want of
+        # an answer the operator could have given first. The recovery key goes to the console
+        # device only, and nothing is written until it has been entered back.
+        from messagefoundry.store.custody_host import mint_host_custody
+
+        try:
+            minted = mint_host_custody(
+                settings.store,
+                service_account=args.service_account,
+                enforcing=posture.enforcing,
+                terminal=_RecoveryKeyConsole(),
+            )
+        except (HostCustodyRefused, FileExistsError, OSError) as exc:
+            _emit_error(after_the_key(str(exc), str(exc)), as_json=args.json)
+            return 2
+        except EOFError:
+            # getpass at end of input (Ctrl-D, Ctrl-Z): not an OSError, and no text of its own.
+            gone = (
+                "the input ended at the recovery key prompt, so the recovery key was not entered "
+                "back; nothing was written. Run the command again from a console"
+            )
+            _emit_error(after_the_key(gone, gone), as_json=args.json)
+            return 2
+        print(
+            "The recovery key was entered back and opens the store key. Keep that copy off this "
+            "host: this engine never shows it again.",
+            file=sys.stderr,
+        )
+
     # No TrustAnchorError arm: the anchors are checked at the build, before the prompt (#2081).
     try:
         outcome, store_path = run_guarded(run())
@@ -8900,7 +9537,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # short server schema (#1720) can first arrive here: with no `schema_meta` table the
         # pre-check finds no store, and only this create=True open runs the DDL batch. The text
         # says what the open may have changed, and that the shown key's entry has no seed (#5067).
-        text = after_the_key(codec_safe_str(exc), _provision_open_refusal(exc, settings.store))
+        text = after_the_key(
+            codec_safe_str(exc), _provision_open_refusal(exc, settings.store, kept=kept_key)
+        )
         _emit_error(text, as_json=args.json)
         return 2
     except (StoreKeylessError, CipherError) as exc:
@@ -8909,7 +9548,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # write itself may follow a row it wrote, so it reaches the floor as it did.
         if write_started:
             raise
-        text = after_the_key(codec_safe_str(exc), _provision_open_refusal(exc, settings.store))
+        text = after_the_key(
+            codec_safe_str(exc), _provision_open_refusal(exc, settings.store, kept=kept_key)
+        )
         _emit_error(text, as_json=args.json)
         return 2
     except sqlite3.IntegrityError as exc:
@@ -8923,6 +9564,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # MRO name as the service matches them; anything else propagates as it did before.
         if not _is_integrity_refusal(exc):
             raise
+        if batch_failed:
+            # The create batch's integrity error (PR 2804 hold 17): no account write started, and
+            # the driver's text can quote a colliding row's value, so the class alone is named.
+            return _emit_error(
+                f"the store could not be created: its create batch failed "
+                f"({type(exc).__name__}) before any account was written, so no Administrator was "
+                "provisioned",
+                as_json=args.json,
+            )
         return refused_write(exc)
 
     # True only once issued codes actually reached the console; ``recovery_codes_shown`` says so to
@@ -10325,6 +10975,10 @@ def _uploads_root_refusal(uploads_dir: str) -> str | None:
         )
 
 
+#: The docs/SECURITY.md section ``rotate-key``'s vault_transit refusal cites, by its bold title.
+_TRANSIT_AUDIT_RETIRE_SECTION = "Retiring an old version of the audit key breaks the chain"
+
+
 def _rotate_key(args: argparse.Namespace) -> int:
     """Re-encrypt every cipher-covered value under the active key (WP-5 key rotation, ASVS 11.2.2).
 
@@ -10332,7 +10986,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
     the prior key(s) in ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` so existing rows can be decrypted, then
     rotate. After it finishes the retired key can be removed. The store pass re-seals the
     secret-rotation fingerprint cells too, so no engine start needs the retired key to read them
-    (BACKLOG #3472, ADR 0213).
+    (BACKLOG #3472, ADR 0213). Under ``[store].cipher_provider = "vault_transit"`` it refuses right
+    after the settings load, before it resolves or unwraps a key, dials Vault or opens the store,
+    since no run there can finish (BACKLOG #2109).
 
     **Offline is checked on SQLite, once, before the store opens (BACKLOG #1915).** The command refuses
     a store another connection holds, which is how a serving engine holds it; see
@@ -10341,7 +10997,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
     roll's head check refuses an audit row that lands inside its read, and nothing refuses a data
     write. A store the probe cannot read, or one not in WAL mode, is not checked, and the command
     prints a note. And on PostgreSQL or SQL Server nothing is checked; the command prints a note
-    there too.
+    there too. On any backend, the uploads pass and the engine's pair removals share a lock, so the
+    pass does not re-create an upload a running engine removes while it runs; that upload is a skip
+    (BACKLOG #3181 item 5). ``uploads._pair_lock`` names at least the cases it does not cover.
 
     **Invocation bound (ASVS 11.3.4).** A ``cipher_meta`` row is keyed on the one-way SHA-256
     fingerprint of the AES key values are sealed under. Since ADR 0196 that is the store's data
@@ -10392,6 +11050,30 @@ def _rotate_key(args: argparse.Namespace) -> int:
     settings, detail = _load_service_settings(args.service_config, cli=cli)
     if settings is None:
         print(f"error: {detail}", file=sys.stderr)
+        return 2
+    if settings.store.cipher_provider == "vault_transit":
+        # BACKLOG #2109. The re-encrypt pass refuses the Transit cipher (BACKLOG #1165), so no run
+        # here can finish. Refuse before the key, the Vault hop and the writable open, which a run
+        # with a local key reached first, and before the "needs an active key" refusal below,
+        # which sends a run without one to set a key the Transit cipher never reads.
+        print(
+            'error: rotate-key does not run under [store].cipher_provider = "vault_transit". It '
+            "re-encrypts only under the in-process aesgcm cipher, and no command moves values "
+            "between that cipher and Transit, in either direction, or between two Transit keys "
+            "(BACKLOG #2109). To rotate the Transit data key, rotate it in Vault: that makes a "
+            "new version of the key named by MEFOR_STORE_TRANSIT_KEY, new values are sealed under "
+            "it, and values under an older version still read. Nothing re-seals those older "
+            "values, so rotating is safe and retiring a version that still seals a value or MACs "
+            "an audit row is not. At least these retire one. Raising the data key's "
+            "min_decryption_version above a version stops the values sealed under it from "
+            "decrypting. Raising the audit key's min_encryption_version above a version breaks "
+            "the audit chain at every row MACed under it; the audit key is the data key unless "
+            "MEFOR_STORE_TRANSIT_AUDIT_KEY names another. Trimming a version off either key does "
+            "the same to what it sealed or MACed, and cannot be undone. docs/SECURITY.md, under "
+            f"'{_TRANSIT_AUDIT_RETIRE_SECTION}', describes the audit chain break and what it "
+            "does to the attestation. Nothing was changed.",
+            file=sys.stderr,
+        )
         return 2
 
     posture = _command_hop_posture(settings)
@@ -10487,8 +11169,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
         )
         from messagefoundry.store.store import SecretRotationMetaStore
 
-        # BACKLOG #2109: in vault_transit mode the Transit key-type check runs inside this open, not
-        # at resolve_active_key above, so its refusal needs the same clean exit 2.
+        # A key the open cannot resolve, or a store hop the posture refuses, exits 2 as one at
+        # resolve_active_key above does. vault_transit mode never gets here (BACKLOG #2109).
         _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         store = await _open_store_or_refuse(open_store(settings.store, posture=posture))
         try:
@@ -10690,8 +11372,12 @@ def _rotate_key(args: argparse.Namespace) -> int:
             f"error: {uploads.skipped} uploaded file(s) were NOT fully re-sealed -- part of each "
             "may still be under the prior key. It could not be read, written or decrypted, or it "
             "is a symlink, which rotate-key does not follow. The causes include at least a prior "
-            "key that was not supplied, a damaged file, a value sealed by another cipher, and a "
-            "file larger than [store].max_upload_bytes allows. The log names each file and its "
+            "key that was not supplied, a damaged file, a value sealed by another cipher, a "
+            "file larger than [store].max_upload_bytes allows, an upload a running engine removed "
+            "or replaced during the run, which a re-run settles, an uploads pair lock still held "
+            "when its wait ran out, so re-run once whatever holds it releases it, and an uploads "
+            "pair lock this "
+            "account could not take (BACKLOG #3181). The log names each file and its "
             "cause. Fix the cause and re-run rotate-key BEFORE retiring any prior key "
             "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). No key will ever open a damaged file, so restore "
             "that upload, or remove its two files from the uploads directory, before the re-run. "
@@ -11487,7 +12173,7 @@ def _check(args: argparse.Namespace) -> int:
     """Commit/CI gate: exit 0 iff every *required* check passed (advisory failures only print)."""
     from messagefoundry.checks import run_checks
 
-    resolved = _resolve_offline_anchor(args)
+    resolved = _resolve_offline_anchor(args, defer_missing_service_config=True)
     if isinstance(resolved, int):
         return resolved
     config_dir, service_config = resolved
@@ -11511,6 +12197,8 @@ def _check(args: argparse.Namespace) -> int:
         # BACKLOG #3063 item 2: _resolve_offline_anchor picked the project root's file, which serve
         # with the same flags may not read; run_checks names the difference on each settings line.
         service_config_from_root=args.service_config is None and service_config is not None,
+        # Vault BACKLOG #2355: the settings legs read --env as serve reads its own.
+        env=args.env,
     )
     if args.json:
         _print_json(report.to_json(), compact=True)
@@ -12003,70 +12691,74 @@ def _security(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
-        AiSettings,
-        AlertsSettings,
-        ApiSettings,
-        ApprovalsSettings,
+        _SECURITY_PASSTHROUGH,
         AuthSettings,
-        BackupSettings,
-        CertMonitorSettings,
-        SecretRotationSettings,
-        SecretsSettings,
         SecuritySettings,
-        StoreSettings,
+        ServiceSettings,
+        _auth_default,
+        _auth_limit_loosenings,
+        _env_overrides,
         security_loosenings,
     )
 
     path = args.service_config
 
-    # This subcommand edits [security], but security_loosenings() also reports [store]/[auth]/[alerts]/
-    # [secret_rotation]/[api]/[approvals]/[cert_monitor]/[backup]/[secrets]/[ai] deviations (ADR 0148: one posture). Resolve those from the whole file so the
-    # list is complete. If the file will
-    # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
-    # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
-    # reporting a subset as if it were everything.
-    # None unless the file exists and will not load. Then: WHY (vault BACKLOG #2600). A stray
-    # MEFOR_<SECTION>_<KEY> variable in this shell refuses the load, and a bare `true` sent the
-    # reader to a file that was fine. Rendered by settings_error_detail, which hides the refused
-    # input but prints each validator's message; its docstring says which messages quote a value.
-    _loosenings_partial_reason: str | None = None
-    _store, _auth, _alerts = StoreSettings(), AuthSettings(), AlertsSettings()
-    # BACKLOG #1004: [secret_rotation].enforce_store_key_expiry is a posture deviation too, so it is
-    # resolved from the same whole-file read and degrades with the same `loosenings_partial` marker.
-    _rotation = SecretRotationSettings()
-    # BACKLOG #1179: [api].plaintext_upstream_hop_acknowledged is a loosening too. Same read, same
-    # degradation marker.
-    _api = ApiSettings()
-    # BACKLOG #2489, vault #3123: [approvals] carries the dual-control dwell, expiry and held list.
-    # Same read, same marker.
-    _approvals = ApprovalsSettings()
-    # BACKLOG #2227: [cert_monitor].warn_days = 0 turns the certificate reminder off. Same read and marker.
-    _cert_monitor = CertMonitorSettings()
-    # Vault BACKLOG #2302: [backup].allow_unencrypted is a loosening too. Same read and marker.
-    _backup = BackupSettings()
-    # Vault BACKLOG #2983: [secrets].vault_revocation_attested is a loosening too. Same read and marker.
-    _secrets = SecretsSettings()
-    # BACKLOG #2193 slice (e): [ai].endpoint_revocation_attested is a loosening too. Same read and
-    # marker.
-    _ai = AiSettings()
-    if Path(path).exists():
-        # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
-        # and `security show` is expected to work offline before any config exists. Only a file that
-        # exists and will not resolve is partial.
-        # The shared load: its catch is the specific ways a settings file fails to resolve, and
-        # anything else is a programming error that surfaces.
-        _full, _loosenings_partial_reason = _load_service_settings(path)
-        if _full is not None:
-            _store, _auth, _alerts = _full.store, _full.auth, _full.alerts
-            _rotation = _full.secret_rotation
-            _api = _full.api
-            _approvals = _full.approvals
-            _cert_monitor = _full.cert_monitor
-            _backup = _full.backup
-            _secrets = _full.secrets
-            _ai = _full.ai
+    def _posture(
+        sec: SecuritySettings, saved: ServiceSettings | None = None, *, degraded: str | None = None
+    ) -> dict[str, object]:
+        """The loosening list for ``sec`` and its scope marker.
 
-    def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
+        This subcommand edits [security], but security_loosenings() also reports the other sections'
+        deviations (ADR 0148: one posture), so they are resolved from the whole file: ``saved``, the
+        candidate `set` validated and wrote, or else a load of the file as it is now. If the file
+        will not load -- it may be invalid OUTSIDE [security], which must not break `security show`
+        -- they fall back to the shipped defaults and the `loosenings_partial` marker SAYS SO, with
+        WHY (vault BACKLOG #2600): a stray MEFOR_<SECTION>_<KEY> variable in this shell refuses the
+        load, and a bare `true` sent the reader to a file that was fine. The reason is rendered by
+        settings_error_detail, which hides the refused input but prints each validator's message;
+        its docstring says which messages quote a value.
+
+        The [auth] copies of the [security] switches are taken from ``sec`` (vault BACKLOG #2600).
+        The registry reads the two session limits off those copies, and the load fills them from
+        the file AND the environment, while ``sec`` is an authored [security] with no environment
+        layer: the file's for `show`, the saved candidate's for `set` (or, when ``degraded`` is
+        set, the [security] checked before the edit). Unmatched, a shell variable
+        named a limit `values` did not show with nothing saying where it came from, a shell variable
+        or the shipped-default fallback hid one `values` did show, and
+        a `set` preview paired with the pre-edit load missed a new loosening. A switch ``sec``
+        leaves unset takes the [auth] field's shipped default, as a load with no MEFOR_SECURITY_*
+        variable leaves it, not ``sec``'s default: the two are separate literals, which
+        tests/test_security_cli.py pins equal for the session limits.
+
+        The two session limits are also read off the load, and a loosening only the load sees is
+        named after the authored entries (vault BACKLOG #2600). docs/SECURITY-LOOSENING.md, the
+        idle-limit entry, says when one is named and how it is labelled.
+
+        ``degraded`` is why ``sec`` is not the [security] the caller meant to report, as when `set`
+        could not re-read the [security] it saved. It marks the report partial, and is the reason
+        given; `set` passes ``saved`` with it, so the load below does not run."""
+        full: ServiceSettings | None = saved
+        partial_reason: str | None = degraded
+        # An ABSENT file is not a degraded read -- the shipped defaults ARE the effective posture
+        # there, and `security show` is expected to work offline before any config exists.
+        if full is None and Path(path).exists():
+            # The shared load: its catch is the specific ways a settings file fails to resolve, and
+            # anything else is a programming error that surfaces.
+            full, partial_reason = _load_service_settings(path)
+        # Only a real load carries the environment layer; the fallback below is shipped defaults.
+        loaded = full is not None
+        if full is None:
+            full = ServiceSettings()
+        auth = full.auth.model_copy(
+            update={
+                field: (
+                    getattr(sec, switch) if switch in sec.model_fields_set else _auth_default(field)
+                )
+                for switch, section, field in _SECURITY_PASSTHROUGH
+                if section == "auth"
+            }
+        )
+
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
         # store — so it can see NEITHER the per-connection declarations NOR the two store
         # observations (#1008 privilege, #1905 audit-chain keying). It passes empty lists and None and
@@ -12077,14 +12769,13 @@ def _security(args: argparse.Namespace) -> int:
         # BACKLOG #2700), the start-up reading (vault BACKLOG #2701) and the service-environment
         # reading (vault BACKLOG #2595) are facts about the ENGINE process, and this command is
         # another process, so it passes None for those too.
-        return [
-            {"switch": s, "risk": r}
-            for s, r in security_loosenings(
+        def registry(auth_view: AuthSettings) -> list[tuple[str, str]]:
+            return security_loosenings(
                 sec,
-                _store,
-                _auth,
-                _alerts,
-                _rotation,
+                full.store,
+                auth_view,
+                full.alerts,
+                full.secret_rotation,
                 cleartext_hops=(),
                 expiry_relaxed_hops=(),
                 hostname_unchecked_hops=(),
@@ -12094,62 +12785,114 @@ def _security(args: argparse.Namespace) -> int:
                 revocation_attested_hops=(),
                 path_form_fhir_hops=(),
                 ech_cleartext_sidecar_hops=(),
-                api=_api,
-                approvals=_approvals,
-                cert_monitor=_cert_monitor,
-                backup=_backup,
-                secrets=_secrets,
-                ai=_ai,
+                api=full.api,
+                approvals=full.approvals,
+                cert_monitor=full.cert_monitor,
+                backup=full.backup,
+                secrets=full.secrets,
+                ai=full.ai,
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,
                 startup=None,
                 service_env=None,
             )
-        ]
 
-    #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
-    #: degraded or settings-only report for a complete one. `partial` means the sections outside
-    #: [security] could not be read at all (the file did not load), so they report shipped defaults; the scope string is the standing limitation above. It names
-    #: ALL the connection-scoped deviations (#333, ADR 0173) — naming only cleartext_accepted made the DECLARED
-    #: scope itself incomplete, which is the same defect one level up.
-    #:
-    #: BACKLOG #1852 added a FOURTH gap and it is named for that same reason. This command reads the
-    #: AUTHORED file; `serve --host` is a CLI override that `load_settings` folds into the [security]
-    #: view at load, so an engine started with an off-box --host reports `local_access_only = false` on
-    #: GET /security/posture while this command still shows the file's `true`. Both readings are right
-    #: for what they describe, and a scope marker that did not say so would send an auditor comparing
-    #: the two surfaces looking for a defect in one of them.
-    #:
-    #: Vault BACKLOG #2599 added a FIFTH, named for the same reason: the config-source escape is an
-    #: environment variable, and security_loosenings() reads it from the process that calls it. Here
-    #: that is the operator's shell, not the service.
-    _loosenings_scope = {
-        "loosenings_partial": _loosenings_partial_reason is not None,
-        # None unless the report is partial. Then: why the whole-file load failed.
-        "loosenings_partial_reason": _loosenings_partial_reason,
-        "loosenings_scope": (
-            "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]/"
-            "[cert_monitor]/[backup]); the "
-            "per-connection "
-            "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
-            "generic-ODBC database TLS, "
-            "tls_hop_attested, "
-            "tls_revocation_attested, FHIR update_url_form and http ECH sidecar declarations are "
-            "NOT included, and neither are the store-principal privilege and audit-chain keying "
-            "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
-            "GET /security/posture reports both). Nor are the engine process's remote-debugging "
-            "reading, its start-up reading (launch flags, start-up code, writable site "
-            "directories) and its Windows service-environment reading: this command is a separate "
-            "process (GET /security/posture reports them). "
-            "These are the AUTHORED values, so a `serve --host` bind override on a "
-            "running engine is not reflected here either — see `messagefoundry check` or "
-            "GET /security/posture. One entry is not read from the file at all: "
-            "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE is reported from the environment of THIS command, "
-            "which may not be the service's, so it can appear here beside an `enforce` file, or be "
-            "absent here while the service carries it — GET /security/posture reads the engine's own"
-        ),
-    }
+        loosenings = [{"switch": s, "risk": r} for s, r in registry(auth)]
+        # The registry reads only the two session limits off their [auth] copies, so those are the
+        # switches a loaded value can loosen behind the authored one. Where the load read a limit
+        # differently, name what the loaded value loosens too, beside any authored entry, so a
+        # variable in this shell is disclosed rather than silently dropped. The label names the
+        # variable only when it is set; otherwise the two reads disagreed, as a concurrent edit
+        # between them leaves them.
+        differs = {
+            switch
+            for switch, section, field in _SECURITY_PASSTHROUGH
+            if section == "auth"
+            and switch in ("sign_out_after_idle_minutes", "max_session_hours")
+            and loaded
+            and getattr(full.auth, field) != getattr(auth, field)
+        }
+        if differs:
+            import os
+
+            for s, r in _auth_limit_loosenings(full.auth):
+                if s not in differs:
+                    continue
+                # The names the load reads as this switch, asked of _env_overrides itself so the
+                # rule cannot drift from the loader's. It folds them in environ order, later
+                # winning, so the last is the one that took effect.
+                variables = [
+                    name
+                    for name in os.environ
+                    if s in _env_overrides({name: ""}).get("security", {})
+                ]
+                source = (
+                    f"set by {variables[-1]} in this command's environment, which the whole-file "
+                    "load reads over the file's [security], and which may not be the service's"
+                    if variables
+                    else "read differently by the whole-file load than by the [security] read "
+                    "this report shows, as a concurrent edit between the two leaves it"
+                )
+                loosenings.append({"switch": s, "risk": f"{source}: {r}"})
+        # Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
+        # degraded or settings-only report for a complete one. `partial` means the sections outside
+        # [security] could not be read at all (the file did not load), so they report shipped
+        # defaults, or that `set` could not re-read the [security] it saved (``degraded``); the
+        # scope string is the standing limitation above. It names
+        # ALL the connection-scoped deviations (#333, ADR 0173) — naming only cleartext_accepted made the DECLARED
+        # scope itself incomplete, which is the same defect one level up.
+        #
+        # BACKLOG #1852 added a FOURTH gap and it is named for that same reason. This command reads the
+        # AUTHORED file; `serve --host` is a CLI override that `load_settings` folds into the [security]
+        # view at load, so an engine started with an off-box --host reports `local_access_only = false` on
+        # GET /security/posture while this command still shows the file's `true`. Both readings are right
+        # for what they describe, and a scope marker that did not say so would send an auditor comparing
+        # the two surfaces looking for a defect in one of them.
+        #
+        # Vault BACKLOG #2599 added a FIFTH, named for the same reason: the config-source escape is an
+        # environment variable, and security_loosenings() reads it from the process that calls it. Here
+        # that is the operator's shell, not the service.
+        return {
+            "loosenings": loosenings,
+            "loosenings_partial": partial_reason is not None,
+            # None unless the report is partial. Then: why it is.
+            "loosenings_partial_reason": partial_reason,
+            "loosenings_scope": (
+                "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]/"
+                "[cert_monitor]/[backup]/[secrets]/[ai]); the "
+                "per-connection "
+                "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
+                "generic-ODBC database TLS, "
+                "tls_hop_attested, "
+                "tls_revocation_attested, FHIR update_url_form and http ECH sidecar declarations are "
+                "NOT included, and neither are the store-principal privilege and audit-chain keying "
+                "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
+                "GET /security/posture reports both). Nor are the engine process's remote-debugging "
+                "reading, its start-up reading (launch flags, start-up code, writable site "
+                "directories), its Windows service-environment reading and its key custody reading "
+                "(recovery_key_unproved, key_custody_non_local_account): this command is a separate "
+                "process (GET /security/posture reports them). "
+                "The [security] switches are the AUTHORED values, so a MEFOR_SECURITY_* "
+                "variable the service carries is NOT reflected here, and neither is a "
+                "`serve --host` bind override on a running engine — see `messagefoundry check` or "
+                "GET /security/posture. Of the MEFOR_SECURITY_* variables in THIS command's "
+                "environment, only the two session limits' are disclosed: one that sets a limit to "
+                "a value other than the file's [security] value, where that value is itself a "
+                "loosening, is named after the authored entries, labelled with the variable. One "
+                "equal to the file's value, or one whose value is no loosening, adds no entry, and "
+                "at least the require_mfa and block_unlisted_outbound variables are never named. "
+                "That needs a whole-file load that ran and succeeded: `show` on an absent file runs "
+                "none and names none, while `set` on a new file loads what it wrote and names it. "
+                "The other sections are read as the whole-file load "
+                "resolves them, so a MEFOR_<SECTION>_<KEY> variable in THIS command's environment "
+                "counts there, which may not be the service's. One entry is not read from the "
+                "file at all: "
+                "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE is reported from the environment of THIS command, "
+                "which may not be the service's, so it can appear here beside an `enforce` file, or be "
+                "absent here while the service carries it — GET /security/posture reads the engine's own"
+            ),
+        }
 
     if args.action == "show":
         try:
@@ -12164,15 +12907,41 @@ def _security(args: argparse.Namespace) -> int:
                 "values": resolved.model_dump(),
                 "set": sorted(raw.keys()),
                 "defaults": SecuritySettings().model_dump(),
-                "loosenings": _loosenings(resolved),
-                **_loosenings_scope,
+                **_posture(resolved),
             },
             compact=args.json,
         )
         return 0
 
     # Also how a relocated legacy key is refused at edit time rather than at the next start.
-    validate = _post_write_settings_check(security_edit.SecurityEditError)
+    saved: list[ServiceSettings] = []
+    saved_sec: list[SecuritySettings] = []
+    reread_failed: list[str] = []
+    check_candidate = _post_write_settings_check(security_edit.SecurityEditError, keep=saved)
+
+    def validate(candidate: Path) -> None:
+        # Only the last run counts, so a second run cannot pair a stale outcome with a fresh one.
+        saved_sec.clear()
+        reread_failed.clear()
+        check_candidate(candidate)
+        # The [security] of the very text that was validated, read under the edit lock, so a
+        # concurrent edit between the pre-check read below and the lock cannot pair a stale
+        # [security] with this candidate's other sections. This read is for the report only and
+        # must not refuse an edit the whole-file load accepted, so a [security] that fails alone
+        # (a MEFOR_SECURITY_* variable overrides its bad value), or a read of the candidate that
+        # raises, falls back to the pre-check view, and the report says it is partial and why.
+        try:
+            saved_sec.append(
+                SecuritySettings.model_validate(security_edit.read_security(candidate))
+            )
+        except (ValueError, OSError) as exc:  # ValidationError, SecurityEditError are ValueErrors
+            # The type only: a validation or read error's text can quote the file's values.
+            reason = (
+                f"the saved [security] could not be re-read for the report ({type(exc).__name__}), "
+                "so the loosenings are reported from the [security] checked before the edit"
+            )
+            logging.getLogger(__name__).warning("security set: %s", reason)
+            reread_failed.append(reason)
 
     try:
         data = args.data if args.data is not None else sys.stdin.read()
@@ -12189,12 +12958,14 @@ def _security(args: argparse.Namespace) -> int:
             else:
                 merged[key] = value
         try:
-            SecuritySettings.model_validate(merged)
+            sec = SecuritySettings.model_validate(merged)
         except ValidationError as exc:
             return _emit_error(f"invalid [security] value: {exc}", as_json=args.json)
         result = security_edit.set_security(path, updates, validate=validate)
-        result["loosenings"] = _loosenings(SecuritySettings.model_validate(merged))
-        result.update(_loosenings_scope)
+        # The candidate the write validated, so the preview reports the posture the edit left.
+        view = saved_sec[-1] if saved_sec else sec
+        degraded = reread_failed[-1] if reread_failed else None
+        result.update(_posture(view, saved[-1] if saved else None, degraded=degraded))
     except _OperatorJsonError as exc:
         return _emit_error(str(exc), as_json=args.json)
     except (security_edit.SecurityEditError, FileNotFoundError, ValueError, OSError) as exc:
@@ -12563,6 +13334,7 @@ _DISPATCH = {
     "cert": _cert,
     "protect-key": _protect_key,
     "admin-unlock": _admin_unlock,
+    "issue-enrolment-code": _issue_enrolment_code,
     "provision-admin": _provision_admin,
     "store": _store,
     "check-privileges": _check_privileges,

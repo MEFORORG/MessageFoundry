@@ -1049,9 +1049,8 @@ jobs:
       #
       # The remaining margin is a SHARED budget across every PR that lands, and it is now ACCOUNTED
       # FOR: `scripts/ci/step_margin.py` runs after the gated step below and reds the leg when a
-      # step's own duration comes within 1.30x of its own cap (BACKLOG #344 proposal 1). Until #3515
-      # the engine leg only warns in merge_group, and on pull_request warns down to 1.20x; the margin
-      # step says why. It used to run after BOTH gated steps; the web console suite moved to its own
+      # step's own duration comes within 1.30x of its own cap (BACKLOG #344 proposal 1), on every
+      # event. It used to run after BOTH gated steps; the web console suite moved to its own
       # `webconsole` job and took its half of the check with it, so each job now measures the one
       # gated step it owns. Three PRs each adding a minute of Windows time is still individually
       # blameless -- the difference is that
@@ -1222,86 +1221,27 @@ jobs:
       # ratio, and the script runs its own red/green control pair on every invocation and prints both
       # into the job summary -- a gate that has never been red is a claim, not a control.
       #
-      # ADVISORY IN THE MERGE QUEUE, A 1.20x FLOOR ON A PULL REQUEST, 1.30x ON EVERY OTHER EVENT.
-      # Owner ruling 2026-10-29, verbatim:
-      # "Go on fix 1: make the Step margin guard advisory in merge_group until #3515 re-measures the
-      # cap, and quarantine the recurring timing tests under #4773." Over the engine merge_group runs
-      # of 2026-10-27 16Z to 10-29 15Z, 14 of the 34 failed jobs were this step with every test
-      # passed. A pull_request run still gates before the entry is enqueued, so a margin is still
-      # enforced once per change, against that PR's own base, at the 1.20x floor below. WHAT THIS
-      # GIVES UP, stated so it is not mistaken for free: a queue entry tests the PR merged onto the
-      # queue head, a tree no pull_request run saw. Two PRs that each pass alone can together breach
-      # the margin, and only the queue run sees that sum; while this is advisory it lands. If the sum
-      # is under 1.20x, the next pull_request run is the first blocking check to red, on a change that
-      # did not cause it. If it is between the floors, no pull_request check blocks at all.
-      # THE PULL REQUEST FLOOR. Decided under the owner's delegation of 2026-10-30, by the Lander after
-      # adversarial review. The question, as the Lander put it: extend the advisory timing ruling to a
-      # PR's own run (A), or keep it blocking (B). The owner's answer: "/driver". The decision is
-      # neither pure option: on pull_request a margin from 1.30x down to 1.20x warns, and below 1.20x
-      # it blocks. WHAT THIS GIVES UP: a PR can now land with less than the 1.30x this gate exists to
-      # keep. Its push run on main then still judges 1.30x, so a change in that band can red `test` on
-      # main with every test passed and no PR to own the red. That is at least the cost accepted until
-      # #3515. The floor is passed to the script rather than compared here, so the self-check runs
-      # against that floor.
-      # tests/test_ci_step_margin.py runs the real script at it. 1.10 is not available as a floor: the
-      # self-check's negative control is 1.111x, so it exits 2. The warning is raised here rather than
-      # left to the script's RE-SIZE escalation, because a censored row never escalates, and the
-      # windows-2022 row is censored (since 2026-11-02; it was windows-2025's before). On an
-      # uncensored row a run over its record gets a RE-SIZE
-      # annotation from EACH call, each naming its own floor's red line, beside this warning.
-      # ONLY THE VERDICT IS ADVISORY, NOT THE INSTRUMENT. In merge_group the run body below turns exit
-      # 1 (LOW margin) into a warning annotation plus a summary line and exits 0, and on pull_request
-      # the second call does the same when it exits 0, so the job, and so the required `test` context,
-      # stays green while the miss stays visible. Both calls then appear in the log and the summary:
-      # the first says LOW against 1.30x, and its "reddened this leg" wording is the script's, not
-      # the step's conclusion. Exit 2 (the script could not measure: a missing mark, a failed
-      # self-check control, no baseline row) still fails the step from either call on every event,
-      # because the ruling is about the cap, not a broken gate. An uncaught Python exception is not
-      # that case: it exits 1, so this step reads it as LOW, and that is a limit of this branch. Not
-      # `continue-on-error`, which would have let exit 2 through as well. `ci-gate` does not need
-      # `test` at all: each `test` leg is its own required context, judged by its job conclusion.
-      # The Windows caps were re-measured 2026-11-02, but the revert also waits on a re-measure of the
-      # ubuntu row, which this softening covers too (Manager ruling of 2026-11-02).
-      # REVERT THIS when #3515's re-measure of the cap lands: drop both event branches, `pr_floor`,
-      # and the `warn` and `margin` functions, restore the single call, and take the matching tests
-      # and the exception in docs/CI.md with them. `test-shard2` carries the same body, and
-      # tests/test_ci_engine_suite_shards.py holds the two identical, so revert both.
-      # tests/test_ci_step_margin.py pins the condition.
+      # BLOCKING ON EVERY EVENT. From the owner ruling of 2026-10-29 until BACKLOG #5247 item 9, a LOW
+      # margin here was a warning in merge_group, and from 2026-10-30 a warning on pull_request down to
+      # 1.20x, both until the cap was re-measured. The test shard pools of 2026-11-09, recorded in
+      # scripts/ci/step_margin_baseline.toml, put every leg far over 1.30x against the caps in force,
+      # and the softening was reverted on that reading; the baseline file says why no row or cap
+      # moved with it.
+      # `test-shard2` carries the same body, and tests/test_ci_engine_suite_shards.py holds the two
+      # identical; tests/test_ci_step_margin.py pins that a LOW margin reds on every event.
       - name: Step margin -- engine suite
         if: always()
         env:
           TESTS_OUTCOME: ${{ steps.tests.outcome }}
           STEP_CAP: ${{ matrix.step_timeout }}
           LEG: ${{ matrix.os }}
-          EVENT_NAME: ${{ github.event_name }}
         run: |
           rc=0
-          pr_floor=1.20
-          margin() {
-            python scripts/ci/step_margin.py --step "Tests (pytest)" --leg "$LEG" \
-              --cap-minutes "$STEP_CAP" --outcome "$TESTS_OUTCOME" \
-              --since before-tests --until now "$@"
-          }
-          warn() {
-            echo "::warning title=$1::$2"
-            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-              printf '\n**WARNING:** %s\n' "$2" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          }
           # `|| rc=$?` OUTSIDE the command, so a non-zero exit is captured rather than swallowed by
           # `set -e` or absorbed into a pipeline.
-          margin || rc=$?
-          if [ "$rc" -eq 1 ] && [ "$EVENT_NAME" = "merge_group" ]; then
-            warn "Step margin advisory (merge_group)" "Step margin -- engine suite found a LOW margin on $LEG. ADVISORY in merge_group under the owner ruling of 2026-10-29 until #3515 re-measures the cap; pull_request blocks below ${pr_floor}x, and every other event below 1.30x."
-            exit 0
-          fi
-          if [ "$rc" -eq 1 ] && [ "$EVENT_NAME" = "pull_request" ]; then
-            # Only exit 0 from this second call passes. Exit 1 is below 1.20x, and exit 2 is an
-            # instrument failure, which is never a pass.
-            margin --min-margin "$pr_floor" || exit $?
-            warn "Step margin advisory (pull_request)" "Step margin -- engine suite is under the 1.30x floor but at or over the ${pr_floor}x pull_request floor on $LEG. It passes here until #3515 re-measures the cap; below ${pr_floor}x it blocks, and the push run on main still reds below 1.30x."
-            exit 0
-          fi
+          python scripts/ci/step_margin.py --step "Tests (pytest)" --leg "$LEG" \
+            --cap-minutes "$STEP_CAP" --outcome "$TESTS_OUTCOME" \
+            --since before-tests --until now || rc=$?
           exit $rc
 
       # BACKLOG #1211: the connscale readings are written on EVERY run, pass or fail, because an
@@ -1448,43 +1388,20 @@ jobs:
           echo "engine suite, test shard $TEST_SHARD of 2: $(wc -l < out/test-shard/files.txt) test files"
           bash scripts/ci/retry-native-crash.sh pytest -q -n "$PYTEST_WORKERS" --dist loadfile --max-worker-restart=0 -m 'not tooling and not timing_quarantine' --ignore-glob='*messagefoundry-webconsole*' -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT" --durations=40 --junitxml="out/junit/test-shard-$TEST_SHARD.xml" @out/test-shard/files.txt
 
-      # The `test` job's margin check, byte for byte. Its note there, REVERT line included, covers
-      # this copy too.
+      # The `test` job's margin check, byte for byte. Its note there covers this copy too.
       - name: Step margin -- engine suite
         if: always()
         env:
           TESTS_OUTCOME: ${{ steps.tests.outcome }}
           STEP_CAP: ${{ matrix.step_timeout }}
           LEG: ${{ matrix.os }}
-          EVENT_NAME: ${{ github.event_name }}
         run: |
           rc=0
-          pr_floor=1.20
-          margin() {
-            python scripts/ci/step_margin.py --step "Tests (pytest)" --leg "$LEG" \
-              --cap-minutes "$STEP_CAP" --outcome "$TESTS_OUTCOME" \
-              --since before-tests --until now "$@"
-          }
-          warn() {
-            echo "::warning title=$1::$2"
-            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-              printf '\n**WARNING:** %s\n' "$2" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          }
           # `|| rc=$?` OUTSIDE the command, so a non-zero exit is captured rather than swallowed by
           # `set -e` or absorbed into a pipeline.
-          margin || rc=$?
-          if [ "$rc" -eq 1 ] && [ "$EVENT_NAME" = "merge_group" ]; then
-            warn "Step margin advisory (merge_group)" "Step margin -- engine suite found a LOW margin on $LEG. ADVISORY in merge_group under the owner ruling of 2026-10-29 until #3515 re-measures the cap; pull_request blocks below ${pr_floor}x, and every other event below 1.30x."
-            exit 0
-          fi
-          if [ "$rc" -eq 1 ] && [ "$EVENT_NAME" = "pull_request" ]; then
-            # Only exit 0 from this second call passes. Exit 1 is below 1.20x, and exit 2 is an
-            # instrument failure, which is never a pass.
-            margin --min-margin "$pr_floor" || exit $?
-            warn "Step margin advisory (pull_request)" "Step margin -- engine suite is under the 1.30x floor but at or over the ${pr_floor}x pull_request floor on $LEG. It passes here until #3515 re-measures the cap; below ${pr_floor}x it blocks, and the push run on main still reds below 1.30x."
-            exit 0
-          fi
+          python scripts/ci/step_margin.py --step "Tests (pytest)" --leg "$LEG" \
+            --cap-minutes "$STEP_CAP" --outcome "$TESTS_OUTCOME" \
+            --since before-tests --until now || rc=$?
           exit $rc
 
       # THE PARTITION GUARD (BACKLOG #5247). It runs pytest's own collection under the engine step's
@@ -3341,18 +3258,52 @@ jobs:
           # are at least three leaf modules store/sqlserver.py imports from outside store/.
           # tests/test_sqlserver_postgres_schema_verify_1720.py imports messagefoundry/logging_setup.py and
           # messagefoundry/redaction.py to run a schema-verify refusal through RedactionFilter and safe_exc.
+          # messagefoundry/pipeline/reference_sync.py and messagefoundry/sqlserver_roles.py carry the
+          # DatabaseRef pool and the fixed-role sets the live login role probe reads (BACKLOG #2617).
+          # tests/_lockout_store_contract.py is the lockout body both server store suites run.
           # ci/python-version is the interpreter every one of these legs runs, so a patch bump
           # must meet them on its own PR rather than first on the nightly after the merge.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service|tokens|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/connection_events|messagefoundry/(logging_setup|redaction)|messagefoundry/odbc_(call_gate|env|dsn)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/_claim_lock_helpers\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_finalize_race_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/_keyed_reopen_contract\.py|tests/test_store_cipher_sweep_parity\.py|tests/test_transit_bound_attestation_server_backends\.py|ci/python-version|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service|tokens|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|reference_sync|sharding|stage_dispatcher|wiring_runner)|messagefoundry/connection_events|messagefoundry/sqlserver_roles|messagefoundry/(logging_setup|redaction)|messagefoundry/odbc_(call_gate|env|dsn)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/_claim_lock_helpers\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_finalize_race_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/_keyed_reopen_contract\.py|tests/_lockout_store_contract\.py|tests/test_store_cipher_sweep_parity\.py|tests/test_transit_bound_attestation_server_backends\.py|ci/python-version|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
           fi
           # The container image smoke runs on PRs that touch the image, the per-profile locks, packaging,
-          # or this workflow (engine-wide regressions are already covered by the `test` job + push-to-main).
+          # this workflow, an engine module on the image's start path, or a rig file its steps run.
           # ci/locks/release-tools.lock is in because the image's builder stage installs from it
           # (BACKLOG #1193), so a bump to it can break the image build.
-          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|\.github/workflows/ci\.yml)'; then
+          #
+          # THE START-PATH ARM (vault BACKLOG #3455). The image's ENTRYPOINT is `python -m
+          # messagefoundry` (docker/Dockerfile), and this job is the only one that starts `serve` the
+          # way the container does: a non-root uid, root-owned anchors and config, a minted TLS pair,
+          # the enforcing PHI posture and an isolated interpreter. The `test` job runs the engine's
+          # unit tests, not that start. Push-to-main does not cover it either, because the push arm
+          # above writes docker=false. Of the engine, PR 2284 changed only __main__.py, api/app.py
+          # and auth/trust_anchors.py, so this job skipped on it, and the nightly run was the first
+          # to see the engine refuse the rig's syslog CA.
+          #
+          # The named modules, and what each is in for, at least: __init__ and __main__ (what `-m`
+          # runs, and the lazy exports the baked config imports); api/__init__ and api/app (the app
+          # factory and lifespan); api/tls and pki (the minted pair); auth/trust_anchors,
+          # auth/anchor_path and config/anchor (the anchor ownership rule); config/settings (the
+          # MEFOR_* values the rig sets); config/wiring (the config load and its root-ownership
+          # check); serviceenv, config/retention_classification, transports/egress and
+          # config/tls_policy (enforcing-start refusals the rig's settings are chosen to pass);
+          # logging_setup (the TLS log forwarder); startupcode and remotedebug (the interpreter
+          # posture); api/models and terminal_text (the posture fields the serve step reads back,
+          # and how the rig prints them); and auth/passwords (the rig Administrator's password
+          # check). The rest are rig files the steps run, and the helper make_syslog_ca_crl.py
+          # imports to mint the CA.
+          #
+          # NAMED MODULES, NOT `^messagefoundry/`, which would run this job on nearly every engine PR
+          # on the contended ubuntu pool. auth/service.py is left out although the rig provisions its
+          # Administrator through it, and a change there can red this job: it changes on many PRs for
+          # routes the smoke never takes. An engine start change outside this list is still first run
+          # by the nightly. A red here stops no merge either: the job is not a required context and
+          # not in ci-gate's needs (see the note above ci-gate). The merge_group and push arms are
+          # unchanged (#1830). tests/test_ci_docker_gate.py pins this alternation, and the measured
+          # run rate is in that file's docstring.
+          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|messagefoundry/(__init__|__main__|serviceenv|terminal_text|api/(__init__|app|models|tls)|auth/(trust_anchors|anchor_path|passwords)|pki|config/(anchor|retention_classification|settings|tls_policy|wiring)|transports/egress|logging_setup|startupcode|remotedebug)\.py$|harness/load/rigadmin\.py$|scripts/ci/make_syslog_ca_crl\.py$|tests/_phi_gate_provisions\.py$|\.github/workflows/ci\.yml)'; then
             echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"
@@ -3822,6 +3773,8 @@ jobs:
           tests/test_adr0157_sqlserver_fence.py
           tests/test_uploads_shard_quota_interleave.py
           tests/test_adr0157_b1497_sqlserver_renew_clamp.py
+          tests/test_sqlserver_lookup_login_role_probe.py
+          tests/test_sqlserver_autocommit_pools_live.py
 
       - name: Run the RTE capture / re-ingress loop on real SQL Server (ADR 0013/0016)
         env:
@@ -4954,8 +4907,8 @@ jobs:
         # and run with exactly the privilege list the installer writes. One Server SKU each.
         # - localsystem (-AllowLocalSystem) is listed. Its first run is in the merge queue.
         # - localuser (-ServiceAccount, a local user created on the runner) is WIRED BUT NOT LISTED,
-        #   for the reason docs/SERVICE.md "Restrict the service token" gives (the store's
-        #   _hardening_refusal in messagefoundry/store/store.py). Add this row once that changes:
+        #   for the reason docs/SERVICE.md "Restrict the service token" gives (the installer's
+        #   read-back of the HOST\user spelling, BACKLOG #3938). Add this row once that changes:
         #     - { os: windows-2025, python-version: "3.14", account: localuser }
         # - A gMSA gets no leg. docs/SERVICE.md "Restrict the service token" says why.
         include:
@@ -5368,12 +5321,44 @@ jobs:
           # windows-2025, in the unit arm that runs the function against a temp directory: an
           # explicit one came through /inheritance:r /grant:r with icacls exiting 0 and reached the
           # logs directory beneath it.
-          $dirs = @("C:\ProgramData\MessageFoundry", "C:\ProgramData\MessageFoundry\logs")
+          #
+          # THE RUN-AS ACCOUNT MUST HOLD ITS GRANT ON BOTH (BACKLOG #1699). A lockdown that dropped
+          # -Account passes every check above, since it leaves SYSTEM and Administrators only, and
+          # the service could then not write its own store or logs. Set-SecureDataDirAcl writes
+          # "<account>:(OI)(CI)M"; icacls prints it (OI)(CI)(M) on the data directory, whose
+          # inheritance the lockdown cut, and (I)(OI)(CI)(M) on logs, which inherits it. Each
+          # directory must show its own form, and no Deny entry for the account may stand beside it.
+          # MATCHED AS THE NAME, A COLON AND THE RIGHTS TOGETHER, NEVER AS A BARE NAME: the path
+          # icacls echoes on its first line holds "MessageFoundry" too, so a substring test on the
+          # name passes with the entry gone.
+          # tests/test_service_install_manifest.py runs this script against stand-in icacls output.
+          # It reads icacls on purpose rather than lifting the installer's Get-WriteGrantProblem:
+          # a witness that shares the installer's code would pass the installer's own bug. The
+          # installer only warns on a missing grant, and the /health step below fails without
+          # naming the cause, so this step is where the cause is named.
+          #
+          # THE LOCALSYSTEM LEG HAS NO NAMED GRANT TO ASSERT. The installer writes none for
+          # LocalSystem ($ServiceAccount is empty on that leg), so that leg requires the entry
+          # LocalSystem writes through instead: SYSTEM's (OI)(CI)(F), which every leg gets.
+          # $grantee mirrors the Install step's for the other legs.
+          if ($env:SMOKE_ACCOUNT -eq "virtual") {
+            $grantee = "NT SERVICE\MessageFoundry"; $rights = "M"
+          } elseif ($env:SMOKE_ACCOUNT -eq "localuser") {
+            $grantee = "$env:COMPUTERNAME\$env:SMOKE_LOCAL_USER"; $rights = "M"
+          } elseif ($env:SMOKE_ACCOUNT -eq "localsystem") {
+            $grantee = "NT AUTHORITY\SYSTEM"; $rights = "F"
+          } else {
+            throw "unknown SMOKE_ACCOUNT '$env:SMOKE_ACCOUNT'"
+          }
+          # Each directory, with the inheritance flag its run-as entry must carry.
+          $dirs = [ordered]@{ "C:\ProgramData\MessageFoundry" = ""; "C:\ProgramData\MessageFoundry\logs" = "(I)" }
           $broad = @("S-1-1-0", "Everyone", "S-1-5-32-545", "BUILTIN\Users",
                      "S-1-5-11", "Authenticated Users", "S-1-5-32-546", "BUILTIN\Guests",
                      "S-1-3-4", "OWNER RIGHTS")
+          $entry = "(?m)(?:^|\s)" + [regex]::Escape("${grantee}:")
           $bad = @()
-          foreach ($d in $dirs) {
+          $missing = @()
+          foreach ($d in $dirs.Keys) {
             if (-not (Test-Path $d)) { throw "expected directory is missing: $d" }
             $acl = (& icacls $d | Out-String)
             "===== icacls $d ====="
@@ -5385,12 +5370,19 @@ jobs:
             foreach ($p in $broad) {
               if ($acl -match [regex]::Escape($p)) { $bad += "$d grants $p" }
             }
+            $want = $dirs[$d] + "(OI)(CI)($rights)"
+            if ($acl -notmatch ($entry + [regex]::Escape($want))) { $missing += "$d shows no '${grantee}:$want' entry" }
+            if ($acl -match ($entry + "(?:\(\w+\))*\(DENY\)")) { $missing += "$d carries a Deny entry for $grantee" }
           }
+          $bad | ForEach-Object { "BROAD ACCESS: $_" }
+          $missing | ForEach-Object { "NO RUN-AS GRANT: $_" }
           if ($bad.Count -gt 0) {
-            $bad | ForEach-Object { "BROAD ACCESS: $_" }
             throw "the data/log directory is reachable by a broad principal - the captured engine logs are a PHI sink (H-13, BACKLOG #1699)"
           }
-          "data-directory DACL OK: no broad principal on either directory"
+          if ($missing.Count -gt 0) {
+            throw "the data/log directory does not show the grant '$grantee' needs to write the store and logs (BACKLOG #1699); the icacls output above shows what it holds"
+          }
+          "data-directory DACL OK: no broad principal on either directory, and $grantee holds (OI)(CI)($rights) on the data directory and (I)(OI)(CI)($rights) on logs"
 
       - name: Start and verify /health
         run: |
@@ -6016,14 +6008,14 @@ jobs:
   # signed in, sends one synthetic ADT^A01 over the in-container MLLP listener, and asserts it FINALIZES
   # to PROCESSED (not merely RECEIVED — that distinguishes ACK-on-receipt from final disposition). Then
   # it verifies a graceful `docker stop`: tini forwards SIGTERM -> uvicorn lifespan -> engine.stop().
-  # Runs NIGHTLY + on dispatch; on PRs only when the image/locks/packaging/this workflow change
-  # (gated by `changes`), so docs/unrelated PRs don't pay the build. No longer per push-to-main —
+  # Runs NIGHTLY + on dispatch; on PRs only when `changes` sets docker=true (its comment lists the
+  # paths), so docs/unrelated PRs don't pay the build. No longer per push-to-main --
   # an image-touching merge was path-gated on its own PR minutes earlier (same rationale as the
   # server-DB legs; `changes` sets docker=false on push, the other half of this guard).
   docker-smoke:
     name: docker image smoke (slim, linux)
     needs: changes
-    # Nightly / on-demand, or a PR that touches the image/locks/packaging.
+    # Nightly / on-demand, or a PR that touches the image/locks/packaging or the engine start path.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     steps:

@@ -81,13 +81,22 @@
 #>
 
 # Every config root that actually holds a session registry.
+#
+# EVERY PATH HERE AND IN Get-SessionRecords IS READ LITERALLY (vault BACKLOG #2985). A -Path read takes
+# its argument as a wildcard pattern: a backtick escapes, [ ] is a set, and * and ? match. So a root
+# named .claude``x was read as its sibling .claude`x, and a record named [1].json as 1.json, and a
+# remover that trusted the read cleared a tree a session was recorded in. -Filter stays: it is the one
+# pattern meant as one, and the file system matches it without PowerShell's escapes.
 function Get-ClaudeConfigRoots {
     [CmdletBinding()]
     param([string[]]$ConfigRoot)
-    if ($ConfigRoot) { return @($ConfigRoot | Where-Object { Test-Path $_ }) }
+    if ($ConfigRoot) { return @($ConfigRoot | Where-Object { Test-Path -LiteralPath $_ }) }
+    # No profile names no root. -LiteralPath refuses a null path with a throw, where -Path listed
+    # the current directory instead.
+    if (-not $env:USERPROFILE) { return @() }
     return @(
-        Get-ChildItem -Path $env:USERPROFILE -Directory -Filter ".claude*" -Force -EA SilentlyContinue |
-            Where-Object { Test-Path (Join-Path $_.FullName "sessions") } |
+        Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter ".claude*" -Force -EA SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "sessions") } |
             ForEach-Object { $_.FullName }
     )
 }
@@ -158,12 +167,17 @@ function Get-SessionRecords {
     param([string[]]$ConfigRoot, [switch]$IncludeUnreadable)
     $out = @()
     foreach ($root in (Get-ClaudeConfigRoots -ConfigRoot $ConfigRoot)) {
-        foreach ($f in @(Get-ChildItem (Join-Path $root "sessions") -Filter *.json -EA SilentlyContinue)) {
+        # -Force lists hidden and system records too: a record skipped here is a session no caller sees.
+        # A directory named *.json is listed too, and reads as unreadable below.
+        foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $root "sessions") -Filter *.json -Force -EA SilentlyContinue)) {
             # A single malformed record must never take down a caller -- one of these runs in a
             # SessionStart hook, where a throw replaces the chat's whole starting context.
             $rec = $null
             $err = ''
-            try { $rec = Get-Content $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { $err = $_.Exception.Message }
+            if ($f -is [System.IO.DirectoryInfo]) { $err = 'a directory, not a file, so it cannot be read as a record' }
+            else {
+                try { $rec = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { $err = $_.Exception.Message }
+            }
             if (-not $rec) {
                 if (-not $err) { $err = 'the file parsed to nothing (empty, or being written right now)' }
                 if ($IncludeUnreadable) {

@@ -79,6 +79,7 @@ from messagefoundry.pipeline.intake_bound import (
 )
 from messagefoundry.pki import read_soonest_crl_facts
 from tests import test_crl_reload as _base
+from tests._log_absence import assert_capture_sees
 from tests._refusal_log_capture import until
 from tests.test_alert_sinks import _drain as _drain_transports
 from tests.test_alert_sinks import _RecordingTransport
@@ -1612,6 +1613,7 @@ async def test_a_first_sight_clear_that_fails_says_there_may_be_no_alert(
     (said,) = [r for r in caplog.records if "could not send the clear" in r.getMessage()]
     assert said.levelno == logging.INFO and key in said.getMessage()
     assert "there may be no such alert" in said.getMessage()
+    assert_capture_sees(caplog, "messagefoundry.pipeline.crl_reload")
     assert not [r for r in caplog.records if "could not be resolved;" in r.getMessage()]
     # The control: the sink did refuse every clear, and the stop says so.
     assert sink.events == []

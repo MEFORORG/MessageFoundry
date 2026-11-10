@@ -75,8 +75,17 @@ standing rule for such decisions, after an adversarial review upheld it. The own
   check would not gate it.
 - **Out of scope.** The `[alerts]` sink and the per-user security notifier keep an ungated sender
   domain. [ADR 0127](0127-operator-editable-alert-email-templates-with-a-non-phi-variable-allowlist.md)
-  limits alert mail to fields with no PHI, and neither sends a message body. DIRECT stays out too:
-  its bounces carry ciphertext ([ADR 0085](0085-direct-hisp-smime-connector.md)).
+  limits only the operator-editable alert templates to fields with no PHI, and neither the sink
+  nor the notifier has a message-body field. The default alert body still carries free-text
+  detail (the [PHI.md logging inventory](../PHI.md#logging-inventory-1611--1623) rows for the
+  `[alerts]` transports; corrected 2026-11-10, BACKLOG #5021: this read *"limits alert mail to
+  fields with no PHI"*). *(Note 2026-11-10: that retired claim was the reason given for this
+  decline, and it is false in the shipped code. The decline is to be re-checked against the
+  off-box alert key allowlist once that is built. That re-check is a Manager decision, not part
+  of the owner ruling of 2026-11-09 on the allowlist;
+  [ADR 0173](0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s
+  note of 2026-11-10 records both and which part each holds.)* DIRECT stays out too: its bounces carry ciphertext
+  ([ADR 0085](0085-direct-hisp-smime-connector.md)).
 - **If the sender becomes per-message.** Today it is a connection setting, so the check runs at
   load, reload and start. A sender chosen per message would need the check at send time.
 
