@@ -133,8 +133,10 @@ DETACH_CHUNK_BYTES = 1024 * 1024
 
 
 class BinaryCarriageError(ValueError):
-    """A value could not be decoded as binary carriage (ADR 0028): a missing ``mfb64:v1:`` marker, or
-    base64 that fails to decode (bad padding / non-alphabet content). Subclasses ``ValueError`` so a
+    """A value could not be decoded as binary carriage (ADR 0028). At least: a missing ``mfb64:v1:``
+    marker, base64 that fails to decode (bad padding / non-alphabet content), and, from
+    :func:`extract_obx_document`, an OBX that is not a Base64 ED document or a message whose
+    delimiters cannot be read from its MSH (BACKLOG #2873). Subclasses ``ValueError`` so a
     Router/Handler can let it propagate to the **error/dead-letter** path (status ``ERROR``) rather
     than yielding a silently-truncated body — honoring the count-and-log invariant (CLAUDE.md §2)."""
 
@@ -311,7 +313,9 @@ def extract_obx_document(message: Message, *, occurrence: int = 1) -> bytes:
     data is corrupt — so a Handler can dead-letter rather than mis-decode. It raises
     :class:`BinaryCarriageError` too when ``Message._encoding_chars`` cannot read the message's
     delimiters, such as an MSH-2 shorter than four characters or no MSH at all (BACKLOG #2873)."""
-    if not _delimiters_readable(message):
+    # occurrence < 1 is left to Message.field, which refuses it as the caller's error before it
+    # reads any delimiter.
+    if occurrence >= 1 and not _delimiters_readable(message):
         # Every read below would raise the bare ValueError, whose text quotes MSH-1 and MSH-2.
         raise BinaryCarriageError(
             f"{_unreadable_delimiters_cause(message)}, so no OBX can be read; refusing the extract"
@@ -687,12 +691,15 @@ def _delimiters_readable(message: Message) -> bool:
 
 def _unreadable_delimiters_cause(message: Message) -> str:
     """Name, without quoting either field, why :func:`_delimiters_readable` answered False for
-    ``message``: it has no MSH, its first MSH's MSH-2 is short, or its MSH-1 is not one character."""
+    ``message``: it has no MSH, its first MSH's MSH-2 is short, or its MSH-1 is not one character.
+    A cause none of those checks finds is named as such, never blamed on a field."""
     if not message.count_segments("MSH"):
         return "the body has no MSH"
     if len(message._raw_field("MSH", 2)) < 4:
         return "its first MSH's MSH-2 is shorter than four characters"
-    return "its first MSH's MSH-1 is not one character"
+    if len(message._raw_field("MSH", 1)) != 1:
+        return "its first MSH's MSH-1 is not one character"
+    return "its first MSH's delimiters cannot be read"
 
 
 def _scan_obx(message: Message, occ: int, min_b64_len: int) -> tuple[bool, bool, bool, bool]:

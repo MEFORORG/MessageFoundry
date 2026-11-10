@@ -632,11 +632,9 @@ def test_the_compression_target_catches_a_wrong_deflate_tail(
 def test_the_short_msh2_reproducer_is_refused_by_name_through_the_raw_helpers() -> None:
     """BACKLOG #2873 regression: the first retired binary-carriage finding stays fixed.
 
-    ``Peek.parse`` still accepts the body, so the listener still answers it AA by design (ADR
-    0054 refuses at parse only a header too short for MSH-1 plus one encoding character).
-    ``extract_obx_document`` now refuses it as ``BinaryCarriageError``, which replaced the bare
-    ``ValueError`` this test pinned while the finding was live, with nothing chained and neither
-    MSH-1 nor MSH-2 quoted. ``strip_documents`` returns it unchanged and ``iter_obx_documents``
+    ``Peek.parse`` still accepts the body (see ``fuzz/README.md``, *Known findings*).
+    ``extract_obx_document`` refuses it as ``BinaryCarriageError`` with nothing chained and neither
+    MSH-1 nor MSH-2 quoted; ``strip_documents`` returns it unchanged and ``iter_obx_documents``
     refuses it as ``UnreadableDelimitersError`` (BACKLOG #5099).
     """
     assert SHORT_MSH2_REPRODUCER in TARGETS_BY_NAME["binary_carriage"].seeds
@@ -655,9 +653,8 @@ def test_the_short_msh2_reproducer_is_refused_by_name_through_the_raw_helpers() 
 def test_the_batch_header_reproducer_is_refused_by_name_through_the_raw_helpers() -> None:
     """BACKLOG #2873 regression: the second retired binary-carriage finding stays fixed.
 
-    ``Peek.parse`` still refuses the body and ``Message.parse`` still accepts it; that parser
-    disagreement is not changed. ``extract_obx_document`` now refuses it as
-    ``BinaryCarriageError`` rather than letting a bare ``ValueError`` out.
+    ``Peek.parse`` still refuses the body and ``Message.parse`` still accepts it (BACKLOG #2874).
+    ``extract_obx_document`` refuses it as ``BinaryCarriageError``, naming the missing MSH.
     """
     assert BATCH_HEADER_REPRODUCER in TARGETS_BY_NAME["binary_carriage"].seeds
     text = BATCH_HEADER_REPRODUCER.decode("ascii")
@@ -666,9 +663,10 @@ def test_the_batch_header_reproducer_is_refused_by_name_through_the_raw_helpers(
     message = Message.parse(text)
     with pytest.raises(UnreadableDelimitersError):
         list(iter_obx_documents(message, received=text))
-    with pytest.raises(BinaryCarriageError) as caught:
+    with pytest.raises(BinaryCarriageError, match="^the body has no MSH,") as caught:
         extract_obx_document(message)
     assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert "^~" not in str(caught.value)
 
 
 def test_extract_obx_document_lets_a_valueerror_subclass_from_the_delimiter_read_escape(
@@ -691,14 +689,17 @@ def test_the_binary_carriage_target_has_no_carve_out_left_on_a_retired_reproduce
     reproducer: bytes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The carve-out came out with the findings (BACKLOG #2873): a bare ``ValueError`` carrying the
-    engine's separators message, planted in the detach scan on a body of either retired shape,
-    now escapes the target. Were a carve-out restored, this plant would be swallowed.
+    engine's separators message, planted in the detach scan or in the extract on a body of either
+    retired shape, now escapes the target. Were a carve-out restored around either call, its plant
+    would be swallowed. Each plant sits alone, so the extract plant is reached with the real scan.
     """
     TARGETS_BY_NAME["binary_carriage"].run(reproducer)  # control: the real body runs clean
     planted = _boom(ValueError("cannot determine HL7 separators: planted"))
-    monkeypatch.setattr(fuzz_targets, "iter_obx_documents", planted)
-    with pytest.raises(ValueError, match="planted"):
-        TARGETS_BY_NAME["binary_carriage"].run(reproducer)
+    for name in ("iter_obx_documents", "extract_obx_document"):
+        with monkeypatch.context() as patch:
+            patch.setattr(fuzz_targets, name, planted)
+            with pytest.raises(ValueError, match="planted"):
+                TARGETS_BY_NAME["binary_carriage"].run(reproducer)
 
 
 def test_write_seed_corpus_materialises_every_seed(tmp_path: Path) -> None:

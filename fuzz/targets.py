@@ -252,13 +252,11 @@ class KnownFinding:
 #: The two binary-carriage findings the ``binary_carriage`` target produced under vault BACKLOG #2683
 #: were fixed under BACKLOG #2873, and their entries and the carve-out in :func:`_binary_carriage`
 #: came out with them. Both were a bare ``ValueError`` ('cannot determine HL7 separators') out of
-#: ``extract_obx_document``: one on an MSH-led body whose MSH-2 carries fewer than four encoding
-#: characters, which ``Peek.parse`` and ``Message.parse`` accept and the listener answers AA; the
-#: other on an FHS- or BHS-led body with no MSH, which only ``Message.parse`` accepts.
-#: ``extract_obx_document`` now refuses both as ``BinaryCarriageError``. BACKLOG #2874 names the
-#: second's reader half too; the parser disagreement it also names is not changed here. Both
-#: reproducers stay on as ``binary_carriage`` seeds, and ``tests/test_fuzz_targets.py`` drives them,
-#: so the fix cannot quietly regress.
+#: ``extract_obx_document``, on an MSH-led body whose MSH-2 carries fewer than four encoding
+#: characters and on an FHS- or BHS-led body with no MSH; it now refuses both as
+#: ``BinaryCarriageError``. What each body still meets at the listener is in ``fuzz/README.md``,
+#: *Known findings*. Both reproducers stay on as ``binary_carriage`` seeds, and
+#: ``tests/test_fuzz_targets.py`` drives them, so the fix cannot quietly regress.
 SHORT_MSH2_REPRODUCER = (
     b"MSH|^~|A|B|C|D|20260101||ORU^R01|X1|P|2.5\rOBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r"
 )
