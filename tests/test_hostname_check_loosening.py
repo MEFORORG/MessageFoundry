@@ -116,28 +116,37 @@ def test_mllp_destination_with_defaults_is_silent(caplog: pytest.LogCaptureFixtu
     assert _hostname_warnings(caplog) == []
 
 
-def test_an_explicit_none_takes_the_default_on_mllp_ftps_and_email() -> None:
+@pytest.mark.parametrize("unset", [None, ""], ids=["none", "empty-string"])
+def test_an_unset_value_takes_the_default_on_mllp_ftps_and_email(unset: str | None) -> None:
     """Vault BACKLOG #3230: ``bool(settings.get(key, True))`` read an explicit ``None`` as off, so a
     spec carrying ``tls_verify = None`` dropped verification. Each now takes the default, as absence
-    does. The FTPS spec carries a credential, so before the fix it was refused as a verify-off hop."""
+    does. The FTPS spec carries a credential, so before the fix it was refused as a verify-off hop.
+    ``bool("")`` is ``False`` too, so an empty string reads as unset the same way (vault BACKLOG
+    #3533 item 11), in the CA readers as well, and a default-off setting reads as it did."""
+    from messagefoundry.auth.trust_anchors import unread_ca_reason
     from messagefoundry.config.models import bool_setting
     from messagefoundry.transports.email import EmailDestination
     from messagefoundry.transports.mllp import _mllp_ssl_context
     from messagefoundry.transports.remotefile import _ftps_ssl_context
 
-    assert bool_setting({"k": None}, "k", default=True) is True
+    assert bool_setting({"k": unset}, "k", default=True) is True
     assert bool_setting({}, "k", default=True) is True
     assert bool_setting({"k": False}, "k", default=True) is False
-    assert bool_setting({"k": None}, "k", default=False) is False
+    assert bool_setting({"k": unset}, "k", default=False) is False
+    # Controls: only None and the empty string are unset; whitespace and 0 read with bool().
+    assert bool_setting({"k": " "}, "k", default=False) is True
+    assert bool_setting({"k": 0}, "k", default=True) is False
 
-    unset = {"tls_verify": None, "tls_check_hostname": None}
-    mllp = _mllp_ssl_context({"tls": True, **unset}, server=False, name="OB_X")
-    ftps = _ftps_ssl_context({"host": "h.example.invalid", "username": "svc", **unset})
+    blank = {"tls_verify": unset, "tls_check_hostname": unset}
+    mllp = _mllp_ssl_context({"tls": True, **blank}, server=False, name="OB_X")
+    ftps = _ftps_ssl_context({"host": "h.example.invalid", "username": "svc", **blank})
     for ctx in (mllp, ftps):
         assert ctx is not None
         assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname is True
-    email = EmailDestination(_email(use_tls=None, **unset))
+    email = EmailDestination(_email(use_tls=unset, **blank))
     assert (email.use_tls, email.tls_verify, email.tls_check_hostname) == (True, True, True)
+    assert unread_ca_reason({"tls": True, "tls_verify": unset}) is None
+    assert unread_ca_reason({"url": "https://h.example.invalid/x", "verify_tls": unset}) is None
 
 
 def test_an_explicit_none_is_read_alike_by_the_reports_and_the_ca_checks() -> None:

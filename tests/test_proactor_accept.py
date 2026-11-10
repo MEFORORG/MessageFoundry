@@ -43,6 +43,7 @@ from messagefoundry.proactor_accept import _guarded, _peer_dropped, guard_accept
 from messagefoundry.transports.base import SourceConnector
 from messagefoundry.transports.mllp import CR, EB, frame
 from messagefoundry.transports.receipt import receipt_handler
+from tests._log_absence import assert_capture_sees
 from tests.test_listener_admission import _ack_handler, _build, _Events, _until
 
 _ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -541,6 +542,7 @@ def test_the_guard_leaves_a_selector_loop_alone(caplog: pytest.LogCaptureFixture
 
     with caplog.at_level(logging.DEBUG, logger=proactor_accept.__name__):
         _on_fresh_loop(run, asyncio.SelectorEventLoop)
+        assert_capture_sees(caplog, proactor_accept.__name__, logging.DEBUG)
     assert [r for r in caplog.records if r.name == proactor_accept.__name__] == []
 
 

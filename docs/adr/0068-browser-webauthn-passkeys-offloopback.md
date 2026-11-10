@@ -666,11 +666,25 @@ reads that follow cannot drop it. A cancel before the row is written writes none
 then refused, and no refusal writes a second clone row. The reasons a gone passkey is refused
 with, audited `auth.webauthn_failed`, include at least `factor_removed`, `factor_unverified` when
 the passkey set read after the write fails its seal, `session_lost` when the session or the
-account went with it, and `locked` when a second-step lock landed. A database driver error, a lost
-connection or a pool acquire timeout in the passkey set read after the write, on any sign-count
-answer, is refused with `store_error` (BACKLOG #3775). At least a closed SQLite connection, the
-engine's other `RuntimeError` refusals and SQLite's `ProgrammingError` still raise there, and so
-does a store error in the session, account and lock re-read before it.
+account went with it, and `locked` when a second-step lock landed.
+
+What an exception in the passkey set read after the write does, on any sign-count answer, is decided
+by class (BACKLOG #3775; `AuthService._passkey_standing` in `messagefoundry/auth/service.py`).
+Everything `_passkey_held` awaits runs under one catch: at least the set read with the account
+re-load and seal-failure report it can make, and the account-row check made when the set does not
+hold the passkey. The catch first re-raises the classes in `AUDIT_WRITE_DEFECTS`
+(`messagefoundry/audit_write.py`), at least `NotImplementedError`, `RecursionError` and
+`sqlite3.ProgrammingError`. It then refuses with `store_error` every exception in
+`store_call_errors()` or `store_connect_errors()` (`messagefoundry/store/base.py`), logs the
+account and the exception's type, and audits the refusal unless the store refuses that row too. Those sets take at
+least every other `RuntimeError`, `OSError` and `ValueError`, SQLite's `DatabaseError`, asyncpg's
+roots and pyodbc's `Error` root where those drivers are installed, and `StoreAcquireTimeout`; the
+`RuntimeError` and `ValueError` halves are vault BACKLOG #4728 finding 3, and a closed SQLite
+connection raises `ValueError`. These classes do not tell a store fault from a bug, so a bug that
+raises one of them is refused as `store_error` too. Every other exception that reaches the catch
+raises out of the ceremony, `sqlite3.InterfaceError` among them: it is a `sqlite3.Error` but not a
+`DatabaseError`. The session, account and lock re-read, which since 2026-11-05 follows that set read
+rather than preceding it (BACKLOG #3068), is outside this catch, so an exception there raises.
 
 **Why a gone passkey still raises the signal.** A self-service passkey delete takes no account
 queue, and an MFA reset deletes every passkey before it revokes the sessions, so either can land
@@ -679,9 +693,15 @@ change exempted such a miss when it judged the passkey gone. Each review round f
 which that exemption alerted less than the engine had before it, so the exemption was withdrawn: a
 false clone row on a deleted passkey is preferred to a missing one. `gone` alone does not show a
 holder's delete: a passkey row removed outside the store's sealed write path, or with its account,
-answers `gone` too. Before discounting a `gone` row, read the same request's refusal: a
-`factor_unverified` refusal, with an `integrity.authority_seal_failed` row for the account's
-passkeys, means the row did not leave through the store.
+answers `gone` too. Before discounting a `gone` row, look for an `integrity.authority_seal_failed`
+row for the account's passkeys from the same request: on a sealed store it means the row did not
+leave through the store. The refusal alone does not tell this apart. A `factor_unverified` refusal
+also follows an account row that does not load, and a session, account or lock refusal is answered
+ahead of it, so it can read `session_lost` or `locked` instead. A keyless store keeps no seal, so
+there a row removed outside the store is refused `factor_removed` and nothing tells it from a
+holder's delete. (Corrected 2026-11-05, BACKLOG #3068 N1: this read "a `factor_unverified`
+refusal, with an `integrity.authority_seal_failed` row ... means the row did not leave through
+the store", which overclaimed the refusal.)
 
 A py_webauthn counter regression (the library's own rejection) is untouched: it is a clone signal
 whether or not the passkey is later deleted. AC-4 is unchanged. Section 4's text is left as

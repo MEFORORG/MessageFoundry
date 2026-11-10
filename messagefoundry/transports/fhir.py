@@ -269,6 +269,17 @@ def _allow_list(
     return frozenset(value)
 
 
+def takes_update(interaction: object, conditional: object) -> bool:
+    """Whether a connection's writes are updates by id, so ``update_url_form="path"`` applies.
+
+    Conditional first, as :class:`FhirDestination` dispatches: ``if-match`` is an update whatever the
+    interaction says. Pure. The ``FHIR()`` factory and ``path_form_fhir_updates`` call it too, so the
+    three apply one rule for which writes are updates (vault BACKLOG #2571). It is not every rule
+    the build applies: a conditional beside ``transaction`` or ``batch`` is refused separately."""
+    cond = str(conditional) if conditional else None
+    return cond == "if-match" or (cond is None and str(interaction) == "update")
+
+
 def entry_screen_settings(interaction: str, methods: object, types: object) -> _EntryScreen | None:
     """Check the Bundle entry allow-lists a connection declares, and return its screen, or ``None``
     for an interaction that sends no Bundle of the Handler's (vault BACKLOG #2804).
@@ -1021,20 +1032,20 @@ class FhirDestination(DestinationConnector):
         self.format: str = str(s.get("format", "json"))
         if self.format != "json":
             # JSON-only MVP; FHIR-XML is deferred to a hardened-lxml path (ADR 0022 Options #5).
+            # The received value is left out, as for interaction below (#1183).
             raise ValueError(
-                f"FHIR destination format={self.format!r} is not supported (JSON only; ADR 0022)"
+                f"FHIR destination format must be one of {('json',)} (JSON only; ADR 0022)"
             )
         self.interaction: str = str(s.get("interaction", "create"))
         if self.interaction not in _INTERACTIONS:
-            raise ValueError(
-                f"FHIR destination interaction must be one of {_INTERACTIONS}, got {self.interaction!r}"
-            )
+            # The received value is left out: an env() value reaches this check at build, and a
+            # wrongly bound key can hold a credential (#1183, as resolve_env_settings does).
+            raise ValueError(f"FHIR destination interaction must be one of {_INTERACTIONS}")
         conditional = s.get("conditional")
         self.conditional: str | None = str(conditional) if conditional else None
         if self.conditional is not None and self.conditional not in _CONDITIONALS:
             raise ValueError(
-                f"FHIR destination conditional must be one of {_CONDITIONALS} or unset, "
-                f"got {self.conditional!r}"
+                f"FHIR destination conditional must be one of {_CONDITIONALS} or unset"
             )
         # Screened HERE rather than on the send path: it reaches an unencoded URL interpolation AND
         # the If-None-Exist HEADER value, and the header sink has none of the URL limb's incidental
@@ -1066,17 +1077,11 @@ class FhirDestination(DestinationConnector):
         self._entry_screen = entry_screen_settings(
             self.interaction, s.get("allowed_entry_methods"), s.get("allowed_entry_types")
         )
-        # Whether this connection's writes are updates by id. Conditional first, as _resolve_request
-        # dispatches: if-match is an update whatever the interaction says.
-        self._is_update = self.conditional == "if-match" or (
-            self.conditional is None and self.interaction == "update"
-        )
+        # Whether this connection's writes are updates by id, as _resolve_request dispatches.
+        self._is_update = takes_update(self.interaction, self.conditional)
         self.update_url_form: str = str(s.get("update_url_form") or "transaction")
         if self.update_url_form not in _UPDATE_URL_FORMS:
-            raise ValueError(
-                f"FHIR destination update_url_form must be one of {_UPDATE_URL_FORMS}, "
-                f"got {self.update_url_form!r}"
-            )
+            raise ValueError(f"FHIR destination update_url_form must be one of {_UPDATE_URL_FORMS}")
         self._path_form = self.update_url_form == "path"
         if self._path_form and not self._is_update:
             # Nothing else carries an id in the URL, so the setting would do nothing. Refused

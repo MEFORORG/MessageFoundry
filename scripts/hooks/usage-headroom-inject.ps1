@@ -120,8 +120,8 @@
       _cli_pool_selfcheck or CACHE_VERSION must be carried here by hand.
 
       No grade. The Steward's `state` field is a severity label, not a stop order (korus
-      roles/STEWARD.md 3b), and usage.ps1's thresholds were set for statusLine readings. The
-      fallback prints the numbers with their age and leaves grading to the reader.
+      roles/COMMON.md, The three usage states), and usage.ps1's thresholds were set for statusLine
+      readings. The fallback prints the numbers with their age and leaves grading to the reader.
 
     The file lives outside git and the Steward owns it. A schema version this hook does not know is
     UNKNOWN rather than a guess.
@@ -401,7 +401,7 @@ function Get-StewardFallback {
     # WHERE THE STEWARD WRITES, resolved the way watch.py resolves DIR: MEFOR_USAGE_DIR, else the config
     # root's mefor-usage; and when that directory holds no usage-now.py, the directory beside watch.py,
     # but only if THAT one holds it. The settings files invoke watch.py by absolute path under
-    # ~/.claude/mefor-usage (korus roles/STEWARD.md 3c), so that is "beside watch.py" here.
+    # ~/.claude/mefor-usage (korus roles/retired/STEWARD.md 3c), so that is "beside watch.py" here.
     $cfg = $env:CLAUDE_CONFIG_DIR
     $statusPath = $StewardStatusFile
     if (-not $statusPath) {

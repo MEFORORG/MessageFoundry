@@ -33,6 +33,7 @@ from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stag
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.mllp import MLLPDestination
 from tests._claim_lock_helpers import claim_past_empty_yield
+from tests._mllp_recorder import MllpRecorder, run_one_batch
 
 DEST = "OB_ADT"
 
@@ -508,19 +509,6 @@ async def test_max_count_caps_the_batch(store: Any) -> None:
 # --- ADR 0205 rule 1: a member the frame cannot carry is dead-lettered alone ----------------------
 
 
-class _MllpRecorder(MLLPDestination):
-    """A real MLLP destination, so ``check_frame`` is the real one, whose send only records."""
-
-    def __init__(self, **field: Any) -> None:
-        settings: dict[str, object] = {"host": "127.0.0.1", "port": 1}
-        config = Destination(name=DEST, type=ConnectorType.MLLP, settings=settings, **field)
-        super().__init__(config)
-        self.sent: list[str] = []
-
-    async def send(self, payload: str, *, metadata: Any = None) -> None:
-        self.sent.append(payload)
-
-
 async def _enqueue_bodies(store: Any, bodies: Sequence[str]) -> list[str]:
     return [
         await store.enqueue_message(
@@ -531,13 +519,12 @@ async def _enqueue_bodies(store: Any, bodies: Sequence[str]) -> list[str]:
 
 
 async def _run_one_batch(store: Any, *, simulate: bool, dest: Any = None, **field: Any) -> Any:
+    # The shared drive closes the destination, this one or the caller's, once the batch ends.
     runner = _runner(store)
-    rec = _MllpRecorder(**field) if dest is None else dest
+    rec = MllpRecorder(DEST, **field) if dest is None else dest
     _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
     runner._simulate[DEST] = simulate
-    head = await store.claim_next_fifo(DEST)
-    assert head is not None
-    await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    await run_one_batch(runner, DEST)
     return rec
 
 
@@ -575,8 +562,10 @@ async def test_a_store_fault_dead_lettering_a_refused_member_spares_the_rest(
         raise RuntimeError("database is locked")
 
     monkeypatch.setattr(store, "dead_letter_now", locked)
+    rec = MllpRecorder(DEST)
     with pytest.raises(RuntimeError, match="locked"):
-        await _run_one_batch(store, simulate=False)
+        await _run_one_batch(store, simulate=False, dest=rec)
+    assert rec._closed  # BACKLOG #4973: closed on the raise path too
     assert await _states(store, mids) == [DELIVERED, QUEUED, DELIVERED]
 
 
@@ -591,9 +580,7 @@ async def test_a_retryable_member_refusal_re_pends_the_whole_batch(store: Any) -
     runner = _runner(store)
     rec = _Transient()
     _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
-    head = await store.claim_next_fifo(DEST)
-    assert head is not None
-    await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    await run_one_batch(runner, DEST)
     assert rec.sent == []
     assert await _states(store, mids) == [QUEUED, QUEUED]
 
@@ -603,6 +590,7 @@ async def test_a_batch_whose_every_member_holds_a_frame_byte_sends_nothing(store
     mids = await _enqueue_bodies(store, bodies)
     rec = await _run_one_batch(store, simulate=False)
     assert rec.sent == []
+    assert rec._closed  # BACKLOG #4973: the drive closes the destination it was handed
     assert await _states(store, mids) == [DEAD_LETTERED, DEAD_LETTERED]
 
 
@@ -664,8 +652,7 @@ async def test_the_batch_envelope_still_goes_out_through_the_real_send(
     )
     monkeypatch.setattr(dest, "_send_once", record)
     mids = await _enqueue(store, 3)
-    async with contextlib.aclosing(dest):
-        await _run_one_batch(store, simulate=False, dest=dest)
+    await _run_one_batch(store, simulate=False, dest=dest)
     (wire,) = sent
     (frame,) = list(MLLP_CODEC.decoder().feed(wire))
     envelope = frame.decode("utf-8")
