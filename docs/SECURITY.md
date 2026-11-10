@@ -1262,12 +1262,13 @@ another engine process on the same store may still be running on an over-granted
 To check, at least:
 
 - Read the clean start's own log. `alert-instance resolve for ... closed nothing` (INFO or
-  WARNING) means the fence kept it open; an ERROR starting `alert-instance resolve gave up` or
+  WARNING) means the resolve did not close it; an ERROR starting `alert-instance resolve gave up` or
   `alert-instance resolve was cancelled before it landed` means the resolve did not land.
 - Check that the clean start's process has an `[alerts]` notifier.
 - Read each node's own log, where cluster nodes run on separate hosts: a start's finding is a
   WARNING starting `vault privilege preflight: <hop> <state>`. Engine shards share one log, and
-  neither that line nor the audit row's detail names the process that wrote it.
+  neither that line nor the audit row's detail names the process that wrote it, so for them check
+  the Vault token each engine process is configured with.
 - The check runs only at start, so a token fixed since a process started is judged only at that
   process's next start. Restart it after you fix the token, or, for an unread one, whatever kept
   its grants from being read, which may be reachability or the probe paths rather than the token.

@@ -162,9 +162,10 @@ it the notifier, or the logging sink when no notifier is configured.
   characters escaped. Nothing about the token is in it.
 - **A clean read can resolve it.** A hop read clean raises `vault_privilege_clean`, which pages
   nobody and can resolve the open warning for the same subject through the ADR 0044 auto-resolve
-  map, under the conditions
-  [SECURITY.md](../SECURITY.md#each-backend-hops-least-privilege-the-engine-probes-the-store-vault-and-ldap)
-  states once, under *When a clean start resolves the warning*.
+  map, fenced as the
+  [ADR 0044 vault BACKLOG #4916 amendment](0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916)
+  states; [SECURITY.md](../SECURITY.md#each-backend-hops-least-privilege-the-engine-probes-the-store-vault-and-ldap),
+  *When a clean start resolves the warning*, says when it does not.
 - **The subject is the hop**, `vault:store` or `vault:secrets`. Keying it by the token's policies
   was rejected: the usual fix is a new token with other policies, and its clean start would never
   resolve the old warning. The cost, stated rather than fixed: engine processes that share one

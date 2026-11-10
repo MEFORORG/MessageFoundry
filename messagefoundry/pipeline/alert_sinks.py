@@ -294,7 +294,7 @@ _AUTO_RESOLVE: dict[str, str] = {
     # #305: a start that OBSERVED a clean store principal resolves the open over-grant warning.
     "store_privilege_clean": "store_privilege_warning",
     # #2903 (ADR 0216): a start that read a Vault token and found it clean can resolve the open
-    # warning for the same hop, under the conditions docs/SECURITY.md states once.
+    # warning for the same hop, fenced as the ADR 0044 BACKLOG #4916 amendment states.
     "vault_privilege_clean": "vault_privilege_warning",
     # #290: a bound that cleared its resume line resolves the open intake pause for the same bound.
     "intake_resumed": "intake_paused",

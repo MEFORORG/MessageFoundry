@@ -362,9 +362,9 @@ of its own monotonic clock. That rule reads only whether a reminder landed, by d
 still paused whose reminders stop reaching the store (cut off, failing writes, or a check that keeps
 raising) has its alert resolved while its intake stays paused, a false clear accepted as the cost of
 a time-to-live. Such a process, still live, keeps its in-memory suspend and occurrence state for
-the resolved instance (vault BACKLOG #8190). It keeps the escalation tier it had reached, which
-over-alerts. It also keeps an operator-set suspend, which mutes that process's notifications
-until the suspend's own window ends, while the new instance shows no suspend. A failed sweep read counts none of the time from the
+the resolved instance (vault BACKLOG #8190). It keeps the escalation tier it had reached. It also
+keeps a suspend it holds in memory, which mutes that process's notifications until the suspend's
+own window ends, while the new instance shows no suspend. A failed sweep read counts none of the time from the
 last good read to the next, and holds what was counted to `STALE_SECONDS` minus
 `GAP_GRACE_SECONDS`, so a live process whose reminder an outage ate has time to land its next one;
 the graces do not stack. The resolve is bounded by the `(id, count)` it read
@@ -387,8 +387,8 @@ column on all three backends holding a random id each notifier draws once per pr
 here.** The fence's snapshot is the key's live `(id, count)`, from `open_alert_generations`. Its
 read is started (`_ResolveFence.begin`, which schedules it with `asyncio.ensure_future`) at the
 resolve task's first step: in emit order, and before the task waits on the key's lock. The read
-itself runs when the event loop and the store reach it, which can be after the task has queued on
-the lock, and on a server store only once a pool connection is borrowed. That lock is the
+itself runs when the event loop and the store reach it: after the task has queued on the lock,
+and after any wait for a store read connection. That lock is the
 notifier's own in-process lock per key (`_state_locks`): it orders this process's writes for the
 key, never another process's raises. Under the lock, `resolve_alert_instances_fenced` closes the
 instance only when its newest raise is the resolver's own, or it is the instance the snapshot saw
@@ -396,8 +396,8 @@ and has taken no raise past that count. The first case keeps defect 8: a raise e
 clear is closed by it, even when it lands after the snapshot read. A raise from another process
 that lands after the snapshot read ran, and is still the newest, keeps the instance open; that
 process's own clear closes it later. One that landed before the read ran, even after the clear was
-emitted, is closed when the UPDATE lands, as before the fence, unless a later raise from
-another process moved the count past the snapshot.
+emitted, is closed when the UPDATE lands, as before the fence, unless the newest raise is
+another process's and moved the count past the snapshot.
 So when two processes raise and clear one key at once, the one whose raise landed last clears it.
 If that process dies or never clears, the instance stays open for an operator (or, for another
 process's `intake_paused`, for the sweep above): a false open, where the unfenced resolve gave a
@@ -405,7 +405,7 @@ false clear.
 
 No clock is compared: the `last_seen <= now` guard the PR for #3756 declined (decision
 d20261030T211551515-1de84e) would leave an alert open for good under cross-node clock skew. Every
-auto-resolve settles through a callback, so every fenced resolve that closes nothing reads the key
+fenced resolve settles through a callback, so every fenced resolve that closes nothing reads the key
 a second time (the verdict). A live instance in that read means the resolve was superseded: it is
 settled as not landed, and it is not retried. The verdict read is a second statement, so a raise
 landing between the UPDATE and it can mark a clear that had nothing to close as superseded. What the clear dropped from memory as it was emitted goes back: the
@@ -413,9 +413,9 @@ key's suspend window and occurrence count for every inverse, and `connection_sta
 too, so a later raise of the still-open row stays muted and keeps its escalation tier. A fault in
 the re-read that tells superseded apart is treated as superseded, with no retry. A store without
 the fence methods resolves unfenced, as before. Every retry of the UPDATE reuses the snapshot.
-Only a snapshot read that failed is read again: that attempt fails, and the next attempt starts a
-new read, under the key's lock, so a clear still closes a raise an earlier run of the same process
+Only a snapshot read that failed is read again: that attempt fails and starts a new read, under
+the key's lock, for the next attempt to use, so a clear still closes a raise an earlier run of the same process
 left once a read succeeds. A resolve can still fail to land: every attempt can fail, which logs
 an ERROR starting `alert-instance resolve gave up`, or the task can be cancelled, for example by
 the shutdown drain while it waits out a retry, which logs an ERROR starting `alert-instance
-resolve was cancelled before it landed`. The instance then stays open.
+resolve was cancelled before it landed`.
