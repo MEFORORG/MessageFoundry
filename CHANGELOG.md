@@ -26,8 +26,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   before it serialises the record, and the handler filters still run over the whole line after.
   A field holding a C0 control is also tried with each control as a space and as nothing, and
   in `detail` an escape its writer's own `json.dumps` left counts as a control. A try is kept only
-  when it shows no word the plain scrub hides. A serialised `detail` is scrubbed string by
-  string, so one the plain scrub leaves parsing still parses. A field whose scrub fails ships as
+  when it shows no word and no other character more often than the plain scrub does, and, for a
+  serialised `detail` the plain scrub leaves parsing, only when it still parses. The tries are
+  bounded by the value's length, and a value they cannot all cover is logged once. A field whose scrub fails ships as
   a fixed marker, the fault is logged once by its type, and the record still ships. The C0
   residual 0.5.2 named for the tee is narrowed, not closed: `scrub_log_field` names at least four
   cases left, and the `emit_audit_tee` docstring names the tee's other two residuals.

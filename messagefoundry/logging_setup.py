@@ -73,6 +73,7 @@ from messagefoundry.logging_guard import (
 from messagefoundry.redaction import (
     _REDACTED,
     ExcInfo,
+    clamp_untrusted,
     prepare_log_record,
     redact,
     redact_untrusted,
@@ -457,71 +458,121 @@ def scrub_log_field(text: str, *, json_escapes: bool = False) -> str:
     after this. The control-character scrub is left to the handler, which runs it last on every
     sink.
 
-    **A C0 control in the value can only ADD redaction, at the level of words.** A raw control
-    such as U+0001 is not whitespace, so a pattern that needs a space between a label and its
-    value, or between the parts of a name, misses ``MRN\\x0112345678`` or ``SMITH,\\x01JOHN``, and
-    one inside a token splits it, as in ``05\\x01/05/1980``. So when the value or the plain result
-    holds one, each control is tried, from the left, as a space and as nothing, and the passes run
-    again with that one control changed. The try that shows fewest letters and digits outside
-    redaction markers is kept if it shows fewer than before, and the next control is tried on it.
-    Then every control left is tried at once. A tab, LF or CR is whitespace already and is not
-    tried. Two controls in one value can each take a different reading.
+    **A C0 control in the value is tried as whitespace and as nothing.** A raw control such as
+    U+0001 is not whitespace, so a pattern that needs a space between a label and its value, or
+    between the parts of a name, misses ``MRN\\x0112345678`` or ``SMITH,\\x01JOHN``, and one inside
+    a token splits it, as in ``05\\x01/05/1980``. So when the value or the plain result holds one,
+    each control is tried, from the left, as a space and as nothing, and the passes run again with
+    that one control changed. The try that shows fewest letters and digits outside redaction
+    markers is kept if it shows fewer than before, and the next control is tried on it. Then
+    every control left is tried at once. A tab, LF or CR is whitespace already and is not tried.
+    Two controls in one value can each take a different reading.
 
-    The tries run twice over. Once over the plain result, where no try can show what the passes
-    hid, since they made it only from what they kept. And once over the raw value, where a
-    control the passes swallowed into a redaction is still there to try; a raw try is kept only
-    when every word it shows, the plain result shows as often, counting two words it shows on
-    either side of a control as one word too. So a reading of the raw value that would show the
-    ``ter2`` the plain passes hid in ``password=hun\\x01ter2`` is refused. The run that shows less
-    wins. A control a kept try changed is gone from the value; the rest stay.
+    The tries run twice over, and the run that shows less wins. Once over the plain result,
+    where no try can show what the passes hid, since they made it only from what they kept. And
+    once over the raw value, where a control the passes swallowed into a redaction is still there
+    to try. A raw try can show what the plain passes hid: reading the control in
+    ``password=hun\\x01ter2`` as a space shows ``ter2``. So a raw try is kept only when every word
+    and every other character it shows, the plain result shows at least as often, counting two
+    words it shows on either side of a control as one word too. A control a kept try changed is
+    gone from the value; the rest stay.
 
-    ``json_escapes`` is for a value its writer already ran through ``json.dumps``, as the audit
-    ``detail`` writers do: a control then arrives as the text ``\\u0001`` or ``\\t``, which no
-    pattern reads as a control. Where the plain result parses as JSON, each string in it holding
-    a control, keys included, is decoded, scrubbed as a raw value as above, and encoded again, and
-    every other token is kept as written, so the result parses too. A string's raw form comes
-    from the raw value where that parses to the same shape. Where the plain result does not
-    parse, each such escape is tried as above, and an escaped tab, LF or CR is tried as a space.
-    Off for a raw field such as an actor, where ``CORP\\bJONES`` is a name with a backslash in
-    it, not a control.
+    ``json_escapes`` is for a value its writer may have run through ``json.dumps`` first, as the
+    audit ``detail`` writers do. Where the value parses as JSON, a control in it arrives as the
+    text ``\\u0001`` or ``\\t``, which no pattern reads as a control, so that text is what is
+    tried, and an escaped tab, LF or CR is tried as a space. Where the plain result parses, a try
+    is kept only if it parses too. The passes themselves can break a text, as they do a
+    ``"password": "..."`` member or a number after an ``"MRN "`` key, and a try that only hides
+    more that way is refused, so what it would have hidden shows, as it does with no control in
+    the value; ``emit_audit_tee`` states that residual. A value that does not parse is read as raw text, as
+    every field without ``json_escapes`` is, so a backslash in it, as in ``CORP\\bJONES``, is a
+    backslash and not a control.
 
-    At least four residuals remain. The tries are bounded by :data:`_TRY_BUDGET`, so a value
-    with many controls can leave its later ones untried. A try is kept one control at a time,
-    so a text that shows less only once two controls are changed together, and not after either
-    alone, is redacted only if the try of every control at once finds it. A raw try that would
-    hide one word by showing another the plain passes hid is refused, so that word shows. And
-    only U+0000 to U+001F are tried, so DEL and a format character such as U+200B still hide the
-    text beside them.
+    Each run of tries is bounded by :func:`_try_budget`, since they run on the caller's thread, which
+    for the engine is the event loop. At least four residuals remain. A value with more
+    controls than the budget covers leaves its later ones untried, which is logged once per
+    process. A text that shows less only once two controls are changed together, and not after
+    either alone, is redacted only if the try of every control at once finds it. A raw try that
+    would hide one word only by showing another the plain passes hid is refused, so that word
+    shows. And only U+0000 to U+001F are tried, so DEL and a format character such as U+200B
+    still hide the text beside them.
 
     ``tests/test_audit_offbox_tee.py`` holds the three passes to the handler chain's, at least on
     the inputs it names, and the chain's filter count to four."""
     scrubbed = _scrub_text_passes(text)
-    reading = _C0_ESCAPE_READING if json_escapes else _C0_RAW_READING
+    as_json = json_escapes and _parses(text)
+    reading = _C0_ESCAPE_READING if as_json else _C0_RAW_READING
     if not any(_tried(m.group()) for value in (text, scrubbed) for m in reading.finditer(value)):
         return scrubbed
-    budget = [_TRY_BUDGET]
-    if json_escapes:
-        rewritten = _scrub_json_strings(text, scrubbed, budget)
-        if rewritten is not None:
-            return rewritten
-    return _scrub_with_controls(text, scrubbed, reading, budget)
+    shown = _shown(scrubbed, reading)
+    keep_json = as_json and _parses(scrubbed)
+
+    def plain_allows(candidate: str) -> bool:
+        return not keep_json or _parses(candidate)
+
+    def raw_allows(candidate: str) -> bool:
+        return plain_allows(candidate) and not _shown(candidate, reading) - shown
+
+    # Bounded as the plain passes bound it, since they read no further either.
+    raw = clamp_untrusted(text)
+    budgets = [_try_budget(scrubbed)], [_try_budget(scrubbed)]
+    try:
+        best = _try_controls(scrubbed, scrubbed, _rescrub, plain_allows, reading, budgets[0])
+        if raw != scrubbed:
+            from_raw = _try_controls(raw, scrubbed, _rescrub, raw_allows, reading, budgets[1])
+            if _visible(from_raw, reading) < _visible(best, reading):
+                best = from_raw
+    finally:
+        if any(budget[0] < 0 for budget in budgets):
+            _note_budget_spent()
+    return best
 
 
-#: How many characters one value's tries may run the passes over, all told. They run on the
-#: caller's thread, which for the engine is the event loop. A try over a short text is charged
-#: :data:`_TRY_FLOOR` characters, so a document of many short strings is bounded too.
-_TRY_BUDGET = 1 << 19
-_TRY_FLOOR = 256
+#: What :func:`_try_budget` allows a value's tries, in characters of text run through the
+#: passes or scanned for controls: this many for each character of the plain result, plus
+#: :data:`_TRY_BASE`, and never more than :data:`_TRY_CAP`. A try over a short text is charged
+#: :data:`_TRY_FLOOR` characters, for the work that does not scale with its length.
+_TRY_PER_CHAR = 24
+_TRY_BASE = 4096
+_TRY_CAP = 1 << 18
+_TRY_FLOOR = 64
 #: A C0 control (:data:`~messagefoundry.controlchars.JSON_ESCAPED_CONTROLS`), raw.
 _C0_RAW_READING = re.compile("[" + re.escape(JSON_ESCAPED_CONTROLS) + "]")
 #: The same, or the JSON escape ``json.dumps`` writes for one. Every other JSON escape matches
 #: too, so it is consumed whole and the ``\\t`` in ``\\\\temp`` is not read as a tab.
-_C0_ESCAPE_READING = re.compile(
-    r"\\u[0-9a-fA-F]{4}|\\.|[" + re.escape(JSON_ESCAPED_CONTROLS) + "]", re.DOTALL
-)
+_C0_ESCAPE_READING = re.compile(r"\\u[0-9a-fA-F]{4}|\\.|[" + re.escape(JSON_ESCAPED_CONTROLS) + "]")
 _JSON_SHORT_ESCAPES = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
 #: The markers the three text passes write in place of what they hide.
 _REDACTION_MARKERS = re.compile(re.escape(_REDACTED) + "|" + re.escape(CREDENTIAL_PLACEHOLDER))
+_WORD = re.compile(r"[^\W_]+")
+#: Whether this process has logged a value whose tries ran out; see :func:`_note_budget_spent`.
+_BUDGET_SPENT_LOGGED = False
+
+
+def _try_budget(scrubbed: str) -> int:
+    """How much the tries for a value whose plain result is ``scrubbed`` may cost. It scales
+    with the value, so a short value a client chose, such as a typed sign-in name, cannot buy
+    many runs of the passes over its few characters."""
+    return min(_TRY_PER_CHAR * len(scrubbed) + _TRY_BASE, _TRY_CAP)
+
+
+def _note_budget_spent() -> None:
+    """Log, once per process and without the value, that a value's tries ran out."""
+    global _BUDGET_SPENT_LOGGED
+    if not _BUDGET_SPENT_LOGGED:
+        _BUDGET_SPENT_LOGGED = True
+        _log.warning(
+            "a log field held more C0 controls than its scrub could try, so its later ones went "
+            "untried; further such fields in this process are not logged"
+        )
+
+
+def _parses(text: str) -> bool:
+    try:
+        json.loads(text)
+    except (ValueError, RecursionError):
+        return False
+    return True
 
 
 def _c0_char(found: str) -> str | None:
@@ -547,30 +598,29 @@ def _readings(found: str) -> tuple[str, ...]:
     return (" ",) if _c0_char(found) in ("\t", "\n", "\r") else (" ", "")
 
 
+def _without_controls(text: str, reading: re.Pattern[str], replacement: str) -> str:
+    """``text`` with each C0 control or escape of one as ``replacement``, outside markers."""
+    bare = reading.sub(
+        lambda m: replacement if _c0_char(m.group()) is not None else m.group(), text
+    )
+    return _REDACTION_MARKERS.sub(" ", bare)
+
+
 def _visible(text: str, reading: re.Pattern[str]) -> int:
-    """How many letters and digits ``text`` keeps outside redaction markers and C0 escapes, so a
+    """How many letters and digits ``text`` shows outside redaction markers and C0 escapes, so a
     try that only removed an escape's text does not count as redacting more."""
-    bare = reading.sub(lambda m: "" if _c0_char(m.group()) is not None else m.group(), text)
-    return sum(ch.isalnum() for ch in _REDACTION_MARKERS.sub("", bare))
+    return sum(ch.isalnum() for ch in _without_controls(text, reading, ""))
 
 
-def _spend(budget: list[int], text: str) -> bool:
-    """Charge one try over ``text`` to ``budget``, or say there is not enough left for it."""
-    cost = max(len(text), _TRY_FLOOR)
-    if budget[0] < cost:
-        return False
-    budget[0] -= cost
-    return True
-
-
-def _words(text: str, reading: re.Pattern[str]) -> collections.Counter[str]:
-    """The runs of letters and digits ``text`` shows outside redaction markers, with a C0 control
-    or its escape counted as a break, and how many times each shows."""
-    bare = reading.sub(lambda m: " " if _c0_char(m.group()) is not None else m.group(), text)
-    return collections.Counter(_WORD.findall(_REDACTION_MARKERS.sub(" ", bare)))
-
-
-_WORD = re.compile(r"[^\W_]+")
+def _shown(text: str, reading: re.Pattern[str]) -> collections.Counter[str]:
+    """What ``text`` shows outside redaction markers, as a count of each word, a control or its
+    escape counted as a break, of each word it shows with its controls removed, and of each
+    other character but whitespace. A word and a single other character cannot collide."""
+    broken = _without_controls(text, reading, " ")
+    joined = _without_controls(text, reading, "")
+    words = collections.Counter(_WORD.findall(broken)) | collections.Counter(_WORD.findall(joined))
+    others = collections.Counter(ch for ch in broken if not ch.isalnum() and not ch.isspace())
+    return words + others
 
 
 def _read_all(text: str, reading: re.Pattern[str], replacement: str) -> str:
@@ -584,71 +634,62 @@ def _read_all(text: str, reading: re.Pattern[str], replacement: str) -> str:
     return reading.sub(read, text)
 
 
-def _scrub_with_controls(
-    raw: str, scrubbed: str, reading: re.Pattern[str], budget: list[int]
-) -> str:
-    """``scrubbed``, the passes' result for ``raw``, with its controls read as
-    :func:`scrub_log_field` describes. The controls are tried twice over: in ``scrubbed``, where
-    no try can show what the passes hid, and in ``raw``, where a control the passes swallowed is
-    still there to try. Whichever shows less wins."""
-    # The words the plain result shows, also with its controls removed, since joining two words
-    # it shows across a control, as pass\x01word into password, shows nothing new.
-    shown = _words(scrubbed, reading) | _words(_read_all(scrubbed, reading, ""), reading)
-
-    def hides_no_more(candidate: str) -> bool:
-        # A reading of the raw value can show a word the plain passes hid: reading the control in
-        # password=hun\x01ter2 as a space shows ter2. So a raw try is kept only when every word
-        # it shows, the plain result shows as often.
-        return not _words(candidate, reading) - shown
-
-    from_scrubbed = _try_controls(scrubbed, scrubbed, _rescrub, None, reading, budget)
-    from_raw = _try_controls(raw, scrubbed, _scrub_text_passes, hides_no_more, reading, budget)
-    if _visible(from_raw, reading) < _visible(from_scrubbed, reading):
-        return from_raw
-    return from_scrubbed
-
-
 class _Spent(Exception):
-    """A try's budget ran out, so :func:`_try_controls` stops trying."""
+    """A value's try budget ran out, so :func:`_try_controls` stops trying."""
+
+
+def _spend(budget: list[int], text: str) -> None:
+    """Charge work over ``text`` to ``budget``, or raise :class:`_Spent`, leaving it negative so
+    the caller can tell, when there is not enough left for it."""
+    cost = max(len(text), _TRY_FLOOR)
+    if budget[0] < cost:
+        budget[0] = -1
+        raise _Spent
+    budget[0] -= cost
 
 
 def _try_controls(
     source: str,
     result: str,
     passes: Callable[[str], str],
-    guard: Callable[[str], bool] | None,
+    allows: Callable[[str], bool] | None,
     reading: re.Pattern[str],
     budget: list[int],
 ) -> str:
     """The best of ``result`` and each try at ``source``'s controls, run through ``passes``:
     each control one at a time and from the left, then every control left at once, as a space
-    and then as nothing. A try is kept when it shows fewer letters and digits and ``guard``, if
-    given, allows it, and the next try starts from it. Each try is charged to ``budget``, and the
-    tries stop when it runs out."""
+    and then as nothing. A try is kept when it shows fewer letters and digits and ``allows``,
+    if given, allows it, and the next try starts from it. Each try, and each scan for the next control, is
+    charged to ``budget``; when it runs out, the best so far is returned."""
     left = _visible(result, reading)
 
     def attempt(*reads: str) -> bool:
         """Try each of ``reads`` and keep the one that shows least, if it beats ``result``."""
         nonlocal source, result, left
         best: tuple[int, str, str] | None = None
-        for read in reads:
-            if read == source:
-                continue
-            if not _spend(budget, read):
-                raise _Spent
-            candidate = passes(read)
-            count = _visible(candidate, reading)
-            better = count < left and (best is None or count < best[0])
-            if better and (guard is None or guard(candidate)):
-                best = (count, read, candidate)
-        if best is None:
-            return False
-        left, source, result = best
-        return True
+        try:
+            for read in reads:
+                if read == source:
+                    continue
+                _spend(budget, read)
+                candidate = passes(read)
+                count = _visible(candidate, reading)
+                if (
+                    count < left
+                    and (best is None or count < best[0])
+                    and (allows is None or allows(candidate))
+                ):
+                    best = (count, read, candidate)
+        finally:
+            # Kept even when the budget ran out partway, so a try already paid for counts.
+            if best is not None:
+                left, source, result = best
+        return best is not None
 
     try:
         kept = 0
         while True:
+            _spend(budget, source)
             controls = [match for match in reading.finditer(source) if _tried(match.group())]
             if kept >= len(controls):
                 break
@@ -669,111 +710,14 @@ def _try_controls(
 def _rescrub(text: str) -> str:
     """The text passes over a result of theirs that a try changed. Without the input clamp: the
     result was bounded once already, and clamping it again would cut its bound note."""
-    return scrub_credentials(_scrub_credential_query(redact(text)))
+    return _scrub_text_passes(text, clamp=False)
 
 
-class _JsonObject(list[tuple[str, Any]]):
-    """A parsed JSON object as its key and value pairs, in order, duplicates kept."""
-
-
-class _JsonLiteral(str):
-    """A JSON number or constant, kept as written."""
-
-    __slots__ = ()
-
-
-def _scrub_json_strings(raw: str, document: str, budget: list[int]) -> str | None:
-    """``document``, the passes' result for ``raw``, with each string in it, keys included,
-    scrubbed as a raw value, or None when it does not parse as JSON. Where ``raw`` parses to the
-    same shape, each string's raw reading comes from its counterpart there. Only a string that
-    changes is encoded again; every other token keeps its text, so the result is ``document``
-    when nothing changes."""
-    try:
-        parsed = _parse_json(document)
-    except (ValueError, RecursionError):
-        return None
-    try:
-        original = _parse_json(raw)
-    except (ValueError, RecursionError):
-        original = None
-    changed = [False]
-    try:
-        encoded = _encode_scrubbed(parsed, original, budget, changed)
-    except RecursionError:
-        return None
-    return encoded if changed[0] else document
-
-
-def _parse_json(text: str) -> Any:
-    return json.loads(
-        text,
-        object_pairs_hook=_JsonObject,
-        parse_int=_JsonLiteral,
-        parse_float=_JsonLiteral,
-        parse_constant=_JsonLiteral,
-    )
-
-
-def _encode_scrubbed(node: Any, original: Any, budget: list[int], changed: list[bool]) -> str:
-    """``node`` encoded with its strings scrubbed. ``original`` is the same place in the raw
-    document, or None where the two differ in shape."""
-
-    def encode(child: Any, counterpart: Any) -> str:
-        return _encode_scrubbed(child, counterpart, budget, changed)
-
-    if isinstance(node, _JsonObject):
-        pairs = (
-            original
-            if isinstance(original, _JsonObject) and len(original) == len(node)
-            else [(None, None)] * len(node)
-        )
-        members = (
-            f"{encode(key, raw_key)}: {encode(value, raw_value)}"
-            for (key, value), (raw_key, raw_value) in zip(node, pairs, strict=True)
-        )
-        return "{" + ", ".join(members) + "}"
-    if isinstance(node, list):
-        items = (
-            original
-            if isinstance(original, list)
-            and not isinstance(original, _JsonObject)
-            and len(original) == len(node)
-            else [None] * len(node)
-        )
-        return (
-            "[" + ", ".join(encode(item, raw) for item, raw in zip(node, items, strict=True)) + "]"
-        )
-    if isinstance(node, _JsonLiteral):
-        return str(node)
-    if isinstance(node, str):
-        raw_text = (
-            original
-            if isinstance(original, str) and not isinstance(original, _JsonLiteral)
-            else node
-        )
-        scrubbed = _scrub_raw_string(raw_text, node, budget)
-        changed[0] = changed[0] or scrubbed != node
-        return json.dumps(scrubbed, ensure_ascii=False)
-    return json.dumps(node)  # true, false and null
-
-
-def _scrub_raw_string(raw: str, text: str, budget: list[int]) -> str:
-    """``text``, one decoded string of the passes' result, scrubbed as a raw value whose own raw
-    form is ``raw``, its tries drawn from the document's. A string with no C0 control in either
-    form decodes to what the plain passes already read, so it is kept."""
-    if not (_C0_RAW_READING.search(text) or _C0_RAW_READING.search(raw)):
-        return text
-    if not _spend(budget, text):
-        return text
-    scrubbed = _rescrub(text)
-    if not any(_tried(m.group()) for m in _C0_RAW_READING.finditer(f"{raw}{scrubbed}")):
-        return scrubbed
-    return _scrub_with_controls(raw, scrubbed, _C0_RAW_READING, budget)
-
-
-def _scrub_text_passes(text: str) -> str:
-    """The handler chain's text passes, in :func:`_install_phi_filters`'s order."""
-    return scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
+def _scrub_text_passes(text: str, *, clamp: bool = True) -> str:
+    """The handler chain's text passes, in :func:`_install_phi_filters`'s order. ``clamp`` bounds
+    the input first, as the chain's redaction filter does."""
+    redacted = redact_untrusted(text) if clamp else redact(text)
+    return scrub_credentials(_scrub_credential_query(redacted))
 
 
 class JsonFormatter(_SafeExcFormatter):

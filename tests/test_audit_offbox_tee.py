@@ -855,6 +855,122 @@ def test_a_field_scrub_fault_is_logged_once_by_its_type(audit_capture, monkeypat
     assert "blew up" not in warnings[0].getMessage()
 
 
+def _shown_in(text: str, *, escapes: bool) -> collections.Counter[str]:
+    """Everything ``text`` shows outside redaction markers: each run of letters and digits, a C0
+    control counted as a break, each run with its controls removed, and each other character but
+    whitespace. With ``escapes``, the JSON escape of a C0 control counts as one. The test's own
+    instrument, so the ship rule below is not measured with the code it measures."""
+    if escapes:
+        text = re.sub(r"\\u00[01][0-9a-fA-F]|\\[bfnrt]", "\x00", text)
+    bare = re.sub(r"\[redacted\]|<redacted>", " ", text)
+    broken = re.sub(r"[\x00-\x1f]", " ", bare)
+    joined = re.sub(r"[\x00-\x1f]", "", bare)
+    words = collections.Counter(re.findall(r"[^\W_]+", broken)) | collections.Counter(
+        re.findall(r"[^\W_]+", joined)
+    )
+    return words + collections.Counter(c for c in broken if not c.isalnum() and not c.isspace())
+
+
+#: Labels a structured pass reads from a JSON key, for the sweeps of a serialised detail.
+_JSON_LABELS = ("error", "mrn", "name", "family", "password", "token", "patient_id")
+
+
+def _ship_rule_values() -> list[tuple[str, bool]]:
+    """Every sweep value, as an actor and as a serialised detail under each label, with whether
+    it is read for JSON escapes."""
+    values = [
+        template.format(c=chr(code))
+        for code in range(0x20)
+        for template, _needle, _stand in _C0_SWEEP_TEMPLATES
+    ]
+    values += [value for value, _needles in _multi_control_keys()]
+    values += [value for value, _needles in _REVIEW_LEAKS]
+    values += ["password=$%^&*\x01!@#DOE JANE", "token=a-b_c.d\x01~!e DOE JANE"]
+    cases = [(value, False) for value in values]
+    for label in _JSON_LABELS:
+        cases += [(json.dumps({label: value}), True) for value in values[::7]]
+    return cases
+
+
+def test_the_field_scrub_shows_nothing_the_plain_passes_hide() -> None:
+    """The ship rule for BACKLOG #3045, measured on the field: nothing the field scrub returns
+    shows a word, or any other character, more often than the plain text passes' own result
+    does, counting two words either side of a control as one word too. Review round 5 found
+    ``!@#``, the tail of a redacted credential, shown that way. Synthetic values."""
+    from messagefoundry.logging_setup import _scrub_text_passes
+
+    shown = []
+    for value, escapes in _ship_rule_values():
+        plain = _shown_in(_scrub_text_passes(value), escapes=escapes)
+        extra = _shown_in(scrub_log_field(value, json_escapes=escapes), escapes=escapes) - plain
+        if extra:
+            shown.append((ascii(value), dict(extra)))
+    assert not shown, shown[:20]
+
+
+@pytest.mark.parametrize(
+    ("detail", "needle"),
+    [
+        ({"mrn": "\x0112345678"}, "12345678"),
+        ({"mrn": "M123\x014567"}, "4567"),
+        ({"patient": {"mrn": "AB\x01C123"}}, "C123"),
+        ({"error": "line one\nDOE\x01JANE"}, "JANE"),
+    ],
+)
+def test_a_labelled_member_of_a_serialised_detail_is_read_with_its_key(
+    detail: dict[str, Any], needle: str
+) -> None:
+    """A serialised detail's controls are tried in the whole document, so a pass that reads a
+    JSON key, such as ``mrn``, still sees the value beside a control, and the detail still
+    parses (BACKLOG #3045, review round 5: each string scrubbed alone lost its key). Synthetic."""
+    scrubbed = scrub_log_field(json.dumps(detail), json_escapes=True)
+    assert needle not in scrubbed, scrubbed
+    json.loads(scrubbed)
+
+
+def test_a_detail_that_is_not_json_is_read_as_raw_text() -> None:
+    """A backslash in a ``detail`` that does not parse as JSON is a backslash, so ``C:\\temp`` is
+    kept while the name beside a raw control is still redacted (BACKLOG #3045, review round 5).
+    Synthetic."""
+    scrubbed = scrub_log_field("C:\\temp DOE\x01JANE", json_escapes=True)
+    assert scrubbed.startswith("C:\\temp ")
+    assert "JANE" not in scrubbed
+
+
+def test_a_short_value_buys_few_runs_of_the_passes(monkeypatch) -> None:
+    """The tries are budgeted by the value's length, so a 256-character typed sign-in name full
+    of controls costs a bounded number of pass runs, not thousands on the event loop (BACKLOG
+    #3045, review round 5 measured 2049). Synthetic."""
+    from messagefoundry import logging_setup
+
+    runs = [0]
+    real = logging_setup._scrub_text_passes
+
+    def counted(text: str, *, clamp: bool = True) -> str:
+        runs[0] += 1
+        return real(text, clamp=clamp)
+
+    monkeypatch.setattr(logging_setup, "_scrub_text_passes", counted)
+    monkeypatch.setattr(logging_setup, "_BUDGET_SPENT_LOGGED", True)
+    scrub_log_field(("Ab\x01" * 86)[:256])
+    assert 2 < runs[0] <= 64, runs[0]
+
+
+def test_a_value_whose_tries_run_out_is_logged_once(monkeypatch, caplog) -> None:
+    """When a value's try budget runs out, that is logged once per process at WARNING, without
+    the value (BACKLOG #3045, review round 5: the bound was silent). Synthetic."""
+    from messagefoundry import logging_setup
+
+    monkeypatch.setattr(logging_setup, "_try_budget", lambda scrubbed: 0)
+    monkeypatch.setattr(logging_setup, "_BUDGET_SPENT_LOGGED", False)
+    with caplog.at_level(logging.WARNING, logger=logging_setup._log.name):
+        for _ in range(2):
+            assert scrub_log_field("DOE\x01JANE") == "DOE\x01JANE"
+    warnings = [r for r in caplog.records if r.name == logging_setup._log.name]
+    assert len(warnings) == 1, warnings
+    assert "JANE" not in warnings[0].getMessage()
+
+
 def test_a_raw_field_keeps_a_backslash_escape_as_text(capsys) -> None:
     """An actor is raw text, so ``CORP\\bJONES`` is a name with a backslash in it, and the field
     scrub does not read it as a control (BACKLOG #3045, review finding 4: the actor was lost)."""

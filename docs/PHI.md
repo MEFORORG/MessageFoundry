@@ -2044,8 +2044,8 @@ residuals that cause these.
 
 **A C0 control beside text in a tee field is narrowed, not closed (BACKLOG #3045).** Each text
 field is scrubbed before the record is serialised, and a field holding a C0 control is also tried
-with each control as a space and as nothing. A try is kept only when it shows no word the plain
-scrub hides. At least four cases can still let text beside a control through on a first
+with each control as a space and as nothing. A try is kept only when it shows no word and no other
+character more often than the plain scrub does. At least four cases can still let text beside a control through on a first
 deployment, among them a value with more controls than the tries' bound covers, and DEL or a
 format character in place of a C0 control. `scrub_log_field` in
 [`logging_setup.py`](../messagefoundry/logging_setup.py) names them.
