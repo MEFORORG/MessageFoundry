@@ -108,6 +108,11 @@ _RAW_C0 = re.compile(r"[\x00-\x1f]")
 _JSON_ESCAPE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|.)", re.DOTALL)
 #: The JSON escapes that spell a C0 control: the short forms and ``\u0000`` to ``\u001f``.
 _C0_ESCAPE = re.compile(r"\\(?:[btnfr]|u00[01][0-9a-fA-F])")
+#: The C0 controls Python's ``\s`` does not match: all but tab, LF, VT, FF, CR and U+001C to
+#: U+001F.
+_NONSPACE_C0 = re.compile(r"[\x00-\x08\x0e-\x1b]")
+#: A JSON escape on the tee line, its backslash itself escaped any number of times.
+_LINE_ESCAPE = re.compile(r"\\+(?:u[0-9a-fA-F]{4}|[^\\])")
 #: The two placeholders the passes write, which are not text of the value.
 _PLACEHOLDERS = re.compile(re.escape(_FIELD_REDACTED) + "|" + re.escape(CREDENTIAL_PLACEHOLDER))
 #: A run of letters or digits: a word, for the check in :func:`_scrub_field`.
@@ -116,10 +121,37 @@ _WORD = re.compile(r"[^\W_]+")
 _FIELD_SCRUB_FAULT_LOGGED = False
 
 
+def _read(text: str, stand_in: str) -> str:
+    """``text`` read with every C0 control as a space, or, for ``""``, with every control the
+    patterns do not already read as whitespace removed. Removing a tab or a line break would
+    glue two lines into one word, a name or a date that is not in the text."""
+    return (_RAW_C0 if stand_in else _NONSPACE_C0).sub(stand_in, text)
+
+
 def _words(text: str, stand_in: str) -> Counter[str]:
-    """The words ``text`` shows outside the placeholders, each control read as ``stand_in``.
+    """The words ``text`` shows outside the placeholders, read as :func:`_read` reads it.
     Counted, so a reading that hides one of two equal words is seen to hide it."""
-    return Counter(_WORD.findall(_RAW_C0.sub(stand_in, _PLACEHOLDERS.sub(" ", text))))
+    return Counter(_WORD.findall(_read(_PLACEHOLDERS.sub(" ", text), stand_in)))
+
+
+def _letters(words: Counter[str]) -> Counter[str]:
+    """The letters and digits of ``words``, counted, whatever the breaks between them."""
+    letters: Counter[str] = Counter()
+    for word, count in words.items():
+        for ch in word:
+            letters[ch] += count
+    return letters
+
+
+def _line_words_of_line(line: str) -> Counter[str]:
+    """As :func:`_line_words`, for text that is already the line's encoding."""
+    return Counter(_WORD.findall(_LINE_ESCAPE.sub(" ", _PLACEHOLDERS.sub(" ", line))))
+
+
+def _line_words(text: str) -> Counter[str]:
+    """The words ``text`` shows on the tee line, where ``json.dumps`` has encoded it: each JSON
+    escape, however many backslashes encode it, read as a break."""
+    return _line_words_of_line(json.dumps(text, ensure_ascii=False)[1:-1])
 
 
 def _parses(text: str) -> bool:
@@ -154,13 +186,22 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
 
     Otherwise the value, cut to that window, is scrubbed as written, which the patterns read with
     a control as a break, as they read any non-word character. Then two readings, every control
-    as a space and every control removed, are scrubbed, each taken from the value and from that
-    plain result. A reading has found more when it does not show every word the plain result
-    shows, counting the controls as that reading does, and equal words counted apart. If none
-    has, the plain result ships, or the value itself where the plain result changed nothing. If
-    one has, the whole field ships as :data:`_FIELD_REDACTED`: a reading changes the text's
-    length, so its redactions cannot be merged into the plain result without mapping spans
-    between the two texts, and that mapping is where an earlier design of this fix leaked.
+    as a space, and every control the patterns do not read as whitespace removed (:func:`_read`),
+    are scrubbed, each taken from that plain result and, where the plain pass changed anything,
+    from the value. A reading of the plain result has found more when it shows fewer of its
+    letters and digits; a reading of the value, which can also show what the plain result hid,
+    when it does not show every word the plain result shows, equal words counted apart. If one
+    has, the whole field ships as :data:`_FIELD_REDACTED`: a reading changes the text's length,
+    so its redactions cannot be merged into the plain result without mapping spans between the
+    two texts, and that mapping is where an earlier design of this fix leaked. The word check
+    also fires where a removed control glues a kept word to a redacted one, so it can cost a
+    field that hid nothing more.
+
+    Otherwise the plain result ships, or the value itself where the plain result changed
+    nothing, but only if it hides every word the handler chain alone hides over the value as
+    the line carries it, encoded. The plain pass can read a span differently from that chain, as
+    a name run that takes a ``Bearer`` label with it and leaves the token, and where it does the
+    whole field ships as :data:`_FIELD_REDACTED` instead.
 
     With ``detail``, where the value parses as JSON and holds no raw control, which is how most
     writers hand ``detail`` over, each JSON escape that spells a C0 control is decoded to the
@@ -180,25 +221,38 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
             and not _RAW_C0.search(probe)
             and _parses(probe)
         )
+        written = probe
         if as_json:
             probe = _decode_c0_escapes(probe)
         if not _RAW_C0.search(probe):
             return value
+        whole = json.dumps(_FIELD_REDACTED) if as_json else _FIELD_REDACTED
         first = scrub_log_text(probe)
-        sources = (probe,) if first == probe else (first, probe)
-        if any(
-            not _words(first, stand_in)
-            <= _words(scrub_log_text(_RAW_C0.sub(stand_in, source)), stand_in)
+        # A reading of the plain result keeps its placeholders, so it can only hide more, and a
+        # drop in the letters it shows says so whatever the word breaks. A reading of the value
+        # can also show what the plain result hid, so it is compared word for word.
+        for stand_in in (" ", ""):
+            shown = _words(first, stand_in)
+            if not _letters(shown) <= _letters(
+                _words(scrub_log_text(_read(first, stand_in)), stand_in)
+            ):
+                return whole
+        if first != probe and any(
+            not _words(first, stand_in) <= _words(scrub_log_text(_read(probe, stand_in)), stand_in)
             for stand_in in (" ", "")
-            for source in sources
         ):
-            return json.dumps(_FIELD_REDACTED) if as_json else _FIELD_REDACTED
+            return whole
         if first == probe:
             return value
-        if not as_json:
-            return first
-        encoded = _encode_c0(first)
-        return encoded if _parses(encoded) else json.dumps(_FIELD_REDACTED)
+        result = _encode_c0(first) if as_json else first
+        if as_json and not _parses(result):
+            return whole
+        # No less than before: the handler chain alone, over the value as the line carried it,
+        # must hide every word this result hides. The plain pass can redact a span the chain
+        # read differently, a name run that takes a ``Bearer`` label with it, and leave the
+        # credential the chain would have caught.
+        alone = scrub_log_text(json.dumps(written, ensure_ascii=False)[1:-1])
+        return result if _line_words(result) <= _line_words_of_line(alone) else whole
     except Exception as exc:  # noqa: BLE001 - fail closed; the tee must still ship the record
         global _FIELD_SCRUB_FAULT_LOGGED
         if not _FIELD_SCRUB_FAULT_LOGGED:
@@ -243,7 +297,8 @@ def emit_audit_tee(
     member -- the previous row's hash, ``ts``, ``actor``, ``action``, ``channel_id``, ``client`` --
     travels in this same record or the one before it. So for a record whose ``detail`` ``safe_text``
     actually cut, a reader of the log can TEST guesses at the removed span offline, one hash per guess
-    (``seq`` travels in the record too).
+    (``seq`` travels in the record too). The same holds for any field the C0 scrub below cut or
+    shipped as ``[redacted]``, ``actor`` included, such as a typed sign-in name.
     That is narrow (it needs an exact byte-for-byte reconstruction of a redacted exception string, and
     an audit ``detail`` that was not HL7-shaped is forwarded unredacted anyway, so there is nothing left
     to guess). It does not arise for a row written by a process that holds a key, where the digest is
@@ -321,8 +376,17 @@ def emit_audit_tee(
       ``JONES`` joined by a control is one: it reads as the two-word name the patterns redact.
       ``detail`` is scrubbed before ``safe_text`` bounds it, so that holds for a control
       anywhere in the scanned window, even in text past the 200 characters that would ship.
-    * The comparison that decides it counts words, runs of letters and digits, so a redaction that
-      hides only punctuation is not counted.
+    * The comparisons that decide it count words, runs of letters and digits, so a redaction that
+      hides only punctuation is not counted, and a reading of the plain result that hides some
+      letters while showing others it hid is not seen.
+    * A control the patterns read as whitespace, at least tab, LF, VT, FF, CR and U+001C to
+      U+001F, is never read as nothing, because gluing two lines made names and dates that were
+      not in the text. Inside a word it splits the word, as it does on any plain log line.
+    * In a JSON ``detail``, only an escape that spells a C0 control is decoded. Most writers call
+      ``json.dumps`` with its default ``ensure_ascii=True``, so a non-ASCII character, such as a
+      no-break space between the parts of a name, arrives as an escape such as ``\\u00a0``,
+      which ends in a word character too, and the text beside it is read by the handler chain
+      alone, as before.
     * In ``detail``, a JSON escape is read as the control it spells only where the detail parses as
       JSON within the handler chain's bound and holds no raw control, which is how ``json.dumps``
       writes it. Elsewhere, at least a pretty-printed JSON detail or a longer one, the escape is

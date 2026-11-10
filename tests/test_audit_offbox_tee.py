@@ -571,15 +571,25 @@ def test_every_c0_control_beside_or_inside_the_text_of_each_field_is_redacted(
     """The sweep the review of engine PR 2040 used, all 32 C0 code points, widened to put the
     control inside the text as well as on either side, in every text field of the record
     (BACKLOG #3045). The control case comes first: with a space or nothing in the control's
-    place, each needle is redacted. A leak names the code point and the value. Synthetic values."""
+    place, each needle is redacted. A leak names the code point and the value. Synthetic values.
+
+    A control the patterns read as whitespace, ``\\s`` in Python (tab, LF, VT, FF, CR and U+001C
+    to U+001F), is never read as nothing, because gluing two lines into one word made names and
+    dates that were not there. Inside a word it splits the word, as it does on any plain log
+    line, so for those the bar is the handler chain's own verdict on the same text unencoded."""
+    from messagefoundry.logging_setup import scrub_log_text
+
+    whitespace = {c for c in range(0x20) if re.fullmatch(r"\s", chr(c))}
     keys = _sweep_keys()
     lines = _tee_lines([_sweep_case(field, value) for _code, value, _needle in keys], capsys)
     leaks = [
         (hex(code), ascii(value), needle)
         for (code, value, needle), line in zip(keys, lines, strict=True)
-        if needle in line
+        if needle in line and (code not in whitespace or needle not in scrub_log_text(value))
     ]
     assert not leaks, leaks
+    # The carve-out is not vacuous, and covers only what the plain chain itself misses.
+    assert whitespace == {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x1F}
 
 
 @pytest.mark.parametrize(
@@ -612,7 +622,24 @@ _REVIEW_LEAKS = (
     ("Bearer\x01abcdefgh pass\x01word=hunter2", ("abcdefgh", "hunter2")),
     ("Authorization:\x01Bearer abcdefgh IB_ACME_ADT", ("abcdefgh",)),
     ("password: hunter2 MRN 1234\x015678", ("hunter2", "5678")),
+    # Review round 2: the plain pass's name run took the ``Bearer`` label, so the credential the
+    # handler chain alone hid would have shipped; and a ``password=`` value the chain hid.
+    ("rejected:\nInvalid Bearer abc123def", ("abc123def",)),
+    ("05/\x1btoken=password= DOE", ("DOE",)),
 )
+
+
+@pytest.mark.parametrize(
+    ("value", "kept"),
+    [
+        ("user alice\nrole Admin\nscope All", "user alice\nrole Admin\nscope All"),
+        ("count 2025\n0101 rows", "count 2025\n0101 rows"),
+    ],
+)
+def test_a_reading_does_not_glue_lines_into_a_name(value: str, kept: str) -> None:
+    """Review round 2: removing a line break glued two lines into a name or a date that was not
+    there, so the whole field went. Synthetic values."""
+    assert audit_tee._scrub_field(value).startswith(kept)
 
 
 @pytest.mark.parametrize("field", ["actor", "detail", "detail-as-json"])
