@@ -541,8 +541,9 @@ def _new_ip_path_field(path: str, seen_text: str | None = None) -> str:
     filter can read as a credential value; then escaped and bounded
     (``logging_setup.redacted_log_field``). With ``seen_text``, the past-cap line's, the path is
     read once more, in the pre-#3770 past-cap line with ``seen_ip=`` and that text after it, only
-    to compare, and that tail is read once on its own unless the line left it as it was: those at
-    most two readings are what the past-cap line costs beyond the repeat line.
+    to compare, and that tail is read once on its own unless that reading is exactly the head, the
+    value and the tail as it was: those at most two readings are what the past-cap line costs
+    beyond the repeat line.
 
     When it logs ``logging_setup.UNREADABLE_LOG_VALUE`` instead is stated once, in
     ``logging_setup.redacted_log_field``; on the past-cap line that can include a path ending in a
@@ -554,14 +555,18 @@ def _new_ip_path_field(path: str, seen_text: str | None = None) -> str:
     last of two shipped handlers hid in the pre-#3770 lines prints in the path field more often
     than it did there: over the paths main hid, each read with each of five seen addresses; over
     quote-closing, control-character and raw-in-line vectors, each read with one seen address;
-    and over a seeded corpus, each path read with one. An ordinary path stays readable
-    with each named seen text a pass rewrites, and with two seen texts the past-cap line leaves
-    raw; and over a seeded corpus, the past-cap line logs the placeholder for a path the repeat
-    line reads only where main's own past-cap line did not print the repeat value there. Not
-    tested, at least: a third handler; a Unicode space separator before an encoded HL7 name,
-    which the pre-#3770 lines printed too; a seen text no vector names; and a pass that, in the
-    past-cap line, hides the end of the path and writes that end back, followed by exactly
-    ``seen_ip=`` and the seen text, as it was or as the passes write it alone."""
+    and over a seeded corpus, each path read with one. An ordinary path stays readable with each
+    named seen text a pass rewrites. Two paths that turn a pass off for the whole line, one with a
+    no-break space and one with a credential shape, stay readable with an encoded HL7 seen text
+    that line leaves raw. Over a seeded corpus, a path the repeat line reads blanks on the
+    past-cap line only where main's own past-cap line, written by two shipped handlers, was not
+    the repeat value followed by the seen text raw or as written alone; that bounds the blanking
+    by those two forms, not by what main hid. Such a path still blanks, at least, with a seen
+    text holding a tab or a second rewritten shape beside the raw one. Not tested, at least: a
+    third handler; a Unicode space separator before an encoded HL7 name, which the pre-#3770
+    lines printed too; a seen text no vector names; and a pass that, in the past-cap line, hides
+    the end of the path and writes that end back, followed by exactly ``seen_ip=`` and the seen
+    text, as it was or as the passes write it alone."""
     checks = (
         ()
         if seen_text is None

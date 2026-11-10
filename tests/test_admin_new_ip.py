@@ -1746,12 +1746,13 @@ def test_a_seen_text_left_raw_in_the_line_leaves_the_path_readable(path: str, se
     assert not _hides_no_less_than_main(path, seen), (ascii(path), seen)
 
 
-def test_the_past_cap_line_blanks_a_path_only_where_main_hid_it() -> None:
+def test_the_past_cap_line_blanks_a_path_only_where_main_wrote_neither_tail_form() -> None:
     """RED when: over the seeded corpus, the past-cap line logs the placeholder for a path the
     repeat line reads, though main's own past-cap line, written by two shipped handlers, printed
     the repeat line's value where the path stood, followed by the seen text raw or as the passes
     write it alone (BACKLOG #3770). Main's line is read through the real handlers here, not the
-    reading the field's check uses."""
+    reading the field's check uses, so this catches drift between the two; it does not catch a
+    blank where main printed the value with the tail written a third way."""
     rng = random.Random(46)
     head = _OVER_HEAD + "path="
     seens = (*_BASELINE_SEEN, *(seen for _, seen in _RAW_IN_LINE_SEEN))

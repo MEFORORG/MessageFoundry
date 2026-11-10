@@ -481,14 +481,17 @@ def redacted_log_field(
       it alone. A check is read only to compare, never logged, so its ``after`` may be caller
       text: it is the line the value stood in. The value read there differs when a pass took
       text of ``after`` into ``text``, or ``after`` made a pass hide more of ``text``, and the
-      reading also fails when a pass rewrote ``after`` in that line other than as it does alone,
-      as when ``text`` ends in a credential label that takes ``after`` as its value. A pass
-      rewriting ``after`` alike in both readings, a date or a tab in it for example, fails
-      nothing; nor does ``text`` turning a pass off for the whole line, a no-break space or a
-      credential shape for example, so that the line leaves ``after`` as it was.
+      reading also fails when the line writes ``after`` neither as it was nor as it is written
+      alone. That happens at least when ``text`` ends in a credential label that takes ``after``
+      as its value; and when ``text`` turns a pass off for the whole line, a no-break space or a
+      credential shape for example, and ``after`` holds a tab, which the reading's tab round
+      respells, or a shape a pass still on rewrites, a date or a name for example, beside one
+      the line leaves. A pass rewriting ``after`` alike in both readings, a date or a tab in it
+      for example, fails nothing; nor does a line that leaves ``after`` exactly as it was.
 
-    Each check is one more full reading, and one of ``after`` alone unless the line left ``after``
-    as it was. Readings stop at the first check that fails.
+    Each check is one more full reading, and one of ``after`` alone unless that reading is
+    exactly ``before``, the value and ``after`` as it was. Readings stop at the first check that
+    fails.
 
     The escape hides most of what the handler filters anchor on, so they read less inside the
     field than in raw text; redacting first, in the lines the caller names, is meant to hide what
@@ -523,7 +526,7 @@ def redacted_log_field(
 def _reads_as(value: str, head: str, text: str, tail: str) -> bool:
     """Whether the line ``head`` + ``text`` + ``tail`` reads with ``value`` unchanged where ``text``
     stood, then ``tail`` as it was or as the passes write it alone (BACKLOG #3770). The tail is read
-    alone only when the line did not leave it as it was."""
+    alone only when the line is not exactly ``head``, ``value`` and ``tail``."""
     line = _shipped_reading(head + text + tail)
     return line == head + value + tail or line == head + value + _shipped_reading(tail)
 
