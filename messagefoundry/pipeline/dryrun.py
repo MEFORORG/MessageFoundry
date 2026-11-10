@@ -54,6 +54,7 @@ from messagefoundry.parsing import (
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.parsing.sniff import _lstrip_bom_ws
 from messagefoundry.parsing.split import one_message_bytes
+from messagefoundry.parsing.validate import warm_validation
 from messagefoundry.pipeline._sandbox_codec import build_payload
 from messagefoundry.pipeline.ingress_guards import (
     IngressGuardError,
@@ -836,6 +837,10 @@ class DryRunResult:
     # {msg['PID-3']}")` is the commonest debugging idiom. The obligation lives here rather than in each
     # consumer's comment because a consumer added later reads the field, not the other consumers.
     error: str | None = None
+    # True only when ``error`` is the strict-validation timeout, so a caller can tell that refusal
+    # from every other ERROR without matching its text (BACKLOG #5107): ``check`` refuses to let a
+    # timeout satisfy a fixture that expects ERROR, since it says nothing about the message.
+    strict_timed_out: bool = False
 
 
 class NoInboundError(ValueError):
@@ -949,8 +954,21 @@ def _dry_run_raw(
     )
 
 
-def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
-    """Strict-validate ``text`` under the listener's timeout; the refusal text, or ``None`` if valid.
+# The (MSH-9, MSH-12) pairs this process has warmed strict validation for. hl7apy's structure
+# follows from them, and everything the warm-up fills is cached per process or per structure, so
+# warming a pair again would buy only a second parse (BACKLOG #5107).
+_warmed: set[tuple[str | None, str | None]] = set()
+
+
+class _StrictRefusal(NamedTuple):
+    """A strict-validation refusal: the listener's text, and whether it is the timeout."""
+
+    text: str
+    timed_out: bool
+
+
+def _strict_validation_error(text: str, ic: InboundConnection, peek: Peek) -> _StrictRefusal | None:
+    """Strict-validate ``text`` under the listener's timeout; the refusal, or ``None`` if valid.
 
     The listener bounds the validate with ``asyncio.wait_for`` over ``asyncio.to_thread`` and refuses
     with ``strict-validation timed out after <N>s`` once the timeout
@@ -973,8 +991,16 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
     the listener's late-result recovery: a validate that began before the deadline and finished
     after it, but before the listener handled the timeout, is used there as if it had not timed out,
     while a dry run reports any validate past the timeout as timed out. Below the timeout the
-    verdict matches; the wall clock, the concurrency and that boundary case do not."""
+    verdict matches; the wall clock, the concurrency and that boundary case do not.
+
+    The clock starts after :func:`~messagefoundry.parsing.validate.warm_validation`, run the first
+    time each MSH-9 and MSH-12 pair is validated, so a verdict never counts the process's cold ``hl7apy`` import, its choice-group probe or the structure's
+    reference load (BACKLOG #5107). The listener's clock still counts them on its first validate;
+    it is not changed here."""
     timeout = strict_validate_timeout(ic)
+    if timeout is not None and (key := (peek.message_type, peek.version)) not in _warmed:
+        warm_validation(text)
+        _warmed.add(key)
     started = time.monotonic()
     fault: Exception | None = None
     try:
@@ -990,11 +1016,11 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
                 "dry-run strict validation raised %s after its timeout; reported as timed out",
                 type(fault).__name__,
             )
-        return f"strict-validation timed out after {timeout}s"
+        return _StrictRefusal(f"strict-validation timed out after {timeout}s", timed_out=True)
     if fault is not None:
         raise fault
     # On ``ok`` alone, as the listener refuses: a fault's text can be empty.
-    return None if result.ok else "; ".join(result.errors)[:200]
+    return None if result.ok else _StrictRefusal("; ".join(result.errors)[:200], timed_out=False)
 
 
 @runs_author_code
@@ -1086,7 +1112,7 @@ def dry_run(
     # threshold, so the preview never times a whole-body validate the engine does not run.
     if (
         strict_validation_due(ic, text)
-        and (refused := _strict_validation_error(text, ic)) is not None
+        and (refused := _strict_validation_error(text, ic, peek)) is not None
     ):
         return DryRunResult(
             inbound=ic.name,
@@ -1095,7 +1121,8 @@ def dry_run(
             message_type=mt,
             control_id=cid,
             summary=summ,
-            error=refused,
+            error=refused.text,
+            strict_timed_out=refused.timed_out,
         )
 
     try:

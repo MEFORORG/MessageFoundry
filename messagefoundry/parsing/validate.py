@@ -49,7 +49,7 @@ from messagefoundry.parsing.peek import (
     normalize,
 )
 
-__all__ = ["ValidationResult", "is_choice_group", "validate"]
+__all__ = ["ValidationResult", "is_choice_group", "validate", "warm_validation"]
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +192,17 @@ def _references(name: str, classname: str, hl7_version: str) -> tuple[_Reference
     return ref, _as_sequence(ref)
 
 
+def _tolerant_parse(norm: str) -> Any:
+    """hl7apy's parse of ``norm`` as :func:`validate` runs it, shared with :func:`warm_validation`
+    so the warm-up cannot drift from the parse it warms. Raises what ``parse_message`` raises."""
+    from hl7apy.consts import VALIDATION_LEVEL
+    from hl7apy.parser import parse_message
+
+    # TOLERANT, stated rather than inherited: it is hl7apy's default, but that default is
+    # process-wide and settable, and the scope in this module's docstring depends on it.
+    return parse_message(norm, find_groups=True, validation_level=VALIDATION_LEVEL.TOLERANT)
+
+
 def _occurrences(element: Any, name: str) -> list[Any]:
     from hl7apy.exceptions import HL7apyException
 
@@ -283,9 +294,7 @@ def validate(
     the whole-body ``hl7apy`` parse the cap exists to bound, and it runs on a worker thread the
     listener's timeout cannot stop. ``docs/HL7-VALIDATION.md`` says so for operators.
     """
-    from hl7apy.consts import VALIDATION_LEVEL
     from hl7apy.exceptions import ChildNotFound, HL7apyException
-    from hl7apy.parser import parse_message
     from hl7apy.validation import Validator
 
     norm = normalize(raw).strip("\r")
@@ -302,9 +311,7 @@ def validate(
         )
 
     try:
-        # TOLERANT, stated rather than inherited: it is hl7apy's default, but that default is
-        # process-wide and settable, and the scope in this module's docstring depends on it.
-        message = parse_message(norm, find_groups=True, validation_level=VALIDATION_LEVEL.TOLERANT)
+        message = _tolerant_parse(norm)
     except HL7apyException as exc:
         return ValidationResult(False, expected_version, [f"parse error: {exc}"])
     except Exception as exc:  # defensive: never let validation crash the pipeline
@@ -352,3 +359,30 @@ def validate(
                 errors.append(str(exc))
 
     return ValidationResult(ok=not errors, version=version, errors=errors)
+
+
+def warm_validation(raw: str | bytes) -> None:
+    """Pay, once, what a first :func:`validate` of ``raw`` would pay before it validates anything.
+
+    That is the cold ``hl7apy`` import, the cached :func:`_choice_fix_needed` probe, and the
+    structure's cached reference table, so a caller that times :func:`validate` measures the
+    validate and not the process's first use of it (BACKLOG #5107). It parses ``raw`` to learn its
+    structure, under the same size caps :func:`validate` applies, so the parse is paid twice; a
+    caller warms once per structure, since all it fills is cached. It reports nothing: any fault here is left for the timed validate to report.
+    """
+    from hl7apy.validation import Validator  # noqa: F401 -- imported for its load time
+
+    choice_fix = _choice_fix_needed()
+    norm = normalize(raw).strip("\r")
+    try:
+        enforce_size_limits(
+            norm, max_bytes=DEFAULT_MAX_MESSAGE_BYTES, max_segments=DEFAULT_MAX_SEGMENTS
+        )
+        # The parse also loads hl7apy's library for the message's version, itself a cold import.
+        message = _tolerant_parse(norm)
+        if choice_fix:
+            _references(message.name, message.classname, getattr(message, "version", None))
+    except Exception as exc:
+        # The class only: an hl7apy error can quote the message. The timed validate meets the
+        # same fault and reports it, so nothing is lost by not raising it here.
+        logger.debug("strict-validation warm-up skipped on %s", type(exc).__name__)

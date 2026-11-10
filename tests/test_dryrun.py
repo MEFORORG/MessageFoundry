@@ -191,6 +191,66 @@ def test_strict_validation_error() -> None:
     assert result.error
 
 
+def test_strict_validation_timing_starts_after_the_warm_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #5107: a verdict must not count the cold hl7apy import, the choice-group probe or
+    the reference load. The warm-up is made to "take" 10 000 s on a fake clock and the validate
+    none, so the run is a timeout only if the clock starts before the warm-up. No wall clock."""
+    import time
+    from types import SimpleNamespace
+
+    from messagefoundry.parsing.validate import ValidationResult
+    from messagefoundry.pipeline import dryrun
+
+    now = [0.0]
+    warmed: list[str] = []
+
+    def cold_warm_up(text: str) -> None:
+        warmed.append(text)
+        now[0] += 10_000.0
+
+    monkeypatch.setattr(dryrun, "time", SimpleNamespace(time=time.time, monotonic=lambda: now[0]))
+    monkeypatch.setattr(dryrun, "warm_validation", cold_warm_up)
+    monkeypatch.setattr(dryrun, "_warmed", set())  # another test may have warmed this pair
+    monkeypatch.setattr(dryrun, "validate", lambda *a, **k: ValidationResult(True, "2.5.1", []))
+
+    result = dry_run(
+        _registry(lambda m: ["h"], {"h": lambda m: Send("out", m)}, strict=True), ADT_A01
+    )
+
+    assert warmed, "the warm-up never ran"
+    assert result.disposition is MessageStatus.RECEIVED, result.error
+    assert result.strict_timed_out is False
+
+    # Once per MSH-9 and MSH-12 pair: what it fills is cached, so a second run does not pay again.
+    dry_run(_registry(lambda m: ["h"], {"h": lambda m: Send("out", m)}, strict=True), ADT_A01)
+    assert len(warmed) == 1
+
+
+def test_warm_validation_fills_what_a_first_validate_loads_lazily() -> None:
+    """The warm-up leaves the probe and the structure's reference table cached, so the timed
+    validate after it loads neither. Cleared first, so a cache another test filled proves nothing."""
+    import importlib
+
+    # By module path: the package re-exports the function under the module's own name.
+    validate_module = importlib.import_module("messagefoundry.parsing.validate")
+
+    validate_module._choice_fix_needed.cache_clear()
+    validate_module._references.cache_clear()
+
+    validate_module.warm_validation(ADT_A01)
+
+    assert validate_module._choice_fix_needed.cache_info().currsize == 1
+    expected = 1 if validate_module._choice_fix_needed() else 0
+    assert validate_module._references.cache_info().currsize == expected
+
+
+def test_warm_validation_never_raises_on_a_body_it_cannot_parse() -> None:
+    from messagefoundry.parsing.validate import warm_validation
+
+    warm_validation("not an HL7 message")
+    warm_validation("")
+
+
 def test_route_message_is_pure_routing() -> None:
     reg = _registry(lambda m: ["h"], {"h": lambda m: Send("out", m)})
     outcome = route_message(reg, reg.inbound["in"], ADT_A01)
