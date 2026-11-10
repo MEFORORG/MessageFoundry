@@ -1,6 +1,6 @@
 # 0087 — Router/Handler subprocess isolation
 
-- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself. **Amended (2026-10-07).** The owner ruled to drop the worker's POSIX `RLIMIT_CPU` backstop, so CPU time is bounded only per call, by the wall cap, and `[sandbox].cpu_seconds` is gone (vault BACKLOG #3133 part 1). The Decision bullet that named the backstop is edited, the reasons are under "POSIX CPU limit dropped" below, and what the limit used to bound is a new residual. `RLIMIT_AS` is unchanged. **Amended (2026-10-11).** The owner ruled that `[sandbox].mem_mb` stays and changes meaning (vault BACKLOG #3133 part 2). On Linux it is now headroom above the loaded graph, enforced with `RLIMIT_DATA`, so address space a thread only reserves does not count. A call that runs out of memory is reported as the memory cap, and its worker is recycled. The reasons are under "Memory cap is headroom above the loaded graph" below; the Decision bullet that named `RLIMIT_AS` is edited. **Amended (2026-11-09).** The owner ruled that a frame found waiting before a request no longer fails that call: the worker is still dropped, and the message is retried once on a fresh worker (vault BACKLOG #3135 step 4). A length header over the frame cap is now read as a frame rather than a dead peer; AC-10's amendment says what that changes. AC-10 and the residual on a compromised worker denying its own feed carry the amendment beside them, and every kill now records a cause, as ADR 0187 *Amendment B* says.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
+- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself. **Amended (2026-10-07).** The owner ruled to drop the worker's POSIX `RLIMIT_CPU` backstop, so CPU time is bounded only per call, by the wall cap, and `[sandbox].cpu_seconds` is gone (vault BACKLOG #3133 part 1). The Decision bullet that named the backstop is edited, the reasons are under "POSIX CPU limit dropped" below, and what the limit used to bound is a new residual. `RLIMIT_AS` is unchanged. **Amended (2026-10-11).** The owner ruled that `[sandbox].mem_mb` stays and changes meaning (vault BACKLOG #3133 part 2). On Linux it is now headroom above the loaded graph, enforced with `RLIMIT_DATA`, so address space a thread only reserves does not count. A call that runs out of memory is reported as the memory cap, and its worker is recycled. The reasons are under "Memory cap is headroom above the loaded graph" below; the Decision bullet that named `RLIMIT_AS` is edited. **Amended (2026-11-09).** The owner ruled that a frame found waiting before a request no longer fails that call: the worker is still dropped, and the message is retried once on a fresh worker (vault BACKLOG #3135 step 4). A length header over the frame cap is now read by the engine as a frame rather than a dead peer; AC-10's amendment says what that changes. AC-10 and the residual on a compromised worker denying its own feed carry the amendment beside them, and every kill now records a cause, as ADR 0187 *Amendment B* says. **Corrected (2026-11-10).** Two statements were false of the code. The grandchild residual said nothing a grandchild writes can be taken as an answer and that its mere presence kills the worker; a grandchild inherits the request pipe too, so it can learn a request's id and forge that request's answer. The Decision bullet *"A frame answers a request, or the worker dies"* called a frame before a dispatch fatal and said the request is written only after proving nothing is queued. Each correction sits beside its text.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
 - **Date:** 2026-07-10
 - **Related:** [ADR 0009](0009-run-scoped-context-providers.md) (RunContext providers) · [ADR 0010](0010-handler-callable-db-lookup.md) / [ADR 0043](0043-fhir-read-lookup.md) (`db_lookup`/`fhir_lookup`) · [ADR 0072](0072-traced-dryrun-mode.md) (tracer seam it composes with) · [ADR 0036](0036-windows-config-source-trust.md) / [ADR 0041](0041-load-path-attestation-and-change-attribution.md) (config-source trust) · CLAUDE.md §2 (reliability/purity, count-and-log) · CLAUDE.md §4 (layering) · BACKLOG #197 · ASVS 15.2.5 / `docs/security/ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17
 
@@ -226,16 +226,22 @@ target, no `pickle` import left to mis-suppress:
   succeeds only if every segment was consumed), so the one silent failure mode of an indirection
   table — cross-wiring one `Send`'s PHI body onto another `Send`'s destination — is unreachable by
   construction, not merely untested.
-- **A frame answers a request, or the worker dies.** Every dispatch mints a fresh
+- **A frame answers a request, or the worker is dropped.** Every dispatch mints a fresh
   `secrets.token_hex(16)` id and a response must echo the whole `(id, phase, name)` triple; *and* the
-  parent treats a frame queued **before** a dispatch — or left over **after** its answer — as fatal.
+  parent drops the worker on a frame queued **before** a dispatch or left over **after** its answer.
+  One left after its answer fails that call closed; one found before a request costs the message one
+  retry on a fresh worker, and AC-10's 2026-11-09 amendment says when it dead-letters instead.
   Both halves are needed, and a first attempt at this shipped only the weaker one: a derivable id
   (a per-spawn nonce plus a counter, both visible to the child) let the code running dispatch *N*
   compute *N+1*'s id and pre-stage its answer, so a benign sibling Handler's delivery was silently
   replaced by attacker-chosen content on a message it never saw — for `phase="accepts"`, a
   routing-verdict flip with no `ERROR` and no disposition anomaly. A random per-dispatch id is not
-  derivable, and the worker only learns it from the request frame, which the parent writes only after
-  proving nothing is already queued. A **dead peer** is deliberately not the same event: EOF is a
+  derivable, and the worker only learns it from the request frame. The parent checks that nothing is
+  queued before it encodes and writes that frame, so the check proves nothing about a frame arriving
+  after it; AC-10's amendment says what such a frame meets, and the grandchild residual says how one
+  can carry the right id. *Corrected 2026-11-10:* this bullet was headed *"or the worker dies"*,
+  called a frame before a dispatch fatal, and said the request is written *"only after proving
+  nothing is already queued"*. A **dead peer** is deliberately not the same event: EOF is a
   parent-private sentinel with no wire form, so a worker cannot manufacture one and it proves nothing
   about trust. It reaps the worker without failing a call that already holds a correlation-proven
   answer — treating it as a forgery would fail closed on a signal that carries no information.
@@ -359,26 +365,37 @@ target, no `pickle` import left to mis-suppress:
   > but that frame no longer fails the call: its message never reached the worker, so it is retried
   > once on a fresh worker. It still fails closed in at least the cases
   > [ADR 0187](0187-bound-the-subprocess-sandbox-worker-count-a-shared-pool-or-router-phase-only-isolation.md)
-  > *Amendment B* lists, the fresh worker having a stray frame waiting too among them. The two
-  > checks run at fixed points. `_live_worker` checks, through `_drop_unsolicited`, before every
-  > request, on every worker it hands out, a fresh one included. `_reject_unsolicited` checks once,
-  > right after the call's answer is read. A frame left **after** an answer still fails the call
-  > closed when it is queued by the time that second check runs. A frame that arrives later meets
-  > at least these outcomes. On a worker still kept, the next call's check before its request finds
-  > it, and that message is retried. One that arrives after that check, and ahead of that call's
-  > answer, is read in its place; unless it is a well-formed answer to that very request it is
-  > rejected as an invalid frame and the message dead-letters, so in that window the later dispatch
-  > does not resolve as `mode=off` does, a case the SHALL above does not except. One that arrives
-  > after that call's answer meets that call's own check after its answer, or carries on to the
-  > next call. A worker that exits first takes the frame with it unexamined, since a respawn starts
-  > a fresh queue. How the engine handles a length header over the frame cap is new since #3135,
-  > not a carried-over rule. Before #3135 such a header read as a dead peer: at least, in the
-  > answer slot the call failed as a crash, after an answer the worker was reaped and the answer
-  > stood, and before a request the message went to a respawn. It is now read as a frame: at least,
-  > it counts as a stray frame at both checks, failing the call closed after an answer and retrying
-  > the message before a request, as an invalid frame in the answer slot, and as a rejected boot
-  > reply at boot. Every kill records a cause; ADR 0187 *Amendment B* says which kills write a
-  > WARNING.
+  > *Amendment B* lists, the fresh worker having a stray frame waiting too among them.
+  >
+  > - **The two checks run at fixed points.** `_live_worker` checks, through `_drop_unsolicited`,
+  >   before every request, on every worker it hands out, a fresh one included, and before the
+  >   request is encoded. `_reject_unsolicited` checks once, right after the call's answer is read.
+  >   A frame left **after** an answer still fails the call closed when it is queued by the time
+  >   that second check runs.
+  > - **A call refused at encode reads nothing.** A request the engine cannot encode, or one over
+  >   the frame cap, fails only its message and keeps its worker without reading the queue, so a
+  >   frame waiting there rolls to the next call's check before its request.
+  > - **A frame that arrives later meets at least these outcomes.** On a worker still kept, the
+  >   next call's check before its request finds it, and that message is retried. One that arrives
+  >   after that check, and ahead of that call's answer, is read in its place. It is rejected as an
+  >   invalid frame, and the message dead-letters, unless it is a well-formed answer to that very
+  >   request, which is taken as the answer, or, at `mode=isolated`, a well-formed lookup for that
+  >   request with seq 1, which is served. So in that window the later dispatch does not resolve as
+  >   `mode=off` does, a case the SHALL above does not except; whether the SHALL changes is left to
+  >   an owner ruling. Only a writer that has read the request can carry its id; the grandchild
+  >   residual below says how one can. One that arrives after that call's answer meets that call's
+  >   own check after its answer, or carries on to the next call. A worker that exits first takes
+  >   the frame with it unexamined, since a respawn starts a fresh queue.
+  > - **A length header over the frame cap.** How the engine handles one is new since vault BACKLOG
+  >   #3135, not a carried-over rule; the worker's own reader still treats one as a dead peer.
+  >   Before vault BACKLOG #3135 the engine read such a header as a dead peer: at least, in the
+  >   answer slot the call failed as a crash, after an answer the worker was reaped and the answer
+  >   stood, before a request the message went to a respawn, and at boot it read as the worker
+  >   exiting during boot. The engine now reads it as a frame: at least, it counts as a stray frame
+  >   at both checks, failing the call closed after an answer and retrying the message before a
+  >   request, as an invalid frame in the answer slot, and as a rejected boot reply at boot.
+  >
+  > Every kill records a cause; ADR 0187 *Amendment B* says which kills write a WARNING.
   → `tests/test_sandbox.py::test_a_desynced_or_forged_response_is_rejected`,
   `tests/test_sandbox.py::test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`,
   `tests/test_sandbox.py::test_a_dead_peer_is_not_treated_as_a_forged_frame`,
@@ -575,12 +592,19 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   narrows the obvious paths but is bypassable (a module imported before it goes up keeps a live
   reference) and carries no compensating-control weight. Least-privilege for the service account
   remains the host control that bounds this. ADR 0147 tracks the fuller closure.
-- **A grandchild the Handler spawns inherits fd 1** and outlives `proc.kill()`. It can write frames
-  into the parent's reader at any later moment. What makes that harmless is the *codec* (nothing it
-  writes can construct an arbitrary object) plus the request-answer binding (nothing it writes can be
-  taken as an answer, and its mere presence kills the worker) — not the process teardown. On POSIX,
+- **A grandchild the Handler spawns inherits fd 1, and fd 0 too,** and outlives `proc.kill()`. It can
+  write frames into the parent's reader at any later moment. What bounds that is the *codec* (nothing
+  it writes can construct an arbitrary object) plus the request-answer binding (a frame is taken as an
+  answer only if it echoes that dispatch's id) — not the process teardown. **It can forge an
+  answer.** fd 0 is the request pipe, so a grandchild alive while the worker is can read a later
+  request frame, which gives it that request's id and can take some or all of those bytes from the worker, and write
+  a well-formed answer the engine accepts as that message's result. Its presence kills nothing: a
+  frame it writes drops the worker only when one of the two checks in AC-10's 2026-11-09 amendment
+  finds it, and a frame on a worker that exits first is never examined. *Corrected 2026-11-10:* this
+  bullet said *"nothing it writes can be taken as an answer, and its mere presence kills the
+  worker"*, and called the result harmless. On POSIX,
   `/proc/<pid>/fd/1` is additionally openable by any same-UID process subject to
-  `ptrace_scope`/`hidepid`. What it **can** still do is force a kill-and-respawn, i.e. dead-letter
+  `ptrace_scope`/`hidepid`. It can also force a kill-and-respawn, i.e. dead-letter
   messages on that inbound: a compromised worker can deny its own feed. (Since 2026-11-09 a frame
   staged before a request costs that message a retry on a fresh worker, and in the cases AC-10's
   amendment points to, its dead-letter too.)

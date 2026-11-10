@@ -1519,10 +1519,11 @@ admin code and the engine, exactly as `mode=off` shares an address space. A gran
 spawns inherits the response pipe and can stage a frame while the worker is alive; killing the worker
 now reaps its whole process tree (a Windows kill-on-close job object / a POSIX process group), so such
 a grandchild no longer outlives the kill (BACKLOG #342). That reap is best-effort process hygiene: what
-makes a stray frame *harmless* is still the codec plus the request-answer binding (a live grandchild can
-at least force a respawn and dead-letter a message, or cost one a retry on a fresh worker; AC-10's
-2026-11-09 amendment in [ADR 0087](adr/0087-sandbox-subprocess-isolation.md) says which, and when),
-not the process teardown.
+bounds a stray frame is still the codec plus the request-answer binding, not the process teardown. A
+live grandchild can at least force a respawn and dead-letter a message, or cost one a retry on a fresh
+worker, and since it inherits the request pipe too it can forge a request's answer; ADR 0087's
+grandchild residual and AC-10's 2026-11-09 amendment in
+[ADR 0087](adr/0087-sandbox-subprocess-isolation.md) say how, and when.
 The child's **stderr is captured by the engine, not inherited** (ADR 0176): a Handler that prints is
 relayed into the engine's log attributed to the inbound, the child pid and the worker generation, with
 **the content itself only at `DEBUG`**. At `INFO` and above you get a rate-limited `WARNING` naming the
