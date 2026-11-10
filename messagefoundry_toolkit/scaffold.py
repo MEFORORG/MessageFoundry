@@ -168,7 +168,7 @@ _VSCODE_SETTINGS = """\
 # engine from your configured index — public PyPI (the published releases carry SLSA + PEP 740
 # attestations), the engine's GitHub Release wheel, or a private index.
 #
-# Where the workflow's comments or _CHECK_STALE's messages name pip's `-c` or `-e` flag, a backtick
+# Where the workflow's comments or _CHECK_STALE's messages name a `-c` or `-e` flag, a backtick
 # sits right before the flag, as in `-c FILE`. A flag that _SCRIPT_TEXT_FLAG_RE in
 # tests/test_threat_model_doc_drift.py matches in a string literal is read as one that hands an
 # interpreter its script text, which makes this module a shell-execution site there. That backtick
@@ -494,9 +494,9 @@ def named(group, name):
 """
 
 #: The stale-lock check's own code, after the shared reader. A raw string for the same reason. A line
-#: of options and no requirement is read by the runner's pip's own requirements-line parser. A pip
-#: `-c` flag its messages name has a backtick right before it, and the note above ``_CI_WORKFLOW``
-#: says why.
+#: of options and no requirement is read by the runner's pip's own requirements-line parser. A `-c`
+#: flag its messages name has a backtick right before it, and the note above ``_CI_WORKFLOW`` says
+#: why.
 _CHECK_STALE = r"""
 import optparse, shlex
 
