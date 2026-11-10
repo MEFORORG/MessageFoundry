@@ -267,7 +267,10 @@ class _RotatingTransit(_FakeTransit):
             # unheld version reaches this, and _needs_hvac() skips those without the extra.
             from hvac.exceptions import InvalidRequest  # type: ignore[import-untyped]
 
-            raise InvalidRequest("cannot generate HMAC: invalid key version")
+            # hvac carries Vault's JSON `errors` list; this is the text Vault's HMACKey answers.
+            raise InvalidRequest(
+                errors=[f"key version does not exist; latest key version is {self.latest}"]
+            )
         version = self.latest if key_version is None else key_version
         secret = self._hmac_secret[name] + version.to_bytes(4, "big")
         digest = hmac.new(secret, base64.b64decode(hash_input), hashlib.sha256).digest()
@@ -474,9 +477,13 @@ async def test_a_transient_failure_of_a_pinned_call_is_not_a_planted_version(
     assert any("could not run" in line for line in lines), lines
 
 
-def _pinned_refusal(answer: Any) -> CipherError:
-    """What the cipher raises when a pinned call gets Transit's 400 and the probe gets ``answer``
-    (a reply, or an exception to raise)."""
+#: Vault's own text for a pinned ``hmac`` call refused for its version, as hvac carries it.
+_VERSION_400 = ["key version does not exist; latest key version is 2"]
+
+
+def _pinned_refusal(answer: Any, errors: Any = _VERSION_400) -> CipherError:
+    """What the cipher raises when a pinned call gets Transit's 400 carrying ``errors`` (hvac's
+    ``errors`` list) and the probe gets ``answer`` (a reply, or an exception to raise)."""
     _needs_hvac()
     from hvac.exceptions import InvalidRequest
 
@@ -486,7 +493,7 @@ def _pinned_refusal(answer: Any) -> CipherError:
     class _Transit(_FakeTransit):
         def generate_hmac(self, **kw: Any) -> dict[str, Any]:
             if kw.get("key_version") is not None:
-                raise InvalidRequest("bad request")
+                raise InvalidRequest("bad request", errors=errors)
             if isinstance(answer, Exception):
                 raise answer
             return {"data": {"hmac": answer}}
@@ -516,6 +523,48 @@ def test_a_pinned_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: A
     from messagefoundry.store.crypto import AuditKeyVersionRefusedError
 
     assert not isinstance(_pinned_refusal(answer), AuditKeyVersionRefusedError)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "key version does not exist; latest key version is 2",
+        "no such key version",
+        "cannot generate HMAC: version is too old (disallowed by policy)",
+        "no HMAC key exists for that key version",
+    ],
+)
+def test_each_vault_version_refusal_text_is_a_refused_version(text: str) -> None:
+    """Every text Vault's hmac path answers a refused version with reads as one (BACKLOG #6707)."""
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+
+    refused = _pinned_refusal("vault:v2:AAAA", [text])
+    assert isinstance(refused, AuditKeyVersionRefusedError)
+
+
+@pytest.mark.parametrize(
+    "errors",
+    [
+        pytest.param(
+            ["unable to decode input as base64: illegal base64 data at input byte 4"],
+            id="payload-400",
+        ),
+        pytest.param(None, id="no-vault-text"),
+        pytest.param([], id="empty-list"),
+        pytest.param(["no such key version", "missing input for HMAC"], id="mixed"),
+    ],
+)
+def test_a_pinned_400_vault_does_not_name_as_a_version_refusal_is_a_plain_cipher_error(
+    errors: Any,
+) -> None:
+    """BACKLOG #6707: after a rotation the probe answers under a newer version, so the probe alone
+    cleared ANY pinned 400 as a refused version. A 400 about the request, or one with no Vault text,
+    must stay a check that could not run, never a break planted at this row."""
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+
+    refused = _pinned_refusal("vault:v2:AAAA", errors)
+    assert not isinstance(refused, AuditKeyVersionRefusedError)
+    assert "Transit audit HMAC failed" in str(refused)
 
 
 def test_a_refused_key_version_survives_a_pickle_with_its_text() -> None:

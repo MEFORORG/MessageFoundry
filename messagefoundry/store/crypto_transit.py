@@ -97,6 +97,36 @@ _ENV_TRANSIT_KEY = "MEFOR_STORE_TRANSIT_KEY"
 #: :data:`~messagefoundry.store.keyprovider_vault.TRANSIT_KEY_TYPES_AUDIT` (BACKLOG #1166); a shared key
 #: is held to the narrower data-key set, because it has to do both jobs.
 _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
+#: The texts Transit's ``hmac`` endpoint answers a refused key VERSION with, lower-cased (BACKLOG
+#: #6707). Read on 2026-11-10 from ``main`` of Vault (``builtin/logical/transit/path_hmac.go``,
+#: ``sdk/helper/keysutil/policy.go`` ``HMACKey`` and ``safeGetKeyEntry``) and of OpenBao, which says the
+#: same: a version above the latest or below zero, one the key no longer holds, one below
+#: ``min_encryption_version``, and one with no HMAC key. Every other 400 on that path, such as an
+#: input that is not base64, is about the request. A reworded text fails closed to CipherError.
+_VERSION_REFUSAL_TEXTS = (
+    "key version does not exist",
+    "no such key version",
+    "version is too old (disallowed by policy)",
+    "no hmac key exists for that key version",
+)
+
+
+def _names_a_version_refusal(exc: Exception) -> bool:
+    """Whether Vault's own error list on ``exc``, which hvac carries on ``exc.errors``, names only a
+    refused key version (BACKLOG #6707). A missing or empty list, or any entry that is not text or
+    not a version refusal, is not evidence, so the caller fails closed to :class:`CipherError`."""
+    errors: object = getattr(exc, "errors", None)
+    if not isinstance(errors, list) or not errors:
+        return False
+    for text in errors:
+        if not isinstance(text, str):
+            return False
+        lowered = text.lower()
+        if not any(known in lowered for known in _VERSION_REFUSAL_TEXTS):
+            return False
+    return True
+
+
 #: The fixed input of the probe that tells a refused key version from an outage (BACKLOG #2337).
 #: Base64, as Transit takes it. It carries no row data, so no row can decide the probe's answer.
 _VERSION_PROBE_INPUT = base64.b64encode(b"messagefoundry audit key version probe").decode("ascii")
@@ -254,11 +284,13 @@ class TransitCipher(_UnmarkedPolicy):
         raises another class, so none of those reads as a refused version. A 400 can also mean the
         key itself is missing, so a probe under the latest version, over FIXED input, must succeed
         too. Fixed input keeps a row's own content from deciding the answer. The probe must also
-        name a different version, or the refusal was not about the version.
+        name a different version, or the refusal was not about the version. A 400 about the request
+        must not pass once a rotation moves the latest version, so Vault's own error text must name
+        a refused version too (:func:`_names_a_version_refusal`, BACKLOG #6707).
 
         This infers the cause from the reply; it does not read the key's version range. So a node
         whose copy of the key lags a rotation can refuse a real, newer version and still pass."""
-        if not is_vault_bad_request(exc):
+        if not is_vault_bad_request(exc) or not _names_a_version_refusal(exc):
             return False
         try:
             probe: Any = self._client.secrets.transit.generate_hmac(
