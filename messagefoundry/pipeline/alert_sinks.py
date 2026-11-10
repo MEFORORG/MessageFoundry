@@ -204,8 +204,10 @@ class _ResolveFence:
     remains, :attr:`superseded` is set and the write is settled as not landed, with no retry, since
     a retry cannot help. The re-read is a second statement, so a raise landing between the two can
     mark a clear that had nothing to close as superseded; its caller then keeps what it would
-    have cleared, which is the safe side. If the snapshot read fails, the resolve closes only this
-    writer's own newest raise. Only a store without the fence methods resolves unfenced."""
+    have cleared, which is the safe side. If the snapshot read fails, that attempt fails as a
+    store error would, and a new read starts for the next attempt, which runs under the key's
+    lock; a resolve whose every read fails gives up as any failed resolve does. Only a store
+    without the fence methods resolves unfenced."""
 
     def __init__(
         self,
@@ -222,11 +224,13 @@ class _ResolveFence:
         self._connection = connection
         self._writer_id = writer_id
         self._snapshot: asyncio.Future[Sequence[_Generation]] | None = None
-        self._snapshot_failed_logged = False
         self.superseded = False
 
     def begin(self) -> None:
-        self._snapshot = asyncio.ensure_future(
+        self._snapshot = self._read()
+
+    def _read(self) -> asyncio.Future[Sequence[_Generation]]:
+        return asyncio.ensure_future(
             self._store.open_alert_generations(
                 event_type=self._event_type, connection=self._connection
             )
@@ -244,21 +248,15 @@ class _ResolveFence:
     async def resolve(self, now: float) -> int:
         assert self._snapshot is not None  # begin ran
         self.superseded = False
-        seen: Sequence[_Generation] = ()
         try:
             seen = await self._snapshot
-        except Exception as exc:
-            # With no snapshot, close only this writer's own newest raise: a false open is the safe
-            # side, where an unfenced resolve could close another process's newer raise. A retry
-            # re-awaits the same failed read, so this is logged once per clear.
-            if not self._snapshot_failed_logged:
-                self._snapshot_failed_logged = True
-                log.warning(
-                    "alert-instance resolve fence: the snapshot read failed (%s); closing only "
-                    "this process's own raise",
-                    type(exc).__name__,
-                    exc_info=True,
-                )
+        except Exception:
+            # The attempt fails, so the retry loop logs it and tries again, and the next attempt
+            # reads afresh: re-awaiting this failed read would fail every retry, and closing only
+            # this writer's own raise would miss one an earlier run of this process left
+            # (BACKLOG #4916, review round-c69a5607).
+            self._snapshot = self._read()
+            raise
         closed = await self._store.resolve_alert_instances_fenced(
             event_type=self._event_type,
             connection=self._connection,
@@ -1264,8 +1262,9 @@ class AlertRuleSet:
 
 @dataclass
 class _ClearedState:
-    """The in-memory alert state one ``connection_started`` cleared for a key, held until its
-    durable resolve settles (BACKLOG #1741, :meth:`NotifierAlertSink._resolve_settled`)."""
+    """The in-memory alert state one clear dropped for a key, held until its durable resolve
+    settles (:meth:`NotifierAlertSink._resolve_settled`): a ``connection_started``'s (BACKLOG
+    #1741), or any other auto-resolving inverse's (BACKLOG #4916), whose ``last`` is always None."""
 
     last: float | None
     occurrences: int | None
@@ -2094,8 +2093,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             raise
 
     def _resolve_settled(self, key: str, cleared: _ClearedState, *, landed: bool) -> None:
-        """Settle the in-memory state :meth:`connection_started` cleared, once its durable resolve
-        has landed or failed (BACKLOG #1741). A landed resolve closed the row, so the state stays
+        """Settle the in-memory state a clear dropped, once its durable resolve has landed or
+        failed: :meth:`connection_started`'s (BACKLOG #1741), or any other inverse's (BACKLOG
+        #4916). A landed resolve closed the row, so the state stays
         cleared, every earlier clear still waiting is settled with it, and a suspend set while it was
         in flight muted the row it closed and goes too. A failed one left the row open: a later
         start's resolve still queued behind it then takes the state over and decides in its turn, or,
@@ -2278,7 +2278,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # has already taken both entries, so nothing is queued for it here.
             suspended = self._suspended.pop(key, None)
             occurrences = self._occurrences.pop(key, None)
-            if on_settled is None and (suspended is not None or occurrences is not None):
+            # Queued even when it dropped nothing: a later clear's entry is what takes an earlier
+            # failed one's state over in _resolve_settled, rather than that state going back.
+            if on_settled is None:
                 cleared = _ClearedState(None, occurrences, suspended)
                 self._pending_clears.setdefault(key, []).append(cleared)
 

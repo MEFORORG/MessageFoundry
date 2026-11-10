@@ -273,12 +273,54 @@ async def test_a_clear_with_nothing_open_settles_as_landed(tmp_path: Path) -> No
         await store.close()
 
 
+class _FlakySnapshot(_Gated):
+    """A view whose first ``fail`` reads of the key raise, as a transient borrow timeout would."""
+
+    def __init__(self, inner: MessageStore, fail: int) -> None:
+        super().__init__(inner)
+        self.fail = fail
+        self.reads = 0
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "open_alert_generations":
+
+            async def read(**kw: Any) -> Any:
+                self.reads += 1
+                if self.reads <= self.fail:
+                    raise RuntimeError("synthetic: store unavailable")
+                return await self._inner.open_alert_generations(**kw)
+
+            return read
+        return super().__getattr__(name)
+
+
+async def test_a_restart_and_a_transient_snapshot_failure_still_close_the_old_runs_alert(
+    tmp_path: Path,
+) -> None:
+    """Round-c69a5607 item a: an earlier run of this process (another writer id) raised the key.
+    The first clear after the restart fails its snapshot read once. That attempt fails, the retry
+    reads again, and the clear closes the earlier run's alert."""
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        earlier_run = NotifierAlertSink([], store=store)
+        _raise(earlier_run)
+        await _drain(earlier_run)
+        view = _FlakySnapshot(store, fail=1)
+        restarted = NotifierAlertSink([], store=view)
+        _clear(restarted)
+        await _drain(restarted)
+        assert view.reads >= 2, "the retry read the snapshot again"
+        assert await _live(store) == []
+    finally:
+        await store.close()
+
+
 @pytest.mark.parametrize("other_raised_last", [False, True], ids=["own-raise", "other-raise"])
-async def test_a_failed_snapshot_closes_only_the_own_raise_and_says_so_once(
+async def test_a_snapshot_that_never_reads_gives_up_and_closes_nothing(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, other_raised_last: bool
 ) -> None:
-    """Round-4 finding 1: with no snapshot, the resolve closes this process's own newest raise and
-    never another process's, rather than falling back to the unfenced resolve."""
+    """With every read failing, each attempt fails, the resolve gives up as any failed resolve
+    does, and nothing is closed unfenced: another process's newer raise is never this clear's."""
     store = await MessageStore.open(tmp_path / "s.db")
     try:
         a = NotifierAlertSink([], store=store)
@@ -288,43 +330,72 @@ async def test_a_failed_snapshot_closes_only_the_own_raise_and_says_so_once(
         if other_raised_last:
             _raise(b)
             await _drain(b)
-
-        class _Broken(_Gated):
-            def __getattr__(self, name: str) -> Any:
-                if name == "open_alert_generations":
-
-                    async def broken(**_kw: Any) -> Any:
-                        raise RuntimeError("store unavailable")
-
-                    return broken
-                return super().__getattr__(name)
-
-        a._store = _Broken(store)
+        view = _FlakySnapshot(store, fail=99)
+        a._store = view
+        settled: list[bool] = []
         with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.alert_sinks"):
-            _clear(a)
+            a._record_state(
+                {"type": "intake_resumed", "connection": KEY}, "info", on_settled=settled.append
+            )
             await _drain(a)
-        if other_raised_last:
-            [(_id, count)] = await _live(store)
-            assert count == 2, "another process's newer raise is not this clear's to close"
-        else:
-            assert await _live(store) == [], "this process's own raise is still closed"
-        failed = [r for r in caplog.records if "snapshot read failed" in r.getMessage()]
-        assert len(failed) == 1
+        assert settled == [False]
+        assert len(await _live(store)) == 1
+        assert any("gave up" in r.getMessage() for r in caplog.records)
+        assert view.calls.get(_FENCED) is None, "no UPDATE runs without a snapshot"
     finally:
         await store.close()
 
 
-async def test_a_clear_nobody_settles_pays_for_no_re_read(tmp_path: Path) -> None:
-    """Review round 2: only a settle callback reads the superseded verdict, so an unsettled clear
-    that closes nothing makes one read (the snapshot) and no second one."""
+async def test_a_failed_first_clear_does_not_restore_state_a_second_clear_then_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-c69a5607 item b: the second clear drops nothing (the first already took the suspend
+    and the count), but it is queued all the same. When the first clear's resolve gives up, the
+    second takes its state over, and once it closes the row nothing comes back."""
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        a = NotifierAlertSink([], store=store)
+        monkeypatch.setattr(a, "_INVERSE_RETRY_DELAYS", (0.0,))
+        key = f"intake_paused:{KEY}"
+        _raise(a)
+        _raise(a)
+        await _drain(a)
+        a._suspended[key] = time.time() + 3600.0
+        real = store.resolve_alert_instances_fenced
+        failures = [RuntimeError("synthetic: locked"), RuntimeError("synthetic: locked")]
+
+        async def failing_first(**kw: Any) -> int:
+            if failures:
+                raise failures.pop()
+            return await real(**kw)
+
+        monkeypatch.setattr(store, "resolve_alert_instances_fenced", failing_first)
+        _clear(a)  # both of its attempts fail
+        _clear(a)  # drops nothing; lands
+        await _drain(a)
+        assert await _live(store) == []
+        assert key not in a._suspended, "the closed row's suspend did not come back"
+        assert key not in a._occurrences, "nor its occurrence count"
+        assert key not in a._pending_clears
+    finally:
+        await store.close()
+
+
+async def test_a_clear_with_nothing_open_reads_twice_and_settles_its_queued_state(
+    tmp_path: Path,
+) -> None:
+    """Every inverse queues the state it dropped (round-c69a5607 item b), so each one settles, and
+    one that closes nothing pays for the verdict re-read: the snapshot, the UPDATE and one more
+    read. With nothing live, it settles as landed and its queue entry goes."""
     store = await MessageStore.open(tmp_path / "s.db")
     try:
         view_a = _Gated(store)
         a = NotifierAlertSink([], store=view_a)
         _clear(a)
         await _drain(a)
-        assert view_a.calls.get("open_alert_generations") == 1
+        assert view_a.calls.get("open_alert_generations") == 2
         assert view_a.calls.get(_FENCED) == 1
+        assert f"intake_paused:{KEY}" not in a._pending_clears
     finally:
         await store.close()
 

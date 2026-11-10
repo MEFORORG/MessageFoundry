@@ -396,5 +396,6 @@ landed, and it is not retried. What the clear dropped from memory as it was emit
 key's suspend window and occurrence count for every inverse, and `connection_started`'s cooldown
 too, so a later raise of the still-open row stays muted and keeps its escalation tier. A fault in
 the re-read that tells superseded apart is treated as superseded, with no retry. A store without
-the fence methods resolves unfenced, as before; a failed snapshot read closes only the resolver's
-own newest raise.
+the fence methods resolves unfenced, as before. A failed snapshot read fails that attempt, and the
+retry reads again under the key's lock, so a clear still closes a raise an earlier run of the same
+process left once a read succeeds.
