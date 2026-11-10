@@ -1029,7 +1029,7 @@ def write_handoff_file(
 
     service_sid = check_handoff_writable(service_account, enforcing=enforcing)
     from messagefoundry.auth.anchor_path import ADMINISTRATORS_SID
-    from messagefoundry.restricted_file import _OwnerRefused
+    from messagefoundry.restricted_file import OwnerRefused
 
     try:
         # write_restricted_file refuses a grant that resolves to a package SID or a broad group.
@@ -1042,7 +1042,7 @@ def write_handoff_file(
             read_delete=True,
             local_volume_only=True,
         )
-    except _OwnerRefused as exc:
+    except OwnerRefused as exc:
         raise CustodyError(f"the handoff was not written: {exc}") from exc
 
 
@@ -1058,10 +1058,10 @@ def check_handoff_writable(service_account: str, *, enforcing: bool = True) -> s
         raise DpapiUnavailable("the handoff blob is Windows-only; a POSIX host needs no handoff")
     from messagefoundry.restricted_file import (
         RestrictedFileError,
-        _administrators_enabled,
         _lookup_account_name,
         _lookup_sid_kind,
         _resolve_sid,
+        administrators_enabled,
         custody_non_local_account_problem,
         handoff_grantee_problem,
         local_account_domain_sid,
@@ -1089,7 +1089,7 @@ def check_handoff_writable(service_account: str, *, enforcing: bool = True) -> s
         # log's patient-name scrubber leaves readable. The typed name, such as NT AUTHORITY\LOCAL
         # SERVICE, is an all-capitals run it would scrub (vault BACKLOG #6674 item 4).
         raise CustodyError(f"the handoff was not written: {refused}")
-    if not _administrators_enabled():
+    if not administrators_enabled():
         raise CustodyError(
             "the handoff was not written: it must be owned by Administrators, and this process's "
             "token does not hold that group enabled (an administrator who is not elevated holds "

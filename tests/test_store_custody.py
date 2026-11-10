@@ -995,7 +995,7 @@ def _engine_sid() -> str:
 def _is_elevated() -> bool:
     # The production pre-check itself, so a test skips exactly where write_handoff_file refuses
     # up front (vault BACKLOG #6674 item 5), never on a second API's answer to a nearby question.
-    return sys.platform == "win32" and restricted_file._administrators_enabled()
+    return sys.platform == "win32" and restricted_file.administrators_enabled()
 
 
 #: The handoff is written owned by Administrators, which a token may make a file's owner where it
@@ -1028,7 +1028,7 @@ def test_windows_a_token_without_administrators_is_refused_up_front(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dpapi_scopes: list[bool]
 ) -> None:
     # The same refusal on an elevated leg, where the real pre-check would pass.
-    monkeypatch.setattr(restricted_file, "_administrators_enabled", lambda: False)
+    monkeypatch.setattr(restricted_file, "administrators_enabled", lambda: False)
     path = tmp_path / "handoff.key"
     with pytest.raises(CustodyError, match="must be owned by Administrators"):
         custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
@@ -1042,7 +1042,7 @@ def test_windows_a_create_refused_its_owner_is_a_custody_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Past a pre-check that answered wrongly, Windows itself refuses the owner at the create.
-    monkeypatch.setattr(restricted_file, "_administrators_enabled", lambda: True)
+    monkeypatch.setattr(restricted_file, "administrators_enabled", lambda: True)
     path = tmp_path / "handoff.key"
     with pytest.raises(CustodyError, match="may not make") as excinfo:
         custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
@@ -1058,7 +1058,7 @@ def test_windows_a_create_refused_its_owner_is_a_custody_refusal_on_every_leg(
     # Vault BACKLOG #6674 item 2: the test above skips on the elevated hosted legs, so this one asks
     # for an owner no token there may assign either (one service's SID, without the restore
     # privilege enabled). Windows refuses it at the create on every leg, and custody translates it.
-    monkeypatch.setattr(restricted_file, "_administrators_enabled", lambda: True)
+    monkeypatch.setattr(restricted_file, "administrators_enabled", lambda: True)
     real = restricted_file.write_restricted_file
 
     # Not _owned_by_this_account: the owner swapped in here is one no token may assign.
@@ -1070,7 +1070,7 @@ def test_windows_a_create_refused_its_owner_is_a_custody_refusal_on_every_leg(
     path = tmp_path / "handoff.key"
     with pytest.raises(CustodyError, match="may not make") as excinfo:
         custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
-    assert isinstance(excinfo.value.__cause__, restricted_file._OwnerRefused)
+    assert isinstance(excinfo.value.__cause__, restricted_file.OwnerRefused)
     assert dpapi_scopes == [True]  # it got as far as protecting the blob, then the create refused
     assert not path.exists()
     assert not _leaks(str(excinfo.value), _MASTER)
@@ -1224,7 +1224,7 @@ def _owned_by_this_account(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make :func:`custody.write_handoff_file` create its file owned by this process's account, an
     owner every token may assign, in place of Administrators, which only some may. The read accepts
     the service as an owner, and a handoff made for this account names it as the service."""
-    monkeypatch.setattr(restricted_file, "_administrators_enabled", lambda: True)
+    monkeypatch.setattr(restricted_file, "administrators_enabled", lambda: True)
     real = restricted_file.write_restricted_file
     me = _engine_sid()
 

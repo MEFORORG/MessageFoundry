@@ -52,7 +52,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry.auth.anchor_path import (
     _GRANTING_ACE_TYPES,
@@ -71,7 +71,9 @@ __all__ = [
     "LINUX_HOST_FILE_SYSTEMS",
     "WINERROR_ACCESS_DENIED",
     "WINERROR_SHARING_VIOLATION",
+    "OwnerRefused",
     "RestrictedFileError",
+    "administrators_enabled",
     "broad_access_problem",
     "can_add_a_file",
     "custody_account_problem",
@@ -229,23 +231,7 @@ def _lookup_sid_kind(sid: str) -> int | None:
     import ctypes
     from ctypes import wintypes
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
-    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
-    advapi32.LookupAccountSidW.argtypes = [
-        wintypes.LPCWSTR,  # lpSystemName (NULL = this machine)
-        ctypes.c_void_p,  # Sid
-        wintypes.LPWSTR,  # Name
-        ctypes.POINTER(wintypes.DWORD),  # cchName
-        wintypes.LPWSTR,  # ReferencedDomainName
-        ctypes.POINTER(wintypes.DWORD),  # cchReferencedDomainName
-        ctypes.POINTER(ctypes.c_int),  # peUse
-    ]
-    advapi32.LookupAccountSidW.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-
+    advapi32, kernel32 = _sid_libraries()
     pointer = ctypes.c_void_p()
     if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(pointer)):
         raise RestrictedFileError(f"the account {sid} could not be read as a SID")
@@ -1240,8 +1226,45 @@ def replace_generated(staged: Path, live: Path) -> None:
 # --- creating the file ----------------------------------------------------------------------------
 
 
-class _OwnerRefused(RestrictedFileError):
+class OwnerRefused(RestrictedFileError):
     """The file could not be created owned by the account asked for, so nothing was written to it."""
+
+
+@functools.cache
+def _sid_libraries() -> tuple[Any, Any]:
+    """``advapi32`` and ``kernel32``, loaded once, with the prototypes of the SID calls this
+    module's account helpers share declared once: converting a SID to and from its string form,
+    looking one up, checking a token's membership, and freeing what those return. Windows only."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise RestrictedFileError("a SID is converted on Windows only")
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    advapi32.CheckTokenMembership.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    advapi32.CheckTokenMembership.restype = wintypes.BOOL
+    advapi32.LookupAccountSidW.argtypes = [
+        wintypes.LPCWSTR,  # lpSystemName (NULL = this machine)
+        ctypes.c_void_p,  # Sid
+        wintypes.LPWSTR,  # Name
+        ctypes.POINTER(wintypes.DWORD),  # cchName
+        wintypes.LPWSTR,  # ReferencedDomainName
+        ctypes.POINTER(wintypes.DWORD),  # cchReferencedDomainName
+        ctypes.POINTER(ctypes.c_int),  # peUse
+    ]
+    advapi32.LookupAccountSidW.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    return advapi32, kernel32
 
 
 #: ERROR_INVALID_OWNER: the creating token may not make the SID asked for a new object's owner.
@@ -1249,7 +1272,7 @@ _WINERROR_INVALID_OWNER = 1307
 _READ_CONTROL = 0x00020000
 
 
-def _administrators_enabled() -> bool:
+def administrators_enabled() -> bool:
     """Whether this process's token holds Administrators as an enabled group: at least an elevated
     administrator's and SYSTEM's do, and a filtered token's (an administrator not elevated, where
     the group is deny-only) does not.
@@ -1263,19 +1286,7 @@ def _administrators_enabled() -> bool:
     import ctypes
     from ctypes import wintypes
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
-    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
-    advapi32.CheckTokenMembership.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_void_p,
-        ctypes.POINTER(wintypes.BOOL),
-    ]
-    advapi32.CheckTokenMembership.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-
+    advapi32, kernel32 = _sid_libraries()
     sid = ctypes.c_void_p()
     if not advapi32.ConvertStringSidToSidW(ADMINISTRATORS_SID, ctypes.byref(sid)):
         raise RestrictedFileError(
@@ -1623,7 +1634,7 @@ def _create_restricted_windows(
         if handle is None or handle == invalid_handle:
             error = ctypes.get_last_error()
             if owner_sid is not None and error == _WINERROR_INVALID_OWNER:
-                raise _OwnerRefused(
+                raise OwnerRefused(
                     f"{path} was not created: this process may not make {describe_sid(owner_sid)} "
                     "the owner of a new file"
                 )
@@ -1642,12 +1653,12 @@ def _create_restricted_windows(
         security = _read_handle_security(handle)
         if owner_sid is not None:
             if security.error is not None or security.owner_sid is None:
-                raise _OwnerRefused(
+                raise OwnerRefused(
                     f"{path} could not be created owned by {describe_sid(owner_sid)}: its owner "
                     f"could not be read back ({security.error or 'none was returned'})"
                 )
             if security.owner_sid != owner_sid:
-                raise _OwnerRefused(
+                raise OwnerRefused(
                     f"{path} could not be created owned by {describe_sid(owner_sid)}: it reads back "
                     f"owned by {_who(security.owner_sid)}"
                 )
@@ -1676,15 +1687,8 @@ def _resolve_sid(principal: str) -> str:
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise RestrictedFileError("an account name resolves to a SID on Windows only")
     import ctypes
-    from ctypes import wintypes
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
-    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-
+    advapi32, kernel32 = _sid_libraries()
     refusal = RestrictedFileError(f"the account {principal!r} could not be resolved")
     literal = principal.removeprefix("*")
     if literal.upper().startswith("S-1-"):
@@ -1721,12 +1725,7 @@ def _render_sid(sid_pointer: object) -> str | None:
     import ctypes
     from ctypes import wintypes
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
-    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
+    advapi32, kernel32 = _sid_libraries()
     text = wintypes.LPWSTR()
     if not advapi32.ConvertSidToStringSidW(sid_pointer, ctypes.byref(text)):
         return None

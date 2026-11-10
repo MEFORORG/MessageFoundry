@@ -577,7 +577,7 @@ def test_windows_creates_the_drafts_descriptor_without_the_creators_entry(tmp_pa
 
 def _is_elevated() -> bool:
     # The production pre-check, not a second API (vault BACKLOG #6674 item 5).
-    return sys.platform == "win32" and restricted_file._administrators_enabled()
+    return sys.platform == "win32" and restricted_file.administrators_enabled()
 
 
 @windows_only
@@ -606,7 +606,7 @@ def test_windows_an_owner_no_token_may_assign_is_refused_on_every_leg(tmp_path: 
     path = tmp_path / "handoff.key"
     with pytest.raises(RestrictedFileError, match="may not make") as caught:
         write_restricted_file(path, b"k", owner=f"*{_SERVICE}")
-    assert isinstance(caught.value, restricted_file._OwnerRefused)
+    assert isinstance(caught.value, restricted_file.OwnerRefused)
     assert not path.exists()
 
 
@@ -630,7 +630,7 @@ def test_windows_an_owner_is_screened_as_a_read_grant_is(
     with pytest.raises(RestrictedFileError, match=refusal) as caught:
         write_restricted_file(path, b"k", owner=owner)
     assert "cannot be owned by it" in str(caught.value)
-    assert not isinstance(caught.value, restricted_file._OwnerRefused)  # refused before the create
+    assert not isinstance(caught.value, restricted_file.OwnerRefused)  # refused before the create
     assert not path.exists()
 
 
