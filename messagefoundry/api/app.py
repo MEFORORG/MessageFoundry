@@ -3829,11 +3829,12 @@ def _compose_preset_layers(
     ``search_messages`` (ADR 0136 §5, BACKLOG #151). Each metadata scalar
     (``channel_id``/``status``/``message_type``/``control_id``) takes the first non-empty value and
     **rejects a conflicting second** (400). **Exactly one** preset may carry a content needle (a
-    ``content`` substring or a ``field_path``[+``field_value``]); >1 or 0 → 400. A lone
-    ``field_value`` counts as a needle too, so ``make_spec`` refuses it (400) rather than the compose
-    dropping it (BACKLOG #6700). Raises
+    ``content`` substring or a ``field_path``[+``field_value``]); >1 or 0 → 400. Raises
     :class:`HTTPException` (400) on a conflict / missing-or-duplicate needle; the caller maps the
-    ``ContentSearchError`` from a malformed field path likewise."""
+    ``ContentSearchError`` from a malformed field path likewise.
+
+    A lone ``field_value`` counts as a needle too, so ``make_spec`` refuses it (400) rather than the
+    compose dropping it (BACKLOG #6700)."""
     meta_keys = ("channel_id", "status", "message_type", "control_id")
     meta: dict[str, str | None] = dict.fromkeys(meta_keys)
     needle: dict[str, Any] | None = None
@@ -3848,7 +3849,12 @@ def _compose_preset_layers(
                     )
                 meta[key] = value
         # A lone field_value counts, so make_spec refuses it rather than the compose dropping it.
-        if sends_a_needle(crit.get("content"), crit.get("field_path"), crit.get("field_value")):
+        # Only a str field_value is read here: a malformed stored one on a preset that is not the
+        # needle must not turn this read into a 500.
+        fv = crit.get("field_value")
+        if sends_a_needle(
+            crit.get("content"), crit.get("field_path"), fv if isinstance(fv, str) else None
+        ):
             if needle is not None:
                 raise HTTPException(
                     400, "layered search allows at most one content predicate across presets"

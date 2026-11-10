@@ -525,3 +525,35 @@ async def test_a_lone_field_value_is_refused_not_saved_unread(engine: Engine) ->
     rows = await engine.store.list_audit(action="preset.create")
     shapes = sorted(json.loads(r["detail"])["needle_shape"] or "" for r in rows)
     assert shapes == ["", "field_path"]
+
+
+async def test_a_non_str_stored_field_value_beside_the_needle_is_not_a_500(engine: Engine) -> None:
+    """The compose reads every preset's field_value to find a lone one (BACKLOG #6700). A stored
+    non-str field_value on a preset that is NOT the needle was never read on origin/main, so it must
+    not become a 500 now. Control: the same layering with an intact second preset also answers 200."""
+    pytest.importorskip("psutil")
+    import json
+
+    from messagefoundry.api import create_app
+
+    service = await _user(engine, Role.OPERATOR, "op")
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        ids = []
+        for name, criteria in (("a", {"content": "MRN999"}), ("b", {"channel_id": "ch1"})):
+            r = await c.post(
+                "/search/presets", json={"name": name, "criteria": criteria}, headers=h
+            )
+            assert r.status_code == 200, r.text
+            ids.append(r.json()["id"])
+        control = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
+        assert control.status_code == 200, control.text
+        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
+        await engine.store._db.execute(
+            "UPDATE search_presets SET criteria=? WHERE id=?",
+            (json.dumps({"channel_id": "ch1", "field_value": 5}), ids[1]),
+        )
+        await engine.store._db.commit()
+        r = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
+        assert r.status_code == 200, r.text
