@@ -285,10 +285,30 @@ _CAMEL_WORDS = _CREDENTIAL_WORDS + _TOKEN_WORDS + _KEY_MATERIAL_WORDS
 # the lookahead. It is also what keeps a camelCase start to a whole label: ``accessTokenValue=`` is not
 # read, exactly as ``access_token_value=`` is not, since both patterns end the keyword with ``\b``.
 #
+# THE VALUE WALKS STOP AT IT TOO. The stop before a later quoted label checks in front of each
+# :data:`_RUN_UNIT`, which splits a run at exactly this boundary, so ``token=x;accessToken="v w"``
+# hides "v w" as ``token=x;access_token="v w"`` does.
+#
 # AT LEAST THESE ARE NOT READ, and each is a residual: an all-capitals run before the keyword
 # (``SASToken=``, where the capital follows a capital), a keyword spelled with a fold character such
 # as U+017F as its first letter (the case-sensitive class reads only ASCII capitals), and a label word
-# glued on with no capital at all (``accesstoken=``), which no start can find inside a word.
+# glued on with no capital at all (``accesstoken=``), which no start can find inside a word. And a
+# braced value under a camelCase label after an earlier plain value, ``token=a;userPwd={pp ww}``,
+# still prints the braced tail " ww}", because :data:`_BRACED_HEAD` keeps its ``\b``. The support
+# bundle's own copy of these patterns, in ``support/redact.py``, has neither this start nor the split
+# walk; its second layer is this module, which reads a camelCase label the copy left alone, but not
+# one the copy's plain value already ran over.
+#
+# THE START IS A TRADE, as :data:`_LABEL_START`'s escape start was, and for the same reason: the passes
+# run one after another, and a label read now can end an earlier value where it used to run on, or
+# take a later label into its own plain value. Measured 2026-11-10 over 40,000 seeded lines dense with
+# camelCase labels, against these patterns with this start and the split walk taken out: 1,407 lines
+# print a value atom they hid, and 33,990 atoms they printed are hidden. Each of the 20 or so printed
+# lines read by hand was a cascade the comment on the stop above already names, reached now because
+# the label is read at all: a newly read plain value running over a later label whose value is
+# unquoted, unclosed, or a quote the guard refuses. That is a sample, not a census. The structured
+# differential in ``tests/test_log_redaction_secret_domain.py``, which holds no camelCase label,
+# reads 0 printed.
 _CAMEL_START = r"(?-i:(?<=[a-z0-9])(?=[A-Z]))(?=(?i:" + _alternation(_CAMEL_WORDS) + r")\b)"
 #: Where the three LABEL patterns may start: :data:`_LABEL_START` or :data:`_CAMEL_START`.
 #: ``_AUTH_SCHEME`` keeps :data:`_LABEL_START` alone, since a scheme word glued on by a capital, as
@@ -409,13 +429,16 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 #   fired after "." and "-" too, and that printed value text: a JWT signature glued by "_" onto a
 #   ``password=`` label came out as label.
 #
-# CHECKED ONCE PER RUN OF LETTERS AND DIGITS, NOT PER CHARACTER. Each plain class below walks its value
-# as tokens -- a whole run of letters and digits, or one other character -- and checks the stop only in
-# front of a run. Every branch of the stop starts on a letter or digit that follows some other
-# character, which is exactly the start of a run, so the two agree; and for the same reason no
-# lookbehind is needed in front of the keyword. Per run is cheaper than per character, but not by
-# much on a hyphen-and-dot run, where every run is one character long. What keeps ordinary lines
-# level is the fast path at ``_NO_QUOTED_LABEL_AFTER``, which skips the walk entirely.
+# CHECKED ONCE PER UNIT OF A RUN OF LETTERS AND DIGITS, NOT PER CHARACTER. Each plain class below walks
+# its value as tokens -- a :data:`_RUN_UNIT`, or one other character -- and checks the stop only in
+# front of a unit. A unit is a whole run of letters and digits, split at each camelCase boundary
+# since BACKLOG #5545. Every branch of the stop starts on a letter or digit that follows some other
+# character, which is the start of a run, or on a capital after a lower-case letter or a digit, where
+# :data:`_CAMEL_START` lets a label start; those are exactly the starts of units, so the two agree;
+# and for the same reason no lookbehind is needed in front of the keyword. Per unit is cheaper than
+# per character, but not by much on a hyphen-and-dot run, where every run is one character long. What
+# keeps ordinary lines level is the fast path at ``_NO_QUOTED_LABEL_AFTER``, which skips the walk
+# entirely.
 #
 # THE MEFOR_ BRANCH KEEPS THE ``\b`` ITS OWN PATTERN HAS, and so does the prefix branch. That is a cost
 # decision. ``\b`` cannot fire inside a word, so a long MEFOR_MEFOR_... or a_a_a_... run offers one
@@ -423,8 +446,8 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 #
 # LINEAR, for three reasons that together bound how often any character is read.
 #
-# * A value walk checks the stop only at the start of a run, and one pattern's matches never overlap,
-#   so each run start is checked a fixed number of times per pattern: once on the walk, and once more
+# * A value walk checks the stop only at the start of a unit, and one pattern's matches never overlap,
+#   so each unit start is checked a fixed number of times per pattern: once on the walk, and once more
 #   where the fast path read the run first and failed.
 # * One check is a fixed-length keyword test plus walks that each start at only one place in a run.
 #   The underscored-prefix walk needs a hard separator behind it, so it starts only at the head of a
@@ -558,6 +581,16 @@ _GUARDED_QUOTED_VALUE = (
 _GUARDED_BRACED_VALUE = r"\{(?:[^}'\"\r\n]|\}\})*+\}(?!\})"
 #: The same, holding no whitespace at all: the one braced shape the old plain class took whole.
 _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
+
+#: One unit of a value walk: a run of letters and digits, SPLIT AT EVERY CAMELCASE BOUNDARY, a capital
+#: after a lower-case letter or a digit (BACKLOG #5545). The walks below check for a later label in
+#: front of each unit, and a label may start at such a boundary since :data:`_CAMEL_START`, so a walk
+#: checking at the head of a whole run alone would run over ``x;accessToken="v w"`` and print the
+#: quoted value that ``x;access_token="v w"`` hides. The split falls exactly where
+#: :data:`_CAMEL_START`'s lookbehind and capital hold, so a stop lands only where a label pattern can
+#: start. Each branch opens on a class the other refuses and takes its run possessively, so the walk
+#: stays deterministic, and a unit is never empty.
+_RUN_UNIT = r"(?-i:[A-Z]++[a-z0-9]*+|[a-z0-9]++)"
 
 #: The first letters of every label keyword. A one-character gate in front of the keyword alternation:
 #: a case-folded alternation is tried branch by branch, and most runs start with none of these.
@@ -717,14 +750,14 @@ _RUN_ON_LABEL = (
     r"|\b(?-i:" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]++)\b[^\S\r\n]*+[:=][^\S\r\n]*+)"
 )
 #: The outer walk: up to the next quote of one kind, or to a label whose value opens with one.
-_SQ_RUN_ON_WALK = r"(?:[^'\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"')[A-Za-z0-9]++)*+"
-_DQ_RUN_ON_WALK = r"(?:[^\"\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"\")[A-Za-z0-9]++)*+"
+_SQ_RUN_ON_WALK = r"(?:[^'\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"')" + _RUN_UNIT + r")*+"
+_DQ_RUN_ON_WALK = r"(?:[^\"\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"\")" + _RUN_UNIT + r")*+"
 #: The inner walk, over the later label's value. It stops at anything a later pass could read past
 #: the closer: either quote, a "{", a "://", any label at all, and any character outside ASCII, so
 #: a keyword spelled with a fold character stops it in both copies alike.
 _RUN_ON_INNER = (
     r"(?:[^'\"{:\r\nA-Za-z0-9\x80-\U0010ffff]|:(?!//)"
-    r"|(?!" + _RUN_ON_LABEL + r")(?-i:[A-Za-z0-9])++)*+"
+    r"|(?!" + _RUN_ON_LABEL + r")" + _RUN_UNIT + r")*+"
 )
 
 # ``_CREDENTIAL_KV``'s quoted value: the plain quoted form ``'[^'\r\n]*+'``, except where the quote that
@@ -802,26 +835,26 @@ _KEY_TERMINATORS = r"\s'\";&"  # _KEY_MATERIAL
 _SCHEME_TERMINATORS = r"\s'\",;"  # _AUTH_SCHEME
 _PLAIN_VALUE = (
     rf"['\"]?(?:[^{_PLAIN_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_PLAIN_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_PLAIN_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_PLAIN_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_PLAIN_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KV_VALUE = (
     rf"['\"]?(?:[^{_KV_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KV_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KV_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_KV_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_KV_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KEY_VALUE = (
     rf"['\"]?(?:[^{_KEY_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KEY_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KEY_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_KEY_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_KEY_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_SCHEME_VALUE = (
     rf"['\"]?(?:[^{_SCHEME_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_SCHEME_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_SCHEME_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_SCHEME_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_SCHEME_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 

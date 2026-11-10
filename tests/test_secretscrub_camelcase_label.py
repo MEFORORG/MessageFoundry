@@ -117,6 +117,75 @@ def test_the_named_residuals_still_print(line: str) -> None:
     assert _VALUE in scrub_credentials(line)
 
 
+#: A later camelCase label with a quoted value, after a first label of every family, glued on by
+#: each separator the stop is written for and by none at all. The stop before a later quoted label
+#: checks in front of every camelCase unit of a run, so the first label's plain value stops there
+#: and the later label's own pattern takes its quoted value.
+_SWALLOW_FIRST = (
+    "password",
+    "client_secret",
+    "api_token",
+    "session",
+    "private_key",
+    "MEFOR_STORE_PW",
+    "Authorization: Bearer",
+)
+_SWALLOW_SEPARATORS = (";", "&", ",", ":", "=", "|", ".", "-", "_", "", " ")
+_SWALLOW_SECOND = ("accessToken", "clientSecret", "userPassword", "refreshToken", "bindPwd")
+_SWALLOW_VALUES = tuple(f"{_VALUE}{n}" for n in range(3))
+
+
+def _swallow_lines() -> list[str]:
+    first_value, head, tail = _SWALLOW_VALUES
+    return [
+        f"connect failed {first}={first_value}{sep}{second}={q}{head} {tail}{q} for svc"
+        if not first.endswith("Bearer")
+        else f"connect failed {first} {first_value}{sep}{second}={q}{head} {tail}{q} for svc"
+        for first in _SWALLOW_FIRST
+        for sep in _SWALLOW_SEPARATORS
+        for second in _SWALLOW_SECOND
+        for q in ("'", '"')
+    ]
+
+
+def _printing(lines: list[str], apply: object) -> list[str]:
+    assert callable(apply)
+    return [line for line in lines if any(value in apply(line) for value in _SWALLOW_VALUES)]
+
+
+def test_a_plain_value_does_not_swallow_a_later_quoted_camelcase_label() -> None:
+    """On the write-time surfaces, no value of any line prints."""
+    lines = _swallow_lines()
+    assert len(lines) == 7 * 11 * 5 * 2
+    for name, apply in _SURFACES[:2]:
+        printed = _printing(lines, apply)
+        assert not printed, f"{name}: {len(printed)} lines printed, first {printed[:3]}"
+
+
+def test_the_support_bundle_still_prints_a_swallowed_camelcase_label() -> None:
+    """A RESIDUAL, pinned so its closing is noticed. ``support/redact.py`` runs its own copy of the
+    label patterns first, and that copy has neither the camelCase start nor the split walk, so its
+    plain value runs over the later camelCase label as every copy did before BACKLOG #5545. Its
+    second layer, this module, then sees only the placeholder and the quoted value after it."""
+    assert _printing(_swallow_lines(), redact_log_line)
+
+
+def test_the_swallow_lines_print_without_the_split_walk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE POSITIVE CONTROL: with each walk taking a whole run of letters and digits again, as
+    before BACKLOG #5545, most lines print, so the green above is the split walk's work."""
+    for name in ("_MEFOR_SECRET", "_BEARER", "_AUTH_SCHEME", "_CREDENTIAL_KV", "_KEY_MATERIAL"):
+        pattern: re.Pattern[str] = getattr(secretscrub, name)
+        assert secretscrub._RUN_UNIT in pattern.pattern, name
+        old = pattern.pattern.replace(secretscrub._RUN_UNIT, "[A-Za-z0-9]++")
+        monkeypatch.setattr(secretscrub, name, re.compile(old, pattern.flags))
+    lines = _swallow_lines()
+    printed = _printing(lines, scrub_credentials)
+    # Measured 2026-11-10: every line but those whose first value class already stops at the
+    # separator. A floor, so a later change to a terminator set does not red this for the wrong
+    # reason.
+    assert len(printed) >= len(lines) // 2, f"only {len(printed)} of {len(lines)} printed"
+
+
 #: The length span and the growth allowed across it, as ``tests/test_log_redaction_secret_domain.py``
 #: sets them for the label patterns' other growth arms: 8x the length, linear near 8.
 _SPAN = (2048, 16384)
