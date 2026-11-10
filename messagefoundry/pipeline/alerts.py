@@ -685,7 +685,9 @@ class AlertSink(Protocol):
         all-callers backstop stops a row, at most once a window per action (BACKLOG #3965); that
         row was shed by the budget, not refused by the store. The directory reconciler uses
         ``directory-reconciler:<action>`` for a row a completed pass could not write, once per
-        action per pass (BACKLOG #3018 step 2). ``action`` is
+        action per pass (BACKLOG #3018 step 2), and a directory sign-in
+        ``directory-sign-in:<action>`` for a role-sync row the store refused twice (BACKLOG
+        #2221). ``action`` is
         the audit action of the lost row, such as ``approval.approved``. The row's detail is NOT
         carried. The ERROR log line written beside this alert carries the row's detail on some paths
         and only the exception on others; docs/SECURITY.md says which. It is raised whether the gate
@@ -1766,6 +1768,30 @@ def step_up_return_audit_alert(sink: AlertSink) -> Callable[[str], None]:
         except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
             log.warning(
                 "the step-up return audit_write_failed alert could not be delivered", exc_info=True
+            )
+
+    return _raise
+
+
+#: The prefix of the ``audit_write_failed`` key for a directory sign-in's role-sync row the store
+#: refused in the role write's transaction and on its own too (BACKLOG #2221). The action follows a
+#: colon, as for the other keys of that alert.
+DIRECTORY_SIGN_IN_AUDIT_KEY = "directory-sign-in"
+
+
+def directory_sign_in_audit_alert(sink: AlertSink) -> Callable[[str], None]:
+    """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call, with the
+    audit action of a directory sign-in's role-sync row the store refused twice, raises
+    :meth:`AlertSink.audit_write_failed` keyed ``<DIRECTORY_SIGN_IN_AUDIT_KEY>:<action>`` (BACKLOG
+    #2221). Carries the key and the action name only. Never raises."""
+
+    def _raise(action: str) -> None:
+        try:
+            sink.audit_write_failed(f"{DIRECTORY_SIGN_IN_AUDIT_KEY}:{action}", action=action)
+        except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
+            log.warning(
+                "the directory sign-in audit_write_failed alert could not be delivered",
+                exc_info=True,
             )
 
     return _raise

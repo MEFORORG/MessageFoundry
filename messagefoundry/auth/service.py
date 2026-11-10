@@ -256,34 +256,43 @@ _LINEAGE_SIGN_IN_SLACK_SECONDS: Final = 120.0
 _RevocationApplied = Literal["skipped", "quiet", "reported"]
 
 
-def _sort_refused_reconciler_write(exc: Exception, action: str, actor: str) -> Exception | None:
-    """Sort what a reconciler write raised with its ``action`` row in its transaction, once the
-    write has been tried again without the row (BACKLOG #3018 step 4). A store refusal of a type
-    :func:`~messagefoundry.store.base.audit_write_errors` names is logged at ERROR and ``None`` is
-    returned; the caller then writes the row on its own. A defect
-    (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`), or any other error, is returned for
-    the caller to raise once the revocation's own steps have run; it is logged here too, so a
-    later raise that ends the revocation first cannot lose it."""
-    if isinstance(exc, AUDIT_WRITE_DEFECTS) or not isinstance(exc, audit_write_errors()):
-        _log.error(
-            "directory reconcile: the write behind the %s row for %s raised %s with its row in "
-            "its transaction; it was tried again without the row, and the error is raised once "
-            "the revocation's own steps have run",
-            action,
-            scrub_log_argument(actor),
-            type(exc).__name__,
-            exc_info=exc,
-        )
-        return exc
-    _log.error(
-        "directory reconcile: the write behind the %s row for %s raised with its row in its "
-        "transaction; it was tried again without the row, and the row, where that write landed, "
-        "is written on its own",
-        action,
-        scrub_log_argument(actor),
-        exc_info=exc,
-    )
-    return None
+def _row_write_errors() -> tuple[type[Exception], ...]:
+    """What :meth:`AuthService._write_with_row` catches from a write that carries its audit row,
+    and from that row written on its own: what
+    :func:`~messagefoundry.store.base.audit_write_errors` names, and the defects
+    (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`). Anything else raises at once."""
+    return (*audit_write_errors(), *AUDIT_WRITE_DEFECTS)
+
+
+def _is_held_write_error(exc: BaseException) -> bool:
+    """Whether an error a write raised with its audit row in its transaction is held, and raised
+    once the write's own steps have run, rather than sorted as a store refusal (BACKLOG #2221,
+    #3018 step 4): a defect (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`), or an error
+    :func:`~messagefoundry.store.base.audit_write_errors` does not name. This is the one statement
+    of the rule."""
+    return isinstance(exc, AUDIT_WRITE_DEFECTS) or not isinstance(exc, audit_write_errors())
+
+
+def _hold(held: Exception | None, more: Exception | None) -> Exception | None:
+    """The error to raise once a write's own steps have run: the first one held, or ``more`` when
+    none was. A second error is named in the first's notes rather than dropped; each was logged
+    with its traceback when it was held."""
+    if held is None:
+        return more
+    if more is not None and more is not held:
+        held.add_note(f"also held and logged after it: {type(more).__name__}: {more}")
+    return held
+
+
+@dataclass(frozen=True, slots=True)
+class _RowWrite[T]:
+    """What :meth:`AuthService._write_with_row` did with one write and its audit row."""
+
+    result: T  #: what the write returned, from the try that ran last
+    written: bool  #: the row landed, in the write's transaction or on its own
+    retried: bool  #: the write was applied again without its row
+    held: Exception | None  #: raise once the caller's own steps have run
+    refused: Exception | None  #: the store refused the row on its own too, and it paged
 
 
 #: How far, in seconds, a verified repeat-revocation row's ``ts`` may fall before this engine's
@@ -3615,6 +3624,7 @@ class AuthService:
         admin_loss_alert: Callable[[str, str], None] | None = None,
         admin_grant_alert: Callable[[str, str], None] | None = None,
         step_up_return_audit_alert: Callable[[str], None] | None = None,
+        sign_in_audit_alert: Callable[[str], None] | None = None,
         way_past_rp_id: str | None = None,
     ) -> None:
         self._store = store
@@ -3640,6 +3650,10 @@ class AuthService:
         # Vault BACKLOG #3141: called with (username, via) when a reconcile pass's role write newly
         # gives an account Administrator. Injected by the API lifespan, as above. None logs only.
         self._admin_grant_alert = admin_grant_alert
+        # BACKLOG #2221: called with the audit action of a directory sign-in's role-sync row the
+        # store refused in the write's transaction and on its own too. Injected by the API
+        # lifespan, as above. None logs only.
+        self._sign_in_audit_alert = sign_in_audit_alert
         # Session token-hash prefix -> monotonic time its seal failure was last reported, so one
         # bad row presented on every request writes one audit row and one alert per interval.
         self._seal_failures_reported = SealFailureThrottle()
@@ -4159,6 +4173,16 @@ class AuthService:
             self._step_up_return_audit_alert(action)
         except Exception:  # noqa: BLE001 -- a page failure must not change what a return answers
             _log.exception("the step-up return audit backstop alert callable raised")
+
+    def _page_sign_in_audit_refused(self, action: str) -> None:
+        """Page ``audit_write_failed`` for a directory sign-in's role-sync row the store refused
+        twice (BACKLOG #2221), through the injected alert. Never raises."""
+        if self._sign_in_audit_alert is None:
+            return
+        try:
+            self._sign_in_audit_alert(action)
+        except Exception:  # noqa: BLE001 -- a page failure must not change what a sign-in does
+            _log.exception("the directory sign-in audit_write_failed alert callable raised")
 
     def allow_phi_read(self, actor: str) -> bool:
         """Per-actor anti-automation gate for the PHI-read endpoints (WP-8, ASVS 2.4.1). True =
@@ -7711,41 +7735,39 @@ class AuthService:
         # transaction, not after the revoke below, because the roles are what it records. A sync
         # that changes nothing writes the same roles and no row.
         changed = set(role_ids) != previous
-        resynced_detail = _json({"from": sorted(previous), "to": role_ids}) if changed else ""
-        resynced: tuple[AuditAppend, ...] = (
-            (
-                AuditAppend(
-                    "auth.ad_roles_resynced",
-                    actor=user.username,
-                    detail=resynced_detail,
-                    client=client,
-                ),
+        held: Exception | None = None
+        if changed:
+            resynced = AuditAppend(
+                "auth.ad_roles_resynced",
+                actor=user.username,
+                detail=_json({"from": sorted(previous), "to": role_ids}),
+                client=client,
             )
-            if changed
-            else ()
-        )
-        lost_row: Exception | None = None
-        try:
-            await self._store.set_user_roles(
-                user.id, role_ids, assigned_by="ad-sync", audits=resynced
+            synced_id = user.id
+
+            async def write(with_row: bool) -> None:
+                await self._store.set_user_roles(
+                    synced_id,
+                    role_ids,
+                    assigned_by="ad-sync",
+                    audits=(resynced,) if with_row else (),
+                )
+
+            # The directory stays authoritative, so a write refused with its row still lands the
+            # roles, and the row is written on its own before the revoke below can raise. A held
+            # error, and a row refused twice, which pages, fail the sign-in only once the
+            # sessions are revoked, the user is told and an Administrator grant has paged.
+            synced = await self._write_with_row(
+                write,
+                lambda _none: resynced,
+                action=resynced.action,
+                actor=user.username,
+                where="auth: the directory sign-in's role sync",
+                on_refused=self._page_sign_in_audit_refused,
             )
-        except Exception as exc:  # noqa: BLE001 - logged, then sorted once the change is applied
-            if not resynced:
-                raise
-            # The directory stays authoritative, so a write refused with its row must not keep the
-            # old roles, or the stale sessions the revoke below ends. The roles land without it.
-            # After the revoke and the notice, a store refusal has its row written on its own, and
-            # only a second refusal fails the sign-in; a defect, or any other error, is raised
-            # then, as the reconciler's `_sort_refused_reconciler_write` sorts it.
-            _log.error(
-                "auth: the role sync for %s raised %s with its auth.ad_roles_resynced row in its "
-                "transaction; the roles are written again without it",
-                scrub_log_argument(user.username),
-                type(exc).__name__,
-                exc_info=exc,
-            )
+            held = _hold(synced.held, synced.refused)
+        else:
             await self._store.set_user_roles(user.id, role_ids, assigned_by="ad-sync", audits=())
-            lost_row = exc
         # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a sync that takes
         # Administrator from its last enabled holder is applied, never refused. It alerts and audits
         # instead, right after the write, so no later step's failure can skip it. The ruling accepts
@@ -7758,36 +7780,38 @@ class AuthService:
         gained = frozenset(role_ids) - previous
         roles_gained = RolesGained(user.username, gained) if gained else None
         if changed:
-            # Directory-side role change (often a downgrade): revoke the user's other live sessions
-            # so stale elevated tokens don't linger until expiry (AUTH-AD-REVOKE). The new session
-            # is issued below, after this, so the current login is unaffected. The role write's
-            # row records it.
-            await self._revoke_after_commit(
-                user.id, change="ad_roles_resynced", actor=user.username, client=client
-            )
-            # A directory-pushed privilege change is the same privilege change to the same user as a
-            # local one, so notify the affected user out-of-band too (ASVS 6.3.7), matching set_roles().
-            # Best-effort; the change is also visible in the audited /me/security-events feed.
-            # ``source`` words it for the directory, as the reconciler's notice is (vault BACKLOG
-            # #3121): the holder did not make this change, so "if this was you" cannot apply.
-            await self._notify_security(
-                ROLES_CHANGED,
-                username=user.username,
-                email=user.notify_email,
-                client=client,
-                detail={"roles": role_ids, "source": "directory"},
-            )
-            if lost_row is not None:
-                if isinstance(lost_row, AUDIT_WRITE_DEFECTS) or not isinstance(
-                    lost_row, audit_write_errors()
-                ):
-                    raise lost_row
-                await self._audit(
-                    "auth.ad_roles_resynced",
-                    actor=user.username,
-                    detail=resynced_detail,
-                    client=client,
+            try:
+                # Directory-side role change (often a downgrade): revoke the user's other live
+                # sessions so stale elevated tokens don't linger until expiry (AUTH-AD-REVOKE).
+                # The new session is issued below, after this, so the current login is unaffected.
+                await self._revoke_after_commit(
+                    user.id, change="ad_roles_resynced", actor=user.username, client=client
                 )
+                # A directory-pushed privilege change is the same privilege change to the same
+                # user as a local one, so notify the affected user out-of-band too (ASVS 6.3.7),
+                # matching set_roles(). Best-effort; the change is also visible in the audited
+                # /me/security-events feed. ``source`` words it for the directory, as the
+                # reconciler's notice is (vault BACKLOG #3121): the holder did not make this
+                # change, so "if this was you" cannot apply.
+                await self._notify_security(
+                    ROLES_CHANGED,
+                    username=user.username,
+                    email=user.notify_email,
+                    client=client,
+                    detail={"roles": role_ids, "source": "directory"},
+                )
+            except Exception as exc:
+                # The route raises the grant's page from the outcome this raise takes away.
+                self._report_directory_admin_grant(
+                    user, before=previous, after=role_ids, via="directory_sign_in"
+                )
+                _hold(exc, held)
+                raise
+        if held is not None:
+            self._report_directory_admin_grant(
+                user, before=previous, after=role_ids, via="directory_sign_in"
+            )
+            raise held
         ad_roles = _roles_from_ids(role_ids)
         ad_custom_permissions = await self._custom_permissions_for_ids(role_ids)
         user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups, client=client)
@@ -10516,11 +10540,11 @@ class AuthService:
         each paging refusal's ``auth.ad_reconcile_paging_refused`` row (vault BACKLOG #3696), which
         names the account as ``actor``, and each unreached account's ``auth.ad_reconcile_unreached``
         row (BACKLOG #3100), which does too. On the reconciler's call only, they include a rename's
-        ``auth.ad_username_refresh_conflict`` row, which names the account as ``actor`` too, and
-        the second try at a revocation's ``auth.ad_roles_resynced`` or ``auth.ad_session_revoked``
-        row (:meth:`_write_reconciled_roles`, :meth:`_revoke_with_row`). Those rows and a rename's
-        ``auth.ad_username_refreshed`` row are otherwise not written here: each commits in its
-        write's own transaction (BACKLOG #3018 steps 4 and 7). **A failed write here does not end
+        ``auth.ad_username_refresh_conflict`` row, which names the account as ``actor`` too. A
+        revocation's ``auth.ad_roles_resynced`` and ``auth.ad_session_revoked`` rows and a rename's
+        ``auth.ad_username_refreshed`` row are not written here: each commits in its write's own
+        transaction (BACKLOG #3018 steps 4 and 7), and the first two take
+        :meth:`_write_with_row`'s second try. **A failed write here does not end
         the pass.** If it raised, the pass would return no plan, and the lifespan task would raise
         no alert for the revocations already applied, nor for the hold, the breaker, the referral,
         the probe fault, the configuration refusal or a paging refusal. It would also skip every
@@ -10640,28 +10664,98 @@ class AuthService:
             return False
         return isinstance(detail, dict) and detail.get("reason") == revocation.reason
 
-    async def _revoke_with_row(
-        self, revocation: reconcile.SessionRevocation
-    ) -> tuple[int, bool, bool]:
-        """End the account's sessions with their ``auth.ad_session_revoked`` row, and return how
-        many ended, whether the row was written, and whether the revoke had to be tried again. A
-        retried count can read low: the first revoke may have committed with its reply lost, so
-        a retried zero that would be quiet alerts instead, as a refused row does.
+    async def _write_with_row[T](
+        self,
+        write: Callable[[bool], Awaitable[T]],
+        row: Callable[[T], AuditAppend],
+        *,
+        action: str,
+        actor: str,
+        where: str,
+        on_refused: Callable[[str], None],
+        landed: Callable[[T], bool] = lambda _result: True,
+    ) -> _RowWrite[T]:
+        """Run a privilege write with its audit row in its own transaction (BACKLOG #2221, #3018
+        step 4). The one sequence the directory sign-in's role sync, the reconciler's role write
+        and the reconciler's revoke share.
 
-        **The row commits in the revoke's own transaction (BACKLOG #3018 step 4, option a, the
-        Manager's decision d20261105T061254503-a486c4)**, built from the count the revoke reads, so
-        the sessions end with their record or not at all.
+        ``write(True)`` writes with the row, ``write(False)`` without it, and ``row`` builds the
+        row from what the write returned. ``landed`` says whether that write changed anything, so
+        a compare-and-set that found the record moved records nothing.
 
-        **A failed revoke-with-row must not keep the sessions alive.** It rolls the revoke back with
-        the row, and a role revocation whose roles already moved would not be planned again, so its
-        sessions would keep the old roles. So whatever it raised, the sessions are then ended
-        without the row, and :func:`_sort_refused_reconciler_write` sorts the error: a store
-        refusal is logged and the row is written once more on its own, through
-        :meth:`_audit_reconciler_row`, which pages ``audit_write_failed`` if that is refused too;
-        anything else is raised once the sessions have ended. A failure of that second revoke is
-        raised, as a failed revoke always was."""
+        **A failed write-with-row must not keep the old state.** The directory stays
+        authoritative, so a refused record must not leave the old roles in place, or the stale
+        sessions. So, in order: the error is sorted by :func:`_is_held_write_error` and logged at
+        ERROR, before anything can raise past it; the write is applied again without the row, and
+        an error there raises at once, chained to the first; and, where that write landed, the row
+        is written on its own, whatever the first error was. A row refused there too is lost: it
+        is logged at ERROR, ``on_refused`` pages for its action, and the refusal is returned. A
+        row that lands on its own is logged at WARNING. A held error, the first or a defect in
+        the row written on its own, is returned for the caller to raise once its own steps have
+        run: the revoke, the user's notice and the pages. Only what :func:`_row_write_errors`
+        names is caught; anything else raises at once."""
+        try:
+            result = await write(True)
+        except _row_write_errors() as exc:
+            held: Exception | None = exc if _is_held_write_error(exc) else None
+            _log.error(
+                "%s: the write behind the %s row for %s raised %s with its row in its "
+                "transaction; it is applied again without the row, and %s",
+                where,
+                action,
+                scrub_log_argument(actor),
+                type(exc).__name__,
+                "the error is raised once the write's own steps have run"
+                if held is not None
+                else "the row, where that write lands, is written on its own",
+                exc_info=exc,
+            )
+            first = exc
+            result = await write(False)
+        else:
+            return _RowWrite(result, landed(result), retried=False, held=None, refused=None)
+        if not landed(result):
+            return _RowWrite(result, False, retried=True, held=held, refused=None)
+        alone = row(result)
+        try:
+            await self._audit(
+                alone.action, actor=alone.actor, detail=alone.detail, client=alone.client
+            )
+        except _row_write_errors() as lost:
+            if lost.__cause__ is None:
+                lost.__cause__ = first
+            _log.error(
+                "%s: the %s row for %s was refused on its own too (%s); the row is lost, and "
+                "audit_write_failed pages",
+                where,
+                action,
+                scrub_log_argument(actor),
+                type(lost).__name__,
+                exc_info=lost,
+            )
+            on_refused(action)
+            if _is_held_write_error(lost):
+                return _RowWrite(result, False, retried=True, held=_hold(held, lost), refused=None)
+            return _RowWrite(result, False, retried=True, held=held, refused=lost)
+        _log.warning(
+            "%s: the %s row for %s was written on its own, after the write it records",
+            where,
+            action,
+            scrub_log_argument(actor),
+        )
+        return _RowWrite(result, True, retried=True, held=held, refused=None)
 
-        def row(result: RevokeResult) -> AuditAppend:
+    async def _revoke_with_row(self, revocation: reconcile.SessionRevocation) -> _RowWrite[int]:
+        """End the account's sessions with their ``auth.ad_session_revoked`` row, through
+        :meth:`_write_with_row`; ``result`` is how many ended. The row commits in the revoke's own
+        transaction (BACKLOG #3018 step 4, option a, the Manager's decision
+        d20261105T061254503-a486c4), built from the count the revoke reads, so the sessions end
+        with their record or not at all. A retried count can read low: the first revoke may have
+        committed with its reply lost, so a retried zero that would be quiet alerts instead, as a
+        refused row does. A row lost twice is noted for the pass's ``audit_write_failed`` page
+        (:meth:`_note_refused_reconciler_row`)."""
+
+        def row(count: int) -> AuditAppend:
             # The detail is a literal here, where the audit scope census reads it (vault BACKLOG
             # #3748 item 6): ``scope_from`` and ``scope_to`` are what it narrows.
             return AuditAppend(
@@ -10670,7 +10764,7 @@ class AuthService:
                 detail=_json(
                     {
                         "reason": revocation.reason,
-                        "sessions": result.count,
+                        "sessions": count,
                         **(
                             {"roles": list(revocation.role_ids)}
                             if revocation.role_ids is not None
@@ -10693,79 +10787,65 @@ class AuthService:
                 ),
             )
 
-        try:
-            ended = await self._store.revoke_user_sessions(revocation.user_id, audit=row)
-            return ended.count, True, False
-        except Exception as exc:  # noqa: BLE001 - sorted below, once the sessions have ended
-            result = await self._store.revoke_user_sessions(revocation.user_id, audit=no_audit_row)
-            pending = _sort_refused_reconciler_write(
-                exc, AD_SESSION_REVOKED_ACTION, revocation.username
+        async def revoke(with_row: bool) -> int:
+            def audit(result: RevokeResult) -> AuditAppend:
+                return row(result.count)
+
+            ended = await self._store.revoke_user_sessions(
+                revocation.user_id, audit=audit if with_row else no_audit_row
             )
-        if pending is not None:
-            raise pending
-        written = await self._audit_reconciler_row(
-            AD_SESSION_REVOKED_ACTION,
+            return ended.count
+
+        return await self._write_with_row(
+            revoke,
+            row,
+            action=AD_SESSION_REVOKED_ACTION,
             actor=revocation.username,
-            detail=str(row(result).detail),
+            where="directory reconcile",
+            on_refused=self._note_refused_reconciler_row,
         )
-        return result.count, written, True
 
     async def _write_reconciled_roles(
         self,
         revocation: reconcile.SessionRevocation,
         role_ids: Sequence[str],
         previous: Sequence[str],
-    ) -> tuple[bool, Exception | None]:
-        """Write a role revocation's roles with their ``auth.ad_roles_resynced`` row, in one
-        transaction (BACKLOG #3018 step 4). Returns whether the roles now stand as written, and an
-        error the caller raises once it has reported the change and ended the sessions.
+    ) -> _RowWrite[bool]:
+        """Write a role revocation's roles with their ``auth.ad_roles_resynced`` row, through
+        :meth:`_write_with_row` (BACKLOG #3018 step 4). ``result`` says whether the roles now stand
+        as this write left them.
 
         The write is the compare-and-set on ``previous``, the roles the caller read (vault BACKLOG
-        #3085), and the row is appended only when it writes. A failed write is tried once more
-        without the row, as :meth:`_revoke_with_row` applies a revoke and for its reason: the
-        directory stays authoritative, so a refused record must not leave the old roles in place.
-        If that second compare-and-set writes, the row is then written on its own, and pages if
-        that is refused too. If it finds the roles moved, it reports no write and records nothing.
-        **Not closed:** a first write that committed with its reply lost then reads as moved, so
-        the change goes unreported here.
-
-        A defect, or any error that is not a store refusal, is returned rather than raised, so the
-        roles that landed are still reported and their stale sessions still end (the caller raises
-        it after its revoke)."""
+        #3085), and the row is appended only when it writes. **A retried compare-and-set that finds
+        the roles moved reads them again**: the first write may have committed with its reply
+        lost, so a record already holding these roles counts as written, and is reported and
+        recorded once more. A duplicate row and page are the safe direction; a silent miss is not.
+        That read also counts another writer's write of the same roles as this one's. A row lost
+        twice is noted for the pass's ``audit_write_failed`` page."""
         detail = _json({"from": sorted(previous), "to": sorted(role_ids), "via": "ad-reconcile"})
-        row = AuditAppend("auth.ad_roles_resynced", actor=revocation.username, detail=detail)
-        try:
+        resynced = AuditAppend("auth.ad_roles_resynced", actor=revocation.username, detail=detail)
+
+        async def write(with_row: bool) -> bool:
             written = await self._store.set_user_roles_if_held(
                 revocation.user_id,
                 list(role_ids),
                 expected_role_ids=previous,
                 assigned_by="ad-reconcile",
-                audits=(row,),
+                audits=(resynced,) if with_row else (),
             )
-            return written, None
-        except Exception as exc:  # noqa: BLE001 - sorted below, once the roles have landed
-            written = await self._store.set_user_roles_if_held(
-                revocation.user_id,
-                list(role_ids),
-                expected_role_ids=previous,
-                assigned_by="ad-reconcile",
-                audits=(),
-            )
-            pending = _sort_refused_reconciler_write(exc, row.action, revocation.username)
-        if written and pending is None:
-            try:
-                await self._audit_reconciler_row(
-                    row.action, actor=revocation.username, detail=detail
-                )
-            except Exception as defect:  # noqa: BLE001 - only a defect gets here; held, not lost
-                _log.error(
-                    "directory reconcile: the %s row for %s raised a defect on its own",
-                    row.action,
-                    scrub_log_argument(revocation.username),
-                    exc_info=defect,
-                )
-                pending = defect
-        return written, pending
+            if written or with_row:
+                return written
+            return set(await self._store.get_user_role_ids(revocation.user_id)) == set(role_ids)
+
+        return await self._write_with_row(
+            write,
+            lambda _written: resynced,
+            action=resynced.action,
+            actor=revocation.username,
+            where="directory reconcile",
+            on_refused=self._note_refused_reconciler_row,
+            landed=bool,
+        )
 
     async def _apply_reconcile_revocation(
         self, revocation: reconcile.SessionRevocation, *, watermark: _AuditWatermark | None
@@ -10837,9 +10917,10 @@ class AuthService:
             # roles unrecorded. The login sync's action, marked with this path. A defect in that
             # write comes back as `pending`, raised only once the change is reported, the sessions
             # have ended and the user is told.
-            roles_changed, pending = await self._write_reconciled_roles(
+            roles = await self._write_reconciled_roles(
                 revocation, revocation.role_ids, user.role_ids
             )
+            roles_changed, pending = roles.result, roles.held
             if not roles_changed:
                 # The roles moved after the read above, or the row went. The writer that moved
                 # them, a second reconciler or a directory sign-in, owns that change and its report;
@@ -10878,7 +10959,15 @@ class AuthService:
             and revocation.reason in _ALWAYS_REPORTED_REASONS
             and await self._already_revoked_elsewhere(revocation, watermark=watermark)
         )
-        revoked, written, retried = await self._revoke_with_row(revocation)
+        try:
+            ended = await self._revoke_with_row(revocation)
+        except Exception as exc:
+            # A failed revoke without its row raises, as a failed revoke always did; the role
+            # write's held error, logged when it was held, is named on it rather than dropped.
+            _hold(exc, pending)
+            raise
+        revoked, written, retried = ended.result, ended.written, ended.retried
+        pending = _hold(pending, ended.held)
         quiet = (
             not revoked
             and not roles_changed
@@ -10927,16 +11016,23 @@ class AuthService:
                 detail={"reason": revocation.reason, "source": "directory"},
             )
         if pending is not None:
-            # The role write's defect, held until the change was reported, the sessions ended and
-            # the user told (BACKLOG #3018 step 4).
+            # A held error of the role write or the revoke, raised only once the change was
+            # reported, the sessions ended and the user told (BACKLOG #3018 step 4).
             raise pending
         return "reported"
 
     def _report_directory_admin_grant(
-        self, user: UserRecord, *, before: Iterable[str], after: Iterable[str]
+        self,
+        user: UserRecord,
+        *,
+        before: Iterable[str],
+        after: Iterable[str],
+        via: str = "directory_reconcile",
     ) -> None:
         """Raise ``administrator_granted`` when a reconcile pass's role write newly gave ``user``
-        the Administrator role (vault BACKLOG #3141).
+        the Administrator role (vault BACKLOG #3141). A directory sign-in whose role sync raises
+        calls it too, with ``via`` ``directory_sign_in``, since its route then has no outcome to
+        raise the page from (BACKLOG #2221).
 
         The sign-in rule (vault BACKLOG #2610): only a role this write ADDED pages, so an account
         that already held Administrator raises nothing. ``before`` is the account's roles as read
@@ -10951,10 +11047,10 @@ class AuthService:
         admin = Role.ADMINISTRATOR.value
         if admin in set(before) or admin not in set(after):
             return
-        _log.warning("a directory reconcile pass gave an account the Administrator role")
+        _log.warning("a directory role write gave an account the Administrator role (%s)", via)
         if self._admin_grant_alert is not None:
             try:
-                self._admin_grant_alert(user.username, "directory_reconcile")
+                self._admin_grant_alert(user.username, via)
             except Exception:  # noqa: BLE001 -- logged with its traceback; see the docstring
                 _log.exception("the administrator_granted alert callable raised")
 
@@ -17540,8 +17636,9 @@ class AuthService:
         **Disabling the last enabled administrator is refused (vault BACKLOG #2779)**, with
         :class:`LastAdministratorRefused`. The guard is the disable write itself: the store checks
         and writes in one transaction (``remove_unless_last_admin``), and the save's
-        ``user.updated`` row commits in that transaction, so no lock-out lands without it (BACKLOG #2221). A read
-        up front refuses the ordinary case before anything is written. Only a removal racing this
+        ``user.updated`` row commits in that transaction, so no lock-out lands without it (BACKLOG
+        #2221). A read up front refuses the ordinary case before anything is written. Only a
+        removal racing this
         one gets past that read; then the profile edit has landed, so it is still audited and
         announced, with ``disable_refused`` on the audit row, and the refusal is raised after that.
         A save that does not disable commits its row with the profile write.

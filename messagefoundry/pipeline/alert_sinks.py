@@ -1670,7 +1670,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # inline config reload uses `config_reload:inline` (vault BACKLOG #2254), and the IdP
         # step-up return audit budget's backstop `step_up_return:audit_budget:<action>` (BACKLOG
         # #3965). The directory reconciler uses `directory-reconciler:<action>` for a row a
-        # completed pass could not write (BACKLOG #3018 step 2). The
+        # completed pass could not write (BACKLOG #3018 step 2), and a directory sign-in
+        # `directory-sign-in:<action>` for a role-sync row refused twice (BACKLOG #2221). The
         # action name lands in the reason column.
         # The ERROR log line beside it carries the row's detail on some paths and only the exception
         # on others (docs/SECURITY.md). No PHI.

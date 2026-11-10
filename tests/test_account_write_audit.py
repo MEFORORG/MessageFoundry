@@ -14,6 +14,7 @@ Synthetic accounts only.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
@@ -258,35 +259,182 @@ async def test_a_directory_sign_in_commits_ad_roles_resynced_with_the_role_write
     assert len(await _details(store, "auth.ad_roles_resynced")) == 3
 
 
+_AD_SETTINGS = AuthSettings(
+    ad_enabled=True,
+    ad_server="ldaps://x",
+    ad_user_search_base="DC=x",
+    ad_bind_dn="CN=svc,DC=x",
+    ad_bind_password="x",
+)
+
+
+class _Notices:
+    def __init__(self) -> None:
+        self.sent: list[Any] = []
+
+    async def notify(self, event: Any) -> bool:
+        self.sent.append(event)
+        return True
+
+
+async def _signed_in(
+    store: MessageStore, role: str = "operator"
+) -> tuple[Any, str, list[tuple[str, str]], list[str]]:
+    """A directory service whose jdoe signed in once holding ``role``, then had the group map moved
+    to viewer, or to operator when ``role`` is viewer. Returns the service, that first token, and
+    the lists the administrator-grant and sign-in audit pages land in."""
+    service = await _service(store, _AD_SETTINGS, ldap=_FakeLdap())
+    grants: list[tuple[str, str]] = []
+    audit_pages: list[str] = []
+    service._admin_grant_alert = lambda name, via: grants.append((name, via))
+    service._sign_in_audit_alert = audit_pages.append
+    service._security_notifier = _Notices()
+    await service.set_ad_group_map([("cn=mf-ops,dc=x", role)], actor="admin")
+    first = (await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)).token
+    assert first is not None
+    return service, first, grants, audit_pages
+
+
+def _append_fails(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore, *errors: Exception
+) -> list[str]:
+    """Make the store's ``auth.ad_roles_resynced`` appends raise ``errors`` in turn, in the role
+    write's transaction and on its own alike, since both append through ``_append_audit_row``."""
+    real = store._append_audit_row
+    raised: list[str] = []
+
+    async def failing(name: str, **kwargs: Any) -> Any:
+        if name == "auth.ad_roles_resynced" and len(raised) < len(errors):
+            error = errors[len(raised)]
+            raised.append(type(error).__name__)
+            raise error
+        return await real(name, **kwargs)
+
+    monkeypatch.setattr(store, "_append_audit_row", failing)
+    return raised
+
+
 async def test_a_defect_in_the_sign_in_role_row_still_lands_the_roles_and_ends_the_sessions(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A defect, not a store refusal, in the sign-in's in-transaction row: the directory stays
-    authoritative, so the roles still land and the stale sessions still end before it is raised,
-    as the reconciler's role write does. No row is written for it."""
-    settings = AuthSettings(
-        ad_enabled=True,
-        ad_server="ldaps://x",
-        ad_user_search_base="DC=x",
-        ad_bind_dn="CN=svc,DC=x",
-        ad_bind_password="x",
-    )
-    service = await _service(store, settings, ldap=_FakeLdap())
-    await service.set_ad_group_map([("cn=mf-ops,dc=x", "operator")], actor="admin")
-    first = (await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)).token
-    assert first is not None
+    authoritative, so the roles still land, the row is written on its own, and the stale sessions
+    end and the user is told before the defect is raised, as the reconciler's role write does."""
+    service, first, _grants, audit_pages = await _signed_in(store)
     await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
-    real = store._append_audits
-
-    async def defective(audits: Sequence[AuditAppend], *, now: float) -> list[AppendedAuditRow]:
-        if any(a.action == "auth.ad_roles_resynced" for a in audits):
-            raise NotImplementedError("synthetic defect")
-        return await real(audits, now=now)
-
-    monkeypatch.setattr(store, "_append_audits", defective)
+    service._security_notifier.sent.clear()
+    raised = _append_fails(monkeypatch, store, NotImplementedError("synthetic defect"))
     with pytest.raises(NotImplementedError):
         await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
+    assert raised == ["NotImplementedError"]
     user = await store.get_user_by_username("jdoe")
     assert user is not None and await store.get_user_role_ids(user.id) == ["viewer"]
     assert await service.identity_for_token(first) is None, "a defect kept a stale session"
-    assert await _details(store, "auth.ad_roles_resynced") == [{"from": [], "to": ["operator"]}]
+    assert [e.username for e in service._security_notifier.sent] == ["jdoe"]
+    assert await _details(store, "auth.ad_roles_resynced") == [
+        {"from": ["operator"], "to": ["viewer"]},
+        {"from": [], "to": ["operator"]},
+    ], "the row was not tried on its own"
+    assert audit_pages == []
+
+
+@pytest.mark.parametrize(
+    "errors",
+    [
+        (sqlite3.OperationalError("synthetic"), sqlite3.OperationalError("synthetic")),
+        (NotImplementedError("synthetic defect"),),
+        (NotImplementedError("synthetic defect"), sqlite3.OperationalError("synthetic")),
+    ],
+    ids=["refused-twice", "defect", "defect-then-refused"],
+)
+async def test_a_sign_in_role_sync_that_raises_still_pages_its_administrator_grant(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, errors: tuple[Exception, ...]
+) -> None:
+    """BACKLOG #2221. A sign-in whose role sync gave Administrator and then raises has no outcome
+    for its route to page from, so the service raises ``administrator_granted`` itself before it
+    raises, after the revoke and the user's notice. A row lost twice also pages
+    ``audit_write_failed``, as the reconciler's does."""
+    service, first, grants, audit_pages = await _signed_in(store, "viewer")
+    await service.set_ad_group_map([("cn=mf-ops,dc=x", ADMIN)], actor="admin")
+    service._security_notifier.sent.clear()
+    _append_fails(monkeypatch, store, *errors)
+    with pytest.raises(type(errors[0])):
+        await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
+    assert grants == [("jdoe", "directory_sign_in")]
+    assert [e.username for e in service._security_notifier.sent] == ["jdoe"]
+    assert await service.identity_for_token(first) is None
+    user = await store.get_user_by_username("jdoe")
+    assert user is not None and await store.get_user_role_ids(user.id) == [ADMIN]
+    lost = len(errors) == 2
+    assert audit_pages == (["auth.ad_roles_resynced"] if lost else [])
+    assert len(await _details(store, "auth.ad_roles_resynced")) == (1 if lost else 2)
+
+
+async def test_a_sign_in_whose_role_row_lands_on_its_own_returns_the_grant_for_its_route(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above. Refused once, the row lands on its own and the sign-in
+    returns, so ``roles_gained`` reaches the route, which raises the page; the service raises
+    none of its own, so nothing pages twice."""
+    service, _first, grants, audit_pages = await _signed_in(store, "viewer")
+    await service.set_ad_group_map([("cn=mf-ops,dc=x", ADMIN)], actor="admin")
+    _append_fails(monkeypatch, store, sqlite3.OperationalError("synthetic"))
+    outcome = await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
+    assert outcome.token is not None
+    assert outcome.roles_gained is not None and ADMIN in outcome.roles_gained.roles
+    assert grants == [] and audit_pages == []
+    assert (await _details(store, "auth.ad_roles_resynced"))[0] == {
+        "from": ["viewer"],
+        "to": [ADMIN],
+    }
+
+
+async def test_a_sign_in_writes_its_role_row_before_a_revoke_that_raises(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2221. A role row refused in the write's transaction is written on its own before
+    the post-commit revoke runs, so a revoke that then raises cannot cost the row."""
+    service, _first, _grants, _audit_pages = await _signed_in(store)
+    await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
+    _refuse(monkeypatch, store, "auth.ad_roles_resynced")
+
+    async def revoke_fails(*_args: object, **_kwargs: object) -> None:
+        raise sqlite3.OperationalError("synthetic: the revoke was refused")
+
+    monkeypatch.setattr(service, "_revoke_after_commit", revoke_fails)
+    with pytest.raises(sqlite3.OperationalError, match="revoke"):
+        await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
+    assert (await _details(store, "auth.ad_roles_resynced"))[0] == {
+        "from": ["operator"],
+        "to": ["viewer"],
+    }
+
+
+async def test_a_sign_in_logs_its_first_role_error_before_the_retry_can_raise(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #2221. The first error is logged at ERROR before the write is tried again, so a
+    retry that raises cannot lose it; the retry's error carries it as its context."""
+    service, _first, _grants, _audit_pages = await _signed_in(store)
+    await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
+    calls: list[int] = []
+
+    async def failing(*_args: object, **_kwargs: object) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise NotImplementedError("synthetic first")
+        raise sqlite3.OperationalError("synthetic retry")
+
+    monkeypatch.setattr(store, "set_user_roles", failing)
+    with (
+        caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"),
+        pytest.raises(sqlite3.OperationalError) as raised,
+    ):
+        await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
+    assert isinstance(raised.value.__context__, NotImplementedError)
+    assert any(
+        r.levelno == logging.ERROR
+        and "NotImplementedError" in r.getMessage()
+        and "auth.ad_roles_resynced" in r.getMessage()
+        for r in caplog.records
+    )

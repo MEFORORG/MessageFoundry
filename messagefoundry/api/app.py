@@ -461,6 +461,7 @@ from messagefoundry.pipeline.alerts import (
     LoggingAlertSink,
     administrator_granted_alert,
     authority_seal_alert,
+    directory_sign_in_audit_alert,
     no_enabled_administrator_alert,
     step_up_return_audit_alert,
     store_cipher_refusal_forwarder,
@@ -12750,6 +12751,11 @@ def create_managed_app(
                     # BACKLOG #3965: the step-up return audit budget's all-callers backstop pages
                     # audit_write_failed here when it stops a row, at most once a window.
                     step_up_return_audit_alert=step_up_return_audit_alert(
+                        notifier or LoggingAlertSink()
+                    ),
+                    # BACKLOG #2221: a directory sign-in's role-sync row refused twice pages
+                    # audit_write_failed here.
+                    sign_in_audit_alert=directory_sign_in_audit_alert(
                         notifier or LoggingAlertSink()
                     ),
                     # BACKLOG #3937: the relying party a passkey must be under to count as a way

@@ -6261,7 +6261,8 @@ async def test_a_defect_in_a_revocation_audit_write_is_still_raised(
     """BACKLOG #3018. The soft write passes a store refusal and nothing else: a defect in the code
     still ends the pass, as it does for the pass's own rows (BACKLOG #2137). The defect is in the
     revoke's own append, so the revoke rolls back with it; the sessions are still ended, without
-    the row, before the defect is raised (BACKLOG #3018 step 4)."""
+    the row, and the row is written on its own, before the defect is raised (BACKLOG #3018 step
+    4)."""
     store = await MessageStore.open(":memory:")
     try:
         ldap = _FakeLdap({"jdoe": _principal("jdoe")})
@@ -6281,7 +6282,9 @@ async def test_a_defect_in_a_revocation_audit_write_is_still_raised(
             await service.reconcile_directory_sessions()
         assert refused == ["jdoe"]
         assert token is not None and await service.identity_for_token(token) is None
-        assert await _actors(store, "auth.ad_session_revoked") == []
+        assert await _actors(store, "auth.ad_session_revoked") == ["jdoe"], (
+            "the row was not tried on its own before the defect was raised"
+        )
     finally:
         await store.close()
 
@@ -7239,5 +7242,133 @@ async def test_a_role_change_that_ends_no_session_still_reports() -> None:
         )
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
         assert [r["sessions"] for r in _revoked_rows(await store.list_audit())] == [0]
+    finally:
+        await store.close()
+
+
+async def test_a_role_write_whose_commit_reply_was_lost_still_reports_the_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3018 step 4. The first compare-and-set commits, roles and row, and then raises, as
+    a lost COMMIT reply would. The retry finds the roles moved, reads them again, finds them as
+    this write left them, and counts the change: the Administrator grant still pages, the row is
+    written again on its own, and the revocation reports. A duplicate row is the safe direction;
+    a silent miss is not."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        grants: list[tuple[str, str]] = []
+        service._admin_grant_alert = lambda name, via: grants.append((name, via))
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        target = (Role.ADMINISTRATOR.value,)
+        real = store.set_user_roles_if_held
+        calls: list[bool] = []
+
+        async def reply_lost(*args: Any, **kwargs: Any) -> bool:
+            written = await real(*args, **kwargs)
+            calls.append(written)
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("synthetic: the COMMIT reply was lost")
+            return written
+
+        monkeypatch.setattr(store, "set_user_roles_if_held", reply_lost)
+        service._reconcile_refused_rows = []
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=target
+        )
+        assert (
+            await service._apply_reconcile_revocation(
+                revocation, watermark=await service._audit_watermark()
+            )
+            == "reported"
+        )
+        assert calls == [True, False], "the first write did not commit, or the retry wrote"
+        assert grants == [("jdoe", "directory_reconcile")]
+        assert len(await store.list_audit(action="auth.ad_roles_resynced")) == 2
+        assert service._reconcile_refused_rows == []
+    finally:
+        await store.close()
+
+
+async def test_held_errors_are_raised_after_the_notice_and_neither_is_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3018 step 4. A defect in the role write's row and another in the revoke's row: the
+    roles land, the sessions end, both rows are written on their own, and the user is told before
+    the first defect is raised. The second is named in its notes, not dropped."""
+    store, _, service, tokens = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        target = () if await store.get_user_role_ids(user.id) else (Role.OPERATOR.value,)
+        real = store._append_audit_row
+        failed: list[str] = []
+        defects: dict[str, Exception] = {
+            "auth.ad_roles_resynced": NotImplementedError("synthetic roles defect"),
+            "auth.ad_session_revoked": RecursionError("synthetic revoke defect"),
+        }
+
+        async def failing(name: str, **kwargs: Any) -> Any:
+            if name in defects and name not in failed:
+                failed.append(name)
+                raise defects[name]
+            return await real(name, **kwargs)
+
+        monkeypatch.setattr(store, "_append_audit_row", failing)
+        service._reconcile_refused_rows = []
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=target
+        )
+        with pytest.raises(NotImplementedError) as raised:
+            await service._apply_reconcile_revocation(
+                revocation, watermark=await service._audit_watermark()
+            )
+        assert any("RecursionError" in note for note in raised.value.__notes__)
+        assert [e.username for e in notifier.sent] == ["jdoe"]
+        assert sorted(await store.get_user_role_ids(user.id)) == sorted(target)
+        assert await service.identity_for_token(tokens["jdoe"]) is None
+        assert len(await store.list_audit(action="auth.ad_roles_resynced")) == 1
+        assert len(_revoked_rows(await store.list_audit())) == 1
+        assert service._reconcile_refused_rows == []
+    finally:
+        await store.close()
+
+
+async def test_a_role_defect_whose_row_is_refused_on_its_own_too_pages_and_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3018 steps 2 and 4. On the defect path the row is still tried on its own; refused
+    there, it is lost and pages ``audit_write_failed``, and the defect is still raised."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        target = () if await store.get_user_role_ids(user.id) else (Role.OPERATOR.value,)
+        real = store._append_audit_row
+        errors: list[Exception] = [
+            NotImplementedError("synthetic defect"),
+            sqlite3.OperationalError("synthetic: disk I/O error"),
+        ]
+
+        async def failing(name: str, **kwargs: Any) -> Any:
+            if name == "auth.ad_roles_resynced" and errors:
+                raise errors.pop(0)
+            return await real(name, **kwargs)
+
+        monkeypatch.setattr(store, "_append_audit_row", failing)
+        service._reconcile_refused_rows = []
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=target
+        )
+        with pytest.raises(NotImplementedError):
+            await service._apply_reconcile_revocation(
+                revocation, watermark=await service._audit_watermark()
+            )
+        assert errors == []
+        assert service._reconcile_refused_rows == ["auth.ad_roles_resynced"]
+        assert await store.list_audit(action="auth.ad_roles_resynced") == []
+        assert len(_revoked_rows(await store.list_audit())) == 1
     finally:
         await store.close()

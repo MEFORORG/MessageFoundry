@@ -3188,8 +3188,8 @@ with no page.
 - **A directory grant.** An account can get Administrator because the *directory* added it to a
   group already mapped to Administrator. The engine sees that grant in one of the two places below,
   whichever comes first. Either one raises `administrator_granted`, but at least these cases raise
-  none. A sign-in that sees it first and fails with a server error after the role write loses it;
-  the retry then gains nothing. A reconciler pass the mass-revoke breaker aborts writes no roles.
+  none. A sign-in that sees it first and fails with a server error in a step after the role sync,
+  such as the session mint, loses it; the retry then gains nothing. A reconciler pass the mass-revoke breaker aborts writes no roles.
   An account that never signs in again raises nothing when no pass reaches it: it holds no live
   session, or `[auth].ad_session_recheck_seconds` is 0. So watch membership of the mapped group in
   the directory itself.
@@ -3200,13 +3200,19 @@ with no page.
   `ad_session_revoked`, which does not name the role. The later sign-in then gains nothing, so it
   raises no `administrator_granted`." Vault BACKLOG #3141 added the reconciler's alert.
   - **At the account's next sign-in.** The engine writes an `auth.ad_roles_resynced` audit row
-    with the old and new roles. It also sends a best-effort roles-changed notice to that
+    with the old and new roles, in the role write's transaction. If the store refuses it there,
+    the roles are written without it and the row is then written on its own. Refused again, the
+    row is lost, `audit_write_failed` pages keyed `directory-sign-in:auth.ad_roles_resynced`, and
+    the sign-in fails once the other sessions are revoked and the notice below is sent. The
+    engine also sends a best-effort roles-changed notice to that
     account's own notification address, when the account has one and security notices are set
     up. The sign-in route raises `administrator_granted`, keyed `user:<username>`, with
     `granted_by` set to `<directory>` and `via` naming the route: `directory_sign_in_negotiate`
     for `POST /auth/negotiate`, `directory_sign_in_sso` for `GET /ui/sso`, and
     `directory_sign_in_oidc` for the `/ui/oidc` callback. A sign-in the engine refuses after the
-    sync ran raises it too, because the role was written all the same. An account that already
+    sync ran raises it too, because the role was written all the same. A role sync that raises
+    leaves the route no outcome, so the engine raises the alert itself before the sign-in fails,
+    with `via` set to `directory_sign_in`. An account that already
     held Administrator raises nothing.
   - **Sooner, when the account holds a live session.** A pass of the
     [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
