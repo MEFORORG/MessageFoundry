@@ -3970,14 +3970,16 @@ class Engine:
             supervisor.cancel()
             await asyncio.gather(supervisor, return_exceptions=True)
         elif not supervisor.cancelled() and (error := supervisor.exception()) is not None:
-            log.warning("engine stop: the graph supervisor had ended with %s", safe_exc(error))
+            # Raised, as before this step had a budget: with none, stop() ends here, and under one
+            # run_teardown logs it and runs the next step.
+            raise error
 
     async def _stop_background_runners(self, bound: float) -> None:
         # Concurrent, so one runner slow to stop, as a CRL pass hung on a share is, holds none of the
         # others (BACKLOG #3191). Each stops its own loop and nothing else, and every one of them
         # stops before the coordinator, as the leader sweep and both convergence loops need. The CRL
         # runner, the one with a long wait of its own, is handed a share of the bound for it, so it
-        # still resolves its open alerts before the step is cut.
+        # abandons a hung pass, and logs that it did, before the step is cut.
         runners = [
             runner
             for runner in (
@@ -4041,10 +4043,12 @@ class Engine:
         # A graph left running keeps its intake gate and raises no graph-stopped clear, since
         # opening the one and raising the other would both be false. The monitor's loop, left
         # running, ends with the process, and so does any intake_paused alert it holds open.
-        if self._graph_left_running():
+        left_running = self._graph_left_running()
+        if left_running:
             log.error(
-                "engine stop: the graph did not stop, so the intake gate stays as it is and no "
-                "graph-stopped clear is raised; its claimed rows recover at the next start"
+                "engine stop: the graph did not stop, so the intake gate stays as it is, no "
+                "graph-stopped clear is raised, and the AES-GCM invocation bound is left for the "
+                "store's close to settle; its claimed rows recover at the next start"
             )
         else:
             # After the graph, so the listeners are already closed when the monitor opens the gate
@@ -4073,8 +4077,10 @@ class Engine:
         # that encrypts after it runs is charged against no reservation with no checkpointer left to
         # refill one. The registry runner is what drives those encrypts, so settling ahead of it would
         # silently under-count every write performed during the shutdown drain. A cut here leaves the
-        # settlement to the store's own close, which settles too.
-        if self._gcm_invocation_runner is not None:
+        # settlement to the store's own close, which settles too. So does a graph left running, whose
+        # workers may still encrypt: its runner keeps refilling the reserve ahead of their spend until
+        # that close, so an unclean exit in between can still only over-count (ASVS 11.3.4).
+        if self._gcm_invocation_runner is not None and not left_running:
             await self._gcm_invocation_runner.stop()
             self._gcm_invocation_runner = None
 

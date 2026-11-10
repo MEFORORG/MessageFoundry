@@ -1241,30 +1241,34 @@ class CrlReloadRunner:
         task = self._task
         self._task = None
         wait = self._stop_timeout if timeout is None else min(timeout, self._stop_timeout)
-        if task is not None:
-            try:
-                done, _ = await asyncio.wait({task}, timeout=wait)
-            except asyncio.CancelledError:
-                task.cancel()
-                raise
-            if not done:
+        try:
+            if task is not None:
+                try:
+                    done, _ = await asyncio.wait({task}, timeout=wait)
+                except asyncio.CancelledError:
+                    task.cancel()
+                    raise
+                if not done:
+                    log.warning(
+                        "crl_reload: a reload pass did not finish within %gs of stop; abandoning it",
+                        wait,
+                    )
+                    task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        finally:
+            # On every exit, a stop cut from outside among them, as engine.stop() cuts a step past
+            # its share (BACKLOG #3191): the loop, cancelled with the stop set, raises nothing more.
+            # Also with no task: a clear the sink refused at an earlier stop is retried by this one.
+            self._resolve(list(self._alerted), "the reload has stopped")
+            if self._alerted:
+                # Said here every time, whatever streak is open: no later pass will try again.
                 log.warning(
-                    "crl_reload: a reload pass did not finish within %gs of stop; abandoning it",
-                    wait,
+                    "crl_reload: %d refused-reload alert(s), or clear(s) for an earlier run, could "
+                    "not be resolved at stop; resolve any open in the alert list: %s",
+                    len(self._alerted),
+                    ", ".join(sorted(self._alerted)),
                 )
-                task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        # Also with no task: a clear the sink refused at an earlier stop is retried by this one.
-        self._resolve(list(self._alerted), "the reload has stopped")
-        if self._alerted:
-            # Said here every time, whatever streak is open: no later pass will try again.
-            log.warning(
-                "crl_reload: %d refused-reload alert(s), or clear(s) for an earlier run, could "
-                "not be resolved at stop; resolve any open in the alert list: %s",
-                len(self._alerted),
-                ", ".join(sorted(self._alerted)),
-            )
 
     async def _run(self) -> None:
         # Sleep first: every context was just built from the file as it is now.

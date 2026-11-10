@@ -859,6 +859,15 @@ async def test_a_supervisor_that_ignores_its_cancel_is_cut_and_the_stop_goes_on(
     assert any("the graph supervisor's exit did not finish within" in m for m in messages), messages
 
 
+def _gcm_runner(calls: list[str]) -> Any:
+    """A stand-in for the AES-GCM invocation runner whose stop, the settlement, is recorded."""
+
+    async def _settle() -> None:
+        calls.append("gcm settled")
+
+    return SimpleNamespace(stop=_settle)
+
+
 async def test_a_hung_graph_stop_is_cut_and_the_later_steps_still_run(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -879,6 +888,9 @@ async def test_a_hung_graph_stop_is_cut_and_the_later_steps_still_run(
     )
     engine.drain_config_writes = _drain  # type: ignore[method-assign]
     engine.on_graph_stopped = lambda: calls.append("graph-stopped clear")
+    # Settled now, the AES-GCM bound would stop refilling while the graph's workers may still
+    # encrypt (ASVS 11.3.4); the store's close settles it instead.
+    engine._gcm_invocation_runner = _gcm_runner(calls)
 
     async def _release_lease() -> None:
         calls.append("lease released")
@@ -897,6 +909,7 @@ async def test_a_hung_graph_stop_is_cut_and_the_later_steps_still_run(
     assert any("the graph's stop did not finish within" in m for m in messages), messages
     assert any("the graph did not stop" in m for m in messages), messages
     assert any("keeps its cluster lease" in m for m in messages), messages
+    assert any("left for the store's close to settle" in m for m in messages), messages
 
 
 async def test_a_graph_that_stopped_gets_its_graph_stopped_clear_under_a_budget(
@@ -908,6 +921,7 @@ async def test_a_graph_that_stopped_gets_its_graph_stopped_clear_under_a_budget(
     calls: list[str] = []
     _record_close(engine, calls)
     engine.on_graph_stopped = lambda: calls.append("graph-stopped clear")
+    engine._gcm_invocation_runner = _gcm_runner(calls)
 
     async def _release_lease() -> None:
         calls.append("lease released")
@@ -916,7 +930,7 @@ async def test_a_graph_that_stopped_gets_its_graph_stopped_clear_under_a_budget(
     await asyncio.wait_for(
         engine.stop(budget_seconds=app_module._ENGINE_STOP_RESERVE_SECONDS), _WAIT_S
     )
-    assert calls == ["graph-stopped clear", "lease released", "close"]
+    assert calls == ["graph-stopped clear", "gcm settled", "lease released", "close"]
 
 
 class _FakeRunner:
@@ -959,6 +973,41 @@ async def test_the_background_runners_all_stop_and_only_the_stopped_are_forgotte
         await engine.stop()
 
 
+async def test_a_convergence_reload_the_runners_stop_finishes_does_not_restart_reference_sync(
+    tmp_path: Path,
+) -> None:
+    """The runners stop side by side, so the reference sync loop can stop before a convergence
+    reload being retired reaches its reference reconcile. That reconcile must not start the loop
+    again against the store engine.stop() closes."""
+    engine = await _bare_engine(tmp_path / "converge-ref.db")
+    calls: list[str] = []
+
+    class _Reference:
+        async def stop(self) -> None:
+            calls.append("reference stopped")
+
+        async def sync_all(self) -> None:
+            return None
+
+        def start(self) -> None:
+            calls.append("reference started")
+
+    class _Convergence:
+        async def stop(self) -> None:
+            # The reload this stop retires ends in its reference reconcile, after the sibling
+            # stop above ran.
+            await asyncio.sleep(0)
+            await engine._reconcile_reference_sync(startup=False)
+            calls.append("convergence stopped")
+
+    engine._reference_runner = _Reference()  # type: ignore[assignment]
+    engine._config_convergence = _Convergence()  # type: ignore[assignment]
+    await asyncio.wait_for(
+        engine.stop(budget_seconds=app_module._ENGINE_STOP_RESERVE_SECONDS), _WAIT_S
+    )
+    assert calls == ["reference stopped", "convergence stopped"]
+
+
 async def test_under_a_budget_the_crl_runner_s_wait_is_a_share_of_its_step(
     tmp_path: Path,
 ) -> None:
@@ -991,6 +1040,48 @@ async def test_engine_stop_with_no_budget_raises_the_first_failure_as_before(
         # Closes the store whatever the assertion did, so its worker thread cannot wedge the run.
         engine._registry_runner = real_runner
         await engine.stop()
+
+
+async def _crashed_supervisor() -> asyncio.Task[None]:
+    """A graph supervisor task that has already ended with an error of its own."""
+
+    async def _crash() -> None:
+        raise RuntimeError("PROBE: the supervisor crashed")
+
+    supervisor = asyncio.create_task(_crash())
+    await asyncio.wait({supervisor}, timeout=_WAIT_S)
+    return supervisor
+
+
+async def test_engine_stop_with_no_budget_raises_a_crashed_supervisor_s_error_as_before(
+    tmp_path: Path,
+) -> None:
+    engine = await _bare_engine(tmp_path / "crashed-supervisor.db")
+    engine._graph_supervisor = await _crashed_supervisor()
+    try:
+        with pytest.raises(RuntimeError, match="PROBE: the supervisor crashed"):
+            await engine.stop()
+    finally:
+        # Closes the store whatever the assertion did, so its worker thread cannot wedge the run.
+        await engine.stop()
+
+
+async def test_under_a_budget_a_crashed_supervisor_is_logged_and_the_store_still_closes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    engine = await _bare_engine(tmp_path / "crashed-supervisor-budget.db")
+    calls: list[str] = []
+    _record_close(engine, calls)
+    engine._graph_supervisor = await _crashed_supervisor()
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.teardown"):
+        await asyncio.wait_for(
+            engine.stop(budget_seconds=app_module._ENGINE_STOP_RESERVE_SECONDS), _WAIT_S
+        )
+    assert calls == ["close"]
+    assert any(
+        "the graph supervisor's exit failed" in r.getMessage() and r.exc_info is not None
+        for r in caplog.records
+    )
 
 
 # --- the embedded lifespan (create_app(engine=...)) ---------------------------------------------

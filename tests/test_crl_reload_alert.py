@@ -1527,6 +1527,39 @@ async def test_stop_resolves_what_is_still_open_and_pages_nobody(pki: _Pki) -> N
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
+async def test_a_stop_cut_from_outside_still_resolves_what_is_open(pki: _Pki) -> None:
+    """BACKLOG #3191: engine.stop() cuts a step past its share, and with it a CRL stop still
+    waiting on a pass. The alert the runner holds open is resolved all the same, since nothing
+    after a stop would clear it."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink, interval_seconds=0.01, stop_timeout_seconds=30.0)
+    pki.crl.write_bytes(_expired(pki))
+    _pass(runner)
+    assert sink.kinds() == ["refused"], "the control: an alert is open before the stop"
+    entered, release = threading.Event(), threading.Event()
+
+    def hung() -> list[ReloadOutcome]:
+        entered.set()
+        release.wait(10)
+        return []
+
+    runner._reload = hung
+    runner.start()
+    try:
+        await until(entered.is_set, "the pass in flight")
+        stop = asyncio.ensure_future(runner.stop())
+        await asyncio.sleep(0.05)
+        assert not stop.done(), "the control: the stop is waiting on the pass"
+        stop.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stop
+    finally:
+        release.set()  # so asyncio.run's executor shutdown does not wait on the thread
+    assert sink.kinds() == ["refused", "applied"]
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
 async def test_an_alert_a_dead_process_left_open_is_resolved_once_by_the_next_run(
     pki: _Pki,
 ) -> None:
