@@ -1359,7 +1359,7 @@ per-inbound worker child** (never a per-message fork), enforcing a forbidden-imp
 worker crash, an invalid answer or one forged without the request's id) fails that message's call as
 an internal error **post-ACK** (no NAK, never dropped), which the `[delivery] internal_error` policy
 then handles. At least two cases differ (vault BACKLOG #3135). A request the engine cannot
-encode, or one over the frame cap, fails only that message's call and keeps the worker, since no byte
+encode, or one over the frame cap, keeps the worker, since no byte
 of it was written; a worker answer the codec rejects still kills the worker. A stray frame found
 waiting **before** a request kills the worker and retries the message once on a fresh one (owner
 ruling 2026-11-09); [ADR 0187](adr/0187-bound-the-subprocess-sandbox-worker-count-a-shared-pool-or-router-phase-only-isolation.md)
