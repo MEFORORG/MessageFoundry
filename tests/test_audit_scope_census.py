@@ -14,7 +14,8 @@ left whole, each with its reason.
 return), a scope written under a key not in :data:`_SCOPE_KEYS`, a key not spelled as a string
 literal, an action passed by keyword or as an expression other than a string or a module-level
 string constant, and a writer outside ``messagefoundry/``. Each of those passes silently. The
-``missing`` check catches such a move only on one of the four narrowed writers.
+``missing`` check catches such a move only on one of the narrowed writers, and the second test's
+stale check only on one of the :data:`_WHOLE_ROW` writers.
 """
 
 from __future__ import annotations
@@ -126,11 +127,12 @@ def test_every_audit_write_with_a_scope_key_is_narrowed_or_named_whole() -> None
     # that the scan ran over the tree. The ``missing`` check is what shows it still sees audit
     # writers: each narrowed action is written with a scope key in a literal detail.
     assert scanned > 100, f"the scan saw only {scanned} calls; the instrument is broken"
-    # The population the ``unclassified`` walk below draws from: the four narrowed actions and the
-    # four _WHOLE_ROW names, eight measured on 2026-11-10.
-    assert len(found) >= 8, f"the census found only {sorted(found)}; the instrument is broken"
     missing = CHANNEL_LIST_ACTIONS - set(found)
     assert not missing, f"the census no longer sees these narrowed writers: {sorted(missing)}"
+    # A count of what the ``unclassified`` walk below draws from, so it cannot pass over nothing.
+    # Every narrowed and every _WHOLE_ROW action is written with a scope key in a literal detail.
+    floor = len(CHANNEL_LIST_ACTIONS) + len(_WHOLE_ROW)
+    assert len(found) >= floor, f"the census found only {sorted(found)}; the instrument is broken"
     unclassified = {
         action: sorted(keys)
         for action, keys in found.items()
