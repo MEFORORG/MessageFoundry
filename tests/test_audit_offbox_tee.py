@@ -756,7 +756,9 @@ async def _provision_store(db: Path) -> None:
     await store.close()
 
 
-def _run_backup(tmp_path: Path, *, allow_unencrypted: bool) -> subprocess.CompletedProcess[str]:
+def _run_backup(
+    tmp_path: Path, *, allow_unencrypted: bool, extra_toml: str = ""
+) -> subprocess.CompletedProcess[str]:
     """Run the real ``messagefoundry backup`` subcommand in a child process and capture both streams.
 
     A child process, not ``main(argv)`` in-process: the whole question is what the PROCESS did about
@@ -774,6 +776,7 @@ def _run_backup(tmp_path: Path, *, allow_unencrypted: bool) -> subprocess.Comple
     body = AT_REST_OPT_OUT_TOML + "[store]\n"
     if allow_unencrypted:
         body += "\n[backup]\nallow_unencrypted = true\n"
+    body += extra_toml
     toml.write_text(body, encoding="utf-8")
     # backup backs up a store and no longer creates the one it is pointed at (BACKLOG #1780), so the
     # store exists before the child runs, as it would after serve's first run.
@@ -851,6 +854,56 @@ def test_backup_subcommand_ships_its_failure_audit_row_off_box(tmp_path) -> None
     # A prefix, not a nested `json.loads`: `safe_text` bounds `detail`'s LENGTH, so this row reaches
     # the wire truncated mid-string and is no longer parseable JSON. The content still travelled.
     assert records[0]["detail"].startswith('{"error": "BackupError')
+
+
+class _NoCollectorCopy(Exception):
+    """The one failure the CLI-forwarding xfail below expects, so a setup fault cannot satisfy it."""
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=_NoCollectorCopy,
+    reason="KNOWN GAP, BACKLOG #3767: a CLI process installs no forwarder, so an audit row it "
+    "commits reaches stderr and never a collector. docs/PHI.md section 7 row 18 states it.",
+)
+def test_a_cli_committed_audit_row_reaches_the_configured_collector(tmp_path) -> None:
+    """``backup`` commits a ``dr_backup`` row from a CLI process whose service config names a
+    collector. The row must arrive there, as a ``serve`` row would. It does not: only ``serve`` and
+    ``supervise`` install a forwarder. When it does, take the marker off. Plain UDP to loopback
+    keeps the collector a bare socket; nothing here judges that hop, because the CLI reads none of
+    ``[logging]``."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as collector:
+        collector.bind(("127.0.0.1", 0))
+        port = collector.getsockname()[1]
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.sendto(b"probe", ("127.0.0.1", port))
+        proc = _run_backup(
+            tmp_path,
+            allow_unencrypted=True,
+            extra_toml=(
+                f'\n[logging]\nforward_host = "127.0.0.1"\nforward_port = {port}\n'
+                'forward_protocol = "udp"\n'
+            ),
+        )
+        # POSITIVE CONTROL: the backup ran under that config and committed the row, whose tee
+        # reached the process's own stderr sink. So a missing collector copy is the gap, not a
+        # backup that never ran or a row that was never written.
+        assert proc.returncode == 0, f"backup did not run: {proc.stdout}\n{proc.stderr}"
+        assert [r["action"] for r in _audit_records_in(proc.stderr)] == ["dr_backup"], proc.stderr
+        # The child has exited, so anything it sent is already queued on this socket.
+        collector.settimeout(0.5)
+        received = []
+        try:
+            while True:
+                received.append(collector.recv(65535).decode("utf-8", "replace"))
+        except TimeoutError:
+            pass
+    # COLLECTOR CONTROL: the probe sent before the run was read, so the read loop works.
+    assert received[:1] == ["probe"], received
+    if not any('"dr_backup"' in datagram for datagram in received):
+        raise _NoCollectorCopy(received)
 
 
 @contextlib.contextmanager
