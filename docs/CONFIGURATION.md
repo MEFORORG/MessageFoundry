@@ -1357,13 +1357,14 @@ with zero overhead**. `mode="subprocess"` runs each inbound's Router/Handler in 
 per-inbound worker child** (never a per-message fork), enforcing a forbidden-import guard
 (socket/store/crypto) and the resource caps below. An isolation denial (forbidden op, cap overrun,
 worker crash, an invalid answer or one forged without the request's id) routes the message to
-`ERROR`/dead-letter **post-ACK** (no NAK, never dropped); a forged answer that carries the id is taken
-as the result (see the grandchild paragraph below). At least two cases differ (vault BACKLOG #3135). A request the engine cannot
+`ERROR`/dead-letter **post-ACK** (no NAK, never dropped). At least two cases differ (vault BACKLOG #3135). A request the engine cannot
 encode, or one over the frame cap, dead-letters only that message and keeps the worker, since no byte
 of it was written; a worker answer the codec rejects still kills the worker. A stray frame found
 waiting **before** a request kills the worker and retries the message once on a fresh one (owner
 ruling 2026-11-09); [ADR 0187](adr/0187-bound-the-subprocess-sandbox-worker-count-a-shared-pool-or-router-phase-only-isolation.md)
-*Amendment B* lists at least the cases in which that message still dead-letters.
+*Amendment B* lists at least the cases in which that message still dead-letters. A forged answer
+that carries the request's id can instead be taken as the message's result; see the grandchild
+paragraph below.
 Each worker kill writes one `WARNING` naming the inbound, the phase and a cause token, and no message
 content, except a graph refusal, which writes none, and a shutdown, logged at `INFO`. The runner alerts
 on a graph refusal against the graph the engine serves; one against a graph a reload has replaced
@@ -1517,9 +1518,9 @@ as the same account as the engine, so it can still read what that account can re
 2026-10-01 correction in [ADR 0087](adr/0087-sandbox-subprocess-isolation.md). All of one inbound's Routers/Handlers
 share a single worker, so this does **not** confine one Handler from another — the boundary is between
 admin code and the engine, exactly as `mode=off` shares an address space. A grandchild the Handler
-spawns inherits the response pipe and can stage a frame while the worker is alive; killing the worker
-now reaps its whole process tree (a Windows kill-on-close job object / a POSIX process group), so such
-a grandchild no longer outlives the kill (BACKLOG #342). That reap is best-effort process hygiene, and
+spawns inherits the request and response pipes and can stage a frame while the worker is alive; killing the worker
+now reaps its whole process tree (a Windows kill-on-close job object / a POSIX process group), so a
+grandchild that stays in that tree no longer outlives the kill (BACKLOG #342); one that leaves it can. That reap is best-effort process hygiene, and
 neither it nor the request-answer binding stops a live grandchild from forging an answer:
 it can at least do that, and deny the feed. The grandchild residual in
 [ADR 0087](adr/0087-sandbox-subprocess-isolation.md) says what it can do, and AC-10's 2026-11-09
