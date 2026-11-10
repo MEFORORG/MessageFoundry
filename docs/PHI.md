@@ -2042,6 +2042,14 @@ fields missing, or with one field's text under another key. The `emit_audit_tee`
 docstring in [`store/audit_tee.py`](../messagefoundry/store/audit_tee.py) names at least two
 residuals that cause these.
 
+**A C0 control beside text in a tee field is narrowed, not closed (BACKLOG #3045).** Each text
+field is scrubbed before the record is serialised, and a field holding a C0 control is read with
+each control as a space and as nothing as well, which can only add redaction to the plain scrub.
+At least two cases can still let text beside a control through, on a first deployment: text that
+needs two controls in it read two different ways, and a span the scrub maps to the wrong copy of a
+repeated stretch. `scrub_log_field` in
+[`logging_setup.py`](../messagefoundry/logging_setup.py) names both.
+
 ### Logging inventory (16.1.1 / 16.2.3)
 
 Every log/event stream the product emits, with the facts ASVS 16.1.1 asks for: **what events are

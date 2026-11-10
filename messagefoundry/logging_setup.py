@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import collections
 import contextlib
-import functools
 import json
 import logging
 import logging.handlers
@@ -447,7 +446,7 @@ class CredentialScrubFilter(logging.Filter):
         return True
 
 
-def scrub_log_field(text: str) -> str:
+def scrub_log_field(text: str, *, json_escapes: bool = False) -> str:
     """Run the text passes of :func:`_install_phi_filters`'s chain over one value, in that order:
     PHI redaction, the credential query scrub, then the credential scrub.
 
@@ -457,70 +456,214 @@ def scrub_log_field(text: str) -> str:
     after this. The control-character scrub is left to the handler, which runs it last on every
     sink.
 
-    **A C0 control in the value is also read two other ways.** A raw control such as U+0001 is
-    not whitespace, so a pattern that needs a space between a label and its value, or between
-    the parts of a name, misses ``MRN\x0112345678`` or ``SMITH,\x01JOHN``, and one inside a token
-    splits it, as in ``05\x01/05/1980``. A writer that ``json.dumps`` its own value first, as
-    the audit ``detail`` writers do, hands over the same control as the text ``\u0001`` or
-    ``\t``, which no pattern reads as a control at all. So a value holding a C0 control, raw or
-    as such an escape, is scrubbed again twice: once with each control as a space, and once with
-    each removed. A tab, LF or CR, raw or escaped, is read as itself, so line structure holds.
-    Whichever of the three results keeps the fewest letters and digits outside redaction
-    markers, not counting a control's escape, is returned, the plain one on a tie. A reading that wins loses the controls, or their escapes,
-    from the value; a value no reading redacts more keeps them.
+    **A C0 control in the value can only ADD redaction.** A raw control such as U+0001 is not
+    whitespace, so a pattern that needs a space between a label and its value, or between the
+    parts of a name, misses ``MRN\\x0112345678`` or ``SMITH,\\x01JOHN``, and one inside a token
+    splits it, as in ``05\\x01/05/1980``. So when the value holds one, the value and the plain
+    passes' result for it are each read twice more: once with every such control as a space, and
+    once with every one removed. A tab, LF or CR is read as itself, so line structure holds. Each
+    reading runs the passes again, and every span any reading redacts is redacted in the plain
+    result. A span of the value maps to the plain result through where the plain passes kept it.
+    Nothing the plain passes redacted can come back, because the readings only ever mark more of
+    the plain result, and the controls they did not redact stay where they were.
+
+    ``json_escapes`` is for a value its writer already ran through ``json.dumps``, as the audit
+    ``detail`` writers do: the control then arrives as the text ``\\u0001`` or ``\\t``, which no
+    pattern reads as a control, so that text is read as the control too. An escape is redacted
+    whole or not at all, and an unescaped quote is never redacted, so a value that was valid JSON
+    stays valid JSON. Off for a raw field such as an actor, where ``CORP\\bJONES`` is a name with
+    a backslash in it, not a control.
+
+    At least two residuals remain. Text that is redacted only when two controls in it are read
+    two different ways, one as a space and one as nothing, is not. And where the plain result
+    repeats a stretch of the value, a span may map to the wrong copy, which can leave a reading's
+    redaction unapplied, though never undo one the plain passes made.
 
     ``tests/test_audit_offbox_tee.py`` holds the three passes to the handler chain's, at least on
     the inputs it names, and the chain's filter count to four."""
     scrubbed = _scrub_text_passes(text)
-    if not _C0_READING.search(text):
+    reading = _C0_ESCAPE_READING if json_escapes else _C0_RAW_READING
+    if not any(_is_c0(match.group()) for match in reading.finditer(text)):
         return scrubbed
-    best, best_left = scrubbed, _visible(scrubbed)
-    for control in (" ", ""):
-        result = _scrub_text_passes(_read_controls(text, control))
-        left = _visible(result)
-        if left < best_left:
-            best, best_left = result, left
-    return best
+    masked = [False] * len(scrubbed)
+    # Each reading of the plain result marks it directly. Each reading of the raw value marks the
+    # characters of the plain result that came from it, through where the plain passes kept them.
+    origin = _origins(text, scrubbed)
+    for source, mapped in ((scrubbed, None), (text, origin)):
+        for control in (" ", ""):
+            source_mask = _reading_mask(source, reading, control)
+            if mapped is None:
+                masked = [m or s for m, s in zip(masked, source_mask, strict=True)]
+            else:
+                for index, at in enumerate(mapped):
+                    if at >= 0 and source_mask[at]:
+                        masked[index] = True
+    if json_escapes:
+        _keep_json_valid(scrubbed, masked)
+    # A marker the plain passes wrote stays as it is, and a run masked right after one joins it.
+    marker_ends = set()
+    for marker in _REDACTION_MARKERS.finditer(scrubbed):
+        masked[marker.start() : marker.end()] = [False] * (marker.end() - marker.start())
+        marker_ends.add(marker.end())
+    out: list[str] = []
+    for index, char in enumerate(scrubbed):
+        if not masked[index]:
+            out.append(char)
+        elif index not in marker_ends and (index == 0 or not masked[index - 1]):
+            out.append(_REDACTED)
+    return "".join(out)
 
 
-#: A C0 control (:data:`~messagefoundry.controlchars.JSON_ESCAPED_CONTROLS`) raw, or as the JSON
-#: escape ``json.dumps`` writes for it. An escaped backslash comes first, so the ``\t`` in
-#: ``\\temp`` is not read as a tab.
-_C0_READING = re.compile(
-    r"\\\\|\\u00[01][0-9a-fA-F]|\\[bfnrt]|[" + re.escape(JSON_ESCAPED_CONTROLS) + "]"
+def _reading_mask(text: str, reading: re.Pattern[str], control: str) -> list[bool]:
+    """Which characters of ``text`` the passes redact when its controls are read as ``control``."""
+    mask = [False] * len(text)
+    read, spans = _read_controls(text, reading, control)
+    result = _scrub_text_passes(read)
+    if result != read:
+        for start, end in _redacted_spans(read, result):
+            mask[spans[start][0] : spans[end - 1][1]] = [True] * (
+                spans[end - 1][1] - spans[start][0]
+            )
+    return mask
+
+
+#: A C0 control (:data:`~messagefoundry.controlchars.JSON_ESCAPED_CONTROLS`), raw.
+_C0_RAW_READING = re.compile("[" + re.escape(JSON_ESCAPED_CONTROLS) + "]")
+#: The same, or the JSON escape ``json.dumps`` writes for one. Every other JSON escape matches
+#: too, so it is consumed whole and the ``\\t`` in ``\\\\temp`` is not read as a tab.
+_C0_ESCAPE_READING = re.compile(
+    r"\\u[0-9a-fA-F]{4}|\\.|[" + re.escape(JSON_ESCAPED_CONTROLS) + "]", re.DOTALL
 )
 _JSON_SHORT_ESCAPES = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+#: A JSON escape, which :func:`_keep_json_valid` redacts whole or not at all.
+_JSON_ESCAPE = re.compile(r"\\u[0-9a-fA-F]{4}|\\.", re.DOTALL)
 
 
-def _read_c0(match: re.Match[str], *, control: str) -> str:
-    """One :data:`_C0_READING` match as the scrub's second pass reads it: a tab, LF or CR as
-    itself, any other C0 control as ``control``, and an escaped backslash unchanged."""
-    found = match.group()
-    if found == "\\\\":
+def _c0_char(found: str) -> str | None:
+    """The C0 control a :data:`_C0_ESCAPE_READING` match stands for, or None for another escape."""
+    if len(found) == 1:
         return found
     if len(found) == 6:
         char = chr(int(found[2:], 16))
-    elif len(found) == 2:
-        char = _JSON_SHORT_ESCAPES[found[1]]
-    else:
-        char = found
-    return char if char in "\t\n\r" else control
+        return char if char in JSON_ESCAPED_CONTROLS else None
+    return _JSON_SHORT_ESCAPES.get(found[1])
+
+
+def _is_c0(found: str) -> bool:
+    """Whether the readings change a reading match: any C0 control but a raw tab, LF or CR, which
+    they read as itself. An escaped one counts, since reading it as itself makes it whitespace."""
+    char = _c0_char(found)
+    return char is not None and (char not in "\t\n\r" or len(found) > 1)
+
+
+def _read_controls(
+    text: str, reading: re.Pattern[str], control: str
+) -> tuple[str, list[tuple[int, int]]]:
+    """``text`` with each C0 control, raw or escaped as ``reading`` matches it, as ``control``,
+    and a tab, LF or CR as itself. Also returns, for each character of the result, the span of
+    ``text`` it came from, so a span redacted in the reading maps back to ``text``."""
+    out: list[str] = []
+    spans: list[tuple[int, int]] = []
+    last = 0
+    for match in reading.finditer(text):
+        for index in range(last, match.start()):
+            out.append(text[index])
+            spans.append((index, index + 1))
+        char = _c0_char(match.group())
+        if char is None:
+            replacement = match.group()
+        elif char in "\t\n\r":
+            replacement = char
+        else:
+            replacement = control
+        # A replacement longer than one character keeps its own characters, one span each.
+        if len(replacement) == len(match.group()):
+            for offset, ch in enumerate(replacement):
+                out.append(ch)
+                spans.append((match.start() + offset, match.start() + offset + 1))
+        else:
+            for ch in replacement:
+                out.append(ch)
+                spans.append((match.start(), match.end()))
+        last = match.end()
+    for index in range(last, len(text)):
+        out.append(text[index])
+        spans.append((index, index + 1))
+    return "".join(out), spans
+
+
+def _placements(source: str, result: str) -> tuple[list[tuple[int, int, int]], int | None]:
+    """Where each piece of ``result`` between redaction markers sits in ``source``, as
+    ``(offset in result, offset in source, length)``, in order. ``result`` is ``source`` with
+    spans swapped for markers, so each piece is found after the one before it, and the last one
+    ends ``source``. Also returns, when a piece cannot be found, the offset in ``source`` the walk
+    stopped at, so a caller can count the rest as redacted: a surprise costs text, never a
+    redaction."""
+    placed: list[tuple[int, int, int]] = []
+    starts = [0, *(marker.end() for marker in _REDACTION_MARKERS.finditer(result))]
+    pieces = _REDACTION_MARKERS.split(result)
+    pos = 0
+    for number, (piece, at) in enumerate(zip(pieces, starts, strict=True)):
+        last = number == len(pieces) - 1
+        stripped = piece.strip()
+        lead = len(piece) - len(piece.lstrip())
+        found, offset, length = -1, at, len(piece)
+        for candidate, shift in ((piece, 0), (stripped, lead)):
+            if last:
+                if source.endswith(candidate) and len(source) - len(candidate) >= pos:
+                    found = len(source) - len(candidate)
+            else:
+                found = source.find(candidate, pos)
+            if found >= 0:
+                offset, length = at + shift, len(candidate)
+                break
+        if found < 0:
+            return placed, pos
+        if length:
+            placed.append((offset, found, length))
+        pos = found + length
+    return placed, None
+
+
+def _redacted_spans(read: str, result: str) -> list[tuple[int, int]]:
+    """The spans of ``read`` the passes replaced to make ``result``: what lies between two of
+    :func:`_placements`'s pieces, and the rest of ``read`` where the walk stopped."""
+    placed, _stopped = _placements(read, result)
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    for _offset, found, length in placed:
+        spans.append((pos, found))
+        pos = found + length
+    spans.append((pos, len(read)))
+    return [span for span in spans if span[1] > span[0]]
+
+
+def _origins(text: str, scrubbed: str) -> list[int]:
+    """For each character of ``scrubbed``, the passes' result for ``text``, the index in ``text``
+    it was kept from, or -1 for a marker's or one the walk could not place."""
+    origin = [-1] * len(scrubbed)
+    placed, _stopped = _placements(text, scrubbed)
+    for offset, found, length in placed:
+        origin[offset : offset + length] = range(found, found + length)
+    return origin
+
+
+def _keep_json_valid(text: str, masked: list[bool]) -> None:
+    """Widen ``masked`` to cover each JSON escape it touches, and unmask each unescaped quote, so
+    replacing the masked runs of a valid JSON text leaves it valid. Unmasking a quote shows no
+    letter or digit."""
+    escaped: set[int] = set()
+    for match in _JSON_ESCAPE.finditer(text):
+        escaped.update(range(match.start(), match.end()))
+        if any(masked[match.start() : match.end()]):
+            masked[match.start() : match.end()] = [True] * (match.end() - match.start())
+    for index, char in enumerate(text):
+        if char == '"' and index not in escaped:
+            masked[index] = False
 
 
 #: The markers the three text passes write in place of what they hide.
 _REDACTION_MARKERS = re.compile(re.escape(_REDACTED) + "|" + re.escape(CREDENTIAL_PLACEHOLDER))
-
-
-def _read_controls(text: str, control: str) -> str:
-    """``text`` with each :data:`_C0_READING` match read by :func:`_read_c0`."""
-    return _C0_READING.sub(functools.partial(_read_c0, control=control), text)
-
-
-def _visible(text: str) -> int:
-    """How many letters and digits ``text`` keeps outside the redaction markers, not counting a
-    control's escape, so a result that kept ``\\u0001`` as text does not look less redacted."""
-    unmarked = _REDACTION_MARKERS.sub("", _read_controls(text, ""))
-    return sum(ch.isalnum() for ch in unmarked)
 
 
 def _scrub_text_passes(text: str) -> str:

@@ -90,20 +90,38 @@ audit_logger.setLevel(logging.INFO)
 
 #: Whether this process has logged a tee failure; see the handler in :func:`emit_audit_tee`.
 _TEE_FAILURE_LOGGED = False
+#: Whether this process has logged a field scrub failure; see :func:`_scrubbed`.
+_SCRUB_FAILURE_LOGGED = False
 
 
-def _scrubbed(value: str | None, finish: Callable[[str], str] | None = None) -> str | None:
+def _scrubbed(
+    value: str | None,
+    finish: Callable[[str], str] | None = None,
+    *,
+    json_escapes: bool = False,
+) -> str | None:
     """``value`` through :func:`~messagefoundry.logging_setup.scrub_log_field`, then through
     ``finish`` if given. The field scrub goes first so it reads the raw value: a pass that ran
     before it could redact the text beside a C0 control and leave the rest. If either raises, a
     fixed marker takes its place, as ``RedactionFilter`` writes for a record: the copy and its
-    anchors still ship, and the raw value never does."""
+    anchors still ship, and the raw value never does. The fault is logged once per process, by
+    its type alone, never the value or the exception's message, which could carry it."""
     if not value:
         return value
     try:
-        scrubbed = scrub_log_field(value)
+        scrubbed = scrub_log_field(value, json_escapes=json_escapes)
         return finish(scrubbed) if finish is not None else scrubbed
     except Exception as exc:  # noqa: BLE001 -- fail closed on the field, not the whole copy
+        # Once per process, for the reason the tee's own handler gives: a line per row would count
+        # the hidden lock rows for `logs:view` (#1131).
+        global _SCRUB_FAILURE_LOGGED
+        if not _SCRUB_FAILURE_LOGGED:
+            _SCRUB_FAILURE_LOGGED = True
+            log.warning(
+                "the audit tee field scrub raised %s, so that field shipped as a marker; further "
+                "field scrub failures in this process are not logged",
+                type(exc).__name__,
+            )
         return f"[field dropped: {type(exc).__name__} while scrubbing it]"
 
 
@@ -231,9 +249,9 @@ def emit_audit_tee(
     caught and logged, not raised. Callers invoke this **after commit** and **outside any write
     lock/transaction**, so a synchronous syslog send can't block the event loop under a lock."""
     try:
-        # Inside the guard, since the field scrub runs patterns: a fault there, or a sink that
-        # cannot be built, must not fail the caller's audit write either. It drops the copy rather
-        # than ship an unscrubbed one.
+        # Inside the guard, so a sink that cannot be built, or any other fault here, must not fail
+        # the caller's audit write. A fault in one field's scrub costs only that field, which
+        # ships as a marker (_scrubbed); a fault anywhere else drops the copy, never ships it raw.
         record = {
             "event": "audit",
             "ts": ts,
@@ -249,7 +267,7 @@ def emit_audit_tee(
             "seq": seq,
             "row_hash": row_hash,
             # PHI chokepoint: redact HL7-shaped content + bound length before it ships off-box.
-            "detail": _scrubbed(detail, safe_text) if detail else None,
+            "detail": _scrubbed(detail, safe_text, json_escapes=True) if detail else None,
         }
         ensure_logger_sink(audit_logger)
         # Not ensure_ascii, and no escaping here: see "The record survives the scrub" above.

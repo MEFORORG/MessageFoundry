@@ -19,16 +19,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
 
 ### Fixed
-- **The off-box audit record no longer lets text beside a C0 control pass the redaction and
-  credential filters.** `json.dumps` escapes a C0 control as `\u0001` or `\t`, which ends in a
-  word character, so on a first deployment a name, a date, a bearer token, an MRN or a
-  `password=` value beside one would have reached the tee line unredacted. The tee now scrubs
-  each text field before it serialises the record, and the handler filters still run over the
-  whole line after. That scrub also reads a C0 control inside a value, raw or as the escape a
-  writer's own `json.dumps` left in `detail`, as a space and as nothing, and keeps the reading
-  that redacts most. A field whose
-  scrub fails ships as a fixed marker, and the record still ships. Of the residuals 0.5.2 named for the tee, the C0 one is closed; the other two
-  remain, and the `emit_audit_tee` docstring names them. (`BACKLOG #3045`)
+- **Text beside a C0 control in an off-box audit record field is now redacted in the cases the
+  tests sweep.** `json.dumps` escapes a C0 control as `\u0001` or `\t`, which ends in a word
+  character, so on a first deployment a name, a date, a bearer token, an MRN or a `password=`
+  value beside one would have reached the tee line unredacted. The tee now scrubs each text field
+  before it serialises the record, and the handler filters still run over the whole line after.
+  A field holding a C0 control is also read with each control as a space and as nothing, and in
+  `detail` an escape its writer's own `json.dumps` left counts as a control. Those readings only
+  add redaction to the plain scrub, never remove one, and a serialised `detail` that parsed still
+  parses. A field whose scrub fails ships as a fixed marker, the fault is logged once by its type,
+  and the record still ships. The C0 residual 0.5.2 named for the tee is narrowed, not closed:
+  `scrub_log_field` names at least two cases left, and the `emit_audit_tee` docstring names the
+  tee's other two residuals. (`BACKLOG #3045`)
 - **The `supervise` process's own TLS log forwarder now picks up a replaced CRL without a
   restart.** An engine process applied a replaced `[logging].forward_tls_crl_file` to its running
   forwarder, but the supervisor builds no engine, so nothing in it did. On a first deployment a

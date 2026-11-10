@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -565,6 +566,41 @@ def test_every_c0_control_beside_or_inside_the_text_of_each_field_is_redacted(
         and (code not in (0x09, 0x0A, 0x0D) or needle not in _scrub_text_passes(value))
     ]
     assert not leaks, leaks
+    if field == "detail-as-json":
+        # A detail its writer serialised must still parse after the field scrub (BACKLOG #3045,
+        # review finding 3: an escape read as a raw control broke it). Read off the field scrub,
+        # not the line: the line chain's own ``password=`` residual can break the whole line,
+        # and ``emit_audit_tee`` states that one.
+        broken = [
+            ascii(fields["detail"]) for fields in cases if not _scrubbed_detail_parses(fields)
+        ]
+        assert not broken, broken
+
+
+def _line_record(line: str) -> dict:
+    return json.loads(line.split("messagefoundry.audit: ", 1)[1])
+
+
+def _scrubbed_detail_parses(fields: dict[str, str | None]) -> bool:
+    """Whether a serialised ``detail`` still parses once the tee's field scrub has run on it,
+    wherever the plain text passes leave it parsing. Where they do not, as when an HL7-shaped
+    run takes the closing quote with it, that is their residual, which ``emit_audit_tee``
+    states, and not the field scrub's."""
+    from messagefoundry.logging_setup import _scrub_text_passes
+
+    detail = fields["detail"]
+    assert detail is not None and _parses(detail)
+    return not _parses(_scrub_text_passes(detail)) or _parses(
+        scrub_log_field(detail, json_escapes=True)
+    )
+
+
+def _parses(text: str) -> bool:
+    try:
+        json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return True
 
 
 def test_the_field_scrub_redacts_no_less_than_the_line_chain_alone(capsys, monkeypatch) -> None:
@@ -581,7 +617,7 @@ def test_the_field_scrub_redacts_no_less_than_the_line_chain_alone(capsys, monke
                 keys += [({"actor": value}, needle), ({"detail": value}, needle)]
     cases = [fields for fields, _needle in keys]
     real = scrub_log_field
-    monkeypatch.setattr(audit_tee, "scrub_log_field", lambda text: text)
+    monkeypatch.setattr(audit_tee, "scrub_log_field", lambda text, **_kw: text)
     before = _tee_lines(cases, capsys)
     monkeypatch.setattr(audit_tee, "scrub_log_field", real)
     after = _tee_lines(cases, capsys)
@@ -595,6 +631,128 @@ def test_the_field_scrub_redacts_no_less_than_the_line_chain_alone(capsys, monke
     # The control: the switch really turns the field scrub off, so the comparison is not vacuous.
     assert gained, "no value differed between the two runs, so the field scrub never switched off"
     assert not lost, lost
+
+
+#: The two values the round-3 review of BACKLOG #3045 found leaking, with what each must hide.
+#: In the first, reading the controls as spaces exposed a credential tail the plain passes had
+#: hidden; in the second, each of two controls needed a different reading.
+_REVIEW_LEAKS = (
+    ("password=hun\x01ter2 DOE\x01JANE\x01SMITH", ("ter2", "DOE", "JANE")),
+    ("Bearer\x01abcdefgh pass\x01word=hunter2", ("abcdefgh", "hunter2")),
+)
+
+
+@pytest.mark.parametrize("field", ["actor", "detail", "detail-as-json"])
+@pytest.mark.parametrize(("value", "needles"), _REVIEW_LEAKS)
+def test_a_control_reading_never_exposes_what_another_reading_hides(
+    field: str, value: str, needles: tuple[str, ...], capsys
+) -> None:
+    """Every span any reading redacts is redacted, and none the plain passes redacted comes
+    back (BACKLOG #3045, review findings 1 and 2). Synthetic values."""
+    fields: dict[str, str | None] = (
+        {"detail": json.dumps({"error": value})} if field == "detail-as-json" else {field: value}
+    )
+    (line,) = _tee_lines([fields], capsys)
+    assert not [needle for needle in needles if needle in line], line
+
+
+def _multi_control_keys() -> list[tuple[str, tuple[str, str]]]:
+    """Two sweep templates in one value, each with its own control, and the control case first:
+    the same pair with a space or nothing in each control's place."""
+    keys = []
+    for first, needle_1, stand_1 in _C0_SWEEP_TEMPLATES:
+        for second, needle_2, stand_2 in _C0_SWEEP_TEMPLATES:
+            for code_1, code_2 in ((-1, -1), (0x01, 0x01), (0x00, 0x1F), (0x1B, 0x08)):
+                one = first.format(c=chr(code_1) if code_1 >= 0 else stand_1)
+                two = second.format(c=chr(code_2) if code_2 >= 0 else stand_2)
+                keys.append((f"{one} {two}", (needle_1, needle_2)))
+    return keys
+
+
+@pytest.mark.parametrize("field", ["actor", "detail-as-json"])
+def test_several_controls_in_one_value_are_each_read(field: str, capsys) -> None:
+    """A value holding two controls, each needing its own reading, hides both needles, and a
+    serialised detail still parses (BACKLOG #3045, review findings 2 and 3). Synthetic values."""
+    keys = _multi_control_keys()
+    if field == "detail-as-json":
+        cases: list[dict[str, str | None]] = [
+            {"detail": json.dumps({"error": value})} for value, _needles in keys
+        ]
+    else:
+        cases = [{field: value} for value, _needles in keys]
+    lines = _tee_lines(cases, capsys)
+    leaks = [
+        (ascii(value), needle)
+        for (value, needles), line in zip(keys, lines, strict=True)
+        for needle in needles
+        if needle in line
+    ]
+    assert not leaks, leaks[:20]
+    if field == "detail-as-json":
+        broken = [
+            ascii(fields["detail"]) for fields in cases if not _scrubbed_detail_parses(fields)
+        ]
+        assert not broken, broken[:20]
+
+
+_ESCAPE_TEXT = re.compile(r"\\u[0-9a-fA-F]{4}|\\.")
+
+
+def test_the_field_scrub_shows_no_word_the_line_chain_alone_hides(capsys, monkeypatch) -> None:
+    """The ship rule for BACKLOG #3045: no word of a value that the code before it hid may show
+    once the field scrub runs, over the single-control and the two-control sweeps. The code
+    before is the field scrub switched off, so only the handler chain runs, over the escaped
+    line. A JSON escape counts as a word break on both sides. Synthetic values."""
+    values = [
+        template.format(c=chr(code))
+        for code in range(0x20)
+        for template, _needle, _stand in _C0_SWEEP_TEMPLATES
+    ]
+    values += [value for value, _needles in _multi_control_keys()]
+    values += [value for value, _needles in _REVIEW_LEAKS]
+    keys: list[tuple[str, dict[str, str | None]]] = []
+    for value in values:
+        keys += [(value, {"actor": value}), (value, {"detail": json.dumps({"error": value})})]
+    cases = [fields for _value, fields in keys]
+    real = scrub_log_field
+    monkeypatch.setattr(audit_tee, "scrub_log_field", lambda text, **_kw: text)
+    before = [_ESCAPE_TEXT.sub(" ", line) for line in _tee_lines(cases, capsys)]
+    monkeypatch.setattr(audit_tee, "scrub_log_field", real)
+    after = [_ESCAPE_TEXT.sub(" ", line) for line in _tee_lines(cases, capsys)]
+    shown = [
+        (ascii(value), word)
+        for (value, _fields), old, new in zip(keys, before, after, strict=True)
+        for word in re.findall(r"[A-Za-z0-9]+", value)
+        if word not in old and word in new
+    ]
+    # The control: the line chain alone hides words in this corpus, so the rule is not vacuous.
+    assert any(
+        word not in old
+        for (value, _f), old in zip(keys, before, strict=True)
+        for word in re.findall(r"[A-Za-z0-9]+", value)
+    )
+    assert not shown, shown[:20]
+
+
+@pytest.mark.parametrize(
+    "value", ["line one\nDOE\x01JANE", "DOE\x01JANE\tnext", "a\r\nDOE\x1fJANE", 'q"DOE\x01JANE']
+)
+def test_a_serialised_detail_with_whitespace_escapes_still_parses(value: str, capsys) -> None:
+    """A ``detail`` its writer ran through ``json.dumps`` holds ``\\n`` or ``\\t`` as escape
+    text. The field scrub reads them as whitespace to find a name, but ships them as written, so
+    the detail still parses and the name is gone (BACKLOG #3045, review finding 3: they shipped
+    as raw controls, which broke the detail). Synthetic values."""
+    (line,) = _tee_lines([{"detail": json.dumps({"error": value})}], capsys)
+    detail = _line_record(line)["detail"]
+    assert "JANE" not in detail
+    assert set(json.loads(detail)) == {"error"}
+
+
+def test_a_raw_field_keeps_a_backslash_escape_as_text(capsys) -> None:
+    """An actor is raw text, so ``CORP\\bJONES`` is a name with a backslash in it, and the field
+    scrub does not read it as a control (BACKLOG #3045, review finding 4: the actor was lost)."""
+    (line,) = _tee_lines([{"actor": "CORP\\bJONES"}], capsys)
+    assert _line_record(line)["actor"] == "CORP\\bJONES"
 
 
 def test_the_field_scrub_runs_the_handler_chains_text_passes_in_its_order() -> None:
@@ -794,7 +952,7 @@ def test_a_field_the_scrub_raises_on_ships_as_a_marker_with_the_anchors(
     """A fault in the field scrub (BACKLOG #3045) costs that field, never the copy: the record
     still ships with its anchors, the field reads as a fixed marker, and the raw value is gone."""
 
-    def scrub(text: str) -> str:
+    def scrub(text: str, **_kw: object) -> str:
         if "hunter2" in text:
             raise RuntimeError("pattern blew up")
         return text
