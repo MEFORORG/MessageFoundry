@@ -646,7 +646,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "inventory",
         help="read-only certificate inventory: print subject / issuer / notAfter / SAN / days-remaining "
         "/ expired per cert, and issuer / nextUpdate / days-remaining per CRL file. Sources: --cert "
-        "PATH (repeatable), the [api] TLS material and settings-level CRL files of "
+        "PATH (repeatable), the [api] TLS material, settings-level CRL files and SQL Server store "
+        "pin of "
         "--service-config, and/or the wired TLS certs and inbound CRLs of --config",
     )
     cert_inventory.add_argument(
@@ -2733,7 +2734,7 @@ def _serve(args: argparse.Namespace) -> int:
     )
     from messagefoundry.crashdump import suppress_crash_dumps
     from messagefoundry.keywrap import KeyWrapRefused
-    from messagefoundry.pipeline.cert_expiry import certs_from_settings, crls_from_settings
+    from messagefoundry.pipeline.cert_expiry import monitored_files_from_settings
     from messagefoundry.store.crypto import memory_locking_available
 
     # ADR 0152 Phase 0 — in-USE PHI hygiene, applied before anything can put PHI in this address
@@ -4982,7 +4983,7 @@ def _serve(args: argparse.Namespace) -> int:
         # [api] client), so a CRL going stale on an OUTBOUND hop alerts before it fails a handshake.
         # Vault BACKLOG #2223: plus the SQL Server store pin, whose expiry the engine watches itself
         # (why: the `ssl_root_cert` row of docs/CONFIGURATION.md).
-        settings_crls=[*crls_from_settings(settings), *certs_from_settings(settings)],
+        settings_monitored_files=monitored_files_from_settings(settings),
         # Reserve the engine's own API listener so no inbound can be wired onto it (it would collide
         # with uvicorn at bind); surfaced as a clear PortConflictError at check/start instead.
         api_listener=(settings.api.host, settings.api.port),
@@ -6243,8 +6244,7 @@ def _cert_inventory(args: argparse.Namespace) -> int:
     from messagefoundry.pipeline.cert_expiry import (
         MonitoredCert,
         certs_from_registry,
-        certs_from_settings,
-        crls_from_settings,
+        monitored_files_from_settings,
     )
 
     explicit = args.cert or []
@@ -6256,15 +6256,15 @@ def _cert_inventory(args: argparse.Namespace) -> int:
         )
 
     # Rows to read — explicit --cert first (label = the path), then the wired TLS certs, then the
-    # settings-level CRL files. A row's `kind` picks the parser: a CRL read as a certificate is a
-    # parse error, which is what the inbound CRLs from the registry used to produce here.
+    # settings-level CRL and pin files. A row's `kind` picks the parser: a CRL read as a certificate
+    # is a parse error, which is what the inbound CRLs from the registry used to produce here.
     rows: list[MonitoredCert] = [MonitoredCert(p, p) for p in explicit]
 
     api_plan: ApiTlsPlan | None = None
     cert_present = False
     served: str | None = None
     client_certs: Sequence[str] = ()
-    settings_crls: list[MonitoredCert] = []
+    settings_monitored_files: list[MonitoredCert] = []
     if args.service_config:
         # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
         settings, detail = _load_service_settings(args.service_config)
@@ -6287,10 +6287,9 @@ def _cert_inventory(args: argparse.Namespace) -> int:
             served = api_plan.cert_file
         # ASVS 6.4.5: inventory the service-caller certs the operator listed, too.
         client_certs = settings.api.tls_client_cert_files
-        # BACKLOG #299: the same settings-level CRL files the engine's expiry monitor watches.
-        settings_crls = crls_from_settings(settings)
-        # Vault BACKLOG #2223: and the SQL Server store pin, which the monitor watches too.
-        settings_crls.extend(certs_from_settings(settings))
+        # BACKLOG #299, vault #2223: the same settings-level CRL and pin files the engine's expiry
+        # monitor watches, from the one helper serve calls.
+        settings_monitored_files = monitored_files_from_settings(settings)
 
     reg = None
     if args.config:
@@ -6305,7 +6304,7 @@ def _cert_inventory(args: argparse.Namespace) -> int:
             return _cert_fail(f"cannot load --config: {exc}", as_json=args.json)
 
     rows.extend(certs_from_registry(reg, served, client_certs))
-    rows.extend(settings_crls)
+    rows.extend(settings_monitored_files)
 
     now = time.time()
     entries: list[dict[str, object]] = []

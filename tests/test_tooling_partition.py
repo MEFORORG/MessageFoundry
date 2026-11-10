@@ -104,6 +104,12 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # tooling predicate does name `docs/`, so those arms alone would be reached there, but they
         # are not the reason it stays.
         "test_architecture_diagrams.py",
+        # Starts uvicorn the way serve does (by host and port, on uvicorn's "auto" loop) and reads
+        # IPV6_V6ONLY off the API's listening socket (vault BACKLOG #3764 item 6). It imports no
+        # engine module, but its subject is the engine's API listener and the uvloop dependency in
+        # messagefoundry's own metadata, so a change that breaks it arrives as an ENGINE or
+        # dependency diff the tooling path gate does not see.
+        "test_api_listener_ipv6_only.py",
         "test_asvs_apply.py",
         "test_asvs_residual_lint.py",
         # Reads changelog.d/ and CHANGELOG.md (BACKLOG #2080). A changelog fragment arrives on an

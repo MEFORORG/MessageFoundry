@@ -73,6 +73,7 @@ __all__ = [
     "certs_from_settings",
     "crls_from_settings",
     "held_crl_label",
+    "monitored_files_from_settings",
     "peer_cert_expiry",
 ]
 
@@ -265,6 +266,13 @@ def certs_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
     ):
         certs.append(MonitoredCert("auth.oidc_client_certificate", oidc_cert))
     return certs
+
+
+def monitored_files_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
+    """The settings-level rows that no connection or ``[api]`` parameter carries:
+    :func:`crls_from_settings`, then :func:`certs_from_settings`. ``serve`` and ``cert inventory``
+    both call this, so the inventory lists the same settings-level rows the monitor watches."""
+    return [*crls_from_settings(settings), *certs_from_settings(settings)]
 
 
 def peer_cert_expiry(peercert: Mapping[str, Any], *, now: float) -> tuple[str, int] | None:
