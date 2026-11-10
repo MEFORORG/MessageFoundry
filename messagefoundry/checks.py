@@ -11,7 +11,8 @@ checks). Two checks are **required** (they can block a commit):
   routes through its inbound's Router/Handler(s) without erroring. A fixture under a
   ``<messages>/<inbound_name>/`` subdir is dry-run **only** against that feed (#11); a fixture not under
   such a subdir runs against **every** inbound. A fixture may also declare its expected dry-run
-  disposition in a sibling ``<fixture>.expect`` file (``RECEIVED``/``UNROUTED``/``FILTERED``/``ERROR``)
+  disposition in a sibling ``<fixture>.expect`` file (at least ``RECEIVED``/``UNROUTED``/``FILTERED``/
+  ``ERROR``, and ``ERROR <reason>``; ``docs/ADOPTER-CI.md`` section 3 lists the forms and their rules)
   — an executable acceptance-criteria check (Secure Development Standards §5); without one the default
   is "must not ERROR". Absent fixtures → skipped (never blocks). The preview runs under
   ``[pipeline].snapshot_on_send`` (copy-on-Send, ADR 0104) resolved best-effort from this instance's
@@ -1821,7 +1822,9 @@ def _expected_disposition(fixture_path: str | Path, *, cap: int) -> _Expectation
     )
     # utf-8-sig: a Windows editor's BOM must not turn a correct sidecar into an unknown name.
     text = data.decode("utf-8-sig").strip()
-    if len(text.splitlines()) > 1:
+    # A membership test, not splitlines(): the sidecar can be as large as the fixture cap. A rarer
+    # line break is whitespace, so the word checks below still refuse it.
+    if "\n" in text or "\r" in text:
         # Checked first, so a stray second line under a bare word is named as such rather than
         # read as a malformed reason separator. Not echoed, as below.
         raise ValueError(
@@ -1841,8 +1844,11 @@ def _expected_disposition(fixture_path: str | Path, *, cap: int) -> _Expectation
     normalized = _DISPOSITION_ALIASES.get(raw, raw)
     if normalized not in _DRYRUN_DISPOSITIONS:
         valid = ", ".join(sorted(_DRYRUN_DISPOSITIONS))
+        # Echoed only when it is a plain word: ``ERROR:DOE^JOHN`` is a reason joined to ERROR
+        # without the space, and a reason can quote the message.
+        shown = repr(raw) if raw.replace("_", "").isalpha() else "(not a plain word, not shown)"
         raise ValueError(
-            f"invalid .expect disposition {raw!r} (use one of {valid}, or ERROR <reason>; "
+            f"invalid .expect disposition {shown} (use one of {valid}, or ERROR <reason>; "
             "PROCESSED, ROUTED, DELIVERED and DELIVERS alias RECEIVED)"
         )
     if not sep:

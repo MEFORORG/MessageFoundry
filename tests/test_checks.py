@@ -761,6 +761,39 @@ def test_expect_error_reason_passes_when_the_error_contains_it(tmp_path: Path) -
     assert dr.ok and "expectation-checked" in dr.detail, dr.detail
 
 
+@pytest.mark.parametrize(("reason", "passes"), [("bad ZZ1", True), ("bad ZZ2", False)])
+def test_expect_error_reason_is_matched_against_a_handler_fault(
+    tmp_path: Path, reason: str, passes: bool
+) -> None:
+    # The run's error is the candidate for every non-strict ERROR, a Handler raise among them.
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, router, handler, File\n"
+        "inbound('IB_X', File(directory='in'), router='r')\n"
+        "@router('r')\n"
+        "def r(m): return ['h']\n"
+        "@handler('h')\n"
+        "def h(m): raise ValueError('bad ZZ1')\n",
+        encoding="utf-8",
+    )
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), f"ERROR {reason}")
+    if passes:
+        dr = _run_dryrun(cfg, msgs)
+        assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+    else:
+        dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+        assert "reason does not match" in dr.detail, dr.detail
+
+
+def test_expect_reason_joined_without_a_space_is_not_echoed(tmp_path: Path) -> None:
+    cfg = _delivering_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR:DOE^JOHN")
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert "invalid .expect disposition" in dr.detail, dr.detail
+    assert "DOE" not in dr.detail, dr.detail
+
+
 def test_expect_sidecar_with_a_utf8_bom_is_read(tmp_path: Path) -> None:
     cfg = _strict_config(tmp_path)
     msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "\ufeffERROR PV1")

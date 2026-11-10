@@ -302,7 +302,8 @@ followed by a scrubbed, uncut copy of those errors. So a reason that quotes text
 200-character cut can never match a strict-validation refusal. On a mismatch the gate says the reason did not match and
 prints neither text, since both can quote the message.
 
-A strict-validation timeout needs a reason to pass. Past `validation.strict_timeout_s` the run's
+A strict-validation timeout on its own needs a reason to pass; the exception, a late content
+refusal, is at the end of this paragraph. Past `validation.strict_timeout_s` the run's
 error is the timeout text, `strict-validation timed out after <N>s`, which the live listener
 records as a final `AR` ([`HL7-VALIDATION.md`](HL7-VALIDATION.md)). A fixture that pins that DoS
 backstop writes a reason holding `timed out`, such as `ERROR strict-validation timed out`; the

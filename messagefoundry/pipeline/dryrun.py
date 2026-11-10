@@ -838,8 +838,9 @@ class DryRunResult:
     # consumer's comment because a consumer added later reads the field, not the other consumers.
     error: str | None = None
     # True only when ``error`` is the strict-validation timeout, so a caller can tell that refusal
-    # from every other ERROR without matching its text (BACKLOG #5107): ``check`` refuses to let a
-    # timeout satisfy a fixture that expects ERROR, since it says nothing about the message.
+    # from every other ERROR without matching its text (BACKLOG #5107): ``check`` does not let a
+    # timeout on its own satisfy a bare ERROR, since it says nothing about the message. Its rule,
+    # with the exceptions, is in ``docs/ADOPTER-CI.md`` section 3.
     strict_timed_out: bool = False
     # The strict validator's own content refusal, on time or late (BACKLOG #5107). On time it is
     # ``error``; past the timeout ``error`` reports the timeout, as the listener would, and this
