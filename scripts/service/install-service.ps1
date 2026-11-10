@@ -855,7 +855,7 @@ function Get-ReparsePointAncestor {
         $absent = $false
         try { $item = Get-Item -LiteralPath $dir -Force -ErrorAction Stop }
         catch [System.Management.Automation.ItemNotFoundException] { $absent = $true }
-        catch { $absent = $false }
+        catch { }
         if (-not $item -and -not $absent) { return "'$dir' above it could not be read" }
         if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
             return "'$dir' above it is a junction, a link or a mounted volume"
@@ -884,9 +884,8 @@ function Get-OtherServiceNamingPath {
         if ($svc.PSChildName -eq $ServiceName) { continue }
         $params = Get-Item -LiteralPath (Join-Path $svc.PSPath "Parameters") -ErrorAction SilentlyContinue
         if (-not $params) { continue }
-        $entry = @($params.GetValue('AppEnvironmentExtra', $null) |
-            Where-Object { $_ -and (Test-EnvironmentEntryNames -Entry $_ -Name $Name) }) | Select-Object -Last 1
-        if ($entry -and ($entry.Substring($Name.Length + 1).TrimEnd('\') -eq $want)) { $found += $svc.PSChildName }
+        $named = Get-EnvironmentListValue -List $params.GetValue('AppEnvironmentExtra', $null) -Name $Name
+        if ($named -and ($named.TrimEnd('\') -eq $want)) { $found += $svc.PSChildName }
     }
     return $found
 }
@@ -931,6 +930,10 @@ function New-RestrictedDirectory {
         throw ("'$Path' was there before this install made it (its owner is $owner), so it is not " +
             "the restricted folder the install asked for. Check who made it, and re-run the installer.")
     }
+    # Read again after the create, as Set-SecretsDirAcl does: a folder above may have become a
+    # junction since the preflight judged the path.
+    $above = Get-ReparsePointAncestor -Path $Path
+    if ($above) { throw "'$Path' cannot be the secrets directory: $above." }
 }
 
 function Set-SecretsDirAcl {
@@ -1010,22 +1013,21 @@ function Set-SecretsDirAcl {
     }
 }
 
-function Assert-SecretsDirEmpty {
+function Get-SecretsDirHeldProblem {
     <#
-      Refuse a secrets directory that holds anything (vault BACKLOG #2595 slice C). Called after the
-      directory is restricted, on one the service does not already name: until the restriction, a
-      local user may have put a file in it, and a file keeps its own access list, which the
-      directory's does not replace. The engine reads every file in the directory as a setting, so a
-      planted file would be read as a secret the operator never set.
+      Why a secrets directory the service does not already name cannot be adopted because it holds
+      something, or "" when it is empty (vault BACKLOG #2595 slice C). Read at preflight, and again
+      once the directory is restricted: until the restriction, a local user may have put a file in
+      it, and a file keeps its own access list, which the directory's does not replace. The engine
+      reads every file in the directory as a setting, so a planted file would be read as a secret
+      the operator never set.
     #>
     param([Parameter(Mandatory)][string]$Path)
     $held = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
-    if ($held.Count -gt 0) {
-        throw ("The secrets directory '$Path' holds $($held.Count) item(s) the installer did not put " +
-            "there, such as '$($held[0].Name)', and the service does not name it yet. Something may " +
-            "have been written there before it was restricted. Empty it, check who wrote them, and " +
-            "re-run the installer; move each file in after the install.")
-    }
+    if ($held.Count -eq 0) { return "" }
+    return ("it holds $($held.Count) item(s) the installer did not put there, such as " +
+        "'$($held[0].Name)', and the service does not name it. Empty it, check who wrote them, or " +
+        "create a new one, and move each file in after the install")
 }
 
 function Get-MergedEnvironmentList {
@@ -1045,6 +1047,18 @@ function Test-EnvironmentEntryNames {
     return $Entry.StartsWith("$Name=", [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-EnvironmentListValue {
+    <#
+      The value of $Name in the NSSM environment list $List (NAME=value entries), or $null when no
+      entry sets it. The last entry wins, as it does when NSSM builds the environment.
+    #>
+    param([AllowNull()][string[]]$List, [Parameter(Mandatory)][string]$Name)
+    $entry = @($List | Where-Object { $_ -and (Test-EnvironmentEntryNames -Entry $_ -Name $Name) }) |
+        Select-Object -Last 1
+    if ($entry) { return $entry.Substring($Name.Length + 1) }
+    return $null
+}
+
 function Get-RegisteredEnvironmentValue {
     <#
       The value of $Name in the service's NSSM environment (AppEnvironmentExtra), or $null when the
@@ -1055,10 +1069,7 @@ function Get-RegisteredEnvironmentValue {
     $key = Get-Item -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName\Parameters" `
         -ErrorAction SilentlyContinue
     if (-not $key) { return $null }
-    $entry = @($key.GetValue('AppEnvironmentExtra', $null) |
-        Where-Object { $_ -and (Test-EnvironmentEntryNames -Entry $_ -Name $Name) }) | Select-Object -Last 1
-    if ($entry) { return $entry.Substring($Name.Length + 1) }
-    return $null
+    return Get-EnvironmentListValue -List $key.GetValue('AppEnvironmentExtra', $null) -Name $Name
 }
 
 function Set-ServiceEnvironmentValue {
@@ -1076,9 +1087,7 @@ function Set-ServiceEnvironmentValue {
         [Parameter(Mandatory)][string]$Value)
     $keyPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName\Parameters"
     $existing = (Get-Item -LiteralPath $keyPath -ErrorAction Stop).GetValue('AppEnvironmentExtra', $null)
-    $previousEntry = @($existing | Where-Object { $_ -and (Test-EnvironmentEntryNames -Entry $_ -Name $Name) }) |
-        Select-Object -Last 1
-    $previous = if ($previousEntry) { $previousEntry.Substring($Name.Length + 1) } else { $null }
+    $previous = Get-EnvironmentListValue -List $existing -Name $Name
     $merged = Get-MergedEnvironmentList -Existing $existing -Name $Name -Value $Value
     Set-ItemProperty -LiteralPath $keyPath -Name 'AppEnvironmentExtra' -Value $merged -Type MultiString -ErrorAction Stop
     $stored = @((Get-Item -LiteralPath $keyPath -ErrorAction Stop).GetValue('AppEnvironmentExtra', $null))
@@ -2253,10 +2262,8 @@ if (-not $secretsProblem) {
 # by someone this installer cannot vouch for: anyone may create a folder under ProgramData, where
 # the default sits. So it must be empty, here and again once it is restricted.
 $SecretsDirNamed = [bool]$RegisteredSecretsDir -and ($RegisteredSecretsDir.TrimEnd('\') -eq $SecretsDir.TrimEnd('\'))
-if (-not $secretsProblem -and (Test-Path -LiteralPath $SecretsDir) -and -not $SecretsDirNamed -and
-        @(Get-ChildItem -LiteralPath $SecretsDir -Force -ErrorAction Stop).Count -gt 0) {
-    $secretsProblem = ("it already exists and holds files, and the service does not name it. Empty " +
-        "it, or create a new one, and move each file in after the install")
+if (-not $secretsProblem -and (Test-Path -LiteralPath $SecretsDir) -and -not $SecretsDirNamed) {
+    $secretsProblem = Get-SecretsDirHeldProblem -Path $SecretsDir
 }
 if ($secretsProblem) {
     throw ("-SecretsDir '$SecretsDir' cannot be the secrets directory: $secretsProblem. Point it at " +
@@ -2339,9 +2346,8 @@ if (-not (Test-Path -LiteralPath $SecretsParent)) { New-AdminOnlyFolder -Path $S
 if (-not (Test-Path -LiteralPath $SecretsDir)) { New-RestrictedDirectory -Path $SecretsDir }
 elseif (-not $SecretsDirNamed) { Set-SecretsDirAcl -Path $SecretsDir }
 if (-not $SecretsDirNamed) {
-    $above = Get-ReparsePointAncestor -Path $SecretsDir
-    if ($above) { throw "-SecretsDir '$SecretsDir' cannot be the secrets directory: $above." }
-    Assert-SecretsDirEmpty -Path $SecretsDir
+    $heldProblem = Get-SecretsDirHeldProblem -Path $SecretsDir
+    if ($heldProblem) { throw "-SecretsDir '$SecretsDir' cannot be the secrets directory, now it is restricted: $heldProblem." }
 }
 # NB the data-dir + config-dir ACL lockdown is applied LATER, AFTER the service is registered and its
 # ObjectName (run-as account) is set - see "ACLs" below. The default run-as is now a per-service VIRTUAL

@@ -95,21 +95,34 @@ def _extract(path: Path, names: list[str], body: str) -> str:
     return "\n".join(lines)
 
 
-def _run(script: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
-    if shutil.which("pwsh") is None:
-        pytest.skip("SKIP (nothing run): pwsh not on PATH")
+def _run(script: str, tmp_path: Path, host: str = "pwsh") -> subprocess.CompletedProcess[str]:
+    """Run ``script`` on PowerShell 7, or on ``host="powershell"``, Windows PowerShell 5.1, the host
+    CI runs the installer on."""
+    if shutil.which(host) is None:
+        pytest.skip(f"SKIP (nothing run): {host} not on PATH")
     f = tmp_path / f"harness-{uuid.uuid4().hex}.ps1"
-    f.write_text(script, encoding="utf-8")
+    env = None
+    if host == "powershell":
+        # 5.1 reads a BOM-less file as the ANSI code page. A PSModulePath inherited from PowerShell 7
+        # points 5.1 at 7's modules, and Get-Acl then fails to load; 5.1 rebuilds its own path when
+        # the variable is absent.
+        f.write_text(script, encoding="utf-8-sig")
+        env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+        cmd = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]
+    else:
+        f.write_text(script, encoding="utf-8")
+        cmd = ["pwsh", "-NoProfile", "-NonInteractive"]
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(f)],
+        [*cmd, "-File", str(f)],
+        env=env,
         capture_output=True,
         text=True,
         timeout=180,
     )
 
 
-def _ok(script: str, tmp_path: Path) -> str:
-    r = _run(script, tmp_path)
+def _ok(script: str, tmp_path: Path, host: str = "pwsh") -> str:
+    r = _run(script, tmp_path, host)
     assert r.returncode == 0, f"harness failed:\n{(r.stderr + r.stdout)[:2000]}"
     return r.stdout
 
@@ -2882,7 +2895,9 @@ def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -
         if c["name"] == "Get-ReparsePointAncestor" and "-Path $SecretsDir" in c["text"]
     )
     sharers = _sole_call(facts, "Get-OtherServiceNamingPath")
-    empty = _sole_call(facts, "Assert-SecretsDirEmpty")
+    held = [c for c in facts["commands"] if c["name"] == "Get-SecretsDirHeldProblem"]
+    assert len(held) == 2, held  # at preflight, and again once the directory is restricted
+    empty = max(held, key=lambda c: c["start"])
     registered = min(
         c["start"]
         for c in facts["commands"]
@@ -2935,32 +2950,6 @@ def test_the_secrets_directory_path_rule(tmp_path: Path) -> None:
     assert "holds" in got["holds"], got
 
 
-def _run_51(script: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
-    """``_run`` on Windows PowerShell 5.1, the host CI runs the installer on."""
-    if shutil.which("powershell") is None:
-        pytest.skip("SKIP (nothing run): Windows PowerShell 5.1 not on PATH")
-    f = tmp_path / f"harness51-{uuid.uuid4().hex}.ps1"
-    f.write_text(script, encoding="utf-8-sig")
-    # A PSModulePath inherited from PowerShell 7 points 5.1 at 7's modules, and Get-Acl then fails
-    # to load. 5.1 rebuilds its own path when the variable is absent.
-    env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
-    return subprocess.run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(f),
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-
-
 @_windows_only
 @pytest.mark.parametrize("host", ["pwsh", "powershell"])
 def test_the_secrets_directory_is_made_restricted_in_one_step(tmp_path: Path, host: str) -> None:
@@ -2997,10 +2986,8 @@ def test_the_secrets_directory_is_made_restricted_in_one_step(tmp_path: Path, ho
     squat = $squat
   }} | ConvertTo-Json -Compress
 """
-    script = _extract(_SCRIPT, ["New-RestrictedDirectory"], body)
-    r = _run(script, tmp_path) if host == "pwsh" else _run_51(script, tmp_path)
-    assert r.returncode == 0, f"harness failed:\n{(r.stderr + r.stdout)[:2000]}"
-    got = json.loads(r.stdout.strip().splitlines()[-1])
+    script = _extract(_SCRIPT, ["New-RestrictedDirectory", "Get-ReparsePointAncestor"], body)
+    got = json.loads(_ok(script, tmp_path, host).strip().splitlines()[-1])
     assert got["owner"] == got["me"] and got["protected"] and got["inherited"] == 0, got
     assert sorted(set(got["sids"])) == ["S-1-5-18", "S-1-5-32-544"], got
     # The parent grants Users Modify; none of it reached the folder.
@@ -3062,7 +3049,15 @@ def test_a_secrets_directory_another_service_names_is_found(tmp_path: Path) -> N
 """
     got = json.loads(
         _ok(
-            _extract(_SCRIPT, ["Get-OtherServiceNamingPath", "Test-EnvironmentEntryNames"], body),
+            _extract(
+                _SCRIPT,
+                [
+                    "Get-OtherServiceNamingPath",
+                    "Get-EnvironmentListValue",
+                    "Test-EnvironmentEntryNames",
+                ],
+                body,
+            ),
             tmp_path,
         )
         .strip()
@@ -3075,8 +3070,8 @@ def test_a_secrets_directory_another_service_names_is_found(tmp_path: Path) -> N
 def test_the_secrets_directory_refuses_residue_and_held_files(tmp_path: Path) -> None:
     """Two refusals, each where a warning used to be. Set-SecretsDirAcl throws when an entry for
     another account is left after the removals: icacls is shadowed so /remove:g does nothing, the
-    way a removal that fails would. Assert-SecretsDirEmpty throws on a directory holding a file.
-    The controls: the same directory with nothing in it passes Assert-SecretsDirEmpty, and the
+    way a removal that fails would. Get-SecretsDirHeldProblem names a file the directory holds.
+    The controls: the same directory with nothing in it reads clean, and the
     residue named is the one the setup granted."""
     assert _SCRIPT is not None
     held = tmp_path / "held"
@@ -3094,10 +3089,8 @@ def test_the_secrets_directory_refuses_residue_and_held_files(tmp_path: Path) ->
   }}
   $res = ''
   try {{ Set-SecretsDirAcl -Path {_psq(str(residue))} }} catch {{ $res = $_.Exception.Message }}
-  $heldMsg = ''
-  try {{ Assert-SecretsDirEmpty -Path {_psq(str(held))} }} catch {{ $heldMsg = $_.Exception.Message }}
-  $emptyMsg = ''
-  try {{ Assert-SecretsDirEmpty -Path {_psq(str(empty))} }} catch {{ $emptyMsg = $_.Exception.Message }}
+  $heldMsg = Get-SecretsDirHeldProblem -Path {_psq(str(held))}
+  $emptyMsg = Get-SecretsDirHeldProblem -Path {_psq(str(empty))}
   [pscustomobject]@{{ res = $res; held = $heldMsg; empty = $emptyMsg }} | ConvertTo-Json -Compress
 """
     try:
@@ -3110,7 +3103,7 @@ def test_the_secrets_directory_refuses_residue_and_held_files(tmp_path: Path) ->
                         "Get-WellKnownBroadSids",
                         "Get-BroadAclResidue",
                         "Get-ReparsePointAncestor",
-                        "Assert-SecretsDirEmpty",
+                        "Get-SecretsDirHeldProblem",
                     ],
                     body,
                 ),
