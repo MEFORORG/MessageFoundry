@@ -197,12 +197,15 @@ def audit_write_grant(privilege: str, table: str) -> str:
     return f"{label} on table {table}"
 
 
-def view_definition_grant(schema: str) -> str:
-    """The one wording for ``VIEW DEFINITION`` held on ``schema`` (BACKLOG #6714), lower-cased for
-    the log redaction as :func:`audit_write_grant` says. ``HAS_PERMS_BY_NAME`` answers the EFFECTIVE
-    right, so the grant that gives it may sit on the schema, the database or the server; the
-    wording says so, or an operator would revoke a schema grant that is not there."""
-    return f"view definition on schema {schema} (granted on it, the database or the server)"
+def view_definition_grant(*schemas: str) -> str:
+    """The one wording for ``VIEW DEFINITION`` on ``schemas`` (BACKLOG #6714), lower-cased for the
+    log redaction as :func:`audit_write_grant` says. One finding for all of them: ``HAS_PERMS_BY_NAME``
+    answers the EFFECTIVE right, so one grant on the database or the server shows on every schema.
+    It may come by any route, at least a grant on the schema, the database or the server, schema
+    ownership, or a role or group membership; the wording says so, or an operator would go looking
+    for a schema grant that is not there."""
+    noun = "schema" if len(schemas) == 1 else "schemas"
+    return f"view definition on {noun} {', '.join(schemas)} (effective, by any route)"
 
 
 def audit_write_alias(table: str, privilege: str) -> str:
@@ -338,7 +341,8 @@ def sqlserver_excess(
         if alter_schema and not ddladmin:
             out.append(f"ALTER on schema {alter_schema}")
         out.extend(w for w in audit_writes if not (ddladmin and w.startswith("ALTER ")))
-        out.extend(view_definition_grant(s) for s in dict.fromkeys(view_definition))
+        if view_definition:
+            out.append(view_definition_grant(*dict.fromkeys(view_definition)))
     return tuple(out)
 
 

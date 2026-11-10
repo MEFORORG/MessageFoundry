@@ -890,14 +890,15 @@ async def test_sqlserver_a_null_view_definition_is_unread_only_where_it_counts(
 async def test_sqlserver_probe_reads_both_schemas_when_the_default_is_not_dbo(
     monkeypatch: pytest.MonkeyPatch, default_held: int, dbo_held: int, expected: tuple[str, ...]
 ) -> None:
-    """The two columns are two schemas when the default is not dbo, and each is named by its own."""
+    """The two columns are two schemas when the default is not dbo, named in one finding, since one
+    database grant shows on both."""
     row = _probe_row(database_roles=tuple(sorted(SQLSERVER_RUNTIME_DATABASE_ROLES)))
     row["default_schema"] = "app"
     row["view_def_default"] = default_held
     row["view_def_dbo"] = dbo_held
     report = await _sqlserver_probe(monkeypatch, row).probe_principal_privileges()
     assert report.status is StorePrivilegeStatus.OBSERVED
-    assert report.excess == tuple(view_definition_grant(s) for s in expected)
+    assert report.excess == (view_definition_grant(*expected),)
 
 
 async def test_sqlserver_an_unread_dbo_view_definition_is_named(
@@ -912,17 +913,19 @@ async def test_sqlserver_an_unread_dbo_view_definition_is_named(
     assert view_definition_grant("app") not in report.detail
 
 
-async def test_sqlserver_an_unread_view_definition_never_softens_a_found_over_grant(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("column", ["view_def_default", "create_table", "alter_schema"])
+async def test_sqlserver_an_unread_external_grant_never_softens_a_found_over_grant(
+    monkeypatch: pytest.MonkeyPatch, column: str
 ) -> None:
     """A held db_owner was READ, so the report stays OBSERVED and the start still refuses under
-    enforce: an unread VIEW DEFINITION must not turn the refusal into a warning."""
+    enforce: an unread grant that only external counts must not turn the refusal into a warning."""
     row = _probe_row(database_roles=("db_datareader", "db_datawriter", "db_owner"))
-    row["view_def_default"] = None
+    row[column] = None
     store = _sqlserver_probe(monkeypatch, row)
     report = await store.probe_principal_privileges()
     assert report.status is StorePrivilegeStatus.OBSERVED
     assert "database role db_owner" in report.excess
+    assert "not read" in report.detail
     with pytest.raises(StorePrivilegeError):
         await run_store_privilege_preflight(store, require_least_privilege=False, enforcing=True)
 
@@ -1019,12 +1022,11 @@ def test_the_update_column_fold_reads_a_null_as_not_read(
 def test_the_update_probe_folds_its_columns_three_ways() -> None:
     from messagefoundry.store.sqlserver import _any_grant, _audit_write_probe
 
-    per_column = (
-        "SELECT HAS_PERMS_BY_NAME('audit_log', 'OBJECT', 'UPDATE', c.name, 'COLUMN') AS p"
-        " FROM sys.columns c WHERE c.object_id = OBJECT_ID('audit_log')"
-    )
     update = _audit_write_probe("audit_log", "UPDATE")
-    assert update == f"{_any_grant(per_column)} AS {audit_write_alias('audit_log', 'UPDATE')}"
+    # The fold the SQLite tests run is the one the probe sends, around the per-column answers.
+    head, _, tail = _any_grant("<answers>").partition("<answers>")
+    assert update.startswith(head) and tail in update
+    assert "'COLUMN') AS p FROM sys.columns" in update
     assert "MAX(" not in update
 
 

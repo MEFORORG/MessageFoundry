@@ -1715,6 +1715,29 @@ async def test_live_sqlserver_external_refuses_then_provisions_then_runs_row_onl
     rows = f"SELECT COUNT(*) FROM [{db}].dbo.audit_log"
     assert await bounded(sa, "count audit rows", admin.scalar(rows)) >= 1
 
+    # BACKLOG #6714, the positive control for the clean read above: VIEW DEFINITION on the login's
+    # default schema (dbo, for a user made FOR LOGIN) is named once granted, then taken back.
+    await bounded(
+        sa,
+        "grant view definition",
+        admin.run_in(db, f"GRANT VIEW DEFINITION ON SCHEMA::[dbo] TO [{login}]"),
+    )
+    store = await bounded(
+        sa,
+        "reopen with view definition",
+        SqlServerStore.open(runtime, cipher=cipher, audit_mac_key=cipher.audit_mac_key()),
+    )
+    try:
+        viewer = await bounded(sa, "probe with view definition", store.probe_principal_privileges())
+    finally:
+        await store.close()
+    assert viewer.excess == (view_definition_grant("dbo"),), viewer.excess
+    await bounded(
+        sa,
+        "revoke view definition",
+        admin.run_in(db, f"REVOKE VIEW DEFINITION ON SCHEMA::[dbo] FROM [{login}]"),
+    )
+
     await bounded(
         sa, "grant db_ddladmin", admin.run_in(db, f"ALTER ROLE db_ddladmin ADD MEMBER [{login}]")
     )

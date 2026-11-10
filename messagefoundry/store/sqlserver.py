@@ -3227,7 +3227,10 @@ def _any_grant(answers: str) -> str:
     ``MAX`` skips NULLs, so a NULL column beside a 0 column folded to 0 and read as not held: a
     false clean from a column that was never read. A 1 still wins over a NULL, since a partial read
     can only understate a held grant. ``OBJECT_ID`` is NULL for a table the login cannot see, so no
-    column row is found and the fold is NULL. Standard SQL only, so a test can run it on SQLite."""
+    column row is found and the fold is NULL. Standard SQL only, so a test can run it on SQLite.
+
+    ``answers`` is interpolated as SQL text, so it must be built from closed constants, as
+    :func:`_audit_write_probe` builds it; never from settings or input."""
     return (
         "(SELECT CASE WHEN SUM(CASE WHEN a.p = 1 THEN 1 ELSE 0 END) > 0 THEN 1"
         " WHEN COUNT(*) > 0 AND COUNT(a.p) = COUNT(*) THEN 0 END"
@@ -4738,38 +4741,42 @@ class SqlServerStore:
         if control_database is None:
             unread.append(f"CONTROL on database {database}")
         external = self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
+        # The grants below are findings under external only, so only external needs them READ. An
+        # unread one never turns an over-grant that WAS read into an unobserved report: it is
+        # weighed after the excess, below (#6714), so a read db_owner still refuses under enforce.
+        external_unread: list[str] = []
         create_table = _probed_grant(row["create_table"])
+        if create_table is None:
+            external_unread.append(f"create table on database {database}")
         alter_schema = _probed_grant(row["alter_schema"])
-        if external:
-            # Only external reads these as findings, so only external needs them READ.
-            if create_table is None:
-                unread.append(f"create table on database {database}")
-            if alter_schema is None:
-                unread.append("ALTER on the default schema")
+        if alter_schema is None:
+            external_unread.append("ALTER on the default schema")
         # #6714: one column per distinct schema; when the default schema is dbo the two name one.
-        # An unread one is handled as an unread audit-table grant is, below, so it never turns an
-        # over-grant that WAS read into an unobserved report.
         default_schema = str(row["default_schema"] or "") or "(unresolved default schema)"
         view_def_columns = {default_schema: "view_def_default"}
         view_def_columns.setdefault("dbo", "view_def_dbo")
         view_definition: list[str] = []
-        view_unread: list[str] = []
         for schema, column in view_def_columns.items():
             grant = _probed_grant(row[column])
             if grant is None:
-                view_unread.append(view_definition_grant(schema))
+                external_unread.append(view_definition_grant(schema))
             elif grant:
                 view_definition.append(schema)
         audit_writes, audit_unread = classify_audit_writes(row, SQLSERVER_AUDIT_WRITE_PRIVILEGES)
+        external_unread += audit_unread
         server_roles = tuple(held_server)
         database_roles = tuple(held_database)
         if unread:
             probed = len(SQLSERVER_FIXED_SERVER_ROLES) + len(SQLSERVER_FIXED_DATABASE_ROLES) + 2
             held_labels = [f"server role {r}" for r in server_roles]
             held_labels += [f"database role {r}" for r in database_roles]
+            also_unread = ""
             if external:  # owner ruling R16 and #6714: each is a finding there
                 held_labels += list(audit_writes)
-                held_labels += [view_definition_grant(s) for s in view_definition]
+                if view_definition:
+                    held_labels.append(view_definition_grant(*view_definition))
+                if external_unread:
+                    also_unread = f"; also not read: {', '.join(external_unread)}"
             # The catalog enumeration below is skipped deliberately: it is additive only, and widening
             # a report already saying the read was incomplete buys nothing an operator can act on.
             return StorePrivilegeReport(
@@ -4785,7 +4792,7 @@ class SqlServerStore:
                     f" be reported as absent: {', '.join(unread)}"
                     " (IS_SRVROLEMEMBER / IS_ROLEMEMBER / HAS_PERMS_BY_NAME answer NULL when the name"
                     " does not resolve for this caller); what DID read as held:"
-                    f" {', '.join(held_labels) or 'nothing'}"
+                    f" {', '.join(held_labels) or 'nothing'}{also_unread}"
                 ),
             )
         # #305: `external` (read above) picks which documented grant the login is measured against.
@@ -4822,18 +4829,15 @@ class SqlServerStore:
             audit_writes=audit_writes,
             view_definition=tuple(view_definition),
         )
-        if external and (audit_unread or view_unread):
-            # Owner ruling R16 and #6714 count these under external only, so only external needs
-            # them READ. A NULL is a table or schema this login cannot resolve. With nothing else
-            # found the read is unobserved rather than clean; with an over-grant already found it
-            # stays OBSERVED, so the start still refuses on what WAS read.
+        if external and external_unread:
+            # With nothing else found the read is unobserved rather than clean; with an over-grant
+            # already found it stays OBSERVED, so the start still refuses on what WAS read.
+            note += (
+                "; these grants answered NULL, or a value that is not 0 or 1, so they were not"
+                f" read: {', '.join(external_unread)}"
+            )
             if audit_unread:
-                note += (
-                    f"; the audit-table grants were not read for {', '.join(audit_unread)}, so"
-                    " whether this login can change audit rows was not read"
-                )
-            if view_unread:
-                note += f"; not read: {', '.join(view_unread)}"
+                note += ", so whether this login can change audit rows was not read"
             if not excess:
                 return StorePrivilegeReport(
                     backend=self.backend,
@@ -4844,7 +4848,8 @@ class SqlServerStore:
                     database_roles=database_roles,
                     detail=(
                         f"{note}; [store].schema_management is 'external', which requires INSERT and"
-                        " SELECT only on audit_log, and no view definition on the store's schemas"
+                        " SELECT only on audit_log, no schema DDL right and no view definition on"
+                        " the store's schemas"
                     ),
                 )
         return StorePrivilegeReport(
