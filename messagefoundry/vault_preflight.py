@@ -26,7 +26,7 @@ the store preflight's ``store_privilege_warning`` does; a hop read clean fires
 hop. The subject is the hop alone (:func:`vault_privilege_alert_subject`), never anything about the
 token, so processes that share one store share each hop's alert: a clean start by one can resolve
 the warning another raised on a different token, so a closed alert does not prove the over-grant
-is gone: run ``messagefoundry check-privileges`` against each process's configuration to confirm.
+is gone.
 ``docs/SECURITY.md`` (*Each backend hop's least privilege*, *A warning still open after a clean
 start*) says what to do with a warning still open.
 

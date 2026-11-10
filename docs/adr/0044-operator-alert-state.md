@@ -391,5 +391,5 @@ leave an alert open for good under cross-node clock skew. The code is the author
 close rule, `resolve_alert_instances_fenced` in `messagefoundry/store/store.py`, `postgres.py` and
 `sqlserver.py`; for the rest, `messagefoundry/pipeline/alert_sinks.py` (`_ResolveFence`,
 `NotifierAlertSink._run_state`, `_record_state`, `_resolve_settled` and
-`NotifierAlertSink.connection_started`) and the store's `upsert_alert_instance`,
-`open_alert_generations` and `resolve_alert_instances_fenced`.
+`NotifierAlertSink.connection_started`) and the store's `upsert_alert_instance` and
+`open_alert_generations`.

@@ -2175,8 +2175,8 @@ count is above `0` (vault BACKLOG #2613).
   `GET /security/posture`. The warning and the `vault_privilege_warning` alert still fire, but the
   alert is keyed on the hop alone, so where engine processes share one store, another process's
   clean start can resolve it while this accepted over-grant still runs, so a closed alert does not
-  prove the over-grant is gone: run `messagefoundry check-privileges` against each process's
-  configuration to confirm. The audit row of each start is the record that stays.
+  prove the over-grant is gone (what an operator checks:
+  [docs/SECURITY.md](SECURITY.md#each-backend-hops-least-privilege-the-engine-probes-the-store-vault-and-ldap)). The audit row of each start is the record that stays.
 - **What it does not do:** it lifts that one refusal only. Every other Vault over-grant, such as a
   token shared by two hops or an extra capability on a path the engine calls, and a probe that could
   not read the token because of a network failure, a timeout or a 403, only warn, so there is
