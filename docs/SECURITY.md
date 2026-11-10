@@ -4432,7 +4432,7 @@ each nested `OutboxInfo` / `EventInfo` individually, because the redactor keys o
 dashboard `GET /connections`, and `GET /connections/{name}/metadata` (all BACKLOG #2443). Its `/ws/stats` push redacts the same rows. The four
 alert-mutation replies (`ack`, `resolve`, `suspend`, `resume`) redact their `AlertInstanceInfo` too.
 
-**Audit.** Five of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
+**Audit.** At least five of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
 census** (`/dead-letters`, `/messages`, `/messages/search`, `/messages/{id}`, and
 `/search/layered` since BACKLOG #5523), so a scripted bulk read cannot harvest the patient census
 unaudited. The rest do **not** call the coalescer — they write their own dedicated audit rows
@@ -4440,14 +4440,15 @@ instead (`response.read` for `GET /messages/{id}/responses`, a `connection_event
 row for each per-item reveal on the three monitoring reads, and a `connection_error_reveal` row for
 each per-connection reveal on `GET /connections` and `GET /connections/{name}/metadata`; those
 five write nothing on a masked load). The census surfaces are audited **only when a
-gated property is actually returned** — `count_exposed()` is computed *post*-redaction and the
-coalescer is called under `if exposed:` — so a fully-redacted list read by a caller without
+gated property is actually returned** — `count_exposed()` and `count_masked()` are computed
+*post*-redaction and the coalescer is called under `if exposed or masked:`, so a display-masked row
+counts (vault BACKLOG #1187) — so a fully-redacted list read by a caller without
 `messages:view_summary` (a Viewer paging `GET /messages` or `GET /dead-letters`) writes **no audit row
 at all**. That is accepted: those reads carry no PHI, and auditing them would let an unprivileged
 caller amplify into unbounded `audit_log` growth. `GET /messages/{id}` and `GET /messages/search` write
 unconditional dedicated rows (`message_view`, `message_search`) regardless, and so does the body fetch
-`GET /messages/{id}/raw` (`message_body_view`, whose detail names the `surface` that asked), as do the other two
-(`response.read`, `preset.layered_search`).
+`GET /messages/{id}/raw` (`message_body_view`, whose detail names the `surface` that asked), as do
+`GET /messages/{id}/responses` (`response.read`) and `GET /search/layered` (`preset.layered_search`).
 
 **Roles and visibility.** `messages:view_raw` is **not** a superset of `messages:view_summary` —
 `Identity.has()` is a flat membership check. The built-in roles happen to grant them nested

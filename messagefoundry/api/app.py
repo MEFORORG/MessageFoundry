@@ -9572,7 +9572,6 @@ def create_app(
             raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
-            tampered = f"preset {preset_id} failed its integrity check and cannot be used"
             refusal: HTTPException | None = None
             try:
                 row = await engine.store.get_search_preset(
@@ -9582,7 +9581,9 @@ def create_app(
                 # BACKLOG #2593: the criteria fail their owner tag (alerted and audited) or are
                 # corrupt (logged); the store refused. The caller's own preset exists, so a refusal,
                 # never a 500. Caught before CipherError, which it subclasses.
-                refusal = HTTPException(423, tampered)
+                refusal = HTTPException(
+                    423, f"preset {preset_id} failed its integrity check and cannot be used"
+                )
             except CipherUnavailableError as exc:
                 # BACKLOG #5523, as #3734 split the upload routes: the key service gave no verdict,
                 # so a later try may succeed. Its text goes to the log only, as in uploads.
@@ -9617,7 +9618,12 @@ def create_app(
                 _log.warning(
                     "layered search refused preset %s: its criteria cell is blank", preset_id
                 )
-                raise HTTPException(423, tampered)
+                # Its own text: a keyless store has no integrity tag for it to fail.
+                raise HTTPException(
+                    423,
+                    f"preset {preset_id} has blank criteria, written outside the store, and cannot"
+                    " be used",
+                )
             # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
             # arm is gone: get_search_preset returns the criteria through the cipher, always a str.

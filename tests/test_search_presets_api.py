@@ -405,7 +405,10 @@ async def test_a_blanked_criteria_cell_answers_423_rather_than_widening(
         await engine.store._db.commit()
         r = await c.get("/search/layered", params=layered, headers=h)
     assert r.status_code == 423, r.text
-    assert r.json()["detail"] == f"preset {narrow} failed its integrity check and cannot be used"
+    assert (
+        r.json()["detail"]
+        == f"preset {narrow} has blank criteria, written outside the store, and cannot be used"
+    )
     assert raised[-1].__context__ is None and raised[-1].__cause__ is None
 
 
@@ -451,7 +454,7 @@ async def test_a_plain_cipher_error_on_the_criteria_answers_423_not_500(tmp_path
             side.commit()
             r = await c.get("/search/layered", params={"presets": pid}, headers=h)
         assert r.status_code == 423, r.text
-        assert r.json()["detail"] == f"preset {pid} failed its integrity check and cannot be used"
+        assert r.json()["detail"].startswith(f"preset {pid} has blank criteria")
     finally:
         side.close()
         await keyed.stop()
@@ -495,11 +498,13 @@ async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after
     assert r.headers["Retry-After"] == str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)
     assert "Transit" not in r.text and "mf-store-secret" not in r.text
     assert raised[-1].__context__ is None and raised[-1].__cause__ is None
+    assert "mf-store-secret" not in repr(raised[-1].args)
 
 
 async def test_layered_search_feeds_the_summary_access_audit(engine: Engine) -> None:
     """BACKLOG #5523: a layered recall that returns summaries is coalesced into ``summary_access``
-    like ``/messages/search`` (review M-5), so it is no way round the harvest signal."""
+    like ``/messages/search`` (review M-5), so it is no way round the harvest signal. Control: a
+    recall that returns no row notes nothing, so the audit cannot be amplified by empty reads."""
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
@@ -515,11 +520,19 @@ async def test_layered_search_feeds_the_summary_access_audit(engine: Engine) -> 
     app = create_app(engine, auth=service)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
         h = await _login(c, "op")
-        r = await c.post(
-            "/search/presets", json={"name": "n", "criteria": {"content": "MRN999"}}, headers=h
-        )
-        assert r.status_code == 200, r.text
-        r = await c.get("/search/layered", params={"presets": r.json()["id"]}, headers=h)
+        ids = []
+        for name, needle in (("miss", "NOSUCHNEEDLE"), ("hit", "MRN999")):
+            r = await c.post(
+                "/search/presets", json={"name": name, "criteria": {"content": needle}}, headers=h
+            )
+            assert r.status_code == 200, r.text
+            ids.append(r.json()["id"])
+        miss, hit = ids
+        r = await c.get("/search/layered", params={"presets": miss}, headers=h)
+        assert r.status_code == 200 and r.json()["matched"] == 0, r.text
+        await app.state.summary_auditor.flush(engine.store)
+        assert await engine.store.list_audit(action="summary_access") == []  # control
+        r = await c.get("/search/layered", params={"presets": hit}, headers=h)
         assert r.status_code == 200 and r.json()["matched"] == 1, r.text
         await app.state.summary_auditor.flush(engine.store)
     rows = await engine.store.list_audit(action="summary_access")
