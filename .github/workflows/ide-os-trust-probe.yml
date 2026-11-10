@@ -15,11 +15,11 @@
 # be refused; its line carries only the OS and Node), and a bare `https` request inside VS Code,
 # which says whether the setting reaches a request at all.
 #
-# HOW TO READ IT. A refused engine client is a FINDING and leaves the job green, provided some request
-# inside VS Code without a `ca` of its own was trusted in some launch; with none trusted, the run
-# cannot show VS Code saw the CA, and that is a broken instrument. Only a broken instrument or a
-# failed setup step turns a leg red; osTrustProbeModel.ts's header says which, and the launcher prints
-# each as an `IDE-OS-TRUST-PROBE problem:` line.
+# HOW TO READ IT. A refused engine client is a FINDING and leaves the job green, provided the store
+# control inside VS Code found the test CA among the certificates the runtime loaded from the OS
+# store; its line names the reader it used (`storeSource`). Only a broken instrument or a failed setup
+# step turns a leg red; osTrustProbeModel.ts's header says which, and the launcher prints each as an
+# `IDE-OS-TRUST-PROBE problem:` line.
 # Record the lines, with this run's URL, on #4576.
 #
 # DISPATCH ONLY, OWNER-APPROVED 2026-11-06 (decision d20261106T101630309-6b6d34). No pull_request,

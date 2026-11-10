@@ -10,10 +10,12 @@
 //
 // It asserts nothing. It makes three requests, writes what each did to MF_OS_TRUST_PROBE_OUT, and
 // the launcher judges the run.
+import { X509Certificate } from "node:crypto";
 import * as fs from "node:fs";
 import * as nodeHttps from "node:https";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as tls from "node:tls";
 
 // The bare specifier on purpose: VS Code's loader substitutes it. See osTrustProbeModel.ts.
 import * as bareHttps from "https";
@@ -21,7 +23,7 @@ import * as vscode from "vscode";
 
 import { getJson, pinRefusal, setTrustFailureHandler, tlsOptions } from "../engineClient";
 import { outcomeOf, TRUSTED } from "./osTrustProbeModel";
-import type { HostReport, Outcome } from "./osTrustProbeModel";
+import type { HostReport, Outcome, StoreControl } from "./osTrustProbeModel";
 import { getOutcome, PROBE_TIMEOUT_MS } from "./osTrustProbeRequest";
 
 function required(name: string): string {
@@ -47,6 +49,62 @@ function proxyAgentVersion(): string {
     }
   }
   return "unknown";
+}
+
+/** The SHA-256 fingerprint of a PEM certificate, or undefined when it does not parse. */
+function fingerprint(pem: string): string | undefined {
+  try {
+    return new X509Certificate(pem).fingerprint256;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The certificates the runtime loads from the OS store, and which reader gave them. Node's
+ *  `tls.getCACertificates("system")` first, where this Electron's Node has it; otherwise the
+ *  `loadSystemCertificates` the bundled proxy-agent exports. */
+async function systemCertificates(): Promise<{ source: StoreControl["source"]; certs: string[] }> {
+  const nodeTls = tls as { getCACertificates?: (type?: string) => string[] };
+  if (typeof nodeTls.getCACertificates === "function") {
+    return { source: "tls.getCACertificates", certs: nodeTls.getCACertificates("system") };
+  }
+  const errors: string[] = [];
+  for (const dir of ["node_modules", "node_modules.asar"]) {
+    try {
+      const file = path.join(vscode.env.appRoot, dir, "@vscode", "proxy-agent");
+      const agent = require(file) as {
+        loadSystemCertificates?: (params: { log: unknown }) => Promise<string[]>;
+      };
+      if (typeof agent.loadSystemCertificates !== "function") {
+        errors.push(`${dir}: no loadSystemCertificates`);
+        continue;
+      }
+      const log = { trace() {}, debug() {}, info() {}, warn() {}, error() {} };
+      return { source: "proxy-agent", certs: await agent.loadSystemCertificates({ log }) };
+    } catch (err) {
+      errors.push(`${dir}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  throw new Error(`no reader for the system store (${errors.join("; ")})`);
+}
+
+/** The store control: is the test CA among the certificates the runtime loaded from the OS store?
+ *  It makes no request, so it stands apart from every request it vouches for. */
+async function storeControl(caPem: string): Promise<StoreControl> {
+  const wanted = fingerprint(caPem);
+  if (wanted === undefined) {
+    return { source: "none", caPresent: undefined, error: "the test CA does not parse" };
+  }
+  try {
+    const { source, certs } = await systemCertificates();
+    return { source, caPresent: certs.some((pem) => fingerprint(pem) === wanted) };
+  } catch (err) {
+    return {
+      source: "none",
+      caPresent: undefined,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 /** "yes" when `request` is the builtin `https.request`, fetched with `process.getBuiltinModule`,
@@ -88,6 +146,7 @@ export async function run(): Promise<void> {
   );
   const bare = await getOutcome(bareHttps.get, health, {});
   const explicitCa = await getOutcome(nodeHttps.get, health, { ca: caPem });
+  const store = await storeControl(caPem);
 
   const report: HostReport = {
     context: [
@@ -100,6 +159,8 @@ export async function run(): Promise<void> {
       ["proxyAgent", proxyAgentVersion()],
       ["http.systemCertificates", String(settingRead)],
       ["http.systemCertificates.effective", String(settingEffective)],
+      ["storeSource", store.source],
+      ["caInSystemStore", String(store.caPresent)],
       ["http.systemCertificatesNode", String(http.get("systemCertificatesNode"))],
       ["http.experimental.systemCertificatesV2", String(http.get("experimental.systemCertificatesV2"))],
       ["http.proxySupport", String(http.get("proxySupport"))],
@@ -111,6 +172,7 @@ export async function run(): Promise<void> {
     ],
     settingRead,
     settingEffective,
+    storeControl: store,
     records: [
       { path: "engine-client", pin, outcome: client },
       { path: "bare-https-control", pin: "n/a", outcome: bare },

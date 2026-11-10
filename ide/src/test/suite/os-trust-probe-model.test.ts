@@ -32,7 +32,13 @@ function report(settingRead: unknown, client: Outcome, overrides: Overrides = {}
       outcome: trusted,
     },
   ];
-  return { context: [["os", "linux"]], settingRead, settingEffective: settingRead, records };
+  return {
+    context: [["os", "linux"]],
+    settingRead,
+    settingEffective: settingRead,
+    storeControl: { source: "tls.getCACertificates", caPresent: true },
+    records,
+  };
 }
 
 function launch(on: boolean, client: Outcome, overrides?: Overrides): Launch {
@@ -87,9 +93,10 @@ suite("OS trust store probe model (BACKLOG #4576)", () => {
     assert.strictEqual(fieldValue(true), "true");
   });
 
-  test("either answer for the engine client is a finding, not a broken instrument", () => {
+  test("with the CA found in the store, every engine-client answer is a finding", () => {
     for (const [on, off] of [
       [trusted, refused],
+      [refused, refused],
       [trusted, trusted],
       [refused, trusted],
     ]) {
@@ -97,40 +104,52 @@ suite("OS trust store probe model (BACKLOG #4576)", () => {
     }
   });
 
-  test("a run with no trusted no-ca request in VS Code is broken, whichever path is trusted", () => {
-    // The explicit-CA control is trusted in both launches here and does not count: it carries a ca.
+  test("a store control that could not read the store, or did not find the CA, is broken", () => {
+    const unread = launch(true, refused);
+    unread.report!.storeControl = { source: "none", caPresent: undefined, error: "no reader" };
     assert.match(
-      problemsOf(launch(true, refused), launch(false, refused)),
-      /^no request inside VS Code without a ca of its own was trusted in any launch[^\n]*$/,
+      problemsOf(unread, launch(false, refused)),
+      /^http.systemCertificates on: the store control could not read the system store \(source none: no reader\)/,
     );
-    // A trusted bare-https-control alone is enough, beside a refused engine client.
-    const bareOnly = launch(true, refused, {
-      "bare-https-control": { path: "bare-https-control", pin: "n/a", outcome: trusted },
-    });
-    assert.strictEqual(problemsOf(bareOnly, launch(false, refused)), "");
-    // So is a trusted engine client alone, beside a refused bare control.
-    const clientOnly = launch(false, refused, {
-      "engine-client": { path: "engine-client", pin: "none", outcome: trusted },
-    });
-    assert.strictEqual(problemsOf(launch(true, refused), clientOnly), "");
+    const absent = launch(false, refused);
+    absent.report!.storeControl = { source: "proxy-agent", caPresent: false };
+    assert.match(
+      problemsOf(launch(true, trusted), absent),
+      /^http.systemCertificates off: the store control \(source proxy-agent\) did not find the test CA/,
+    );
   });
 
   test("a launch whose effective setting differs from the value written is broken", () => {
     const overridden = launch(false, refused);
-    if (overridden.report !== undefined) {
-      overridden.report.settingEffective = true;
-    }
+    overridden.report!.settingEffective = true;
     assert.match(
       problemsOf(launch(true, trusted), overridden),
       /^http.systemCertificates off: VS Code resolved the setting as true/,
     );
     const unresolved = launch(true, trusted);
-    if (unresolved.report !== undefined) {
-      unresolved.report.settingEffective = undefined;
-    }
+    unresolved.report!.settingEffective = undefined;
     assert.match(
       problemsOf(unresolved, launch(false, trusted)),
       /^http.systemCertificates on: VS Code resolved the setting as undefined/,
+    );
+  });
+
+  test("a misread user setting names one cause, not a second effective-value line", () => {
+    const misread: Launch = {
+      settingWritten: false,
+      report: report(true, trusted),
+      failure: undefined,
+    };
+    const problems = problemsOf(launch(true, trusted), misread);
+    assert.match(problems, /^http.systemCertificates off: VS Code read the setting back as true[^\n]*$/);
+  });
+
+  test("launches with no report add no line beyond their own failure", () => {
+    const failedOn: Launch = { settingWritten: true, report: undefined, failure: "exit code 1" };
+    const failedOff: Launch = { settingWritten: false, report: undefined, failure: "exit code 1" };
+    assert.strictEqual(
+      problemsOf(failedOn, failedOff),
+      "http.systemCertificates on: exit code 1\nhttp.systemCertificates off: exit code 1",
     );
   });
 
@@ -173,6 +192,7 @@ suite("OS trust store probe model (BACKLOG #4576)", () => {
     assert.ok(isHostReport(report(true, trusted)));
     assert.ok(!isHostReport({ context: [], settingRead: true }));
     assert.ok(!isHostReport({ context: [], records: [1] }));
+    assert.ok(!isHostReport({ context: [], records: [], settingRead: true }));
     assert.ok(!isHostReport(null));
   });
 

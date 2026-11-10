@@ -10,8 +10,8 @@
 // then launches VS Code twice, with `http.systemCertificates` written on and then off in a fresh
 // profile's user settings, running osTrustProbeHost.ts in each. It prints one IDE-OS-TRUST-PROBE line
 // per request, and exits non-zero only when the instrument is broken (osTrustProbeModel.ts says
-// which cases those are). A refused engine client is a finding and exits 0, as long as some request
-// in VS Code without its own `ca` was trusted.
+// which cases those are). A refused engine client is a finding and exits 0, as long as the store
+// control found the test CA.
 //
 // Inputs, all from the environment:
 //   MF_OS_TRUST_PROBE_DIR     a directory holding ca.pem, leaf.pem and leaf.key (the job makes them)
