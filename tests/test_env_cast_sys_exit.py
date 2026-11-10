@@ -122,10 +122,31 @@ async def test_a_reload_whose_cast_exits_is_refused_and_leaves_the_graph(tmp_pat
         await eng.stop()
 
 
-def test_check_fails_a_cast_that_exits_zero(tmp_path: Path) -> None:
+_EXIT_CAST = "import sys\ndef quit(raw):\n    sys.exit(0)\n"
+_PLACEMENTS = {
+    # resolve_env_settings, when the outbound is built.
+    "outbound_port": _EXITING_CONFIG,
+    # The listener-port pre-flight (_resolve_port), which runs before any connector is built.
+    "inbound_port": _EXIT_CAST
+    + "from messagefoundry import inbound, router, MLLP, env\n"
+    + "inbound('IB_E', MLLP(port=env('peer_port', cast=quit)), router='r')\n"
+    + "@router('r')\ndef route(msg):\n    return []\n",
+    # The encoding pre-flight (_resolve_one_env_value), also before the build.
+    "encoding": _EXIT_CAST
+    + "from messagefoundry import inbound, outbound, router, File, env\n"
+    + "inbound('IB_E', File(directory={inbox!r}), router='r')\n"
+    + "outbound('OUT_F', File(directory={inbox!r}, encoding=env('peer_port', cast=quit)))\n"
+    + "@router('r')\ndef route(msg):\n    return []\n",
+}
+
+
+@pytest.mark.parametrize("placement", sorted(_PLACEMENTS))
+def test_check_fails_a_cast_that_exits_zero(tmp_path: Path, placement: str) -> None:
     # The gate's build-check leg resolves env() as serve does. A cast that exits 0 there ended
-    # `messagefoundry check` with exit status 0, a pass; it must be a blocking failure instead.
-    cfg = _write(tmp_path / "config", _EXITING_CONFIG.format(inbox=str(tmp_path / "in")))
+    # `messagefoundry check` with exit status 0, a pass; it must be a blocking failure instead,
+    # wherever the cast is first run.
+    text = _PLACEMENTS[placement].format(inbox=str(tmp_path / "in"))
+    cfg = _write(tmp_path / "config", text)
     (tmp_path / "environments").mkdir()
     (tmp_path / "environments" / "dev.toml").write_text('peer_port = "6661"\n', encoding="utf-8")
     report = run_checks(cfg, run_lint=False, env="dev", project_root=tmp_path)

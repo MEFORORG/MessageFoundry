@@ -642,6 +642,9 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
     return view
 
 
+_SYSTEM_EXIT_CODE: Any = vars(SystemExit)["code"]  # the C slot's descriptor, for from_exit
+
+
 class UserCodeCalledSysExit(Exception):
     """A Router, an ``accepts=`` predicate or a Handler raised ``SystemExit``, ``sys.exit()`` called
     at run time (vault BACKLOG #3134). The one definition, for the dry run and the live runner alike
@@ -677,7 +680,9 @@ class UserCodeCalledSysExit(Exception):
 
     @classmethod
     def from_exit(cls, exc: SystemExit) -> UserCodeCalledSysExit:
-        code = exc.code
+        # The base slot, not ``exc.code``: a SystemExit subclass can make ``code`` a property,
+        # which is user code that could exit again inside the arm converting this exit.
+        code: object = _SYSTEM_EXIT_CODE.__get__(exc, SystemExit)
         named = ""
         # type() first, since isinstance() alone may read a user-defined ``__class__``; the
         # isinstance() after it only narrows for mypy. bool cannot be subclassed, so ``is`` will do.

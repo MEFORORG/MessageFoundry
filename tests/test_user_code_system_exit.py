@@ -198,7 +198,7 @@ class _FakeInt:
     """Not an int, but a ``__class__`` that tells ``isinstance`` it is one."""
 
     @property  # type: ignore[misc]
-    def __class__(self) -> type:  # noqa: PLE0307
+    def __class__(self) -> type:
         raise AssertionError("from_exit consulted the code's own __class__")
 
 
@@ -219,6 +219,16 @@ class _FakeInt:
 def test_the_exit_code_is_formatted_as_a_plain_int(code: object, named: str) -> None:
     text = str(UserCodeCalledSysExit.from_exit(SystemExit(code)))
     assert text == f"Router or Handler code raised SystemExit{named} (sys.exit() at run time)"
+
+
+def test_a_system_exit_overriding_its_code_is_not_asked_for_it() -> None:
+    class Quit(SystemExit):
+        @property
+        def code(self) -> Any:  # type: ignore[override]
+            sys.exit("PID-5 was DOE^JANE")
+
+    text = str(UserCodeCalledSysExit.from_exit(Quit(4)))
+    assert text == "Router or Handler code raised SystemExit with code 4 (sys.exit() at run time)"
 
 
 def test_an_exit_code_faking_its_class_names_no_code() -> None:

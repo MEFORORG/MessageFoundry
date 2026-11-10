@@ -440,7 +440,7 @@ def _run_one(
         raise  # not a plain handler error: main() answers it and recycles the worker
     except SystemExit as exc:
         # Caught deliberately: sys.exit() in user code is a content fault, reported in mode=off's words
-        # (vault BACKLOG #3134; UserCodeCalledSysExit says why config code differs). Uncaught, it ended
+        # (vault BACKLOG #3134; UserCodeCalledSysExit says why it is converted). Uncaught, it ended
         # the worker, so the message read as a crash and the next paid a respawn. No shutdown of this
         # worker raises here: the parent closes the pipe (EOF in main()) or kills it. KeyboardInterrupt
         # and every other BaseException are not converted, as at mode=off.
