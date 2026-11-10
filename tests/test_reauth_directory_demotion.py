@@ -330,15 +330,17 @@ async def test_a_scope_map_that_fails_its_seal_is_no_demotion(
         DIRECTORY_SCOPE_MAP_UNSEALED,
         DIRECTORY_SCOPE_NARROWED,
     )
-    from messagefoundry.store.store import AD_SCOPE_MAP, ad_map_seal_ok
+    from messagefoundry.store.row_seal import AnyRowSealer
+    from messagefoundry.store.store import AD_SCOPE_MAP, AdMap, ad_map_seal_ok_async
 
     s = await _signed_in(store, _VIEWERS, _SCOPE_AB, scope_map=_SCOPE_MAP)
-    real = ad_map_seal_ok
-    monkeypatch.setattr(
-        service_module,
-        "ad_map_seal_ok",
-        lambda sealer, current: current.name != AD_SCOPE_MAP and real(sealer, current),
-    )
+    real = ad_map_seal_ok_async
+
+    # The service's map seal check is awaitable (ADR 0217 slice 1b); only the scope map fails.
+    async def scope_map_fails(sealer: AnyRowSealer | None, current: AdMap) -> bool:
+        return current.name != AD_SCOPE_MAP and await real(sealer, current)
+
+    monkeypatch.setattr(service_module, "ad_map_seal_ok_async", scope_map_fails)
 
     refused = await s.service.reauth(s.identity, _GOOD, token=s.token)
 
