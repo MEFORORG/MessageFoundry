@@ -6,6 +6,7 @@ CRUD + the bounded AND-compose layered query over search_messages. SQLite here; 
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -285,6 +286,22 @@ def _keep_raised(app: FastAPI) -> list[StarletteHTTPException]:
     return raised
 
 
+def _layered_refusal_log(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The route's refusal records, each holding only text (BACKLOG #5523). An exception object
+    among a record's args would carry its traceback, and through it the route frame's decrypted
+    criteria, to any handler that keeps records unformatted."""
+    records = [
+        rec
+        for rec in caplog.records
+        if rec.name == "messagefoundry.api.app" and rec.getMessage().startswith("layered search")
+    ]
+    assert records, "the refusal was not logged"
+    for rec in records:
+        assert rec.exc_info is None and isinstance(rec.args, tuple)
+        assert all(isinstance(arg, str) for arg in rec.args), [type(arg) for arg in rec.args]
+    return records
+
+
 async def test_a_preset_planted_in_the_callers_account_answers_423(tmp_path: Path) -> None:
     """BACKLOG #2593: criteria bind their owner. Another account's preset moved into the caller's
     account outside the store is refused on the layered recall with a 423, audited and alerted once,
@@ -412,7 +429,9 @@ async def test_a_blanked_criteria_cell_answers_423_rather_than_widening(
     assert raised[-1].__context__ is None and raised[-1].__cause__ is None
 
 
-async def test_a_plain_cipher_error_on_the_criteria_answers_423_not_500(tmp_path: Path) -> None:
+async def test_a_plain_cipher_error_on_the_criteria_answers_423_not_500(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """BACKLOG #5523: ``open_tagged_cell`` re-raises a cipher error that is not a tag failure, here
     the refusal of an unmarked value planted in a keyed store. It escaped as a 500. It is a 423 now,
     naming no cipher detail and chaining nothing. A blanked cell in the same keyed store, which the
@@ -443,12 +462,16 @@ async def test_a_plain_cipher_error_on_the_criteria_answers_423_not_500(tmp_path
                 "UPDATE search_presets SET criteria=? WHERE id=?", ('{"content": "MRN999"}', pid)
             )
             side.commit()
+            caplog.set_level(logging.WARNING, logger="messagefoundry.api.app")
             r = await c.get("/search/layered", params={"presets": pid}, headers=h)
             assert r.status_code == 423, r.text
             opened = f"preset {pid} cannot be opened with the store's keys"
             assert r.json()["detail"].startswith(opened)
             assert "unmarked" not in r.text and "MRN999" not in r.text
             assert raised[-1].__context__ is None and raised[-1].__cause__ is None
+            logged = _layered_refusal_log(caplog)
+            assert any(f"refused preset {pid}: " in rec.getMessage() for rec in logged)
+            assert all("MRN999" not in rec.getMessage() for rec in logged)
 
             side.execute("UPDATE search_presets SET criteria='' WHERE id=?", (pid,))
             side.commit()
@@ -461,7 +484,7 @@ async def test_a_plain_cipher_error_on_the_criteria_answers_423_not_500(tmp_path
 
 
 async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5523, after #3734: Vault Transit's outage reaches the route as the
     ``CipherUnavailableError`` that ``open_tagged_cell`` re-raises for a cipher with no
@@ -492,6 +515,7 @@ async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after
             raise CipherUnavailableError("Transit unreachable for key mf-store-secret")
 
         monkeypatch.setattr(cipher, "decrypt", _outage)
+        caplog.set_level(logging.WARNING, logger="messagefoundry.api.app")
         r = await c.get("/search/layered", params={"presets": pid}, headers=h)
         monkeypatch.undo()
     assert r.status_code == 503, r.text
@@ -499,6 +523,12 @@ async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after
     assert "Transit" not in r.text and "mf-store-secret" not in r.text
     assert raised[-1].__context__ is None and raised[-1].__cause__ is None
     assert "mf-store-secret" not in repr(raised[-1].args)
+    assert any(
+        rec.getMessage()
+        == f"layered search answered 503 on preset {pid}: Transit unreachable for key"
+        " mf-store-secret"
+        for rec in _layered_refusal_log(caplog)
+    )
 
 
 async def test_layered_search_feeds_the_summary_access_audit(engine: Engine) -> None:

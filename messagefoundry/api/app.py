@@ -9586,8 +9586,9 @@ def create_app(
                 )
             except CipherUnavailableError as exc:
                 # BACKLOG #5523, as #3734 split the upload routes: the key service gave no verdict,
-                # so a later try may succeed. Its text goes to the log only, as in uploads.
-                _log.warning("layered search answered 503 on preset %s: %s", preset_id, exc)
+                # so a later try may succeed. Its text goes to the log only, as in uploads, and as
+                # a str: the exception's traceback would reach this frame's decrypted `criterias`.
+                _log.warning("layered search answered 503 on preset %s: %s", preset_id, str(exc))
                 refusal = HTTPException(
                     503,
                     f"the store's key service could not open preset {preset_id}. Try again shortly",
@@ -9626,7 +9627,8 @@ def create_app(
                 )
             # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
-            # arm is gone: get_search_preset returns the criteria through the cipher, always a str.
+            # arm is gone: get_search_preset returns the criteria through the cipher as a str, or
+            # None for a NULL cell, and the blank-cell refusal above has already refused None.
             criteria, refused = json_loads_or_refusal(row["criteria"])
             if refused is not None or not isinstance(criteria, dict):
                 raise HTTPException(400, f"preset {preset_id} has malformed criteria")
