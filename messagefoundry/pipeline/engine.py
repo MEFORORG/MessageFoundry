@@ -648,10 +648,10 @@ class Engine:
         # verifies rather than presents, so the served-cert enumeration cannot see them; watching them by
         # file is what catches a caller whose cert expires while it has stopped connecting.
         self._api_tls_client_cert_files = tuple(api_tls_client_cert_files)
-        # BACKLOG #299, vault #2223: the settings-level CRL files and the SQL Server store pin,
-        # which serve builds with monitored_files_from_settings. No connection carries them, so
-        # the registry scan cannot see them, and a stale one would otherwise stay silent until a
-        # handshake failed.
+        # BACKLOG #299: the CRL files the service settings configure (crls_from_settings), mostly for
+        # OUTBOUND hops. No connection carries them, so the registry scan cannot see them, and a stale
+        # one would otherwise stay silent until the next context build failed. Vault BACKLOG #2223: the
+        # serve path also passes the SQL Server store pin here (certs_from_settings), a kind="cert" row.
         self._settings_monitored_files = tuple(settings_monitored_files)
         # The engine's own API listener (host, port), reserved so no inbound listener can steal it (it
         # would collide with uvicorn at bind). None (embedding/tests with no API socket) → nothing

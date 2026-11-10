@@ -4892,9 +4892,10 @@ def _serve(args: argparse.Namespace) -> int:
         # ASVS 6.4.5: operator-held copies of inbound service callers' client certs — watched by the same
         # [cert_monitor] scan, so a caller's cert cannot expire unnoticed while it has stopped connecting.
         api_tls_client_cert_files=settings.api.tls_client_cert_files,
-        # BACKLOG #299, vault #2223: the settings-level CRL files and the SQL Server store pin that
-        # no connection carries (monitored_files_from_settings lists them), so a CRL going stale on
-        # an OUTBOUND hop, or the pin nearing expiry, alerts before it fails a handshake.
+        # BACKLOG #299: the settings-level CRL files ([tls], [logging] forward, [auth] OIDC, [store],
+        # [api] client), so a CRL going stale on an OUTBOUND hop alerts before it fails a handshake.
+        # Vault BACKLOG #2223: plus the SQL Server store pin, whose expiry the engine watches itself
+        # (why: the `ssl_root_cert` row of docs/CONFIGURATION.md).
         settings_monitored_files=monitored_files_from_settings(settings),
         # Reserve the engine's own API listener so no inbound can be wired onto it (it would collide
         # with uvicorn at bind); surfaced as a clear PortConflictError at check/start instead.
