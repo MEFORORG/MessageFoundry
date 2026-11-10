@@ -167,6 +167,12 @@ _VSCODE_SETTINGS = """\
 # check` (validate + dryrun + advisory lint) on every PR. `pip install -r requirements.txt` resolves the
 # engine from your configured index — public PyPI (the published releases carry SLSA + PEP 740
 # attestations), the engine's GitHub Release wheel, or a private index.
+#
+# Where the workflow's comments or _CHECK_STALE's messages name pip's `-c` or `-e` flag, it is in
+# backticks. tests/test_threat_model_doc_drift.py reads a flag such as `-c`, `-e`, `-lc`, `/c` or
+# `/k` standing alone in a string literal, between spaces or at the literal's start or end, as one
+# that hands a shell its script text, and so reads this module as a shell-execution site. A flag
+# in backticks does not stand alone.
 _CI_WORKFLOW = """\
 name: check
 on:
@@ -487,10 +493,8 @@ def named(group, name):
 """
 
 #: The stale-lock check's own code, after the shared reader. A raw string for the same reason. A line
-#: of options and no requirement is read by the runner's pip's own requirements-line parser.
-#: pip's ``-c`` is in backticks wherever this module's text names it, here and in the workflow's
-#: comments: tests/test_threat_model_doc_drift.py reads an unquoted ``-c`` in a string literal as
-#: a flag that hands a shell its script text, and so as a shell-execution site.
+#: of options and no requirement is read by the runner's pip's own requirements-line parser. A pip
+#: flag in its messages is in backticks, as the note above ``_CI_WORKFLOW`` says why.
 _CHECK_STALE = r"""
 import optparse, shlex
 
