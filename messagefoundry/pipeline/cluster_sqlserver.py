@@ -136,9 +136,9 @@ class SqlServerCoordinator:
         # widening it is a multi-site enumeration — the exact defect class this avoids).
         self._on_demote: Callable[[], None] | None = None
         self._fence_timeout = leader_fence_timeout_seconds
-        # ADR 0157 Inc 0: the clamp on every statement in the maintenance loop (the heartbeat, the
-        # claim/renew and the config-version refresh, which the engine's start-up seed also calls)
-        # and on the stepdown's release write, as DbCoordinator._call_tick bounds them (BACKLOG
+        # ADR 0157 Inc 0: the clamp on at least the maintenance loop's heartbeat, claim/renew and
+        # config-version refresh (which the engine's start-up seed also calls), and on the
+        # stepdown's release write, as DbCoordinator._call_tick bounds them (BACKLOG
         # #5064, #6472): each runs in series with the renew or under _leadership_lock, so
         # [store].command_timeout there would delay the renew. SqlServerStore._fetchone_clamped
         # says how it is applied, why one costs up to about twice the clamp, three times when its
@@ -234,9 +234,9 @@ class SqlServerCoordinator:
         # NOT under _leadership_lock, and best-effort on a failed write — see DbCoordinator.stop().
         # Forced unconditionally, so a self-fenced node releases its row, and each write bounded
         # (BACKLOG #1987). DbCoordinator.stop() says why the force is unconditional, when the tombstone
-        # is skipped, and what the bound does not cover. No asyncpg-style helper here: the store's
-        # _acquire already bounds the borrow and quarantines a cancelled connection, and
-        # STOP_WRITE_TIMEOUT_SECONDS says what that can still cost.
+        # is skipped, and what the bound does not cover. No asyncpg-style helper here: the store
+        # bounds the borrow (the release's at this bound too, BACKLOG #5064) and quarantines a
+        # cancelled connection, and STOP_WRITE_TIMEOUT_SECONDS says what that can still cost.
         started = time.monotonic()
         _, _, wrote, _ = await self._release_leadership(
             force_write=True, timeout=self._stop_write_timeout

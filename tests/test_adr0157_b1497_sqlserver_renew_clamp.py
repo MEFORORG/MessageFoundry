@@ -331,17 +331,18 @@ async def test_a_failed_rollback_discards_the_connection_and_raises_the_original
     assert conn.raw.log[-1] == "rollback", conn.raw.log
 
 
-async def test_a_hung_rollback_ends_at_the_clamp_and_discards_the_connection() -> None:
+@pytest.mark.parametrize("method", ["_fetchone_clamped", "_execute_clamped"])
+async def test_a_hung_rollback_ends_at_the_clamp_and_discards_the_connection(method: str) -> None:
     """The bound (step 1 of #5066): the rollback gets the clamp floored at 1 s. Past it the
-    connection is discarded and the claim's error is raised, so the rollback cannot hold the
-    leadership lock unbounded."""
+    connection is discarded and the statement's error is raised, so the rollback cannot hold the
+    leadership lock unbounded. The clamped write is the stepdown release's path (BACKLOG #5064)."""
     conn = _Conn()
     conn.rollback_hangs = True
     conn.fail = RuntimeError("HYT00 query timeout expired")
     store = _store(conn)
     started = time.monotonic()
     with pytest.raises(RuntimeError, match="HYT00"):
-        await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=1.0)
+        await getattr(store, method)("UPDATE leader_lease ...", ("k",), timeout_clamp=1.0)
     elapsed = time.monotonic() - started
     assert 0.9 <= elapsed < 3.0, elapsed
     assert conn.rolled_back == 1
@@ -601,9 +602,10 @@ async def test_a_renew_on_a_busy_pool_and_a_stalled_server_resolves_within_twice
     """The kept bound (Manager decision d20261030T213636115-0af931), pinned by timing rather than
     by the warning's arithmetic: the borrow and the statement each get the clamp, with no shared
     deadline, so a renew that waits on a busy pool and then meets a stalled server still resolves
-    inside twice the clamp, and the node takes nothing. The borrow takes 0.9 of the clamp, near
-    the most it may, and the statement the whole of it, so the expected 1.9 x clamp is close to the
-    bound; the 0.5 s over it is timer slack on a loaded runner, not part of the bound. The lower
+    inside twice the clamp, and the node takes nothing. The borrow takes 0.75 of the clamp, which
+    leaves the acquire bound 0.5 s of headroom, and the statement the whole of it, so 1.75 x clamp
+    is expected; the 0.5 s allowed over twice the clamp is timer slack on a loaded runner, not part
+    of the bound. The lower
     bound shows both windows were spent, so this is the composite and not one window alone. The
     COMMIT is outside both windows, by a reading of pyodbc, not a measurement (BACKLOG #6621); this
     fake's commit is immediate."""
@@ -611,13 +613,13 @@ async def test_a_renew_on_a_busy_pool_and_a_stalled_server_resolves_within_twice
     conn = _Conn()
     conn.stalls = True
     store = _store(conn)
-    store._pool = _SlowPool(conn, delay=0.9 * clamp)
+    store._pool = _SlowPool(conn, delay=0.75 * clamp)
     coord = SqlServerCoordinator(store, "A", lease_renew_timeout_seconds=clamp)
     started = time.monotonic()
     with pytest.raises(RuntimeError, match="HYT00"):
         await coord._maintain_leadership()
     elapsed = time.monotonic() - started
-    assert 1.75 * clamp <= elapsed < 2 * clamp + 0.5, elapsed
+    assert 1.6 * clamp <= elapsed < 2 * clamp + 0.5, elapsed
     assert conn.statement_timeouts == [2]
     assert coord.is_leader() is False
     assert not coord._leadership_lock.locked()

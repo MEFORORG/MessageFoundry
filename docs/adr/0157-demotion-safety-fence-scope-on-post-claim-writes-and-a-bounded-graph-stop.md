@@ -399,7 +399,8 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    clamp after it is issued, while the margin check compares the clamp alone. The COMMIT after the
 >    statement is not bounded by it. Since BACKLOG #5064 the heartbeat, config-version refresh and
 >    stepdown release run under the clamp the same way, each with the same twice-the-clamp bound, three
->    times when its rollback runs (`SqlServerStore._execute_clamped`); until then they ran under `command_timeout`, as this
+>    times when its rollback runs (`SqlServerStore._execute_clamped` for the two writes,
+>    `_fetchone_clamped` for the refresh); until then they ran under `command_timeout`, as this
 >    sentence said. Whether msodbcsql bounds the COMMIT (`SQLEndTran`) needs a live server; BACKLOG
 >    #6621 measures it. The first difference is on purpose; the second is a kept
 >    residual (Manager decision d20261030T213636115-0af931): the margin check is unchanged, and

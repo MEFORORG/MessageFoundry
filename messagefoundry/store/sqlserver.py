@@ -5663,7 +5663,9 @@ class SqlServerStore:
         entered the gate never runs (BACKLOG #2394), so the separate close that follows takes the
         gate's lock with no rollback left to race it, and the close ends the transaction.
         :meth:`_fetch_rows` passes the lease claim's clamp, so a stalled rollback
-        after a failed claim cannot hold ``_leadership_lock`` past it (BACKLOG #5066).
+        after a failed claim cannot hold ``_leadership_lock`` past it (BACKLOG #5066), and
+        :meth:`_write_rows` passes it for a stepdown's release write, which holds the same lock
+        (BACKLOG #5064).
 
         The discard is :func:`_detach_connection`, the same detach :meth:`_release_dirty` uses, and
         unlike that method it does NOT wait for the close.
