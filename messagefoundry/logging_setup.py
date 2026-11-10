@@ -104,6 +104,7 @@ __all__ = [
     "CredentialScrubFilter",
     "redact_log_value",
     "redacted_log_field",
+    "UNREADABLE_LOG_FIELD",
     "SyslogForward",
     "ForwarderStatus",
     "FORWARD_LOSS_COUNTERS",
@@ -420,57 +421,62 @@ def _through_shipped_handlers(text: str, handlers: int) -> str:
     return record.getMessage()
 
 
-def redact_log_value(text: str, *, before: str = "", after: str = "") -> str:
-    """``text`` as the second of two shipped handlers would write it, read in the line it would
-    have stood in on main, ``before`` + ``text`` + ``after``, then once more with each tab written
-    as a space (BACKLOG #3770).
+def redact_log_value(text: str, *, before: str = "", after: str = "") -> str | None:
+    """``text`` as the second of two shipped handlers would write it, read in the line
+    ``before`` + ``text`` + ``after``, or ``None`` when that line's context did not survive
+    (BACKLOG #3770).
 
     The field's own escape hides its text from every handler, so this value is meant to carry what
     main's handlers would have hidden. The filters are the ones :func:`_install_phi_filters`
-    installs, not a copy, and the line's own context is kept because some passes read past a
-    value. The extra round exists because a tab, which the control-character escape keeps, makes
-    the PHI pass read the text as not printable and skip it; it reads text main's two handlers
-    already redacted. What is tested, in ``tests/test_admin_new_ip.py``, is that no word of a path
-    main's last of two handlers hid on either new-address line prints, over named vectors and a
-    seeded corpus. Not tested: a third handler, and a Unicode space separator before an encoded
-    HL7 name, which main printed too.
+    installs, not a copy, and the context is kept because some passes read past a value. When the
+    result holds a tab, it runs once more with each tab written as a space: a tab, which the
+    control-character escape keeps, makes the PHI pass read the text as not printable and skip it.
 
-    ``before`` is removed from the result when it survives at its head, or else its words up to
-    its last space when those do, and ``after`` when it survives at its tail; otherwise the
-    rewritten context stays in the value, which then carries more of the line than ``text`` alone. A control logs as its escape spelling and a tab as a
-    space, so the value no longer tells either from that text."""
+    The value is what lies between ``before`` and ``after``, each found exactly at its end of the
+    result. When a pass rewrote either, the boundary is unknown, so this returns ``None`` rather
+    than a value that may carry the context's text; a caller logs a fixed placeholder then. A
+    control logs as its escape spelling and a tab as a space, so the value no longer tells either
+    from that text."""
     line = before + text + after
-    out = _through_shipped_handlers(_through_shipped_handlers(line, 2).replace("\t", " "), 1)
-    if before and out.startswith(before):
-        out = out[len(before) :]
-    elif before and out.startswith(head := before[: before.rfind(" ") + 1]):
-        # A pass took the last word of ``before`` with the text, as the HL7 run takes a whole
-        # whitespace-delimited run; the words before it are still the fixed text.
-        out = out[len(head) :]
-    if after and out.endswith(after):
-        out = out[: -len(after)]
-    return out
+    out = _through_shipped_handlers(line, 2)
+    if "\t" in out:
+        out = _through_shipped_handlers(out.replace("\t", " "), 1)
+    if len(out) < len(before) + len(after) or not (out.startswith(before) and out.endswith(after)):
+        return None
+    return out[len(before) : len(out) - len(after)]
 
 
-def redacted_log_field(text: str, limit: int, *, before: str = "", after: str = "") -> str:
+#: The field :func:`redacted_log_field` logs when its value cannot be read apart from its context.
+UNREADABLE_LOG_FIELD = f'"{PHI_PLACEHOLDER}"'
+
+
+def redacted_log_field(
+    text: str, limit: int, *, contexts: tuple[tuple[str, str], ...] = (("", ""),)
+) -> str:
     """``text`` as one ``key="value"`` field value of a log line: redacted by
-    :func:`redact_log_value` in the context ``before`` and ``after``, then escaped and bounded by
-    :func:`~messagefoundry.controlchars.log_field_token` (BACKLOG #3770).
+    :func:`redact_log_value` in each ``(before, after)`` of ``contexts``, then escaped and bounded
+    by :func:`~messagefoundry.controlchars.log_field_token` (BACKLOG #3770). When a pass rewrote a
+    context, or two contexts read the text differently, it is :data:`UNREADABLE_LOG_FIELD`, so one
+    field serves every line the caller names.
 
     The escape hides most of what the handler filters anchor on, so they read less inside the
-    field than in raw text; redacting first, as main's handlers read the line, means a PHI or
-    credential value they would have hidden is hidden anyway. The placeholders the passes write are kept as they are, not escaped, so a
-    search for ``<redacted>`` or ``[redacted]`` still finds the line. The filters still run on the
-    whole line afterwards and may rewrite a run inside the field, never past its quotes.
+    field than in raw text; redacting first, in each line the caller names, is meant to hide what
+    the handlers would have hidden there. Each context reads the raw text: a second reading of an
+    already redacted value can miss what the same reading of the raw text hid. The placeholders
+    the passes write are kept as they are, not escaped, so a search for ``<redacted>`` or
+    ``[redacted]`` still finds the line. The filters still run on the whole line afterwards and
+    may rewrite a run inside the field, never past its quotes.
 
     A log argument must never raise, as in :class:`RedactionFilter`: a failing pass gives a fixed
     placeholder rather than the value."""
     try:
-        return log_field_token(
-            redact_log_value(text, before=before, after=after),
-            limit,
-            literals=(CREDENTIAL_PLACEHOLDER, PHI_PLACEHOLDER),
-        )
+        readings = {
+            redact_log_value(text, before=before, after=after) for before, after in contexts
+        }
+        value = readings.pop()
+        if value is None or readings:
+            return UNREADABLE_LOG_FIELD
+        return log_field_token(value, limit, literals=(CREDENTIAL_PLACEHOLDER, PHI_PLACEHOLDER))
     except Exception as exc:  # noqa: BLE001 -- a log argument must never raise
         name = type(exc).__name__
         # Reported by type only, since the message and traceback may carry the value, and once per

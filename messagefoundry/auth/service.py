@@ -535,12 +535,26 @@ _NEW_IP_OVER_CAP_HEAD = (
 )
 
 
-def _new_ip_path_field(path: str, *, before: str, after: str = "") -> str:
-    """The path field of a new-address WARNING (BACKLOG #3770): redacted as main's shipped handlers
-    read it in main's line, ``before`` the path and ``after`` it, then escaped and bounded. Where a
-    handler rewrote the context, the rewritten context stays in the field. What the tests check of
-    it is in ``logging_setup.redact_log_value``."""
-    return redacted_log_field(path, _NEW_IP_LOG_FIELD_MAX, before=before, after=after)
+# The contexts the path stood in on main's two lines: last on the repeat line, and followed by the
+# seen address on the past-cap line. The seen address is caller text, so a constant stands in for
+# it here; the field then never holds any part of it, and both lines log the same field.
+_NEW_IP_PATH_CONTEXTS = (
+    (_NEW_IP_REPEAT_HEAD, ""),
+    (_NEW_IP_OVER_CAP_HEAD + "path=", " seen_ip=0.0.0.0"),
+)
+
+
+def _new_ip_path_field(path: str) -> str:
+    """The path field of both new-address WARNINGs (BACKLOG #3770): redacted by the shipped
+    handler filters in each of main's two lines, then escaped and bounded
+    (``logging_setup.redacted_log_field``). When the two readings differ, or a pass rewrote a
+    line's fixed context, it is ``logging_setup.UNREADABLE_LOG_FIELD``, so the field holds only
+    the path's own text, and both lines log the one field. What the tests check of it is in
+    ``tests/test_admin_new_ip.py``: over named vectors and a seeded corpus, with several seen
+    addresses, no word of a path that main's last of two handlers hid prints on either line. Not
+    tested: a third handler, and a Unicode space separator before an encoded HL7 name, which main
+    printed too."""
+    return redacted_log_field(path, _NEW_IP_LOG_FIELD_MAX, contexts=_NEW_IP_PATH_CONTEXTS)
 
 
 # The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). Its baseline is the store's
@@ -651,11 +665,13 @@ def _address_log_field(address: str) -> str:
     whole text, keyed by :data:`_ADDRESS_LOG_KEY`, when it does not parse. A zone id is text, so an
     address with one logs its canonical address, ``-zone-sha256-`` and that digest.
 
-    The canonical form holds only hex digits, ``.`` and ``:``, which spell no credential label, HL7
-    separator, date or name a handler filter reads, so the field cannot close, merge or erase
-    another, and the address still reads as an address. Its spelling may differ from the raw text
-    the audit rows keep, ``2001:db8::1`` for ``2001:DB8:0:0:0:0:0:1`` for one. The address is
-    caller-supplied on a proxied hop, so its text is never logged as it is."""
+    The canonical form holds only hex digits, ``.`` and ``:``, and the digest forms only letters,
+    digits, ``.``, ``:`` and ``-``, so the address still reads as an address; the tests read the
+    past-cap line through two shipped handlers and check, for the addresses they name, that this
+    field closes, merges with and erases no other. Its spelling may differ from the raw text the
+    audit rows keep, ``2001:db8::1`` for ``2001:DB8:0:0:0:0:0:1`` for one. The address is
+    caller-supplied on a proxied hop, so this field never carries its text as it is; the audit
+    rows still do."""
     try:
         parsed = ipaddress.ip_address(address)
     except ValueError:
@@ -14000,14 +14016,14 @@ class AuthService:
         # addresses, so a replayed token cannot amplify the audit log / notifications even when it
         # alternates between addresses (BACKLOG #2159).
         flag = self._first_new_ip_flag(token_hash, seen_key)
-        # No logged request field can close, merge with or erase another (BACKLOG #3770): the path
-        # is redacted, escaped and bounded, and the address logs only as an address. The path still
-        # comes last, a second guard. Only when the line will be written: this branch is the one a replayed token loops on.
+        # BACKLOG #3770: the path logs as an escaped, bounded field holding only its own redacted
+        # text, and the address only as a canonical address or a keyed digest. The tests read
+        # both lines through two shipped handlers and check that no field closes, merges with or
+        # erases another for the vectors they name. The path still comes last, a second guard.
+        # Only when the line will be written: this branch is the one a replayed token loops on.
         if flag == "repeat":
             if _log.isEnabledFor(logging.WARNING):
-                _log.warning(
-                    _NEW_IP_REPEAT_HEAD + "%s", _new_ip_path_field(path, before=_NEW_IP_REPEAT_HEAD)
-                )
+                _log.warning(_NEW_IP_REPEAT_HEAD + "%s", _new_ip_path_field(path))
             return True
         # What the row, the notice and main's past-cap log line carry. Text within
         # _NEW_IP_TEXT_MAX, which is every address without a long zone id, is unchanged, so a search
@@ -14023,11 +14039,7 @@ class AuthService:
                 _log.warning(
                     _NEW_IP_OVER_CAP_HEAD + "seen_ip=%s path=%s",
                     _address_log_field(client_ip),
-                    _new_ip_path_field(
-                        path,
-                        before=_NEW_IP_OVER_CAP_HEAD + "path=",
-                        after=" seen_ip=" + scrub_log_argument(seen_text),
-                    ),
+                    _new_ip_path_field(path),
                 )
             return True
         known_text = _bounded_address_text(session.client)
