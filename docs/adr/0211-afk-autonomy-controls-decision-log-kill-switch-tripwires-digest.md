@@ -622,8 +622,9 @@ blind sample optional. Three things change here.
   resolved decisions in the window is not calibrated, so an empty history is not (Manager
   decision 2026-11-09, plan section 12). Owner ratings still count when given: any trailing window of up to 60
   holding more than 3 disagreements is a breach, with the 60 fresh ratings to recover. Fewer than
-  60 ratings no longer holds a class back, so AC-7's *"calibrated only at 60 rated samples"* and
-  the gate section's *"Today it answers REVIEW (or HALT) for every seat"* are superseded.
+  60 ratings no longer holds a class back, so AC-7's *"calibrated only at 60 rated samples"*,
+  the gate section's *"Today it answers REVIEW (or HALT) for every seat"*, and the reversal-budget
+  text saying only `reversed` counts and a later outcome cancels it, are superseded.
 - **The gate derives the paths the act changes from git**: the branch's diff against
   `origin/main`, the uncommitted and staged changes and the untracked files, joined with any
   `-Touches`. No path is REVIEW, since an act that changes no file has no git undo. Every path must

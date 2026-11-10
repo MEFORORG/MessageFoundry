@@ -606,7 +606,8 @@ $script:DecisionReversalOutcomes = @('reversed', 'reopened', 'rebriefed', 're-br
 # The status outcomes that are a result, an allowlist: any other status, a typo included, is not
 # one. A status counts only from a later `outcome` record, never from the decision's own log-time
 # -Outcome, which is written before the act exists.
-$script:DecisionResolvedOutcomes = @('merged', 'landed', 'kept', 'done', 'closed', 'completed', 'fixed', 'shipped')
+# A close is the T1 undo, so 'closed' is not a clean result, and a vague 'done' or 'kept' is not one.
+$script:DecisionResolvedOutcomes = @('merged', 'landed', 'shipped')
 # NO-REVIEW needs at least this many of the seat's decisions in the 14-day window to carry a
 # resolved outcome (Manager decision 2026-11-09, plan section 12).
 $script:DecisionResolvedFloor = 20
@@ -751,18 +752,25 @@ function Get-DecisionCalibration {
 # THE FAST-PATH ALLOWLIST, the one place it lives (Manager decision 2026-11-09, plan section 12).
 # A path the T1 fast path may touch matches one of these, and Get-DecisionClassCPath names nothing
 # about it. Anything else goes to review. Product code outside the security modules, and its tests:
-# keep it conservative, since a path added here skips review. The parser's hardening, XML, DICOM,
-# FHIR and decompression code is denied in Get-DecisionClassCPath, and so is every dot segment.
+# keep it conservative, since a path added here skips review. Every entry names files one by one,
+# so a file added later defaults to REVIEW until someone decides it belongs here. The parser's
+# message model (XXE hardening in message.py), validators, XML, DICOM, FHIR and decompression code
+# are not named, and Get-DecisionClassCPath denies them and every dot segment as well.
 $script:DecisionFastPathAllow = @(
-    '^messagefoundry/parsing/.+',
-    '^messagefoundry_toolkit/generators/.+',
+    # Not peek (input bounds), summary (PHI summary fields), split (ReDoS-pinned patterns),
+    # validate, tree, binary, groups, sniff or the X12 framing: each holds or is pinned as a control
+    # (Manager decision 2026-11-09). A parsing file joins only when a test pins nothing in it.
+    '^messagefoundry/parsing/consistency\.py$',
+    '^messagefoundry_toolkit/generators/(readme\.md|_core\.py|_hl7data\.py|(adt|all_types|bar|dft|documents|mdm|mfn|oml|orl|orm|oru|ras|rde|siu|vxu)\.py)$',
     '^messagefoundry_toolkit/hl7(schema|structures)\.py$',
-    '^samples/.+',
-    # Ordinary product pages, named one by one: a page carrying security, TLS, deployment or
+    # Synthetic sample messages only: sample config carries connection, TLS and credential settings.
+    '^samples/messages/[a-z0-9_.-]+\.hl7$',
+    # Ordinary product pages, named one by one: a page carrying security, PHI, TLS, deployment or
     # exposure prose is never here.
-    '^docs/(codesets|hl7-message-ordering-reference|hl7-validation|message-ordering-design|steps-palette|throughput)\.md$',
+    '^docs/(hl7-message-ordering-reference|message-ordering-design|steps-palette)\.md$',
     # Their tests, named one by one: a hardening, bounds, guard, transport or pipeline test is not.
-    '^tests/test_(binary_carriage|builtin_hl7_parity|generate_cli|generated_adt|generators_(choice|core|types)|hl7_core_features|hl7_raw_separators|hl7schema|hl7structures|message|message_(copy|split|timestamps|type_of)|parse_tree|parsing|samples_typed_steps|x12_parsing|x12_validate)\.py$'
+    # A test that pins a bound, a ReDoS pattern, PHI handling or entity hardening is not here.
+    '^tests/test_(builtin_hl7_parity|generate_cli|generated_adt|generators_(choice|core|types)|hl7schema|message|message_type_of)\.py$'
 )
 
 function Get-DecisionPathKey([string]$Path) {

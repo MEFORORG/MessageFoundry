@@ -38,18 +38,20 @@
         REVIEW     exit 11  take the adversarial-review path first.
         HALT       exit 12  do not act; defer. The cost rung is hit.
     The conditions NO-REVIEW needs are docs/AUTONOMY-PLAN.md R4 and section 12, stated there once;
-    this header does not restate them. What the gate itself reads, in order: the cost rung (plan
-    4.7); a seat docs/roles/seats.json resolves; that it runs in a checkout whose origin is
-    MEFORORG/MessageFoundry; the paths the act touches, which it derives itself from git (the
-    branch's diff against origin/main, the uncommitted and staged changes, and untracked files)
-    joined with any -Touches (relative paths, one per line: pwsh -File passes one string); that
-    every one of them is on the fast-path allowlist, _decisionlog.ps1 DecisionFastPathAllow, and
-    not refused by Get-DecisionClassCPath; the kill switch (afk-kill.ps1 -Status); the seat's
+    this header does not restate them. What the gate itself reads, in order: that -Seat agrees with
+    the seat this session declared, where it declared one; the cost rung (plan 4.7); a seat given;
+    that it runs in a checkout whose origin is MEFORORG/MessageFoundry; the paths the act touches,
+    which it derives itself from git (the branch's diff against refs/remotes/origin/main, the
+    working-tree and staged changes, and untracked files) joined with any -Touches (relative paths,
+    one per line: pwsh -File passes one string); that every one of them is on the fast-path
+    allowlist, _decisionlog.ps1 DecisionFastPathAllow, is not refused by Get-DecisionClassCPath, and
+    is not a link or under one; that docs/roles/seats.json resolves the seat; the kill switch (afk-kill.ps1 -Status); the seat's
     calibration (_decisionlog.ps1 Get-DecisionCalibration, the digest's own arithmetic); any
     reversal on the item; the reversal budgets (plan 4.5); and the chain (plan 4.6, below). A
     NO-REVIEW lists on stderr the conditions it did not check. The derived paths are the checkout's
-    state when the gate runs, not the act's: an act made afterwards, outside git, in an ignored file,
-    or in another checkout is not in them, so the session names in -Touches every path the act will
+    state when the gate runs, not the act's: an act made afterwards, outside git, in an ignored file
+    (an ignored path under .claude/ or any .env* is refused, as is a deleted test), or in another
+    checkout is not in them, so the session names in -Touches every path the act will
     change. -Json and the -Log record carry the paths the gate classified.
     IT FAILS CLOSED. No exit code but 10 is NO-REVIEW, so a crash (1), a usage error (2) or anything
     else reads as no permission. A read that fails, a seat that cannot be named, an empty or
@@ -340,14 +342,28 @@ function Test-DecisionEngineOrigin([string]$Top) {
     return ($u -match '^(https://|ssh://git@|git@)github\.com[/:]mefororg/messagefoundry$')
 }
 
+# The session-start hooks write these two ignored files into every worktree, so their presence is
+# not an act; any other ignored entry under .claude/, or any .env*, is refused.
+$IgnoredHookFiles = @('.claude/role.local.md', '.claude/seat.local.txt')
+
+function Test-DecisionIgnoredRefused([string]$Entry) {
+    $k = (Get-DecisionPathKey $Entry).Key
+    if ($IgnoredHookFiles -contains $k) { return $false }
+    $segs = @((Get-DecisionPathKey $Entry).Segments | ForEach-Object { $_.ToLowerInvariant() })
+    return ($segs -contains '.claude' -or @($segs | Where-Object { $_ -like '.env*' -or $_ -eq 'claude.local.md' }).Count -gt 0)
+}
+
 function Get-DecisionTouchedPaths([string]$Top) {
     <#
       The repository paths this checkout's act changes, from git: the branch's diff against
       origin/main, the uncommitted and staged changes against HEAD, and untracked files. Renames
-      list both sides. Error is set when any read fails, and the caller then treats the set as
-      unknown.
+      list both sides. Deleted holds the paths any of those reads shows deleted, and Ignored the
+      git-ignored entries (`git status --ignored`, a directory collapsed to one entry) that are
+      agent configuration or environment files: their edits are invisible to every other read.
+      Error is set when any read fails, and the caller then treats the set as unknown.
     #>
     $paths = [System.Collections.Generic.List[string]]::new()
+    $deleted = [System.Collections.Generic.List[string]]::new()
     # A file marked assume-unchanged or skip-worktree hides its edits from every read below.
     $flags = & git -C $Top ls-files -v 2>$null
     if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Paths = @(); Error = 'git ls-files -v failed' } }
@@ -355,17 +371,28 @@ function Get-DecisionTouchedPaths([string]$Top) {
     if ($hidden.Count) {
         return [pscustomobject]@{ Paths = @(); Error = "$($hidden.Count) file(s) are marked assume-unchanged or skip-worktree, so git may hide their edits" }
     }
+    # The full ref name: a tag or branch named origin/main would shadow the short form.
     $reads = @(
-        @('diff', '--name-only', '--no-renames', 'origin/main...HEAD'),
+        @('diff', '--name-only', '--no-renames', 'refs/remotes/origin/main...HEAD'),
         @('diff', '--name-only', '--no-renames', 'HEAD'),
+        @('diff', '--cached', '--name-only', '--no-renames', 'HEAD'),
         @('ls-files', '--others', '--exclude-standard')
     )
     foreach ($a in $reads) {
         $out = & git -C $Top -c core.quotepath=off @a 2>$null
         if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Paths = @(); Error = "git $($a -join ' ') failed" } }
         foreach ($l in @($out)) { if ([string]$l) { $paths.Add(([string]$l).Trim()) } }
+        if ($a[0] -eq 'diff') {
+            $gone = & git -C $Top -c core.quotepath=off @a --diff-filter=D 2>$null
+            if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Paths = @(); Error = "git $($a -join ' ') --diff-filter=D failed" } }
+            foreach ($l in @($gone)) { if ([string]$l) { $deleted.Add(([string]$l).Trim()) } }
+        }
     }
-    return [pscustomobject]@{ Paths = @($paths | Select-Object -Unique); Error = '' }
+    $ign = & git -C $Top -c core.quotepath=off status --porcelain --ignored=matching --untracked-files=all 2>$null
+    if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Paths = @(); Error = 'git status --ignored failed' } }
+    $ignored = @(@($ign) | Where-Object { ([string]$_).StartsWith('!! ') } | ForEach-Object { ([string]$_).Substring(3).Trim().Trim('"') } |
+            Where-Object { Test-DecisionIgnoredRefused $_ })
+    return [pscustomobject]@{ Paths = @($paths | Select-Object -Unique); Deleted = @($deleted | Select-Object -Unique); Ignored = $ignored; Error = '' }
 }
 
 function New-GateAnswer([string]$Result, $Why, $Paths = @()) {
@@ -383,8 +410,13 @@ function Invoke-DecisionGate {
     param([string]$Item, [string]$Seat, [string[]]$BuildsOn, [string]$UsageScript, [string]$ThresholdsFile, [switch]$Offline,
         [string]$ExcludeId = '', [string[]]$Touches = @(), [string]$RegistrySeat = '')
     $why = [System.Collections.Generic.List[string]]::new()
+    $paths = @()
     try {
-        if (Test-DecisionLanderSeat $Seat) {
+        # A -Seat the caller names must agree with the seat this session declared, where it declared
+        # one, or a session could borrow another seat's calibration, budget or Lander exemption. It
+        # is settled first, so a disagreeing seat still has the cost rung read.
+        $mismatch = $Seat -and $RegistrySeat -and (Get-DecisionSeatKey $RegistrySeat) -ne (Get-DecisionSeatKey $Seat)
+        if (-not $mismatch -and (Test-DecisionLanderSeat $Seat)) {
             $why.Add('cost rung: not read, because the Lander is exempt from the Steward''s states (korus roles/COMMON.md, The three usage states)')
         } else {
             $rung = Get-DecisionCostRung -UsageScript $UsageScript -ThresholdsFile $ThresholdsFile -TimeoutSeconds $UsageTimeoutSeconds
@@ -396,6 +428,10 @@ function Invoke-DecisionGate {
                 $why.Add('an UNKNOWN cost reading cannot show the rung is clear, so this goes to review, not to a halt')
                 return (New-GateAnswer 'REVIEW' $why)
             }
+        }
+        if ($mismatch) {
+            $why.Add("seat: -Seat '$Seat' is not the seat this session declared ('$RegistrySeat'), so whose calibration applies is unknown")
+            return (New-GateAnswer 'REVIEW' $why)
         }
         if (-not $Seat) {
             $why.Add('no seat was given or found in the seat registry, so its calibration and its reversal budget cannot be read')
@@ -425,19 +461,43 @@ function Invoke-DecisionGate {
             return (New-GateAnswer 'REVIEW' $why)
         }
         $paths = @(@($derived.Paths) + @($Touches) | Where-Object { $_ } | Select-Object -Unique)
+        # Deleting a test removes a pin, and an ignored agent or environment file hides its edit:
+        # neither is ever eligible (Manager decision 2026-11-09).
+        $gone = @(@($derived.Deleted) | Where-Object { (Get-DecisionPathKey $_).Key.StartsWith('tests/') })
+        if ($gone.Count -or @($derived.Ignored).Count) {
+            foreach ($g in $gone) { $why.Add("touches: '$g' is a deleted test, so the T1 fast path does not apply") }
+            foreach ($g in @($derived.Ignored)) { $why.Add("touches: '$g' is a git-ignored agent or environment path, whose edits git cannot show, so the T1 fast path does not apply") }
+            return (New-GateAnswer 'REVIEW' $why $paths)
+        }
         if (-not $paths.Count) {
             $why.Add('touches: git shows no changed path and no -Touches was given, and an act that changes no file has no git undo, so it has no fast path')
             return (New-GateAnswer 'REVIEW' $why)
         }
         $refused = @($paths | ForEach-Object { Get-DecisionFastPathRefusal $_ } | Where-Object { $_ })
+        # A link is classified by its name while a write lands on its target: a committed one (mode
+        # 120000, a plain file where core.symlinks is false) or one on disk, at the leaf or above it.
+        $links = & git -C $top ls-files -s 2>$null
+        if ($LASTEXITCODE -ne 0) { $refused += 'git ls-files -s failed, so a committed link cannot be ruled out' }
+        $linked = @(@($links) | Where-Object { [string]$_ -match '^120000 ' } | ForEach-Object { (([string]$_ -split "`t", 2)[1]).ToLowerInvariant() })
         foreach ($t in $paths) {
             $full = Join-Path $top $t
             # A directory in this checkout may hold any file, so it is not classified as one path.
-            if ([System.IO.Directory]::Exists($full)) { $refused += "'$t' is a directory in this checkout, so it cannot be classified; name the files" }
-            # A link is classified by its name while a write lands on its target.
-            elseif ([System.IO.File]::Exists($full) -and ([System.IO.File]::GetAttributes($full) -band [System.IO.FileAttributes]::ReparsePoint)) {
-                $refused += "'$t' is a symbolic link or reparse point, so its name does not say what it changes"
+            if ([System.IO.Directory]::Exists($full) -and -not (([System.IO.File]::GetAttributes($full)) -band [System.IO.FileAttributes]::ReparsePoint)) {
+                $refused += "'$t' is a directory in this checkout, so it cannot be classified; name the files"
+                continue
             }
+            $key = (Get-DecisionPathKey $t).Key
+            $segs = @((Get-DecisionPathKey $t).Segments)
+            $isLink = $false
+            for ($i = 1; $i -le $segs.Count; $i++) {
+                $sub = $segs[0..($i - 1)] -join '/'
+                $at = Join-Path $top $sub
+                if ($linked -contains $sub.ToLowerInvariant()) { $isLink = $true; break }
+                if (([System.IO.File]::Exists($at) -or [System.IO.Directory]::Exists($at)) -and
+                    ([System.IO.File]::GetAttributes($at) -band [System.IO.FileAttributes]::ReparsePoint)) { $isLink = $true; break }
+            }
+            if ($isLink) { $refused += "'$t' is, or is under, a symbolic link or reparse point, so its name does not say what it changes" }
+            elseif ($linked -contains $key) { $refused += "'$t' is a committed symbolic link" }
         }
         if ($refused.Count) {
             foreach ($c in $refused) { $why.Add("touches: $c, so the T1 fast path does not apply") }
@@ -445,20 +505,14 @@ function Invoke-DecisionGate {
         }
         $touched = $paths.Count
         $canon = Get-DecisionSeatKey $Seat
-        # A -Seat the caller names must agree with the seat this session declared, where it declared
-        # one, or a session could borrow another seat's calibration and budget.
-        if ($canon -and $RegistrySeat -and (Get-DecisionSeatKey $RegistrySeat) -ne $canon) {
-            $why.Add("seat: -Seat '$Seat' is not the seat this session declared ('$RegistrySeat'), so whose calibration applies is unknown")
-            return (New-GateAnswer 'REVIEW' $why $paths)
-        }
         if (-not $canon) {
             $why.Add("seat: '$Seat' is not a live seat or alias in docs/roles/seats.json, or that roster could not be read, so it cannot be held to a seat's calibration and budget")
-            return (New-GateAnswer 'REVIEW' $why)
+            return (New-GateAnswer 'REVIEW' $why $paths)
         }
         $kill = Get-DecisionKillSwitch
         if ($kill -ne 'OFF') {
             $why.Add("kill switch reads '$kill', so every class is in ask-mode (ADR 0211)")
-            return (New-GateAnswer 'REVIEW' $why)
+            return (New-GateAnswer 'REVIEW' $why $paths)
         }
         $now = [DateTime]::UtcNow
         $today = $now.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
@@ -529,13 +583,14 @@ function Invoke-DecisionGate {
                 'the live state the act rests on was read this turn',
                 'the act is not class C under plan R3 for a reason no path shows',
                 'every path the act will change is in the touched set, not only what git shows now',
+                'the act deletes or weakens no test',
                 "the seat is this session's own$(if (-not $RegistrySeat) { ', since no declared seat was found to compare' })")) {
             $why.Add("unchecked: $u; the session checks it before acting without review")
         }
         return (New-GateAnswer 'NO-REVIEW' $why $paths)
     } catch {
         $why.Add("the gate failed, so it fails closed: $($_.Exception.Message)")
-        return (New-GateAnswer 'REVIEW' $why)
+        return (New-GateAnswer 'REVIEW' $why $paths)
     }
 }
 
@@ -552,7 +607,9 @@ $Touches = @($Touches | ForEach-Object { $_ -split '\r?\n' } | ForEach-Object { 
 if ($Gate) {
     if (-not $Item) { [Console]::Error.WriteLine('decision.ps1: -Gate needs -Item, the item the act is on.'); exit 2 }
     if (-not $Session) { $Session = [string]$env:CLAUDE_CODE_SESSION_ID }
-    $declared = Resolve-SeatFromRegistry $Session
+    # The declared seat is this process's own session's, whatever -Session names.
+    $own = [string]$env:CLAUDE_CODE_SESSION_ID
+    $declared = Resolve-SeatFromRegistry $(if ($own) { $own } else { $Session })
     if (-not $Seat) { $Seat = $declared }
     $g = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript -ThresholdsFile $ThresholdsFile `
         -Touches $Touches -RegistrySeat $declared
@@ -601,7 +658,12 @@ if ($List) {
 
 # -Log. Refuse a record missing what its kind needs, before anything is written.
 if (-not $Session) { $Session = [string]$env:CLAUDE_CODE_SESSION_ID }
-$declaredSeat = Resolve-SeatFromRegistry $Session -Offline:$NoPost
+# Read only where it is needed: a seat to fill in, or a record the gate will judge.
+$declaredSeat = ''
+if (-not $Seat -or ($Kind -eq 'decision' -and $Class -eq 'B' -and $Reviewed -eq 'no')) {
+    $ownSid = [string]$env:CLAUDE_CODE_SESSION_ID
+    $declaredSeat = Resolve-SeatFromRegistry $(if ($ownSid) { $ownSid } else { $Session }) -Offline:$NoPost
+}
 if (-not $Seat) { $Seat = $declaredSeat }
 $missing = switch ($Kind) {
     'decision' { @(@{ Item = $Item; Class = $Class; Recommendation = $Recommendation; Seat = $Seat }.GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object Key) }
@@ -682,6 +744,10 @@ function Complete-Log([string]$How, [int]$Code) {
         if ($gateAnswer.Result -ne 'NO-REVIEW') {
             foreach ($w in $gateAnswer.Reasons) { [Console]::Error.WriteLine("decision.ps1: gate: $w") }
             exit $GateCodes[$gateAnswer.Result]
+        }
+        # NECESSARY, NOT SUFFICIENT: the conditions the gate could not see go out on this route too.
+        foreach ($w in @($gateAnswer.Reasons | Where-Object { ([string]$_).StartsWith('unchecked:') })) {
+            [Console]::Error.WriteLine("decision.ps1: gate: $w")
         }
     }
     exit $Code

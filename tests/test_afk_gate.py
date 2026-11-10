@@ -186,7 +186,7 @@ def _thresholds(sb: Sandbox) -> Path:
     return sb.state_path.parent / "thresholds.json"
 
 
-PLAIN = ("-Touches", "messagefoundry/parsing/peek.py")
+PLAIN = ("-Touches", "messagefoundry/parsing/consistency.py")
 
 
 def gate(
@@ -322,12 +322,11 @@ def test_an_act_that_names_nothing_it_touches_reviews(sb: Sandbox) -> None:
 @pytest.mark.parametrize(
     "path",
     [
-        "messagefoundry/parsing/peek.py",
-        "messagefoundry/parsing/split.py",
-        "samples/config/IB_DEMO_ORU_router.py",
+        "messagefoundry/parsing/consistency.py",
+        "samples/messages/adt_a01.hl7",
         "messagefoundry_toolkit/generators/adt.py",
-        "docs/CODESETS.md",
-        "tests/test_parsing.py",
+        "docs/STEPS-PALETTE.md",
+        "tests/test_message.py",
     ],
 )
 def test_a_path_on_the_allowlist_may_take_the_fast_path(sb: Sandbox, path: str) -> None:
@@ -555,6 +554,24 @@ def test_an_alias_shares_its_seats_calibration(sb: Sandbox) -> None:
         "samples/.github/workflows/x.yml",
         "docs/CONNECTIONS.md",
         "docs/USER-GUIDE.md",
+        "docs/HL7-VALIDATION.md",
+        "docs/CODESETS.md",
+        "docs/THROUGHPUT.md",
+        "messagefoundry/parsing/message.py",
+        "messagefoundry/parsing/validate.py",
+        "messagefoundry/parsing/x12/validate.py",
+        "messagefoundry/parsing/newcodec.py",
+        "samples/config/IB_DEMO_ORU_router.py",
+        "samples/config/connections.toml",
+        "messagefoundry_toolkit/generators/new.py",
+        "messagefoundry/parsing/peek.py",
+        "messagefoundry/parsing/summary.py",
+        "messagefoundry/parsing/split.py",
+        "messagefoundry/parsing/tree.py",
+        "messagefoundry/parsing/binary.py",
+        "messagefoundry/parsing/x12/delimiters.py",
+        "tests/test_parsing.py",
+        "tests/test_parse_tree.py",
     ],
 )
 def test_a_class_c_or_unclassifiable_path_reviews(sb: Sandbox, path: str) -> None:
@@ -693,11 +710,90 @@ def test_a_symbolic_link_reviews(sb: Sandbox) -> None:
 
 def test_the_json_answer_carries_the_paths_it_classified(sb: Sandbox) -> None:
     seed_vault(sb, calibrated("manager"))
-    (sb.repo / "samples").mkdir()
-    (sb.repo / "samples" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (sb.repo / "samples" / "messages").mkdir(parents=True)
+    (sb.repo / "samples" / "messages" / "a.hl7").write_text("MSH|^~\\&|\n", encoding="utf-8")
     code, doc = gate(sb)
     assert code == NO_REVIEW, why(doc)
-    assert sorted(doc["paths"]) == ["messagefoundry/parsing/peek.py", "samples/a.py"]
+    assert sorted(doc["paths"]) == [
+        "messagefoundry/parsing/consistency.py",
+        "samples/messages/a.hl7",
+    ]
+
+
+def test_a_deleted_test_reviews(sb: Sandbox) -> None:
+    (sb.repo / "tests").mkdir()
+    (sb.repo / "tests" / "test_message.py").write_text("x = 1\n", encoding="utf-8")
+    resync(sb)
+    seed_vault(sb, calibrated("manager"))
+    (sb.repo / "tests" / "test_message.py").unlink()
+    code, doc = gate(sb)
+    assert code == REVIEW and "is a deleted test" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize(
+    "ignored", [".claude/settings.local.json", ".env", "samples/messages/.env.local"]
+)
+def test_an_ignored_agent_or_environment_file_reviews(sb: Sandbox, ignored: str) -> None:
+    (sb.repo / ".gitignore").write_text(f"{ignored}\n", encoding="utf-8")
+    resync(sb)
+    seed_vault(sb, calibrated("manager"))
+    target = sb.repo / ignored
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("x\n", encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == REVIEW and "git-ignored agent or environment path" in why(doc), why(doc)
+
+
+def test_the_hook_written_seat_files_do_not_close_the_path(sb: Sandbox) -> None:
+    """The session-start hooks write these into every worktree, so their presence is not an act."""
+    (sb.repo / ".gitignore").write_text(
+        ".claude/seat.local.txt\n.claude/ROLE.local.md\n", encoding="utf-8"
+    )
+    resync(sb)
+    seed_vault(sb, calibrated("manager"))
+    (sb.repo / ".claude").mkdir()
+    (sb.repo / ".claude" / "seat.local.txt").write_text("manager\n", encoding="utf-8")
+    (sb.repo / ".claude" / "ROLE.local.md").write_text("x\n", encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == NO_REVIEW, why(doc)
+
+
+def test_a_staged_change_the_working_tree_undid_is_read(sb: Sandbox) -> None:
+    """git commit lands the index, so a staged edit counts even when the file on disk matches HEAD."""
+    seed_vault(sb, calibrated("manager"))
+    seats = sb.repo / "docs" / "roles" / "seats.json"
+    before = seats.read_bytes()
+    seats.write_bytes(before + b"\n")
+    git(sb.repo, "add", "docs/roles/seats.json")
+    seats.write_bytes(before)
+    code, doc = gate(sb)
+    assert code == REVIEW and "docs/roles/seats.json" in why(doc), why(doc)
+
+
+def test_a_local_ref_named_origin_main_does_not_hide_the_branch(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    (sb.repo / "CLAUDE.md").write_text("x\n", encoding="utf-8")
+    git(sb.repo, "add", "-A")
+    git(sb.repo, "commit", "-q", "-m", "branch work")
+    git(sb.repo, "tag", "origin/main", "HEAD")
+    code, doc = gate(sb)
+    assert code == REVIEW and "touches: 'CLAUDE.md'" in why(doc), why(doc)
+
+
+def test_a_path_under_a_committed_link_reviews(sb: Sandbox) -> None:
+    """With core.symlinks false a committed link checks out as a plain file, so git's mode decides."""
+    seed_vault(sb, calibrated("manager"))
+    blob = subprocess.run(
+        ["git", "-C", str(sb.repo), "hash-object", "-w", "--stdin"],
+        input="../../scripts/coord/decision.ps1",
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    ).stdout.strip()
+    git(sb.repo, "update-index", "--add", "--cacheinfo", f"120000,{blob},samples/messages/l.hl7")
+    code, doc = gate(sb)
+    assert code == REVIEW and "symbolic link" in why(doc), why(doc)
 
 
 def test_a_signal_is_read_whatever_its_case(sb: Sandbox) -> None:
