@@ -203,12 +203,10 @@ HL7-VALIDATION.md lists what that covers. It does not check field content.
   subcomponents (`_split_reps`, same module).
 - When your code reads a value, `unescape` decodes it. `\F\`, `\S\`, `\R\`, `\T\` and `\E\` become
   the message's own delimiters, and `\Xhh\` is read as hex. A sequence it cannot map is dropped from
-  the value, not refused. An escape character that nothing closes is kept as data.
-- Inside a field, ingress does not check at least that the separators differ from each other, that
-  an escape sequence is known, or how many components a field holds.
+  the value, not refused.
+- Inside a field, ingress does not check that an escape sequence is known.
 
-**The engine defines no rule for what a field's value means.** A date, a code, an identifier or a
-name inside a field is not checked at ingress, at either tier. Checking it is the job of your Router
+**The engine defines no rule for what a field's value means.** Checking it is the job of your Router
 or Handler. Two tools exist for that:
 
 - the consistency primitives in
@@ -286,13 +284,13 @@ need and the engine does not enforce is written in your Handler, as
 
 | Payload | Rules the engine checks over two or more items | Where |
 |---|---|---|
-| HL7 v2 | At ingress, only on a streaming inbound that detaches a document: the detach refuses a body whose `MSH-1` or `MSH-2` holds a base64 character, and an `OBX-5.5` Base64 document that holds an escape sequence. The opt-in primitives `same_across` and `dates_in_order` compare fields and return the violations; they refuse nothing. HL7-VALIDATION.md, Tier 3, describes them. `extract_obx_document` reads an embedded document only when `OBX-2` is `ED` and `OBX-5.4` is `Base64`. | `iter_obx_documents` and `parsing/consistency.py`; `parsing/binary.py` |
+| HL7 v2 | The opt-in primitives `same_across` and `dates_in_order` compare fields and return the violations; they refuse nothing. HL7-VALIDATION.md, Tier 3, describes them. `extract_obx_document` reads an embedded document only when `OBX-2` is `ED` and `OBX-5.4` is `Base64`. | `parsing/consistency.py`; `parsing/binary.py` |
 | `json` | None. | |
 | `text` | None. | |
 | `binary` | None. | |
 | `xml` | None of its own. An XML Schema you supply may define some. | `validate_against` in `parsing/xml/schema.py` |
 | `x12` | `check_integrity` compares the envelope with itself: `ISA13` with `IEA02`, `IEA01` with the number of groups, `GS06` with `GE02`, `GE01` with the number of sets in the group, `ST02` with `SE02`, and `SE01` with the number of segments in the set. The engine applies no rule of its own inside a transaction set. The implementation-guide check in `validate` applies the guide's rules. | `parsing/x12/interchange.py`; `parsing/x12/validate.py` |
-| `fhir`, inbound | `FhirPeek` refuses a JSON object that repeats a key. `FhirResource.parse` applies the resource model. | `parsing/fhir/peek.py`; `parsing/fhir/resource.py` |
+| `fhir`, inbound | `FhirPeek` refuses a JSON object that repeats a key. | `parsing/fhir/peek.py` |
 | `fhir`, outbound `transaction` or `batch` Bundle | At least these, enforced before the engine sends the Bundle: no JSON object repeats a key; each entry's `request.url` has the form its `request.method` needs; and a `POST` or `PUT` entry's resource has the resource type its URL names. The screen also compares the Bundle with the connection's own settings. [CONNECTIONS.md](CONNECTIONS.md), section "A Bundle connection screens every entry", lists the screen's rules. | `_bundle_refusal` and `_entry_refusal` in `transports/fhir.py` |
 | `dicom` | None. In particular, the C-STORE receiver does not compare the request's SOP class or instance with the dataset's own `SOPClassUID` or `SOPInstanceUID`, and does not refuse an object where they differ. | `DicomScpSource._on_c_store` in `transports/dicom.py` |
 
