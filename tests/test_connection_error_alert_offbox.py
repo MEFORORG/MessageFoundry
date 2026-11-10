@@ -120,6 +120,21 @@ def test_a_class_name_that_is_not_a_str_is_a_fixed_token() -> None:
     assert shown_error_class(weird) == "unnamed error"
 
 
+async def test_a_non_str_class_name_still_raises_the_alert_and_its_record() -> None:
+    transport = _RecordingTransport()
+    store = _RecordingStore()
+    sink = NotifierAlertSink([transport], store=store)
+    weird: Any = 5
+    sink.connection_error("OB_FAKE", kind="connection_lost", detail=_DETAIL, error_class=weird)
+    sink.start()
+    await asyncio.sleep(0)
+    await sink.aclose()
+    await sink.drain_state(1.0)
+
+    assert [e["error_class"] for e in transport.events] == ["unnamed error"]
+    assert [u["reason"] for u in store.upserts] == [_DETAIL]
+
+
 class _RecordingTransport:
     name = "custom"
 

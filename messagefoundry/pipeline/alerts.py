@@ -41,6 +41,7 @@ __all__ = [
     "intake_pause_detail",
     "remote_debug_refused_detail",
     "sandbox_worker_refused_detail",
+    "shown_error_class",
     "store_restored_detail",
     "utc_or_unknown",
 ]

@@ -185,8 +185,8 @@ async def test_rest_over_length_message_header_is_a_permanent_nak() -> None:
 async def test_the_message_header_arm_never_names_the_header() -> None:
     """PHI egress. At construction a header name is operator-static, so naming it is safe. At send
     time `outbound_headers_from_metadata` derives it from a message-metadata key suffix, and this
-    string reaches `last_error`, `message_events.detail` and — on the DeliveryError arm — the webhook
-    AlertSink, i.e. OFF-BOX. Only the class and the length may leave.
+    string reaches `last_error`, `message_events.detail` and — on the DeliveryError arm — the stored,
+    revealable alert reason. Only the class and the length may appear there.
 
     Mutation: put `violation.name` back in the message-derived branch. Red: the `not in` below."""
     dest = _dest()
@@ -728,7 +728,7 @@ def test_the_encoding_refusal_names_neither_the_value_nor_the_header() -> None:
     time the NAME is a metadata key suffix that `_HEADER_NAME_TOKEN` bounds by CHARSET, not content --
     so `X-Patient-MRN-12345` is a well-formed token. This string reaches `last_error`,
     `message_events.detail` and, on a DeliveryError arm, the stored alert reason. Only the
-    codec and an index may leave, exactly as `test_the_message_header_arm_never_names_the_header`
+    codec and an index may appear there, exactly as `test_the_message_header_arm_never_names_the_header`
     already requires of the over-length arm.
 
     Mutation: interpolate `name` (or the value) into the message. Red: the assertions below."""

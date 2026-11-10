@@ -1760,8 +1760,8 @@ def enforce_send_time_length_limits(
     metadata key suffix (``_HEADER_NAME_TOKEN`` bounds the charset, not the content). This message
     travels through ``safe_exc`` into ``last_error`` and ``message_events.detail``, and on the
     ``DeliveryError`` arm through ``_note_lane_unhealthy`` → ``connection_error`` into the stored
-    alert reason, which an operator can reveal. ``redaction.py`` concedes single-token identifiers are its
-    acknowledged residual, so only the class and the length may leave.
+    alert reason, which an operator can reveal. ``redaction.py`` concedes single-token
+    identifiers are its acknowledged residual, so only the class and the length may appear there.
     """
     violation = find_outbound_length_violation(url, headers)
     if violation is None:
