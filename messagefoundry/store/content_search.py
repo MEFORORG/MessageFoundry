@@ -75,12 +75,23 @@ class SearchSpec:
 def newest_first(rows: Iterable[Any]) -> list[Any]:
     """Order fetched candidates newest-first, as the scan walks them. Done here rather than by an
     outer SQL ``ORDER BY``, which would make the database sort the rows with their bodies (and may
-    spill them to temp files) when the rows are already in memory (BACKLOG #2068)."""
+    spill them to temp files) when the rows are already in memory (BACKLOG #2068).
+
+    Equal timestamps tie-break on ``id`` in code-point order. That agrees with each backend's
+    ``ORDER BY received_at DESC, id DESC`` under a binary, a case-insensitive or a default
+    linguistic collation, because every message id is 32 lowercase hex characters (``uuid4().hex``
+    or a truncated SHA-256 hex digest), which sort alike under each of those. A collation with
+    numeric ordering would not agree (BACKLOG #6699)."""
     return sorted(rows, key=lambda r: (r["received_at"], r["id"]), reverse=True)
 
 
 class ContentSearchError(ValueError):
     """A malformed content-search request (empty needle, both/neither needle kinds, bad field path)."""
+
+
+def _sent(value: str | None) -> str | None:
+    """``value`` unchanged, or ``None`` when it is empty or only whitespace (counts as not sent)."""
+    return value if value and not value.isspace() else None
 
 
 def make_spec(
@@ -91,30 +102,38 @@ def make_spec(
     target: SearchTarget = SearchTarget.BOTH,
     scan_limit: int = DEFAULT_SCAN_LIMIT,
 ) -> SearchSpec:
-    """Validate + normalize a content-search request into a :class:`SearchSpec`.
+    """Validate a content-search request into a :class:`SearchSpec`.
 
     Raises :class:`ContentSearchError` on an empty needle, supplying both a substring and a field path,
-    or a malformed HL7 field path. ``scan_limit`` is clamped into ``[1, MAX_SCAN_LIMIT]``."""
-    has_content = bool(content and content.strip())
-    has_field = bool(field_path and field_path.strip())
-    if has_content == has_field:
+    a ``field_value`` beside a substring (it would otherwise be dropped unread), a malformed HL7 field
+    path, or a ``scan_limit`` that is not an ``int`` (a ``bool`` is refused too). A value of only
+    whitespace counts as not sent; any other needle is kept exactly as given, because leading or
+    trailing spaces narrow a contains-match. ``scan_limit`` is clamped into ``[1, MAX_SCAN_LIMIT]``."""
+    if isinstance(scan_limit, bool) or not isinstance(scan_limit, int):
+        raise ContentSearchError(f"scan_limit must be an integer, not {type(scan_limit).__name__}")
+    limit = max(1, min(scan_limit, MAX_SCAN_LIMIT))
+    needle = _sent(content)
+    path = field_path.strip() if field_path else ""  # a locator, not a needle: padding is noise
+    fv = _sent(field_value)
+    if (needle is None) == (not path):
         raise ContentSearchError("provide exactly one of a content substring or an HL7 field path")
-    limit = max(1, min(int(scan_limit), MAX_SCAN_LIMIT))
-    if has_content:
+    if needle is not None:
+        if fv is not None:
+            raise ContentSearchError(
+                "field_value applies only to an HL7 field path, not to content"
+            )
         return SearchSpec(
-            substring=content.strip(),  # type: ignore[union-attr]
+            substring=needle,
             field_path=None,
             field_value=None,
             target=target,
             scan_limit=limit,
         )
     # Field-path needle — validate the path eagerly so a bad path is a 4xx, not a per-row failure.
-    path = field_path.strip()  # type: ignore[union-attr]
     try:
         parse_path(path)
     except HL7PeekError as exc:
         raise ContentSearchError(str(exc)) from exc
-    fv = field_value.strip() if field_value and field_value.strip() else None
     return SearchSpec(
         substring=None,
         field_path=path,
