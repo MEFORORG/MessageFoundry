@@ -467,6 +467,68 @@ def test_a_root_gone_at_the_first_lock_check_is_root_missing(
     assert (result.skipped, result.body_lost, reads) == (0, 0, [])
 
 
+def _root_gone_answers(monkeypatch: pytest.MonkeyPatch, *answers: bool) -> list[bool]:
+    """``_root_gone`` answers ``answers`` in turn, then the last one, as a root that went or came
+    back between two looks would; returns the answers it gave."""
+    given: list[bool] = []
+
+    def _gone(exc: OSError, root: Path) -> bool:
+        given.append(answers[min(len(given), len(answers) - 1)])
+        return given[-1]
+
+    monkeypatch.setattr(uploads_mod, "_root_gone", _gone)
+    return given
+
+
+@pytest.mark.parametrize("first", [True, False], ids=["logged-gone", "logged-refused"])
+def test_the_first_check_acts_on_the_failure_the_lock_logged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    first: bool,
+) -> None:
+    """``ENOENT`` at the first check is classified once. A root that comes back (or goes) after
+    that look does not turn the logged "directory is gone" into a refusal, or the logged refusal
+    into a missing root."""
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    fids = [_seed(root, old), _seed(root, old)]
+    monkeypatch.setattr(uploads_mod, "edit_lock", _dangling)
+    given = _root_gone_answers(monkeypatch, first, not first)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert given == [first], given
+    assert ("its directory is gone" in caplog.text) is first, caplog.text
+    assert ("Run rotate-key as the account" in caplog.text) is not first, caplog.text
+    assert result.root_missing is first
+    assert result.skipped == (0 if first else len(fids)) and result.incomplete
+
+
+@pytest.mark.parametrize("first", [True, False], ids=["logged-gone", "logged-refused"])
+def test_a_half_write_acts_on_the_failure_the_lock_logged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    first: bool,
+) -> None:
+    """The first check takes the lock; a half's write gets ``ENOENT`` at the lock's open. The
+    half's warning gives the cause ``_pair_lock`` logged, whatever a second look would say."""
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    fid = _seed(root, old)
+    _busy_at(monkeypatch, names=lambda name: name != LOCK_FILE_NAME, fail=_dangling)
+    given = _root_gone_answers(monkeypatch, first, not first)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert result.skipped == 1 and result.incomplete
+    assert given[0] is first
+    half = [
+        r.getMessage() for r in caplog.records if f"uploaded file {fid} (body)" in r.getMessage()
+    ]
+    assert len(half) == 1, caplog.text
+    assert half[0].endswith("the uploads directory is gone") is first, half
+
+
 def test_a_lock_path_missing_under_a_root_still_there_is_a_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -2174,8 +2174,8 @@ class UploadStore:
                 # nothing is written; a half already under the active key needs none, and is not one.
                 with _pair_lock(self._root / LOCK_FILE_NAME, for_reseal=True):
                     pass
-            except OSError as exc:
-                blocked = _pair_lock_failure(exc, self._root)
+            except _PairLockFailed as failed:
+                blocked = failed.kind
                 if blocked == "gone":
                     # The root went after the listing: the BACKLOG #4940 outcome, not N lost bodies.
                     return ResealResult(root_missing=True)
@@ -2387,8 +2387,15 @@ class UploadStore:
                 changed,
             )
             return _Half.SKIPPED
-        except OSError as exc:
-            if _root_gone(exc, self._root):
+        except (_PairLockFailed, OSError) as exc:
+            # The lock's failure is read as _pair_lock logged it, never classified again: a root
+            # that came back in between would make the two disagree.
+            if isinstance(exc, _PairLockFailed):
+                gone = exc.kind == "gone"
+                exc = exc.cause
+            else:
+                gone = _root_gone(exc, self._root)
+            if gone:
                 # The target's own absence is _ChangedUnderReseal. Its error would name the lock
                 # file when the root went before the lock's open, so this half's warning does not
                 # give it as the cause.
@@ -3318,6 +3325,18 @@ def _pair_lock_failure(exc: OSError, root: Path) -> _PairLockFailure:
     return "failed"
 
 
+class _PairLockFailed(Exception):
+    """What :func:`_pair_lock` raises for the re-seal when it cannot take the lock: ``kind`` is the
+    failure it classified and logged, and ``cause`` is the error. The caller reads ``kind`` rather
+    than classifying ``cause`` again, since a root that went or came back in between would make the
+    two disagree."""
+
+    def __init__(self, kind: _PairLockFailure, cause: OSError) -> None:
+        super().__init__(kind)
+        self.kind: _PairLockFailure = kind
+        self.cause = cause
+
+
 #: What a busy pair lock tells the ``rotate-key`` operator to do.
 _RERUN_WHEN_FREE = "re-run rotate-key once whatever holds the lock releases it"
 
@@ -3366,8 +3385,9 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
     Nor is an OS timeout, which is logged at WARNING each time as a timeout, nor any other error
     that is not a refusal, which is logged at WARNING each time, naming the error
     (:func:`_pair_lock_failure`).
-    **The re-seal fails closed (``for_reseal``):** a lock it cannot take is logged and raised. At
-    the pass's first check that stops every write; at a half's write, that half is a skip."""
+    **The re-seal fails closed (``for_reseal``):** a lock it cannot take is logged and raised as
+    :class:`_PairLockFailed`, carrying the failure it was logged as. At the pass's first check that
+    stops every write; at a half's write, that half is a skip."""
     with contextlib.ExitStack() as held:
         try:
             held.enter_context(
@@ -3429,7 +3449,7 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
                     codec_safe_str(exc),
                 )
             if for_reseal:
-                raise
+                raise _PairLockFailed(failure, exc) from exc
         else:
             if _unlocked_logged:
                 with _unlocked_logged_lock:
