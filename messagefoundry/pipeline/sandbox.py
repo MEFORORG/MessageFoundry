@@ -1379,7 +1379,7 @@ class SandboxSession:
         worker is checked the same way, the one spawned after a leftover EOF included, and a second
         stray frame raises, so the retry happens at most once per dispatch. The spawns are bounded
         too: a worker that keeps exiting, or closing its pipe, before its request fails the call.
-        ADR 0187 *Amendment B* states when such a message's call fails.
+        ADR 0187 *Amendment B* lists at least the cases in which such a message's call fails.
 
         A worker spawned here and found exited by this check is recorded as
         :attr:`KillCause.EXITED_AFTER_BOOT`, whether or not its EOF has reached the queue: the
@@ -1735,7 +1735,7 @@ class SandboxSession:
         a plain, still-alive worker survives a *denied* call so the next message reuses it. The one
         thing it does **not** survive is writing a frame nobody asked for
         (see :meth:`_reject_unsolicited`) — that is a lost worker, and a failed call when the
-        frame follows its answer; one waiting before the request is retried once instead."""
+        frame is found after its answer; one waiting before the request is retried once instead."""
         with self._lock:
             if self._closed:
                 raise SandboxSessionClosed("sandbox session is closed")
