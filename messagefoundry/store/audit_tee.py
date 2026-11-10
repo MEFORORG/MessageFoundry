@@ -111,8 +111,11 @@ _C0_ESCAPE = re.compile(r"\\(?:[btnfr]|u00[01][0-9a-fA-F])")
 #: The C0 controls Python's ``\s`` does not match: all but tab, LF, VT, FF, CR and U+001C to
 #: U+001F.
 _NONSPACE_C0 = re.compile(r"[\x00-\x08\x0e-\x1b]")
-#: A JSON escape on the tee line, its backslash itself escaped any number of times.
-_LINE_ESCAPE = re.compile(r"\\+(?:u[0-9a-fA-F]{4}|[^\\])")
+#: A JSON escape on the tee line, its backslash itself escaped any number of times. LINEAR: a
+#: match starts only at the first backslash of a run and takes the run possessively, so a long
+#: run, at the end of the text above all, is walked once, not once per backslash in it. The
+#: unanchored ``\\+`` form was quadratic there.
+_LINE_ESCAPE = re.compile(r"(?<!\\)\\++(?:u[0-9a-fA-F]{4}|[^\\]|\Z)")
 #: The two placeholders the passes write, which are not text of the value.
 _PLACEHOLDERS = re.compile(re.escape(_FIELD_REDACTED) + "|" + re.escape(CREDENTIAL_PLACEHOLDER))
 #: A run of letters or digits: a word, for the check in :func:`_scrub_field`.
@@ -197,11 +200,17 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
     also fires where a removed control glues a kept word to a redacted one, so it can cost a
     field that hid nothing more.
 
-    Otherwise the plain result ships, or the value itself where the plain result changed
-    nothing, but only if it hides every word the handler chain alone hides over the value as
-    the line carries it, encoded. The plain pass can read a span differently from that chain, as
-    a name run that takes a ``Bearer`` label with it and leaves the token, and where it does the
-    whole field ships as :data:`_FIELD_REDACTED` instead.
+    Otherwise, where the plain result changed nothing, the value itself ships, so its line is the
+    line before this scrub and the handler chain treats it as it did. Where the plain result
+    changed something, it ships only if it hides every word the handler chain alone hides over the
+    value as the line carries it, encoded. The plain pass can read a span differently from that
+    chain, as a name run that takes a ``Bearer`` label with it and leaves the token, and where it
+    does the whole field ships as :data:`_FIELD_REDACTED` instead.
+
+    So, at least, the whole field ships as :data:`_FIELD_REDACTED` where a reading found more,
+    where the plain result shows a word the chain alone hides, and on a fault; a JSON ``detail``
+    ships as the JSON string ``"[redacted]"`` in those cases and where the passes leave it
+    unparseable.
 
     With ``detail``, where the value parses as JSON and holds no raw control, which is how most
     writers hand ``detail`` over, each JSON escape that spells a C0 control is decoded to the
@@ -211,6 +220,7 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
     :func:`emit_audit_tee` states what this covers and what it leaves."""
     if value is None:
         return None
+    as_json = False
     try:
         probe = clamp_untrusted(value)
         if probe is not value:  # the cut appends its note after a newline of its own
@@ -262,7 +272,7 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
                 "faults in this process are not logged",
                 type(exc).__name__,
             )
-        return _FIELD_REDACTED
+        return json.dumps(_FIELD_REDACTED) if as_json else _FIELD_REDACTED
 
 
 def emit_audit_tee(
@@ -374,6 +384,10 @@ def emit_audit_tee(
     * Where a reading finds more than the plain passes, the whole field ships as ``[redacted]``, so
       that record loses its ``actor`` or its ``detail``. A typed sign-in name of ``CORP`` and
       ``JONES`` joined by a control is one: it reads as the two-word name the patterns redact.
+      A client can use this on purpose: a failed sign-in sets ``actor`` to the typed name, so a
+      client that types a control beside a name- or credential-shaped word makes its own typed
+      name ship as ``[redacted]`` in the off-box copy, and that copy then holds no typed name to
+      attribute the attempt by. The ``client`` address and the rest of the record still ship.
       ``detail`` is scrubbed before ``safe_text`` bounds it, so that holds for a control
       anywhere in the scanned window, even in text past the 200 characters that would ship.
     * The comparisons that decide it count words, runs of letters and digits, so a redaction that

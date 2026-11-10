@@ -795,6 +795,45 @@ def test_text_that_needs_two_controls_read_differently_is_redacted() -> None:
         raise _MixedReadingLeak(ascii(value))
 
 
+def test_a_long_backslash_run_is_scanned_in_linear_time() -> None:
+    """Review round 3: the line-escape pattern backtracked quadratically on a run of backslashes
+    at the end of its input, which ``json.dumps(...)[1:-1]`` always gives a field ending in one,
+    on the event loop. The control is the old pattern, slow on a run the new one walks at once."""
+    import time
+
+    old = re.compile(r"\\+(?:u[0-9a-fA-F]{4}|[^\\])")
+    run = "x " + "\\" * 3000
+
+    def took(fn) -> float:
+        start = time.perf_counter()
+        fn()
+        return time.perf_counter() - start
+
+    old_t = took(lambda: old.sub(" ", run))
+    new_t = took(lambda: audit_tee._LINE_ESCAPE.sub(" ", run))
+    assert old_t > 20 * new_t, (old_t, new_t)
+    # The field scrub as a whole, on a field near the window that ends in a long run.
+    value = f"password=hunter2{chr(0x01)} " + "\\" * 60000
+    assert took(lambda: audit_tee._scrub_field(value)) < 1.0
+    assert "hunter2" not in audit_tee._scrub_field(value)
+
+
+def test_the_line_escape_pattern_still_reads_each_escape_as_a_break() -> None:
+    line = 'a\\nb \\\\u0001c \\"d e\\\\'
+    assert audit_tee._LINE_ESCAPE.sub(" ", line).split() == ["a", "b", "c", "d", "e"]
+
+
+def test_a_fault_on_a_json_detail_ships_a_json_string(monkeypatch) -> None:
+    """Review round 3: every other whole-field path for a JSON detail ships the JSON string."""
+
+    def boom(_text: str) -> str:
+        raise RuntimeError("synthetic")
+
+    monkeypatch.setattr(audit_tee, "scrub_log_text", boom)
+    out = audit_tee._scrub_field(json.dumps({"error": "a\nb"}), detail=True)
+    assert json.loads(out) == "[redacted]"
+
+
 def test_a_control_with_nothing_to_redact_keeps_the_actor() -> None:
     """Attribution survives: a typed name holding a control, with nothing a reading redacts, ships
     as typed, and the handler chain escapes the control. Synthetic values."""
