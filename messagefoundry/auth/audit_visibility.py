@@ -76,6 +76,7 @@ from typing import Final
 
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
+from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.store.audit_exclusion import AuditExclusion
 
 __all__ = [
@@ -94,6 +95,7 @@ __all__ = [
     "LOGIN_LOCKED_ACTION",
     "audit_detail_for",
     "audit_exclusion_for",
+    "narrows_scope_rows_for",
     "is_audit_copy_line",
     "reads_audit_copies_in_the_log",
     "withholds_rows_from",
@@ -161,22 +163,22 @@ _SHOWN_KEYS: Final = ("user_id",)
 CHANNELS_WITHHELD: Final = "withheld"
 
 
+def narrows_scope_rows_for(identity: Identity) -> bool:
+    """Whether ``identity`` reads :data:`CHANNEL_LIST_ACTIONS` rows with their lists withheld:
+    every reader without ``users:manage``, the permission ``GET /users`` shows a scope to."""
+    return not identity.has(Permission.USERS_MANAGE)
+
+
 def audit_detail_for(identity: Identity, action: str, detail: str | None) -> str | None:
-    """``detail`` as ``identity`` may read it. For a reader without ``users:manage``, a
-    :data:`CHANNEL_LIST_ACTIONS` row reads as its :data:`_SHOWN_KEYS` and ``"channels"`` set to
-    :data:`CHANNELS_WITHHELD`, whatever else it held. So every such row has one shape, and a
+    """``detail`` as ``identity`` may read it. For a reader :func:`narrows_scope_rows_for`
+    names, a :data:`CHANNEL_LIST_ACTIONS` row reads as its :data:`_SHOWN_KEYS` and ``"channels"``
+    set to :data:`CHANNELS_WITHHELD`, whatever else it held. So every such row has one shape, and a
     withdrawn scope, which adds a ``withdrawn`` key, cannot be told from a set one. A detail that
-    is not a JSON object reads the same way, with no shown keys. Every other row is unchanged."""
-    if (
-        action not in CHANNEL_LIST_ACTIONS
-        or detail is None
-        or audit_exclusion_for(identity) is None
-    ):
+    is not a JSON object, or that does not parse, depth limit included, reads the same way, with no
+    shown keys. Every other row is unchanged."""
+    if action not in CHANNEL_LIST_ACTIONS or detail is None or not narrows_scope_rows_for(identity):
         return detail
-    try:
-        parsed = json.loads(detail)
-    except ValueError:
-        parsed = None
+    parsed, _refusal = json_loads_or_refusal(detail)
     shown = (
         {key: parsed[key] for key in _SHOWN_KEYS if key in parsed}
         if isinstance(parsed, dict)

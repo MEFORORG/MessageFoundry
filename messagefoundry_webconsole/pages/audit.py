@@ -34,8 +34,9 @@ def _ts(ts: float) -> str:
 #: of row and never a row or a count: ``AuditList.withheld`` is decided by permission alone, so this
 #: sentence appears whether or not a hidden row falls in range, and cannot say a lock happened.
 WITHHELD_NOTE = (
-    "Your permissions leave account-lock entries out of this list, its count and the export. "
-    "A user with users:manage sees them."
+    "Your permissions leave account-lock entries out of this list, its count and the export, "
+    "and show each channel scope change with its channels withheld. A user with users:manage "
+    "sees them."
 )
 
 

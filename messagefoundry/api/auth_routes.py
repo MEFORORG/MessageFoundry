@@ -17,7 +17,6 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Sequence
-from functools import partial
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -126,8 +125,10 @@ from messagefoundry.auth import (
 )
 from messagefoundry.auth.audit_visibility import (
     AUDIT_WITHHELD_HEADER,
+    CHANNEL_LIST_ACTIONS,
     audit_detail_for,
     audit_exclusion_for,
+    narrows_scope_rows_for,
     withholds_rows_from,
 )
 from messagefoundry.auth.ldap import LdapError, canonical_group_dn
@@ -480,6 +481,29 @@ def _user_summary(
         channel_scope_withheld=not show_scope,
         credential_expires_at=credential_expires_at,
         lock_state=None if lock_state_at is None else _lock_state(user, lock_state_at),
+    )
+
+
+def _console_user_summary(
+    user: UserRecord,
+    role_ids: list[str],
+    *,
+    show_scope: bool,
+    credential_expires_at: float | None = None,
+    lock_state_at: float | None = None,
+) -> UserSummary:
+    """:func:`_user_summary` as the console seam hands it on, with ``show_scope`` REQUIRED (vault
+    BACKLOG #3748 item 5). Each console page decides, and one that forgets raises rather than
+    discloses. A console from before the engine's default flipped calls without it, and the seam
+    digest records no parameter, so that console still mounts: its users:manage page then fails
+    loudly, where a withholding default would read a real scope as deny-all and offer to save that
+    over it."""
+    return _user_summary(
+        user,
+        role_ids,
+        credential_expires_at=credential_expires_at,
+        lock_state_at=lock_state_at,
+        show_scope=show_scope,
     )
 
 
@@ -2182,7 +2206,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         across all three backends (BACKLOG #170) -- never string-interpolated into the query.
 
         Each row's ``detail`` is the one ``identity`` may read (:func:`audit_detail_for`), so a
-        scope change's channel list is withheld here for every caller too (vault BACKLOG #3748)."""
+        scope change's channel list is withheld here, for every caller without ``users:manage``,
+        on all three reads (vault BACKLOG #3748)."""
         rows = await service.store.list_audit(
             limit=limit,
             actor=actor,
@@ -2193,8 +2218,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             before_id=before_id,
             offset=offset,
         )
+        if not narrows_scope_rows_for(identity):
+            return rows
         return [
             {**row, "detail": audit_detail_for(identity, row["action"], row["detail"])}
+            if row["action"] in CHANNEL_LIST_ACTIONS
+            else row
             for row in rows
         ]
 
@@ -2588,12 +2617,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         list_audit=_audit_ui_list,
         export_audit=export_audit,
         my_security_events=my_security_events,
-        # The console calls this only on its users:manage pages. The seam keeps the disclosing
-        # default those calls were written against (vault BACKLOG #3748 item 5): the seam digest
-        # records no parameter default, so a console from before the engine's default flipped
-        # mounts on this engine, and with the withholding default its user page would read the
-        # scope as deny-all and offer to save that over the real one.
-        user_summary=partial(_user_summary, show_scope=True),
+        user_summary=_console_user_summary,
         federated_identity_view=_federated_identity_view,
         current_user=_current_user,
     )

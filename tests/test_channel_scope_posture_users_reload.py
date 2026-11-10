@@ -294,10 +294,10 @@ async def test_a_user_summary_withholds_the_scope_unless_asked(engine: Engine) -
     assert shown.channel_scope_withheld is False
 
 
-async def test_the_console_seam_user_summary_keeps_the_disclosing_default(engine: Engine) -> None:
-    """Vault BACKLOG #3748 item 5: the console calls ``user_summary`` only on its users:manage
-    pages, and the seam digest records no parameter default, so a console from before the flip
-    still mounts. The seam's callable therefore keeps disclosing when the argument is left out."""
+async def test_the_console_seam_user_summary_needs_show_scope(engine: Engine) -> None:
+    """Vault BACKLOG #3748 item 5: the seam digest records no parameter, so a console from before
+    the flip still mounts. Its call without ``show_scope`` raises rather than reading a real scope
+    as deny-all, and a call that names it gets what it asked for."""
     from fastapi import FastAPI
 
     from messagefoundry.api.auth_routes import add_auth_routes
@@ -309,8 +309,12 @@ async def test_the_console_seam_user_summary_keeps_the_disclosing_default(engine
     assert user is not None
     app = FastAPI()
     app.router.route_class = AuthenticatedBeforeBodyRoute
-    shown = add_auth_routes(app).user_summary(user, [])
+    summary = add_auth_routes(app).user_summary
+    with pytest.raises(TypeError):
+        summary(user, [])
+    shown = summary(user, [], show_scope=True)
     assert shown.channel_scope == [THEIRS] and shown.channel_scope_withheld is False
+    assert summary(user, [], show_scope=False).channel_scope_withheld is True
 
 
 async def test_the_users_manage_create_routes_still_show_the_scope(engine: Engine) -> None:
@@ -378,7 +382,8 @@ def test_a_withheld_scope_row_has_one_shape_whatever_it_held() -> None:
     withheld = {"channels": "withheld"}
     withdraw = json.dumps({"channels": None, "withdrawn": [THEIRS]})
     set_one = json.dumps({"channels": [THEIRS]})
-    for detail in (withdraw, set_one, "[1]", "not json"):
+    too_deep = "[" * 100_000 + "]" * 100_000  # json's depth limit raises RecursionError
+    for detail in (withdraw, set_one, "[1]", "not json", too_deep):
         shown = audit_detail_for(reader, "auth.ad_scope_resynced", detail)
         assert shown is not None and json.loads(shown) == withheld, detail
     added = json.dumps({"user_id": "x", "channels": [THEIRS], "previous": [THEIRS]})

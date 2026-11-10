@@ -570,8 +570,9 @@ class AuditList(BaseModel):
 
     ``withheld`` is True when the caller's permissions leave a class of rows out of this listing
     and its total: the lock rows a reader without ``users:manage`` does not see (BACKLOG #1131,
-    #2446). It is a fact about the CALLER, not about this page. It is True whether or not any such
-    row falls in the filtered range, so it cannot tell a reader whether a lock happened.
+    #2446). The same caller reads each channel scope change with its channels withheld (vault
+    BACKLOG #3748). It is a fact about the CALLER, not about this page. It is True whether or not
+    any such row falls in the filtered range, so it cannot tell a reader whether a lock happened.
 
     ``as_of`` is the snapshot the page was read under: only rows whose ``ts`` is at or before it.
     A reader passes it back with the next ``offset``, so rows written after the first page, such
