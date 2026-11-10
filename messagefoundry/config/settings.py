@@ -6381,6 +6381,7 @@ class ClusterSettings(_Section):
     # SCOPE, stated because a control that claims more than it covers is worse than none: on POSTGRES
     # it bounds every maintenance-loop statement with its borrow (BACKLOG #2523); on SQL SERVER the
     # heartbeat, the claim/renew, the config-version refresh and a stepdown's release (BACKLOG #5064),
+    # and the paused tick's owner read at the smaller of this and half its own budget, at least,
     # each borrow and statement separately, as SqlServerStore._fetchone_clamped describes, and a value
     # under 1 s is refused there (ServiceSettings._sqlserver_renew_clamp_whole_seconds).
     #

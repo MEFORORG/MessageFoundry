@@ -1329,7 +1329,8 @@ class _FakeSqlLeaseStore:
     async def _fetchone_clamped(
         self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
     ) -> dict[str, object] | None:
-        return await self._fetchone(sql, params)  # the claim; the clamp is not modelled here
+        # The claim and the paused owner read (BACKLOG #5064); the clamp is not modelled here.
+        return await self._fetchone(sql, params)
 
     async def _execute(self, sql: str, params: tuple[object, ...]) -> int:
         if self.yield_in_execute:

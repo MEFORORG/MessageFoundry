@@ -600,6 +600,31 @@ async def test_the_paused_owner_read_is_clamped_at_the_smaller_of_clamp_and_budg
     assert clamps == [min(coord._renew_timeout, coord._paused_read_budget / 2.0)]
 
 
+async def test_a_short_fence_halves_the_paused_read_budget_below_the_renew_clamp() -> None:
+    """The budget term on its own: at a 4 s fence the budget is 3 s, so the read is clamped at
+    1.5 s, below a 5 s renew clamp. Clamping at the renew clamp, or at the unhalved budget, would
+    let the borrow and the statement together overrun the event-loop budget."""
+    clamps: list[float] = []
+
+    class _Store:
+        async def _fetchone_clamped(
+            self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+        ) -> dict[str, object]:
+            clamps.append(timeout_clamp)
+            return {"owner": "A"}
+
+    coord = SqlServerCoordinator(
+        _Store(),
+        "A",
+        leader_fence_timeout_seconds=4.0,
+        lease_renew_timeout_seconds=5.0,
+        monotonic=lambda: 0.0,
+    )
+    coord._no_claim_until = 10.0
+    assert await coord._claim_or_renew_lease() is False
+    assert clamps == [1.5]
+
+
 async def test_a_stalled_paused_owner_read_ends_at_the_driver_not_at_command_timeout() -> None:
     """Over the real store seam: a paused read the server never answers is ended by the driver's
     clamped statement timeout, not by [store].command_timeout (30 s here, which the fake would
