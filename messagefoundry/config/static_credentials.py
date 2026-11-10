@@ -168,9 +168,13 @@ def _oauth2(settings: Mapping[str, Any]) -> bool:
 
 
 def _digest(settings: Mapping[str, Any]) -> bool:
-    from messagefoundry.transports.http_auth import http_digest_selected
+    from messagefoundry.transports.http_auth import HttpAuthError, http_digest_selected
 
-    return http_digest_selected(settings)
+    try:
+        return http_digest_selected(settings)
+    except HttpAuthError:
+        # An unrecognised mode refuses the connector (#5529), so no Digest credential crosses.
+        return False
 
 
 def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool) -> list[str]:

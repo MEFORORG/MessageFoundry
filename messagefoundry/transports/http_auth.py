@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.tls_policy import (
     CREDENTIAL_HOP_WAYS_ACROSS,
+    MIRRORED_CONNECTION_SETTING,
     SYSTEM_TRUST_ANCHOR,
     InsecureHopRefused,
     TrustAnchor,
@@ -330,10 +331,24 @@ class _ApprovedDigestAuthHandler(_ApprovedDigestMixin, urllib.request.HTTPDigest
 
 
 def http_digest_selected(s: Mapping[str, Any]) -> bool:
-    """Whether ``http_auth`` selects HTTP Digest. The SINGLE definition, shared by
-    :func:`digest_handler_from_settings`, the REST ECH refusal and the static-credential census
-    (``config.static_credentials._http_static``), so the connector and the posture reader agree."""
-    return str(s.get("http_auth") or "").lower() == "digest"
+    """Whether ``http_auth`` selects HTTP Digest. The SINGLE definition, shared by the connectors
+    and the static-credential census so the two agree.
+
+    Unset, or blank once stripped, is off. Any other value than ``digest`` (any case, any padding)
+    raises :class:`HttpAuthError` (BACKLOG #5529 limb 1): a typo used to read as auth off, so the
+    connection built and delivered with no auth. The message does not echo the value."""
+    raw = s.get("http_auth")
+    mode = "" if raw is None else str(raw).strip().lower()
+    if not mode:
+        return False
+    if mode == "digest":
+        return True
+    connection = s.get(MIRRORED_CONNECTION_SETTING)
+    raise HttpAuthError(
+        f"{hop_name_prefix(None if connection is None else str(connection))}http_auth names a "
+        "mode this engine does not offer; the only value is 'digest' "
+        "(with_http_digest), or leave it unset for no HTTP auth"
+    )
 
 
 def digest_handler_from_settings(

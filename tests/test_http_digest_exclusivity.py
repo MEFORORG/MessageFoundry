@@ -2,14 +2,16 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #5529: HTTP Digest either runs as configured or the connection does not build.
 
+Limb 1: ``http_auth`` set to anything but ``digest`` (a typo, say) read as auth off, and the
+posture reader agreed. It is refused now, through one predicate the reader shares.
+
 Limb 2: a static ``bearer_token``, Basic pair or ``Authorization`` header rode beside Digest on
 REST, SOAP and FHIR. urllib lets a request header override the Digest handler's own, so the static
 credential is what would have crossed. Refused once, in ``digest_handler_from_settings``.
 
 Limb 3 (also #2707 closing step 1): ``ech_egress`` replaced the opener that held the Digest
-handler, so a REST connection built and delivered with no Digest auth. The handler cannot simply
-ride the ECH opener: its password manager is keyed on the destination URL, while the ECH request
-goes to the sidecar URL, so no challenge would ever match. The pair is refused at construction.
+handler, so a REST connection built with no Digest auth. The pair is refused at construction; the
+comment beside the refusal in ``RestDestination.__init__`` says why the handler cannot move.
 """
 
 from __future__ import annotations
@@ -19,9 +21,15 @@ import urllib.request
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.static_credentials import _http_static
+from messagefoundry.config.tls_policy import MIRRORED_CONNECTION_SETTING
 from messagefoundry.config.wiring import FHIR, Rest, Soap
 from messagefoundry.transports import build_destination
-from messagefoundry.transports.http_auth import with_http_digest
+from messagefoundry.transports.http_auth import (
+    digest_handler_from_settings,
+    http_digest_selected,
+    with_http_digest,
+)
 from messagefoundry.transports.rest import HttpAuthError, RestDestination
 from tests._egress_policy import permitting
 
@@ -57,12 +65,6 @@ def test_ech_egress_with_digest_is_refused_at_construction() -> None:
     assert _PW not in str(ei.value)
 
 
-def test_control_digest_without_ech_builds_with_its_handler() -> None:
-    dest = _build(ConnectorType.REST, _digest_rest())
-    assert isinstance(dest, RestDestination)
-    assert _has_digest(dest)
-
-
 def test_control_ech_without_digest_builds() -> None:
     settings = Rest(url=URL).settings
     settings.update(_SIDECAR)
@@ -89,12 +91,11 @@ _STATIC: dict[str, dict[str, object]] = {
 
 
 def _digest_spec(ctype: ConnectorType, **extra: object) -> dict[str, object]:
-    settings = with_http_digest(
+    return with_http_digest(
         _FACTORIES[ctype](url=URL, **extra),  # type: ignore[operator]
         user="u",
         password=_PW,
     ).settings
-    return settings
 
 
 @pytest.mark.parametrize("static", list(_STATIC), ids=list(_STATIC))
@@ -123,3 +124,43 @@ def test_control_a_non_auth_static_header_beside_digest_builds() -> None:
     assert _has_digest(
         _build(ConnectorType.REST, _digest_spec(ConnectorType.REST, headers={"X-Trace": "1"}))
     )
+
+
+# --- limb 1: an unrecognised http_auth is refused, not read as "auth off" ------------------------
+
+_CREDS = {"http_auth_user": "u", "http_auth_password": _PW}
+
+
+@pytest.mark.parametrize("mode", ["digset", "basic", "ntlm", "true"])
+def test_an_unrecognised_http_auth_mode_is_refused(mode: str) -> None:
+    with pytest.raises(HttpAuthError, match="http_auth") as ei:
+        digest_handler_from_settings({"http_auth": mode, **_CREDS}, url=URL)
+    assert _PW not in str(ei.value)
+
+
+def test_an_unrecognised_http_auth_mode_refuses_the_connector() -> None:
+    settings = Rest(url=URL).settings
+    settings.update({"http_auth": "digset", **_CREDS})
+    # The runner mirrors the connection name into the settings (wiring_runner); a direct build does not.
+    settings[MIRRORED_CONNECTION_SETTING] = "OB_HTTP"
+    with pytest.raises(HttpAuthError, match="http_auth") as ei:
+        _build(ConnectorType.REST, settings)
+    assert "OB_HTTP" in str(ei.value)
+    assert "digset" not in str(ei.value)
+
+
+@pytest.mark.parametrize("unset", [None, "", "   "])
+def test_control_an_unset_http_auth_is_off(unset: str | None) -> None:
+    assert digest_handler_from_settings({"http_auth": unset, **_CREDS}, url=URL) is None
+    assert not http_digest_selected({"http_auth": unset})
+
+
+def test_control_digest_is_read_whatever_its_case_and_padding() -> None:
+    assert digest_handler_from_settings({"http_auth": " Digest ", **_CREDS}, url=URL) is not None
+
+
+def test_the_census_shares_the_predicate_and_does_not_raise() -> None:
+    """``_http_static`` reads the same predicate. A connector refuses to build on an unrecognised
+    mode, so no Digest credential is reported, and the census itself does not raise."""
+    assert "HTTP Digest" not in _http_static(ConnectorType.REST, {"http_auth": "digset"}, False)
+    assert "HTTP Digest" in _http_static(ConnectorType.REST, {"http_auth": " DIGEST "}, False)
