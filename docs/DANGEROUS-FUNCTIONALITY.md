@@ -852,8 +852,10 @@ or compression library:
   connector's ceiling, `max_decompressed_bytes`, defaults to 64 MiB; setting it to `0` turns it off.
   A connection with `decompress=` set and that ceiling off logs one warning when it is built.
   Its gzip member cap, `max_decompressed_members`, defaults to 1024 and cannot be turned off.
-  A zip is refused whole for too many members, duplicate or overlapped members, or bytes before or
-  after the archive. Each member's name must be a safe relative path, and its bytes must match the
+  A zip is refused whole for at least too many members, duplicate or overlapped members, bytes
+  before or after the archive, or an entry compressed with any method but STORED or DEFLATED. The
+  ceiling holds as it goes only for those two methods, because stdlib `zipfile` does not bound one
+  read's output for the others (BACKLOG #5535). Each member's name must be a safe relative path, and its bytes must match the
   type its extension names. Members come back as bytes in memory; this module writes no file.
 - `parsing/dicom/_inflate.py` bounds a deflated DICOM object's inflate before `pydicom` reads it,
   because `pydicom` would otherwise inflate the whole stream with no limit.

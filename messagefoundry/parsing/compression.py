@@ -396,11 +396,11 @@ def zip_decompress(
     position and never by its filename.
 
     Only STORED and DEFLATED entries are read (BACKLOG #5535). An entry with any other compression
-    method, BZIP2, LZMA and Zstandard included, refuses the whole archive before any member is read,
-    directory entries too, and with or without a ceiling. ``zipfile`` reads those three methods
-    without bounding one read's output, so the ceiling would be checked only after the expansion;
-    see ``_ZIP_BOUNDED_METHODS``. The refusal does not depend on ``max_output_bytes``, so whether an
-    archive is readable never depends on the ceiling a caller chose. :func:`zip_compress` writes
+    method, BZIP2, LZMA and Zstandard included, refuses the whole archive before any member is
+    read, directory entries too. ``zipfile`` reads those three methods without bounding one read's
+    output, so the ceiling would be checked only after the expansion; see
+    ``_ZIP_BOUNDED_METHODS``. This refusal does not depend on ``max_output_bytes``: an
+    archive it refuses is refused under any ceiling, and under none. :func:`zip_compress` writes
     only DEFLATED members.
 
     Duplicate file member names also refuse the whole archive, since the returned mapping cannot
@@ -451,21 +451,22 @@ def zip_decompress(
             ]
             if len({info.filename for _, info in members}) != len(members):
                 raise CompressionError("zip archive contains duplicate member names")
-            # Methods and names, BEFORE a single byte is read. _read_zip_member is bounded only for
-            # the methods let through here (BACKLOG #5535). Every entry is checked, a directory
-            # entry too: one is never read, but an archive that carries one is still refused.
+            # Names, then methods, BEFORE a single byte is read: a traversal name is refused for
+            # what it is, not for what it expands to, and refusing early spends nothing on a
+            # hostile archive. Names go first, so a hostile name is the reason an operator sees.
+            for position, info in members:
+                name_reason = archive_member_name_reason(info.filename)
+                if name_reason is not None:
+                    raise CompressionError(f"zip archive member {position} refused: {name_reason}")
+            # _read_zip_member is bounded only for the methods let through here (BACKLOG #5535).
+            # Every entry is checked, a directory entry too, so no entry with an unbounded method
+            # is admitted in any form.
             for position, info in enumerate(zf.infolist(), start=1):
                 if info.compress_type not in _ZIP_BOUNDED_METHODS:
                     raise CompressionError(
                         f"zip archive member {position} {_UNSUPPORTED_FEATURE} (compression method "
                         f"{info.compress_type}; only stored and deflated members are read)"
                     )
-            # A traversal name is refused for what it is, not for what it expands to, and refusing
-            # early spends nothing on a hostile archive.
-            for position, info in members:
-                name_reason = archive_member_name_reason(info.filename)
-                if name_reason is not None:
-                    raise CompressionError(f"zip archive member {position} refused: {name_reason}")
             # With a ceiling, a trial pass reads every member and keeps nothing, so an archive
             # over it is refused before any member is kept (BACKLOG #1129). The member count was
             # read from the central directory above, so with no ceiling there is nothing to try.
