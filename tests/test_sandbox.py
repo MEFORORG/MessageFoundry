@@ -12,6 +12,7 @@ answer a later dispatch, and the engine's code-set tables — not the child's ow
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import os
@@ -43,11 +44,14 @@ from messagefoundry.pipeline._sandbox_codec import (
 from messagefoundry.pipeline.dryrun import route_only, transform_one
 from messagefoundry.pipeline.sandbox import (
     _EOF,
+    KillCause,
     SandboxError,
     SandboxMode,
     SandboxPolicy,
     SandboxSession,
+    SandboxWorkerRefused,
     _StderrRelay,
+    graph_shape,
 )
 from messagefoundry.store.store import MessageStore
 from tests.test_db_lookup import sandbox_run_one  # noqa: F401 - a fixture
@@ -829,12 +833,12 @@ def _session(
 ) -> SandboxSession:
     # The default lives in this TEST helper only, never in the production constructor, where a default
     # would silently reinstate the unattributable relay ADR 0176 exists to close.
+    kw.setdefault("graph", None)
     return SandboxSession(
         policy or SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
         inbound=inbound,
         config_dir=config_dir,
         env=None,
-        graph=None,
         **kw,  # type: ignore[arg-type]
     )
 
@@ -1228,7 +1232,7 @@ def test_an_unreloaded_codeset_edit_does_not_brick_the_inbound(tmp_path: Path) -
         (tmp_path / "codesets" / "cs.csv").write_text(
             "key,value\nA,EDITED_ON_DISK\n", encoding="utf-8"
         )
-        session._kill(session._proc)  # exactly what a wall-cap kill or a crash does
+        session._reap(session._proc)  # exactly what a wall-cap kill or a crash does
 
         second, _, _, _ = transform_one(registry, "h", RAW, sandbox=session, run_context=rc)
     finally:
@@ -1461,7 +1465,7 @@ def test_worker_kill_reaps_the_whole_process_tree(tmp_path: Path) -> None:
         responses = session._responses  # capture THIS generation's queue before the kill
 
         # The single funnel for a wall-cap kill / crash cleanup / shutdown.
-        session._kill(proc)
+        session._reap(proc)
 
         # PRIMARY: the response pipe reaches EOF only once EVERY holder of fd 1 is gone — the worker
         # AND the grandchild. The reader thread enqueues `_EOF` at that point.
@@ -1737,7 +1741,7 @@ def test_the_relay_thread_ends_when_the_worker_tree_is_reaped(tmp_path: Path) ->
         assert relay.name == "mf-sandbox-stderr-IB_ORPH-1", relay.name
         assert relay.is_alive()
 
-        session._kill(session._proc)
+        session._reap(session._proc)
         assert _await(lambda: not relay.is_alive()), (
             "the stderr relay thread outlived the worker tree reap -- fd 2 never reached EOF"
         )
@@ -1765,7 +1769,7 @@ def test_notices_carry_a_generation_so_a_recycled_pid_cannot_confuse_two_workers
     try:
         _deliveries(registry, "h_ctrl", sandbox=session, run_context=RunContext())
         assert _await(lambda: len(_notices(caplog)) >= 1)
-        session._kill(session._proc)  # forces a fresh generation on the next dispatch
+        session._reap(session._proc)  # forces a fresh generation on the next dispatch
         _deliveries(registry, "h_ctrl", sandbox=session, run_context=RunContext())
         assert _await(lambda: len(_notices(caplog)) >= 2)
     finally:
@@ -1924,3 +1928,176 @@ def test_the_sandbox_mode_default_is_off_and_lives_in_exactly_one_place() -> Non
     assert SandboxSettings(mode="subprocess").mode == "subprocess"
     assert SandboxPolicy(mode=SandboxMode.SUBPROCESS).mode is SandboxMode.SUBPROCESS
     assert SandboxPolicy(mode=SandboxMode.OFF).mode is SandboxMode.OFF
+
+
+# --- kill causes (vault BACKLOG #3135) ---------------------------------------
+
+
+def _kill_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == sandbox_mod.log.name and "sandbox worker killed" in r.getMessage()
+    ]
+
+
+def test_a_forged_frame_kill_records_its_cause_and_warns_without_content(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Steps 1 and 2: the kill records a cause from the closed set and writes one WARNING built
+    from the inbound, the phase and the cause token, never from the error text, which can quote
+    the message."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    try:
+        assert session.last_kill_cause is None
+        with pytest.raises(SandboxError, match="invalid frame"):
+            _deliveries(registry, "h_forge", sandbox=session, run_context=RunContext())
+        assert session.last_kill_cause is KillCause.INVALID_FRAME
+        warnings = _kill_warnings(caplog)
+        assert len(warnings) == 1
+        assert warnings[0].levelno == logging.WARNING
+        assert warnings[0].args == ("IB_T", "transform", "invalid_frame")
+        # Nothing from the message or the forged frame reaches the line.
+        assert "FORGED" not in warnings[0].getMessage()
+        assert "DOE" not in warnings[0].getMessage()
+    finally:
+        session.close()
+
+
+def test_an_unsolicited_frame_before_a_dispatch_is_its_own_cause(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    registry, config_dir = graph
+    session = _session(config_dir)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        session._responses.put(b"{}")  # a frame nobody asked for, waiting before the next dispatch
+        with pytest.raises(SandboxError, match="unsolicited"):
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert session.last_kill_cause is KillCause.UNSOLICITED_BEFORE
+        assert [r.args for r in _kill_warnings(caplog)] == [
+            ("IB_T", "transform", "unsolicited_before")
+        ]
+    finally:
+        session.close()
+
+
+def test_an_unsolicited_frame_after_an_answer_is_its_own_cause(
+    graph: tuple[Registry, str],
+) -> None:
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        session._spawn("transform")
+        session._responses.put(b"{}")
+        with pytest.raises(SandboxError, match="unsolicited"):
+            session._reject_unsolicited(session._proc, "after", "transform")
+        assert session.last_kill_cause is KillCause.UNSOLICITED_AFTER
+    finally:
+        session.close()
+
+
+def test_a_reap_that_is_not_a_kill_records_nothing_and_does_not_warn(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A queued EOF only says the peer died, and with no worker there is nothing to kill: neither is
+    a kill, so neither records a cause or writes a WARNING. Closing a session with no worker is the
+    same."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    try:
+        session._spawn("transform")
+        session._responses.put(_EOF)
+        session._reject_unsolicited(session._proc, "before", "transform")
+        assert session._proc is None
+        session._kill(None, KillCause.CRASH, "transform")  # no worker: nothing to kill
+        assert session.last_kill_cause is None
+        assert _kill_warnings(caplog) == []
+    finally:
+        session.close()
+    assert session.last_kill_cause is None  # no live worker at close: nothing was killed
+    assert _kill_warnings(caplog) == []
+
+
+def test_closing_a_live_session_records_shutdown(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    registry, config_dir = graph
+    session = _session(config_dir)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+    session.close()
+    assert session.last_kill_cause is KillCause.SHUTDOWN
+    assert [r.args for r in _kill_warnings(caplog)] == [("IB_T", "shutdown", "shutdown")]
+
+
+def test_a_graph_refusal_records_its_cause_and_leaves_the_warning_to_the_runner(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The runner already raises the ``sandbox_worker_refused`` alert for this, so the session
+    records the cause and writes no second line."""
+    registry, config_dir = graph
+    shape = graph_shape(registry)
+    differs = dataclasses.replace(shape, handlers=shape.handlers | {"h_not_in_the_worker"})
+    session = _session(config_dir, graph=lambda: differs)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    try:
+        with pytest.raises(SandboxWorkerRefused):
+            session._spawn("transform")
+        assert session.last_kill_cause is KillCause.GRAPH_MISMATCH
+        assert _kill_warnings(caplog) == []
+    finally:
+        session.close()
+
+
+def test_a_request_the_codec_refuses_keeps_the_worker(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Step 3: a payload outside the closed grammar is refused before a byte is written, so the
+    worker is still in step. Only that message fails, and the next one reuses the same worker."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    try:
+        expected = _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        proc = session._proc
+        assert proc is not None
+        with pytest.raises(SandboxError, match="failed to marshal"):
+            session.dispatch("transform", "h_ok", object(), RunContext())
+        assert session._proc is proc
+        assert proc.poll() is None
+        assert session.last_kill_cause is None
+        assert _kill_warnings(caplog) == []
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert session._proc is proc
+    finally:
+        session.close()
+
+
+def test_a_request_write_that_fails_still_kills_the_worker(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for step 3: a broken pipe or a partial write may leave part of a frame in the
+    worker, so that path still fails closed and kills it."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        proc = session._proc
+        assert proc is not None
+
+        def _broken(stream: object, body: bytes) -> None:
+            raise BrokenPipeError("the pipe broke")
+
+        monkeypatch.setattr(sandbox_mod, "_write_frame", _broken)
+        with pytest.raises(SandboxError, match="failed to send"):
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert session._proc is None
+        assert proc.poll() is not None
+        assert session.last_kill_cause is KillCause.REQUEST_WRITE
+    finally:
+        session.close()

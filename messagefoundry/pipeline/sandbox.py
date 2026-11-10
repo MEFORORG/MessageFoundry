@@ -129,6 +129,7 @@ from messagefoundry.redaction import safe_exc
 
 __all__ = [
     "SandboxMode",
+    "KillCause",
     "SandboxError",
     "SandboxCodecError",
     "SandboxPolicy",
@@ -181,6 +182,60 @@ class SandboxMode(str, enum.Enum):  # noqa: UP042
     # check that means "runs in a worker" is `is not SandboxMode.OFF`, so this mode can never take an
     # in-process branch that only SUBPROCESS was excluded from (vault BACKLOG #3131).
     ISOLATED = "isolated"
+
+
+class KillCause(str, enum.Enum):  # noqa: UP042
+    """Why a :class:`SandboxSession` killed its worker: a closed set (vault BACKLOG #3135).
+
+    A session records the cause of its last kill in :attr:`SandboxSession.last_kill_cause`, and
+    every kill but :attr:`GRAPH_MISMATCH` writes one WARNING naming the inbound, the dispatch phase
+    and this token, never any message content or exception text. A reap that is not a kill records
+    nothing: closing a session with no worker, the prior generation's reap at the top of a spawn,
+    and the reap after a queued EOF, which only says the peer died.
+
+    There is no CPU-cap cause: the engine sets no ``RLIMIT_CPU`` (engine PR 2133), and the wall
+    cap is the bound. A request the codec refuses before a byte is written kills nothing, so it
+    has no cause either."""
+
+    #: The worker answered that it ran out of memory and exits, so it is reaped (vault BACKLOG #3133).
+    MEMORY_CAP = "memory_cap"
+    #: The worker loaded a graph that differs from the engine's. No WARNING here: the runner raises
+    #: the ``sandbox_worker_refused`` alert for it.
+    GRAPH_MISMATCH = "graph_mismatch"
+    #: The boot frame could not be written to the new worker.
+    BOOT_WRITE = "boot_write"
+    #: The worker did not answer its boot frame within ``startup_seconds``.
+    STARTUP_TIMEOUT = "startup_timeout"
+    #: The worker exited before it answered its boot frame.
+    BOOT_EXIT = "boot_exit"
+    #: The worker's boot reply was not a valid frame.
+    BOOT_REPLY_REJECTED = "boot_reply_rejected"
+    #: The worker reported that its bootstrap failed.
+    BOOT_FAILED = "boot_failed"
+    #: The request frame could not be written: a broken pipe or a partial write.
+    REQUEST_WRITE = "request_write"
+    #: The dispatch ran past ``wall_seconds``.
+    WALL_CAP = "wall_cap"
+    #: The dispatch ran past ``wall_seconds`` counting the lookups the engine served for it.
+    WALL_CAP_LOOKUPS = "wall_cap_lookups"
+    #: The worker exited while a dispatch was running.
+    CRASH = "crash"
+    #: The worker's answer was forged, desynchronized or out of sequence.
+    INVALID_FRAME = "invalid_frame"
+    #: The engine itself failed while serving a brokered lookup (``mode=isolated``).
+    LOOKUP_FAULT = "lookup_fault"
+    #: The reply to a brokered lookup could not be written to the worker.
+    LOOKUP_REPLY_WRITE = "lookup_reply_write"
+    #: A frame no request asked for was waiting before a dispatch.
+    UNSOLICITED_BEFORE = "unsolicited_before"
+    #: A frame no request asked for was waiting after a dispatch's answer.
+    UNSOLICITED_AFTER = "unsolicited_after"
+    #: The session was closed, at engine stop or when a reload replaced it.
+    SHUTDOWN = "shutdown"
+
+
+#: The kill causes that write no WARNING of their own, because the runner already alerts on them.
+_RUNNER_ALERTED: Final = frozenset({KillCause.GRAPH_MISMATCH})
 
 
 @dataclass(frozen=True)
@@ -722,6 +777,9 @@ class SandboxSession:
         self._generation = 0
         self._lock = threading.Lock()
         self._closed = False
+        # Why this session last killed its worker, or ``None`` before the first kill (vault BACKLOG
+        # #3135). A pooled worker or a per-lane kill budget reads it.
+        self.last_kill_cause: KillCause | None = None
         # The [egress] lists whose empty-list refusal this session has logged.
         self._lookup_refusals_logged: set[str] = set()
         # Per (kind, connection), the completion event of the runner call running on it, removed by
@@ -735,13 +793,15 @@ class SandboxSession:
 
     # -- lifecycle ------------------------------------------------------------
 
-    def _spawn(self) -> None:
-        """Launch the child and complete its bootstrap (config load + guard install). Fail-closed."""
+    def _spawn(self, phase: str = "spawn") -> None:
+        """Launch the child and complete its bootstrap (config load + guard install). Fail-closed.
+
+        ``phase`` is the dispatch phase the spawn serves, named in a kill's WARNING."""
         # Reap any prior generation FIRST. A worker that died on its own (the ``_live_worker`` respawn
         # path) leaves its kill-on-close job handle in ``self._job``; overwriting it below without
         # reaping would leak the handle and let that dead worker's orphaned grandchild tree survive.
         # A no-op on the first spawn and whenever there is no live proc.
-        self._kill(self._proc)
+        self._reap(self._proc)
         engine_graph = self._graph() if self._graph is not None else None
         if self._refused is not None and self._refused[0] is engine_graph:
             raise SandboxWorkerRefused(
@@ -847,32 +907,33 @@ class SandboxSession:
         try:
             _write_frame(proc.stdin, boot)
         except (OSError, SandboxError) as exc:
-            self._kill(proc)
+            self._kill(proc, KillCause.BOOT_WRITE, phase)
             raise SandboxError(f"failed to bootstrap sandbox worker: {exc}") from exc
         try:
             frame = self._responses.get(timeout=self.policy.startup_seconds)
         except queue.Empty:
-            self._kill(proc)
+            self._kill(proc, KillCause.STARTUP_TIMEOUT, phase)
             raise SandboxError(
                 f"sandbox worker did not start within {self.policy.startup_seconds}s"
             ) from None
         if frame is _EOF:
-            self._kill(proc)
+            self._kill(proc, KillCause.BOOT_EXIT, phase)
             raise SandboxError("sandbox worker exited during bootstrap")
         try:
             worker_graph, detail = codec.decode_boot_reply(frame)
         except SandboxError as exc:
-            self._kill(proc)
+            self._kill(proc, KillCause.BOOT_REPLY_REJECTED, phase)
             raise SandboxError(f"sandbox worker bootstrap frame was rejected: {exc}") from exc
         if worker_graph is None:
-            self._kill(proc)
+            self._kill(proc, KillCause.BOOT_FAILED, phase)
             raise SandboxError(f"sandbox worker bootstrap failed: {detail}")
         if engine_graph is not None:
             differing = graph_differences(engine_graph, worker_graph)
             if differing:
                 # FAIL CLOSED. A worker that loaded a different graph would answer for this inbound
-                # from that graph, and nothing in its answers would say so.
-                self._kill(proc)
+                # from that graph, and nothing in its answers would say so. No WARNING: the runner
+                # raises the sandbox_worker_refused alert for this refusal.
+                self._kill(proc, KillCause.GRAPH_MISMATCH, phase)
                 # Module bytes alone differ only when the worker read its modules: a worker that
                 # could not read them reports no digest, and that is not the same bytes.
                 content_only = worker_graph.code_digest is not None and all(
@@ -927,7 +988,27 @@ class SandboxSession:
         except OSError:
             sink.put(_EOF)
 
-    def _kill(self, proc: subprocess.Popen[bytes] | None) -> None:
+    def _kill(self, proc: subprocess.Popen[bytes] | None, cause: KillCause, phase: str) -> None:
+        """Kill ``proc`` for ``cause``: record the cause, write its WARNING, and reap the tree.
+
+        The WARNING is built from the inbound, ``phase`` and the cause token alone, never from a
+        message's content or an exception's text, which can carry it (CLAUDE.md section 9). A cause
+        in :data:`_RUNNER_ALERTED` writes none. With no ``proc`` nothing is killed, so nothing is
+        recorded. A reap that is not a kill calls :meth:`_reap` instead."""
+        if proc is None:
+            return
+        self.last_kill_cause = cause
+        if cause not in _RUNNER_ALERTED:
+            log.warning(
+                "inbound %r: sandbox worker killed during %s (cause=%s)",
+                self._inbound,
+                phase,
+                cause.value,
+            )
+        self._reap(proc)
+
+    def _reap(self, proc: subprocess.Popen[bytes] | None) -> None:
+        """Reap ``proc``'s whole tree, recording and logging nothing (see :class:`KillCause`)."""
         if proc is None:
             return
         # Reap the WHOLE tree, not just ``proc``: a grandchild the Handler spawned inherited fd 1 (the
@@ -954,7 +1035,7 @@ class SandboxSession:
         """Stop the worker cleanly (idempotent). Safe to call from a shutdown path."""
         with self._lock:
             self._closed = True
-            self._kill(self._proc)
+            self._kill(self._proc, KillCause.SHUTDOWN, "shutdown")
             for thread in self._threads:
                 # A bounded join, and ONLY on the shutdown path. The stderr relay LOGS, and a daemon
                 # thread that logs can still be inside a handler's ``emit`` when ``logging.shutdown``
@@ -968,7 +1049,9 @@ class SandboxSession:
                 thread.join(timeout=_STDERR_JOIN_SECONDS)
             self._threads = []
 
-    def _reject_unsolicited(self, proc: subprocess.Popen[bytes] | None, when: str) -> None:
+    def _reject_unsolicited(
+        self, proc: subprocess.Popen[bytes] | None, when: str, phase: str = "dispatch"
+    ) -> None:
         """Drop the worker if anything is pending that no outstanding request asked for.
 
         The protocol is strictly one request, one frame, so a FRAME queued **before** a dispatch or
@@ -1007,15 +1090,17 @@ class SandboxSession:
             stray = self._responses.get_nowait()
         except queue.Empty:
             return
-        self._kill(proc)
         if stray is _EOF:
+            self._reap(proc)  # the peer is already gone
             return
+        cause = KillCause.UNSOLICITED_BEFORE if when == "before" else KillCause.UNSOLICITED_AFTER
+        self._kill(proc, cause, phase)
         raise SandboxError(
             f"sandbox worker wrote an unsolicited response frame {when} a dispatch — "
             "the pipe is not trustworthy"
         )
 
-    def _live_worker(self) -> subprocess.Popen[bytes]:
+    def _live_worker(self, phase: str) -> subprocess.Popen[bytes]:
         """The session's worker — spawned or respawned as needed — on a pipe nothing is waiting on.
 
         The unsolicited check runs **after** the liveness check, not before: a killed worker's queue is
@@ -1024,10 +1109,10 @@ class SandboxSession:
         judging. A leftover EOF reaps it (see :meth:`_reject_unsolicited`), so spawn once more rather
         than dead-letter this message on a peer that merely died."""
         if self._proc is None or self._proc.poll() is not None:
-            self._spawn()
-        self._reject_unsolicited(self._proc, "before")
+            self._spawn(phase)
+        self._reject_unsolicited(self._proc, "before", phase)
         if self._proc is None:
-            self._spawn()
+            self._spawn(phase)
         proc = self._proc
         assert proc is not None
         return proc
@@ -1054,12 +1139,12 @@ class SandboxSession:
             except queue.Empty:
                 # Wall cap exceeded — the authoritative resource bound on every platform. Kill the
                 # runaway child (a busy-loop can't wedge intake) and fail closed.
-                self._kill(proc)
+                self._kill(proc, KillCause.WALL_CAP, phase)
                 raise SandboxError(
                     f"sandbox {phase} {name!r} exceeded the {self.policy.wall_seconds}s wall cap"
                 ) from None
             if frame is _EOF:
-                self._kill(proc)
+                self._kill(proc, KillCause.CRASH, phase)
                 served = expected_seq - 1
                 after = f", after {served} brokered lookup(s)" if served else ""
                 raise SandboxError(f"sandbox worker crashed while running {phase} {name!r}{after}")
@@ -1078,7 +1163,7 @@ class SandboxSession:
             except SandboxError as exc:
                 # A desynchronized or forged frame: the worker's stream can no longer be trusted to
                 # line up with our requests, so drop it and respawn on the next message.
-                self._kill(proc)
+                self._kill(proc, KillCause.INVALID_FRAME, phase)
                 raise SandboxError(
                     f"sandbox {phase} {name!r} returned an invalid frame: {exc}"
                 ) from exc
@@ -1086,7 +1171,7 @@ class SandboxSession:
                 return answer
             expected_seq += 1
             if not self._serve_bounded(proc, request_id, phase, name, answer, deadline):
-                self._kill(proc)
+                self._kill(proc, KillCause.WALL_CAP_LOOKUPS, phase)
                 raise SandboxError(
                     f"sandbox {phase} {name!r} exceeded the {self.policy.wall_seconds}s wall cap, "
                     "which counts the lookups the engine served for it"
@@ -1168,13 +1253,13 @@ class SandboxSession:
             abandoned.set()
             return False
         if fault:
-            self._kill(proc)
+            self._kill(proc, KillCause.LOOKUP_FAULT, phase)
             raise SandboxError(
                 f"sandbox {phase} {name!r} failed while serving its worker's lookup: an "
                 "unexpected engine error, logged by type"
             )
         if failure:
-            self._kill(proc)
+            self._kill(proc, KillCause.LOOKUP_REPLY_WRITE, phase)
             raise SandboxError(f"could not answer the sandbox worker's lookup: {failure[0]}")
         return True
 
@@ -1349,41 +1434,45 @@ class SandboxSession:
         with self._lock:
             if self._closed:
                 raise SandboxSessionClosed("sandbox session is closed")
-            proc = self._live_worker()
+            proc = self._live_worker(phase)
             assert proc.stdin is not None
             # A FRESH unpredictable id per dispatch, not a counter: the worker learns it only when it
             # reads this request frame, which the check above proves is the first thing it can answer.
             # A derivable id (a per-spawn nonce plus a sequence) let the code running dispatch N
             # compute N+1's and pre-stage its answer.
             request_id = secrets.token_hex(16)
+            # Encoded BEFORE the write, outside its try: a payload or run-context outside the closed
+            # grammar is refused with no byte written, so the worker is still in step and is kept
+            # (vault BACKLOG #3135). Only this message fails.
             try:
-                _write_frame(
-                    proc.stdin,
-                    codec.encode_request(
-                        request_id=request_id,
-                        phase=phase,
-                        name=name,
-                        payload=payload,
-                        origin=origin,
-                        run_context=run_context,
-                    ),
+                request = codec.encode_request(
+                    request_id=request_id,
+                    phase=phase,
+                    name=name,
+                    payload=payload,
+                    origin=origin,
+                    run_context=run_context,
                 )
-            except (OSError, SandboxError) as exc:
-                # A payload/run-context outside the closed grammar, or a broken pipe: fail closed and
-                # reset the worker.
-                self._kill(proc)
+            except SandboxError as exc:
                 raise SandboxError(f"failed to marshal sandbox {phase} {name!r}: {exc}") from exc
+            try:
+                _write_frame(proc.stdin, request)
+            except (OSError, SandboxError) as exc:
+                # A broken pipe or a partial write: the worker may hold part of a frame, so fail
+                # closed and reset it.
+                self._kill(proc, KillCause.REQUEST_WRITE, phase)
+                raise SandboxError(f"failed to send sandbox {phase} {name!r}: {exc}") from exc
             resp = self._await_answer(proc, request_id, phase, name)
             # One request, one frame: a second FRAME already queued means the worker is writing frames
             # nobody asked for, so this answer is not trustworthy either. (A queued EOF is only a dead
             # peer — it reaps the worker and leaves this proven answer standing.)
-            self._reject_unsolicited(proc, "after")
+            self._reject_unsolicited(proc, "after", phase)
             if not resp.ok:
                 if resp.kind == codec.FAIL_MEMORY:
                     # The worker exits after this reply. Reap it now, so the next dispatch starts a
                     # fresh one rather than writing to a worker on its way out (vault BACKLOG #3133).
                     if proc is self._proc:
-                        self._kill(proc)
+                        self._kill(proc, KillCause.MEMORY_CAP, phase)
                     # The worker's text names the cap it set, or says it set none.
                     raise SandboxError(
                         f"sandbox {phase} {name!r} ran out of memory, and its worker was "
