@@ -595,9 +595,10 @@ _PIP_AUDIT_SHORT_VALUE_OPTIONS = {
 #: This module's own options, which argparse hands to pip-audit when they come after the lock.
 _OWN_OPTIONS = ("--skip-private", "--pass-environment")
 
-#: pip-audit options that end it with exit 0 without auditing what the auditor hands it: a dry
-#: run, a fix that rewrites the copy, help and version. After the lock each is refused, so the gate
-#: cannot read clean with nothing audited.
+#: pip-audit options that can end it with exit 0 on a vulnerable lock. A dry run, help and version
+#: audit nothing. ``--fix`` audits, then rewrites the copy to fixed versions and exits 0 once every
+#: vulnerable package was rewritten (pip-audit 2.10.1 ``_cli.py``: it exits 1 only when
+#: ``pkg_count != fixed_pkg_count``). After the lock each is refused.
 _FAIL_OPEN_LONG = ("--dry-run", "--fix", "--help", "--version")
 _FAIL_OPEN_SHORT = frozenset("dhV")
 
@@ -651,8 +652,8 @@ def _after_lock_refusal(pip_audit_args: Sequence[str]) -> str | None:
             )
         if _opens_the_gate(head):
             return (
-                f"word {position} after the lock would end pip-audit with no audit (a dry run, a "
-                "fix, help or version); it is not passed on"
+                f"word {position} after the lock could let pip-audit exit 0 on a vulnerable lock (a "
+                "dry run, a fix, help or version); it is not passed on"
             )
         if not equals:
             continue

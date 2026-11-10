@@ -1134,7 +1134,7 @@ _SECRET = "marker-not-a-key"
         ([f"--out=KEYRING_A={_SECRET}"], 1, "holds '='"),
         # A flag in the = form: argparse's "ignored explicit argument" error quotes the value.
         ([f"--strict={_SECRET}"], 1, "holds '='"),
-        ([f"--help={_SECRET}"], 1, "no audit"),
+        ([f"--help={_SECRET}"], 1, "vulnerable lock"),
         ([f"-S={_SECRET}"], 1, "holds '='"),
         # A fixed-form value holding "=": its "invalid choice" error quotes the value.
         ([f"--format=json={_SECRET}"], 1, "holds '='"),
@@ -1184,19 +1184,20 @@ def test_a_word_after_the_lock_that_pip_audit_would_quote_is_refused_unquoted(
         "--dry-run=yes",
     ],
 )
-def test_an_option_that_ends_pip_audit_with_no_audit_is_refused_after_the_lock(
+def test_an_option_that_could_pass_a_vulnerable_lock_is_refused_after_the_lock(
     word: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A dry run, a fix, help and version each end pip-audit with exit 0 and nothing audited, so
-    the gate would read clean on a vulnerable lock. Each is refused by position, in full,
-    abbreviated, or inside a cluster of short flags, and pip-audit never starts."""
+    """A dry run, help and version audit nothing, and a fix exits 0 once it has rewritten every
+    vulnerable pin in the copy, so each could let the gate read clean on a vulnerable lock. Each
+    is refused by position, in full, abbreviated, or inside a cluster of short flags, and
+    pip-audit never starts."""
     src = tmp_path / "x.lock"
     src.write_text(LOCK, encoding="utf-8")
     ran, run = _recorder(0)
     assert main([str(src), "--desc", "on", word], run=run) == 2
     assert not ran
     err = capsys.readouterr().err
-    assert "word 3 after the lock would end pip-audit with no audit" in err
+    assert "word 3 after the lock could let pip-audit exit 0 on a vulnerable lock" in err
 
 
 def test_pip_audits_own_options_still_pass_through_after_the_lock(tmp_path: Path) -> None:
