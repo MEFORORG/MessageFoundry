@@ -81,28 +81,33 @@ _KEYED_DETAIL = (
     " you set [secret_rotation].store_key_last_rotated, update it."
 )
 
+# Every read skips virtual tables: a pragma on one whose module is not loaded here raises "no such
+# module" (BACKLOG #6719). The store builds none, and a test pins that, so an expected name held by a
+# virtual table reads as a missing table and is refused rather than skipped.
+_ORDINARY_TABLE = "m.type = 'table' AND m.sql NOT LIKE 'CREATE VIRTUAL TABLE%'"
 # Each pragma is read through its table-valued form, so one statement reads every table, and the
 # table names travel as bound parameters rather than being spliced into SQL. Only tables the EXPECTED
 # shape names are read for columns. The placeholder list is built from a count, never from a name.
 _COLUMNS_SQL = (
     "SELECT m.name AS tbl, c.name AS col, c.type AS type, c.pk AS pk"
     " FROM sqlite_master AS m, pragma_table_info(m.name) AS c"
-    " WHERE m.type = 'table' AND lower(m.name) IN ({marks})"
+    " WHERE " + _ORDINARY_TABLE + " AND lower(m.name) IN ({marks})"
 )
 # Indexes are read from EVERY ordinary table, not just the expected ones, so an index whose expected
 # name was taken on some other table is reported as living there instead of as merely missing. Driven
 # from pragma_index_list rather than from sqlite_master's index rows, because a WITHOUT ROWID table's
-# key index has no sqlite_master row. Virtual tables are skipped: a module not loaded here would make
-# the pragma raise. index_xinfo rather than index_info: it carries each key column's collation and
-# direction; key = 0 rows are the row id or auxiliary columns, not part of what the index enforces.
+# key index has no sqlite_master row. index_xinfo rather than index_info: it carries each key column's
+# collation and direction; key = 0 rows are the row id or auxiliary columns, not part of what the index
+# enforces.
 _INDEXES_SQL = (
     "SELECT m.name AS tbl, il.name AS idx, il.[unique] AS uniq, il.origin AS origin,"
     " il.partial AS partial, ix.seqno AS seqno, ix.name AS col, ix.[desc] AS dsc, ix.coll AS coll"
     " FROM sqlite_master AS m, pragma_index_list(m.name) AS il, pragma_index_xinfo(il.name) AS ix"
-    " WHERE m.type = 'table' AND m.sql NOT LIKE 'CREATE VIRTUAL TABLE%' AND ix.key = 1"
+    f" WHERE {_ORDINARY_TABLE} AND ix.key = 1"
 )
 _TABLES_SQL = (
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+    "SELECT m.name FROM sqlite_master AS m"
+    f" WHERE {_ORDINARY_TABLE} AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
 )
 
 
@@ -339,13 +344,24 @@ async def verify_live_schema(
 
 #: The SQLite messages that name an existing object's shape. A syntax error in this build's own
 #: DDL, or a statement the local SQLite is too old for, is also SQLITE_ERROR, and it is not fixed
-#: by recreating the store, so the code alone is not enough.
+#: by recreating the store, so the code alone is not enough. An expected name held by an object of
+#: another kind is not "already exists": SQLite names the kind, or refuses the index or ALTER the
+#: script or a migration then runs on it (BACKLOG #6720; the texts are measured in
+#: tests/test_schema_verify_6719_6720.py). "no such module" is left out: it is also what a local
+#: SQLite built without a module says.
 _SHAPE_MESSAGES = (
     "no such column",
     "no such table",
     "has no column named",
     "duplicate column name",
     "already exists",
+    "there is already an index named",
+    "there is already a table named",
+    "views may not be indexed",
+    "virtual tables may not be indexed",
+    "Cannot add a column to a view",
+    "virtual tables may not be altered",
+    "because it is a view",
 )
 
 
