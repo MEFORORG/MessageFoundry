@@ -270,8 +270,7 @@ class RestartReconciliation:
 
     #: Rows this process had claimed in its previous life, now ``interrupted``.
     interrupted: tuple[str, ...]
-    #: Rows this process owns whose move raised anything but a seal refusal. The next start
-    #: tries them again.
+    #: Rows this process owns whose move raised an ``Exception`` other than ``RowSealError``.
     unsettled: tuple[str, ...]
     #: Rows another claim owner holds. Left alone: the owner may be alive and running them.
     foreign: tuple[str, ...]

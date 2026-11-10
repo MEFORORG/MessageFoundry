@@ -2105,9 +2105,7 @@ class AuditStore(Protocol):
         hide the rows that have waited longest, and nothing would ever bring them back. Oldest first,
         a row past the cap appears as the ones before it are resolved.
 
-        Projects the same columns as the pending queue. ``approver`` says who released it.
-        ``decided_at`` is the cut-off time for a release cancelled mid-run, and the claim time for
-        one a restart or an operator moved to ``interrupted``."""
+        Projects the same columns as the pending queue."""
         ...
 
     async def decide_pending_approval(
