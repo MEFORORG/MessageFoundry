@@ -11373,7 +11373,9 @@ async def _directory_reconciler(
                 if found:
                     # Once, at the read that fixes the set (BACKLOG #3084): every clear of these
                     # instances is dropped for this process's life, and without this line only
-                    # docs/CONFIGURATION.md would say so. Keys only; an instance carries no PHI.
+                    # docs/CONFIGURATION.md would say so. Keys only: the line names each instance's
+                    # event type and connection, never its stored reason, which can hold free text
+                    # (docs/PHI.md, the alert_instance.reason row).
                     # "When this process first read", not "before its first pass": a first read
                     # that failed lets this process's own early trip or hold land in the set.
                     _log.warning(

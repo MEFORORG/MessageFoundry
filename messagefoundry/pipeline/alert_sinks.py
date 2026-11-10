@@ -10,7 +10,9 @@ a bounded in-memory queue, and a **background task** drains the queue and perfor
 the other transports still run — alerting is best-effort and never breaks delivery.
 
 Transports use only the **standard library** (``urllib.request`` / ``smtplib``), so wiring real
-notifications adds no dependency. Payloads carry the connection name + queue shape only — **no PHI**.
+notifications adds no dependency. Payloads have no message-body field, but they are **not**
+PHI-free: some events still send free-text ``detail``/``reason`` off the box. docs/PHI.md row
+10 names at least some of them, and is not a complete list.
 
 Construction is config-driven: :func:`notifier_from_settings` turns an
 :class:`~messagefoundry.config.settings.AlertsSettings` into a :class:`NotifierAlertSink`, or ``None``
@@ -66,6 +68,7 @@ from messagefoundry.pipeline.alerts import (
     intake_pause_detail,
     remote_debug_refused_detail,
     sandbox_worker_refused_detail,
+    shown_error_class,
 )
 from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
 from messagefoundry.transports.base import DeliveryError
@@ -717,9 +720,11 @@ def _refuse_alert_smtp_revocation(
     guards that hop, with ``[tls].crl_file`` or the ``[alerts]`` attestation pair as the levers.
 
     **A hop with no login takes no guard**, by the same ruling, recorded in ADR 0173: it carries no
-    credential, and an alert body carries no PHI. A hop with ``use_tls`` or ``tls_verify`` off
-    builds no verifying context, and a login over one is refused at load and again at each send,
-    so there is nothing for this guard to judge.
+    credential. The decline does not rest on what the body holds, and an alert body is not PHI-free
+    in the shipped code: the docs/PHI.md logging-inventory rows 11 and 12 say what crosses, and
+    ADR 0173's note of 2026-11-10 records the owner ruling that this decline stands. A hop with
+    ``use_tls`` or ``tls_verify`` off builds no verifying context, and a login over one is refused
+    at load and again at each send, so there is nothing for this guard to judge.
 
     It reads no allowlist. Both callers refuse a relay off ``[alerts].smtp_allowed_hosts`` before
     they call this (BACKLOG #5088), with or without a login, so every relay judged here is one the
@@ -1086,7 +1091,8 @@ class EmailTransport:
         self.tls_ca_file = tls_ca_file
         self.trust_anchor_policy = trust_anchor_policy
         # Optional egress allowlist (lower-cased) for the SMTP host; empty = any (WP-11c, parity with
-        # the webhook allowlist). The alert payload carries no PHI, so this is general egress control.
+        # the webhook allowlist). The alert payload has no message-body field, but it can carry
+        # free-text detail (docs/PHI.md row 11); this allowlist is the egress control for that hop.
         self.allowed_hosts = tuple(h.lower() for h in allowed_hosts)
         # #138: operator-editable templates (None = fixed subject/body). Validated at config-load.
         self.subject_template = subject_template
@@ -1385,9 +1391,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         detail: str | None = None,
         error_class: str | None = None,
     ) -> None:
-        # #46: an outbound lane went down. error_class is not sent: the event is unchanged. The shared _emit throttle keys on (type, connection), so a
-        # retry storm on one lane collapses to one notification per cooldown. detail is safe_exc-scrubbed.
-        self._emit({"type": "connection_error", "connection": name, "kind": kind, "detail": detail})
+        # #46: an outbound lane went down. The shared _emit throttle keys on (type, connection), so a
+        # retry storm on one lane collapses to one notification per cooldown. detail can echo a
+        # partner's reply, so it rides under _detail: stored as the alert reason, popped in _handle
+        # before any transport sees the event (BACKLOG #5021). Off-box carries the class instead.
+        self._emit(
+            {
+                "type": "connection_error",
+                "connection": name,
+                "kind": kind,
+                "error_class": shown_error_class(error_class),
+                "_detail": detail,
+            }
+        )
 
     def log_write_failed(
         self, name: str, *, stage: str, reason: str, stopped: int | None = None
@@ -2318,8 +2334,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
         else:
             fence = None
-            # reason: prefer the safe, PHI-free diagnostic the event already carries (detail/reason).
-            raw_reason = event.get("detail") or event.get("reason")
+            # reason: the diagnostic the event carries. _detail is a reason kept off the wire
+            # (connection_error, BACKLOG #5021); the stored copy is masked until revealed (#2443).
+            raw_reason = event.get("_detail") or event.get("detail") or event.get("reason")
             reason = str(raw_reason) if raw_reason is not None else None
 
             # Only a store that fences takes the writer id; a test double without it still works.
@@ -2531,6 +2548,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # #146: pop the per-rule EMAIL recipient override BEFORE the fan-out loop so it never reaches the
         # webhook (which serializes the event to JSON); only the email transport consumes it.
         recipients = event.pop("_recipients", None)
+        # #5021: a reason kept off the wire. _record_state already read it in _emit.
+        event.pop("_detail", None)
         # #138: pop the email-template context (rule label + effective cooldown) into a side mapping so the
         # event delivered to every transport is clean (no internal ``_``-keys); only the email uses it.
         context = {
@@ -2544,7 +2563,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 await transport.send(event, recipients=recipients, context=context)
             except Exception:
                 # Best-effort: a failing transport must not drop the event for the others, nor
-                # ever propagate into the engine. Detail (not PHI) is in the event itself.
+                # ever propagate into the engine. The line names the event's type and connection,
+                # never its free text, which can echo a partner's reply (docs/PHI.md row 10).
                 log.warning(
                     "alert transport %s failed for %s/%r",
                     transport.name,
