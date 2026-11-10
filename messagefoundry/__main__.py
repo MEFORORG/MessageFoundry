@@ -11609,7 +11609,8 @@ def _restore_verify(args: argparse.Namespace) -> int:
     # No #1670 clause here on purpose: this one never opens `settings.store`. Its only open_store
     # call is inside `_full_open_check`, which catches broadly around that open and reports FAIL
     # with a reason -- and the leak that made that hang is fixed in `MessageStore.open` itself.
-    # Its decrypt pass, which runs before that open, is caught the same way (BACKLOG #1719).
+    # Its decrypt pass runs before that open; a RuntimeError, ValueError, OSError or sqlite3.Error
+    # from it is reported as a FAIL too (BACKLOG #1719).
     try:
         result = run_guarded(
             run_restore_verify(args.archive, store_settings=settings.store, full=args.full)

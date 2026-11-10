@@ -205,9 +205,7 @@ POSITION = "position"
 #: usual chunk would hold hundreds of MiB at once. The store's own seal pass batches it the same.
 _ATTACHMENT_CHUNK_ROWS = 16
 
-#: The id-keyed cells both server stores seal. Neither server module keeps one tuple of them that
-#: this could import (SQL Server spells its list inline in ``_encrypt_existing_rows``), so they are
-#: declared here and pinned to each module's ``cell_aad`` calls by a test.
+#: The id-keyed cells both server stores seal, pinned to each module's ``cell_aad`` calls by a test.
 _SERVER_ID_KEYED: tuple[tuple[str, str], ...] = (
     ("messages", "raw"),
     ("messages", "error"),

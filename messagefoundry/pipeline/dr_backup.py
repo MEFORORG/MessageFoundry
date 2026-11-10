@@ -4026,8 +4026,7 @@ def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str
     # and a difference list with no length of its own. The remedy leads, so a cut loses only detail.
     return safe_text(
         "the archive's store is from an incompatible version, so this build cannot open it: restore"
-        f" it with {wrote}. The archive opened and passed its integrity and row-count checks; its"
-        f" cells were not decrypted. {tail}",
+        f" it with {wrote}. The archive opened and passed its integrity and row-count checks. {tail}",
         limit=_INCOMPATIBLE_REASON_LIMIT,
     )
 
