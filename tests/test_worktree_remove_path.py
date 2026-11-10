@@ -880,6 +880,35 @@ def test_a_hidden_record_is_read_and_occupies_the_target(rig: Rig, attrs: tuple[
     assert not wt.exists()
 
 
+def test_the_record_count_guard_still_refuses_a_registry_read_that_skips_a_record(rig: Rig) -> None:
+    """remove.ps1 keeps its record-count guard behind the registry. No registry input reaches it any
+    more, so a copy of the scripts whose registry lists records without -Force stands in for a
+    registry that regresses: the hidden record it skips is counted by the second listing."""
+    wt = rig.add(rig.scratch("count-guard"))
+    copy = rig.root / "copy"
+    copy_real_scripts(copy)
+    registry = copy / "scripts" / "coord" / "session-registry.ps1"
+    text = registry.read_text(encoding="utf-8")
+    assert text.count("-Filter *.json -File -Force") == 1
+    registry.write_text(
+        text.replace("-Filter *.json -File -Force", "-Filter *.json -File"), "utf-8"
+    )
+    script = copy / "scripts" / "worktree" / "remove.ps1"
+    hidden = rig.registry(wt) / ".claude" / "sessions" / "2.json"
+    subprocess.run(["attrib", "+h", str(hidden)], check=True, capture_output=True)
+
+    proc = rig.run("-Path", str(wt), script=script, repo_root=rig.primary)
+    assert proc.returncode != 0, _out(proc)
+    assert "the receipt examined 1 session record(s) and a second listing found 2" in _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: without the hidden record the two reads agree, and the copy removes the tree.
+    hidden.unlink()
+    proc = rig.run("-Path", str(wt), script=script, repo_root=rig.primary)
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
 def test_a_record_whose_name_holds_wildcard_characters_is_read_by_its_own_name(rig: Rig) -> None:
     """Vault BACKLOG #2985. The registry read each record with a positional Get-Content, which takes
     the name as a pattern, so [1].json was read as 1.json. Both files counted as records and both

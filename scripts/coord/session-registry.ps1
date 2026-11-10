@@ -168,7 +168,9 @@ function Get-SessionRecords {
     $out = @()
     foreach ($root in (Get-ClaudeConfigRoots -ConfigRoot $ConfigRoot)) {
         # -Force lists hidden and system records too: a record skipped here is a session no caller sees.
-        foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $root "sessions") -Filter *.json -Force -EA SilentlyContinue)) {
+        # -File counts what remove.ps1's and remove-scratch.ps1's second listings count: a directory is
+        # never a record.
+        foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $root "sessions") -Filter *.json -File -Force -EA SilentlyContinue)) {
             # A single malformed record must never take down a caller -- one of these runs in a
             # SessionStart hook, where a throw replaces the chat's whole starting context.
             $rec = $null
