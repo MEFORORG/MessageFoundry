@@ -205,18 +205,22 @@ def test_strict_validation_timing_starts_after_the_warm_up(monkeypatch: pytest.M
     warmed: list[str] = []
 
     def cold_warm_up(text: str) -> None:
-        warmed.append(text)
+        warmed.append("warm")
         now[0] += 10_000.0
+
+    def fast_validate(*args: Any, **kwargs: Any) -> ValidationResult:
+        warmed.append("validate")
+        return ValidationResult(True, "2.5.1", [])
 
     monkeypatch.setattr(dryrun, "time", SimpleNamespace(time=time.time, monotonic=lambda: now[0]))
     monkeypatch.setattr(dryrun, "warm_validation", cold_warm_up)
-    monkeypatch.setattr(dryrun, "validate", lambda *a, **k: ValidationResult(True, "2.5.1", []))
+    monkeypatch.setattr(dryrun, "validate", fast_validate)
 
     result = dry_run(
         _registry(lambda m: ["h"], {"h": lambda m: Send("out", m)}, strict=True), ADT_A01
     )
 
-    assert warmed, "the warm-up never ran"
+    assert warmed == ["warm", "validate"], "the warm-up must run, and before the validate"
     assert result.disposition is MessageStatus.RECEIVED, result.error
     assert result.strict_timed_out is False
 
@@ -239,21 +243,31 @@ def test_warm_validation_fills_what_a_first_validate_loads_lazily() -> None:
     assert validate_module._references.cache_info().currsize == expected
 
 
-def test_warm_validation_reads_the_msh_segment_only() -> None:
-    """The warm-up's cost does not grow with the body: a body over the segment cap, which
-    validate() would refuse unparsed, still warms its structure, because only MSH is parsed."""
+@pytest.mark.parametrize("lead", ["", " \n", "\r\n\t"])
+def test_warm_validation_parses_the_msh_segment_only(
+    monkeypatch: pytest.MonkeyPatch, lead: str
+) -> None:
+    """The warm-up's parse does not grow with the body: it is handed the MSH segment alone, after
+    leading whitespace as hl7apy strips it, and that segment still fills the reference table."""
     import importlib
 
-    from messagefoundry.parsing.peek import DEFAULT_MAX_SEGMENTS
-
     validate_module = importlib.import_module("messagefoundry.parsing.validate")
-    if not validate_module._choice_fix_needed():
-        pytest.skip("the issue 151 shim is off, so no reference table is loaded")
+    parsed: list[str] = []
+    real = validate_module._tolerant_parse
+
+    def recording(norm: str) -> Any:
+        parsed.append(norm)
+        return real(norm)
+
+    monkeypatch.setattr(validate_module, "_tolerant_parse", recording)
     validate_module._references.cache_clear()
 
-    validate_module.warm_validation(ADT_A01 + "NTE|1\r" * (DEFAULT_MAX_SEGMENTS + 1))
+    validate_module.warm_validation(lead + ADT_A01 + "NTE|1\r" * 50)
 
-    assert validate_module._references.cache_info().currsize == 1
+    assert len(parsed) == 1
+    assert parsed[0].startswith("MSH|") and "\r" not in parsed[0], parsed[0][:40]
+    expected = 1 if validate_module._choice_fix_needed() else 0
+    assert validate_module._references.cache_info().currsize == expected
 
 
 def test_warm_validation_never_raises_on_a_body_it_cannot_parse() -> None:

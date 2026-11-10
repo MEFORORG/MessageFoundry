@@ -50,9 +50,9 @@ never began (no worker thread ran it inside the timeout) is temporary, an ``AE``
 dry-run stays synchronous: it runs the same validate inline, measures its elapsed time against the
 same timeout, and reports a validate that took longer as an ``ERROR`` preview carrying the
 listener's text (BACKLOG #1689). Unlike the listener it does not abandon the validate at the
-timeout, so a slow fixture still takes its full validate time, and it warms ``hl7apy`` before its
-clock starts, so it never counts the cold loads a listener's first validate after a start counts
-(BACKLOG #5107). The operator resend
+timeout, so a slow fixture still takes its full validate time, and its clock does not count
+the cold ``hl7apy`` loads a listener's first validate does (``dryrun._strict_validation_error``
+says which). The operator resend
 (:func:`admit_resubmission`) honours the timeout too.
 
 **At least these live guards are deliberately NOT mirrored for the dry-run, each by design:**

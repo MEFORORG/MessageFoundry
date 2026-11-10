@@ -123,11 +123,13 @@ def _choice_fix_needed() -> bool:
     Keep :func:`is_choice_group` and ``_SEQUENCES_LABELLED_CHOICE`` when it is: the generator
     uses them.
     """
+    from hl7apy.consts import VALIDATION_LEVEL
     from hl7apy.exceptions import HL7apyException
+    from hl7apy.parser import parse_message
     from hl7apy.validation import Validator
 
     def accepted(raw: str) -> bool:
-        message = _tolerant_parse(raw)
+        message = parse_message(raw, find_groups=True, validation_level=VALIDATION_LEVEL.TOLERANT)
         try:
             Validator.validate(message)
         except HL7apyException:
@@ -192,7 +194,8 @@ def _references(name: str, classname: str, hl7_version: str) -> tuple[_Reference
 
 def _tolerant_parse(norm: str) -> Any:
     """hl7apy's parse of ``norm`` as :func:`validate` runs it, shared with :func:`warm_validation`
-    so the warm-up cannot drift from the parse it warms. Raises what ``parse_message`` raises."""
+    so the warm-up cannot drift from the parse it warms. Raises what ``parse_message`` raises.
+    Each caller imports ``hl7apy`` itself first, outside its own ``except``."""
     from hl7apy.consts import VALIDATION_LEVEL
     from hl7apy.parser import parse_message
 
@@ -292,8 +295,11 @@ def validate(
     the whole-body ``hl7apy`` parse the cap exists to bound, and it runs on a worker thread the
     listener's timeout cannot stop. ``docs/HL7-VALIDATION.md`` says so for operators.
     """
-    import hl7apy.parser  # noqa: F401 -- a broken install raises here, not as a parse refusal
+    # Imported here, outside any except, so a broken install raises rather than reading as a
+    # parse refusal; _tolerant_parse's own imports are then cache hits.
+    from hl7apy.consts import VALIDATION_LEVEL  # noqa: F401
     from hl7apy.exceptions import ChildNotFound, HL7apyException
+    from hl7apy.parser import parse_message  # noqa: F401
     from hl7apy.validation import Validator
 
     norm = normalize(raw).strip("\r")
@@ -360,22 +366,30 @@ def validate(
     return ValidationResult(ok=not errors, version=version, errors=errors)
 
 
+# How much of a body the warm-up reads to find its MSH segment: far past any real MSH.
+_WARM_HEAD_CHARS = 64 * 1024
+
+
 def warm_validation(raw: str | bytes) -> None:
     """Pay, once, what a first :func:`validate` of ``raw`` would pay before it validates anything.
 
     That is the cold ``hl7apy`` import, the cached :func:`_choice_fix_needed` probe, hl7apy's
     library for the message's version and the structure's cached reference table, so a caller that
     times :func:`validate` measures the validate and not the process's first use of it (BACKLOG
-    #5107). It parses the MSH segment alone, which is enough to learn the structure and version, so
-    the cost does not grow with the body. A body it cannot read is left for the timed validate to
+    #5107). It parses the first segment of a bounded head of ``raw``, leading whitespace stripped
+    as hl7apy strips it, which is enough to learn the structure and version, so neither the copy
+    nor the parse grows with the body. A body it cannot read is left for the timed validate to
     refuse; a broken ``hl7apy`` install still raises, as :func:`validate` would.
     """
+    # Imported here, outside any except, so a broken install raises rather than reading as a
+    # parse refusal; _tolerant_parse's own imports are then cache hits.
+    from hl7apy.consts import VALIDATION_LEVEL  # noqa: F401
+    from hl7apy.parser import parse_message  # noqa: F401
     from hl7apy.validation import Validator  # noqa: F401 -- imported for its load time
 
     choice_fix = _choice_fix_needed()
-    msh = normalize(raw).strip("\r").split("\r", 1)[0]
+    msh = normalize(raw[:_WARM_HEAD_CHARS]).lstrip().split("\r", 1)[0]
     try:
-        enforce_size_limits(msh, max_bytes=DEFAULT_MAX_MESSAGE_BYTES, max_segments=1)
         message = _tolerant_parse(msh)
         if choice_fix:
             _references(message.name, message.classname, getattr(message, "version", None))
