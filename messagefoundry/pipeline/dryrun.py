@@ -643,23 +643,54 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
 
 
 class UserCodeCalledSysExit(Exception):
-    """A Router, an ``accepts=`` predicate or a Handler called ``sys.exit()`` during a preview.
+    """A Router, an ``accepts=`` predicate or a Handler raised ``SystemExit``, ``sys.exit()`` called
+    at run time (vault BACKLOG #3134). The one definition, for the dry run and the live runner alike
+    (vault BACKLOG #5105): it lives here because ``wiring_runner`` imports this module, which cannot
+    import ``wiring_runner`` back, and ``wiring_runner`` re-exports it.
 
-    :func:`route_message` turns the ``SystemExit`` into this, so its callers' ``except Exception``
-    reports the message as ``ERROR`` rather than letting the exit leave ``dry_run`` and end
-    ``messagefoundry check`` with whatever code the script passed, 0 included, which reads as a pass.
-    The text is the live runner's own (``wiring_runner.UserCodeCalledSysExit``, vault BACKLOG #3134),
-    kept as a copy because ``wiring_runner`` imports this module, and
-    ``tests/test_user_code_system_exit.py`` fails if the two drift. It names an integer exit code and
-    nothing else: ``sys.exit("...")`` carries the author's text,
-    which could quote a field. It is raised outside the ``except`` that caught the exit, so the
-    ``SystemExit``, and that text, is not on its ``__context__`` either. ``KeyboardInterrupt`` is not
-    converted; it stops the preview."""
+    **In a preview**, :func:`route_message` turns the ``SystemExit`` into this, so its callers'
+    ``except Exception`` reports the message as ``ERROR`` rather than letting the exit leave
+    ``dry_run`` and end ``messagefoundry check`` with whatever code the script passed, 0 included,
+    which reads as a pass. It is raised outside the ``except`` that caught the exit, so the
+    ``SystemExit``, and its text, is not on its ``__context__`` either.
+
+    **In the live engine** it is converted at least where the engine runs that code in-process, so
+    the message takes the internal-error policy as for any other raise. At ``[sandbox].mode``
+    subprocess or isolated, the worker's ``_run_one`` converts at least a ``sys.exit()`` raised while
+    the Router, predicate or Handler runs, a generator Router's body included, and reports this
+    class's text as an error; the parent then raises ``SandboxError`` carrying it, and the worker
+    serves the next message. At least one case is not converted: at ``mode=off``, a ``sys.exit()`` in
+    the ``__str__`` of an exception user code raised, which the internal-error path renders on the
+    event loop.
+
+    **Why convert it at all:** a Router or Handler runs once per message, after the ACK, in a worker
+    thread, and a ``SystemExit`` there is a script habit in one piece of logic, not a request to stop
+    the engine. Left alone, asyncio re-raises it out of the event loop and every connection stops.
+    (``config/wiring.py`` refuses an ``env()`` cast's ``SystemExit`` the same way, BACKLOG #5105.)
+    Only ``SystemExit`` is converted: a ``KeyboardInterrupt`` or ``CancelledError`` that Router or
+    Handler code raises itself still escapes, and would still stop every connection, since in a
+    worker thread it is no Ctrl+C. Converting it too is not done here.
+
+    Redacted by construction: the text names an integer exit code and nothing else, since
+    ``sys.exit("...")`` carries the author's text, which could quote a field. Named without a leading
+    underscore because the name reaches operators, in a dead-letter reason and an alert detail."""
 
     @classmethod
     def from_exit(cls, exc: SystemExit) -> UserCodeCalledSysExit:
         code = exc.code
-        named = f" with code {code}" if isinstance(code, int) and not isinstance(code, bool) else ""
+        named = ""
+        # type() first, since isinstance() alone may read a user-defined ``__class__``; the
+        # isinstance() after it only narrows for mypy. bool cannot be subclassed, so ``is`` will do.
+        if issubclass(type(code), int) and isinstance(code, int) and type(code) is not bool:
+            # int.__int__, not f"{code}" or int(code): an int subclass's own __format__, __str__ or
+            # __int__ is user code, which could raise, exit again or print a field. The base slot
+            # copies the plain value without calling any of them.
+            try:
+                named = f" with code {int.__int__(code)}"
+            except ValueError:
+                # Past sys.get_int_max_str_digits() an int will not convert to text, and this
+                # must not raise: its callers convert a fault, they do not expect another.
+                named = " with an integer code too long to print"
         return cls(f"Router or Handler code raised SystemExit{named} (sys.exit() at run time)")
 
 

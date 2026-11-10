@@ -1649,7 +1649,8 @@ def resolve_env_settings(
     the failure is loud and actionable, not a raw traceback that names nothing and aborts on the
     first bad value (fail loud, never blank; review M-22). A cast is an arbitrary callable, so
     **every** exception it raises is caught and redacted, not just ``ValueError``/``TypeError``
-    (BACKLOG #1656; see the handler)."""
+    (BACKLOG #1656), and so is a ``SystemExit`` from ``sys.exit()`` in it (vault BACKLOG #5105; see
+    the handler)."""
     resolved: dict[str, Any] = {}
     missing: list[str] = []
     bad: list[str] = []
@@ -1679,7 +1680,7 @@ def resolve_env_settings(
                 if name in bool_defaults:
                     want = "bool"
                     got = _read_bool_setting(got, bool_defaults[name])
-            except Exception as exc:
+            except (Exception, SystemExit) as exc:
                 # BACKLOG #1656 limb 2: `Exception`, not `(ValueError, TypeError)`. A cast is
                 # an arbitrary callable, so it can raise anything -- a `KeyError` from a
                 # lookup-table cast was the measured case -- and a non-(ValueError, TypeError)
@@ -1687,8 +1688,15 @@ def resolve_env_settings(
                 # text. That re-opened, for every other exception type, exactly the leak
                 # BACKLOG #1183 closed for the ValueError arm. The redaction below is the
                 # whole point of catching it, so it has to cover every way a cast can fail.
-                # NEVER `BaseException`: a KeyboardInterrupt or SystemExit is not a cast
-                # failure and must keep propagating.
+                #
+                # `SystemExit` too (vault BACKLOG #5105): a cast that calls `sys.exit()` is a
+                # script habit in a setting reader, not a request to stop. Uncaught, it left a
+                # reload, and `messagefoundry check` ended with the cast's code, 0 included,
+                # which reads as a pass; `sys.exit("...")` can also carry the value it was
+                # handed. It is refused here like any other cast failure, its code and text
+                # withheld. NEVER `BaseException`: a KeyboardInterrupt (or a CancelledError)
+                # comes from outside the cast, an operator or the event loop stopping the work,
+                # and must keep propagating.
                 #
                 # NEVER the raw value: a MEFOR_VALUE_* env() setting carries store passwords
                 # and connector keys, and this string is raised at startup into the operator
