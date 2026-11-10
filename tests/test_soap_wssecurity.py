@@ -126,10 +126,10 @@ def test_opener_selection_prefers_client_cert(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_no_client_cert_uses_shared_opener_unchanged() -> None:
-    before = soap_mod._NO_REDIRECT_OPENER
+    before = soap_mod._shared_no_redirect_opener()
     dest = _dest()
-    assert dest._opener is soap_mod._NO_REDIRECT_OPENER
-    assert soap_mod._NO_REDIRECT_OPENER is before  # REST's shared singleton never mutated
+    assert dest._opener is soap_mod._shared_no_redirect_opener()
+    assert soap_mod._shared_no_redirect_opener() is before  # REST's shared singleton never mutated
 
 
 def test_client_cert_without_key_rejected() -> None:

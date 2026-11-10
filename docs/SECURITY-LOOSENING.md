@@ -1827,8 +1827,7 @@ count is above `0` (vault BACKLOG #2613).
   the shapes its own controls pin. It reads call shapes by name, not what the code evaluates to, so
   some such call sites pass it; ADR 0173 §4.3's note of 2026-11-04 and the docstrings of that
   file's relaxed-hop census say what it reads. REST, SOAP
-  and FHIR hand the guard no context there, so their refusal names the `[tls].crl_file` default
-  (ADR 0173 §13, *Left open*).)* The engine will tell you *which* connections have it set,
+  and FHIR hand the guard no context there.)* The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
