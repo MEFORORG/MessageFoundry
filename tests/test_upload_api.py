@@ -443,28 +443,26 @@ async def test_upload_parse_runs_in_a_worker_thread(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #5522: the multipart parse walks a body of up to ``[store].max_upload_bytes`` part by
-    part, so it runs in a worker thread, not on the event-loop thread. The parser is wrapped to
-    record the thread it ran on; the test body runs on the loop, so its thread is the one to avoid.
-    The upload must still succeed, which shows the wrapper was reached on the real path.
+    part, so it runs on the parser's own executor, not on the event-loop thread. The parser is
+    wrapped to record the thread it ran on; the test body runs on the loop, so its thread is the one
+    to avoid. The upload must still succeed, which shows the wrapper was reached on the real path.
 
     This pins where the per-part Python work runs, not that the loop never stalls: each whole-body
     ``split``, slice and ``partition`` is one C call that holds the GIL wherever it runs."""
     pytest.importorskip("psutil")
     import threading
 
-    from messagefoundry.api import app as api_app
-    from messagefoundry.api import create_app
-    from messagefoundry.api.multipart import FilePart
-    from messagefoundry.api.multipart import parse_single_file_upload as real_parse
+    from messagefoundry.api import create_app, multipart
 
+    real_parse = multipart.parse_single_file_upload
     loop_thread = threading.get_ident()
     seen: list[int] = []
 
-    def parse(*args: Any, **kwargs: Any) -> FilePart:
+    def parse(*args: Any, **kwargs: Any) -> multipart.FilePart:
         seen.append(threading.get_ident())
         return real_parse(*args, **kwargs)
 
-    monkeypatch.setattr(api_app, "parse_single_file_upload", parse)
+    monkeypatch.setattr(multipart, "parse_single_file_upload", parse)
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
@@ -479,39 +477,42 @@ async def test_upload_parse_runs_in_a_worker_thread(
     assert seen[0] != loop_thread, "the multipart parse ran on the event-loop thread"
 
 
-async def test_concurrent_upload_parses_hold_at_most_two_pool_threads(
+async def test_concurrent_upload_parses_hold_at_most_two_threads(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #5522: the parse runs on the default thread pool the pipeline's router and transform
-    workers share, and each parse holds transient copies of its body, so concurrent uploads take at
-    most two parse slots. Four uploads are sent at once and the parser is slowed so their parses
-    would overlap; the most that ever ran together must be two, and every upload must succeed."""
+    """BACKLOG #5522: each parse holds transient copies of its body, so the parser's executor runs
+    at most two at once. Four uploads are sent together. Each parse waits until a second one is
+    running (or a generous timeout passes), which makes the overlap certain rather than a matter of
+    timing, then lingers so a third would be seen if the bound let one in. The most that ever ran
+    together must be exactly two, and every upload must succeed."""
     pytest.importorskip("psutil")
     import threading
     import time
 
-    from messagefoundry.api import app as api_app
-    from messagefoundry.api import create_app
-    from messagefoundry.api.multipart import FilePart
-    from messagefoundry.api.multipart import parse_single_file_upload as real_parse
+    from messagefoundry.api import create_app, multipart
 
+    real_parse = multipart.parse_single_file_upload
     lock = threading.Lock()
+    two_running = threading.Event()
     running = 0
     peak = 0
 
-    def parse(*args: Any, **kwargs: Any) -> FilePart:
+    def parse(*args: Any, **kwargs: Any) -> multipart.FilePart:
         nonlocal running, peak
         with lock:
             running += 1
             peak = max(peak, running)
+            if running >= 2:
+                two_running.set()
         try:
-            time.sleep(0.3)
+            two_running.wait(timeout=10)
+            time.sleep(0.2)
             return real_parse(*args, **kwargs)
         finally:
             with lock:
                 running -= 1
 
-    monkeypatch.setattr(api_app, "parse_single_file_upload", parse)
+    monkeypatch.setattr(multipart, "parse_single_file_upload", parse)
 
     service = await _make_user(engine, Role.OPERATOR, name="op")
     app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
@@ -530,6 +531,36 @@ async def test_concurrent_upload_parses_hold_at_most_two_pool_threads(
         )
     assert [u.status_code for u in ups] == [200] * 4, [u.text for u in ups]
     assert peak == 2, f"{peak} upload parses ran at once; the bound is 2"
+
+
+async def test_the_new_multipart_caps_answer_400_and_413(engine: Engine, tmp_path: Path) -> None:
+    """BACKLOG #5522: through the route, too many parts is a 400 (the base ``MultipartError``) and an
+    oversized text field is a 413 (``MultipartTooLargeError``). Nothing is stored either way."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app, multipart
+
+    def body_of(parts: list[bytes]) -> bytes:
+        return b"".join(b"--B\r\n" + part + b"\r\n" for part in parts) + b"--B--\r\n"
+
+    file_part = (
+        b'Content-Disposition: form-data; name="file"; filename="a.hl7"\r\n\r\n' + BATCH.encode()
+    )
+
+    def field(i: int, size: int) -> bytes:
+        return f'Content-Disposition: form-data; name="f{i}"\r\n\r\n'.encode() + b"v" * size
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = {**await _login(c, "op"), "Content-Type": "multipart/form-data; boundary=B"}
+        many = body_of([file_part] + [field(i, 1) for i in range(multipart._MAX_PARTS)])
+        r = await c.post("/uploads", content=many, headers=h)
+        assert r.status_code == 400, r.text
+        big = body_of([file_part, field(0, multipart._MAX_FIELD_BYTES + 1)])
+        r = await c.post("/uploads", content=big, headers=h)
+        assert r.status_code == 413, r.text
+        assert (await c.get("/uploads", headers=h)).json()["files"] == []
 
 
 async def test_upload_over_quota_rejected_409_and_audited(engine: Engine, tmp_path: Path) -> None:

@@ -16,7 +16,10 @@ of scope for an operator file upload and are not accepted.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 # The leading ``(?<!\w)`` is a **ReDoS guard**, not a semantic filter (CodeQL py/polynomial-redos).
@@ -58,6 +61,14 @@ _MAX_PARTS = 16
 #: bounded by the body cap alone and was decoded into a ``str`` of up to the whole body. No upload
 #: surface reads a text field today, so this only has to admit a short form value.
 _MAX_FIELD_BYTES = 16 * 1024
+
+#: The upload parse's own executor (BACKLOG #5522). Not the loop's default executor: router and
+#: transform work runs there, and each parse holds several transient copies of its body. Two workers
+#: bound the threads, and those copies, that concurrent uploads can take in this process. Later
+#: parses queue here. A semaphore around ``asyncio.to_thread`` would not hold that bound, because a
+#: cancelled request (the request deadline) releases its slot while its thread keeps parsing. The
+#: bodies themselves are read before the parse and are not bounded by this.
+_PARSE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mefor-upload-parse")
 
 
 class MultipartError(ValueError):
@@ -127,10 +138,8 @@ def parse_multipart_form(
     ``max_file_bytes`` or a text field exceeds ``_MAX_FIELD_BYTES``. The boundary is trusted not to
     appear inside a part body (the RFC-2046 invariant every multipart parser relies on).
 
-    The function is synchronous and walks the whole body, so an async caller runs it in a worker
-    thread. That keeps the per-part work off the event loop, but each whole-body ``split``, slice
-    and ``partition`` is one C call that holds the GIL, so a large part still stalls the loop while
-    it is copied."""
+    The function is synchronous and walks the whole body, so an async caller goes through
+    :func:`parse_upload_off_loop`."""
     boundary = parse_boundary(content_type)
     if boundary is None:
         raise MultipartError("Content-Type is not multipart/form-data with a boundary")
@@ -174,7 +183,8 @@ def parse_multipart_form(
                 # ``curl -F 'file=<log.hl7'`` does, rather than as a file part.
                 raise MultipartTooLargeError(
                     f"multipart text field is {len(content)} bytes; the limit is "
-                    f"{_MAX_FIELD_BYTES}. Send a file as a file part with a filename"
+                    f"{_MAX_FIELD_BYTES}. Send a file as a file part with a plain filename "
+                    f'parameter (filename="...")'
                 )
             form.fields[name] = content.decode("utf-8", "replace")
     return form
@@ -189,3 +199,18 @@ def parse_single_file_upload(
     if not form.files:
         raise MultipartError("no file part in the multipart/form-data body")
     return form.files[0]
+
+
+async def parse_upload_off_loop(
+    content_type: str | None, body: bytes, *, max_file_bytes: int
+) -> FilePart:
+    """:func:`parse_single_file_upload` on :data:`_PARSE_EXECUTOR`, for an async caller. It raises
+    what that function raises. The per-part work leaves the event loop; each whole-body ``split``,
+    slice and ``partition`` is still one C call that holds the GIL while it runs."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _PARSE_EXECUTOR,
+        functools.partial(
+            parse_single_file_upload, content_type, body, max_file_bytes=max_file_bytes
+        ),
+    )

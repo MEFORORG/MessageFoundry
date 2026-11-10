@@ -226,7 +226,7 @@ from messagefoundry.api.models import (
 from messagefoundry.api.multipart import (
     MultipartError,
     MultipartTooLargeError,
-    parse_single_file_upload,
+    parse_upload_off_loop,
 )
 from messagefoundry.api.outlive import (
     CANCEL_GRACE_SECONDS,
@@ -8901,8 +8901,6 @@ def create_app(
             message_count=meta.message_count,
         )
 
-    upload_parse_slots = asyncio.Semaphore(2)
-
     @app.post("/uploads", response_model=UploadedFileInfo)
     async def upload_file(
         request: Request,
@@ -8931,17 +8929,11 @@ def create_app(
         us = _require_upload_store(request)
         body = await request.body()
         # BACKLOG #5522: the parse walks a body of up to [store].max_upload_bytes part by part, so
-        # it runs in a worker thread rather than on the event loop. The pipeline's router and
-        # transform workers share that pool, and each parse holds several transient copies of its
-        # body, so two slots bound the threads and the memory concurrent uploads can take.
+        # it runs on the parser's own two-thread executor rather than on the event loop.
         try:
-            async with upload_parse_slots:
-                part = await asyncio.to_thread(
-                    parse_single_file_upload,
-                    request.headers.get("content-type"),
-                    body,
-                    max_file_bytes=us.max_bytes,
-                )
+            part = await parse_upload_off_loop(
+                request.headers.get("content-type"), body, max_file_bytes=us.max_bytes
+            )
         except MultipartTooLargeError as exc:
             raise HTTPException(413, str(exc)) from None
         except MultipartError as exc:

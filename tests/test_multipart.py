@@ -415,7 +415,7 @@ def test_an_oversized_text_field_is_refused_as_too_large() -> None:
     """A non-file field past ``_MAX_FIELD_BYTES`` is refused with the 413 subclass. Before the cap a
     text field was bounded only by the body cap and decoded whole into a ``str``."""
     big = _field("note", b"x" * (multipart._MAX_FIELD_BYTES + 1))
-    with pytest.raises(MultipartTooLargeError, match="text field .* with a filename"):
+    with pytest.raises(MultipartTooLargeError, match="text field .* plain filename parameter"):
         parse_single_file_upload(
             f"multipart/form-data; boundary={_B}", _body([_FILE_PART, big]), max_file_bytes=1024
         )
