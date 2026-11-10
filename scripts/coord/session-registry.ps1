@@ -168,8 +168,7 @@ function Get-SessionRecords {
     $out = @()
     foreach ($root in (Get-ClaudeConfigRoots -ConfigRoot $ConfigRoot)) {
         # -Force lists hidden and system records too: a record skipped here is a session no caller sees.
-        # A directory named *.json is listed too, and reads as unreadable below, so a caller about to
-        # destroy something refuses on it rather than skip it.
+        # A directory named *.json is listed too, and reads as unreadable below.
         foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $root "sessions") -Filter *.json -Force -EA SilentlyContinue)) {
             # A single malformed record must never take down a caller -- one of these runs in a
             # SessionStart hook, where a throw replaces the chat's whole starting context.
