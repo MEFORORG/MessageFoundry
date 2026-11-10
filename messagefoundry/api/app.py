@@ -2226,8 +2226,9 @@ class _LoadedConfig:
     registry: Registry | None
     #: The ``env()`` values ``registry`` resolves against, taken with it, so the start row's
     #: loosenings resolve a DATABASE hop's ``env()`` dialect as ``GET /security/posture`` does.
-    #: ``None`` when the snapshot did not take them, as a reload's row does not. They include
-    #: secret values, so they are kept out of the repr and of equality.
+    #: A reload's are the values it swapped in (vault BACKLOG #3814). ``None`` when the snapshot
+    #: did not take them. They include secret values, so they are kept out of the repr and of
+    #: equality.
     env_values: Mapping[str, Any] | None = field(default=None, repr=False, compare=False)
 
     @classmethod
@@ -2265,7 +2266,7 @@ class _LoadedConfig:
     def of(cls, outcome: ReloadOutcome) -> _LoadedConfig:
         """What an applied reload itself loaded, read off its own outcome (vault BACKLOG #2257), so
         the row names that reload's graph whatever the engine runs by the time it is written."""
-        return cls._of(outcome.directory, outcome.registry, outcome.fingerprint)
+        return cls._of(outcome.directory, outcome.registry, outcome.fingerprint, outcome.env_values)
 
     def swapped(self, engine: Engine) -> bool:
         """Whether the engine's graph is no longer the one this snapshot read: a reload has
@@ -2454,8 +2455,13 @@ async def _record_reload_audit(
     client: str | None = None,
     failed_steps: Sequence[str] = (),
     extra: Mapping[str, object] | None = None,
+    loosenings: Callable[[], Awaitable[list[str] | None]] | None = None,
 ) -> list[str]:
     """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
+
+    ``loosenings``, when passed, is awaited inside the write and its result recorded under the
+    ``loosenings`` key, after ``extra``. A cluster convergence reload passes it (vault BACKLOG
+    #3814), so the read waits out a cancel with the row rather than losing the row before it.
 
     The start writes its ``config_loaded`` row through here too (vault BACKLOG #2597), passing the
     action and its ``loosenings`` in ``extra``. Every row names its cluster node, and the
@@ -2522,6 +2528,8 @@ async def _record_reload_audit(
 
     async def write() -> None:
         nonlocal detail
+        # Before the superseded check below, so no await falls between that check and the write.
+        listed = {"loosenings": await loosenings()} if loosenings is not None else {}
         superseded = False
         config_version: int | None = None
         state: _LoadedConfig | None
@@ -2554,6 +2562,7 @@ async def _record_reload_audit(
                 **({"config_version": config_version} if config_version is not None else {}),
                 **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
                 **(extra or {}),
+                **listed,
                 **({"superseded": True, _BASELINE_UNCHECKED: True} if superseded else {}),
                 **digest,
             }
@@ -3374,7 +3383,8 @@ async def _graph_loosenings(
     row and a cluster convergence reload's ``config_reload`` row record them (vault BACKLOG #2597,
     #3814).
 
-    It never raises: both rows are written after the graph is live. A list it cannot read is
+    It raises no ``Exception``, a cancellation aside: both rows are written after the graph is
+    live. A list it cannot read is
     ``None``, which says unknown, never an empty list, which would say none are active. ``action``
     names the row in the log line for that case."""
     try:
@@ -12415,6 +12425,8 @@ def create_managed_app(
         # against the newest row that did land, normally the initiator's, which names the same
         # bytes where every node shares one config directory. A change goes unreported only if
         # that row was lost too; otherwise the cost is at most a false config_changed.
+        posture_stashed = False  # set once the loosenings reader's settings are stashed
+
         async def _audit_convergence_reload(outcome: ReloadOutcome) -> None:
             failed = outcome.failed_steps
             # A row with no digest would be the newest baseline and leave the next start nothing
@@ -12425,20 +12437,21 @@ def create_managed_app(
             no_digest = (
                 "config_fingerprint" in failed or digest_coverage(outcome.fingerprint) is None
             )
+
             # The row names the digest judged above, not the engine's at the write: a later
             # reload marks it superseded instead (vault BACKLOG #3765, item 19).
-            # The loosenings of the graph this reload loaded, as a start row records its own, so a
-            # convergence that brings one in is named on a row (vault BACKLOG #3814). No operator
-            # asked for this reload, so no request or answer names them. The env() values are the
-            # runner's only while it still runs this graph; without them a hop whose dialect or
-            # url is an env() keeps its unresolved marker.
-            rr = engine.registry_runner
-            env_values = (
-                rr.env_values if rr is not None and rr.registry is outcome.registry else None
-            )
-            loosenings = await _graph_loosenings(
-                app.state, engine, outcome.registry, env_values, "config_reload"
-            )
+            # The loosenings of the graph this reload loaded, read against the env() values it
+            # swapped in, as a start row records its own (vault BACKLOG #3814). Read inside the
+            # row's write, so a cancel waits for the row as it does for the write. A convergence
+            # inside engine.start() can run before the settings the reader needs are stashed; its
+            # list would leave settings-scoped loosenings out, so it is recorded as unknown.
+            async def _loosenings() -> list[str] | None:
+                if not posture_stashed:
+                    return None
+                return await _graph_loosenings(
+                    app.state, engine, outcome.registry, outcome.env_values, "config_reload"
+                )
+
             await _record_reload_audit(
                 engine,
                 actor=_CONVERGENCE_ACTOR,
@@ -12446,9 +12459,9 @@ def create_managed_app(
                 failed_steps=failed,
                 extra={
                     "initiator": _CONVERGENCE_INITIATOR,
-                    "loosenings": loosenings,
                     **({_BASELINE_UNCHECKED: True} if no_digest else {}),
                 },
+                loosenings=_loosenings,
             )
 
         async def _audit_convergence_failure(
@@ -12758,6 +12771,8 @@ def create_managed_app(
             # fallback for an app that sets the stash with no service attached.
             if auth_settings is not None:
                 app.state.auth_settings = auth_settings
+            # A convergence row reads the same stashes for its loosenings (vault BACKLOG #3814).
+            posture_stashed = True
             # The start's config_loaded row (vault BACKLOG #2597), as early as its readers allow: the
             # last stash the loosenings reader needs is the one above, and the graph is already
             # serving, so a later startup step that aborts must not leave the start unrecorded.

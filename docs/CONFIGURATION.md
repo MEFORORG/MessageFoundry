@@ -1954,9 +1954,9 @@ started together, can each raise it; the alert list folds them into one instance
   between and becomes the baseline.
 - A convergence reload writes its own `config_reload` row, in the shape an operator reload writes
   (vault BACKLOG #3076). Its actor is `system:cluster-convergence` and its `initiator` is
-  `cluster_convergence`, and it also carries `loosenings`, as a start's row does (vault BACKLOG
-  #3814). So the store's newest baseline names the graph the node converged on,
-  whether the reload lands before or after the start's row. A convergence row that could not take
+  `cluster_convergence`. So the store's newest baseline names the graph the node converged on,
+  whether the reload lands before or after the start's row. What its `loosenings` key holds is in
+  [SECURITY.md](SECURITY.md#audit-1). A convergence row that could not take
   a fingerprint is marked `baseline_unchecked`, so a later start passes over it. One that took a
   partial fingerprint is a baseline like any other. The row names the fingerprint that reload
   took, and is marked `superseded` when a later reload moved the engine on first.

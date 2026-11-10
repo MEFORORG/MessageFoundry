@@ -7175,10 +7175,12 @@ unseen. A reload whose swap lands after that read leaves the alert resolved whil
 runs. A reload onto a loosened graph after a clean start raises nothing until a later start. A
 reload onto a clean graph resolves nothing either. `GET /security/posture` reads the live graph, so
 read that for the current posture. A cluster convergence reload's `config_reload` row, under
-`system:cluster-convergence`, names the loosenings of the graph it loaded in its `loosenings` key,
-as a start's row does, or `null` when they could not be read, so a loosening a convergence brings
-in is on a row; the detector still does not read it (vault BACKLOG #3814). An operator reload's
-row has no such key: its loosenings are what `GET /security/posture` reads once it is live.
+`system:cluster-convergence`, carries a `loosenings` key read off the graph that reload loaded,
+as a start's row does, and the detector does not read it either (vault BACKLOG #3814). The key is
+`null`, which says unknown, at least when the list could not be read and when the reload ran
+inside the start before the settings it reads were in place. A convergence whose row is lost
+writes no list at all. An operator reload's row has no such key, so until a later start's row
+lists them, no row names the loosenings an operator reload brings in.
 
 **`posture_loosened` may not name a given switch, the layer's own included.** Its sentence gives the
 count of every loosening, then their names, cut at 200 characters and ending in `...`. The
