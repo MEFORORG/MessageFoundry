@@ -938,6 +938,13 @@ count is above `0` (vault BACKLOG #2613).
   `ad_connect_timeout` stretches it too. Each outage pass still logs a WARNING and writes an
   `auth.ad_reconcile_skipped` audit row; only the page waits. The table row above gives the load's
   bound.
+- **What you lose, the unreachable-account page:** the page about one account the directory keeps
+  failing for (vault BACKLOG #3100) counts that account's own probes, not outage passes, so its
+  least delay runs from that account's first failing probe, not from the first outage pass. An
+  `ad_reconcile_outage_passes` above `3`, a longer
+  `ad_session_recheck_seconds`, or an `ad_session_recheck_max_users` below `200` in an estate larger
+  than the budget delays it. The `ad_reconcile_outage_passes` row of
+  [CONFIGURATION.md](CONFIGURATION.md) states when it comes.
 - **Not named:** fewer strikes, a larger budget, or a higher brake threshold. Each ends sessions
   sooner or ends more of them, and none keeps a session the directory withdrew, though a larger
   budget can stretch the outage page, as the bullet above says. Nor is a shorter
@@ -1920,12 +1927,22 @@ count is above `0` (vault BACKLOG #2613).
 - **Compensating controls:** treat the server's access logs as PHI-bearing, with the access control and
   retention that implies, and confirm who can read any proxy log on the path.
 - **It is never silent:** a WARNING at every construction naming the connection, never an id, a
-  `fhir-update-path-form` line in `messagefoundry check` naming every connection that sets it, and
+  `fhir-update-path-form` line in `messagefoundry check` naming the connections listed below, and
   an `update_url_form` entry in `security_loosenings()`, which `GET /security/posture` shows with
-  the same connection names (vault BACKLOG #2571). The last two read one list. That list holds a
-  connection whose `update_url_form` is written as the literal `"path"`. A value supplied
-  through `env()` is not resolved when the list is built, so such a connection is not named by
-  either.
+  the connections its own reading names (vault BACKLOG #2571). The last two apply one reader. A value of
+  `update_url_form`, `interaction`, `conditional` or a Bundle entry list supplied through `env()` is
+  read too. The posture route resolves it against the engine's current environment values, and
+  names the connection plainly only if it resolves to the path form on an update. `check` resolves
+  none, so the two can name different sets. A connection with a value the reading cannot resolve is
+  named and marked possibly. At least two kinds are left off instead. One is a connection whose
+  known values rule the path form out: a form other than `"path"`, which puts no path form in
+  force, or one of these, beside which the build refuses the path form: a `transaction` or `batch`
+  interaction, a conditional other than `if-match`, an interaction other than `update` with no
+  conditional, or Bundle entry lists that are set. The
+  other is a `deployed=False` connection whose `update_url_form` is an `env()` value, because it is
+  never built and that value is never read. A `deployed=False` connection with a literal `"path"`
+  is named, marked possibly where its interaction, conditional or an entry list is an `env()`
+  value.
 - **What it cannot do, and where it is NOT reported:** it is **advisory only**, on the precedent of
   `tls_allow_expired`, the other per-connection interoperability relaxation. No posture gate keys on it,
   and `[security].enforcement = enforce` does not refuse it. It is not in the

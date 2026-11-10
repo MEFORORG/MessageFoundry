@@ -137,6 +137,37 @@ captured message bodies** (so it's safe to hand to a reviewer or an AI session).
 python -m tee export --db ./tee.db --naks-only --since 24h --out ./tee-review.json
 ```
 
+### What `--out` does to the file
+
+`export --out`, `anonymize-captures --out` and `compare --out` share one writer,
+`_write_owner_only` in `tee/__main__.py`, which is the source of record. At least these
+consequences follow from it:
+
+* **On POSIX a new file's mode is never wider than `0600`**, whatever the umask.
+* **On POSIX an existing file is replaced, not written into.** A read-only (`0444`) file is
+  overwritten, a hard link at the path is broken (the other name keeps the old contents), and a
+  symbolic link at the path is replaced. On POSIX, a target that resolves, through any link, to a
+  character device, or to anything else that is neither a regular file nor a directory and that
+  this account owns, such as a pipe, is opened for writing in place instead of replaced; the open
+  can be refused, for example for a socket, and that is an error and exit 1. These hold for all
+  three commands.
+* **`export` and `anonymize-captures` write LF line endings on every OS**, Windows included. Before
+  vault BACKLOG #3166 a Windows `export` file ended its lines in CRLF.
+* **On Windows, `export` and `anonymize-captures` write an existing file in place**, as `write_text`
+  did before #3166. It keeps its access list and owner, whatever they hold, so a file another
+  account created there first stays that account's. A link to a file at the path is followed and
+  the file it names is written in place. The write is not atomic, so a failure part way leaves the
+  file truncated or partly written. A file the open refuses is an error and exit 1, never replaced:
+  at least one this account may not write, a read-only, Hidden or System one, a directory, and one
+  another process holds open without write sharing. A new file takes its folder's access list.
+* **compare replaces an existing regular file; the replace can be refused, for example for a
+  read-only file on Windows.** On Windows the report takes its folder's access list, whatever list
+  the old file had, so an access list hardened on the old file is not kept, and a link to a regular
+  file is replaced. On Windows compare opens a target that resolves, through any link, to anything
+  that is neither a regular file nor a directory, such as NUL or CON, for writing in place instead
+  of replacing it; the open can be refused, for example for a named pipe, and that is an error and
+  exit 1. It writes the platform's line endings.
+
 ### Purge
 
 `python -m tee purge` clears the log DB and reclaims disk (`VACUUM`). With no `--before` it purges

@@ -425,8 +425,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         description="Run validate + dryrun (+ advisory ruff/mypy) as a commit/CI gate. The dryrun "
         "sub-check previews under [pipeline].snapshot_on_send (copy-on-Send, ADR 0104) resolved "
         "best-effort from the settings the posture check reads: this instance's "
-        "messagefoundry.toml, or with no file, the MEFOR_* environment when MEFOR_AI_ENVIRONMENT "
-        "names the instance. When no settings load, the preview falls back to the "
+        "messagefoundry.toml, or with no file, the MEFOR_* environment when --env or "
+        "MEFOR_AI_ENVIRONMENT names the instance. When no settings load, the preview falls back to the "
         "setting's own default (ON) — matching the default engine, never a silent OFF (#230). "
         "Under --project-root with no --service-config, check reads the project root's "
         "messagefoundry.toml, else the config dir's, while serve with the same flags reads the "
@@ -438,7 +438,14 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "reaches it, fails the settings checks, as it stops serve.",
     )
     check.add_argument("--config", default="samples/config", help="config modules directory")
-    _add_anchor_flags(check)
+    _add_anchor_flags(
+        check,
+        env_help="active environment NAME, read as serve --env reads it (ADR 0050 AC-6): it selects "
+        "environments/<env>.toml values and overrides [ai].environment, above the file and "
+        "MEFOR_AI_ENVIRONMENT, so the settings checks apply serve's posture refusal to that name, and "
+        "with no messagefoundry.toml they grade that instance instead of skipping. With no --env, "
+        "check adopts no required-env refusal.",
+    )
     check.add_argument(
         "--messages", default=None, help="HL7 fixtures dir (dryrun gates when it has *.hl7)"
     )
@@ -1357,13 +1364,16 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     return parser, _DISPATCH
 
 
-def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
+def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str | None = None) -> None:
     """Add the project-root / active-env / service-config trio to an OFFLINE subcommand (ADR 0050 §3).
 
     ``validate``/``graph``/``dryrun``/``check`` carried only ``--config`` before, so the commit/CI gate
     could resolve a DIFFERENT environment view than ``serve`` (review C3). These flags let the gate
     anchor the same bundle root and select the same active environment ``serve`` does — value
     resolution only, WITHOUT adopting serve's required-active-env / explicit-posture refusal (AC-6).
+    ``check`` is the exception for ``--env``, by ADR 0050's amended AC-6: its settings legs read it
+    as ``serve --env`` does, so its ``posture`` leg judges that name (vault BACKLOG #2355).
+    ``env_help`` replaces the ``--env`` help for it.
     """
     p.add_argument(
         "--project-root",
@@ -1375,7 +1385,8 @@ def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--env",
         default=None,
-        help="active environment NAME (selects environments/<env>.toml values). With no --env the gate "
+        help=env_help
+        or "active environment NAME (selects environments/<env>.toml values). With no --env the gate "
         "behaves exactly as before (no env values loaded); it never adopts serve's required-env refusal.",
     )
     p.add_argument(
@@ -1386,7 +1397,9 @@ def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
     )
 
 
-def _resolve_offline_anchor(args: argparse.Namespace) -> tuple[str, str | None] | int:
+def _resolve_offline_anchor(
+    args: argparse.Namespace, *, defer_missing_service_config: bool = False
+) -> tuple[str, str | None] | int:
     """Apply the ADR 0050 project-root anchor to an offline subcommand's paths, and fail loud on the
     one scoped missing-value-file case. Returns ``(config_dir, service_config)`` resolved under the
     root, or a non-zero exit code (already reported to stderr) on the hard failure.
@@ -1419,7 +1432,18 @@ def _resolve_offline_anchor(args: argparse.Namespace) -> tuple[str, str | None] 
     # Fail loud only under an EXPLICIT root with an env name AND an env-referencing graph AND no file
     # (ADR 0050 §2, ratified). Without --env there is no value file to require; without --project-root
     # the silent-empty default is preserved; a zero-env() graph is never failed.
-    if args.project_root is not None and args.env is not None and root is not None:
+    #
+    # defer_missing_service_config is check's: a --service-config that is no file stops serve before
+    # its value-file check, and check's settings legs fail on it in serve's words. The value-file
+    # check here would name a guessed directory instead, so it is left to them.
+    # exists(), not is_file(): serve's load_settings tests exists(), so it reads a device such as
+    # NUL as an empty file, and the value-file check still applies there.
+    deferred = (
+        defer_missing_service_config
+        and service_config is not None
+        and not Path(service_config).exists()
+    )
+    if args.project_root is not None and args.env is not None and root is not None and not deferred:
         env_dir = _env_dir_name(service_config)
         rc = _check_env_file_present(config_dir, root, args.env, env_dir)
         if rc is not None:
@@ -1433,7 +1457,16 @@ def _env_dir_name(service_config: str | None) -> str:
     Read from the resolved ``service_config`` TOML (a tiny, settings-free tomllib read) so the offline
     AC-3 check honors a CUSTOM ``dir = "envs"`` instead of false-positive-failing on the hardcoded
     literal. Best-effort: no/unreadable/malformed file -> the default. The full ``load_settings`` is
-    deliberately avoided here (the offline gate stays settings-free, like validate/graph/dryrun)."""
+    deliberately avoided here (the offline gate stays settings-free, like validate/graph/dryrun).
+
+    ``MEFOR_ENVIRONMENTS_DIR`` beats the file, as it does in ``serve``'s ``load_settings`` (vault
+    BACKLOG #2355). The file read is ``service_config`` alone: under ``--project-root`` with no root
+    file, ``check``'s settings legs read the config dir's file, which this does not."""
+    from messagefoundry.config.settings import environments_dir_named_by_env
+
+    named = environments_dir_named_by_env()
+    if named is not None:
+        return named
     if service_config is None:
         return "environments"
     try:
@@ -1444,7 +1477,8 @@ def _env_dir_name(service_config: str | None) -> str:
     env_section = data.get("environments")
     if isinstance(env_section, dict):
         name = env_section.get("dir")
-        if isinstance(name, str) and name:
+        if isinstance(name, str):
+            # A blank dir is taken as given, as serve's loader takes it.
             return name
     return "environments"
 
@@ -1470,9 +1504,8 @@ def _check_env_file_present(config_dir: str, root: Path, env_name: str, env_dir:
     if not env_file.is_file():
         print(
             f"error: the graph references env() but no value file was found at {env_file} under the "
-            f"explicit --project-root {str(root)!r} for --env {env_name!r}. Create "
-            f"{env_dir}/{env_name}.toml under the project root (or drop --project-root to use the "
-            "working directory).",
+            f"explicit --project-root {str(root)!r} for --env {env_name!r}. Create that file (or drop "
+            "--project-root to use the working directory).",
             file=sys.stderr,
         )
         return 2
@@ -12125,7 +12158,7 @@ def _check(args: argparse.Namespace) -> int:
     """Commit/CI gate: exit 0 iff every *required* check passed (advisory failures only print)."""
     from messagefoundry.checks import run_checks
 
-    resolved = _resolve_offline_anchor(args)
+    resolved = _resolve_offline_anchor(args, defer_missing_service_config=True)
     if isinstance(resolved, int):
         return resolved
     config_dir, service_config = resolved
@@ -12149,6 +12182,8 @@ def _check(args: argparse.Namespace) -> int:
         # BACKLOG #3063 item 2: _resolve_offline_anchor picked the project root's file, which serve
         # with the same flags may not read; run_checks names the difference on each settings line.
         service_config_from_root=args.service_config is None and service_config is not None,
+        # Vault BACKLOG #2355: the settings legs read --env as serve reads its own.
+        env=args.env,
     )
     if args.json:
         _print_json(report.to_json(), compact=True)

@@ -2424,10 +2424,9 @@ class AuthStore(Protocol):
     #
     # ADR 0197 Amendment A: ``password_generated`` is REQUIRED, with no default, for the reason
     # ``create_user`` gives: the generated paths pass True and every holder-chosen path passes False.
-    # ``require_way_past`` makes the write CONDITIONAL on a way past the sign-in lock, in the same
-    # transaction as the write: TOTP on with a secret, or (wave 2) a passkey recorded as
-    # discoverable, read from the set the account's seal covers. So an ``admin_reset_mfa`` or a
-    # passkey removal that lands between the caller's check and this write makes it match no row.
+    # ``require_way_past`` makes the write CONDITIONAL on a way past the sign-in lock: a TOTP as
+    # ``judge_totp``'s ``TotpJudgement`` counts it, or (wave 2) a passkey recorded as discoverable,
+    # read in the same transaction as the write from the set the account's seal covers.
     # Returns whether a row was written; a conditional caller refuses on False.
     async def set_password(
         self,
@@ -2436,8 +2435,7 @@ class AuthStore(Protocol):
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool: ...
@@ -2632,8 +2630,7 @@ class AuthStore(Protocol):
         user_id: str,
         *,
         now: float | None = None,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
     ) -> bool: ...
 
@@ -2673,19 +2670,20 @@ class AuthStore(Protocol):
     # ``require_way_past`` (ADR 0197 Amendment A, wave 2): delete only while the account keeps a way
     # past the sign-in lock after the delete (TOTP, or another discoverable passkey), judged in the
     # delete's own transaction with the account row held. False when refused or when no row matched.
-    # ``totp_usable`` (BACKLOG #3422) is the caller's rule for what an OPENED TOTP secret is
-    # (``TotpState``); the conditional writes count TOTP as a way past unless it is a KNOWN refusal,
-    # so an unknown one counts as the plain enabled-TOTP rule counts it. The same keyword on
-    # ``set_password``. ``passkey_counts`` (BACKLOG #3937) is the caller's rule for which passkey
-    # counts, the auth service's narrowing to the configured relying party; ``None`` is
-    # ``passkey_is_way_past`` alone. The same keyword on ``set_password`` and ``disable_totp``.
+    # ``require_way_past`` IS the caller's rule for what an OPENED TOTP secret is (``TotpState``,
+    # BACKLOG #3422), one parameter, so a condition with no rule cannot be written (BACKLOG #3948
+    # finding 14); ``None`` is an unconditional write. The conditional writes count TOTP as a way
+    # past unless it is a KNOWN refusal, so an unknown one counts as the plain enabled-TOTP rule
+    # counts it. The same keyword on ``set_password`` and ``disable_totp``. ``passkey_counts``
+    # (BACKLOG #3937) is the caller's rule for which passkey counts, the auth service's narrowing to
+    # the configured relying party; ``None`` is ``passkey_is_way_past`` alone. The same keyword on
+    # ``set_password`` and ``disable_totp``.
     async def delete_webauthn_credential(
         self,
         user_id: str,
         credential_id_hash: str,
         *,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
     ) -> bool: ...
 
@@ -2737,10 +2735,10 @@ class AuthStore(Protocol):
     # SIGN-IN lock the TOTP's usability is judged before the lock, on a cell the locked row must
     # still hold (``store.escalation_verdict``, BACKLOG #3422), and a passkey the caller's
     # ``passkey_escalates`` counts escalates it too, from the set read in the same transaction
-    # (``store.escalation_passkeys``, BACKLOG #3937 item 8). Returns ``(attempts, just_locked,
-    # cycles)``; ``just_locked`` is decided INSIDE that atomic section and must not be recomputed
-    # outside it, where it is only the stale read again. See ``store.next_lockout_state`` for the
-    # policy.
+    # (``store.escalation_passkeys``, BACKLOG #3937 item 8). Returns a ``LockoutIncrement``
+    # (``attempts``, ``just_locked``, ``cycles``, ``totp_state``); ``just_locked`` is decided
+    # INSIDE that atomic section and must not be recomputed outside it, where it is only the stale
+    # read again. See ``store.next_lockout_state`` for the policy.
     async def increment_login_failure(
         self,
         user_id: str,

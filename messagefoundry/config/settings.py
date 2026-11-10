@@ -8007,6 +8007,18 @@ def environment_named_by_env(environ: Mapping[str, str] | None = None) -> str | 
     return value if isinstance(value, str) and value.strip() else None
 
 
+def environments_dir_named_by_env(environ: Mapping[str, str] | None = None) -> str | None:
+    """The ``[environments].dir`` that ``MEFOR_ENVIRONMENTS_DIR`` sets, or ``None`` when it is unset.
+
+    Read through :func:`_env_overrides`, as :func:`load_settings` reads it, and returned as given, a
+    blank value included, since the loader takes that too. The offline subcommands locate
+    ``<dir>/<env>.toml`` without loading settings, so they need the variable that beats the file's
+    ``dir`` in ``serve``'s settings (vault BACKLOG #2355)."""
+    environ = os.environ if environ is None else environ
+    value = _env_overrides(environ).get("environments", {}).get("dir")
+    return value if isinstance(value, str) else None
+
+
 def insecure_bind_escape(settings: ServiceSettings, *, flag: bool = False) -> bool:
     """The cleartext-listener escape, folded the one way every caller folds it (ADR 0118, BACKLOG
     #1672): ``serve --allow-insecure-bind`` OR ``[security].require_encryption_for_remote = false``.
@@ -9612,7 +9624,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"the directory reconciler runs every {interval} s, less often than the "
                     f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}. The "
                     f"interval also delays the page about a directory outage, which comes after "
-                    f"{floor}",
+                    f"{floor}, and the page about one account the directory keeps failing for, "
+                    f"which comes after at least {run} of that account's own probes running "
+                    f"fail, at least {(run - 1) * interval} s after its first such probe",
                 )
             )
         if run > _auth_default("ad_reconcile_outage_passes"):
@@ -9625,7 +9639,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "configured interval. Until it does, a directory account disabled or deleted "
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
                     "per pass to show for it. The same count bounds one account the directory "
-                    "keeps failing for while it answers others, so that page waits longer too",
+                    "keeps failing for, so that page waits longer too",
                 )
             )
         strikes = auth.ad_session_recheck_strikes
@@ -9647,7 +9661,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "a reconciler pass probes fewer accounts than the default of "
                     f"{_auth_default('ad_session_recheck_max_users')}, so a larger estate takes "
                     f"more passes to cover, and {late}. The smaller sample is also the breaker's "
-                    "denominator, so a smaller wave of revocations aborts the pass",
+                    "denominator, so a smaller wave of revocations aborts the pass. In an estate "
+                    "larger than the sample each account is probed less often, so the page about "
+                    "one account the directory keeps failing for, which counts that account's "
+                    "probes, comes more passes later too",
                 )
             )
         brake = (
@@ -10250,9 +10267,9 @@ def security_loosenings(
     ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24),
     ``revocation_attested_hops`` declares ``tls_revocation_attested`` (ADR 0173), and
     ``path_form_fhir_hops`` is an outbound ``FHIR()`` connection that sets
-    ``update_url_form="path"`` (vault BACKLOG #2571), and ``ech_cleartext_sidecar_hops`` is a
-    ``REST`` outbound whose ECH sidecar is an ``http://`` URL (ADR 0139). They arrive as
-    plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
+    ``update_url_form="path"``, or may through an ``env()`` value (vault BACKLOG #2571), and
+    ``ech_cleartext_sidecar_hops`` is a ``REST`` outbound whose ECH sidecar is an ``http://`` URL
+    (ADR 0139). They arrive as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
     connections; ``expiry_relaxed_hops``, which walks outbound and the inbound REMOTEFILE pollers;
@@ -10260,8 +10277,11 @@ def security_loosenings(
     which walks outbound and ``FhirLookup``; ``unverified_generic_db_hops``, which walks inbound as well as
     outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads;
     ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``;
-    ``path_form_fhir_updates``, which walks outbound and already returns plain names;
-    ``ech_cleartext_sidecar_hops``, which walks the ``REST`` outbounds). A caller that
+    ``path_form_fhir_updates``, which walks the ``FHIR()`` outbounds;
+    ``ech_cleartext_sidecar_hops``, which walks the ``REST`` outbounds). At least the path-form,
+    ECH and generic-DATABASE names can carry a ``possibly`` marker in parentheses after the name,
+    where the caller could not resolve an ``env()`` value, so an entry is not always a bare
+    connection name. A caller that
     genuinely has no graph — ``messagefoundry security show``, which reads a
     settings file and never loads the connection config — passes empty sequences and SAYS SO in its
     output, rather than reporting a subset as if it were everything.
@@ -10912,11 +10932,12 @@ def security_loosenings(
         out.append(
             (
                 "update_url_form",
-                f"{len(path_form_fhir_hops)} FHIR connection(s) send updates in the PATH form "
-                f"({named}) — each update puts the message's resource id in the request URL, "
-                "so the receiving server's access log, and any proxy log on the path, holds "
-                "it; an id can be a medical record number or another identifier. The shipped "
-                "transaction form keeps the id out of the URL",
+                f"{len(path_form_fhir_hops)} FHIR connection(s) send updates in the PATH form, "
+                f"or may where marked possibly ({named}) — each such update puts the message's "
+                "resource id in the request URL, so the receiving server's access log, and any "
+                "proxy log on the path, holds it; an id can be a medical record number or "
+                "another identifier. The shipped transaction form keeps the id out of the URL. "
+                "A name marked possibly has an env() value this reading could not resolve",
             )
         )
     # ADR 0139: the engine-to-sidecar hop of an ECH connection. docs/SECURITY-LOOSENING.md,
