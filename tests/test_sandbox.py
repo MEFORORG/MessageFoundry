@@ -19,6 +19,7 @@ import math
 import os
 import queue
 import signal
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -2369,6 +2370,26 @@ def test_a_request_over_the_frame_cap_keeps_the_worker(
         assert session._proc is proc
         assert proc.poll() is None
         assert session.last_kill_cause is None
+    finally:
+        session.close()
+
+
+def test_a_boot_frame_over_the_frame_cap_spawns_no_worker(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The boot frame's cap check runs before the child exists, so a refusal leaves no worker."""
+    _registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        monkeypatch.setattr(sandbox_mod, "_MAX_FRAME", 16)
+
+        def _no_popen(*args: object, **kwargs: object) -> None:
+            raise AssertionError("an over-cap boot frame reached Popen")
+
+        monkeypatch.setattr(subprocess, "Popen", _no_popen)
+        with pytest.raises(SandboxError, match="frame too large"):
+            session._spawn("transform")
+        assert session._proc is None
     finally:
         session.close()
 
