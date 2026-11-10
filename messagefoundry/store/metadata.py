@@ -97,35 +97,47 @@ def encode_response_headers(headers: Mapping[str, str] | None) -> str | None:
     return json.dumps(clean)
 
 
-def _load_object(text: str | bytes | bytearray | None) -> dict[str, Any]:
+class MetadataTooDeepError(RuntimeError):
+    """A stored metadata cell nested past json's depth limit, raised where reading it as empty would
+    change an outcome (BACKLOG #6712). A ``RuntimeError``, as json's own ``RecursionError`` was on
+    main, so no ``ValueError`` arm downstream turns it into "no metadata". Carries no content."""
+
+
+def _load_object(
+    text: str | bytes | bytearray | None, *, too_deep_raises: bool = False
+) -> dict[str, Any]:
     """The JSON object ``text`` holds, or ``{}`` for ``None``, empty, malformed or non-object text.
 
-    It decodes a ``str`` through :func:`~messagefoundry.redaction.json_loads_or_refusal`, so json's
-    depth-limit ``RecursionError`` on deeply nested input reads as malformed like any other decode
-    failure (BACKLOG #6712). A refusal is logged with json's content-free hint, never the text.
-    ``bytes``/``bytearray`` decode as ``json.loads`` decoded them before; any other type reads as
-    ``{}``, as the ``TypeError`` arm this replaced did."""
+    It decodes through :func:`~messagefoundry.redaction.json_loads_or_refusal`, so json's depth-limit
+    ``RecursionError`` never escapes (BACKLOG #6712): it reads as malformed, or with
+    ``too_deep_raises`` it raises :class:`MetadataTooDeepError`, outside any handler so nothing is
+    chained. A refusal is logged with json's content-free hint, never the text. ``bytes``/``bytearray``
+    decode as ``json.loads`` decoded them before; any other type reads as ``{}``, as the
+    ``TypeError`` arm this replaced did."""
     if isinstance(text, bytearray):
         text = bytes(text)
     if not isinstance(text, str | bytes) or not text:
         return {}
     value, refusal = json_loads_or_refusal(text)
     if refusal is not None:
+        if too_deep_raises and refusal == RecursionError.__name__:
+            raise MetadataTooDeepError("a stored metadata cell is too deeply nested to decode")
         log.warning("a stored JSON cell is unreadable (%s); read as empty", refusal)
         return {}
     return value if isinstance(value, dict) else {}
 
 
-def _dumps_or_none(value: Any) -> str | None:
-    """``json.dumps(value)``, or ``None`` when json's encoder hits its depth limit.
+def _dumps_or_raise(value: Any) -> str:
+    """``json.dumps(value)``, or :class:`MetadataTooDeepError` when json's encoder hits its depth
+    limit, raised outside the handler so nothing is chained.
 
     The encoder's limit sits below the decoder's, so an object :func:`_load_object` read can still
-    be too deep to write back (BACKLOG #6712). Logged, content-free."""
+    be too deep to write back (BACKLOG #6712)."""
     try:
         return json.dumps(value)
     except RecursionError:
-        log.warning("a stored JSON cell is too deeply nested to re-encode")
-        return None
+        pass
+    raise MetadataTooDeepError("a stored metadata cell is too deeply nested to re-encode")
 
 
 def decode_response_headers(headers_json: str | None) -> dict[str, str]:
@@ -145,20 +157,16 @@ def merge_user_metadata(existing_json: str | None, meta_ops: Sequence[tuple[str,
     Any non-``user`` keys already present (ADR 0013 correlation lineage) are preserved untouched. Within
     one message the same key is last-writer-wins. ``existing_json`` may be ``None``/empty (no metadata
     yet) or a non-object (defensively treated as empty), and so may a non-object ``"user"`` bag. An
-    existing object that decodes but is too deep to re-encode raises ``ValueError``. Caller passes
-    decrypted JSON in and encrypts the result out — this function does neither."""
+    existing object that decodes but is too deep to re-encode raises :class:`MetadataTooDeepError`
+    rather than being written back as the ops alone, which would erase the engine-internal keys.
+    Caller passes decrypted JSON in and encrypts the result out — this function does neither."""
     parsed = _load_object(existing_json)
     existing_user = parsed.get("user")
     user: dict[str, Any] = dict(existing_user) if isinstance(existing_user, dict) else {}
     for key, value in meta_ops:
         user[key] = value
     parsed["user"] = user
-    encoded = _dumps_or_none(parsed)
-    if encoded is None:
-        # Refused, not written back as the ops alone: the caller persists the result over the cell,
-        # which would erase the readable engine-internal keys (correlation lineage, refused-body record).
-        raise ValueError("existing message metadata is too deeply nested to re-encode; not merged")
-    return encoded
+    return _dumps_or_raise(parsed)
 
 
 def user_metadata(metadata_json: str | None) -> str | None:
@@ -173,8 +181,10 @@ def user_metadata(metadata_json: str | None) -> str | None:
     refusal names the body's length and the head bound, never the digest or a byte of the body.
 
     Returns ``None`` for absent/empty/unparseable metadata or an empty user bag, so the wire field is
-    ``null`` rather than ``"{}"`` when nothing was attached."""
-    user = _load_object(metadata_json).get("user")
+    ``null`` rather than ``"{}"`` when nothing was attached. A cell too deep to decode or re-encode
+    raises :class:`MetadataTooDeepError` instead: ``None`` would send a ``dynamic_headers`` delivery
+    out without its headers, where the error faults it and it retries, as on main."""
+    user = _load_object(metadata_json, too_deep_raises=True).get("user")
     if not isinstance(user, dict) or not user:
         return None
-    return _dumps_or_none(user)
+    return _dumps_or_raise(user)

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import types
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,10 @@ import pytest
 from messagefoundry.config.settings import EgressSettings, ReferenceSettings
 from messagefoundry.config.wiring import FileRef, ReferenceSpec
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.store import metadata as metadata_module
 from messagefoundry.store.metadata import (
+    MetadataTooDeepError,
     decode_response_headers,
     encode_reference_value,
     encode_response_headers,
@@ -124,16 +128,33 @@ def test_the_deep_input_really_reaches_the_recursion_limit() -> None:
 
 
 @pytest.mark.parametrize("bad", [_DEEP, "{not json"], ids=["deep-nesting", "plain-malformed"])
-def test_decoders_read_malformed_input_as_empty(bad: str) -> None:
-    """Deep nesting raises json's ``RecursionError``; it must read like any other malformed cell."""
+def test_header_and_merge_decoders_read_malformed_input_as_empty(bad: str) -> None:
+    """Deep nesting raises json's ``RecursionError``; here it reads like any other malformed cell."""
     assert decode_response_headers(bad) == {}
-    assert user_metadata(bad) is None
     assert json.loads(merge_user_metadata(bad, [("k", "v")])) == {"user": {"k": "v"}}
+
+
+def test_user_metadata_reads_plain_malformed_input_as_none() -> None:
+    """Unchanged from main: an unparseable cell is "no metadata"."""
+    assert user_metadata("{not json") is None
+
+
+@pytest.mark.parametrize("deep", [_DEEP, _DEEP.encode("ascii")], ids=["str", "bytes"])
+def test_user_metadata_raises_on_a_cell_too_deep_to_decode(deep: Any) -> None:
+    """None would send a dynamic_headers delivery out without its headers; on main json's
+    RecursionError faulted it instead, so the delivery retried. Raised unchained, content-free."""
+    with pytest.raises(MetadataTooDeepError) as info:
+        user_metadata(deep)
+    assert info.value.__cause__ is None
+    assert info.value.__context__ is None
+    assert not getattr(info.value, "__notes__", None)
+    assert not isinstance(info.value, ValueError)  # no ValueError arm may read it as "none"
 
 
 def _encoder_overflows_once(monkeypatch: pytest.MonkeyPatch) -> None:
     """json's encoder depth limit sits below its decoder's (measured: a 16_000-deep value decodes
-    but will not re-encode on 3.14), but where exactly is stack-dependent, so it is simulated."""
+    but will not re-encode on 3.14), but where exactly is stack-dependent, so it is simulated. The
+    fault is scoped to the module under test, not the process-wide ``json.dumps``."""
     real = json.dumps
     calls = {"n": 0}
 
@@ -143,15 +164,30 @@ def _encoder_overflows_once(monkeypatch: pytest.MonkeyPatch) -> None:
             raise RecursionError("maximum recursion depth exceeded while encoding a JSON object")
         return real(value, **kwargs)
 
-    monkeypatch.setattr(json, "dumps", dumps)
+    monkeypatch.setattr(metadata_module, "json", types.SimpleNamespace(dumps=dumps))
 
 
-def test_user_metadata_reads_a_bag_too_deep_to_re_encode_as_none(
+def test_user_metadata_raises_on_a_bag_too_deep_to_re_encode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stored = json.dumps({"user": {"k": "v"}})
     _encoder_overflows_once(monkeypatch)
-    assert user_metadata(stored) is None
+    with pytest.raises(MetadataTooDeepError, match="re-encode") as info:
+        user_metadata(stored)
+    assert info.value.__context__ is None
+
+
+async def test_a_dynamic_headers_read_faults_rather_than_proceeding_without_headers() -> None:
+    """The delivery-side reader: it must not hand back None (deliver with no headers) for a deep cell."""
+
+    class _Store:
+        async def message_metadata_json(self, message_id: str) -> str:
+            return _DEEP
+
+    runner = RegistryRunner.__new__(RegistryRunner)
+    runner.store = _Store()  # type: ignore[assignment]
+    with pytest.raises(MetadataTooDeepError):
+        await runner._user_metadata_for("m1")
 
 
 def test_merge_user_metadata_refuses_when_existing_will_not_re_encode(
@@ -160,7 +196,7 @@ def test_merge_user_metadata_refuses_when_existing_will_not_re_encode(
     """Refused rather than written back as the ops alone, which would erase the readable lineage."""
     stored = json.dumps({"correlation_id": "c", "user": {"old": "x"}})
     _encoder_overflows_once(monkeypatch)
-    with pytest.raises(ValueError, match="too deeply nested") as info:
+    with pytest.raises(MetadataTooDeepError, match="re-encode") as info:
         merge_user_metadata(stored, [("k", "v")])
     assert info.value.__context__ is None
 
@@ -188,7 +224,7 @@ def test_a_bytes_cell_keeps_its_lineage_through_merge(wrap: Any) -> None:
 
 def test_a_malformed_bytes_cell_reads_as_empty() -> None:
     """The hardening still holds for bytes: deep nesting and a bad UTF-8 byte read as malformed."""
-    assert user_metadata(_DEEP.encode("ascii")) is None  # type: ignore[arg-type]
+    assert decode_response_headers(_DEEP.encode("ascii")) == {}  # type: ignore[arg-type]
     assert user_metadata(b'{"user": {"k": "\xff"}}') is None  # type: ignore[arg-type]
 
 
@@ -196,7 +232,7 @@ def test_an_unreadable_cell_is_logged_without_its_content(caplog: pytest.LogCapt
     marker = "SYNTHETIC-MRN-5550199"
     with caplog.at_level("WARNING", logger="messagefoundry.store.metadata"):
         assert user_metadata('{"user": {"k": "' + marker + '"') is None
-        assert user_metadata("[" * 200_000 + '"' + marker) is None
+        assert decode_response_headers("[" * 200_000 + '"' + marker) == {}
     assert len(caplog.records) == 2
     assert all(marker not in r.getMessage() for r in caplog.records)
 
