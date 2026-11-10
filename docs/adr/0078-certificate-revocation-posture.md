@@ -265,10 +265,9 @@ are **byte-identical**. This reuses `config/tls_policy.py`, mirroring the #200/A
   two verifying branches (pinned CA + system trust store); attestation is the blanket env only (the store
   has no per-connection TOML). Sits beside — and composes with — the existing weakened-TLS refusal.
 
-### Composition with #200 (no double-refusal)
+### Composition with #200
 
-#200 refuses the **cleartext / verify-off** hop; this amendment fires **only on a VERIFYING hop**. On a direct
-hop the two gates key on disjoint conditions, so it is refused by at most one of them, never both.
+#200 refuses the **cleartext / verify-off** hop; this amendment fires **only on a VERIFYING hop**.
 
 ### Still out of scope (unchanged, documented)
 

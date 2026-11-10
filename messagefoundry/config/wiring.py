@@ -8651,8 +8651,7 @@ def outbound(
     OCSP/CRL fetch). It lets the hop cross the revocation refusal under ``[security].enforcement =
     enforce``, and needs a written ``tls_revocation_attested_reason``, recorded in the WARNING audit
     line logged at every construction where it suppresses that refusal. It is a different claim from
-    ``cleartext_accepted`` and never reaches a cleartext or verify-off hop. Also a
-    ``connections.toml`` key."""
+    ``cleartext_accepted``. Also a ``connections.toml`` key."""
     file, line = _call_site()
     _active_registry().add_outbound(
         build_outbound_connection(

@@ -1888,8 +1888,7 @@ count is above `0` (vault BACKLOG #2613).
 - **When acceptable:** a revocation-checking PKI or terminator really does cover this hop, and you can
   name it. That name belongs in the reason. On a listener, prefer `tls_crl_file`, which checks
   revocation in the engine and needs no attestation.
-- **What it cannot do:** it never reaches a cleartext or verify-off hop, which keep their own
-  refusals. It is a claim about one named connection, which is why it crosses an enforcing instance
+- **What it cannot do:** it is a claim about one named connection, which is why it crosses an enforcing instance
   where the process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does not (BACKLOG #299). That is one hop on
   a connection with no token endpoint. It is two on any connection that signs in to a SMART or
   OAuth2 token endpoint, a `FhirLookup` included, so the reason has to hold for both.

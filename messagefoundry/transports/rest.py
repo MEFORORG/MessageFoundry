@@ -1608,8 +1608,7 @@ def refuse_unrevoked_verified_hop(
     attested (per-connection ``tls_revocation_attested`` or the blanket ``MEFOR_TLS_REVOCATION_ATTESTED``
     env, folded in by :meth:`RevocationHopGuard.capture`); a non-prod PHI hop WARNs; loopback / synthetic /
     attested hops are byte-identical. Only meaningful for ``https`` — an ``http`` url has no TLS (its
-    cleartext body is refused by :func:`refuse_cleartext_egress`) and ``verify_tls=false`` on a direct
-    hop is not a verifying hop (refused by :func:`refuse_verify_off`).
+    cleartext body is refused by :func:`refuse_cleartext_egress`).
 
     ``opener`` (BACKLOG #1498) is the opener this hop will really dial through, when the caller has
     already built one. Its https context is then read and handed to the guard, so a ``[tls].crl_file``
@@ -2896,8 +2895,7 @@ class RestDestination(DestinationConnector):
         if verify or self._ech_sidecar is not None:
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the peer cert but does no
             # OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI verified
-            # hop unless revocation is attested or this hop's own opener checks a CRL. On a direct hop
-            # it keys on the verify-ON https path, disjoint from the verify-off gate above.
+            # hop unless revocation is attested or this hop's own opener checks a CRL.
             #
             # An ECH hop is judged here whatever verify_tls says (vault BACKLOG #2977 item 8): the
             # sidecar opener above replaced the insecure one, and the sidecar makes the peer's TLS
