@@ -7,14 +7,19 @@
   ``POST /approvals/{id}/interrupt`` moves one to ``interrupted`` after judging its owner in three
   tiers: live in this process, a cluster node's heartbeat, or an operator's attestation. An
   unpinned cluster node's old claims (residual 4) read as a lapsed heartbeat.
-- The restart reads the audit trail for a known outcome (residual 3), keeps the claim time in
-  ``decided_at`` (residual 6), and reads other owners' rows apart from its own (residual 7).
+- The restart keeps the claim time in ``decided_at`` (residual 6) and reads other owners' rows
+  apart from its own (residual 7). It claims no outcome from the audit trail: residual 3 was
+  dropped by Manager decision d20261109T215156567-4334fc, since ``list_audit`` checks no row MAC.
+- The interrupt refuses the original requester and reads ``attest_owner_stopped`` strictly (the
+  same decision).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import sqlite3
 import time
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
@@ -31,10 +36,10 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import ANY_CLAIM_OWNER, AuditAppend, AuditVerdict
 from tests._bound_proof import reproving_transport
 from tests._pending_approval_store_contract import _APPROVER as APPROVER
+from tests._pending_approval_store_contract import _REQUESTER_ID as REQUESTER_ID
 from tests._pending_approval_store_contract import (
     _audit_rows_for,
     _claimed_directly,
-    _KeyedTrail,
     _resolve,
     _StandingStore,
 )
@@ -70,7 +75,7 @@ def _liveness(fresh: bool | None = None, *, fails: bool = False) -> Any:
 
 def _gate(engine: Engine, *, owner: str = "engine", liveness: Any = None) -> ApprovalGate:
     return ApprovalGate(
-        _KeyedTrail(engine.store),
+        _StandingStore(engine.store),
         ON,
         resolve_identity=_resolve,
         claim_owner=owner,
@@ -179,7 +184,7 @@ async def test_the_restart_scans_siblings_with_the_owner_filter(engine: Engine) 
     assert found.foreign == (sibling,)
 
 
-# --- the restart reads the trail (residuals 3 and 6) ---------------------------------------------
+# --- the restart (residual 6; residual 3 dropped) ------------------------------------------------
 
 
 async def _outcome_row(engine: Engine, action: str, approval_id: str, *, actor: str) -> None:
@@ -188,121 +193,51 @@ async def _outcome_row(engine: Engine, action: str, approval_id: str, *, actor: 
     )
 
 
-@pytest.mark.parametrize(
-    ("action", "status"), [("approval.approved", "approved"), ("approval.failed", "failed")]
-)
-async def test_a_restart_settles_a_known_outcome_to_it(
-    engine: Engine, action: str, status: str
-) -> None:
+@pytest.mark.parametrize("action", ["approval.approved", "approval.failed"])
+async def test_a_restart_claims_no_outcome_from_the_trail(engine: Engine, action: str) -> None:
+    """Residual 3 is dropped (decision d20261109T215156567-4334fc): an outcome row in the trail,
+    read through list_audit whose row MAC nobody checks, never settles a leftover release. It
+    moves to 'interrupted', keeping its claim time, and an operator records what happened."""
     approval_id = await _stranded(engine, "engine")
     claimed_at = float((await _row(engine, approval_id))["decided_at"])
     await _outcome_row(engine, action, approval_id, actor=APPROVER)
-    found = await _gate(engine).reconcile_after_restart()
-    assert found.settled == (approval_id,) and found.interrupted == ()
-    row = await _row(engine, approval_id)
-    assert str(row["status"]) == status
-    assert float(row["decided_at"]) == claimed_at, "the claim time is kept (residual 6)"
-    [reconciled] = await _audit(engine, "approval.reconciled", approval_id)
-    detail = json.loads(str(reconciled["detail"]))
-    [outcome] = await _audit(engine, action, approval_id)
-    assert detail["status"] == status and detail["outcome_audit_id"] == outcome["id"]
-    assert detail["reason"] == "engine_restart" and str(reconciled["actor"]) == "system"
-    assert await _audit(engine, "approval.interrupted", approval_id) == []
 
+    # A chain that verifies under a held key: the strongest trail the dropped settle trusted.
+    class _Keyed(_StandingStore):
+        async def verify_audit_chain(self, **_kw: Any) -> Any:
+            return AuditVerdict(True, "clean")
 
-@pytest.mark.parametrize(
-    "rows",
-    [
-        [],  # nothing in the trail
-        [("approval.interrupted", APPROVER)],  # an unknown outcome, written alone
-        [("approval.approved", "someone-else")],  # not the releasing approver's row
-        [("approval.approved", APPROVER), ("approval.failed", APPROVER)],  # they disagree
-        [("approval.approved", APPROVER), ("approval.interrupted", APPROVER)],
-    ],
-)
-async def test_an_unknown_outcome_is_still_interrupted(
-    engine: Engine, rows: list[tuple[str, str]]
-) -> None:
-    approval_id = await _stranded(engine, "engine")
-    claimed_at = float((await _row(engine, approval_id))["decided_at"])
-    for action, actor in rows:
-        await _outcome_row(engine, action, approval_id, actor=actor)
-    found = await _gate(engine).reconcile_after_restart()
-    assert found.interrupted == (approval_id,) and found.settled == ()
+    gate = ApprovalGate(_Keyed(engine.store), ON, resolve_identity=_resolve)
+    found = await gate.reconcile_after_restart()
+    assert found.interrupted == (approval_id,)
     row = await _row(engine, approval_id)
     assert str(row["status"]) == "interrupted"
     assert float(row["decided_at"]) == claimed_at, "the claim time is kept (residual 6)"
+    [interrupted] = await _audit(engine, "approval.interrupted", approval_id)
+    detail = json.loads(str(interrupted["detail"]))
+    assert detail["reason"] == "engine_restart" and str(interrupted["actor"]) == "system"
     assert await _audit(engine, "approval.reconciled", approval_id) == []
 
 
-@pytest.mark.parametrize(
-    "verdict",
-    [
-        AuditVerdict(
-            True, "clean", keyless_walk=True
-        ),  # anyone who can write the log recomputes it
-        AuditVerdict(False, "row 3: MAC mismatch"),
-        AuditVerdict(False, "keyed chain", key_unavailable=True),
-        None,  # the walk itself fails
-    ],
-)
-async def test_an_outcome_row_on_an_unverified_chain_is_not_trusted(
-    engine: Engine, verdict: AuditVerdict | None
-) -> None:
-    """An outcome row read through list_audit, whose MAC nobody checked, settles a row only while
-    the keyed chain verifies, so a row written without the key cannot become a sealed status."""
+async def test_a_restart_never_reads_the_audit_trail(engine: Engine) -> None:
+    """Nothing in the reconcile reads the trail now, so a chain walk or a trail read that would
+    fail cannot hold up or abort the start."""
     approval_id = await _stranded(engine, "engine")
-    await _outcome_row(engine, "approval.failed", approval_id, actor=APPROVER)
 
-    class _Chain(_StandingStore):
-        async def verify_audit_chain(self, **_kw: Any) -> Any:
-            if verdict is None:
-                raise OSError("PROBE: audit log unreachable")
-            return verdict
+    reads: list[str] = []
 
-    gate = ApprovalGate(_Chain(engine.store), ON, resolve_identity=_resolve)
-    found = await gate.reconcile_after_restart()
-    assert found.interrupted == (approval_id,) and found.settled == ()
-    assert str((await _row(engine, approval_id))["status"]) == "interrupted"
-    # Control: the same trail under a keyed verdict settles it.
-    other = await _stranded(engine, "engine")
-    await _outcome_row(engine, "approval.failed", other, actor=APPROVER)
-    assert (await _gate(engine).reconcile_after_restart()).settled == (other,)
+    class _NoTrail(_StandingStore):
+        async def verify_audit_chain(self, **kw: Any) -> Any:
+            reads.append("verify_audit_chain")
+            return await self._store.verify_audit_chain(**kw)
 
+        async def list_audit(self, **kw: Any) -> Any:
+            reads.append("list_audit")
+            return await self._store.list_audit(**kw)
 
-async def test_a_defect_in_the_trail_read_is_raised(engine: Engine) -> None:
-    await _stranded(engine, "engine")
-
-    class _Defect(_StandingStore):
-        async def list_audit(self, **_kw: Any) -> Any:
-            raise NotImplementedError("PROBE: a code defect, not an outage")
-
-    gate = ApprovalGate(_Defect(engine.store), ON, resolve_identity=_resolve)
-    with pytest.raises(NotImplementedError):
-        await gate.reconcile_after_restart()
-
-
-async def test_another_requests_outcome_row_is_not_read_as_this_ones(engine: Engine) -> None:
-    approval_id = await _stranded(engine, "engine")
-    await _outcome_row(engine, "approval.approved", "some-other-request", actor=APPROVER)
-    found = await _gate(engine).reconcile_after_restart()
-    assert found.interrupted == (approval_id,)
-
-
-async def test_an_unread_trail_leaves_the_outcome_unknown(
-    engine: Engine, caplog: pytest.LogCaptureFixture
-) -> None:
-    approval_id = await _stranded(engine, "engine")
-    await _outcome_row(engine, "approval.approved", approval_id, actor=APPROVER)
-
-    class _TrailDown(_StandingStore):
-        async def list_audit(self, **_kw: Any) -> Any:
-            raise OSError("PROBE: audit log unreachable")
-
-    gate = ApprovalGate(_TrailDown(engine.store), ON, resolve_identity=_resolve)
-    found = await gate.reconcile_after_restart()
-    assert found.interrupted == (approval_id,) and found.settled == ()
-    assert any("could not be read for its outcome" in r.getMessage() for r in caplog.records)
+    gate = ApprovalGate(_NoTrail(engine.store), ON, resolve_identity=_resolve)
+    assert (await gate.reconcile_after_restart()).interrupted == (approval_id,)
+    assert reads == []
 
 
 # --- GET /approvals/executing and the three tiers (residuals 1 and 4) ------------------------------
@@ -333,7 +268,9 @@ async def test_a_lapsed_node_heartbeat_lets_the_interrupt_move_the_row(engine: E
     approval_id = await _stranded(engine, "node:old-random-id")
     claimed_at = float((await _row(engine, approval_id))["decided_at"])
     gate = _gate(engine, owner="node:new-random-id", liveness=_liveness(False))
-    out = await gate.interrupt_stranded(approval_id, actor="operator", client="10.0.0.9")
+    out = await gate.interrupt_stranded(
+        approval_id, actor="operator", actor_user_id="operator-id", client="10.0.0.9"
+    )
     assert out["status"] == "interrupted" and out["liveness"] == "owner_heartbeat_lapsed"
     row = await _row(engine, approval_id)
     assert str(row["status"]) == "interrupted" and str(row["approver"]) == APPROVER
@@ -372,7 +309,9 @@ async def test_a_node_owner_that_may_be_live_is_refused(
     [listed] = [r for r in await gate.list_executing() if r["id"] == approval_id]
     assert listed["liveness"] == verdict and listed["interrupt"] == "refused"
     with pytest.raises(ApprovalError) as refused:
-        await gate.interrupt_stranded(approval_id, actor="operator", attest_owner_stopped=True)
+        await gate.interrupt_stranded(
+            approval_id, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True
+        )
     assert refused.value.status == status
     assert str((await _row(engine, approval_id))["status"]) == "executing"
     assert await _audit(engine, "approval.interrupted", approval_id) == []
@@ -385,10 +324,12 @@ async def test_an_owner_with_no_heartbeat_needs_an_attestation(
     approval_id = await _stranded(engine, owner)
     gate = _gate(engine, owner="shard:a", liveness=_liveness(False))
     with pytest.raises(ApprovalError) as refused:
-        await gate.interrupt_stranded(approval_id, actor="operator")
+        await gate.interrupt_stranded(approval_id, actor="operator", actor_user_id="operator-id")
     assert refused.value.status == 409 and "attest_owner_stopped" in refused.value.detail
     assert str((await _row(engine, approval_id))["status"]) == "executing"
-    out = await gate.interrupt_stranded(approval_id, actor="operator", attest_owner_stopped=True)
+    out = await gate.interrupt_stranded(
+        approval_id, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True
+    )
     assert out["liveness"] == "attestation_required"
     [audit] = await _audit(engine, "approval.interrupted", approval_id)
     assert json.loads(str(audit["detail"]))["owner_stopped_attested"] is True
@@ -403,7 +344,12 @@ async def test_a_release_running_in_this_process_is_refused(engine: Engine) -> N
         [listed] = [r for r in await gate.list_executing() if r["id"] == approval_id]
         assert listed["liveness"] == "releasing_here" and listed["this_process"] is True
         with pytest.raises(ApprovalError) as refused:
-            await gate.interrupt_stranded(approval_id, actor="operator", attest_owner_stopped=True)
+            await gate.interrupt_stranded(
+                approval_id,
+                actor="operator",
+                actor_user_id="operator-id",
+                attest_owner_stopped=True,
+            )
         assert refused.value.status == 409
     finally:
         leave.set()
@@ -417,7 +363,7 @@ async def test_a_lost_claim_does_not_untrack_the_release_that_won(engine: Engine
     """A second approve that reads the row as pending, then loses the claim to the running one,
     leaves that one tracked."""
 
-    class _StaleRead(_KeyedTrail):
+    class _StaleRead(_StandingStore):
         stale: Any = None
 
         async def get_pending_approval(self, approval_id: str) -> Any:
@@ -461,7 +407,7 @@ async def test_a_release_stays_tracked_until_its_outcome_write_ends(engine: Engi
     here until that write ends; an interrupt's own write never does."""
     entered, leave, write_held, write_go = (asyncio.Event() for _ in range(4))
 
-    class _SlowOutcome(_KeyedTrail):
+    class _SlowOutcome(_StandingStore):
         async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
             if kw.get("status") == "approved":
                 write_held.set()
@@ -491,7 +437,9 @@ async def test_a_release_stays_tracked_until_its_outcome_write_ends(engine: Engi
         await release
     assert approval_id in gate._releasing, "the outcome write is still running"
     with pytest.raises(ApprovalError) as refused:
-        await gate.interrupt_stranded(approval_id, actor="operator", attest_owner_stopped=True)
+        await gate.interrupt_stranded(
+            approval_id, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True
+        )
     assert refused.value.status == 409
     write_go.set()
     await gate.drain()
@@ -502,7 +450,7 @@ async def test_a_release_stays_tracked_until_its_outcome_write_ends(engine: Engi
 async def test_an_interrupt_in_flight_does_not_read_as_a_release(engine: Engine) -> None:
     held, go = asyncio.Event(), asyncio.Event()
 
-    class _SlowMove(_KeyedTrail):
+    class _SlowMove(_StandingStore):
         async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
             if kw.get("status") == "interrupted":
                 held.set()
@@ -512,7 +460,9 @@ async def test_an_interrupt_in_flight_does_not_read_as_a_release(engine: Engine)
     approval_id = await _stranded(engine, "shard:b")
     gate = ApprovalGate(_SlowMove(engine.store), ON, resolve_identity=_resolve)
     first = asyncio.create_task(
-        gate.interrupt_stranded(approval_id, actor="operator", attest_owner_stopped=True)
+        gate.interrupt_stranded(
+            approval_id, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True
+        )
     )
     await held.wait()
     try:
@@ -523,16 +473,20 @@ async def test_an_interrupt_in_flight_does_not_read_as_a_release(engine: Engine)
         await first
 
 
-async def test_an_outcome_whose_row_was_interrupted_elsewhere_is_still_written(
-    engine: Engine,
+@pytest.mark.parametrize("combined_raises", [False, True])
+async def test_an_outcome_whose_row_was_interrupted_elsewhere(
+    engine: Engine, caplog: pytest.LogCaptureFixture, combined_raises: bool
 ) -> None:
-    """The combined outcome write fails, and the status alone finds the row moved by an operator
-    interrupt from another process: the outcome row is then written alone, not skipped."""
+    """An operator interrupt from another process moves the row while this process still runs
+    the release. The combined outcome write then finds the row moved, and the outcome row is
+    written alone. Where that combined write RAISES instead, main's read-back (vault BACKLOG
+    #3193 N1) decides: the row reads back moved by another caller, so no row is written alone
+    and the lost detail is logged."""
     entered, leave = asyncio.Event(), asyncio.Event()
 
-    class _InterruptedMeanwhile(_KeyedTrail):
+    class _InterruptedMeanwhile(_StandingStore):
         async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
-            if kw.get("status") == "approved" and kw.get("audit") is not None:
+            if combined_raises and kw.get("status") == "approved" and kw.get("audit") is not None:
                 raise OSError("PROBE: combined write failed")
             return bool(await self._store.decide_pending_approval(approval_id, **kw))
 
@@ -554,24 +508,70 @@ async def test_an_outcome_whose_row_was_interrupted_elsewhere_is_still_written(
     await entered.wait()
     # Another process's operator interrupts it.
     elsewhere = _gate(engine, owner="shard:other")
-    await elsewhere.interrupt_stranded(approval_id, actor="operator", attest_owner_stopped=True)
+    await elsewhere.interrupt_stranded(
+        approval_id, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True
+    )
     leave.set()
-    await release
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        await release
     assert str((await _row(engine, approval_id))["status"]) == "interrupted"
-    [approved] = await _audit(engine, "approval.approved", approval_id)
-    assert str(approved["actor"]) == "checker"
+    approved = await _audit(engine, "approval.approved", approval_id)
+    if combined_raises:
+        assert approved == []
+        [lost] = [r.getMessage() for r in caplog.records if "Lost detail" in r.getMessage()]
+        assert "'interrupted'" in lost
+    else:
+        [row] = approved
+        assert str(row["actor"]) == "checker"
+
+
+async def test_a_cut_off_release_whose_interrupted_write_committed_writes_one_row(
+    engine: Engine,
+) -> None:
+    """Decision d20261109T215156567-4334fc, the duplicate interrupted row: the combined
+    'interrupted' write COMMITS and its reply is lost. The read-back finds the row at
+    'interrupted' with this write's own decision time, so no second approval.interrupted row,
+    with recorded=false, is written beside the first. An operator interrupt or a restart keeps
+    the claim time, so its move cannot be mistaken for this one."""
+
+    class _ReplyLost(_StandingStore):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            moved = bool(await self._store.decide_pending_approval(approval_id, **kw))
+            audit: AuditAppend | None = kw.get("audit")
+            if audit is not None and audit.action == "approval.interrupted":
+                raise sqlite3.OperationalError("PROBE: connection reset after COMMIT")
+            return moved
+
+    approval_id = await _stranded(engine, "engine")
+    gate = ApprovalGate(_ReplyLost(engine.store), ON, resolve_identity=_resolve)
+    await gate._record_interrupted_execution(
+        approval_id,
+        operation="dead_letter_replay",
+        approver=APPROVER,
+        requester="r",
+        client=None,
+    )
+    assert str((await _row(engine, approval_id))["status"]) == "interrupted"
+    [only] = await _audit(engine, "approval.interrupted", approval_id)
+    assert json.loads(str(only["detail"]))["recorded"] is True
 
 
 async def test_an_interrupt_of_a_row_not_executing_answers_409(engine: Engine) -> None:
     approval_id = await _stranded(engine, "shard:b")
     gate = _gate(engine)
-    await gate.interrupt_stranded(approval_id, actor="operator", attest_owner_stopped=True)
+    await gate.interrupt_stranded(
+        approval_id, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True
+    )
     with pytest.raises(ApprovalError) as again:
-        await gate.interrupt_stranded(approval_id, actor="operator", attest_owner_stopped=True)
+        await gate.interrupt_stranded(
+            approval_id, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True
+        )
     assert again.value.status == 409
     assert len(await _audit(engine, "approval.interrupted", approval_id)) == 1
     with pytest.raises(ApprovalError) as missing:
-        await gate.interrupt_stranded("0" * 32, actor="operator", attest_owner_stopped=True)
+        await gate.interrupt_stranded(
+            "0" * 32, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True
+        )
     assert missing.value.status == 404
 
 
@@ -587,8 +587,62 @@ async def test_an_interrupt_whose_audit_row_is_refused_moves_nothing(engine: Eng
 
     gate = ApprovalGate(_AuditRefused(engine.store), ON, resolve_identity=_resolve)
     with pytest.raises(ApprovalError) as fault:
-        await gate.interrupt_stranded(approval_id, actor="operator", attest_owner_stopped=True)
+        await gate.interrupt_stranded(
+            approval_id, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True
+        )
     assert fault.value.status == 503
+    assert str((await _row(engine, approval_id))["status"]) == "executing"
+
+
+async def test_the_requester_cannot_interrupt_their_own_release(engine: Engine) -> None:
+    """Decision d20261109T215156567-4334fc: an interrupt rests on its actor's word, so the
+    requester is refused, as on the resolve it leads to, attested or not, and keyed on the user
+    id rather than the name."""
+    approval_id = await _stranded(engine, "shard:b")
+    gate = _gate(engine)
+    for attest in (False, True):
+        with pytest.raises(ApprovalError) as refused:
+            await gate.interrupt_stranded(
+                approval_id,
+                actor="renamed-requester",
+                actor_user_id=REQUESTER_ID,
+                attest_owner_stopped=attest,
+            )
+        assert refused.value.status == 403
+    assert str((await _row(engine, approval_id))["status"]) == "executing"
+    assert await _audit(engine, "approval.interrupted", approval_id) == []
+    # Control: anyone else with the same attestation moves it.
+    out = await gate.interrupt_stranded(
+        approval_id, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True
+    )
+    assert out["status"] == "interrupted"
+
+
+async def test_a_release_with_no_requester_id_cannot_be_interrupted(engine: Engine) -> None:
+    """Fail closed, as the resolve does: with no requester id the requester cannot be told
+    apart from anyone else."""
+    approval_id = "f" * 32
+    await engine.store.create_pending_approval(
+        approval_id=approval_id,
+        operation="dead_letter_replay",
+        params="{}",
+        requester="maker",
+        requester_user_id="",
+        requested_at=time.time() - 31.0,
+        expires_at=None,
+    )
+    assert await engine.store.decide_pending_approval(
+        approval_id,
+        status="executing",
+        approver=APPROVER,
+        decided_at=time.time() - 30.0,
+        claim_owner="shard:b",
+    )
+    with pytest.raises(ApprovalError) as refused:
+        await _gate(engine).interrupt_stranded(
+            approval_id, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True
+        )
+    assert refused.value.status == 409 and "requester id" in refused.value.detail
     assert str((await _row(engine, approval_id))["status"]) == "executing"
 
 
@@ -629,6 +683,16 @@ async def test_the_routes_list_and_interrupt_a_stranded_release(engine: Engine) 
             f"/approvals/{approval_id}/interrupt", headers=admin, json={"surprise": 1}
         )
         assert stray.status_code == 422, "the body refuses an unknown field"
+        # Strict: only JSON true attests (decision d20261109T215156567-4334fc).
+        other = await _stranded(engine, "shard:gone")
+        for loose in ("yes", "true", 1, "1", "on"):
+            coerced = await c.post(
+                f"/approvals/{other}/interrupt",
+                headers=admin,
+                json={"attest_owner_stopped": loose},
+            )
+            assert coerced.status_code == 422, (loose, coerced.text)
+        assert str((await _row(engine, other))["status"]) == "executing"
 
 
 async def test_the_interrupt_requires_a_fresh_step_up(engine: Engine) -> None:
@@ -659,5 +723,7 @@ async def test_the_app_reads_the_cluster_heartbeats(engine: Engine) -> None:
     gate: ApprovalGate = create_app(engine, approvals=ON).state.approval_gate
     approval_id = await _stranded(engine, "node:peer")
     with pytest.raises(ApprovalError) as refused:
-        await gate.interrupt_stranded(approval_id, actor="operator", attest_owner_stopped=True)
+        await gate.interrupt_stranded(
+            approval_id, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True
+        )
     assert refused.value.status == 409 and "reads no cluster heartbeats" in refused.value.detail

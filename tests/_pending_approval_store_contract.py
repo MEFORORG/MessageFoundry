@@ -344,19 +344,6 @@ class _AnyPermission:
         return True
 
 
-class _KeyedTrail(_StandingStore):
-    """:class:`_StandingStore` whose audit chain reads as verified under a held key (BACKLOG
-    #1562). The test stores run keyless, and the restart reconcile trusts an outcome row only on a
-    keyed verdict, so this turns the real walk's clean keyless verdict into a keyed one. A break
-    the real walk finds is still a break."""
-
-    async def verify_audit_chain(self, **kw: Any) -> Any:
-        from messagefoundry.store.store import AuditVerdict
-
-        verdict = await self._store.verify_audit_chain(**kw)
-        return AuditVerdict(*verdict) if verdict.keyless_walk else verdict
-
-
 async def _resolve(_user_id: str) -> Any:
     return _AnyPermission()
 

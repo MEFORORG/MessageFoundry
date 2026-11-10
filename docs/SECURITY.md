@@ -2957,8 +2957,8 @@ the row to one of three outcomes. Each move carries its own audit row, after the
 
 | Status | Meaning | Audit row (against the approver) |
 |---|---|---|
-| `approved` | The operation ran and returned | `approval.approved` (and `approval.reconciled` against `system`, when a restart settles it from that row) |
-| `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` (and `approval.reconciled` against `system`, when a restart settles it from that row) |
+| `approved` | The operation ran and returned | `approval.approved` |
+| `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` |
 | `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. Or the engine process that claimed it restarted before it recorded an outcome. Or an operator interrupted a release stranded in `executing`. It may have done none, some or all of its work | `approval.interrupted` (against `system`, with `reason` `engine_restart`, when a restart finds it; against the operator, with `reason` `operator_interrupt`, when an operator interrupts it) |
 | `resolved_applied` | An operator checked an `interrupted` release and recorded that its effects were applied | `approval.resolved` (against the resolver) |
 | `resolved_not_applied` | An operator checked an `interrupted` release and recorded that its effects were not applied | `approval.resolved` (against the resolver) |
@@ -3007,20 +3007,14 @@ row at `executing`. A process can die mid-operation. A release's outcome write c
 the operation ran but the move from `executing` to `approved` fails even when written alone, the
 error is logged and the release still succeeds, because an error would invite a new request that
 runs it twice. The gate still tries to write the `approval.approved` audit row. And a claim can
-commit after its reply was lost, so nothing ran. The status cannot tell these apart; the audit
-trail sometimes can, and the restart reads it.
+commit after its reply was lost, so nothing ran. The status cannot tell these apart, so the
+restart claims no outcome for any of them.
 
 The claim records which engine process owns the release, in the row's `claim_owner` column. At its
-next start, before the API serves an approval, that process settles each `executing` row it owns.
-It first reads the trail for the row's outcome row, written by the releasing approver. Where it
-finds `approval.approved` or `approval.failed` rows that all agree, and no `approval.interrupted`,
-and the audit chain verifies under a key the engine holds, it moves the row to that status,
-`approved` or `failed`, with an `approval.reconciled` row naming the newest outcome row it read.
-Every other row moves to `interrupted`, with an `approval.interrupted` row: no outcome row, an
-`approval.interrupted` one, rows that disagree, a trail it cannot read in full, or a chain that does
-not verify that way, a keyless walk included. Only the start itself reads the trail; the catch-up
-an embedded engine shard runs once its name is known moves each leftover row to `interrupted`. Each row is in the same write as its move, written against `system`, and carries `reason`
-`engine_restart`, the claim owner and the claim time. The move keeps the row's `decided_at` as the
+next start, before the API serves an approval, that process moves each `executing` row it owns to
+`interrupted`, with an `approval.interrupted` row; so does the catch-up an embedded engine shard
+runs once its name is known. Each row is in the same write as its move, written against `system`,
+and carries `reason` `engine_restart`, the claim owner and the claim time. The move keeps the row's `decided_at` as the
 claim time, so an `interrupted` row a restart settled shows when it was claimed, not when the
 engine restarted. Nothing re-runs. The operator checks the effects of an `interrupted` row and
 resolves it as above. A move that fails is logged and the row stays `executing` for the next start
@@ -3047,8 +3041,9 @@ a slow one. An operator settles it instead, through two routes (owner-delegated 
   whether this process owns it, and what an interrupt would judge of its owner now. It needs
   `approvals:approve`. `GET /approvals` does not list `executing` rows.
 - `POST /approvals/{id}/interrupt` moves one to `interrupted`, so it takes the resolve above. It
-  needs `approvals:approve` and a fresh step-up. It never runs the operation and never records an
-  outcome. It judges the owner in three tiers:
+  needs `approvals:approve` and a fresh step-up, and it refuses the original requester, **403**, as
+  the resolve does, comparing user ids; a row with no recorded requester id is refused, **409**. It
+  never runs the operation and never records an outcome. It judges the owner in three tiers:
 
 | Owner | The interrupt |
 |---|---|
@@ -3057,7 +3052,7 @@ a slow one. An operator settles it instead, through two routes (owner-delegated 
 | `node:<id>`, and the heartbeats cannot be read | refused, **503**; try again |
 | `node:<id>`, on an engine that is not a cluster node and reads no heartbeats | refused, **409**; interrupt from a cluster node |
 | `node:<id>`, and the heartbeat has lapsed or the node is gone | moves the row |
-| `shard:<id>`, `engine`, no owner, or any other name | moves the row only with `{"attest_owner_stopped": true}`, the operator's word that no process under that name is running; otherwise **409** |
+| `shard:<id>`, `engine`, no owner, or any other name | moves the row only with `{"attest_owner_stopped": true}`, a JSON `true` and nothing a parser could coerce to one (any other value is **422**), the operator's word that no process under that name is running; otherwise **409** |
 
 A cluster node whose `[cluster].node_id` is not pinned comes back under a new id, so its old claims
 read as a lapsed heartbeat here and can be interrupted without an attestation. The heartbeat is the
@@ -3070,8 +3065,9 @@ against the operator, with `reason` `operator_interrupt`, the claim owner, the t
 and `owner_stopped_attested`. If that write fails the call answers **503**, pages
 `audit_write_failed`, and the row stays `executing`. The move keeps `decided_at` as the claim time.
 An attestation is the operator's word, and nothing checks it. A row interrupted while its owner was
-in fact still running it is recorded when that owner writes its outcome: the status write finds
-the row moved and logs it, and the outcome row is written alone.
+in fact still running it is recorded when that owner writes its outcome: the outcome write finds
+the row moved and logs it, and the outcome row is written alone. If that outcome write raised
+instead, no outcome row is written alone, and it pages `audit_write_failed`, as the list above says.
 
 A row claimed before the column existed has no owner, and the first process to start treats it as its
 own. Two plain `serve` processes over one store would share the `engine` owner; that layout is

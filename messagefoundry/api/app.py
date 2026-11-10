@@ -7206,6 +7206,8 @@ def create_app(
             outcome = await gate.interrupt_stranded(
                 approval_id,
                 actor=identity.username,
+                # The requester refusal keys on the immutable id, like resolve (BACKLOG #1540).
+                actor_user_id=identity.user_id,
                 attest_owner_stopped=body is not None and body.attest_owner_stopped,
                 client=client_ip(request),
             )

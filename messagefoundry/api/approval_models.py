@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 
 from messagefoundry.api.request_model import RequestModel
 
@@ -61,9 +61,10 @@ class ExecutingApprovalList(BaseModel):
 class ApprovalInterruptRequest(RequestModel):
     """``attest_owner_stopped`` is the operator's word that the process owning the claim is not
     running. Only an owner with no heartbeat to read needs it; the audit row records it either
-    way."""
+    way. Strict: only JSON ``true`` or ``false``, so ``"yes"``, ``"true"`` or ``1`` is a 422,
+    never an attestation."""
 
-    attest_owner_stopped: bool = False
+    attest_owner_stopped: StrictBool = False
 
 
 class ApprovalInterruptResult(BaseModel):

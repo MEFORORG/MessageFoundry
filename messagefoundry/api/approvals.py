@@ -15,8 +15,7 @@ unknown, never retried). BACKLOG #1562; :meth:`ApprovalGate.approve` carries the
 operator later records an ``interrupted`` row's effects as applied or not applied
 (:meth:`ApprovalGate.resolve_interrupted`), which never re-runs the operation. The claim records
 which engine process owns the release, and at that process's next start
-:meth:`ApprovalGate.reconcile_after_restart` moves any row it left ``executing`` to the outcome the
-audit trail records for it, or to ``interrupted`` when the trail records none.
+:meth:`ApprovalGate.reconcile_after_restart` moves any row it left ``executing`` to ``interrupted``.
 
 A request YOUNGER than ``[approvals].min_dwell_seconds`` cannot be approved yet (ASVS 2.4.2). The expiry
 is a ceiling; this is the floor. The refusal is a 409 with a ``Retry-After`` header naming the
@@ -217,24 +216,6 @@ _INTERRUPT_REFUSED: Mapping[str, tuple[int, str]] = {
     ),
 }
 
-#: The outcome rows a release writes, each mapped to the status it records (BACKLOG #1562). The
-#: restart reconcile reads them: a release whose status write failed may still have its outcome
-#: row in the trail, and that row says what happened. ``approval.interrupted`` records an unknown
-#: outcome, so it maps to ``None``, as finding no row does.
-_OUTCOME_ROWS: Mapping[str, str | None] = {
-    "approval.approved": "approved",
-    "approval.failed": "failed",
-    "approval.interrupted": None,
-}
-
-#: How many rows of each outcome action the reconcile reads, newest first, back to just before the
-#: request. A read that fills it may have missed the row, so the outcome then counts as unknown.
-_OUTCOME_SCAN_LIMIT = 5000
-
-#: How far before a request's own time the outcome read starts. The outcome row is stamped by the
-#: store's clock after the claim, so this only absorbs a clock step back between the two.
-_OUTCOME_SCAN_SLACK_SECONDS = 300.0
-
 #: How many open requests :meth:`ApprovalGate.rejoin` reads, newest first. A repeat whose request
 #: sits further back is not found there and falls through to the proof and :meth:`ApprovalGate.guard`,
 #: whose own repeat rule still joins it; only the proof-free path is lost. A renamed requester's
@@ -293,8 +274,6 @@ class RestartReconciliation:
     unsettled: tuple[str, ...]
     #: Rows another claim owner holds. Left alone: the owner may be alive and running them.
     foreign: tuple[str, ...]
-    #: Rows this process had claimed whose outcome the audit trail records, now at that outcome.
-    settled: tuple[str, ...] = ()
 
 
 def _stored_params(
@@ -349,16 +328,6 @@ def _audit_detail(fields: Mapping[str, Any]) -> str:
             scrub_log_argument(", ".join(degraded)),
         )
         return json.dumps(safe, default=str)
-
-
-def _audited_id(detail: Any) -> str | None:
-    """The ``approval_id`` an approval audit row's JSON detail names, or ``None`` when the detail
-    is not a JSON object naming one (BACKLOG #1562)."""
-    parsed, refusal = json_loads_or_refusal(str(detail))
-    if refusal is not None or not isinstance(parsed, dict):
-        return None
-    found = parsed.get("approval_id")
-    return found if isinstance(found, str) else None
 
 
 def _claim_time(row: ApprovalRow, clock: Callable[[], float]) -> float:
@@ -717,13 +686,10 @@ class ApprovalGate:
         row this process claimed in its previous life and never settled is a release whose outcome
         the gate never recorded. At least three things leave one: the process died mid-run, both of
         :meth:`_settle`'s writes failed (the operation ran), or a claim committed but its reply was
-        lost (nothing ran). The status cannot say which, but the audit trail sometimes can, so it
-        is read first (:meth:`_recorded_outcome`). A row whose outcome row is there moves to the
-        status that row records, ``approved`` or ``failed``, with an ``approval.reconciled`` audit
-        row naming it. Every other row moves to ``interrupted`` with an ``approval.interrupted``
-        audit row. Each audit row is in the SAME write as its move (vault BACKLOG #2255), and its
-        ``reason`` is ``engine_restart``. The move keeps the row's ``decided_at``, the claim time.
-        Nothing re-runs: an operator records what happened to an ``interrupted`` row through
+        lost (nothing ran). The audit trail may say which; the status does not, so each such row
+        moves to ``interrupted`` with an ``approval.interrupted`` audit row in the SAME write
+        (vault BACKLOG #2255), whose ``reason`` is ``engine_restart``. The move keeps the row's
+        ``decided_at``, the claim time. Nothing re-runs: an operator records what happened through
         :meth:`resolve_interrupted`, exactly as for a release cut off by a cancel.
 
         **Only this process's rows.** Engine shards and cluster nodes share one store, so an
@@ -756,10 +722,7 @@ class ApprovalGate:
         """The body of :meth:`reconcile_after_restart` under owner ``me``. With
         ``claimed_before``, a row claimed at or after that time is left alone: it is this life's."""
         interrupted: list[str] = []
-        settled: list[str] = []
         unsettled: list[str] = []
-        # Read once, and only when a trail outcome is found: whether the audit chain verifies.
-        trail_ok: bool | None = None
         # Filtered in SQL, so other owners' stranded rows cannot push ours past the read's cap.
         # A row that fails its seal is reported and left as it is: the store would refuse the move
         # anyway, and nothing re-seals it (BACKLOG #2592).
@@ -769,43 +732,18 @@ class ApprovalGate:
             if claimed_before is not None and (row.decided_at or 0.0) >= claimed_before:
                 continue  # claimed by this process since it started, so not a leftover
             approval_id = row.id
-            # A release whose status write failed may have written its outcome row anyway, and
-            # then the trail knows what the status does not. Only an unknown outcome is
-            # 'interrupted'; a known one is settled to what the trail says.
-            # The catch-up path runs inside a queue request, where a whole-chain walk does not
-            # belong, so only a true start reads the trail; a catch-up row is 'interrupted'.
-            known = (
-                None
-                if claimed_before is not None or trail_ok is False
-                else await self._recorded_outcome(row)
-            )
-            if known is not None:
-                # list_audit checks no row MAC, so an outcome row is trusted only while the keyed
-                # chain verifies: a row written by someone without the key must not become a
-                # sealed status.
-                if trail_ok is None:
-                    trail_ok = await self._audit_chain_verifies()
-                if not trail_ok:
-                    known = None
-            if known is None:
-                status, audit = "interrupted", "approval.interrupted"
-                fields = _stranded_fields(row, "engine_restart")
-            else:
-                status, audit = known[0], "approval.reconciled"
-                fields = _stranded_fields(
-                    row, "engine_restart", status=status, outcome_audit_id=known[1]
-                )
+            detail = _audit_detail(_stranded_fields(row, "engine_restart"))
             try:
                 # Guarded on 'executing' and written back with the releasing approver, as the
                 # resolve path does: the column says who released the request. ``decided_at``
                 # keeps the claim time; the audit row's own time says when this ran.
                 moved = await self._store.decide_pending_approval(
                     approval_id,
-                    status=status,
+                    status="interrupted",
                     approver=row.approver,
                     decided_at=_claim_time(row, self._clock),
                     from_status="executing",
-                    audit=AuditAppend(audit, actor="system", detail=_audit_detail(fields)),
+                    audit=AuditAppend("approval.interrupted", actor="system", detail=detail),
                 )
             except RowSealError:
                 # Changed outside the store between the read and the move. Nothing re-seals it,
@@ -814,15 +752,14 @@ class ApprovalGate:
                 continue
             except Exception:  # noqa: BLE001 - every store backend raises its own type
                 log.exception(
-                    "approval %s: could not move this process's leftover 'executing' release to "
-                    "'%s'; it stays 'executing' and the next start tries again",
+                    "approval %s: could not mark this process's leftover 'executing' release "
+                    "interrupted; it stays 'executing' and the next start tries again",
                     approval_id,
-                    status,
                 )
                 unsettled.append(approval_id)
                 continue
             if moved:
-                (interrupted if known is None else settled).append(approval_id)
+                interrupted.append(approval_id)
             else:
                 log.info(
                     "approval %s: settled by another caller between the read and the move",
@@ -853,90 +790,7 @@ class ApprovalGate:
                 len(interrupted),
                 ", ".join(interrupted),
             )
-        if settled:
-            log.warning(
-                "approvals: %d release(s) this process claimed before it restarted had an outcome "
-                "in the audit trail but not in their status, so they now read that outcome "
-                "(approval.reconciled); approval ids: %s",
-                len(settled),
-                ", ".join(settled),
-            )
-        return RestartReconciliation(
-            tuple(interrupted), tuple(unsettled), tuple(foreign), tuple(settled)
-        )
-
-    async def _audit_chain_verifies(self) -> bool:
-        """Whether the audit chain verifies under a key this process holds (BACKLOG #1562), the
-        condition the restart puts on trusting an outcome row. ``False`` on a break, on a keyless
-        walk (anyone who can write the log can recompute it), on a keyed chain this process cannot
-        check, and on a failed walk, each logged."""
-        try:
-            verdict = await self._store.verify_audit_chain()
-        except _READ_DEFECTS:
-            raise
-        except Exception:  # noqa: BLE001 - an unchecked trail leaves every outcome unknown
-            log.exception(
-                "approvals: the audit chain could not be verified, so no outcome row in it is "
-                "trusted and each leftover release counts as unknown"
-            )
-            return False
-        ok, message = verdict
-        if ok and not verdict.keyless_walk:
-            return True
-        log.warning(
-            "approvals: the audit chain is not verified under a held key (%s), so no outcome row "
-            "in it is trusted and each leftover release counts as unknown",
-            scrub_log_argument(str(message)) if not ok else "a keyless walk",
-        )
-        return False
-
-    async def _recorded_outcome(self, row: ApprovalRow) -> tuple[str, int] | None:
-        """The status the audit trail records for release ``row``, with the id of the outcome row
-        that records it, or ``None`` when the outcome is unknown (BACKLOG #1562).
-
-        It reads each outcome action in :data:`_OUTCOME_ROWS` written by the approver who released
-        it, as every outcome row is, back to just before the claim, and keeps the rows naming this
-        request. Exactly one known outcome, and no ``approval.interrupted``, is a known outcome.
-        Anything else is unknown: no row, an ``approval.interrupted``, two outcomes that disagree,
-        a row with no approver, a read that fills :data:`_OUTCOME_SCAN_LIMIT`, or a read that
-        fails, which is logged. An unknown outcome is ``interrupted``, which claims nothing, so a
-        doubt here never records a release as run or as not run."""
-        if row.approver is None:
-            return None  # no approver to read the trail by; `actor=None` would read everyone's
-        since = row.requested_at if row.decided_at is None else row.decided_at
-        since -= _OUTCOME_SCAN_SLACK_SECONDS
-        found: dict[str | None, int] = {}
-        try:
-            for action, status in _OUTCOME_ROWS.items():
-                entries = await self._store.list_audit(
-                    action=action, actor=row.approver, since=since, limit=_OUTCOME_SCAN_LIMIT
-                )
-                if len(entries) >= _OUTCOME_SCAN_LIMIT:
-                    log.warning(
-                        "approval %s: the trail holds too many %s rows to read for its outcome, so "
-                        "it counts as unknown",
-                        row.id,
-                        action,
-                    )
-                    return None
-                for entry in entries:
-                    # The substring test only skips parsing rows that cannot name this request.
-                    detail = str(entry["detail"])
-                    if row.id in detail and _audited_id(detail) == row.id:
-                        found.setdefault(status, int(entry["id"]))
-        except _READ_DEFECTS:
-            raise  # a defect, not an outage, as _read treats it
-        except Exception:  # noqa: BLE001 - an unread trail leaves the outcome unknown, not an error
-            log.exception(
-                "approval %s: the audit trail could not be read for its outcome, so it counts as "
-                "unknown",
-                row.id,
-            )
-            return None
-        if len(found) != 1:
-            return None
-        [(status, audit_id)] = found.items()
-        return None if status is None else (status, audit_id)
+        return RestartReconciliation(tuple(interrupted), tuple(unsettled), tuple(foreign))
 
     def register(
         self,
@@ -2756,6 +2610,7 @@ class ApprovalGate:
         approval_id: str,
         *,
         actor: str,
+        actor_user_id: str,
         attest_owner_stopped: bool = False,
         client: str | None = None,
     ) -> dict[str, Any]:
@@ -2779,7 +2634,12 @@ class ApprovalGate:
         it judged, and its ``approval.interrupted`` row, against the operator, is in the SAME
         write, so a row that moved or changed owner since moves nothing and answers 409. A write
         fault answers 503 and pages ``audit_write_failed``. ``decided_at`` keeps the claim time.
-        The route requires ``approvals:approve`` with a fresh step-up."""
+        The route requires ``approvals:approve`` with a fresh step-up.
+
+        **The original requester is refused, 403**, as :meth:`resolve_interrupted` refuses them,
+        comparing user ids (BACKLOG #1540): an interrupt rests on the actor's word that the owner
+        is stopped, and the resolve it leads to is closed to the requester for that reason. A row
+        with no recorded requester id cannot be checked, so it is refused, 409."""
         row = await self._load(
             approval_id,
             status="executing",
@@ -2787,6 +2647,16 @@ class ApprovalGate:
                 f"request is {current}; only an executing release can be interrupted here"
             ),
         )
+        if not row.requester_user_id:
+            # Fail closed, as resolve_interrupted does: with no id the requester cannot be told
+            # apart from anyone else.
+            raise ApprovalError(
+                409,
+                "this request has no recorded requester id, so it cannot be checked for "
+                "self-interruption and cannot be interrupted here",
+            )
+        if row.requester_user_id == actor_user_id:
+            raise ApprovalError(403, "you cannot interrupt your own request")
         liveness = await self._owner_liveness(row, {})
         verdict = _interrupt_verdict(liveness)
         if verdict == "refused":
