@@ -920,7 +920,7 @@ class AlertSink(Protocol):
         store principal. No page; when alert-state is wired (ADR 0044) it auto-resolves the open
         warning for the same subject, so a fixed grant clears the dashboard. The resolve is fenced
         (ADR 0044, the vault BACKLOG #4916 amendment): a warning another process raised that lands
-        after the resolve reads the alert stays open, and may be that process's live finding."""
+        after the resolve's last read of the alert stays open, and may be a live finding."""
         ...
 
     def vault_privilege_warning(
@@ -944,7 +944,7 @@ class AlertSink(Protocol):
         token and found it clean. No page; when alert-state is wired (ADR 0044) it auto-resolves
         the open warning for the same subject, so a fixed token clears the dashboard. The resolve is
         fenced (ADR 0044, the vault BACKLOG #4916 amendment): a warning another process raised that
-        lands after the resolve reads the alert stays open, and may be that process's live finding."""
+        lands after the resolve's last read of the alert stays open, and may be a live finding."""
         ...
 
     def config_changed(

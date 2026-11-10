@@ -27,7 +27,7 @@ The subject is the hop alone (:func:`vault_privilege_alert_subject`), never anyt
 token, so processes that share one store share each hop's alert: a clean start by one can resolve
 the warning another raised on a different token. It does so only when, at least, its sink resolves
 (a notifier with alert state, not the logging sink), it probes that hop, and the warning's raise
-landed before the fenced auto-resolve's own read of the alert (ADR 0044, the vault BACKLOG #4916
+landed before the fenced auto-resolve's last read of the alert (ADR 0044, the vault BACKLOG #4916
 amendment). A warning still open after a clean start may be a live finding, another process on the
 same store still running on the over-granted or unread token.
 

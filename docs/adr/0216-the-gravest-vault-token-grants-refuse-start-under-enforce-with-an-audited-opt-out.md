@@ -169,9 +169,11 @@ it the notifier, or the logging sink when no notifier is configured.
   store share each hop's alert, so one process's clean start can resolve a warning another raised
   on a different token. It does so only when, at least, its process has a notifier with alert
   state (the logging sink resolves nothing), it probes that hop, and the warning's raise landed
-  before the fenced auto-resolve's own read of the alert (ADR 0044, the vault BACKLOG #4916
+  before the fenced auto-resolve's last read of the alert (ADR 0044, the vault BACKLOG #4916
   amendment). A warning still open after a clean start may be a live finding: another process
-  still running on the over-granted or unread token. Each start's audit row still records every
-  process's own reading.
+  still running on the over-granted or unread token. Each start's audit row still records its
+  own reading, though not which process wrote it. CORRECTED 2026-11-10: this bullet and the one
+  above said a clean start resolves the warning, with no conditions; the #4916 fence and the
+  logging sink make that false.
 - **Best effort.** A sink that raises is logged and never masks the finding, the audit row or the
   refusal.
