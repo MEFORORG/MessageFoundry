@@ -16,6 +16,7 @@ comment beside the refusal in ``RestDestination.__init__`` says why the handler 
 
 from __future__ import annotations
 
+import logging
 import urllib.request
 
 import pytest
@@ -28,6 +29,7 @@ from messagefoundry.transports import build_destination
 from messagefoundry.transports.http_auth import (
     digest_handler_from_settings,
     http_digest_selected,
+    is_authorization_header_name,
     with_http_digest,
 )
 from messagefoundry.transports.rest import HttpAuthError, RestDestination
@@ -103,7 +105,7 @@ def _digest_spec(ctype: ConnectorType, **extra: object) -> dict[str, object]:
 def test_a_static_credential_beside_digest_is_refused(ctype: ConnectorType, static: str) -> None:
     # SOAP refuses a half Basic pair before it reads Digest (#5526), with that refusal's own words.
     half_soap = ctype is ConnectorType.SOAP and static == "basic-user-only"
-    expected = "must be set together" if half_soap else "beside HTTP Digest"
+    expected = "must be set together" if half_soap else "beside a static credential"
     with pytest.raises(HttpAuthError, match=expected) as ei:
         _build(ctype, _digest_spec(ctype, **_STATIC[static]))
     assert _PW not in str(ei.value)
@@ -149,8 +151,9 @@ def test_an_unrecognised_http_auth_mode_refuses_the_connector() -> None:
     assert "digset" not in str(ei.value)
 
 
-@pytest.mark.parametrize("unset", [None, "", "   "])
-def test_control_an_unset_http_auth_is_off(unset: str | None) -> None:
+@pytest.mark.parametrize("unset", [None, "", "   ", False, 0])
+def test_control_an_unset_http_auth_is_off(unset: object) -> None:
+    """Every falsy value read as off before #5529 and still does; only a set, unknown mode raises."""
     assert digest_handler_from_settings({"http_auth": unset, **_CREDS}, url=URL) is None
     assert not http_digest_selected({"http_auth": unset})
 
@@ -164,3 +167,40 @@ def test_the_census_shares_the_predicate_and_does_not_raise() -> None:
     mode, so no Digest credential is reported, and the census itself does not raise."""
     assert "HTTP Digest" not in _http_static(ConnectorType.REST, {"http_auth": "digset"}, False)
     assert "HTTP Digest" in _http_static(ConnectorType.REST, {"http_auth": " DIGEST "}, False)
+
+
+# --- review round 1: spelling-proof header names, and refusing before any hop gate logs ----------
+
+
+@pytest.mark.parametrize(
+    "name", ["Authorization\t", " authorization", "AUTHORIZATION\x00", "Authorization\x7f"]
+)
+def test_an_authorization_header_however_spelled_is_refused_beside_digest(name: str) -> None:
+    """``http.client`` sends such a name as written, and a peer may read it as the plain header."""
+    assert is_authorization_header_name(name)
+    with pytest.raises(HttpAuthError, match="beside a static credential"):
+        _build(ConnectorType.REST, _digest_spec(ConnectorType.REST, headers={name: "Basic x"}))
+
+
+@pytest.mark.parametrize("name", ["Authorization-2", "X-Authorization", "Proxy-Authorization"])
+def test_control_another_header_is_not_authorization(name: str) -> None:
+    assert not is_authorization_header_name(name)
+
+
+def test_an_unrecognised_mode_refuses_before_the_verify_off_gate_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The refusal runs first in construction, so a connection that never builds logs no DISABLED
+    warning (the placement vault BACKLOG #2977 item 8 set for the ECH refusals)."""
+    url = "https://127.0.0.1:8443/ingest"
+    caplog.set_level(logging.DEBUG)
+    settings = Rest(url=url, verify_tls=False).settings
+    settings.update({"http_auth": "digset", **_CREDS})
+    with pytest.raises(HttpAuthError, match="http_auth"):
+        _build(ConnectorType.REST, settings)
+    assert "DISABLED" not in caplog.text
+    # CONTROL: the same loopback verify-off hop with no http_auth builds and logs the warning, so the
+    # absence above is the refusal's placement and not a log this capture cannot see.
+    caplog.clear()
+    _build(ConnectorType.REST, Rest(url=url, verify_tls=False).settings)
+    assert "DISABLED" in caplog.text

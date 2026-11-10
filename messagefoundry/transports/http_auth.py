@@ -34,6 +34,7 @@ here is shaped to admit it. See ADR 0024 amendment.
 from __future__ import annotations
 
 import base64
+import re
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
@@ -76,6 +77,8 @@ __all__ = [
     "bearer_provider_from_settings",
     "digest_handler_from_settings",
     "http_digest_selected",
+    "is_authorization_header_name",
+    "refuse_http_digest_conflicts",
     "oauth2_auth_configured",
     "oauth2_cc_provider_from_settings",
     "proxy_auth_handler_from_settings",
@@ -330,15 +333,34 @@ class _ApprovedDigestAuthHandler(_ApprovedDigestMixin, urllib.request.HTTPDigest
     which the proxy 407 handler shares, so the origin and proxy paths cannot drift apart."""
 
 
+#: RFC 9110 ``tchar``: the characters a field name can hold. The same set as
+#: ``bounded_read._TCHARS``, which reads ``Proxy-Authorization`` by this rule.
+_TCHARS = r"!#$%&'*+\-.^_`|~0-9A-Za-z"
+#: ``Authorization`` in any ASCII letter case, with any run of characters no field name can hold
+#: before it, and after it either nothing or such a character and then anything (the rule
+#: ``bounded_read.is_proxy_credential_header_name`` applies to ``Proxy-Authorization``).
+_AUTHORIZATION_NAME = re.compile(
+    rf"[^{_TCHARS}]*authorization(?:[^{_TCHARS}].*)?", re.ASCII | re.IGNORECASE | re.DOTALL
+)
+
+
+def is_authorization_header_name(name: str) -> bool:
+    """Whether ``name`` is the ``Authorization`` header, however it is spelled (BACKLOG #5529).
+    ``http.client`` sends a name ending in a space, a tab, a NUL or a DEL as it is written, and a
+    peer may read each as the plain name, so a bare ``lower()`` comparison is not enough."""
+    return _AUTHORIZATION_NAME.fullmatch(name) is not None
+
+
 def http_digest_selected(s: Mapping[str, Any]) -> bool:
     """Whether ``http_auth`` selects HTTP Digest. The SINGLE definition, shared by the connectors
     and the static-credential census so the two agree.
 
-    Unset, or blank once stripped, is off. Any other value than ``digest`` (any case, any padding)
-    raises :class:`HttpAuthError` (BACKLOG #5529 limb 1): a typo used to read as auth off, so the
-    connection built and delivered with no auth. The message does not echo the value."""
+    Off for an unset or falsy value, or a string that is blank once stripped. Any other value than
+    ``digest`` (any case, any padding) raises :class:`HttpAuthError` (BACKLOG #5529 limb 1): a typo
+    used to read as auth off, so the connection built and delivered with no auth. The message does
+    not echo the value."""
     raw = s.get("http_auth")
-    mode = "" if raw is None else str(raw).strip().lower()
+    mode = str(raw).strip().lower() if raw else ""
     if not mode:
         return False
     if mode == "digest":
@@ -349,6 +371,31 @@ def http_digest_selected(s: Mapping[str, Any]) -> bool:
         "mode this engine does not offer; the only value is 'digest' "
         "(with_http_digest), or leave it unset for no HTTP auth"
     )
+
+
+def refuse_http_digest_conflicts(s: Mapping[str, Any]) -> bool:
+    """Whether Digest is selected, after refusing what cannot stand beside it (BACKLOG #5529).
+
+    The connectors call this at the top of construction, so a connection that will not build logs
+    no insecure-hop crossing or warning first; :func:`digest_handler_from_settings` calls it again.
+    Refuses an unrecognised ``http_auth`` (:func:`http_digest_selected`), and with Digest selected,
+    a static ``bearer_token``, ``basic_user``, ``basic_password`` or ``Authorization`` entry in
+    ``headers``: urllib lets a request header override the Digest handler's own, so where such a
+    credential is sent it replaces the Digest response on the wire. Names settings, never a value."""
+    if not http_digest_selected(s):
+        return False
+    static = [name for name in ("bearer_token", "basic_user", "basic_password") if s.get(name)]
+    extra = s.get("headers")
+    if isinstance(extra, Mapping) and any(is_authorization_header_name(str(k)) for k in extra):
+        static.append("an Authorization entry in headers")
+    if static:
+        # Read strictly: a non-bool flag raises HttpAuthError naming the connection (#2232).
+        _, (_, _, conn), _ = hop_declarations_from_settings(s, HttpAuthError)
+        raise HttpAuthError(
+            f"{hop_name_prefix(conn)}HTTP Digest cannot be configured beside a static credential "
+            f"({', '.join(static)}); configure exactly one"
+        )
+    return True
 
 
 def digest_handler_from_settings(
@@ -364,23 +411,11 @@ def digest_handler_from_settings(
     a loopback host lifts it, never ``tls_hop_attested`` or ``cleartext_accepted`` (vault BACKLOG #3533
     item 4). A missing user/password is a loud :class:`HttpAuthError` (fail-closed, never a silent
     no-auth request)."""
-    if not http_digest_selected(s):
+    if not refuse_http_digest_conflicts(s):
         return None
     # The declarations are read strictly: a non-bool flag raises HttpAuthError naming the connection
-    # (vault BACKLOG #2232), and the mirrored connection name heads each refusal below.
+    # (vault BACKLOG #2232), and the mirrored connection name heads the refusal below.
     _, (_, _, accept_conn), _ = hop_declarations_from_settings(s, HttpAuthError)
-    # BACKLOG #5529 limb 2: urllib lets a request header override the Digest handler's own
-    # Authorization, so a static credential beside Digest is what would cross. One refusal here
-    # covers REST, SOAP and FHIR. It names the settings, never a value.
-    extra = s.get("headers")
-    static = [name for name in ("bearer_token", "basic_user", "basic_password") if s.get(name)]
-    if isinstance(extra, Mapping) and any(str(k).lower() == "authorization" for k in extra):
-        static.append("an Authorization entry in headers")
-    if static:
-        raise HttpAuthError(
-            f"{hop_name_prefix(accept_conn)}a static credential ({', '.join(static)}) cannot ride beside "
-            "HTTP Digest: it would replace the Digest response on the wire; configure exactly one"
-        )
     scheme = urllib.parse.urlsplit(url).scheme.lower()
     # The digest response is a credential, so an off-box cleartext hop is refused with no escape
     # (``refuse_cleartext_credential_hop``, vault BACKLOG #3533 item 4). It raises

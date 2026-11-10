@@ -401,7 +401,9 @@ def _drop_authorization(headers: dict[str, str]) -> None:
     connection configures owns the one header (BACKLOG #5526). urllib capitalises names and the last
     write wins, so the configured value already crossed; the table still held two keys, and the
     length gate measured both."""
-    for key in [k for k in headers if k.lower() == "authorization"]:
+    from messagefoundry.transports.http_auth import is_authorization_header_name
+
+    for key in [k for k in headers if is_authorization_header_name(k)]:
         del headers[key]
 
 
@@ -483,6 +485,10 @@ class SoapDestination(DestinationConnector):
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
         self._refuse_half_credential_pairs(s)
+        # BACKLOG #5529: refused before any hop gate logs a crossing for a connection that never builds.
+        from messagefoundry.transports.http_auth import refuse_http_digest_conflicts
+
+        refuse_http_digest_conflicts(s)
         self._validate_ws(scheme, s)
 
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).

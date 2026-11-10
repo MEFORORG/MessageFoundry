@@ -2770,6 +2770,11 @@ class RestDestination(DestinationConnector):
         accepted, accept_reason = config.cleartext_accepted, config.cleartext_reason
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
+        # BACKLOG #5529: an http_auth this connection cannot honour is refused first, so a connection
+        # that never builds logs no insecure-hop crossing or warning below. Lazy: http_auth imports rest.
+        from messagefoundry.transports.http_auth import refuse_http_digest_conflicts
+
+        digest_selected = refuse_http_digest_conflicts(s)
         # ADR 0139 (ASVS 12.1.5): opt-in ECH SNI-hiding. When set, this connection re-addresses each
         # request to a loopback terminating sidecar at send time (see _ech_request); destination TLS +
         # ECH are the sidecar's, so no forward proxy is used. Off (default) → None → byte-identical.
@@ -2794,9 +2799,7 @@ class RestDestination(DestinationConnector):
         # Digest handler is folded into, so the connection used to build and deliver with no Digest
         # auth. Keeping the handler on the ECH opener would not work: its password manager is keyed
         # on self.url, and the ECH request goes to the sidecar URL, so no challenge would match.
-        from messagefoundry.transports.http_auth import http_digest_selected
-
-        if self._ech_sidecar is not None and http_digest_selected(s):
+        if self._ech_sidecar is not None and digest_selected:
             raise HttpAuthError(
                 f"{hop_name_prefix(config.name)}ech_egress and HTTP Digest are mutually exclusive -- "
                 "the Digest handler cannot answer a challenge through the ECH sidecar (ADR 0139)"

@@ -1029,6 +1029,10 @@ class FhirDestination(DestinationConnector):
         self.base_url = url
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("FHIR", config.name)
+        # BACKLOG #5529: refused before any hop gate logs a crossing for a connection that never builds.
+        from messagefoundry.transports.http_auth import refuse_http_digest_conflicts
+
+        refuse_http_digest_conflicts(s)
         self.fhir_version: str = str(s.get("fhir_version", "R4B"))
         self.format: str = str(s.get("format", "json"))
         if self.format != "json":

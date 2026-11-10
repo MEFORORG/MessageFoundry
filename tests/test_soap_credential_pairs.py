@@ -120,7 +120,10 @@ def test_control_a_whole_username_token_pair_stamps_the_token() -> None:
 # --- a configured credential owns the one Authorization header (hardening) ----------------------
 
 
-@pytest.mark.parametrize("casing", ["authorization", "AUTHORIZATION", "Authorization"])
+@pytest.mark.parametrize(
+    "casing",
+    ["authorization", "AUTHORIZATION", "Authorization", "Authorization\t", " authorization"],
+)
 @pytest.mark.parametrize(
     "cred",
     [{"basic_user": "svc", "basic_password": _PW}, {"bearer_token": "tok-synthetic"}],
