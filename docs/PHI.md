@@ -123,8 +123,8 @@ through Transit for the audit chain's MAC on `vault_transit`. `SealPager.forged`
 with no interval, and `SealPager.unverifiable` pages an Unverifiable one every time too, its
 five-minute window choosing only the page's subject. So a row a revoke checks that keeps failing
 Forged or Unverifiable is audited, and paged to the alert sink, on each revoke whose seal checks
-reach it. That is mainly the user row the account-epoch raise reads, and at least also the kept
-session's re-stamp. A row the revoke meets after its first Outage is not checked, so it is not
+reach it. That is mainly the user row the account-epoch raise reads. A row the revoke meets after
+its first Outage is not checked, so it is not
 reported, and an Outage is paged without an audit row. That engine-side lack of an interval is a
 filed residual (vault #8202). Every one of these pages is an `integrity_drift` alert. A
 configured notifier sink throttles it per subject for `[alerts].realert_seconds` (300 seconds by
