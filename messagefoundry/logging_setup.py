@@ -479,11 +479,13 @@ def redacted_log_field(
     - for a ``(before, after)`` of ``checks``, the line ``before`` + ``text`` + ``after`` does not
       read as ``before``, the value, and ``after`` either as it was or as the same passes write
       it alone. A check is read only to compare, never logged, so its ``after`` may be caller
-      text: it is the line the value stood in. The value read there differs when a pass took
-      text of ``after`` into ``text``, or ``after`` made a pass hide more of ``text``, and the
-      reading also fails when the line writes ``after`` neither as it was nor as it is written
-      alone. That happens at least when ``text`` ends in a credential label that takes ``after``
-      as its value; and when ``text`` turns a pass off for the whole line, a no-break space or a
+      text: it is the line the value stood in. The value read there differs at least when a
+      pass took text of ``after`` into ``text``; when ``after`` made a pass hide more of
+      ``text``; and when ``after`` turned a pass off for the whole line, a credential shape or a
+      no-break space in it for example, so the line hides less of ``text``. The reading also
+      fails when the line writes ``after`` neither as it was nor as it is written alone. That
+      happens at least when ``text`` ends in a credential label that takes ``after`` as its
+      value; and when ``text`` turns a pass off for the whole line, a no-break space or a
       credential shape for example, and ``after`` holds a raw encoded run beside another
       rewritten shape (a tab, a date, a name). A pass rewriting ``after`` alike in both
       readings, a date or a tab in it for example, fails nothing; nor does a line that leaves

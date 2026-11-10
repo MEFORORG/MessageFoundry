@@ -1486,11 +1486,12 @@ def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1") -> list[str]:
     main's two WARNING lines. Main's lines are its own two formats, with the seen address as main
     logged it. Main's path span is its line after its head and, on the past-cap line, before
     ``seen_ip=`` and the seen text, as main logged it or as two handlers write it alone. Where
-    neither tail is found whole, main wrote its tail a third way: the span runs to the end of the
-    line, and the count taken off is the larger of the two tails' counts of the word, capped by
-    its count in the line from the first `` seen_ip=`` on, which holds all of that third tail
-    while its `` seen_ip=`` survives. So main gets no credit for a word only its own tail printed,
-    nor loses a path word its tail did not print."""
+    neither tail is found whole, the span runs to the end of the line and the larger of the two
+    tails' counts of the word is taken off, uncapped. The subtraction is strict: it guesses no
+    boundary, so a word only main's tail printed is not credited to main, but a path word main
+    printed can be taken off when its tail, written a third way, did not print it, a false red
+    that ``_KNOWN_FALSE_RED`` pins. Not covered, at least: a path word a pass's placeholder or
+    escape spells, which a tail rewritten more in the line than alone could add."""
     seen_text = _bounded_address_text(seen)
     repeat = _new_ip_path_field(path)
     over = _new_ip_path_field(path, seen_text)
@@ -1526,9 +1527,8 @@ def _main_span(
 ) -> tuple[str, Callable[[str], int]]:
     """Main's path span in ``line``, and how many of a word in it the caller takes off: the rest
     of ``head`` where a pass took part of it; and, where no tail of ``tails`` is found whole at the
-    line's end, so main wrote its tail a third way, the larger of the tails' counts, capped by the
-    count in the span from its first `` seen_ip=`` on, which holds all of that third tail while its
-    `` seen_ip=`` survives."""
+    line's end, the larger of the tails' counts, uncapped: the strict rule
+    ``_hides_no_less_than_main`` states."""
     line = line.rstrip("\n")
     extra = ""
     if line.startswith(head):
@@ -1538,16 +1538,7 @@ def _main_span(
     for tail in tails:
         if line.endswith(tail):
             return line[: len(line) - len(tail)], extra.count
-    cut = line.find(" seen_ip=")
-    region = line[cut:] if cut >= 0 else None
-
-    def taken_off(word: str) -> int:
-        in_tail = max(tail.count(word) for tail in tails)
-        if region is not None:
-            in_tail = min(in_tail, region.count(word))
-        return extra.count(word) + in_tail
-
-    return line, taken_off
+    return line, lambda word: extra.count(word) + max(tail.count(word) for tail in tails)
 
 
 def _path_value(line: str) -> str:
@@ -1557,25 +1548,28 @@ def _path_value(line: str) -> str:
     return dict(_logged_fields(line.rstrip("\n")))["path"]
 
 
-#: Paths whose past-cap line main wrote with its tail a third way, the encoded run raw and the
-#: date redacted, while the path's own date printed (round-5aa03c4b).
-_THIRD_WAY_TAIL = (
+#: Known false reds of the strict baseline (round-5aa03c4b): main wrote the past-cap tail a third
+#: way, the encoded run raw and the date redacted, while the path's own date printed, so taking
+#: off the raw tail's date takes off the path's. The field prints the date no more often than main.
+_KNOWN_FALSE_RED = (
     "//codemrn/1980-01-01SECRET\t|",
     "/'.:\t1980-01-01Authorization: 123-45-6789",
 )
 
 
-@pytest.mark.parametrize("path", _THIRD_WAY_TAIL)
-def test_a_tail_main_wrote_a_third_way_takes_off_only_what_it_printed(path: str) -> None:
-    """RED when: the baseline takes a path word off main's span for a seen text whose raw form
-    holds it, though main's own tail, written a third way, did not print it, so a field printing
-    the word no more often than main reads as a leak (BACKLOG #3770)."""
+@pytest.mark.parametrize("path", _KNOWN_FALSE_RED)
+def test_the_strict_baseline_reports_a_known_false_red(path: str) -> None:
+    """RED when: the baseline stops flagging a named false red, so its subtraction is no longer the
+    strict one its docstring states, or the field prints the date more often than main's line did
+    (BACKLOG #3770). Either change needs this vector re-read rather than dropped."""
     seen = "a%7Cb%7Cc 1980-01-01"
-    line = _last_sink_line(_OVER_HEAD + "path=%s%s", path, _seen_tail(_bounded_address_text(seen)))
-    # The control: main's tail is neither raw nor as written alone, and the path's date printed.
-    assert line.endswith(" seen_ip=a%7Cb%7Cc [redacted]") and "1980" in line, ascii(line)
-    assert "1980" in _unescaped(_new_ip_path_field(path, _bounded_address_text(seen)))
-    assert not _hides_no_less_than_main(path, seen), ascii(path)
+    seen_text = _bounded_address_text(seen)
+    line = _last_sink_line(_OVER_HEAD + "path=%s%s", path, _seen_tail(seen_text))
+    # The controls: main's tail is neither raw nor as written alone, main printed the path's date
+    # once, and the field prints it once.
+    assert line.endswith(" seen_ip=a%7Cb%7Cc [redacted]") and line.count("1980") == 1, ascii(line)
+    assert _unescaped(_new_ip_path_field(path, seen_text)).count("1980") == 1
+    assert _hides_no_less_than_main(path, seen) == ["1980"], ascii(path)
 
 
 @pytest.mark.parametrize(("path", "seen"), _QUOTE_CLOSING_SEEN)
@@ -1712,8 +1706,9 @@ def test_redact_log_value_follows_the_shipped_filter_chain(
 def test_a_rewritten_context_logs_a_placeholder() -> None:
     """RED when: a pass that rewrites the line's fixed context around the value leaves that context
     in the value; or a seen text a pass takes into the path is not caught; or a path ending in a
-    credential label is unreadable on the repeat line; or the placeholder passes its bound (BACKLOG
-    #3770).
+    credential label is unreadable on the repeat line, or ``/x/password:`` is readable on the
+    past-cap line, where its label takes ``seen_ip=`` as its value; or the placeholder passes its
+    bound (BACKLOG #3770).
     ``/x/password:`` before ``seen_ip=`` reads as a label whose value is the next field."""
     assert _UNREADABLE not in ("<redacted>", "[redacted]")
     assert redact_log_value("/x/password:", after=" seen_ip=0.0.0.0") is None
@@ -1779,6 +1774,17 @@ def test_a_seen_text_left_raw_in_the_line_leaves_the_path_readable(path: str, se
     assert not _hides_no_less_than_main(path, seen), (ascii(path), seen)
 
 
+@pytest.mark.parametrize("seen", ["code=SECRETVALUE", "10.0.0.1\xa0"])
+def test_a_seen_text_that_turns_a_pass_off_blanks_a_path_that_pass_rewrote(seen: str) -> None:
+    """RED when: the case ``redacted_log_field`` names, a seen text that turns a pass off for the
+    whole line so the line hides less of the path than the repeat line did, stops logging the
+    placeholder (BACKLOG #3770). It fails closed; a change that makes it readable must also change
+    that docstring, and still pass the hides-no-less tests."""
+    path = "/api/x a%7Cb%7Cc"
+    assert _new_ip_path_field(path) == '"/api/x_u0020_[redacted]"'
+    assert _new_ip_path_field(path, _bounded_address_text(seen)) == _UNREADABLE_FIELD
+
+
 @pytest.mark.parametrize("seen", ["a%7Cb%7Cc\tx", "a%7Cb%7Cc 1980-01-01", "a%7Cb%7Cc DOE JANE"])
 @pytest.mark.parametrize("path", [path for path, _ in _RAW_IN_LINE_SEEN])
 def test_a_raw_run_beside_another_rewritten_shape_blanks_a_switch_off_path(
@@ -1792,32 +1798,55 @@ def test_a_raw_run_beside_another_rewritten_shape_blanks_a_switch_off_path(
     assert _new_ip_path_field(path) != _UNREADABLE_FIELD
 
 
-def test_the_past_cap_line_blanks_a_path_only_where_main_wrote_neither_tail_form() -> None:
-    """RED when: over the seeded corpus, the past-cap line logs the placeholder for a path the
-    repeat line reads, though main's own past-cap line, written by two shipped handlers, printed
-    the repeat line's value where the path stood, followed by the seen text raw or as the passes
-    write it alone (BACKLOG #3770). Main's line is read through the real handlers here, not the
-    reading the field's check uses, so this catches drift between the two; it does not catch a
-    blank where main printed the value with the tail written a third way."""
+def _unexplained_blanks(field: Callable[[str, str], str]) -> tuple[int, list[str]]:
+    """Over the seeded corpus, how many paths ``field`` blanks on the past-cap line though the
+    repeat line reads them, and those of them main's own past-cap line, written by two shipped
+    handlers, printed readably: as the repeat value, or main's own repeat-line path span, followed
+    by the seen text raw or as the passes write it alone."""
     rng = random.Random(46)
     head = _OVER_HEAD + "path="
     seens = (*_BASELINE_SEEN, *(seen for _, seen in _RAW_IN_LINE_SEEN))
-    blanked = 0
+    blanked, readable_in_main = 0, []
     for n in range(300):
         path = _corpus_path(rng)
         seen_text = _bounded_address_text(seens[n % len(seens)])
-        if _new_ip_path_field(path, seen_text) != _UNREADABLE_FIELD:
+        if field(path, seen_text) != _UNREADABLE_FIELD:
             continue
         value = redact_log_value(path, before=_REPEAT_HEAD)
         if value is None:
             continue
         blanked += 1
+        # Main's own repeat span keeps a tab the repeat value, read with the tab round, respells.
+        repeat = _last_sink_line(_REPEAT_HEAD + "%s", path)
+        spans = {value}
+        if repeat.startswith(_REPEAT_HEAD):
+            spans.add(repeat[len(_REPEAT_HEAD) :])
         tail = _seen_tail(seen_text)
-        alone = _last_sink_line("%s", tail)
+        tails = (tail, _last_sink_line("%s", tail))
         line = _last_sink_line(head + "%s%s", path, tail)
-        assert line not in (head + value + tail, head + value + alone), (ascii(path), seen_text)
+        if any(line == head + span + end for span in spans for end in tails):
+            readable_in_main.append(ascii(path))
+    return blanked, readable_in_main
+
+
+def test_the_past_cap_line_blanks_a_path_only_where_main_wrote_neither_tail_form() -> None:
+    """RED when: over the seeded corpus, the past-cap line logs the placeholder for a path the
+    repeat line reads, though main's own past-cap line, written by two shipped handlers, printed
+    it readably: the repeat value or main's own repeat-line path span, followed by the seen text
+    raw or as the passes write it alone (BACKLOG #3770). Main's line is read through the real
+    handlers here, not the reading the field's check uses. It does not catch a blank where main
+    printed the path with the tail written a third way."""
+    blanked, unexplained = _unexplained_blanks(_new_ip_path_field)
     # The control: the corpus reaches the placeholder at all.
     assert blanked, "no corpus path was blanked, so this measured nothing"
+    assert not unexplained, unexplained
+    # The control: a field that blanks every path holding a tab is caught, which a comparison
+    # with the repeat value alone, a tab respelled, could not catch.
+    # Only the paths it blanks are read further, so any other spelling serves the rest.
+    _, caught = _unexplained_blanks(
+        lambda path, seen_text: _UNREADABLE_FIELD if "\t" in path else '"readable"'
+    )
+    assert any("\\t" in path for path in caught), caught
 
 
 def test_a_cut_checksum_is_never_read_as_a_date() -> None:

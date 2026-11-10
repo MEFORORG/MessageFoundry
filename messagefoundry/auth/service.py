@@ -553,15 +553,18 @@ def _new_ip_path_field(path: str, seen_text: str | None = None) -> str:
 
     What the tests check of it is in ``tests/test_admin_new_ip.py``. No word of a path that the
     last of two shipped handlers hid in the pre-#3770 lines prints in the path field more often
-    than it did there: over the paths main hid, each read with each of five seen addresses; over
-    quote-closing, control-character and raw-in-line vectors, each read with one seen address;
-    and over a seeded corpus, each path read with one. An ordinary path stays readable with each
-    named seen text a pass rewrites. Two paths that turn a pass off for the whole line, one with a
-    no-break space and one with a credential shape, stay readable with an encoded HL7 seen text
-    that line leaves raw. Over a seeded corpus, a path the repeat line reads blanks on the
-    past-cap line only where main's own past-cap line, written by two shipped handlers, was not
-    the repeat value followed by the seen text raw or as written alone; that bounds the blanking
-    by those two forms, not by what main hid. A path that turns a pass off for the whole line
+    than it did there, as the strict baseline ``_hides_no_less_than_main`` counts main's path
+    span; it can report a false red, which ``_KNOWN_FALSE_RED`` pins, and its docstring names
+    what it does not cover. That holds over the paths main hid, each read with each of five seen
+    addresses; over quote-closing, control-character and raw-in-line vectors, each read with one
+    seen address; and over a seeded corpus, each path read with one. An ordinary path stays
+    readable with each named seen text a pass rewrites.
+    Two paths that turn a pass off for the whole line, one with a no-break space and one with a
+    credential shape, stay readable with an encoded HL7 seen text that line leaves raw. Over a
+    seeded corpus, a path the repeat line reads blanks on the past-cap line only where main's
+    own past-cap line, written by two shipped handlers, was not the repeat value or main's own
+    repeat-line path span, followed by the seen text raw or as written alone; that bounds the
+    blanking by those forms, not by what main hid. A path that turns a pass off for the whole line
     still blanks, at least, with a seen text that holds a raw encoded run beside another
     rewritten shape (a tab, a date, a name). Not tested, at least: a third handler; a Unicode
     space separator before an encoded HL7 name, which the pre-#3770 lines printed too; a seen
