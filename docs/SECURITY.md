@@ -2164,15 +2164,17 @@ the same permission set on the same method reds CI until it is listed here.
 > row, for a channel it may reach. The row does not say which engine shard answered. To read one,
 > look the named inbound up in the whole config, which `messagefoundry check` reads: an inbound
 > that exists and that the actor's scope lists was asked of the wrong engine shard, or was removed
-> by a reload. The wrong-engine-shard cause is run on one route, `GET
-> /connections/{name}/metadata`, and the reload cause is not run (BACKLOG #3031):
+> by a reload. Neither cause is run on engine shards, and the reload cause is not run at all
+> (BACKLOG #3031).
 > `test_a_scoped_operator_asking_the_wrong_engine_gets_the_403_and_a_denial_row` in
-> `tests/test_multishard_smoke.py` asks one engine about an in-scope inbound that only another
-> holds. It pins the 403, the same body an out-of-scope inbound gets, and one denial row whose
-> detail names only the channel. The other routes above share that route's resolver, and are not
-> run this way. The two engines are plain `serve` processes over one store, not `serve --shard`;
-> the test's own comment says why. That each engine shard's graph holds only its own inbounds is
-> pinned apart, in `tests/test_sharding.py`. A row naming an in-scope inbound has at least one more cause, on any deployment: a
+> `tests/test_multishard_smoke.py` runs two plain `serve` processes over one store, not
+> `serve --shard`, each loading only its own inbounds; the test's own comment says why. On one
+> route, `GET /connections/{name}/metadata`, it asks one engine about an in-scope inbound that only
+> the other holds. It pins the 403, the same body an out-of-scope inbound gets, and one denial row
+> whose detail names only the channel. The other routes above share that route's resolver, and are
+> not run this way. That each engine shard's graph holds only its own inbounds is pinned apart, in
+> `tests/test_sharding.py`.
+> A row naming an in-scope inbound has at least one more cause, on any deployment: a
 > flag request refused for its direction. Such a row's detail carries
 > `"flag_direction_not_inbound": true`, so a row without that marker was not refused for its
 > direction (BACKLOG #3378). `POST /connections/{name}/flag` writes it for a direction of
