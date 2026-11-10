@@ -5061,7 +5061,8 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     producible only from an empty log, so ``5:`` is a head the store can never emit and falls under the
     refusal above. Left accepted it parses to ``(5, "")``, which no intact chain can match — so a line
     truncated while being copied, or an anchor file caught half-written, would be reported as
-    ``truncated or rewritten`` on a chain nobody touched.
+    ``truncated or rewritten`` on a chain nobody touched. The converse holds too: a log with rows has
+    a newest seq of 1 or more, so ``0:<head>`` is refused for the same reason.
 
     IT LIVES HERE, BESIDE THE COMPARATORS AND THE PRODUCER, BECAUSE IT NOW HAS TWO CONSUMERS: the
     ``audit-verify`` CLI and the engine's ``[integrity].audit_anchor_file`` startup check (BACKLOG #328).
@@ -5092,6 +5093,14 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
                 text,
             )
         return count, head
+    if count == 0:
+        # The converse of the pairing above: a log with rows has a newest seq of 1 or more, so a head
+        # beside a zero count is one the store can never emit, and a comparator would report it as
+        # `truncated or rewritten` on an intact chain (vault BACKLOG #5987 item 1).
+        raise AuditAnchorError(
+            "a zero row count is only producible from an EMPTY log, so it cannot carry a head",
+            text,
+        )
     refusal, head = _audit_head_shape(head)
     if refusal is not None:
         raise AuditAnchorError(refusal, text)
