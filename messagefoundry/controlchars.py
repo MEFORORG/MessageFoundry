@@ -330,20 +330,20 @@ def quote_log_text(text: str) -> str:
     """``text`` as one double-quoted token that its own content cannot close or extend, in text no
     handler filter reads.
 
-    JSON string quoting escapes every quote and backslash, writes ``\\n``, ``\\r``, ``\\t``, ``\\b``
-    and ``\\f`` for those controls, and every other character outside printable ASCII, DEL included,
-    as ``\\uXXXX``, a character past U+FFFF as a surrogate pair of them. So, in text no handler
-    filter reads, a value cannot end its token and write a separator, a second entry or a mark after
-    it, and a lookalike quote such as U+02BA or U+FF02, or a right-to-left letter, cannot fake that
-    end for a human reader (vault BACKLOG #3139). The output is printable ASCII, and
+    JSON string quoting escapes every double quote and backslash, writes ``\\n``, ``\\r``, ``\\t``,
+    ``\\b`` and ``\\f`` for those controls, and every other character outside printable ASCII, DEL
+    included, as ``\\uXXXX``, a character past U+FFFF as a surrogate pair of them. So, in text no
+    handler filter reads, a value cannot end its token and write a separator, a second entry or a
+    mark after it, and a lookalike quote such as U+02BA or U+FF02, or a right-to-left letter, cannot
+    fake that end for a human reader (vault BACKLOG #3139). The output is printable ASCII, and
     :func:`scrub_log_argument` changes nothing in it. It stays as a guard should the ``json.dumps``
     call ever drop ``ensure_ascii``, and because CodeQL's ``py/log-injection`` accepts its
     line-break ``replace`` as the neutraliser and does not see ``json.dumps``.
 
-    NOT FOR ANY TEXT A CONFIGURED HANDLER'S FILTERS READ, WHEREVER IT SITS IN THE LINE. At least
-    the credential scrub and the redaction filters can close the token early or erase its closing
-    quote, and the text after it then reads as fields of its own (BACKLOG #3770). For a logged
-    field, use :func:`log_field_token`."""
+    NOT FOR ANY TEXT A CONFIGURED HANDLER'S FILTERS READ, WHEREVER IT SITS IN THE LINE. At least the
+    credential scrub and the redaction filters can close the token early or erase its closing quote,
+    and the text after it then reads as fields of its own (BACKLOG #3770). For a logged field, use
+    :func:`messagefoundry.logging_setup.redacted_log_field`."""
     # Imported here, not at the top: the remote-debug guard imports this module before its hook
     # goes in, and json, with re and enum under it, would lengthen that window.
     import json
