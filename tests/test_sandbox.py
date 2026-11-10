@@ -2421,7 +2421,7 @@ def h_plain(msg):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX process-group reap")
-@pytest.mark.parametrize("after", ["dispatch", "close"])
+@pytest.mark.parametrize("after", ["dispatch", "close", "reaped_elsewhere"])
 def test_a_worker_that_died_on_its_own_still_has_its_group_reaped(
     tmp_path: Path, after: str
 ) -> None:
@@ -2429,10 +2429,14 @@ def test_a_worker_that_died_on_its_own_still_has_its_group_reaped(
     respawn, or ``close``, must still reach that group, so the liveness check must not reap the
     worker first (vault BACKLOG #3135, the WNOWAIT fix).
 
-    FALSIFICATION, not run on the Windows host this was written on: make :func:`_has_exited` return
-    ``proc.poll() is not None`` on POSIX again. The poll reaps the zombie, ``kill_process_group``
-    can no longer read its group and falls back to a single kill of a dead pid, and the grandchild
-    is still sleeping when the assert below reads it.
+    The ``reaped_elsewhere`` arm reaps the worker behind the session's back first, so the reap
+    must go through :func:`proctree.kill_reaped_leader_group`.
+
+    POSIX-only, so NOT RUN on the Windows host this was written on. FALSIFICATION: make
+    :func:`_reap_process_tree` return without a signal for a worker already reaped, and the
+    ``reaped_elsewhere`` arm reds; make :func:`_has_exited` reap with ``proc.poll()`` too, and
+    every arm reds, since the poll leaves every reap with an already-reaped worker. Making
+    ``_has_exited`` reap alone no longer reds: the reuse-safe signal still reaches the group.
 
     The worker exits only once the test creates a go file, after the dispatch has returned, so
     its exit cannot race the after-answer check."""
@@ -2461,6 +2465,10 @@ def test_a_worker_that_died_on_its_own_still_has_its_group_reaped(
                 ("OB_X", "PLAIN")
             ]
         else:
+            if after == "reaped_elsewhere":
+                # Reaped behind the session's back. The grandchild keeps the group's id taken,
+                # so the pid is free and the reuse-safe group signal still reaches it.
+                os.waitpid(proc.pid, 0)
             session.close()
         assert _wait_until_not_running(grandchild_pid, timeout=5.0) is not True, (
             "the grandchild of a worker that died on its own survived the reap of its group"
@@ -2612,7 +2620,7 @@ def test_a_worker_reaped_elsewhere_has_its_group_signalled_only_while_its_pid_is
         caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
         session.close()
         assert unread == []
-        refused = [r for r in caplog.records if "is not signalled" in r.getMessage()]
+        refused = [r for r in caplog.records if "not be signalled safely" in r.getMessage()]
         if pid_now == "reused":
             assert killpg_calls == []
             assert len(refused) == 1

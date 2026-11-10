@@ -1366,7 +1366,11 @@ ruling 2026-11-09); [ADR 0187](adr/0187-bound-the-subprocess-sandbox-worker-coun
 Each worker kill writes one `WARNING` naming the inbound, the phase and a cause token, and no message
 content, except a graph refusal, which writes none, and a shutdown, logged at `INFO`. The runner alerts
 on a graph refusal against the graph the engine serves; one against a graph a reload has replaced
-writes no line.
+writes no line. The line says the worker was `killed`, or that it `exited` for a cause recorded only
+once the worker is seen gone (a crash, an exit during boot or right after it), which may still be a
+signal from outside the engine. On POSIX a second `WARNING`, naming the inbound and the pid, says a
+worker that was already reaped could not have its process group signalled safely, so a process it
+started may survive.
 **Read once at engine start — a `/config/reload` does NOT re-read it (restart to change).**
 
 **`mode` is engine-wide — there is no per-connection sandbox setting.** One policy is rendered for the

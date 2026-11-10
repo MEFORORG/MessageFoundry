@@ -358,8 +358,7 @@ from one added pointer to this amendment, at the end of its paragraph on what a 
   it may hold part of a frame. The worker's answer is a different case: a codec rejection of an
   answer still kills the worker, recorded as an invalid frame.
 - **A frame waiting before a request kills the worker and retries the message once on a fresh one**
-  (owner ruling 2026-11-09, #3135 step 4). The message never reached the worker. This is the one
-  statement of when the retried message still dead-letters; the other documents link here. It
+  (owner ruling 2026-11-09, #3135 step 4). The message never reached the worker. It
   dead-letters in at least these cases: the fresh worker has a stray frame waiting too; a respawn
   fails; the workers spawned for it keep exiting, or closing their pipe, before its request is
   written; and any fault the request itself meets on the fresh worker, as for any other message,

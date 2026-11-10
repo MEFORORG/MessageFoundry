@@ -19,8 +19,10 @@ BACKLOG #2622).
 **A process can still escape**, so this is process hygiene and not a trust control. At least
 these escape: on POSIX a descendant that leaves the group (``setsid``, and ``sudo`` in its default
 ``use_pty`` mode) or that the engine's account may not signal; on Windows, work a child hands to
-another process outside its tree (a WMI provider, Task Scheduler, a service). Any failure to set up
-the job, or to signal the group, degrades to a single-process kill, logged.
+another process outside its tree (a WMI provider, Task Scheduler, a service). A failure to set up
+the job, or to signal the group through :func:`kill_process_group`, degrades to a single-process
+kill, logged. :func:`kill_reaped_leader_group` has no process left to fall back to, and says so in
+its return value.
 
 Standard library only (``ctypes``), so ``pipeline/`` modules may import it.
 """
@@ -302,8 +304,9 @@ def kill_reaped_leader_group(pid: int) -> bool | None:
     """``SIGKILL`` the process group that ``pid`` led, after ``pid`` itself was reaped, on POSIX.
 
     Returns ``True`` when the signal was sent, ``False`` when there was nothing to signal (Windows,
-    the caller's own group, or a group with no members left), and ``None`` when it refused because
-    ``pid`` may name another process now.
+    the caller's own group, or a group with no members left), and ``None`` when it sent none and
+    members may remain: ``pid`` may name another process now, or the signal failed. Unlike
+    :func:`kill_process_group` there is no single-process fallback, since the leader is gone.
 
     POSIX does not reuse a pid while a process group with that id has members, so while the group a
     reaped leader led has a member, ``pid`` names no live process and ``killpg(pid)`` reaches that
@@ -330,5 +333,5 @@ def kill_reaped_leader_group(pid: int) -> bool | None:
         log.warning(
             "could not signal process group %d (%s)", pid, exc.strerror or type(exc).__name__
         )
-        return False
+        return None
     return True

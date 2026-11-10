@@ -791,11 +791,10 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None, inbound: 
     which ``start_new_session=True`` made it the leader of — guarded on ``pgid == proc.pid`` so this
     only ever signals the worker's own group and never the caller's (e.g. the engine/pytest group).
 
-    A POSIX worker that something other than this session already reaped is the exception (vault
-    BACKLOG #3135): its group is signalled only through
-    :func:`proctree.kill_reaped_leader_group`, which refuses when the pid may name another process
-    now. A refusal writes a WARNING naming ``inbound``, and a process the worker started may then
-    survive."""
+    A POSIX worker already reaped before this reap is the exception (vault BACKLOG #3135): its
+    group is signalled only through :func:`proctree.kill_reaped_leader_group`, which sends nothing
+    when the pid may name another process now or the signal fails. Then a WARNING names
+    ``inbound``, and a process the worker started may survive."""
     if sys.platform == "win32":
         if job is not None:
             proctree.terminate_job(job)
@@ -803,16 +802,18 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None, inbound: 
             _kill_single(proc)
         return
     if _posix_child_state(proc) == "reaped":
-        # Reaped by something else, or by the kernel under ``SIGCHLD`` set to ``SIG_IGN``. A
-        # running or zombie child's pid cannot have been given to another process, so only this
-        # state needs the reuse-safe signal. The state check cannot see a pid reaped elsewhere
-        # and then reused by another child of this engine, which needs a reaper of every child,
-        # such as ``waitpid(-1)``, and the engine runs none.
+        # Reaped by ``Popen``, by something else, or by the kernel under ``SIGCHLD`` set to
+        # ``SIG_IGN``. A running or zombie child's pid cannot have been given to another process,
+        # so only this state needs the reuse-safe signal. The state check cannot see a pid reaped
+        # elsewhere and then reused by another child of this engine, which takes a reaper of every
+        # child: a ``waitpid(-1)`` loop or an ignored ``SIGCHLD``. The engine sets up neither, but
+        # code loaded into its process could, and a later reap of this worker could then signal
+        # that child's group. A zombie reaped between the state check and the signal is missed
+        # too: its group is not signalled, and nothing is logged.
         if proctree.kill_reaped_leader_group(proc.pid) is None:
             log.warning(
-                "inbound %r: sandbox worker pid %d was reaped elsewhere and the pid may name "
-                "another process now, so its process group is not signalled, and a process the "
-                "worker started may survive",
+                "inbound %r: sandbox worker pid %d was already reaped and its process group could "
+                "not be signalled safely, so a process the worker started may survive",
                 inbound,
                 proc.pid,
             )
