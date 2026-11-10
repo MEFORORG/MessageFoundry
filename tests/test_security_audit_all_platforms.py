@@ -1117,6 +1117,8 @@ def test_a_pass_environment_after_the_lock_is_refused_by_name(
         ["--pass-environment=KEYRING_A=marker-not-a-key"],
         ["--pass-env=KEYRING_A=marker-not-a-key"],
         ["--pas=KEYRING_A=marker-not-a-key"],
+        ["--pa=KEYRING_A=marker-not-a-key"],
+        ["--p=KEYRING_A=marker-not-a-key"],
         ["--pass-environment-x=marker-not-a-key"],
         ["--pass-env", "KEYRING_A=marker-not-a-key"],
     ],

@@ -89,8 +89,9 @@ a ``--skip-private`` that names the engine or another published
 MessageFoundry package, a package the lock does not pin, or every pin, or that comes after the lock
 as a word of its own (the ``=`` form or an abbreviation there reaches pip-audit, which fails on it
 as an unknown option); and a ``--pass-environment`` entry the paragraph above says it refuses, or
-any word after the lock that starts with ``--pas``, the ``=`` form and an abbreviation included,
-since pip-audit's usage error would print a ``NAME=value`` typed there. It does not judge
+any word after the lock that argparse would read as that flag before it, the ``=`` form and an
+abbreviation down to ``--p`` included, since pip-audit's usage error would print a ``NAME=value``
+typed there. It does not judge
 whether a non-empty lock is complete; released-line-audit carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
@@ -537,15 +538,23 @@ def _skip_private_refusal(private: Collection[str], pip_audit_args: Sequence[str
     )
 
 
+def _names_pass_environment(arg: str) -> bool:
+    """Whether ``arg``, up to any ``=``, is a word argparse would read as ``--pass-environment``
+    before the lock, down to its shortest abbreviation ``--p``, or a longer word starting with
+    ``--pas``. pip-audit has ``--path`` and ``--progress-spinner``, so ``--p`` and ``--pa`` reach its
+    ambiguous-option error, which prints the word whole."""
+    head = arg.partition("=")[0]
+    return (len(head) > 2 and "--pass-environment".startswith(head)) or head.startswith("--pas")
+
+
 def _pass_environment_refusal(names: Sequence[str], pip_audit_args: Sequence[str]) -> str | None:
     """Why a ``--pass-environment`` request is refused, or ``None``.
 
     After the lock, any word that starts as the flag does is refused, the ``=`` form and an
     abbreviation included, not only the exact word: argparse hands it to pip-audit, whose usage
     error prints it, and ``--pass-environment=NAME=value`` typed by mistake would carry the value
-    into a CI log. A pip-audit option that started with ``--pas`` would be refused too. The text
-    echoes none of it."""
-    if any(arg.partition("=")[0].startswith("--pas") for arg in pip_audit_args):
+    into a CI log. The text echoes none of it."""
+    if any(_names_pass_environment(arg) for arg in pip_audit_args):
         return "--pass-environment goes before the lock, not after it"
     refusals = (pass_environment_refusal(name) for name in names)
     first = next((refusal for refusal in refusals if refusal), None)

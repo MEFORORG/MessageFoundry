@@ -876,7 +876,8 @@ class SandboxSession:
                     "not given, because the worker runs the config again under an allowlisted "
                     "environment: name each such variable in [sandbox].pass_environment and "
                     "restart. Settings load refuses an engine variable there, any MEFOR_* name "
-                    "among them, so config must read such a value under another name."
+                    "among them, and every Router and Handler can read what is listed, so never "
+                    "list a secret."
                 )
                 # Short before the differences: a dead-lettered message keeps about the first 200
                 # characters of this, behind its stage prefix and the exception's type name.

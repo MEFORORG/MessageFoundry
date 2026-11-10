@@ -264,9 +264,12 @@ def test_the_detail_names_the_cause_and_the_remedy_first() -> None:
     # A worker runs the engine's snapshot, so a disk edit is no cause and a reload no remedy.
     assert "changed on disk" not in edited + names
     assert "reload" not in names.lower()
-    assert "add it to [sandbox].pass_environment and restart" in kept_names
-    # Settings load refuses a MEFOR_* name in that setting, so the remedy says so, within the bound.
-    assert "A MEFOR_* name is refused there" in kept_names
+    # Settings load refuses a MEFOR_* name in that setting, and a Handler can read what is listed,
+    # so the remedy says neither belongs there. The impact still fits within the bound.
+    assert "list it in [sandbox].pass_environment (no MEFOR_* name, no secret) and restart" in (
+        kept_names
+    )
+    assert "fails at routing or transform" in kept_names
 
 
 def test_the_logging_sink_warns(caplog: pytest.LogCaptureFixture) -> None:

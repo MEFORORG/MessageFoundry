@@ -421,9 +421,9 @@ def worker_environment(
 
     ``extra_names`` is what the caller adds: for the sandbox worker, the names an operator listed in
     ``[sandbox].pass_environment``. Never a secret there: whatever is named here is in the
-    environment of the code this builder exists to keep secrets from. Settings load refuses the
-    engine's own, and so does this builder, raising :class:`ValueError` as :func:`hook_environment`
-    does.
+    environment of the code this builder exists to keep secrets from. Settings load refuses
+    what :func:`pass_environment_refusal` refuses, the engine's own names among them, and so does
+    this builder, raising :class:`ValueError` as :func:`hook_environment` does.
 
     ``defaults`` are values for names the result does not already hold, so a value the operator
     passed through ``extra_names`` wins. They are set here, not on the returned dict, because
@@ -446,13 +446,15 @@ def worker_environment(
 
 
 def _outside_engine_keys(extra_names: Collection[str]) -> frozenset[str]:
-    """:func:`_extra_keys`, refusing a name of the engine's own namespace with
-    :class:`ValueError`. It checks the keys it returns, so a one-shot iterable cannot slip a name
-    past it."""
+    """:func:`_extra_keys`, refusing with :class:`ValueError` a name
+    :func:`pass_environment_refusal` refuses, so a builder called with a policy no settings load
+    checked applies the same rule. It checks the keys it returns, so a one-shot iterable cannot
+    slip a name past it."""
     extras = _extra_keys(extra_names)
     for key in extras:
-        if not outside_engine_namespace(key):
-            raise ValueError(f"extra_names may not name the engine's own variable {key!r}")
+        refusal = pass_environment_refusal(key)
+        if refusal:
+            raise ValueError(f"extra_names: {refusal}")
     return extras
 
 
@@ -505,9 +507,10 @@ def hook_environment(
 
     No interpreter variable crosses unless listed: the hook is a shell command, not this
     interpreter's child. ``LD_LIBRARY_PATH`` does, with the other POSIX start-up names, so a hook
-    that starts an interpreter needing it still starts. An extra in the engine's own namespace
-    raises :class:`ValueError`. Settings load refuses one first, so this is the last check, not
-    the first."""
+    that starts an interpreter needing it still starts. An extra
+    :func:`pass_environment_refusal` refuses, one in the engine's own namespace among them, raises
+    :class:`ValueError`. Settings load refuses one first, so this is the last check, not the
+    first."""
     names = _platform_names() | _outside_engine_keys(extra_names)
     if sys.platform == "win32":
         names |= _WINDOWS_SHELL_NAMES
@@ -533,13 +536,14 @@ def auditor_environment(
     Built through :func:`worker_environment`, so the two cannot drift apart. That builder's
     "never a secret" rule is for code the engine does not trust; ``pip`` is a tool the auditor
     names, and a ``PIP_INDEX_URL`` that carries an index credential is meant for it."""
-    extras = _extra_keys(extra_names)
-    for key in extras:
-        refusal = pass_environment_refusal(key)
-        if refusal:
-            raise ValueError(f"extra_names: {refusal}")
+    extras = _outside_engine_keys(extra_names)
     source = _source(environ)
-    pip_names = {name for name in source if _key(name).startswith(_PIP_PREFIX)}
+    # A name that is not an identifier is no pip option, and the builder would refuse it.
+    pip_names = {
+        name
+        for name in source
+        if _key(name).startswith(_PIP_PREFIX) and name.isascii() and name.isidentifier()
+    }
     return worker_environment(source, extra_names=_AUDITOR_NAMES | pip_names | extras)
 
 
