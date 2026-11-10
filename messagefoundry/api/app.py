@@ -9598,7 +9598,10 @@ def create_app(
                 # answered 500. The type name only: the text is the cipher's, not this route's.
                 _log.warning("layered search refused preset %s: %s", preset_id, type(exc).__name__)
                 refusal = HTTPException(
-                    423, f"preset {preset_id} cannot be opened and cannot be used"
+                    423,
+                    f"preset {preset_id} cannot be opened with the store's keys and cannot be used;"
+                    " a retired key that is not supplied, or a value written outside the store,"
+                    " can cause this",
                 )
             if refusal is not None:
                 # Raised after the handler, so the refusal chains nothing (BACKLOG #1796): `from
@@ -9609,7 +9612,11 @@ def create_app(
             if not row["criteria"]:
                 # BACKLOG #5523: the store never writes blank criteria, and a keyed store passes a
                 # blank cell through unopened, so NULL or "" was written outside the store. Read as
-                # `{}` it would drop out of the compose and widen the search, so refuse it.
+                # `{}` it would drop out of the compose and widen the search, so refuse it. Logged,
+                # since only the caller would learn of it otherwise.
+                _log.warning(
+                    "layered search refused preset %s: its criteria cell is blank", preset_id
+                )
                 raise HTTPException(423, tampered)
             # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
@@ -9639,18 +9646,6 @@ def create_app(
         )
         messages = [_summary(r) for r in result.rows]
         messages = [redact_unauthorized(m, identity) for m in messages]
-        # BACKLOG #5523: coalesced into summary_access like /messages/search, so a layered recall
-        # is no way round the harvest signal (review M-5). Counted post-redaction.
-        exposed, masked = count_exposed(messages), count_masked(messages)
-        if exposed or masked:
-            await request.app.state.summary_auditor.note(
-                engine.store,
-                identity.username,
-                meta["channel_id"],
-                exposed,
-                time.time(),
-                masked=masked,
-            )
         await engine.store.record_audit(
             "preset.layered_search",
             actor=identity.username,
@@ -9663,6 +9658,19 @@ def create_app(
             ),
             client=client_ip(request),
         )
+        # BACKLOG #5523: coalesced into summary_access after the route's own row, as
+        # /messages/search does, so a layered recall is no way round the harvest signal (review
+        # M-5). Counted post-redaction.
+        exposed, masked = count_exposed(messages), count_masked(messages)
+        if exposed or masked:
+            await request.app.state.summary_auditor.note(
+                engine.store,
+                identity.username,
+                meta["channel_id"],
+                exposed,
+                time.time(),
+                masked=masked,
+            )
         return MessageSearchResults(
             messages=messages,
             scanned=result.scanned,

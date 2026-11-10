@@ -412,7 +412,8 @@ async def test_a_blanked_criteria_cell_answers_423_rather_than_widening(
 async def test_a_plain_cipher_error_on_the_criteria_answers_423_not_500(tmp_path: Path) -> None:
     """BACKLOG #5523: ``open_tagged_cell`` re-raises a cipher error that is not a tag failure, here
     the refusal of an unmarked value planted in a keyed store. It escaped as a 500. It is a 423 now,
-    naming no cipher detail and chaining nothing."""
+    naming no cipher detail and chaining nothing. A blanked cell in the same keyed store, which the
+    cipher passes through unopened, is refused too."""
     import sqlite3
 
     pytest.importorskip("psutil")
@@ -440,10 +441,17 @@ async def test_a_plain_cipher_error_on_the_criteria_answers_423_not_500(tmp_path
             )
             side.commit()
             r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+            assert r.status_code == 423, r.text
+            opened = f"preset {pid} cannot be opened with the store's keys"
+            assert r.json()["detail"].startswith(opened)
+            assert "unmarked" not in r.text and "MRN999" not in r.text
+            assert raised[-1].__context__ is None and raised[-1].__cause__ is None
+
+            side.execute("UPDATE search_presets SET criteria='' WHERE id=?", (pid,))
+            side.commit()
+            r = await c.get("/search/layered", params={"presets": pid}, headers=h)
         assert r.status_code == 423, r.text
-        assert r.json()["detail"] == f"preset {pid} cannot be opened and cannot be used"
-        assert "unmarked" not in r.text and "MRN999" not in r.text
-        assert raised[-1].__context__ is None and raised[-1].__cause__ is None
+        assert r.json()["detail"] == f"preset {pid} failed its integrity check and cannot be used"
     finally:
         side.close()
         await keyed.stop()
@@ -454,9 +462,10 @@ async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after
 ) -> None:
     """BACKLOG #5523, after #3734: Vault Transit's outage reaches the route as the
     ``CipherUnavailableError`` that ``open_tagged_cell`` re-raises for a cipher with no
-    ``holds_key_for``. The store method stands in for that path here. It is a 503 with Retry-After,
-    not the 423 that would send an operator after a preset that is fine, and not a 500. The outage
-    text stays off the response and its chain."""
+    ``holds_key_for``. The keyless store's cipher has none either, so its ``decrypt`` stands in for
+    Transit's, and the error takes the store's real path. It is a 503 with Retry-After, not the 423
+    that would send an operator after a preset that is fine, and not a 500. The outage text stays
+    off the response and its chain."""
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
     from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
@@ -472,11 +481,16 @@ async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after
         assert r.status_code == 200, r.text
         pid = r.json()["id"]
 
-        async def _outage(**_kw: object) -> None:
+        assert isinstance(engine.store, MessageStore)
+        cipher = engine.store._cipher
+        assert not hasattr(cipher, "holds_key_for")  # else open_tagged_cell reads it as drift
+
+        def _outage(stored: str, **_kw: object) -> str:
             raise CipherUnavailableError("Transit unreachable for key mf-store-secret")
 
-        monkeypatch.setattr(engine.store, "get_search_preset", _outage)
+        monkeypatch.setattr(cipher, "decrypt", _outage)
         r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+        monkeypatch.undo()
     assert r.status_code == 503, r.text
     assert r.headers["Retry-After"] == str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)
     assert "Transit" not in r.text and "mf-store-secret" not in r.text

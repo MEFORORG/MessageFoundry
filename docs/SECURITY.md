@@ -4432,14 +4432,14 @@ each nested `OutboxInfo` / `EventInfo` individually, because the redactor keys o
 dashboard `GET /connections`, and `GET /connections/{name}/metadata` (all BACKLOG #2443). Its `/ws/stats` push redacts the same rows. The four
 alert-mutation replies (`ack`, `resolve`, `suspend`, `resume`) redact their `AlertInstanceInfo` too.
 
-**Audit.** Four of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
-census** (`/dead-letters`, `/messages`, `/messages/search`, `/messages/{id}`), so a scripted bulk read
-cannot harvest the patient census unaudited. The rest do **not** call the coalescer — they write
-their own dedicated audit rows instead (`response.read` for `GET /messages/{id}/responses`,
-`preset.layered_search` for `GET /search/layered`, a `connection_event_reveal` or `alert_reveal`
+**Audit.** Five of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
+census** (`/dead-letters`, `/messages`, `/messages/search`, `/messages/{id}`, and
+`/search/layered` since BACKLOG #5523), so a scripted bulk read cannot harvest the patient census
+unaudited. The rest do **not** call the coalescer — they write their own dedicated audit rows
+instead (`response.read` for `GET /messages/{id}/responses`, a `connection_event_reveal` or `alert_reveal`
 row for each per-item reveal on the three monitoring reads, and a `connection_error_reveal` row for
 each per-connection reveal on `GET /connections` and `GET /connections/{name}/metadata`; those
-five write nothing on a masked load). The four census surfaces are audited **only when a
+five write nothing on a masked load). The census surfaces are audited **only when a
 gated property is actually returned** — `count_exposed()` is computed *post*-redaction and the
 coalescer is called under `if exposed:` — so a fully-redacted list read by a caller without
 `messages:view_summary` (a Viewer paging `GET /messages` or `GET /dead-letters`) writes **no audit row
