@@ -2388,8 +2388,10 @@ the same permission set on the same method reds CI until it is listed here.
 >   console's user list reads that flag and drops both scope columns for such a reader. On the
 >   same rule, `GET /audit`, its console page and `GET /audit/export` narrow, for such a reader,
 >   the detail of the four audit actions a census of the writers on 2026-11-09 found naming a
->   channel list or who owns a scope: `user.channel_scope_changed` and `auth.ad_scope_resynced`
->   read as the account's `user_id`, where the row has one, and `"channels": "withheld"`;
+>   channel list or who owns a scope: `user.channel_scope_changed` reads as the account's
+>   `user_id`, where the row has one, and `"channels": "withheld"`; `auth.ad_scope_resynced` reads
+>   as `"channels": "withheld"` alone, since its writer stores no `user_id` and the row names the
+>   account only as its actor;
 >   `auth.ad_session_revoked` reads `scope_from` and `scope_to` as `"withheld"` on a scope-delta
 >   row, the only row that carries them, and keeps `scope_changed`; and
 >   `user.channel_scope_change_refused` reads `owner`, `read_source`, `expected_source` and
