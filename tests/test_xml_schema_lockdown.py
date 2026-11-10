@@ -7,8 +7,10 @@ Three limbs, each pinned against the behaviour it replaces:
 * a schema opening with a byte-order mark is the schema DOCUMENT, not a path, so it goes through the
   hardened pre-parse. A BOM-prefixed ``bytes`` schema used to skip that pre-parse, and xmlschema then
   expanded a DOCTYPE entity in it;
-* an inline schema opens no other resource (``allow="none"``), and a path schema opens files only from
-  its own directory (``allow="sandbox"``), with every file it opens defused (``defuse="always"``);
+* every open goes through ``schema._ConfinedFiles``, xmlschema's opener: an inline schema opens none
+  of its own locations, a path schema opens files only under its own directory, each checked by
+  ``parse_bytes``, and either may read xmlschema's bundled copies of well-known namespaces.
+  ``allow="local"`` still refuses a remote URL before the opener sees it;
 * a malformed or DOCTYPE ``document`` raises the hardened parser's error rather than returning an
   invalid result, and the docstring now says so.
 
@@ -19,7 +21,9 @@ except the one test that sets it with ``monkeypatch.chdir``.
 from __future__ import annotations
 
 import codecs
+import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -117,7 +121,7 @@ def test_inline_schema_import_of_a_local_file_is_not_opened(tmp_path: Path) -> N
 
 
 def test_inline_schema_still_resolves_a_namespace_xmlschema_already_holds() -> None:
-    # Anti-vacuity for allow="none": a location-free import of the xml namespace needs no resource.
+    # Anti-vacuity for the confinement: a location-free import of the xml namespace needs no resource.
     schema = (
         f'<xs:schema {_XS} targetNamespace="urn:t">'
         '<xs:import namespace="http://www.w3.org/XML/1998/namespace"/>'
@@ -258,8 +262,62 @@ def test_path_schema_with_an_empty_doctype_is_refused_like_inline_text(tmp_path:
 def test_path_schema_include_with_a_doctype_entity_is_refused(tmp_path: Path) -> None:
     (tmp_path / "inc.xsd").write_text(_ENTITY, encoding="utf-8")
     main = _write_path_schema(tmp_path, "inc.xsd")
-    with pytest.raises(XmlValidationError):
+    with pytest.raises(XmlValidationError) as ei:
         validate_against("<patient>x</patient>", str(main))
+    # parse_bytes refused it, not only xmlschema's narrower entity check.
+    assert "XmlSecurityError" in _causes(ei.value)
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        pytest.param("\\\\nonexist-5537.invalid\\share\\x.xsd", id="unc-backslash"),
+        pytest.param("file:////nonexist-5537.invalid/share/x.xsd", id="unc-file-url"),
+        pytest.param("\\\\.\\pipe\\nonexist-5537", id="device"),
+    ],
+)
+def test_a_network_or_device_location_is_refused_before_it_is_resolved(
+    location: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # On Windows realpath opens the path, so resolving one of these would already connect to it.
+    resolved: list[str] = []
+    real_realpath = os.path.realpath
+
+    def spy(path: Any, *args: Any, **kwargs: Any) -> Any:
+        resolved.append(os.fsdecode(path))
+        return real_realpath(path, *args, **kwargs)
+
+    main = _write_path_schema(tmp_path, location)
+    for source in (main.read_text(encoding="utf-8"), str(main)):
+        resolved.clear()
+        monkeypatch.setattr(os.path, "realpath", spy)
+        with pytest.raises(XmlValidationError) as ei:
+            validate_against("<patient>x</patient>", source)
+        monkeypatch.setattr(os.path, "realpath", real_realpath)
+        assert "XMLResourceBlocked" in _causes(ei.value)
+        assert not [p for p in resolved if "nonexist-5537" in p]
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["http://127.0.0.1:9/x.xsd", "ftp://127.0.0.1:9/x.xsd", "urn:x-5537:schema"],
+)
+def test_a_non_file_schema_source_is_refused(source: str) -> None:
+    # It used to become a path relative to the working directory, which xmlschema then opened.
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against("<patient>x</patient>", source)
+    assert _causes(ei.value)[1] == "ValueError"
+
+
+@pytest.mark.parametrize("codec", ["utf-16-be", "utf-16-le"])
+def test_bomless_utf16_schema_bytes_are_read_as_the_schema(codec: str) -> None:
+    # With a declaration the parser detects the encoding from the first bytes and the schema loads.
+    declared = ('<?xml version="1.0" encoding="UTF-16"?>' + _CLEAN).encode(codec)
+    assert validate_against("<patient>x</patient>", declared).valid
+    # Without one it still goes to the hardened parser, never to the filesystem as a path.
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against("<patient>x</patient>", _CLEAN.encode(codec))
+    assert "XmlParseError" in _causes(ei.value)
 
 
 # --- limb 3: a document the hardened parser refuses is raised, as the docstring now says ---------

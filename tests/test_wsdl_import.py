@@ -292,6 +292,8 @@ def test_namespace_only_import_of_a_well_known_namespace_still_validates() -> No
         ("C:\\schemas\\x.xsd", "a local path"),
         ("\\\\fileserver\\share\\x.xsd", "a network path"),
         ("//fileserver/share/x.xsd", "a network path"),
+        ("\\/fileserver/share/x.xsd", "a network path"),
+        ("\\\\.\\pipe\\fileserver", "a device path"),
         ("https://example.invalid/x.xsd", "scheme 'https'"),
         ("JohnSmith:MRN12345", "an unrecognised scheme"),
         ("http://[JohnSmith-MRN12345]/x.xsd", "an unparseable location"),

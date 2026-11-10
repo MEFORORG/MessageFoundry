@@ -424,9 +424,9 @@ def test_xmlschema_refuses_a_schema_its_siblings_would_refuse() -> None:
 
 
 def test_xmlschema_still_disables_remote_schema_resolution() -> None:
-    # The SSRF half of the fourth parser's lockdown. It was a source pin on allow="local" until
-    # BACKLOG #5537 replaced that mode; xmlschema's access check runs before it opens anything, so the
-    # refusal is observable without a network. tests/test_xml_schema_lockdown.py covers local files.
+    # The SSRF half of the fourth parser's lockdown. It was a source pin on the allow="local" text until
+    # BACKLOG #5537; allow="local" still makes xmlschema refuse a remote URL before it opens anything,
+    # so the refusal is observable without a network. tests/test_xml_schema_lockdown.py covers files.
     if not _lxml_available():
         pytest.skip("xmlschema/lxml (the [xml] extra) are not installed")
     from messagefoundry.parsing.xml.errors import XmlValidationError

@@ -24,11 +24,10 @@ consulted to *check* an envelope, never to *drive* one (BACKLOG #70's synchronou
   ``wsdl:import`` is read by *this* code before any schema is built. :func:`parse_wsdl` refuses a
   non-empty ``location``/``schemaLocation`` on a ``wsdl:import`` / ``xsd:import`` / ``xsd:include`` /
   ``xsd:redefine`` / ``xsd:override``, local or remote
-  (:class:`~messagefoundry.parsing.xml.errors.WsdlSecurityError`, BACKLOG #5539). Until then a relative,
-  rooted or backslash UNC location passed, and ``xmlschema``, then built with ``allow="local"``, resolved
-  a relative one against the process's working directory and opened it; the claim here that a local
-  import "is not fetched" was false. An ``xsd:import`` naming only a ``namespace`` stays legal; a type
-  reachable only through it fails closed through ``xmlschema``.
+  (:class:`~messagefoundry.parsing.xml.errors.WsdlSecurityError`, BACKLOG #5539). What the guard let
+  through before, and what was opened, is recorded once, in ADR 0122's 2026-11-10 amendment. An
+  ``xsd:import`` naming only a ``namespace`` stays legal; a type reachable only through it fails closed
+  through ``xmlschema``.
 
 **PHI (CLAUDE.md §9):** every failure names element **QNames** / reason **categories** / URI **schemes**
 only — never element content or a full URL. The PHI-bearing SOAP body goes only to the secured store.
@@ -220,11 +219,9 @@ def _refuse_imports(root: Any) -> None:
     """Refuse any ``wsdl:import`` / ``xsd:import`` / ``xsd:include`` / ``xsd:redefine`` /
     ``xsd:override`` that carries a non-empty ``location``/``schemaLocation`` (ADR 0122, BACKLOG #5539).
 
-    A remote location would let a crafted WSDL SSRF past the XSD lockdown. A relative, rooted or Windows
-    backslash UNC location is refused too: before BACKLOG #5539 those passed this guard, and xmlschema,
-    then built with ``allow="local"``, resolved one against the process's working directory and opened
-    it. An ``xsd:import`` that names only a ``namespace`` stays legal; it loads nothing. PHI-safe: the
-    error names the element and the URI scheme, never the location itself."""
+    Local locations are refused as well as remote ones; ADR 0122's 2026-11-10 amendment says why. An
+    ``xsd:import`` that names only a ``namespace`` stays legal; it loads nothing of the author's.
+    PHI-safe: the error names the element and :func:`_locator`'s description, never the location."""
     for tag, attr, label in _LOCATION_ATTRS:
         for elem in root.iter(tag):
             location = elem.get(attr)
@@ -243,7 +240,10 @@ def _locator(location: str) -> str:
     """A PHI-safe description of a location for an error: a well-known URI scheme, or the kind of
     reference. Never any other text from the location."""
     text = location.strip()
-    if text.startswith(("//", "\\\\")):
+    slashed = text.replace("\\", "/")
+    if slashed.startswith(("//./", "//?/")):
+        return "a device path"
+    if slashed.startswith("//"):
         return "a network path"
     if text[1:2] == ":" and text[:1].isalpha():  # a Windows drive, which urlsplit reads as a scheme
         return "a local path"

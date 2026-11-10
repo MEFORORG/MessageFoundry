@@ -179,11 +179,12 @@ and `requirements.lock` are untouched.
 
 Two statements above were false in the shipped code, and both are corrected here rather than in place.
 
-- *"A relative/local location is not fetched either."* It was. The guard refused only a location with a
-  scheme or a `//host` authority, so a relative, rooted or Windows backslash UNC location passed, and
-  `xmlschema`, built with `allow="local"` and `base_url=None`, resolved a relative one against the
-  process's working directory and opened it. `xsd:override` was never inspected at all, even with an
-  `http:` URL. `parse_wsdl` now refuses **any** non-empty `location`/`schemaLocation` on `wsdl:import`,
+- *"A relative/local location is not fetched either."* For a schema location it was. The guard refused
+  only a location with a scheme or a `//host` authority, so a relative, rooted or Windows backslash UNC
+  location passed. On an `xsd:import`, `xsd:include` or `xsd:redefine` inside an embedded schema,
+  `xmlschema`, built with `allow="local"` and `base_url=None`, then resolved a relative location against
+  the process's working directory and opened it. A `wsdl:import` location was never opened by anything;
+  nothing reads it. `xsd:override` was never inspected at all, even with an `http:` URL. `parse_wsdl` now refuses **any** non-empty `location`/`schemaLocation` on `wsdl:import`,
   `xsd:import`, `xsd:include`, `xsd:redefine` and `xsd:override` with `WsdlSecurityError`, naming the
   element and a well-known scheme, or the kind of reference ("a local path", "a network path"), never
   text from the location. An `xsd:import` that names only a `namespace` stays legal: it loads nothing
@@ -198,5 +199,11 @@ Two statements above were false in the shipped code, and both are corrected here
   override locations is opened. `xmlschema`'s `allow="sandbox"` was tried and not used: it compares URL
   string prefixes, narrows to each includer's directory, and blocks the bundled schemas.
 
-No SMB fetch through the backslash UNC form was shown with `xmlschema` 4.3.2; it rewrote that form to a
-drive-rooted local path. The guard refuses the form either way.
+The backslash UNC form did reach the network on the shipped configuration. Measured 2026-11-10 with
+`xmlschema` 4.3.2 and Python 3.14 on Windows: an inline schema's `xs:include` of
+`\\nonexist-5539.invalid\share\x.xsd` was normalised to `file:////nonexist-5539.invalid/share/x.xsd`
+and opened, and failed with WinError 53, *"The network path was not found"*, so the open went to
+Windows network-path resolution. Whether it would then have completed an SMB session against a live
+host, and with which credentials, was not measured. An earlier reading of a different call shape saw
+the form rewritten to a drive-rooted local path; it does not hold for this one. The guard refuses the
+form, and the opener in `schema.py` refuses a UNC or device location on its text, before resolving it.
