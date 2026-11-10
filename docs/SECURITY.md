@@ -2626,10 +2626,14 @@ test (vault BACKLOG #3746).** A start or restart whose CA check the store stoppe
 carry `reason` `store_unavailable`. A restart would have stopped the lane before the check ran, so
 its 503 would say the connection is left stopped until the next start. The lane would read
 `failed`, with a line saying the CA could not be checked. That line would replace one recorded
-earlier for any other reason, and a refused CA found once the store is back would replace it in
-turn, each with one alert; a repeat of the same kind of failure keeps the line and alerts no
-more (vault BACKLOG #5146). A refused-CA lane whose line a store fault replaced is no longer kept
-failed across a reload, so the next reload reads its CA again. An outbound checks its CA at a
+earlier for any other reason, with one alert. The CA's file checks run before any store call, so
+the store-fault line means the CA had passed them; a later start that finds the CA refused, such
+as after the file or the pin changed, replaces the store-fault line in turn, with one alert. A CA
+failure of the kind the line already records, a store fault after a store fault or a refusal after
+a refusal, keeps the line and alerts no more (vault BACKLOG #5146). That once-only rule is for CA
+failures: on an outbound, a start failure that is not one records its line and alerts each time.
+A refused-CA lane whose line a store fault replaced is no longer kept failed across a reload, so
+the next reload reads its CA again. An outbound checks its CA at a
 start only when it has no connector. An operator start of
 such a lane that was paused would leave it paused with its rows pending, because a resumed lane
 with no connector charges each row it claims an attempt, and a finite `max_attempts` would

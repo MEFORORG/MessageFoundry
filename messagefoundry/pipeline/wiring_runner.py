@@ -3203,10 +3203,13 @@ class RegistryRunner:
     def _repeats_failed_class(self, kind: Direction, name: str, exc: BaseException) -> bool:
         """Whether the ``kind`` lane ``name`` already has a failed line of ``exc``'s class: both a
         store fault, or both not (vault BACKLOG #5146). The once-only guards stay silent on a
-        repeat, so a scheduled retry or a rule's restart does not page again. A class that flips replaces
-        the line, with its alert: a CA refused once the store is back no longer reads as a store
-        outage, nor a store outage as a refused CA. The class is a flag, never the line's text,
-        which varies."""
+        repeat, so a scheduled retry or a rule's restart does not page again. The outbound build's
+        guard asks this only of a :class:`TrustAnchorError`, so any other outbound failure records
+        and alerts every time. A class that flips replaces the line, with its alert. The CA's file
+        checks run before any store call, so a store-fault line means the CA had passed them; a CA
+        refused at a later start, once the store is back, replaces that line rather than read as a
+        store outage, and a store fault replaces a refusal's line. The class is a flag, never the
+        line's text, which varies."""
         line = self._failed.get((kind, name))
         return line is not None and line.store_fault == _is_store_fault(exc)
 
@@ -7798,8 +7801,8 @@ class RegistryRunner:
                     # failed record a passive start or an earlier activation may have left is
                     # dropped, so a fault still there is recorded and alerted as this build's
                     # own. A lane whose build already failed since this activation keeps its
-                    # record, and a CA still refused is not alerted again
-                    # (_ensure_destination_built). Marked before the await, which a cancelled
+                    # record, and a CA failure of the class that record holds, a store fault or
+                    # not, is not alerted again (_ensure_destination_built, _repeats_failed_class). Marked before the await, which a cancelled
                     # reload can end there: the passive marker is gone, and this mark sends the
                     # next reload down this path again. A build that succeeds drops it.
                     self._filtered.pop(("outbound", name), None)

@@ -1399,8 +1399,9 @@ async def test_each_retrying_inbound_door_records_a_class_change_once(
 async def test_a_passive_line_keeps_its_store_fault_class(
     store: MessageStore, tmp_path: Path
 ) -> None:
-    """The passive start builds its fixed line rather than raise it, so it links the line to its
-    cause itself. Red under: ``_preflight_passive_lanes`` not setting the line's ``__cause__``."""
+    """The passive start builds its fixed line rather than raise it, with no cause linked, so it
+    names the line's class itself. Red under: ``_preflight_passive_lanes`` not passing
+    ``store_fault`` to ``_record_failed``."""
     runner = _runner(
         store,
         _poller_graph(_ca(tmp_path), _WRONG_PIN),
