@@ -81,8 +81,11 @@ class _StopRecordingRunner(crl_reload.CrlReloadRunner):
     process's event loop."""
 
     stops = 0
+    #: The cap the last runner was built with.
+    max_reloads = 0
 
     def __init__(self, **kwargs: Any) -> None:
+        type(self).max_reloads = kwargs["max_reloads"]
         super().__init__(**{**kwargs, "interval_seconds": 0.05})
 
     async def stop(self) -> None:
@@ -90,7 +93,9 @@ class _StopRecordingRunner(crl_reload.CrlReloadRunner):
         type(self).stops += 1
 
 
-def _run_supervise(monkeypatch: pytest.MonkeyPatch, fleet: _Fleet) -> int:
+def _run_supervise(
+    monkeypatch: pytest.MonkeyPatch, fleet: object, *, crl_max_reloads: int | None = None
+) -> int:
     spec = ShardSpec(shard="default", db_path="mefor.db", port=8765, argv=("serve",))
 
     async def no_refusal(config: str) -> None:
@@ -108,6 +113,7 @@ def _run_supervise(monkeypatch: pytest.MonkeyPatch, fleet: _Fleet) -> int:
             db_base="mefor.db",
             base_port=8765,
             install_signal_handlers=False,
+            crl_max_reloads=crl_max_reloads,
         )
     )
 
@@ -124,3 +130,21 @@ def test_the_supervisor_forwarder_refuses_a_collector_revoked_after_start(
         "CRL revokes, so nothing in the supervisor reloaded it"
     )
     assert _StopRecordingRunner.stops == 1, "the runner must stop when the fleet does"
+
+
+@dataclass
+class _IdleFleet:
+    crash_looped: set[str] = field(default_factory=set)
+
+    async def run(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize(("cap", "expected"), [(7, 7), (None, crl_reload.MAX_RELOADS)])
+def test_supervise_hands_its_cap_to_the_runner(
+    cap: int | None, expected: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``[cert_monitor].crl_max_reloads`` reaches the supervisor's runner, and with none given
+    the runner's own default applies."""
+    assert _run_supervise(monkeypatch, _IdleFleet(), crl_max_reloads=cap) == 0
+    assert _StopRecordingRunner.max_reloads == expected

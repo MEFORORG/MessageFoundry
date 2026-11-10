@@ -451,8 +451,29 @@ def scrub_log_field(text: str) -> str:
     then sees no word boundary or whitespace beside it. The handler chain still runs over the whole
     message after this, so a caller loses nothing by also calling this. The control-character scrub
     is left to the handler, which runs it last on every sink.
-    ``tests/test_audit_offbox_tee.py`` holds this order to the handler chain's, so a pass added
-    there and not here goes red."""
+
+    **A C0 control inside the value is read as a space too.** Raw, a control such as U+0001 is not
+    whitespace, so a pattern that needs a space between a label and its value, or between the
+    parts of a name, misses ``MRN\\x0112345678`` or ``SMITH,\\x01JOHN``. So a value holding one is
+    scrubbed again with each C0 control as a space, and when that second pass redacts more, its
+    result is returned, with the controls as spaces. A value it redacts no more keeps its controls.
+
+    ``tests/test_audit_offbox_tee.py`` holds the three passes to the handler chain's, at least on
+    the inputs it names, and the chain's filter count to four."""
+    scrubbed = _scrub_text_passes(text)
+    if not _C0_CONTROL.search(scrubbed):
+        return scrubbed
+    spaced = _C0_CONTROL.sub(" ", scrubbed)
+    rescrubbed = _scrub_text_passes(spaced)
+    return scrubbed if rescrubbed == spaced else rescrubbed
+
+
+#: The 32 C0 controls, U+0000 to U+001F, the characters ``json.dumps`` escapes in a string.
+_C0_CONTROL = re.compile("[\x00-\x1f]")
+
+
+def _scrub_text_passes(text: str) -> str:
+    """The handler chain's text passes, in :func:`_install_phi_filters`'s order."""
     return scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
 
 

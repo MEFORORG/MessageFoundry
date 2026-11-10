@@ -93,7 +93,15 @@ _TEE_FAILURE_LOGGED = False
 
 
 def _scrubbed(value: str | None) -> str | None:
-    return scrub_log_field(value) if value else value
+    """``value`` through :func:`~messagefoundry.logging_setup.scrub_log_field`, or, if the scrub
+    raises, a fixed marker in its place, as ``RedactionFilter`` writes for a record: the copy and
+    its anchors still ship, and the raw value never does."""
+    if not value:
+        return value
+    try:
+        return scrub_log_field(value)
+    except Exception as exc:  # noqa: BLE001 -- fail closed on the field, not the whole copy
+        return f"[field dropped: {type(exc).__name__} while scrubbing it]"
 
 
 def emit_audit_tee(
@@ -126,7 +134,8 @@ def emit_audit_tee(
     **One residual, stated because "the head hash carries nothing" is very slightly too strong.** In
     the keyless posture ``row_hash`` is a plain SHA-256 over a canonical list whose every other
     member -- the previous row's hash, ``ts``, ``actor``, ``action``, ``channel_id``, ``client`` --
-    travels in this same record or the one before it. So for a record whose ``detail`` ``safe_text``
+    travels in this same record or the one before it, unless the field scrub below rewrote it. So
+    for a record whose ``detail`` ``safe_text``
     actually cut, a reader of the log can TEST guesses at the removed span offline, one hash per guess
     (``seq`` travels in the record too).
     That is narrow (it needs an exact byte-for-byte reconstruction of a redacted exception string, and
@@ -151,7 +160,8 @@ def emit_audit_tee(
     them as making the audit log unmodifiable.
 
     ``client`` (ADR 0150) is the caller's network address, or ``None`` for an engine-internal write. It
-    is forwarded verbatim — it is an infrastructure identifier, not message content, and the whole point
+    is forwarded as it is, except where the field scrub below rewrites a span a redaction or
+    credential pattern matches, as for every text field — it is an infrastructure identifier, not message content, and the whole point
     of the off-box copy is that attribution survives a host/DB compromise, which it cannot do if the
     "from where" is dropped on the way out. It is emitted as a discrete field (never folded into
     ``detail``) so a SIEM can index it without parsing the redacted blob.
@@ -189,15 +199,18 @@ def emit_audit_tee(
     tab, LF or CR stops being whitespace. So the handler chain alone missed a name, a date, a
     bearer token, an MRN or a ``password=`` value beside a C0 control. Each text field therefore
     goes through :func:`~messagefoundry.logging_setup.scrub_log_field` first, the same text passes
-    the handlers run, and the handlers still run over the whole line afterwards. ``ts`` and the
-    anchor fields are engine-generated numbers and digests, and are not scrubbed on their own.
+    the handlers run, and the handlers still run over the whole line afterwards. That function
+    says how it reads a C0 control inside a value. ``ts`` and the anchor fields are
+    engine-generated numbers and digests, and are not scrubbed on their own. A field the scrub
+    raises on ships as a fixed marker, so the copy and its anchors still go.
 
     **At least two residuals remain.** The first can break the JSON a collector receives, or
     alter it silently. The second can break it.
 
     * The redaction and credential filters rewrite spans of this document as text, and a span can
-      take a closing quote with it. A typed name of ``password=`` or ``a|b|c`` does that on every
-      sink, with no escaped character involved. When two fields carry attacker-influenced text,
+      take a closing quote with it. A typed name of ``password=`` does that on every sink, with no
+      escaped character involved. (``a|b|c`` did too until BACKLOG #3045: the field scrub now
+      redacts it before the document exists.) When two fields carry attacker-influenced text,
       the document can instead still parse, with the fields between them missing. Those can be
       at least ``channel_id``, ``client``, ``detail`` and the row anchors. A field that survives,
       such as ``actor``, can then carry another field's text.

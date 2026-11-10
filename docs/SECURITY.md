@@ -7571,7 +7571,8 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
   as built on 2026-10-08.
 
 The **`audit_log`** rows *themselves* are **also** forwarded off-box (sec-offbox-log #361/#363): every
-audit row `serve` or `supervise` commits ships as metadata, with only best-effort PHI redaction
+audit row `serve` or `supervise` commits while its forwarder is installed is handed to that
+forwarder, best effort as ADR 0200 says, as metadata, with only best-effort PHI redaction
 ([PHI.md §7](PHI.md#7-logging--phi-redaction)), through the `messagefoundry.audit` logger to the same
 forwarder — so it inherits the TLS transport automatically — across all three store backends, so both the
 operational log and the tamper-evident audit trail survive a host/DB compromise. A row any other CLI

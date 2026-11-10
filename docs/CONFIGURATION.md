@@ -2168,7 +2168,10 @@ issuer. The engine applies a replaced file only when all three of these hold:
    same scope, signing key and critical extensions.
 
 Otherwise the hop keeps the copy it holds, and the engine logs an ERROR once that names the reason and
-what to do. It also raises the `crl_reload_refused` alert described further down. A file failing
+what to do. It also raises the `crl_reload_refused` alert described further down. The `supervise`
+process reloads its own log forwarder's CRL the same way (BACKLOG #3314), but has no alert store,
+so its `crl_reload_refused` alert is written to its log only, and no `[alerts]` rule sees it.
+A file failing
 rule 1 would also stop the engine starting, so fix the file. A file whose CRL fails its signature
 check under rule 2 is held back too. On the signature, a start refuses it only where the engine
 proves the signature bad, so fix that file. Short of that proof the signature does not stop a

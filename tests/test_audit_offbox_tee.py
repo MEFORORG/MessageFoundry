@@ -504,27 +504,43 @@ def _tee_lines(cases: list[dict[str, str | None]], capsys) -> list[str]:
     return lines
 
 
+#: Where a C0 control goes: ``{c}`` before, after, and between a label and its value or between
+#: the parts of a name. With ``{c}`` as a space each is redacted, which the sweep checks first.
+_C0_SWEEP_TEMPLATES = (
+    ("{c}DOE JANE", "DOE"),
+    ("DOE JANE{c}", "DOE"),
+    ("DOE{c}JANE", "DOE"),
+    ("SMITH,{c}JOHN", "SMITH"),
+    ("{c}password=hunter2", "hunter2"),
+    ("password=hunter2{c}", "hunter2"),
+    ("{c}05/05/1980", "1980"),
+    ("05/05/1980{c}", "1980"),
+    ("{c}Bearer abcdefgh", "abcdefgh"),
+    ("Bearer{c}abcdefgh", "abcdefgh"),
+    ("{c}MRN 12345678", "12345678"),
+    ("MRN{c}12345678", "12345678"),
+    ("MRN 12345678{c}", "12345678"),
+)
+
+
 @pytest.mark.parametrize("field", ["actor", "channel_id", "client", "detail"])
-def test_every_c0_control_on_either_side_of_each_field_is_redacted_beside(
+def test_every_c0_control_beside_or_inside_the_text_of_each_field_is_redacted(
     field: str, capsys
 ) -> None:
-    """The sweep the review of engine PR 2040 used, all 32 C0 code points, on both sides of the
-    text and in every free-text field of the record (BACKLOG #3045). A leak names the code point,
-    the side and the needle."""
+    """The sweep the review of engine PR 2040 used, all 32 C0 code points, widened to put the
+    control inside the text as well as on either side, in every free-text field of the record
+    (BACKLOG #3045). A space in the control's place is the control case: it must be redacted,
+    so a leak measures the control and not the pattern. A leak names the code point and value."""
     keys = [
-        (code, before, text, needle)
-        for code in range(0x20)
-        for text, needle in _C0_SWEEP_CASES
-        for before in (True, False)
+        (code, template.format(c=chr(code)), needle)
+        for code in [0x20, *range(0x20)]  # 0x20, a space, first: the control case
+        for template, needle in _C0_SWEEP_TEMPLATES
     ]
-    cases: list[dict[str, str | None]] = [
-        {field: f"{chr(code)}{text}" if before else f"{text}{chr(code)}"}
-        for code, before, text, _needle in keys
-    ]
+    cases: list[dict[str, str | None]] = [{field: value} for _code, value, _needle in keys]
     lines = _tee_lines(cases, capsys)
     leaks = [
-        (hex(code), before, needle)
-        for (code, before, _text, needle), line in zip(keys, lines, strict=True)
+        (hex(code), ascii(value), needle)
+        for (code, value, needle), line in zip(keys, lines, strict=True)
         if needle in line
     ]
     assert not leaks, leaks
@@ -574,6 +590,9 @@ def test_the_field_scrub_runs_the_handler_chains_text_passes_in_its_order() -> N
     _install_phi_filters(handler)
     passes = [f for f in handler.filters if not isinstance(f, ControlCharScrubFilter)]
     assert len(passes) == len(handler.filters) - 1
+    # Three text passes: a filter added to the chain fails here even when no input below sees it,
+    # until scrub_log_field takes it too and this count moves with it.
+    assert len(passes) == 3, [type(f).__name__ for f in passes]
     for text in (
         "DOE JANE",
         "password=hunter2",
@@ -748,6 +767,35 @@ def test_emit_audit_tee_is_best_effort_on_logging_failure(audit_capture, monkeyp
     )
 
 
+def test_a_field_the_scrub_raises_on_ships_as_a_marker_with_the_anchors(
+    audit_capture, monkeypatch
+) -> None:
+    """A fault in the field scrub (BACKLOG #3045) costs that field, never the copy: the record
+    still ships with its anchors, the field reads as a fixed marker, and the raw value is gone."""
+
+    def scrub(text: str) -> str:
+        if "hunter2" in text:
+            raise RuntimeError("pattern blew up")
+        return text
+
+    monkeypatch.setattr(audit_tee, "scrub_log_field", scrub)
+    emit_audit_tee(
+        action="auth.login_failed",
+        actor="password=hunter2",
+        channel_id=None,
+        detail="ok",
+        ts=1.0,
+        row_id=7,
+        seq=7,
+        row_hash=_HASH,
+    )
+    (line,) = audit_capture.messages
+    record = json.loads(line)
+    assert record["actor"] == "[field dropped: RuntimeError while scrubbing it]"
+    assert (record["seq"], record["row_hash"], record["detail"]) == (7, _HASH, "ok")
+    assert "hunter2" not in line
+
+
 def test_tee_docstring_and_cipher_registry_agree_about_audit_log() -> None:
     """The tee's docstring makes a claim about ``audit_log.detail`` at rest; pin it to the registry.
 
@@ -865,7 +913,7 @@ async def _provision_store(db: Path) -> None:
 
 
 def _run_backup(
-    tmp_path: Path, *, allow_unencrypted: bool, extra_toml: str = ""
+    tmp_path: Path, *, allow_unencrypted: bool, extra_toml: str = "", top_toml: str = ""
 ) -> subprocess.CompletedProcess[str]:
     """Run the real ``messagefoundry backup`` subcommand in a child process and capture both streams.
 
@@ -881,7 +929,7 @@ def _run_backup(
     toml = tmp_path / "messagefoundry.toml"
     # A keyless box, so it takes the audited at-rest opt-out, which BACKLOG #1916 requires of every
     # command that opens a fresh store with no key. Dotted keys, so they precede the first table.
-    body = AT_REST_OPT_OUT_TOML + "[store]\n"
+    body = AT_REST_OPT_OUT_TOML + top_toml + "[store]\n"
     if allow_unencrypted:
         body += "\n[backup]\nallow_unencrypted = true\n"
     body += extra_toml
@@ -978,8 +1026,10 @@ def test_a_cli_committed_audit_row_reaches_the_configured_collector(tmp_path) ->
     """``backup`` commits a ``dr_backup`` row from a CLI process whose service config names a
     collector. The row must arrive there, as a ``serve`` row would. It does not: only ``serve`` and
     ``supervise`` install a forwarder. When it does, take the marker off. Plain UDP to loopback
-    keeps the collector a bare socket; nothing here judges that hop, because the CLI reads none of
-    ``[logging]``."""
+    keeps the collector a bare socket. The CLI reads none of ``[logging]`` today; the config sets
+    ``enforcement = "warn"`` so a fix that gives the CLI ``serve``'s forwarding gates still lets
+    this hop through with a warning, and the test then passes rather than failing at the backup's
+    return code. A fix that refuses the hop under ``warn`` too needs a TLS collector here."""
     import socket
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as collector:
@@ -990,6 +1040,7 @@ def test_a_cli_committed_audit_row_reaches_the_configured_collector(tmp_path) ->
         proc = _run_backup(
             tmp_path,
             allow_unencrypted=True,
+            top_toml='security.enforcement = "warn"\n',
             extra_toml=(
                 f'\n[logging]\nforward_host = "127.0.0.1"\nforward_port = {port}\n'
                 'forward_protocol = "udp"\n'
