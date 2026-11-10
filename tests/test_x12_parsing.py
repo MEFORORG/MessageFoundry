@@ -299,7 +299,7 @@ _REFUSE_STR_SURFACES = [
     ],
 )
 def test_a_delimiter_in_isa_element_data_is_refused(
-    surface: Any, element: str, kwargs: dict[str, str]
+    surface: Any, element: str, kwargs: dict[str, Any]
 ) -> None:
     with pytest.raises(X12PeekError, match=f"{element} holds a delimiter character") as caught:
         surface(interchange(**kwargs))
