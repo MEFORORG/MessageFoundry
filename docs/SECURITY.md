@@ -1244,11 +1244,23 @@ slice B). A hop that is over-granted, in either class, or that could not be read
 so a refused start still pages, and an accepted opt-out quiets nothing. The payload is the finding,
 the count of refusing-class grants and the hop's judgment, which names policy names, paths and
 capabilities, never a token, an accessor or a digest of either. A later start that reads that
-hop's token clean raises `vault_privilege_clean`, which pages nobody and resolves the open
-instance, as `store_privilege_clean` does for the store. The subject names the hop and nothing
+hop's token clean raises `vault_privilege_clean`, which pages nobody and can resolve the open
+instance, under the conditions below, as `store_privilege_clean` does for the store. The subject names the hop and nothing
 about the token, because a fix is usually a new token: so engine processes that share one store
-share each hop's alert, and a clean start by one resolves a warning another raised on a different
-token. The log line and the audit row of every start stay the record.
+share each hop's alert, and a clean start by one can resolve a warning another raised on a
+different token. It resolves it only when, at least, that start's process has an `[alerts]`
+notifier (the logging sink a process without one gets resolves nothing), it probes that hop and
+reads it clean, and the warning's raise landed in the store before the fenced auto-resolve's last
+read of the alert (a retry reads it again) ([ADR 0044, the vault BACKLOG #4916
+amendment](adr/0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916)).
+**A warning still open after a clean start may be a live finding:** another engine process on the
+same store still running on an over-granted or unread token. Before you resolve it by hand, find
+that process. Neither the audit row's detail nor the preflight's log line names the process that
+wrote it, and engine shards share one log, so check the Vault token each engine process on the
+store is configured with. Fix an over-granted token. For an unread one, fix whatever kept its
+grants from being read, which may be reachability or the probe paths rather than the token. Then
+restart that process, since the check runs only at start. The log line and the audit row of every
+start stay the record.
 
 ### Data-layer hops refuse cleartext on their defaults (ASVS 12.3.1 census)
 

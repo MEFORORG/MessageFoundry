@@ -1668,6 +1668,19 @@ class AlertInstance:
 
 
 @dataclass(frozen=True)
+class AlertGeneration:
+    """Which raise a live alert instance is at: its ``id`` and its occurrence ``count`` (BACKLOG
+    #3269). ``count`` only grows on a live row and a new row gets a new ``id``, so the pair names one
+    point in the instance's life without reading any clock. A resolve bounded by it
+    (:meth:`~messagefoundry.store.base.QueueStore.resolve_alert_generation`) cannot close a raise
+    that landed after the pair was read. Metadata only, never a reason or a message body."""
+
+    id: int
+    connection: str
+    count: int
+
+
+@dataclass(frozen=True)
 class AlertSummary:
     """The whole-of-scope aggregate over **active** (open + acknowledged) alert instances (BACKLOG
     #1564) — what the nav bell needs, and the one thing a page of rows cannot give it.
@@ -9406,7 +9419,8 @@ CREATE TABLE IF NOT EXISTS alert_instance (
     acked_at    REAL,
     resolved_at REAL,                 -- when it resolved (NULL while open/acknowledged)
     suspended_until REAL,             -- #143: windowed NOTIFICATION mute end-epoch (NULL/past = not suspended)
-    escalation_tier INTEGER NOT NULL DEFAULT 0  -- #81: highest occurrence-driven escalation tier reached (0=base)
+    escalation_tier INTEGER NOT NULL DEFAULT 0, -- #81: highest occurrence-driven escalation tier reached (0=base)
+    raised_by   TEXT                  -- #4916: the notifier that wrote the newest raise (a per-process random id)
 );
 -- One LIVE (non-resolved) instance per throttle key; resolved rows leave the index so the key re-opens.
 CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_instance_open
@@ -11729,6 +11743,10 @@ class MessageStore:
             await db.execute(
                 "ALTER TABLE alert_instance ADD COLUMN escalation_tier INTEGER NOT NULL DEFAULT 0"
             )
+        # #4916: NULL on an existing row = no fencing writer raised it, so only its seen count can
+        # close it, which is what an unfenced writer's raise needs.
+        if alert_cols and "raised_by" not in alert_cols:
+            await db.execute("ALTER TABLE alert_instance ADD COLUMN raised_by TEXT")
         # #306: a pre-existing search_presets table (from #151/ADR 0136) predates last_used_at — ALTER
         # it in. NULL on every existing row is CORRECT: those presets were never recall-stamped, so the
         # purge's null-safe MAX falls back to updated_at and their window is byte-identical to before
@@ -16327,6 +16345,7 @@ class MessageStore:
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
+        raised_by: str | None = None,
     ) -> None:
         # Pure observer (ADR 0044 D2): a single short upsert under the write lock — NO queue row, NO
         # finalizer call (alert_instance is invisible to _maybe_finalize_message's `FROM queue` scan), so
@@ -16350,17 +16369,26 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET last_seen=?, count=count+1, severity=?, reason=?,"
-                " escalation_tier=MAX(escalation_tier, ?)"
+                " escalation_tier=MAX(escalation_tier, ?), raised_by=?"
                 " WHERE event_type=? AND connection=? AND status!='resolved'",
-                (now, severity, reason_enc, escalation_tier, event_type, connection),
+                (now, severity, reason_enc, escalation_tier, raised_by, event_type, connection),
             )
             if cur.rowcount == 0:
                 await self._db.execute(
                     "INSERT INTO alert_instance"
                     " (event_type, connection, severity, status, first_seen, last_seen, count, reason,"
-                    " escalation_tier)"
-                    " VALUES (?,?,?,'open',?,?,1,?,?)",
-                    (event_type, connection, severity, now, now, reason_enc, escalation_tier),
+                    " escalation_tier, raised_by)"
+                    " VALUES (?,?,?,'open',?,?,1,?,?,?)",
+                    (
+                        event_type,
+                        connection,
+                        severity,
+                        now,
+                        now,
+                        reason_enc,
+                        escalation_tier,
+                        raised_by,
+                    ),
                 )
             await self._commit()
 
@@ -16537,6 +16565,65 @@ class MessageStore:
                 "UPDATE alert_instance SET status='resolved', resolved_at=?"
                 " WHERE event_type=? AND connection=? AND status!='resolved'",
                 (now, event_type, connection),
+            )
+            await self._commit()
+            return int(cur.rowcount)
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = None
+    ) -> list[AlertGeneration]:
+        # BACKLOG #3269: the live instances of one alert type, for one subject or all, as
+        # (id, connection, count) only. Lockfree read; no reason cell is read or decrypted.
+        # status!='resolved' is ux_alert_instance_open's own filter, so the read seeks that index.
+        where = ["event_type=?", "status!='resolved'"]
+        params: list[Any] = [event_type]
+        if connection is not None:
+            where.append("connection=?")
+            params.append(connection)
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, connection, count FROM alert_instance WHERE "
+                + " AND ".join(where)
+                + " ORDER BY id",
+                params,
+            )
+            rows = await cur.fetchall()
+        return [AlertGeneration(int(r[0]), str(r[1]), int(r[2])) for r in rows]
+
+    async def resolve_alert_instances_fenced(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        raised_by: str,
+        seen: AlertGeneration | None,
+        now: float | None = None,
+    ) -> int:
+        # BACKLOG #4916: close the key's live instance only when its newest raise is one this writer
+        # saw at the clear (seen_id/seen_count) or is this writer's own (raised_by). Clock-free.
+        now = time.time() if now is None else now
+        seen_id, seen_count = (seen.id, seen.count) if seen is not None else (-1, -1)
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE alert_instance SET status='resolved', resolved_at=?"
+                " WHERE event_type=? AND connection=? AND status!='resolved'"
+                " AND (raised_by=? OR (id=? AND count<=?))",
+                (now, event_type, connection, raised_by, seen_id, seen_count),
+            )
+            await self._commit()
+            return int(cur.rowcount)
+
+    async def resolve_alert_generation(
+        self, *, alert_id: int, through_count: int, now: float | None = None
+    ) -> int:
+        # BACKLOG #3269: resolve one live instance only while no raise has folded into it past
+        # through_count. Clock-free, so a later raise from any process keeps the row open.
+        now = time.time() if now is None else now
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE alert_instance SET status='resolved', resolved_at=?"
+                " WHERE id=? AND count<=? AND status!='resolved'",
+                (now, alert_id, through_count),
             )
             await self._commit()
             return int(cur.rowcount)
