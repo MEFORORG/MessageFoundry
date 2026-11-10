@@ -743,7 +743,7 @@ Postgres runtime tests. It adds the two NOCOUNT tests and both recovery-closure 
   server: the discarded session keeps its open transaction and its locks until its close lands or
   the server ends it, and the rollback keeps its executor thread until the driver returns.
   At least these are not clamped either: the start-up
-  `_register` and `_ensure_tables`. **CORRECTED 2026-11-09 (BACKLOG #5064):** this list also named
+  `_register`, `_ensure_tables` and config-version seed. **CORRECTED 2026-11-09 (BACKLOG #5064):** this list also named
   the heartbeat, config-version and release statements. The heartbeat, the config-version
   refresh and a stepdown's release now run under the clamp; `stop()`'s release and `left` write run under its own shutdown bound
   (`STOP_WRITE_TIMEOUT_SECONDS`), at the driver too. The

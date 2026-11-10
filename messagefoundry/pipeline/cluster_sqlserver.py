@@ -316,8 +316,8 @@ class SqlServerCoordinator:
         """Read (seeding to 0 if absent) and cache the cluster-wide config-reload version, with the
         initiator's digest from the same statement (vault BACKLOG #3109). Under
         ``[store].command_timeout``, not the renew clamp: at least the engine's start-up seed
-        calls this, and :meth:`Engine.start` seeds again, while the maintenance loop already
-        runs, whenever no earlier seed stands. The loop refreshes through
+        calls this, including :meth:`Engine.start`'s, which runs while the maintenance loop
+        already does, whenever no earlier seed stands. The loop refreshes through
         :meth:`_refresh_config_version` instead."""
         return await self._read_config_version(None)
 
@@ -477,10 +477,11 @@ class SqlServerCoordinator:
 
     async def _heartbeat_loop(self) -> None:
         while not self._stop.is_set():
-            for step in (
-                self.heartbeat_once,
-                self._maintain_leadership,
-                self._refresh_config_version,
+            # The log names main's step names, so the warning reads the same (BACKLOG #6472).
+            for name, step in (
+                ("heartbeat_once", self.heartbeat_once),
+                ("_maintain_leadership", self._maintain_leadership),
+                ("config_version", self._refresh_config_version),
             ):
                 try:
                     await step()
@@ -489,7 +490,7 @@ class SqlServerCoordinator:
                 except Exception as exc:
                     log.warning(
                         "cluster: %s failed for node %s; will retry: %s",
-                        step.__name__,
+                        name,
                         self.node_id,
                         safe_exc(exc),
                     )
