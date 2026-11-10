@@ -126,6 +126,21 @@ channelSuite("engineLog: what reaches the MessageFoundry Engine channel", () => 
     );
   });
 
+  test("the other controls a reader may split or reorder on are escaped, and tab is kept", () => {
+    const forged = "2026-01-02T03:04:05.678Z INFO x";
+    el.engineLog().info(
+      `a\u0085${forged}\u2029b\u000bc\u000cd\u001ce\u001ef\u0000g\u001bh\u007fi\u202ej\u2066k\tl`,
+    );
+    const written = writes.flatMap((w) => w.split(/\r\n|[\n\v\f\r\x1c-\x1e\x85\u2028\u2029]/));
+    assert.strictEqual(written.length, 1, JSON.stringify(written));
+    assert.ok(
+      written[0].endsWith(
+        `INFO a\\u0085${forged}\\u2029b\\u000bc\\u000cd\\u001ce\\u001ef\\u0000g\\u001bh\\u007fi\\u202ej\\u2066k\tl`,
+      ),
+      written[0],
+    );
+  });
+
   test("the probe, state and action lines are stamped, and a refused route is a visible ERROR", () => {
     el.logProbe("https://127.0.0.1:8765", "/health", { kind: "ok" } as never, 12, "reachable");
     el.logProbe("https://127.0.0.1:8765", "/messages", { kind: "ok" } as never, 1, "x");

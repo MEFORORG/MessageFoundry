@@ -42,16 +42,28 @@ const out = (): vscode.OutputChannel =>
 
 /** One record is one line. A message can carry text this extension did not write, such as an
  *  error's message, so a line break in it is written as an escape. Left raw, it would start a line
- *  that carries a real stamp and level word, and reads as a record of its own (CWE-117). */
-const LINE_BREAK_ESCAPES: Readonly<Record<string, string>> = {
-  "\r": "\\r",
-  "\n": "\\n",
-  "\u0085": "\\u0085",
-  "\u2028": "\\u2028",
-  "\u2029": "\\u2029",
-};
+ *  that carries a real stamp and level word, and reads as a record of its own (CWE-117). The other
+ *  C0 and C1 controls but tab, DEL, and the bidi controls are escaped too: a reader of the editor's
+ *  copy may split lines on VT, FF or FS to RS (Python's `splitlines` does), and a bidi override can
+ *  reorder the rest of the line as shown. */
+const ESCAPED = /[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u200e\u200f\u2028-\u202e\u2066-\u2069]/g;
+const ESCAPES = new Map<string, string>();
+for (const [first, last] of [
+  [0x00, 0x08],
+  [0x0a, 0x1f],
+  [0x7f, 0x9f],
+  [0x200e, 0x200f],
+  [0x2028, 0x202e],
+  [0x2066, 0x2069],
+]) {
+  for (let code = first; code <= last; code++) {
+    ESCAPES.set(String.fromCharCode(code), `\\u${code.toString(16).padStart(4, "0")}`);
+  }
+}
+ESCAPES.set("\r", "\\r");
+ESCAPES.set("\n", "\\n");
 function oneLine(message: string): string {
-  return message.replace(/[\r\n\u0085\u2028\u2029]/g, (c) => LINE_BREAK_ESCAPES[c] ?? c);
+  return message.replace(ESCAPED, (c) => ESCAPES.get(c) ?? c);
 }
 
 const write = (level: string, message: string): void =>

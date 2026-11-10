@@ -101,11 +101,11 @@ A **`MarkdownString` hover** is the primary diagnosis — it renders *at* the it
 needing **no command dispatch at all**, so it works even for a user who never realises the click opens anything.
 Plus a **state-gated QuickPick** on click (with a `title:`, never a `placeHolder:`), a **`$(sync~spin)` flip at the
 click site** (the only feedback that appears where the user actually clicked), and the extension's **first engine
-output channel** ("MessageFoundry Engine") — one line per probe/action carrying URL, status or errno, duration
+`LogOutputChannel`** ("MessageFoundry Engine") — one line per probe/action carrying URL, status or errno, duration
 and verdict, and **never a body, never a token** (CLAUDE.md §9; it is wired at the status-bar layer, *not* inside
 the shared `engineClient`, which would silently capture whatever every future caller sends). *(Amended 2026-11-06,
-vault BACKLOG #2349, ASVS 16.2.2: this sentence named a `LogOutputChannel`, which the editor stamps in a format and
-zone the extension cannot set. It is now a plain output channel the extension stamps in UTC itself, and the
+vault BACKLOG #2349, ASVS 16.2.2: the editor stamps a `LogOutputChannel` in a format and zone the extension cannot
+set. The channel is now a plain output channel the extension stamps in UTC itself, and the
 editor's per-level filter on it is gone; [`docs/PHI.md`](../PHI.md) row 16 gives the line format.)*
 
 A webview panel is **rejected**: it opens from the same command dispatch (so it fixes a missed click no better), it

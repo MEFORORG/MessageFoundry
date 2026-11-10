@@ -116,12 +116,8 @@ the gate being keyed on configuration and not on the collector.
 - Not built here: the shard supervisor and the sandbox child still have no forwarder path, and the
   collector-separation probe (every resolved address is this host's) stays unbuilt. #1199 names them.
   **Note added 2026-11-06 (vault BACKLOG #2356 subject 3). It speaks to the sandbox child only, not
-  to the supervisor.** The child still has no forwarder of its own. The engine process that spawned
-  it relays its stderr (ADR 0176), and the relay's `WARNING` count notice is an ordinary engine log
-  record, so where the parent's forwarder is installed it is forwarded off-box with the parent's
-  other records. The owner ruled on 2026-11-05 that this count notice is the off-box path for the
-  child (*"Count notice is enough"*). [`docs/PHI.md`](../PHI.md) section 7 is the single statement
-  of the relay, what it carries at each level, and its residuals.
+  to the supervisor.** The child still has no forwarder of its own. Its off-box path, and the owner's
+  ruling of 2026-11-05 on it, are stated once, in [`docs/PHI.md`](../PHI.md) section 7.
 
 ## Follow-ups (BACKLOG #2278, #2279), 2026-10-08
 
