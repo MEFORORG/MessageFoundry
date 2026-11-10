@@ -31,6 +31,7 @@ from messagefoundry.parsing.binary import (
     encode,
     extract_obx_document,
     is_marked,
+    strip_documents_in_hl7,
 )
 from messagefoundry.pipeline.dryrun import route_only, transform_one
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
@@ -126,43 +127,77 @@ def test_extract_rejects_non_ed_segment() -> None:
         extract_obx_document(msg)
 
 
-@pytest.mark.parametrize(
-    ("raw", "cause"),
-    [
-        (
-            "MSH|^~|A|B|C|D|20260101||ORU^R01|1|P|2.5\rOBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r",
-            "its first MSH's MSH-2 is shorter than four characters",
-        ),
-        (
-            "FHS|^~\\&|A|B\rOBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r",
-            "the body has no MSH",
-        ),
-    ],
-)
-def test_extract_refuses_unreadable_delimiters_as_binary_carriage_error(
-    raw: str, cause: str
+_UNREADABLE_DELIMITER_BODIES = [
+    (
+        "MSH|^~|A|B|C|D|20260101||ORU^R01|1|P|2.5\rOBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r",
+        "its first MSH's MSH-2 is shorter than four characters",
+    ),
+    (
+        "FHS|^~\\&|A|B\rOBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r",
+        "the body has no MSH",
+    ),
+]
+
+#: The three Handler-facing OBX readers and writers that refuse unreadable delimiters (BACKLOG #2873).
+_DELIMITER_GUARDED: dict[str, Any] = {
+    "extract": lambda msg: extract_obx_document(msg),
+    "embed": lambda msg: embed_obx_document(msg, b"data", data_subtype="PDF"),
+    "strip": lambda msg: strip_documents_in_hl7(msg, pruned_at=0.0),
+}
+
+
+@pytest.mark.parametrize("op", sorted(_DELIMITER_GUARDED))
+@pytest.mark.parametrize(("raw", "cause"), _UNREADABLE_DELIMITER_BODIES)
+def test_obx_helpers_refuse_unreadable_delimiters_as_binary_carriage_error(
+    op: str, raw: str, cause: str
 ) -> None:
     """BACKLOG #2873: a message whose delimiters cannot be read is refused by name, not with the
-    bare ``ValueError`` that quotes MSH-1 and MSH-2; an occurrence below one stays the caller's
-    error, as it is on a readable message."""
+    bare ``ValueError`` that quotes MSH-1 and MSH-2, and the message is left as it was."""
     msg = Message.parse(raw)
+    before = msg.encode()
     with pytest.raises(BinaryCarriageError) as caught:
-        extract_obx_document(msg)
+        _DELIMITER_GUARDED[op](msg)
     assert str(caught.value).startswith(cause + ",")
     assert caught.value.__cause__ is None and caught.value.__context__ is None
     assert "^~" not in str(caught.value)
+    assert msg.encode() == before
+
+
+@pytest.mark.parametrize("raw", [raw for raw, _ in _UNREADABLE_DELIMITER_BODIES])
+def test_unreadable_delimiters_leave_the_callers_own_errors_alone(raw: str) -> None:
+    """An occurrence below one, and an embed into an absent OBX, stay the caller's errors, as they
+    are on a readable message."""
+    msg = Message.parse(raw)
     with pytest.raises(ValueError, match="1-based") as wrong:
         extract_obx_document(msg, occurrence=0)
     assert not isinstance(wrong.value, BinaryCarriageError)
+    with pytest.raises(ValueError, match="1-based") as wrong:
+        embed_obx_document(msg, b"data", data_subtype="PDF", occurrence=0)
+    assert not isinstance(wrong.value, BinaryCarriageError)
+    with pytest.raises(KeyError):
+        embed_obx_document(msg, b"data", data_subtype="PDF", occurrence=2)
 
 
-def test_extract_names_a_handler_written_msh_1_as_the_cause() -> None:
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "MSH|^~|A|B|C|D|20260101||ORU^R01|1|P|2.5\rPID|1\r",
+        "FHS|^~\\&|A|B\rPID|1\r",
+    ],
+)
+def test_strip_in_hl7_with_no_obx_strips_nothing_on_unreadable_delimiters(raw: str) -> None:
+    """With no OBX there is nothing to read, so an unreadable header is no refusal there."""
+    assert strip_documents_in_hl7(Message.parse(raw), pruned_at=0.0) == (0, 0)
+
+
+@pytest.mark.parametrize("op", sorted(_DELIMITER_GUARDED))
+def test_obx_helpers_name_a_handler_written_msh_1_as_the_cause(op: str) -> None:
     """BACKLOG #2873: a Handler that writes a two-character MSH-1 gets the MSH-1 cause named."""
     msg = Message.parse(OBX_HL7)
     embed_obx_document(msg, b"data", data_subtype="PDF")
     msg.set("MSH-1", "##")
     with pytest.raises(BinaryCarriageError, match="^its first MSH's MSH-1 is not one character,"):
-        extract_obx_document(msg)
+        _DELIMITER_GUARDED[op](msg)
 
 
 def test_extract_rejects_wrong_encoding() -> None:
