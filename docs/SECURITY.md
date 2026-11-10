@@ -2629,7 +2629,8 @@ its 503 would say the connection is left stopped until the next start. The lane 
 earlier for any other reason, and a refused CA found once the store is back would replace it in
 turn, each with one alert; a repeat of the same kind of failure keeps the line and alerts no
 more (vault BACKLOG #5146). A refused-CA lane whose line a store fault replaced is no longer kept
-failed across a reload, so the next reload reads its CA again. An outbound checks its CA at a start only when it has no connector. An operator start of
+failed across a reload, so the next reload reads its CA again. An outbound checks its CA at a
+start only when it has no connector. An operator start of
 such a lane that was paused would leave it paused with its rows pending, because a resumed lane
 with no connector charges each row it claims an attempt, and a finite `max_attempts` would
 dead-letter it with nothing known against the CA.

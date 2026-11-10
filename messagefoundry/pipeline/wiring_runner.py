@@ -3202,8 +3202,8 @@ class RegistryRunner:
 
     def _repeats_failed_class(self, kind: Direction, name: str, exc: BaseException) -> bool:
         """Whether the ``kind`` lane ``name`` already has a failed line of ``exc``'s class: both a
-        store fault, or both not (vault BACKLOG #5146). The once-only guards stay silent on a repeat,
-        so a scheduled retry or a rule's restart does not page again. A class that flips replaces
+        store fault, or both not (vault BACKLOG #5146). The once-only guards stay silent on a
+        repeat, so a scheduled retry or a rule's restart does not page again. A class that flips replaces
         the line, with its alert: a CA refused once the store is back no longer reads as a store
         outage, nor a store outage as a refused CA. The class is a flag, never the line's text,
         which varies."""
@@ -4302,8 +4302,9 @@ class RegistryRunner:
                     exc_info=not refused,
                 )
                 line = _lane_anchor_line(direction, name, settings, exc, passive=True)
-                line.__cause__ = exc  # as a start raises it, so the line's class reads off it
-                self._record_failed(name, line, kind=direction)
+                # The line is not linked to its cause, which would put the refusal's traceback in
+                # the ERROR the record logs, so its class is named here (vault BACKLOG #5146).
+                self._record_failed(name, line, kind=direction, store_fault=_is_store_fault(exc))
 
     def engine_parked_outbounds(self) -> frozenset[str]:
         """The outbounds the ENGINE holds down by design: those the DR run-profile parks, and those
@@ -5025,8 +5026,8 @@ class RegistryRunner:
         recorded nothing an operator reads as status. The next tick still retries, and a bind that
         succeeds clears the record. While the record stands, a retry that fails in the same class,
         a store fault or not (:meth:`_repeats_failed_class`), is logged at DEBUG only: keying on
-        the reason text would re-alert every tick on an error whose message varies. A reload clears the record (see :meth:`reload`), so the next window
-        open alerts afresh.
+        the reason text would re-alert every tick on an error whose message varies. A reload
+        clears the record (see :meth:`reload`), so the next window open alerts afresh.
 
         :meth:`_checked_inbound_start` records a failed start before this runs (BACKLOG #3859), so
         this usually finds the record and only logs the retry. It still records anything that
@@ -5398,7 +5399,9 @@ class RegistryRunner:
         if source is not None:
             await source.stop()
 
-    def _record_failed(self, name: str, exc: BaseException, *, kind: Direction) -> None:
+    def _record_failed(
+        self, name: str, exc: BaseException, *, kind: Direction, store_fault: bool | None = None
+    ) -> None:
         """Isolate a connection that failed to build/bind (ADR 0031): record the reason, log it
         loudly, and alert — the engine keeps the rest of the graph running. Reuses the AlertSink
         ``connection_stopped`` signal: its meaning ("this connection is down until an operator
@@ -5408,11 +5411,13 @@ class RegistryRunner:
         bare name: an alert row is addressed to the operator's connection, and the detail says which
         direction failed to start.
 
-        The line's class (:class:`FailedLine`) is read off ``exc``'s explicit cause chain, so a
-        fixed line must carry its cause (vault BACKLOG #5146)."""
+        The line's class (:class:`FailedLine`) is read off ``exc``'s explicit cause chain, unless
+        ``store_fault`` names it for a fixed line recorded with no cause: the passive preflight's,
+        whose cause would put a refusal's traceback in this ERROR (vault BACKLOG #5146)."""
         fixed = isinstance(exc, TrustAnchorError) and exc.fixed_text
         reason = safe_exc(exc, limit=_ANCHOR_LINE_LIMIT) if fixed else safe_exc(exc)
-        store_fault = _is_store_fault(exc)
+        if store_fault is None:
+            store_fault = _is_store_fault(exc)
         if store_fault:
             # A store fault's line replaces a refusal's, so the refusal's mark goes with it: the
             # lane no longer reads as held on a refused CA, and the next reload reads the CA

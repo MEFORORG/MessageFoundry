@@ -440,6 +440,16 @@ async def test_a_reload_with_a_typo_in_a_literal_pin_is_an_invalid_config(
 # --- item 5: the advice a refused setting gets, and a kept failure that stops resolving --------
 
 
+class _Switch:
+    """A lane check that raises whatever ``exc`` holds now, for every lane."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+    async def __call__(self, _direction: str, _name: str, _settings: object) -> None:
+        raise self.exc
+
+
 def _raising(exc: BaseException) -> Any:
     """A lane check that raises ``exc`` for every lane."""
     return _Switch(exc)
@@ -1227,16 +1237,6 @@ async def test_flipping_a_flag_back_ends_a_kept_ca_failure(
 # --- vault BACKLOG #5146: the once-only guards key on the line's class -----------------------
 
 
-class _Switch:
-    """A lane check that raises whatever ``exc`` holds now, for every lane (:func:`_raising`)."""
-
-    def __init__(self, exc: BaseException) -> None:
-        self.exc = exc
-
-    async def __call__(self, _direction: str, _name: str, _settings: object) -> None:
-        raise self.exc
-
-
 def _refused() -> TrustAnchorError:
     return TrustAnchorError("the CA does not match its configured SHA-256 pin")
 
@@ -1281,6 +1281,30 @@ async def test_an_outbound_line_follows_its_class_in_both_directions(
         # The refusal's mark went with its line, so a reload reads the CA again.
         assert ("outbound", "OUT") not in runner._anchor_refused
         assert sink.stopped == ["OUT", "OUT", "OUT"]
+    finally:
+        await runner.stop()
+
+
+async def test_a_store_fault_after_a_refusal_ends_the_kept_ca_failure(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """A refused outbound is kept failed across a reload that changes nothing, so the reload does
+    not read its CA. Once a store fault replaces its line, the next reload reads the CA again,
+    and a CA still refused refuses that reload. Red under: ``_record_failed`` keeping the
+    refusal's mark beside a store fault's line, where the reload keeps the lane unread."""
+    ca = _ca(tmp_path)
+    switch = _Switch(_refused())
+    runner = _runner(store, _outbound_registry(ca, _sha(ca)), lane_anchor_check=switch)
+    await runner.start()
+    try:
+        assert ("outbound", "OUT") in runner._anchor_refused
+        await runner.reload(_outbound_registry(ca, _sha(ca)))  # the control: kept, not read
+        switch.exc = _store_down()
+        await runner.start_outbound("OUT")
+        assert runner.failed_on_store_fault("outbound", "OUT")
+        switch.exc = _refused()
+        with pytest.raises(WiringError):
+            await runner.reload(_outbound_registry(ca, _sha(ca)))
     finally:
         await runner.stop()
 
