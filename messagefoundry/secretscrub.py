@@ -136,6 +136,19 @@ because the fast path refuses any "{", 0.83 against 0.045 ms, and a 6 KB braced 
 which the tail mask then walked word by word, 4.9 against 0.9 ms. Both grew linearly, under the
 ceiling above. Every figure in this paragraph predates the allowlist tail, which checks for no label
 and masks with one ``str.translate``; it was not measured again.
+
+WHAT THE CAMELCASE START, THE SPLIT WALK AND THE COMPOUND KEY WORDS COST (BACKLOG #5545), measured
+2026-11-10 the third paragraph's way: one whole ``scrub_credentials`` call against the module at
+``82ddcd03bc``, minimum over interleaved rounds, on a shared box whose absolute figures sit above the
+table's. The table above is left as measured, because it is a different instrument. The plain line
+is level, 0.70 against 0.70 us. A credential line costs 12 percent more, 6.3 against 5.6 us, because
+every start position now also tries the camelCase start; it fails on the first character that is not
+a capital, which is most of them. The 6 KB hyphen-and-dot run naming every family, the adversarial
+ceiling above, costs 4.9 against 4.0 ms. Two shapes built for this change cost more and are stated
+rather than hidden: a 6 KB run of alternating lower-case and capital letters naming every family,
+where each capital is a candidate start, 1.9 against 0.52 ms, and a 6 KB value of such letters ending
+on a quote, which forces the value walk to check before every unit, 0.68 against 0.085 ms. Both grow
+linearly, as ``tests/test_secretscrub_camelcase_label.py`` times, and both sit under the ceiling.
 """
 
 from __future__ import annotations
@@ -330,7 +343,7 @@ _CAMEL_WORDS = _CREDENTIAL_WORDS + _TOKEN_WORDS + _KEY_LABEL_WORDS
 # unquoted, unclosed, or a quote the guard refuses. That is a sample, not a census. The structured
 # differential in ``tests/test_log_redaction_secret_domain.py``, which holds no camelCase label,
 # reads 0 printed.
-_CAMEL_START = r"(?-i:(?<=[a-z0-9])(?=[A-Z]))(?=(?i:" + _alternation(_CAMEL_WORDS) + r")\b)"
+_CAMEL_START = r"(?-i:(?=[A-Z])(?<=[a-z0-9]))(?=(?i:" + _alternation(_CAMEL_WORDS) + r")\b)"
 #: Where the three LABEL patterns may start: :data:`_LABEL_START` or :data:`_CAMEL_START`.
 #: ``_AUTH_SCHEME`` keeps :data:`_LABEL_START` alone, since a scheme word glued on by a capital, as
 #: in ``isBearer token``, is no ``Authorization`` header.

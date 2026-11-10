@@ -266,6 +266,11 @@ def _mixed_case_run(length: int) -> str:
     return "aB" * (length // 2) + " token=x"
 
 
+def _quote_ended_value(length: int) -> str:
+    """A token value of camelCase units whose capitals open label-word initials, ending on a quote."""
+    return "token=" + "pS" * (length // 2) + '"'
+
+
 def test_the_camelcase_start_grows_linearly_in_line_length() -> None:
     """The start runs on every admitted record, on text an attacker can influence. THE POSITIVE
     CONTROL is ``_BEARER`` with the same capital start and no label-word lookahead: every capital in
@@ -276,6 +281,12 @@ def test_the_camelcase_start_grows_linearly_in_line_length() -> None:
         partial(shipped.sub, "x"), _mixed_case_run(_SPAN[0]), _mixed_case_run(_SPAN[1]), rounds=5
     )
     assert growth < _MAX_GROWTH, f"the shipped camelCase start grew {growth:.1f}x for 8x the length"
+    # The split walk: a value of alternating lower-case and capital letters ending on a quote, so the
+    # fast path refuses it and the stop is checked before every unit.
+    walk = _growth_between(
+        scrub_credentials, _quote_ended_value(_SPAN[0]), _quote_ended_value(_SPAN[1]), rounds=5
+    )
+    assert walk < _MAX_GROWTH, f"the split value walk grew {walk:.1f}x for 8x the length"
     no_lookahead = secretscrub._LABEL_OR_CAMEL_START.replace(
         r"(?=(?i:" + secretscrub._alternation(secretscrub._CAMEL_WORDS) + r")\b)", ""
     )
