@@ -584,10 +584,16 @@ looked:
 - **Reserve-then-spend.** A process atomically adds a block of 2^16 and only then spends it, so an
   UNCLEAN exit can only ever OVER-count: it forfeits the unspent remainder of its block, bounded slack in
   the conservative direction — the opposite bias to a spend-then-flush checkpoint. A CLEAN close
-  **settles the exact figure** instead (charging an overspend, refunding an unspent reserve), because
+  **settles the figure** instead (charging an overspend, refunding an unspent reserve), because
   forfeiting a whole block per open does not survive arithmetic: ~65k opens would exhaust a key on paper
   alone, and a crash-looping service under NSSM auto-restart (~8.6k opens/day at a 10 s restart) would
   reach the fail-closed 2^32 in about a week with no cryptographic cause.
+
+  > **Amended 2026-11-10 (BACKLOG #3191).** The close settles and closes the bound in one step, so the
+  > cipher refuses any encrypt after it. A close whose store stays busy past its wait writes no
+  > settlement: an unspent reserve stays persisted, and an overspent one waits to the stop's deadline
+  > and, if the store is still busy then, is left uncharged by the amount its ERROR line names.
+
 - **Long bursts are charged as they run, not at the end.** `reencrypt_to_active` and the on-open at-rest
   migration re-encrypt every stored value inside one process and one write lock; each charges the bound
   after every committed batch, so the durable count trails actual spend by at most one batch and a kill

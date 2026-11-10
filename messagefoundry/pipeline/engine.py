@@ -118,7 +118,7 @@ from messagefoundry.pipeline.wiring_runner import (
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.crypto import Cipher
-from messagefoundry.store.gcm_bound import SETTLE_WAIT_SECONDS
+from messagefoundry.store.gcm_bound import SETTLE_WAIT_SECONDS, overspend_deadline
 from messagefoundry.store.store import (
     AUDIT_PREFIX_BREAK_MARKER,
     REINGRESS_TARGET_PREFIX,
@@ -4165,14 +4165,17 @@ class Engine:
         if drain is not None:
             await drain(_within(bound, _ALERT_STATE_DRAIN_SECONDS))
 
-    async def _close_store_at_stop(self, _bound: float) -> None:
+    async def _close_store_at_stop(self, bound: float) -> None:
         closed = False
         try:
             await self._await_convergence_row()
             # The close settles the AES-GCM invocation bound and closes it in one step, so the cipher
             # refuses any encrypt after the figure it writes, a graph left running among them
-            # (ASVS 11.3.4, BACKLOG #3191).
-            await self.store.close()
+            # (ASVS 11.3.4, BACKLOG #3191). An overspent reserve may wait for the store's writer to
+            # the end of this stop's budget, the last step's bound, so it is charged if it can be.
+            loop = asyncio.get_running_loop()
+            with overspend_deadline(None if math.isinf(bound) else loop.time() + bound):
+                await self.store.close()
             closed = True
         finally:
             # Only now: until the close took its settlement the runner kept the reserve ahead of

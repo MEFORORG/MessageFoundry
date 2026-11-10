@@ -1733,10 +1733,10 @@ class AesGcmCipher(_UnmarkedPolicy):
         cryptographic cause, and a crash-looping service under NSSM auto-restart (~8.6k opens/day at a
         10 s restart) reaches the fail-closed 2**32 in about a week.
 
-        The conservative bias is preserved where it is actually needed — an UNCLEAN exit, which never
-        reaches a settlement and therefore still forfeits its whole reserved block. The store's close
-        takes its settlement through :meth:`close_invocation_bound`, after which this cipher refuses
-        to encrypt, so the exact figure it writes cannot under-count."""
+        An UNCLEAN exit never reaches a settlement and forfeits its whole reserved block. The store's
+        close takes its settlement through :meth:`close_invocation_bound`, after which this cipher
+        refuses to encrypt. A close whose store stays busy to its deadline with an overspent reserve
+        writes no settlement and leaves uncharged the amount its ERROR line names (BACKLOG #3191)."""
         with self._count_lock:
             return -self._reserve_remaining
 

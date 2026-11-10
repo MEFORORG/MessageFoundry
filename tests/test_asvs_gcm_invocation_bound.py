@@ -49,8 +49,10 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.gcm_bound import (
     GCM_RESERVE_BLOCK,
+    SETTLE_WAIT_SECONDS,
     bounded_cipher,
     checkpoint_invocations,
+    overspend_deadline,
     settle_at_close,
 )
 from messagefoundry.store.store import _writer_guard
@@ -711,32 +713,57 @@ async def test_a_writer_lock_held_past_the_wait_closes_the_bound_unsettled(
     assert any("without refunding" in r.getMessage() for r in caplog.records)
 
 
-async def test_a_close_that_times_out_overspent_returns_in_time_and_names_the_under_count(
+async def _overspent(db: Path) -> tuple[MessageStore, AesGcmCipher, int]:
+    """A keyed store whose reserve is spent and 5 more, as a refill that fell behind leaves it."""
+    store, cipher = await _keyed_store(db)
+    reserved = await store.cipher_invocations(cipher.invocation_key_id)
+    cipher.grant_invocations(-cipher._reserve_remaining - 5, reserved)
+    return store, cipher, reserved
+
+
+async def test_an_overspend_is_charged_once_a_busy_writer_frees_within_the_deadline(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A busy writer plus an overspent reserve: the close still returns within its wait, and the
-    ERROR line names the exact amount the persisted total under-counts by."""
-    db = tmp_path / "overspent.db"
-    store, cipher = await _keyed_store(db)
-    key_id = cipher.invocation_key_id
-    reserved = await store.cipher_invocations(key_id)
-    # Spend the whole reserve and 5 more, as a refill that fell behind would leave it.
-    cipher.grant_invocations(-cipher._reserve_remaining - 5, reserved)
+    """Past the settle's own wait, an overspent reserve keeps waiting for the writer, to the stop's
+    deadline; a writer that frees within it lets the close charge the overspend, with no ERROR."""
+    db = tmp_path / "frees.db"
+    store, cipher, reserved = await _overspent(db)
+    loop = asyncio.get_running_loop()
+    await store._lock.acquire()
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.store.gcm_bound"):
+        with overspend_deadline(loop.time() + 5.0):
+            close = asyncio.ensure_future(store.close())
+        try:
+            await asyncio.sleep(SETTLE_WAIT_SECONDS * 3)
+            assert not close.done(), "the control: the close is still waiting for the writer"
+        finally:
+            store._lock.release()
+            await asyncio.wait_for(close, 10)
+    assert not [r for r in caplog.records if "not charged" in r.getMessage()]
+    assert await _persisted(db, cipher.invocation_key_id) == reserved + 5
+
+
+async def test_an_overspend_a_writer_never_frees_for_is_named_at_the_deadline(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A writer still busy at the stop's deadline: the close returns at that deadline, and the ERROR
+    names the amount not charged."""
+    db = tmp_path / "never.db"
+    store, cipher, reserved = await _overspent(db)
+    loop = asyncio.get_running_loop()
     await store._lock.acquire()
     try:
         with caplog.at_level(logging.ERROR, logger="messagefoundry.store.gcm_bound"):
-            began = asyncio.get_running_loop().time()
-            await asyncio.wait_for(store.close(), 10)
-            elapsed = asyncio.get_running_loop().time() - began
+            with overspend_deadline(loop.time() + 0.5):
+                close = asyncio.ensure_future(store.close())
+            await asyncio.wait_for(close, 10)
     finally:
         store._lock.release()
     assert cipher.invocation_bound_closed
-    assert elapsed < 2.0, f"the close took {elapsed:.2f}s"
-    assert any("under-counts by 5" in r.getMessage() for r in caplog.records), [
+    assert any("overspend of 5 was not charged" in r.getMessage() for r in caplog.records), [
         r.getMessage() for r in caplog.records
     ]
-    assert not any("over-count" in r.getMessage() for r in caplog.records)
-    assert await _persisted(db, key_id) == reserved
+    assert await _persisted(db, cipher.invocation_key_id) == reserved
 
 
 async def test_a_close_that_times_out_with_an_unspent_reserve_keeps_the_block(
