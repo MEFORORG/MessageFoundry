@@ -411,13 +411,16 @@ def redact_log_value(text: str) -> str:
     is not printable, so ``/x\\x01DOE%5EJANE%5EQ`` was hidden only by the second handler's passes on
     the escaped text. The field's own escape later hides that text from every handler, so this
     value must already carry what the second one would have hidden. A tab, which that escape keeps
-    and which the PHI pass also reads as not printable, is written ``\\t`` here too, so the sweep
-    covers every C0 control; that hides more than main's handlers did, never less."""
+    and which the PHI pass also reads as not printable, becomes a space here; not ``\\t``, which
+    glued a ``t`` to the next word and cost a credential label its word boundary. So a control
+    logs as its escape spelling and a tab as a space, and the field no longer tells either from
+    that text. At least the two-handler reading is matched; a third handler's further round, and
+    a Unicode space separator, which the PHI pass also reads as not printable, are not modelled."""
 
     def passes(value: str) -> str:
         return scrub_credentials(_scrub_credential_query(redact_untrusted(value)))
 
-    return passes(scrub_control_chars(passes(text)).replace("\t", "\\t"))
+    return passes(scrub_control_chars(passes(text)).replace("\t", " "))
 
 
 def redacted_log_field(text: str, limit: int) -> str:

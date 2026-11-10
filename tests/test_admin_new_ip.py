@@ -1322,11 +1322,19 @@ def test_a_redaction_that_raises_logs_a_placeholder_not_an_exception(
 
 #: Every C0 control and DEL, each before a percent-encoded HL7 name: the PHI pass skips the encoded
 #: run in text that is not printable, so on main only a second handler, reading the first one's
-#: escaped text, hid the name (BACKLOG #3770).
+#: escaped text, hid the name, and with a tab, which that escape keeps, no handler did (BACKLOG
+#: #3770). The rest put a credential label, a date or a name after a tab, with a value split by an
+#: escaped line break: a tab written ``\t`` there unhid what main's second handler hid.
 _CONTROL_HL7_PATHS = tuple(
     f"/x{chr(c)}DOE{sep}JANE{sep}Q"
     for c in [*range(0x20), 0x7F]
     for sep in ("%5E", "%7C", "%7E", "%26")
+) + (
+    "/x\tpassword:\tabc\nSECRETVALUE",
+    "/x Bearer\tabc\nSECRETVALUE",
+    "/\tcode=\x0b.1234567/",
+    "/\tcode=-\r1980-01-01secret:",
+    "/DOB:\tpassword=Bearer|\nJane",
 )
 
 
@@ -1359,7 +1367,7 @@ def test_a_control_character_does_not_unhide_an_encoded_hl7_name(path: str) -> N
     # No less than main, whose line carried the raw path: a word hidden on main's last sink is
     # hidden on every one of ours.
     main_last = _sink_lines(path)[-1]
-    for word in ("DOE", "JANE", "Q"):
+    for word in ("DOE", "JANE", "Q", "SECRETVALUE", "1234567", "1980", "Jane", "abc"):
         if word not in main_last:
             assert all(word not in line for line in ours), (word, ascii(ours))
 
