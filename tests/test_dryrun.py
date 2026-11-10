@@ -189,6 +189,8 @@ def test_strict_validation_error() -> None:
     result = dry_run(_registry(lambda m: ["h"], {"h": lambda m: Send("out", m)}, strict=True), bad)
     assert result.disposition is MessageStatus.ERROR
     assert result.error
+    # On time, the validator's verdict is the run's error itself (BACKLOG #5107).
+    assert result.strict_refusal == result.error and result.strict_timed_out is False
 
 
 def test_strict_validation_timing_starts_after_the_warm_up(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -233,7 +235,7 @@ def test_strict_timeout_keeps_a_late_content_refusal(
     monkeypatch: pytest.MonkeyPatch, outcome: str, late: str | None
 ) -> None:
     """BACKLOG #5107: past the timeout ``error`` is the listener's timeout text whatever the
-    validate did, and ``strict_late_refusal`` keeps only a content refusal it returned. Fake clock:
+    validate did, and ``strict_refusal`` keeps only a content refusal it returned. Fake clock:
     every read advances 31 s past the timeout."""
     import itertools
     import time
@@ -261,7 +263,7 @@ def test_strict_timeout_keeps_a_late_content_refusal(
     assert result.disposition is MessageStatus.ERROR
     assert result.strict_timed_out is True
     assert result.error is not None and result.error.startswith("strict-validation timed out")
-    assert result.strict_late_refusal == late
+    assert result.strict_refusal == late
 
 
 def test_warm_validation_fills_what_a_first_validate_loads_lazily() -> None:

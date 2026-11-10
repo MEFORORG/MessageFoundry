@@ -1976,7 +1976,7 @@ def _check_dryrun(
                     errors.append(
                         f"{label} @ {ic_name}: expected {expected.disposition}, got {got}"
                     )
-                elif result.strict_timed_out and result.strict_late_refusal is None:
+                elif result.strict_timed_out and result.strict_refusal is None:
                     # A timeout is the validator's wall clock, not the message, so on its own it
                     # never proves a fixture that expects ERROR (BACKLOG #5107). A content refusal
                     # the validate returned after the timeout does: the verdict is the message's,
@@ -1988,10 +1988,9 @@ def _check_dryrun(
                     )
                 elif expected.reason is not None:
                     # Matched against the raw text, never safe_error's: redaction must not decide
-                    # whether the gate fails. On a late refusal the reason is the validator's own
+                    # whether the gate fails. A strict refusal is matched as the validator's own
                     # verdict, not the timeout text that stands in ``error`` for listener parity.
-                    said = result.strict_late_refusal if result.strict_timed_out else result.error
-                    if expected.reason not in (said or ""):
+                    if expected.reason not in (result.strict_refusal or result.error or ""):
                         # Neither text is printed: the error and the reason can both quote the
                         # message, and this detail lands in a CI log.
                         errors.append(
