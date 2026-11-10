@@ -20,6 +20,11 @@ from typing import Any
 
 import httpx
 import pytest
+
+# The [vault] extra's libraries. The repo harness legs install without that extra (ci.yml), so the module skips there.
+pytest.importorskip("requests", reason="Transit outage tests need the [vault] extra")
+pytest.importorskip("hvac", reason="Transit outage tests need the [vault] extra")
+
 import requests
 import urllib3.exceptions
 from hvac.exceptions import (  # type: ignore[import-untyped]

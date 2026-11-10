@@ -8744,10 +8744,9 @@ def create_app(
 
         Built by :func:`_upload_unavailable`, which logs the store's error TEXT and keeps it off
         the 503, so the 503 holds no link to the Transit chain, whose request can carry a body.
-        Every caller raises it after its ``except`` clause has ended, so ``__context__`` is empty
-        too. ``args`` is set to ``(503, detail)`` here, because Starlette's ``__init__`` leaves it
-        as the call's own arguments; a copy or unpickle rebuilds it through ``cls(*args)``, which
-        logs nothing."""
+        Each raise in this module comes after its ``except`` clause has ended. ``args`` is set to
+        ``(503, detail)`` here, because Starlette's ``__init__`` leaves it as the call's own
+        arguments; a copy rebuilds it through ``cls(*args)``, which logs nothing."""
 
         def __init__(self, *_rebuilt: object) -> None:
             super().__init__(
