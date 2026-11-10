@@ -1472,8 +1472,10 @@ def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1") -> list[str]:
     """The words of ``path`` that a sink of this branch's matching line prints in its path field,
     escapes decoded, more often than main's last handler printed them in its path span, on one of
     main's two WARNING lines. Main's lines are its own two formats, with the seen address as main
-    logged it. Main's path span is counted as its line less the seen text as one handler pair
-    writes it alone, so a seen text that repeats a path word does not hide that word's loss."""
+    logged it. Main's path span is its line after its head and, on the past-cap line, before
+    ``seen_ip=`` and the seen text as two handlers write it alone. Where that tail is not found
+    whole, the span runs to the end of the line and the seen text's own count of the word is taken
+    off, so a seen text that repeats a path word does not hide that word's loss."""
     repeat = _new_ip_path_field(path)
     over = _new_ip_path_field(path, _bounded_address_text(seen))
     main_seen = scrub_log_argument(_bounded_address_text(seen))
@@ -1488,18 +1490,33 @@ def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1") -> list[str]:
     # ``path=`` to a run of the path.
     opening = "a request from a new client address must re-verify; the address "
     assert all(line.startswith(opening) for pair in pairs for side in pair for line in side)
-    words = set(re.findall(r"[A-Za-z0-9]{3,}", path)) - set(
-        re.findall(r"[A-Za-z0-9]+", _REPEAT_HEAD + _OVER_HEAD)
-    )
-    seen_alone = _sink_lines("seen=%s", main_seen)[-1]
+    words = set(re.findall(r"[A-Za-z0-9]{3,}", path))
+    tail = _sink_lines("%s", " seen_ip=" + main_seen)[-1].rstrip("\n")
     shown = []
-    for (main, ours), seen_written in zip(pairs, ("", seen_alone), strict=True):
+    for (main, ours), head, after in zip(
+        pairs, (_REPEAT_HEAD, _OVER_HEAD + "path="), ("", tail), strict=True
+    ):
+        span, extra = _main_span(main[-1], head, opening, after)
         fields = [_unescaped(_path_value(line)) for line in ours]
         for word in sorted(words):
-            in_main_span = max(0, main[-1].count(word) - seen_written.count(word))
+            in_main_span = max(0, span.count(word) - extra.count(word))
             if any(field.count(word) > in_main_span for field in fields):
                 shown.append(word)
     return shown
+
+
+def _main_span(line: str, head: str, opening: str, tail: str) -> tuple[str, str]:
+    """Main's path span in ``line``, and the text whose counts the caller takes off: the rest of
+    ``head`` where a pass took part of it, and ``tail`` where it is not found whole."""
+    line = line.rstrip("\n")
+    extra = ""
+    if line.startswith(head):
+        line = line[len(head) :]
+    else:
+        line, extra = line[len(opening) :], head[len(opening) :]
+    if line.endswith(tail):
+        return line[: len(line) - len(tail)], extra
+    return line, extra + tail
 
 
 def _path_value(line: str) -> str:
@@ -1634,9 +1651,9 @@ def test_redact_log_value_follows_the_shipped_filter_chain(
 
 def test_a_rewritten_context_logs_a_placeholder() -> None:
     """RED when: a pass that rewrites the line's fixed context around the value leaves that context
-    in the value; or a seen text a pass takes into the path is not caught; or an ordinary path
-    after a credential label's word logs as unreadable; or the placeholder passes its bound
-    (BACKLOG #3770).
+    in the value; or a seen text a pass takes into the path is not caught; or a path ending in a
+    credential label is unreadable on the repeat line, or readable on the past-cap line, where its
+    label takes ``seen_ip=`` as its value; or the placeholder passes its bound (BACKLOG #3770).
     ``/x/password:`` before ``seen_ip=`` reads as a label whose value is the next field."""
     from messagefoundry.logging_setup import redact_log_value
 
@@ -1652,8 +1669,24 @@ def test_a_rewritten_context_logs_a_placeholder() -> None:
     assert _new_ip_path_field("/x/password:") == '"/x/password_u003A_"'
     assert _new_ip_path_field("/plain/path", "10.0.0.1") == '"/plain/path"'
     assert _new_ip_path_field("/api/auth/bearer") == '"/api/auth/bearer"'
+    # The bearer label takes ``seen_ip=`` as its value in the past-cap line, which the seen text
+    # read alone does not show, so that line cannot tell the path apart from the rewritten tail.
     for seen in ("10.0.0.1", "DOE JANE hunter2"):
         assert _new_ip_path_field("/api/auth/bearer", seen) == _UNREADABLE_FIELD, seen
+
+
+#: Seen texts a shipped filter rewrites on their own: each must leave an ordinary path readable.
+_REWRITTEN_SEEN = (*_HOSTILE_SEEN, "1980-01-01", "MRN 12345", "Smith John", "a^b^c")
+
+
+@pytest.mark.parametrize("seen", _REWRITTEN_SEEN)
+@pytest.mark.parametrize("path", ["/plain", "/users", "/a b", "/api/admin/users/42"])
+def test_a_rewritten_seen_address_leaves_an_ordinary_path_readable(path: str, seen: str) -> None:
+    """RED when: a seen text that a filter rewrites alike in the past-cap line and on its own, a
+    date, a name, a tab or an HL7 run, makes an ordinary path unreadable on that line, so a
+    caller's forwarded header blanks the only log of which path it reached (BACKLOG #3770)."""
+    field = _new_ip_path_field(path, _bounded_address_text(seen))
+    assert field == _new_ip_path_field(path) != _UNREADABLE_FIELD, (path, seen, field)
 
 
 def test_a_cut_checksum_is_never_read_as_a_date() -> None:

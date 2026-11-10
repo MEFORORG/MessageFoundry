@@ -472,14 +472,21 @@ def redacted_log_field(
     :func:`redact_log_value` in the line ``before`` + ``text`` + ``after``, then escaped and
     bounded by :func:`~messagefoundry.controlchars.log_field_token` (BACKLOG #3770).
 
-    It is :data:`UNREADABLE_LOG_VALUE`, escaped and bounded by ``limit``, when a pass rewrote
-    ``before`` or ``after``, or when ``text`` in a ``(before, after)`` of ``checks`` does not
-    read as the same value with that ``before`` and ``after`` both whole. A check is read only to
-    compare, never logged, so its ``after`` may be caller text: it is the line the value stood in,
-    whose text a pass can take into a value of ``text``, or which can make a pass hide more of
-    ``text``. So a check also fails when a pass rewrote its ``after`` alone, as when ``text``
-    ends in a credential label that takes it as its value. Each check is one more full reading.
-    Readings stop at the first that fails.
+    It is :data:`UNREADABLE_LOG_VALUE`, escaped and bounded by ``limit``, in these cases, the
+    one statement of them that callers link to:
+
+    - a pass rewrote ``before`` or ``after``;
+    - for a ``(before, after)`` of ``checks``, the line ``before`` + ``text`` + ``after`` does not
+      read as ``before``, the value, and ``after`` as the same passes write it alone. A check is
+      read only to compare, never logged, so its ``after`` may be caller text: it is the line the
+      value stood in. The value read there differs when a pass took text of ``after`` into
+      ``text``, or ``after`` made a pass hide more of ``text``, and the reading also fails when
+      a pass rewrote ``after`` only in that line, as when ``text`` ends in a credential label
+      that takes ``after`` as its value. A pass rewriting ``after`` alike in both readings, a
+      date or a tab in it for example, fails nothing.
+
+    Each check is one more full reading, and one of ``after`` alone. Readings stop at the first
+    that fails.
 
     The escape hides most of what the handler filters anchor on, so they read less inside the
     field than in raw text; redacting first, in the lines the caller names, is meant to hide what
@@ -487,15 +494,17 @@ def redacted_log_field(
     already redacted value can miss what the same reading of the raw text hid. The placeholders
     the passes write are kept as they are, not escaped, so a search for ``<redacted>`` or
     ``[redacted]`` finds a value they wrote; an unreadable value carries neither, so a search for
-    redactions also needs :data:`UNREADABLE_LOG_VALUE`, which a limit under 19 cuts. The filters still run on the whole line
-    afterwards and may rewrite a run inside the field, never past its quotes.
+    redactions also needs :data:`UNREADABLE_LOG_VALUE`, which a limit under 19 cuts. The filters
+    still run on the whole line afterwards and may rewrite a run inside the field, never past its
+    quotes.
 
     A log argument must never raise, as in :class:`RedactionFilter`: a failing pass gives a fixed
     placeholder rather than the value."""
     try:
         value = redact_log_value(text, before=before, after=after)
         if value is None or not all(
-            redact_log_value(text, before=head, after=tail) == value for head, tail in checks
+            _shipped_reading(head + text + tail) == head + value + _shipped_reading(tail)
+            for head, tail in checks
         ):
             return log_field_token(UNREADABLE_LOG_VALUE, limit)
         return log_field_token(value, limit, literals=(CREDENTIAL_PLACEHOLDER, PHI_PLACEHOLDER))
