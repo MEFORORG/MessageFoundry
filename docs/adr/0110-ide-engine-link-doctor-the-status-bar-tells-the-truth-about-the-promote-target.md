@@ -1,6 +1,6 @@
 # ADR 0110 — IDE engine-link doctor: the status bar tells the truth about the promote target
 
-- **Status:** Accepted (2026-07-14) — owner-directed this session; built (IDE extension v0.0.28, BACKLOG #1757).
+- **Status:** Accepted (2026-07-14) — owner-directed this session; built (IDE extension v0.0.28, BACKLOG #1757). Amended 2026-11-06 (vault BACKLOG #2349, the Engine channel).
 - **Deciders:** owner (report + "do it all" directive) + a 23-agent design/adversarial pass.
 - **Extends:** [ADR 0100](0100-ide-native-surface-polish-and-open-to-messagefoundry-startup-experience-backlog-221.md)
   (the native surface, whose §1 enumerates this status-bar item — and records it as one that *"opens
@@ -103,7 +103,10 @@ Plus a **state-gated QuickPick** on click (with a `title:`, never a `placeHolder
 click site** (the only feedback that appears where the user actually clicked), and the extension's **first engine
 `LogOutputChannel`** ("MessageFoundry Engine") — one line per probe/action carrying URL, status or errno, duration
 and verdict, and **never a body, never a token** (CLAUDE.md §9; it is wired at the status-bar layer, *not* inside
-the shared `engineClient`, which would silently capture whatever every future caller sends).
+the shared `engineClient`, which would silently capture whatever every future caller sends). *(Amended 2026-11-06,
+vault BACKLOG #2349, ASVS 16.2.2: the editor stamps a `LogOutputChannel` in a format and zone the extension cannot
+set. The channel is now a plain output channel the extension stamps in UTC itself, and the
+editor's per-level filter on it is gone; [`docs/PHI.md`](../PHI.md) row 16 gives the line format.)*
 
 A webview panel is **rejected**: it opens from the same command dispatch (so it fixes a missed click no better), it
 is an unbounded canvas into which queue depths and message lists creep, and its HTML+postMessage surface is the one

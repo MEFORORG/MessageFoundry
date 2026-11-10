@@ -115,6 +115,13 @@ the gate being keyed on configuration and not on the collector.
   2-second figure was costed against something else and does not apply to it.
 - Not built here: the shard supervisor and the sandbox child still have no forwarder path, and the
   collector-separation probe (every resolved address is this host's) stays unbuilt. #1199 names them.
+  **Note added 2026-11-06 (vault BACKLOG #2356 subject 3). It speaks to the sandbox child only, not
+  to the supervisor.** The child still has no forwarder of its own. Its off-box path, and the owner's
+  ruling of 2026-11-05 on it, are stated once, in [`docs/PHI.md`](../PHI.md) section 7.
+  **Corrected 2026-11-10 (vault BACKLOG #2356 subject 2).** The supervisor half of this bullet is
+  no longer true: engine PR 2195 gave the engine-shard supervisor its own forwarder, behind the
+  forwarding gates `serve` passes and with its own spool directory (`_supervisor_forward_spool_dir`
+  in `messagefoundry/__main__.py`; `tests/test_supervisor_log_forwarding.py`).
 
 ## Follow-ups (BACKLOG #2278, #2279), 2026-10-08
 
