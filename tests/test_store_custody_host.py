@@ -2483,12 +2483,14 @@ def test_the_add_file_check_reads_a_junctions_target_not_the_link(tmp_path: Path
 @host_file_platforms
 @pytest.mark.parametrize("backend", [StoreBackend.POSTGRES, StoreBackend.SQLSERVER])
 @pytest.mark.parametrize("anywhere", [None, True, False])
+@pytest.mark.parametrize("schema", ["auto", "external"])
 def test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     anywhere: bool | None,
     backend: StoreBackend,
+    schema: str,
 ) -> None:
     # PR 2804 fourteenth hold, item 4: the pre-check read a server open's "no store" as absent and
     # minted. That open sees only what its login resolves (a search_path, a default schema, the
@@ -2526,22 +2528,29 @@ def test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none(
     (tmp_path / "messagefoundry.toml").write_text(
         f'[store]\nbackend = "{backend.value}"\nkey_provider = "host"\n'
         'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
-        # A create that builds the schema: under the default, external, a database with no store
-        # schema refuses before the mint (vault BACKLOG #8119 item 1).
-        'schema_management = "auto"\n'
-        "[security]\nrequire_mfa = false\n"
+        # Under external, the server default, the create builds no schema, so a database with no
+        # store schema refuses before the mint (vault BACKLOG #8119 item 1); the catalog's own
+        # refusals still come first.
+        + ('schema_management = "auto"\n' if schema == "auto" else "")
+        + "[security]\nrequire_mfa = false\n"
     )
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
     code = main([*argv, "--no-totp"])
     err = " ".join(capsys.readouterr().err.split())
     assert code == 2, err
-    if anywhere is False:  # the control: the whole catalog shows no store, so the mint runs
+    provision = base.PROVISION_SCHEMA_COMMAND
+    if anywhere is False and schema == "auto":  # the control: no store anywhere, so it mints
         assert shown == ["recovery key shown"], err
         return
     assert shown == [], err  # refused before any recovery key was shown
     assert "no key was minted" in err.lower(), err
     assert not (secrets / custody_host.HOST_FILE_NAME).exists()
+    assert not _advises_changing(err), err
+    if anywhere is False:  # external: no store schema, and none is built here
+        assert provision in err and "'external'" in err, err
+        return
+    assert provision not in err, err  # the catalog's own refusal, not the external one
     # Fifteenth hold, review round 1: the text names only this backend's cause, and a found
     # store is not said to be unreachable. Hold 17: nor partly created, which invites dropping
     # tables another application may own. Neither advises changing what exists.
@@ -2722,11 +2731,13 @@ class _PresentTablesConn(_CatalogConn):
 
 @host_file_platforms
 @pytest.mark.parametrize("present", [{"users"}, {"messages"}, set()])
+@pytest.mark.parametrize("schema", ["auto", "external"])
 def test_a_schema_holding_one_store_table_without_schema_meta_refuses_and_mints_nothing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     present: set[str],
+    schema: str,
 ) -> None:
     # PR 2804 sixteenth hold, item 2 (F1): a table under one of the store's own names, with no
     # schema_meta, passed the pre-check, so the run minted and the create then failed over that
@@ -2774,8 +2785,9 @@ def test_a_schema_holding_one_store_table_without_schema_meta_refuses_and_mints_
     (tmp_path / "messagefoundry.toml").write_text(
         '[store]\nbackend = "postgres"\nkey_provider = "host"\n'
         'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
-        'schema_management = "auto"\n'  # the default, external, refuses the empty schema too
-        "[security]\nrequire_mfa = false\n"
+        # The default, external, refuses the empty schema too, after the catalog's refusals.
+        + ('schema_management = "auto"\n' if schema == "auto" else "")
+        + "[security]\nrequire_mfa = false\n"
     )
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
@@ -2783,9 +2795,12 @@ def test_a_schema_holding_one_store_table_without_schema_meta_refuses_and_mints_
     err = " ".join(capsys.readouterr().err.split())
     assert code == 2, err
     assert len(conn.calls) == 2, conn.calls  # the catalog was asked
-    if not present:
+    if not present and schema == "auto":
         assert shown == ["recovery key shown"], err
         return
+    # A found table gets the catalog's refusal under either mode; only an empty schema under
+    # external gets the provisioning one.
+    assert (base.PROVISION_SCHEMA_COMMAND in err) is (not present), err
     assert shown == [], err  # refused before any recovery key was shown
     assert "no key was minted" in err.lower(), err
     assert not (secrets / custody_host.HOST_FILE_NAME).exists()
@@ -3399,63 +3414,34 @@ def test_a_failed_server_create_keeps_the_minted_key_and_names_it_to_the_end(
 # --- vault BACKLOG #8119: a server mint that fails before the key is used -------------------------
 
 
-@host_file_platforms
-@pytest.mark.parametrize("backend", [StoreBackend.POSTGRES, StoreBackend.SQLSERVER])
-def test_an_external_schema_with_no_store_refuses_before_the_mint(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    backend: StoreBackend,
-) -> None:
-    # Vault BACKLOG #8119 item 1: under external schema management, the server default, the
-    # create open runs no DDL, so over a database with no store schema it refused only after the
-    # recovery key was shown and proved, keeping a key no store could use. Now the run refuses
-    # before the prompts and names the provisioning command. The control is
-    # test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none: under auto the
-    # same database mints.
-    from messagefoundry import __main__ as cli
-    from messagefoundry.__main__ import main
-    from messagefoundry.store import base
+class _EmptyProvisionedStore:
+    """A read-only server store whose schema is provisioned, with every table empty."""
 
-    secrets = tmp_path / "secrets"
-    secrets.mkdir()
-    if sys.platform != "win32":
-        secrets.chmod(0o700)
-    monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
-    shown: list[str] = []
+    async def table_occupancy(self) -> dict[str, int]:
+        return dict.fromkeys(("messages", "message_events", "audit_log", "users", "schema_meta"), 0)
 
-    async def _open(settings: StoreSettings, **kwargs: object) -> Store:
-        if kwargs.get("custody") is None:
-            raise HostCustodyMissing("no host blob and no handoff here (stand-in)")
-        raise base.StoreNotFoundError.server_schema(backend, "mefor")
+    async def close(self) -> None:
+        return None
 
-    async def _none_anywhere(*_args: object, **_kwargs: object) -> bool:
-        return False
 
-    def _ceremony(*_args: object, **_kwargs: object) -> None:
-        shown.append("recovery key shown")
-        raise HostCustodyRefused("the ceremony was reached (stand-in)")
+@pytest.mark.parametrize("module", ["postgres", "sqlserver", "store"])
+def test_every_writable_open_checks_the_pin_before_its_first_keyed_write(module: str) -> None:
+    # Vault BACKLOG #8119 item 2 rests on this order: a minting open's failure before the pin
+    # check passed is typed as one that sealed nothing, and its key is removed. So each backend's
+    # open must call check_open_store_pin before bind_store_salt, the first step under the key.
+    import importlib
+    import inspect
 
-    monkeypatch.setattr(base, "open_store", _open)
-    monkeypatch.setattr(base, "server_store_schema_found_anywhere", _none_anywhere)
-    monkeypatch.setattr(custody_host, "mint_host_custody", _ceremony)
-    monkeypatch.setattr(cli, "_read_new_password", lambda _prompt: "correct horse battery")
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "messagefoundry.toml").write_text(
-        f'[store]\nbackend = "{backend.value}"\nkey_provider = "host"\n'
-        'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
-        "[security]\nrequire_mfa = false\n"
-    )
-    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
-    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
-    code = main([*argv, "--no-totp"])
-    err = " ".join(capsys.readouterr().err.split())
-    assert code == 2, err
-    assert shown == [], err  # refused before any recovery key was shown
-    assert "no key was minted" in err.lower(), err
-    assert base.PROVISION_SCHEMA_COMMAND in err and "'external'" in err, err
-    assert not (secrets / custody_host.HOST_FILE_NAME).exists()
-    assert not _advises_changing(err), err
+    target = importlib.import_module(f"messagefoundry.store.{module}")
+    cls = {
+        "postgres": "PostgresStore",
+        "sqlserver": "SqlServerStore",
+        "store": "MessageStore",
+    }[module]
+    source = inspect.getsource(getattr(target, cls).open)
+    pin = source.index("await check_open_store_pin(store)")
+    assert pin < source.index("bind_store_salt("), module
+    assert pin < source.index("checkpoint_cipher_invocations"), module
 
 
 class _EmptyChain:
@@ -3481,13 +3467,13 @@ def _failing_backend(failure: Exception, *, after_the_pin: bool) -> Any:
 
 
 @pytest.mark.parametrize(
-    "case", ["before the pin", "after the pin", "not minting", "sqlite", "pin refusal"]
+    "case", ["before the pin", "after the pin", "not minting", "sqlite", "pin refusal", "batch"]
 )
 def test_a_minting_server_open_that_fails_before_its_pin_check_is_typed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
     # Vault BACKLOG #8119 item 2: a server open's connection, TLS, schema or settings failure
-    # comes before its pin check, the last step before its first write, so nothing was sealed
+    # comes before its pin check, the last step before its first write under the key, so nothing was sealed
     # under the key a minting open carries. The open now types it, as a failed create batch is
     # typed, so provision-admin removes the void key and a re-run can mint. Every other open, and
     # a failure once the pin check passed, keeps the error as it was.
@@ -3503,6 +3489,8 @@ def test_a_minting_server_open_that_fails_before_its_pin_check_is_typed(
     failure: Exception = ConnectionRefusedError("the server did not answer (stand-in)")
     if case == "pin refusal":
         failure = StoreIdPinRefusedBeforeWrite("refusing to open the store (stand-in)")
+    if case == "batch":  # the backend typed it already, and it is not wrapped twice
+        failure = StoreCreateBatchFailedBeforeKeyUse(_collision())
     backend = StoreBackend.SQLITE if case == "sqlite" else StoreBackend.POSTGRES
     settings = _settings(tmp_path, backend=backend, server="db.invalid", database="mefor")
     monkeypatch.setattr(
@@ -3521,16 +3509,20 @@ def test_a_minting_server_open_that_fails_before_its_pin_check_is_typed(
 
 @host_file_platforms
 @pytest.mark.parametrize("after_the_pin", [False, True])
+@pytest.mark.parametrize("schema", ["auto", "external"])
 def test_a_server_create_that_fails_before_its_pin_check_removes_the_minted_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     after_the_pin: bool,
+    schema: str,
 ) -> None:
     # Vault BACKLOG #8119 item 2, through provision-admin and the real open: a hop refusal at the
     # create, before its pin check, wrote nothing under the minted key, so the key is removed and
     # the next run mints a new one rather than stop at the file. The control fails after the pin
-    # check passed, where the open may have written, so the key is kept as before.
+    # check passed, where the open may have written, so the key is kept as before. Under auto the
+    # probe finds no store schema; under external, the server default, it finds a provisioned
+    # schema with an empty chain and no data, the default's one way to a mint.
     from messagefoundry import __main__ as cli
     from messagefoundry.__main__ import main
     from messagefoundry.config.tls_policy import InsecureHopRefused
@@ -3547,11 +3539,12 @@ def test_a_server_create_that_fails_before_its_pin_check_removes_the_minted_key(
         InsecureHopRefused("the store hop was refused (stand-in)"), after_the_pin=after_the_pin
     )
 
-    async def _open_backend(settings: StoreSettings, **kwargs: object) -> Store:
-        if kwargs.get("read_only"):  # the pre-check's probe: no store schema here
+    async def _open_backend(settings: StoreSettings, **kwargs: object) -> Any:
+        if kwargs.get("read_only"):  # the pre-check's probe
+            if schema == "external":
+                return _EmptyProvisionedStore()
             raise base.StoreNotFoundError.server_schema(StoreBackend.POSTGRES, "mefor")
-        result: Store = await create(settings, **kwargs)
-        return result
+        return await create(settings, **kwargs)
 
     def _ceremony(*_args: object, **_kwargs: object) -> MintedCustody:
         host_file.write_bytes(b"minted (stand-in)")
@@ -3568,7 +3561,7 @@ def test_a_server_create_that_fails_before_its_pin_check_removes_the_minted_key(
     (tmp_path / "messagefoundry.toml").write_text(
         '[store]\nbackend = "postgres"\nkey_provider = "host"\n'
         'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
-        'schema_management = "auto"\n'
+        f'schema_management = "{schema}"\n'
         "[security]\nrequire_mfa = false\n"
     )
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))

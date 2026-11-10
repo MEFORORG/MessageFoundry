@@ -5747,7 +5747,9 @@ OPEN_STORE_PIN: ContextVar[StorePin | None] = ContextVar("mefor_open_store_pin",
 
 class PinCheck:
     """Whether the open in progress has passed its store id pin check (:func:`check_open_store_pin`),
-    the last step before its first write. A mutable cell rather than a flag in a context variable,
+    the last step before its first write under the store key. Under ``auto`` schema management the
+    open may already have committed its schema, and on SQL Server altered the database's options,
+    before it; neither is under the key. A mutable cell rather than a flag in a context variable,
     so a pass recorded under a copied context still reaches the open that set it (vault BACKLOG
     #8119 item 2)."""
 
@@ -5892,7 +5894,7 @@ async def check_open_store_pin(host: AuditRangeHost) -> None:
     refusal = await _store_pin_refusal(host, await host._audit_genesis_row(), pin, writable=True)
     if refusal is None:
         if (check := OPEN_STORE_PIN_CHECK.get()) is not None:
-            check.passed = True  # the open may write from here on
+            check.passed = True  # the open may write under the key from here on
         return
     refused = StoreChainNeverStarted if refusal.never_started else StoreIdPinRefusedBeforeWrite
     raise refused(f"refusing to open the store: {refusal.text}")

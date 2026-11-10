@@ -9070,9 +9070,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
         """``none`` once the server database's catalog shows no table under a store table name in
         the schemas the open resolves (PR 2804 fourteenth and fifteenth holds). An open's "no
         store" is only what its login may see there, so a store it cannot see reads the same.
-        Raises :class:`HostCustodyRefused` for such a table there, whoever made it, and for a
-        catalog it cannot show, a search_path it cannot
-        read included: neither is minted over. What the catalog read cannot see, at least, is in
+        Raises :class:`HostCustodyRefused` for at least such a table there, whoever made it, a
+        catalog it cannot show, a search_path it cannot read included, and, after those, no store
+        schema under external schema management, which the create would not build (vault BACKLOG
+        #8119 item 1): none is minted over. What the catalog read cannot see, at least, is in
         :func:`~messagefoundry.store.base.server_store_schema_found_anywhere`."""
         from messagefoundry.store import base as store_base
         from messagefoundry.store.base import store_connect_errors, store_driver_errors
@@ -9542,9 +9543,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
             else "MEFOR_SECRETS_DIRECTORY unset, so that it looks beside the SQLite store file"
         )
         print(
-            f"The store key was written to {minted.path}. The service finds it only with {where} "
-            "in its own environment too; one that names another custody directory does not find "
-            "it, and refuses to start.",
+            f"The store key was written to {minted.path}. The service looks for it in the custody "
+            f"directory its own environment names; here that came from {where}. A service whose "
+            "environment names another custody directory does not find it, and refuses to start.",
             file=sys.stderr,
         )
 

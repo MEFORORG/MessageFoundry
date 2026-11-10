@@ -4497,8 +4497,9 @@ def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
     return None
 
 
-#: Errors an open already types as raised before anything was written under the key, which the
-#: minting open's wrap passes as they are (vault BACKLOG #8119 item 2).
+#: What the minting open's wrap passes as it is (vault BACKLOG #8119 item 2): a batch failure the
+#: backend already typed, so it is not wrapped twice, and every pin refusal, whose own class
+#: (``StoreIdPinRefusedBeforeWrite`` or not) is what decides whether the minted key is removed.
 _ALREADY_BEFORE_KEY_USE: Final = (StoreIdPinRefused, StoreCreateBatchFailedBeforeKeyUse)
 
 
