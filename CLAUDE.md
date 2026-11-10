@@ -533,8 +533,9 @@ and is not part of the signature. The signature covers R1-R9 as they stand in va
 The copy on vault `main` is `docs/LEDGER-INFLOW-RULINGS.md`, from vault PR 2818 (`a03b25550`). At
 `a03b25550` it keeps R1-R9 as signed, edits the sections around them, and adds, as its last
 section, the Manager's reading that this file calls "recorded beside the signed text".
-The owner exempted the minimal T4 qualifier on new product scope from R5 (2026-11-09, in session:
-*"Exempt this change"*); [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 12 records it.
+Asked how the autonomy-tier change should treat R5, the owner answered *"Exempt this change"*
+(2026-11-09, in session); the minimal T4 qualifier is the part of that change that landed, and
+[`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 12 records it.
 
 The brief is disposable. The BACKLOG item is the record.
 
@@ -618,10 +619,10 @@ Manager's watch reached the cloud session 29 seconds after its question.
   **Every class B decision takes that review for now**, whatever the sample count: plan section
   10 opens the no-review path only in its last wave, per seat, as calibration passes. Plan section
   5.2 retires the go *"once section 4 is built"*, and section 4 is only partly built, so this
-  retirement runs ahead of the plan's order; SAIDS section 6.2 and its A.6 record the gap. A filed
-  ledger row with a build verdict, and the direction of an ADR the owner accepted, are not new
-  product scope, so picking and splitting such work is a routine plan; the qualifier is in plan
-  section 3's class C row and its rulings in plan section 12 (owner ruling 2026-11-10). Point
+  retirement runs ahead of the plan's order; SAIDS section 6.2 and its A.6 record the gap. Which
+  filed build rows and owner-accepted ADR direction are not new product scope, and the limits on
+  that, are stated once in plan section 3's class C row; plan section 12 records the rulings
+  (owner ruling 2026-11-10). Point
   the brief at the relevant existing code; it measurably improves the result.
 - The rest of the Manager's dispatch rules bind only that seat. Korus `roles/MANAGER.md` carries
   them; read it at `origin/main`. Every brief ends with push, then report. A brief names who else is
