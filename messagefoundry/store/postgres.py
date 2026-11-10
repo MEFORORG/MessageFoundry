@@ -1185,10 +1185,15 @@ _SCHEMA: list[str] = [
     # every other node's config-convergence loop sees the higher version and reloads its OWN (identically
     # deployed) config dir to converge. The DbCoordinator owns it (read/cache/bump); it lands in
     # db_schema via the pool's search_path like every other table. CREATE TABLE IF NOT EXISTS is safe on
-    # a fresh OR existing DB (no ALTER/migration).
+    # a fresh OR existing DB; the gated ADD COLUMNs below migrate an existing one. config_digest is
+    # the initiating node's digest of what it applied, and config_digest_version the version it was
+    # stored with, both written by the same bump as the version, so a follower reads them as one
+    # pair (vault BACKLOG #3109; stamped_config_digest in pipeline/cluster.py). NULL is unknown.
     """CREATE TABLE IF NOT EXISTS cluster_config (
         id              INTEGER PRIMARY KEY,
         config_version  BIGINT NOT NULL,
+        config_digest   TEXT,
+        config_digest_version BIGINT,
         updated_at      DOUBLE PRECISION NOT NULL
     )""",
     # Track B Step 6b: the per-namespace transform-STATE version token (mirrors reference_version's role
@@ -1257,6 +1262,10 @@ CLUSTER_SCHEMA: tuple[str, ...] = (
     _gated_add_column("leader_lease", "leader_epoch", "BIGINT NOT NULL DEFAULT 0"),
 )
 _SCHEMA.extend(CLUSTER_SCHEMA)
+# Vault BACKLOG #3109: the initiator's digest beside the shared config version, for a cluster_config
+# created before the column. An existing row gets NULL, which reads as an unknown digest.
+_SCHEMA.append(_gated_add_column("cluster_config", "config_digest", "TEXT"))
+_SCHEMA.append(_gated_add_column("cluster_config", "config_digest_version", "BIGINT"))
 # BACKLOG #2143: the IdP auth_time an oidc session's step-up is compared with, for a sessions table
 # created before the column. In _SCHEMA rather than _migrate_lease_columns, so it moves the schema
 # hash itself and its catalog read is scoped to current_schema(). Pre-existing rows get NULL, which

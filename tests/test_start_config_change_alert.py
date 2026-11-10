@@ -752,6 +752,35 @@ async def test_a_convergence_row_names_its_own_reload_when_the_engine_moves_on_f
     assert row["superseded"] is True and row["baseline_unchecked"] is True
 
 
+async def test_a_convergence_row_names_the_initiators_digest_beside_its_own(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #3109 step 1: a convergence row carries, as ``initiator_digest``, the digest the
+    initiating node stored with the version the row names, beside the row's own ``fingerprint``.
+    The coordinator here answers only for version 3, as one whose cache holds version 3, so the
+    row for version 4 names none: a digest is never set beside a version it was not stored with."""
+    initiator = {
+        "fingerprint": "e" * 64,
+        "scheme": FINGERPRINT_SCHEME,
+        "unreadable_files": ["x.py"],
+    }
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        stored = json.dumps(initiator)
+        monkeypatch.setattr(
+            engine.coordinator, "config_digest_cached", lambda v: stored if v == 3 else None
+        )
+        await engine._converge_reload(3)
+        await engine._converge_reload(4)
+        reload_rows = await engine.store.list_audit(action="config_reload")
+    later, row = (json.loads(r["detail"]) for r in reload_rows)  # newest first
+    assert row["config_version"] == 3 and row["initiator"] == "cluster_convergence"
+    assert row["initiator_digest"] == initiator
+    assert row["fingerprint"] == config_fingerprint(cfg) != initiator["fingerprint"]
+    assert later["config_version"] == 4 and "initiator_digest" not in later
+
+
 async def test_a_failed_convergence_writes_one_failed_row_per_version(
     tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
 ) -> None:

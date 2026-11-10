@@ -1965,7 +1965,16 @@ started together, can each raise it; the alert list folds them into one instance
 - On a cluster, a reload row carries `config_version`, the shared version the reload applied
   (vault BACKLOG #3109). An operator reload's row carries the version it bumped the cluster to. A
   convergence row carries the version the node converged on. An operator reload whose bump failed
-  carries none. A follower's row records the bytes that node loaded, not the operator's digest.
+  carries none. A follower's `fingerprint` is of the bytes that node loaded. Beside it, a
+  convergence row carries `initiator_digest`: the `fingerprint`, `scheme` and any
+  `unreadable_files` parsed from unsigned text read from the shared `cluster_config` row,
+  stamped with the row's `config_version` (vault BACKLOG #3109). Compare the
+  two as a start compares digests: only under one `scheme` and with the same `unreadable_files`.
+  The digest is the one stored with `config_version`, but the node reads its own directory when it
+  reloads, so its `fingerprint` can be of files deployed after that version was bumped.
+  The key is absent when that digest is not known, at least when the initiator took none, when
+  the node's cached version had already moved on to a later bump, and for a version bumped by an
+  engine that does not write `cluster_config.config_digest` and the version it stamps beside it.
 - A convergence reload that fails writes a `config_reload_failed` row under the same actor, or
   `config_reload_denied` when its directory is outside the reload roots (vault BACKLOG #3109). The loop retries that version every interval and logs each failure. An
   engine process writes each distinct row once per version: rows that differ in action, `reason`

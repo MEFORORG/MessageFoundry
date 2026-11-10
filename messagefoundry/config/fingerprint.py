@@ -26,6 +26,7 @@ exactly like ``load_config`` itself.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -40,6 +41,7 @@ from messagefoundry.config.snapshot import (
     value_file_rel,
 )
 from messagefoundry.credential import constant_time_equal
+from messagefoundry.redaction import json_loads_or_refusal, refuse_repeated_keys
 
 __all__ = [
     "FINGERPRINT_SCHEME",
@@ -55,6 +57,8 @@ __all__ = [
     "is_missing_directory",
     "left_out_of",
     "same_digest",
+    "shared_digest_of",
+    "shared_digest_text",
     "snapshot_fingerprint",
     "value_file_material",
 ]
@@ -273,6 +277,68 @@ def describe_left_out(left_out: Iterable[str]) -> str:
     """``left_out`` for a log line, with ``.`` in words. Paths only, never content; a caller still
     scrubs it, since a file name is whatever the directory holds."""
     return ", ".join("the config directory" if rel == "." else rel for rel in left_out)
+
+
+#: The keys of a digest another node can compare its own with: the fold, the scheme it was taken
+#: under, and what it left out (:func:`same_digest` and the scheme check). ``files`` and ``git_head``
+#: are left out, as describing the initiator's checkout rather than the bytes (vault BACKLOG #3109).
+_SHARED_DIGEST_KEYS: frozenset[str] = frozenset({"fingerprint", "scheme", UNREADABLE_FILES_KEY})
+
+
+#: The longest text a bump stores or a follower reads back (vault BACKLOG #3109). Another node wrote
+#: it, and each follower parses it on the event loop and copies it into its audit row, so a larger
+#: value reads as no digest. The writer applies the same bound, so it never stores what the reader
+#: refuses; a digest that leaves out enough files to pass it is stored as unknown.
+_SHARED_DIGEST_MAX_CHARS = 65_536
+
+#: A fold as :func:`_fold` writes it: a SHA-256 in lower-case hex.
+_FOLD_CHARS = frozenset("0123456789abcdef")
+
+
+def shared_digest_text(detail: Mapping[str, object] | None) -> str | None:
+    """The text a cluster config-version bump stores beside the version it writes: the JSON of the
+    initiating node's digest, cut to :data:`_SHARED_DIGEST_KEYS` (vault BACKLOG #3109). ``None``
+    when ``detail`` holds no digest :func:`shared_digest_of` would read back; the bump then stores
+    the digest as unknown."""
+    if detail is None:
+        return None
+    shared = {key: value for key, value in detail.items() if key in _SHARED_DIGEST_KEYS}
+    if not _is_comparable_digest(shared):
+        return None
+    text = json.dumps(shared, sort_keys=True, separators=(",", ":"))
+    return text if len(text) <= _SHARED_DIGEST_MAX_CHARS else None
+
+
+def _is_comparable_digest(detail: Mapping[str, object]) -> bool:
+    """Whether ``detail`` is a digest another node can compare with, in the shape
+    :func:`config_fingerprint_detail` writes one: a 64-character lower-case hex fold, a non-empty
+    scheme, and an ``unreadable_files`` that is absent or a non-empty list of strings. The writer
+    and the reader apply this one rule, so the writer never stores what the reader refuses."""
+    fold = detail.get("fingerprint")
+    scheme = detail.get("scheme")
+    if not (isinstance(fold, str) and len(fold) == 64 and set(fold) <= _FOLD_CHARS):
+        return False
+    if not (isinstance(scheme, str) and scheme):
+        return False
+    if UNREADABLE_FILES_KEY not in detail:
+        return True
+    left_out = detail[UNREADABLE_FILES_KEY]
+    return (
+        isinstance(left_out, list) and bool(left_out) and all(isinstance(r, str) for r in left_out)
+    )
+
+
+def shared_digest_of(text: object) -> dict[str, object] | None:
+    """The digest :func:`shared_digest_text` wrote, or ``None`` when ``text`` is not one: not a
+    string, longer than :data:`_SHARED_DIGEST_MAX_CHARS`, not JSON, a repeated key, not an object,
+    a key outside :data:`_SHARED_DIGEST_KEYS`, or a value :func:`_is_comparable_digest` refuses.
+    Another node wrote it, so it is read as data and checked rather than trusted."""
+    if not isinstance(text, str) or len(text) > _SHARED_DIGEST_MAX_CHARS:
+        return None
+    value, refusal = json_loads_or_refusal(text, object_pairs_hook=refuse_repeated_keys)
+    if refusal is not None or not isinstance(value, dict) or not set(value) <= _SHARED_DIGEST_KEYS:
+        return None
+    return value if _is_comparable_digest(value) else None
 
 
 def fingerprint_matches(current: object, loaded: str) -> bool:
