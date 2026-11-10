@@ -25,8 +25,9 @@ action" thesis that its own module had already outgrown: a reader taking that li
 which is how the escape table came to live in ``logging_setup``.)
 
 THE NEUTRALISERS ARE DIFFERENT AND ONE MUST NEVER BE "SIMPLIFIED" INTO ANOTHER. Beside the
-refusals, that makes three actions built on one predicate. QUOTE, a fourth, is built on a percent
-escape, not on the predicate:
+refusals, that makes three actions built on one predicate. QUOTE, a fourth, is not built on the
+predicate: it keeps a small allowlist and writes every other character as ``_uXXXX_``, one per
+UTF-16 code unit:
 
   * REJECT -- six sites. A control character in a value that reaches a URL path, a header, a
     filename or a config field is refused outright.

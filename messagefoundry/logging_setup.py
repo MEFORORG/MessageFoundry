@@ -404,8 +404,12 @@ def _scrub_credential_query(text: str) -> str:
 
 
 def _shipped_filters() -> tuple[logging.Filter, ...]:
-    """The filters :func:`_install_phi_filters` puts on a shipped handler, built by that function,
-    so :func:`redact_log_value` cannot drift from it (BACKLOG #3770)."""
+    """The ``logging.Filter`` objects :func:`_install_phi_filters` puts on a shipped handler, built
+    by that function, so the reading :func:`redact_log_value` takes follows the text rewrites those
+    objects make to a record (BACKLOG #3770). It does not model at least two things a shipped
+    handler would do: a plain-callable filter, which this drops because it keeps only
+    ``logging.Filter`` instances, and a filter's return value, since :func:`_settled_reading`
+    ignores both a veto and a replacement record."""
     handler = logging.NullHandler()
     _install_phi_filters(handler)
     return tuple(f for f in handler.filters if isinstance(f, logging.Filter))
@@ -455,9 +459,10 @@ def _settled_reading(text: str, filters: tuple[logging.Filter, ...]) -> str | No
 
 def _shipped_reading(line: str) -> str | None:
     """``line`` as :func:`_settled_reading` reads it, then, when that holds a tab, read again with
-    each tab written as a space: a tab, which the control-character escape keeps, makes the PHI pass
-    read the text as not printable and skip it (BACKLOG #3770). ``None`` when either reading did
-    not settle."""
+    each tab written as a space: a tab, which the control-character escape keeps, makes the
+    encoded-HL7-run pass of :func:`messagefoundry.redaction.redact` (its
+    ``_HL7_ENCODED_FIELD_RUN`` substitution) read the text as not printable and skip it; its other
+    passes still run (BACKLOG #3770). ``None`` when either reading did not settle."""
     filters = _shipped_filters()
     out = _settled_reading(line, filters)
     if out is not None and "\t" in out:
