@@ -1252,13 +1252,19 @@ different token.
 
 **A warning still open after a clean start.** A clean start can leave another process's warning
 open ([ADR 0044, the vault BACKLOG #4916 amendment](adr/0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916)).
-Treat an open warning as live until you have found and fixed its cause, which may be the token,
-reachability or the probe paths. Neither the log line nor the audit row names the process that
-raised or cleared it, and engine shards share one log, so check each process's configuration and
-restart it after the fix: the probe runs only at start. A start whose process has no `[alerts]`
-transport, such as a webhook or email, gets the logging sink, which resolves nothing. A resolve
-can also fail to land; one that gives up logs an ERROR starting `alert-instance resolve gave up`.
-If the cause is fixed and the warning is still open, resolve it in the alert list.
+Treat an open warning as live until you have found and fixed its cause. The cause may be, at
+least, the token, reachability, the probe paths, or the engine's own Vault client setup (a missing
+extra, address or token variable, or a refused TLS or cleartext address). Neither the log line nor
+the audit row names the process that raised or cleared it, and under the engine-shard supervisor
+every shard shares one log, so check each process's configuration and restart it after the fix:
+only a serve start's preflight raises or resolves this warning (`messagefoundry check-privileges`
+runs the same probe on demand but changes no alert). A start whose process has no `[alerts]`
+transport, such as a webhook or email, gets the logging sink, which resolves nothing. It also
+raises nothing durable, so a process with no transport never appears in the alert list; an empty
+list does not prove every process is clean. A resolve can also fail to land, at least: it logs an
+ERROR such as `alert-instance resolve gave up` or `alert-instance resolve was cancelled before it
+landed`, or it can be dropped with no line at all. If the cause is fixed and the warning is still
+open, resolve it by hand from the alert list.
 
 The log line and the audit row of every start stay the record.
 

@@ -940,7 +940,7 @@ class AlertSink(Protocol):
 
     def vault_privilege_clean(self, name: str) -> None:
         """The INVERSE of :meth:`vault_privilege_warning`: a start whose preflight read a Vault
-        token and found it clean. No page; when alert-state is wired (ADR 0044) it auto-resolves
+        token and found it clean. No page; when alert-state is wired (ADR 0044) it can auto-resolve
         the open warning for the same subject; see ``docs/SECURITY.md``'s *A warning still open
         after a clean start*."""
         ...
