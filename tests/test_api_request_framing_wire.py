@@ -109,7 +109,7 @@ _FRAMED: dict[str, tuple[bytes, list[int]]] = {
 }
 
 _TE_CHUNKED = b"Transfer-Encoding is not accepted; send a Content-Length"
-_TE_NOT_CHUNKED = b"Transfer-Encoding does not end in chunked"
+_TE_NOT_CHUNKED = b"Transfer-Encoding must end in a single chunked"
 _TE_BESIDE_CL = b"ambiguous framing: Content-Length with Transfer-Encoding"
 
 #: Shapes llhttp passes and the app refuses (BACKLOG #5345), each with the status and the detail
@@ -475,9 +475,8 @@ async def test_the_probe_sees_the_shapes_h11_would_accept(engine: Engine) -> Non
             statuses, raw = await _answers(port, _REFUSED[shape])
             # The first request reached the app: a 405 and then the request behind it, or, for
             # the unfolded chunked one, the app's 411, after which it closes the connection.
-            assert statuses in ([405, 200], [411]) and _PARSER_400_BODY not in raw, (
-                f"{shape}: {raw!r}"
-            )
+            expected = [411] if shape == "obs-folded transfer-encoding" else [405, 200]
+            assert statuses == expected, f"{shape}: {raw!r}"
 
 
 async def _split(port: int, head: bytes, body: bytes) -> tuple[list[int], bytes, bool]:

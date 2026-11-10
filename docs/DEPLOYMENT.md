@@ -161,7 +161,8 @@ once its head is read, and it answers a chunked request with no `Content-Length`
 from the head alone, then closes the connection. When the bad body arrives in the same read as
 the head, the engine writes only the `400`, and nothing after it. When the head arrives first
 and the bad body later, the engine sends its `411` and closes, so the bad body is never parsed
-and no `400` follows.
+and no `400` follows. A client still sending its body when the engine closes gets a connection
+reset, not the `411`.
 
 llhttp refuses more than this table lists, so treat it
 as the shapes that were measured, not as the whole set. `tests/test_api_request_framing_wire.py` sends each one on a real
@@ -205,8 +206,8 @@ Your proxy must also meet at least these four rules.
    header the client never sent. nginx drops field names with an underscore by default
    (`underscores_in_headers off`).
 
-**Check your proxy, because nothing in the engine can.** Replay each shape in `_REFUSED` through the
-proxy with a second request appended, in one write, as that test does. The client must get exactly one response,
+**Check your proxy, because nothing in the engine can.** Replay each shape in `_REFUSED` and
+`_APP_REFUSED` through the proxy with a second request appended, in one write, as that test does. The client must get exactly one response,
 an error, and the appended request must never be answered. Two responses mean the proxy and the
 engine framed the bytes differently. For the two chunk shapes, a `411` instead means the proxy
 forwarded a chunked body, which breaks rule 1. Passing this check covers only the shapes in that table. A copy of a reference terminator config (see

@@ -3,7 +3,7 @@
 """The baseline security headers must be on EVERY response, including the ones no route produced.
 
 `_security_headers` is the INNERMOST user middleware, so every emitter outside it escaped: the request
-body cap's four short-circuits shipped with none of the baseline, and an unhandled exception shipped
+body cap's short-circuits shipped with none of the baseline, and an unhandled exception shipped
 with none of it either (a handler registered for Exception/500 becomes ServerErrorMiddleware's, which
 Starlette places outside `user_middleware` entirely). These tests assert the SECURITY property on the
 error paths themselves — a normal 200 carrying the headers was already true before the fix and proves
@@ -320,11 +320,18 @@ def test_csp_names_frame_ancestors_parses_directives_not_substrings() -> None:
             400,
         ),
         (
-            "the Transfer-Encoding-without-length refusal",
+            "the chunked-without-length refusal",
             "POST",
             "/messages",
             (("transfer-encoding", "chunked"),),
             411,
+        ),
+        (
+            "the non-chunked Transfer-Encoding refusal",
+            "POST",
+            "/messages",
+            (("transfer-encoding", "gzip"),),
+            400,
         ),
         (
             "the invalid Content-Length refusal",
@@ -448,6 +455,7 @@ async def test_an_attachment_response_through_the_floor_stays_one_policy_with_ba
             (("transfer-encoding", "chunked"),),
             411,
         ),
+        ("non-chunked Transfer-Encoding", (("transfer-encoding", "gzip"),), 400),
         ("Content-Length not a plain decimal", (("content-length", "not-a-number"),), 400),
         ("oversized Content-Length", (("content-length", "99999999"),), 413),
     ],
@@ -455,7 +463,7 @@ async def test_an_attachment_response_through_the_floor_stays_one_policy_with_ba
 async def test_a_body_cap_refusal_carries_the_baseline_headers(
     label: str, request_headers: tuple[tuple[str, str], ...], expected_status: int
 ) -> None:
-    """Each of the body cap's four short-circuits returns its own JSONResponse from one layer OUTSIDE
+    """Each of the body cap's short-circuits returns its own JSONResponse from one layer OUTSIDE
     `_security_headers`, so before the floor every one of them shipped bare. These are pre-auth
     refusals reachable by anyone who can open a socket — exactly the responses a browser most needs
     nosniff and frame-deny on."""

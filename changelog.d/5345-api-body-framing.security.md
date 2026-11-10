@@ -7,11 +7,9 @@
   before reading the body. Under `serve`, an empty `Transfer-Encoding` ahead of a `Content-Length`
   also reached a route. On a server other than the one `serve` pins, which refuses these first, the
   limit also took `+2`, `-5` and `0_2` as lengths through `int()`, and read only the first of
-  several `Content-Length` lines. Now the limit refuses any
-  `Transfer-Encoding` line, whatever its value, where llhttp has not refused it first with its own
-  **400**, and closes the connection: **411** for a coding list ending in `chunked` with no
-  `Content-Length`, otherwise **400**; a `Content-Length` must be one line of plain
-  decimal digits or the request is refused **400**; and the cap on the declared length, 1 MiB or
-  `[store].max_upload_bytes` on the upload routes, is unchanged. [SECURITY.md](../docs/SECURITY.md)
-  control 5 states the rule, and [DEPLOYMENT.md](../docs/DEPLOYMENT.md) tells a proxy in front of the
+  several `Content-Length` lines. Now the limit refuses, and closes
+  the connection on, any request carrying `Transfer-Encoding` and any `Content-Length` that is not
+  one line of plain decimal digits, where llhttp under `serve` has not refused them first; the
+  cap on the declared length is unchanged.
+  [SECURITY.md](../docs/SECURITY.md) control 5 states the rule and its statuses, and [DEPLOYMENT.md](../docs/DEPLOYMENT.md) tells a proxy in front of the
   engine to refuse a `Transfer-Encoding` on more than one line. (vault `BACKLOG #5345`)

@@ -4812,12 +4812,13 @@ def create_app(
                     close=True,
                 )
             codings = [c.strip(" \t").lower() for line in te_lines for c in line.split(",")]
-            if codings[-1] != "chunked":
+            # RFC 9112 §7: chunked is the final coding and is applied once.
+            if codings[-1] != "chunked" or "chunked" in codings[:-1]:
                 return _refuse_body(
                     request,
                     400,
-                    "invalid framing: Transfer-Encoding does not end in chunked",
-                    "Transfer-Encoding not ending in chunked",
+                    "invalid framing: Transfer-Encoding must end in a single chunked",
+                    "Transfer-Encoding not ending in a single chunked",
                     close=True,
                 )
             return _refuse_body(
@@ -4830,10 +4831,12 @@ def create_app(
         if not lengths:
             return None
         # One line holding `1*DIGIT` (RFC 9112 §6.2), not int(): int() takes `+2`, `-5` and `0_2`,
-        # and a repeated line is a second framing claim.
+        # and a repeated line is a second framing claim. An invalid length closes too (§6.3 item 5).
         value = lengths[0].strip(" \t")
         if len(lengths) > 1 or not (value.isascii() and value.isdigit()):
-            return _refuse_body(request, 400, "invalid Content-Length", "invalid Content-Length")
+            return _refuse_body(
+                request, 400, "invalid Content-Length", "invalid Content-Length", close=True
+            )
         # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
         upload_store = getattr(request.app.state, "upload_store", None)
         cap = (
@@ -11027,7 +11030,7 @@ def create_app(
     # ASVS 3.4.4/3.4.5 — registered LAST, so Starlette makes it the OUTERMOST user middleware
     # (add_middleware inserts at index 0; the stack is built from reversed(user_middleware)) and its
     # response-path send wrapper runs after every other emitter. That position is the whole point:
-    # _security_headers is the INNERMOST user middleware, so the body cap's four short-circuits above
+    # _security_headers is the INNERMOST user middleware, so the body cap's short-circuits above
     # shipped with no baseline headers at all, and both middlewares that hand-copy the baseline
     # (client_networks._DENIAL_HEADERS, request_timeout._TIMEOUT_HEADERS) omit HSTS. The floor
     # setdefaults, never assigns, so the attachment sandbox CSP re-asserted above and every other
