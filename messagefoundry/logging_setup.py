@@ -477,16 +477,18 @@ def redacted_log_field(
 
     - a pass rewrote ``before`` or ``after``;
     - for a ``(before, after)`` of ``checks``, the line ``before`` + ``text`` + ``after`` does not
-      read as ``before``, the value, and ``after`` as the same passes write it alone. A check is
-      read only to compare, never logged, so its ``after`` may be caller text: it is the line the
-      value stood in. The value read there differs when a pass took text of ``after`` into
-      ``text``, or ``after`` made a pass hide more of ``text``, and the reading also fails when
-      a pass rewrote ``after`` only in that line, as when ``text`` ends in a credential label
-      that takes ``after`` as its value. A pass rewriting ``after`` alike in both readings, a
-      date or a tab in it for example, fails nothing.
+      read as ``before``, the value, and ``after`` either as it was or as the same passes write
+      it alone. A check is read only to compare, never logged, so its ``after`` may be caller
+      text: it is the line the value stood in. The value read there differs when a pass took
+      text of ``after`` into ``text``, or ``after`` made a pass hide more of ``text``, and the
+      reading also fails when a pass rewrote ``after`` in that line other than as it does alone,
+      as when ``text`` ends in a credential label that takes ``after`` as its value. A pass
+      rewriting ``after`` alike in both readings, a date or a tab in it for example, fails
+      nothing; nor does ``text`` turning a pass off for the whole line, a no-break space or a
+      credential shape for example, so that the line leaves ``after`` as it was.
 
-    Each check is one more full reading, and one of ``after`` alone. Readings stop at the first
-    that fails.
+    Each check is one more full reading, and one of ``after`` alone unless the line left ``after``
+    as it was. Readings stop at the first check that fails.
 
     The escape hides most of what the handler filters anchor on, so they read less inside the
     field than in raw text; redacting first, in the lines the caller names, is meant to hide what
@@ -502,10 +504,7 @@ def redacted_log_field(
     placeholder rather than the value."""
     try:
         value = redact_log_value(text, before=before, after=after)
-        if value is None or not all(
-            _shipped_reading(head + text + tail) == head + value + _shipped_reading(tail)
-            for head, tail in checks
-        ):
+        if value is None or not all(_reads_as(value, head, text, tail) for head, tail in checks):
             return log_field_token(UNREADABLE_LOG_VALUE, limit)
         return log_field_token(value, limit, literals=(CREDENTIAL_PLACEHOLDER, PHI_PLACEHOLDER))
     except Exception as exc:  # noqa: BLE001 -- a log argument must never raise
@@ -519,6 +518,14 @@ def redacted_log_field(
             )
         # No space or ":": a type name is an identifier, so this holds nothing that ends a field.
         return f'"unloggable-{name}"'
+
+
+def _reads_as(value: str, head: str, text: str, tail: str) -> bool:
+    """Whether the line ``head`` + ``text`` + ``tail`` reads with ``value`` unchanged where ``text``
+    stood, then ``tail`` as it was or as the passes write it alone (BACKLOG #3770). The tail is read
+    alone only when the line did not leave it as it was."""
+    line = _shipped_reading(head + text + tail)
+    return line == head + value + tail or line == head + value + _shipped_reading(tail)
 
 
 #: The exception types :func:`redacted_log_field` has reported, so each is reported once.
