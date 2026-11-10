@@ -164,6 +164,7 @@ async def test_the_sweep_runs_on_its_own_task_only_when_a_sink_is_wired(tmp_path
         finally:
             for monitor in (off, on, without):
                 await monitor.stop()
+            await _drain(cast(NotifierAlertSink, sink))
         assert off._sweep_task is None and on._task is None and on._sweep_task is None
     finally:
         await store.close()
@@ -192,7 +193,11 @@ async def test_a_failed_read_changes_nothing_and_warns_once_per_streak(
             assert await monitor.sweep_once() == 0
             monkeypatch.setattr(store, "open_alert_generations", real)
             assert await _is_open(store, stale), "a failed read resolves nothing"
-            assert await monitor.sweep_once() == 1, "the watch survived the failed reads"
+            assert await monitor.sweep_once() == 0, (
+                "a failed read forgot the watch: the outage time does not count toward staleness"
+            )
+            clock[0] += STALE_SECONDS
+            assert await monitor.sweep_once() == 1
             monkeypatch.setattr(store, "open_alert_generations", broken)
             assert await monitor.sweep_once() == 0
         failures = [r for r in caplog.records if "sweep: the read failed" in r.getMessage()]

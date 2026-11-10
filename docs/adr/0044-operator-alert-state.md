@@ -350,3 +350,17 @@ three backends (the ADR 0064 `_schema_hash` bumps automatically on the server ba
 in-memory map per sink. Deliberately **notification-only**: suspend/mute never hides the open condition
 (that is what `resolve` is for) and — matching "gates notification only" — a suspended alert's #144
 control action still fires (a windowed mute is not a control-action mute; disable the rule for that).
+
+## Amendment (2026-11-09) -- one staleness sweep, for `intake_paused` only (BACKLOG #3269)
+
+The generic "has not re-fired in N cooldowns, so it is stale" sweep this ADR defers (D2, and under
+*Consequences*) is still deferred. One narrow case is built. An `intake_paused` subject names its
+engine process (`intake:<reason>@<process>`), so one whose process never returns under that name had
+no inverse that could ever fire. Every `IntakeBoundMonitor` with a sink now resolves an open
+`intake_paused` instance of another process whose `count` has not moved for four reminder intervals
+of its own monotonic clock. The resolve is bounded by the `(id, count)` it read
+(`resolve_alert_generation`, all three backends), so a raise that lands first keeps the row open, and
+no clock is compared across processes. It closes an acknowledged instance too, as every auto-resolve
+does; retention then treats it as any other resolved row. Other process-labelled subjects
+(`crl_reload_refused`, `posture_loosened`, `log_forward_failed`, `remote_debug_refused`) are not
+swept by it.

@@ -6855,7 +6855,8 @@ class PostgresStore:
         if connection is not None:
             where.append("connection=$2")
             params.append(connection)
-        rows = await self._pool.fetch(
+        # Bounded borrow (BACKLOG #1052): every engine process polls this once a minute.
+        rows = await self._fetchall(
             "SELECT id, connection, count FROM alert_instance WHERE "
             + " AND ".join(where)
             + " ORDER BY id",
@@ -6869,14 +6870,13 @@ class PostgresStore:
         # BACKLOG #3269: resolve one live instance only while no raise has folded in past
         # through_count. Clock-free.
         now = time.time() if now is None else now
-        result = await self._pool.execute(
+        return await self._execute(
             "UPDATE alert_instance SET status='resolved', resolved_at=$1"
             " WHERE id=$2 AND count<=$3 AND status<>'resolved'",
             now,
             alert_id,
             through_count,
         )
-        return _rowcount(result)
 
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
