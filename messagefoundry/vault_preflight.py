@@ -19,17 +19,15 @@ a network failure, a timeout or a 403 (:func:`~messagefoundry.privilege_probes.e
 which the opt-out does not lift. Every other finding warns and writes an audit row. Under ``warn``
 nothing refuses.
 
-**Every finding also raises an alert, and a clean read resolves it** (slice B). A hop that is not
-clean fires ``vault_privilege_warning`` BEFORE any refusal, so a refused start still pages, as the
-store preflight's ``store_privilege_warning`` does; a hop read clean fires
-``vault_privilege_clean``, which auto-resolves an open warning for the same hop and pages nobody.
-The subject is the hop alone (:func:`vault_privilege_alert_subject`), never anything about the
+**Every finding also raises an alert, and a clean read can resolve it** (slice B). A hop that is
+not clean fires ``vault_privilege_warning`` BEFORE any refusal, so a refused start still pages, as
+the store preflight's ``store_privilege_warning`` does; a hop read clean fires
+``vault_privilege_clean``, which pages nobody and can auto-resolve an open warning for the same
+hop. The subject is the hop alone (:func:`vault_privilege_alert_subject`), never anything about the
 token, so processes that share one store share each hop's alert: a clean start by one can resolve
-the warning another raised on a different token. It does so only when, at least, its sink resolves
-(a notifier with alert state, not the logging sink), it probes that hop, and the warning's raise
-landed before the fenced auto-resolve's last read of the alert (ADR 0044, the vault BACKLOG #4916
-amendment). A warning still open after a clean start may be a live finding, another process on the
-same store still running on the over-granted or unread token.
+the warning another raised on a different token. When it does is stated once, in
+``docs/SECURITY.md`` (*Each backend hop's least privilege*, *When a clean start resolves the
+warning*), with what a warning still open after a clean start can mean.
 
 **Nothing secret is written.** A hop's detail names policy names, paths and capabilities, never a
 token, an accessor or a digest of either; the log line escapes every control character a server
