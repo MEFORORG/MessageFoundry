@@ -804,6 +804,7 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
         1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."
     ),
+    "messagefoundry_toolkit/scaffold.py::<module>": Site(1, INTERNAL, "Package resource literal."),
     "messagefoundry_toolkit/scaffold.py::scaffold": Site(
         1, INTERNAL, "Template paths from the module's own table, under the operator's target."
     ),
