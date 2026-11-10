@@ -1665,6 +1665,46 @@ async def test_the_convergence_row_writes_the_fingerprint_it_judged(
     assert row["baseline_unchecked"] is True, "the engine has moved on: it is no baseline"
 
 
+async def test_a_convergence_row_names_the_loosening_it_brings_in(
+    tmp_path: Path, cfg: Path, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #3814: a convergence reload onto a graph with a loosening the start's graph
+    did not have writes a row naming it. Before, the convergence row had no ``loosenings`` key, so
+    no row named what the converged graph loosened."""
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        start = (await _start_rows(engine))[-1]
+        _add_a_cleartext_hop(cfg)  # the sibling's change, on the shared directory
+        await engine._converge_reload(3)
+        rows = await engine.store.list_audit(action="config_reload")
+    assert "cleartext_accepted" not in start["loosenings"], "control: the start had none"
+    assert len(rows) == 1 and rows[0]["actor"] == "system:cluster-convergence"
+    row = json.loads(rows[0]["detail"])
+    assert row["initiator"] == "cluster_convergence"
+    assert "cleartext_accepted" in row["loosenings"]
+
+
+async def test_a_convergence_row_whose_loosenings_cannot_be_read_records_none(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #3814: a list the reader faults on is ``None``, unknown, never ``[]``, which
+    would say none are active, and the row is still written."""
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+
+        def _fault(*_a: Any, **_kw: Any) -> Any:
+            raise RuntimeError("synthetic posture read fault")
+
+        monkeypatch.setattr(app_module, "_posture_loosenings", _fault)
+        await engine._converge_reload(3)
+        rows = await engine.store.list_audit(action="config_reload")
+    assert len(rows) == 1 and rows[0]["actor"] == "system:cluster-convergence"
+    row = json.loads(rows[0]["detail"])
+    assert "loosenings" in row and row["loosenings"] is None
+
+
 # --- vault BACKLOG #3765, items 18 and 21, LF8 and LF11: one digest read, of the bytes that ran ---
 
 

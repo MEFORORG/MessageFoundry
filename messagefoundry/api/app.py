@@ -3362,6 +3362,39 @@ async def _record_a_restore(store: Store, sink: AlertSink) -> None:
         _log.warning("the store_restored alert could not be raised: %s", safe_exc(exc))
 
 
+async def _graph_loosenings(
+    state: Any,
+    engine: Engine,
+    graph: Registry,
+    env_values: Mapping[str, Any] | None,
+    action: str,
+) -> list[str] | None:
+    """The names of the loosenings ``graph`` runs under, as ``GET /security/posture`` lists them
+    for an unscoped reader, for an audit row's ``loosenings`` key. The start's ``config_loaded``
+    row and a cluster convergence reload's ``config_reload`` row record them (vault BACKLOG #2597,
+    #3814).
+
+    It never raises: both rows are written after the graph is live. A list it cannot read is
+    ``None``, which says unknown, never an empty list, which would say none are active. ``action``
+    names the row in the log line for that case."""
+    try:
+        pairs, _scope = _posture_loosenings(
+            state,
+            engine,
+            None,
+            graph=graph,
+            graph_env_values=env_values,
+            remote_debug=remote_debug_posture(),
+            startup=await asyncio.to_thread(startup_posture),
+            service_env=await asyncio.to_thread(service_env_posture),
+            security=_posture_security(state),
+        )
+    except Exception:  # noqa: BLE001 - a live graph's audit row must not fail on its list
+        _log.exception("the loosenings list could not be read; %s records None", action)
+        return None
+    return [name for name, _risk in pairs]
+
+
 async def _record_start_audit(
     app: FastAPI,
     engine: Engine,
@@ -3402,25 +3435,13 @@ async def _record_start_audit(
     swap check marks the row degraded with the ``start_swap_check`` step and unchecked, and never
     ``superseded``. Either way its ``loosenings`` stand: they are read off the graph the snapshot
     took, not the live one, so a swap cannot change them (vault BACKLOG #3076, #3109)."""
-    switches: list[str] | None = None
-    if loaded is not None and loaded.registry is not None:
-        try:
-            pairs, _scope = _posture_loosenings(
-                app.state,
-                engine,
-                None,
-                graph=loaded.registry,
-                graph_env_values=loaded.env_values,
-                remote_debug=remote_debug_posture(),
-                startup=await asyncio.to_thread(startup_posture),
-                service_env=await asyncio.to_thread(service_env_posture),
-                security=_posture_security(app.state),
-            )
-            switches = [name for name, _risk in pairs]
-        except Exception:  # noqa: BLE001 - a start must not fail on its own audit row (step 5)
-            _log.exception(
-                "the start's loosenings list could not be read; config_loaded records None"
-            )
+    switches = (
+        await _graph_loosenings(
+            app.state, engine, loaded.registry, loaded.env_values, "config_loaded"
+        )
+        if loaded is not None and loaded.registry is not None
+        else None
+    )
     # Nothing awaits between here and the row's detail. A reload that swaps the graph later is
     # not caught.
     superseded = swap_unknown = False
@@ -12406,6 +12427,18 @@ def create_managed_app(
             )
             # The row names the digest judged above, not the engine's at the write: a later
             # reload marks it superseded instead (vault BACKLOG #3765, item 19).
+            # The loosenings of the graph this reload loaded, as a start row records its own, so a
+            # convergence that brings one in is named on a row (vault BACKLOG #3814). No operator
+            # asked for this reload, so no request or answer names them. The env() values are the
+            # runner's only while it still runs this graph; without them a hop whose dialect or
+            # url is an env() keeps its unresolved marker.
+            rr = engine.registry_runner
+            env_values = (
+                rr.env_values if rr is not None and rr.registry is outcome.registry else None
+            )
+            loosenings = await _graph_loosenings(
+                app.state, engine, outcome.registry, env_values, "config_reload"
+            )
             await _record_reload_audit(
                 engine,
                 actor=_CONVERGENCE_ACTOR,
@@ -12413,6 +12446,7 @@ def create_managed_app(
                 failed_steps=failed,
                 extra={
                     "initiator": _CONVERGENCE_INITIATOR,
+                    "loosenings": loosenings,
                     **({_BASELINE_UNCHECKED: True} if no_digest else {}),
                 },
             )
