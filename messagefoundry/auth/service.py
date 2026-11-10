@@ -541,22 +541,23 @@ def _new_ip_path_field(path: str, seen_text: str | None = None) -> str:
     filter can read as a credential value; then escaped and bounded
     (``logging_setup.redacted_log_field``). With ``seen_text``, the past-cap line's, the path is
     read once more, in the pre-#3770 past-cap line with ``seen_ip=`` and that text after it, only
-    to compare; that extra full reading is what the past-cap line costs beyond the repeat line.
+    to compare, and that tail is read once on its own: those two readings are what the past-cap
+    line costs beyond the repeat line.
 
     When it logs ``logging_setup.UNREADABLE_LOG_VALUE`` instead is stated once, in
     ``logging_setup.redacted_log_field``; on the past-cap line that includes a path ending in a
     credential label, ``/api/auth/bearer`` for one, whose label takes ``seen_ip=`` as its value.
-    The field holds only the path's own text, and the two lines log either the one value or that
-    placeholder.
+    The field holds only the path's own text, and the two lines log the one value, that
+    placeholder, or ``unloggable-`` and an exception type when a reading raises.
 
-    What the tests check of it is in ``tests/test_admin_new_ip.py``: over named vectors and a
-    seeded corpus, read with each of several seen addresses, no word of a path that the last of
-    two shipped handlers hid in the pre-#3770 lines prints in the path field more often than it
-    did there; and an ordinary path stays readable with each named hostile seen text. Not tested,
-    at least: a third handler; a Unicode space separator before an encoded HL7 name, which the
-    pre-#3770 lines printed too; a seen text no vector names; and a pass whose rewrite of the
-    seen text in the line grows it back into exactly ``seen_ip=`` and the seen text as written
-    alone, after hiding the end of the path."""
+    What the tests check of it is in ``tests/test_admin_new_ip.py``: over named vectors, each read
+    with each of several seen addresses, and a seeded corpus, each path read with one of them, no
+    word of a path that the last of two shipped handlers hid in the pre-#3770 lines prints in the
+    path field more often than it did there; and an ordinary path stays readable with each named
+    seen text that a pass rewrites. Not tested, at least: a third handler; a Unicode space
+    separator before an encoded HL7 name, which the pre-#3770 lines printed too; a seen text no
+    vector names; and a pass that, in the past-cap line, hides the end of the path and writes that
+    end back, followed by exactly ``seen_ip=`` and the seen text as the passes write it alone."""
     checks = (
         ()
         if seen_text is None

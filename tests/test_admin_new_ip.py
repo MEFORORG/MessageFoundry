@@ -1675,16 +1675,18 @@ def test_a_rewritten_context_logs_a_placeholder() -> None:
         assert _new_ip_path_field("/api/auth/bearer", seen) == _UNREADABLE_FIELD, seen
 
 
-#: Seen texts a shipped filter rewrites on their own: each must leave an ordinary path readable.
+#: Seen texts the past-cap reading rewrites on their own: a date, a name, an MRN or an HL7 run a
+#: shipped filter rewrites, or a tab, which the shipped filters keep and only that reading's tab
+#: round writes as a space. Each must leave an ordinary path readable.
 _REWRITTEN_SEEN = (*_HOSTILE_SEEN, "1980-01-01", "MRN 12345", "Smith John", "a^b^c")
 
 
 @pytest.mark.parametrize("seen", _REWRITTEN_SEEN)
 @pytest.mark.parametrize("path", ["/plain", "/users", "/a b", "/api/admin/users/42"])
 def test_a_rewritten_seen_address_leaves_an_ordinary_path_readable(path: str, seen: str) -> None:
-    """RED when: a seen text that a filter rewrites alike in the past-cap line and on its own, a
-    date, a name, a tab or an HL7 run, makes an ordinary path unreadable on that line, so a
-    caller's forwarded header blanks the only log of which path it reached (BACKLOG #3770)."""
+    """RED when: a seen text that the past-cap reading rewrites alike in the line and on its own
+    (``_REWRITTEN_SEEN``) makes an ordinary path unreadable on that line, so a caller's forwarded
+    header blanks the only log of which path it reached (BACKLOG #3770)."""
     field = _new_ip_path_field(path, _bounded_address_text(seen))
     assert field == _new_ip_path_field(path) != _UNREADABLE_FIELD, (path, seen, field)
 

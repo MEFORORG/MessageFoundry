@@ -472,8 +472,8 @@ def redacted_log_field(
     :func:`redact_log_value` in the line ``before`` + ``text`` + ``after``, then escaped and
     bounded by :func:`~messagefoundry.controlchars.log_field_token` (BACKLOG #3770).
 
-    It is :data:`UNREADABLE_LOG_VALUE`, escaped and bounded by ``limit``, in these cases, the
-    one statement of them that callers link to:
+    It is :data:`UNREADABLE_LOG_VALUE`, escaped and bounded by ``limit``, in at least these
+    cases, stated here once for callers to link to:
 
     - a pass rewrote ``before`` or ``after``;
     - for a ``(before, after)`` of ``checks``, the line ``before`` + ``text`` + ``after`` does not
