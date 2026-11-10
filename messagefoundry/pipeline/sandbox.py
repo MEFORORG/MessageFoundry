@@ -207,8 +207,9 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     MEMORY_CAP = "memory_cap"
     #: The worker loaded a graph that differs from the engine's. No WARNING here: the runner logs
     #: and raises the ``sandbox_worker_refused`` alert for a refusal against the graph it serves. A
-    #: refusal against a graph a reload has since replaced it drops silently, and this record is
-    #: then the only trace of the kill.
+    #: refusal against a graph a reload has since replaced gets neither, and this record does not
+    #: outlast it: the reload discards this session. That kill then writes no line anywhere; only
+    #: the refused dispatch's own error reaches the runner's internal-error policy.
     GRAPH_MISMATCH = "graph_mismatch"
     #: The boot frame could not be written to the new worker.
     BOOT_WRITE = "boot_write"
