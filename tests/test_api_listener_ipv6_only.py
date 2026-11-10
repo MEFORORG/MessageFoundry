@@ -63,13 +63,14 @@ async def _app(scope: dict[str, Any], receive: Any, send: Any) -> None:
 
 
 @functools.cache
-def _ipv6_loopback_enabled() -> bool:
-    """Whether this host can bind ``::1``; an IPv6-disabled runner has nothing to measure."""
+def _ipv6_enabled() -> bool:
+    """Whether this host can bind the address the tests bind; an IPv6-disabled runner has nothing
+    to measure."""
     if not socket.has_ipv6:
         return False
     try:
         with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
-            probe.bind(("::1", 0))
+            probe.bind((_listen_host(), 0))
     except OSError:
         return False
     return True
@@ -82,6 +83,16 @@ def _v6only(fileno: int) -> int:
         return dup.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY)
 
 
+def _listen_host() -> str:
+    """The IPv6 host both tests bind. The wildcard is the case dual stack changes, and Linux's
+    ``__inet6_bind`` forces ``IPV6_V6ONLY`` on for any bind to a specific, non-v4-mapped address
+    such as ``::1``, so on Linux only the wildcard can show the option off. Elsewhere a wildcard
+    bind can raise a firewall prompt (Windows, and macOS with its firewall on), so ``::1`` is bound
+    there. A loop sets the option per IPv6 socket, not per address, so ``::1`` reads the loop's
+    same code path."""
+    return "::" if sys.platform == "linux" else "::1"
+
+
 def _fresh_default() -> int:
     """``IPV6_V6ONLY`` on a fresh IPv6 socket nobody set it on: this host's default."""
     with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as fresh:
@@ -92,11 +103,11 @@ def test_the_read_sees_a_dual_stack_socket() -> None:
     """The control for the instrument: the same read returns 0 for a socket with the option
     cleared, so it can see a dual-stack socket. Whether the host's default is off is a separate
     precondition, checked by each arm below on Linux."""
-    if not _ipv6_loopback_enabled():
+    if not _ipv6_enabled():
         pytest.skip("IPv6 is not enabled on this host")
     with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as dual:
         dual.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-        dual.bind(("::1", 0))
+        dual.bind((_listen_host(), 0))
         assert _v6only(dual.fileno()) == 0
 
 
@@ -118,15 +129,12 @@ def test_the_api_ipv6_listener_is_ipv6_only(loop_name: str) -> None:
             pytest.skip("messagefoundry's uvloop requirement does not apply on this interpreter")
         # A dependency here, so a missing one fails rather than skips.
         uvloop = importlib.import_module("uvloop")
-    if not _ipv6_loopback_enabled():
+    if not _ipv6_enabled():
         _not_measurable("IPv6 is not enabled on this host", fail_under_ci=uvloop is not None)
     if sys.platform == "linux" and _fresh_default() != 0:
         # net.ipv6.bindv6only=1: every socket reads 1, so a 1 would not be the loop's doing.
         _not_measurable("this host defaults IPV6_V6ONLY on", fail_under_ci=uvloop is not None)
-    # The wildcard is the case dual stack changes, so it is read on Linux, where a bind prompts
-    # nobody. Elsewhere a wildcard bind can raise a firewall prompt (Windows, and macOS with its
-    # firewall on); the option is set per IPv6 socket, so ::1 reads the same code path.
-    host = "::" if sys.platform == "linux" else "::1"
+    host = _listen_host()
     config = uvicorn.Config(
         _app, host=host, port=0, loop=loop_name, lifespan="off", log_config=None
     )
