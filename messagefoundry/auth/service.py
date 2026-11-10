@@ -535,25 +535,20 @@ _NEW_IP_OVER_CAP_HEAD = (
 )
 
 
-# The heads the path followed in the pre-#3770 lines: ``path=%s`` and ``path=%s seen_ip=%s``. The
-# path is read after each head with nothing after it, a context no shipped filter reads as a
-# credential value; what the seen address after it changed on the past-cap line is checked apart.
-_NEW_IP_PATH_CONTEXTS = (
-    (_NEW_IP_REPEAT_HEAD, ""),
-    (_NEW_IP_OVER_CAP_HEAD + "path=", ""),
-)
-
-
 def _new_ip_path_field(path: str, seen_text: str | None = None) -> str:
     """The path field of a new-address WARNING (BACKLOG #3770): redacted by the shipped handler
-    filters after each pre-#3770 head, then escaped and bounded
+    filters in the pre-#3770 repeat line, ``path=%s``, with nothing after the path, which no shipped
+    filter can read as a credential value; then escaped and bounded
     (``logging_setup.redacted_log_field``). With ``seen_text``, the past-cap line's, the path is
-    also read in the pre-#3770 past-cap line, ``seen_ip=`` and that text after it, only to
-    compare.
+    read once more, in the pre-#3770 past-cap line with ``seen_ip=`` and that text after it, only
+    to compare; that extra full reading is what the past-cap line costs beyond the repeat line.
 
-    It is ``logging_setup.UNREADABLE_LOG_FIELD`` when the readings differ, a pass rewrote a head,
-    or a pass took the seen text into the path, so the field holds only the path's own text, and
-    the two lines log either the one value or that placeholder. What the tests check of it is in
+    It is ``logging_setup.UNREADABLE_LOG_VALUE`` in at least these cases: a pass rewrote the
+    repeat head; or the past-cap reading does not keep the head, the value and the space after it,
+    as when a pass took the seen text into the path, when the seen text made a pass hide more of
+    the path, or when a tab in the seen text set off the extra tab round. The field holds only the
+    path's own text, and the two lines log either the one value or that placeholder. What the
+    tests check of it is in
     ``tests/test_admin_new_ip.py``: over named vectors and a seeded corpus, with several seen
     addresses, no word of a path that the last of two shipped handlers hid in the pre-#3770 lines
     prints in the path field. Not tested, at least: a third handler; a Unicode space separator
@@ -566,7 +561,7 @@ def _new_ip_path_field(path: str, seen_text: str | None = None) -> str:
         else ((_NEW_IP_OVER_CAP_HEAD + "path=", " seen_ip=" + scrub_log_argument(seen_text)),)
     )
     return redacted_log_field(
-        path, _NEW_IP_LOG_FIELD_MAX, contexts=_NEW_IP_PATH_CONTEXTS, checks=checks
+        path, _NEW_IP_LOG_FIELD_MAX, before=_NEW_IP_REPEAT_HEAD, checks=checks
     )
 
 

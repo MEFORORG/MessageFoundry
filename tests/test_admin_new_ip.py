@@ -56,7 +56,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.logging_setup import (
-    UNREADABLE_LOG_FIELD,
+    UNREADABLE_LOG_VALUE,
     _install_phi_filters,
     redacted_log_field,
 )
@@ -346,11 +346,6 @@ _FORGING_PATHS = (
     "/u" + "x" * 5000,
 )
 
-#: Seen addresses a forwarded header could carry, each with what the past-cap line must log for
-#: it: an address in its canonical form, or a fixed token and a digest, never the text (BACKLOG
-#: #3770). The first two are the review's: ``%20`` read as a label start by the credential scrub,
-#: which took the closing quote and the ``path=`` key, and ``a|b c|d``, which the ``%XX`` escape
-#: joined into one HL7 run that erased ``seen_ip=`` with its value.
 #: A seen text over ``_NEW_IP_TEXT_MAX`` that holds a tab. The shipped handlers leave its bounded
 #: text unchanged; at 9dc628aa47 the extra tab-to-space round rewrote it in the past-cap context,
 #: so its prefix and its plain digest reached the path field.
@@ -360,6 +355,11 @@ _LONG_SEEN = "hunter2\tpw" + "x" * 70
 #: the PHI pass rewrites; and ``_LONG_SEEN``.
 _HOSTILE_SEEN = ("hunter2\tpw", "DOE JANE hunter2", _LONG_SEEN)
 
+#: Seen addresses a forwarded header could carry, each with what the past-cap line must log for
+#: it: an address in its canonical form, or a fixed token and a digest, never the text (BACKLOG
+#: #3770). The first two are the review's: ``%20`` read as a label start by the credential scrub,
+#: which took the closing quote and the ``path=`` key, and ``a|b c|d``, which the ``%XX`` escape
+#: joined into one HL7 run that erased ``seen_ip=`` with its value.
 _FORGING_SEEN = (
     ("x%20password=<redacted>/users", None),
     ("a|b c|d", None),
@@ -372,8 +372,8 @@ _FORGING_SEEN = (
     *((seen, None) for seen in _HOSTILE_SEEN),
 )
 
-#: Paths the forge test logs with every seen address above, so it can check that the path field
-#: does not change with the address.
+#: Paths the forge test logs with every seen address above, so it can check that a path has one
+#: spelling, the repeat line's, wherever the past-cap line does not log the unreadable placeholder.
 _PATHS_FOR_EVERY_SEEN = ("/users", "/a b", "/x/password:", "/x code=SECRETVALUE")
 
 #: What a path field may hold: the escape's kept characters and ``_uXXXX_`` units, the two
@@ -383,7 +383,8 @@ _PATH_FIELD = r"(?:[A-Za-z0-9./-]|_u[0-9A-F]{4}_|<redacted>|\[redacted\])*(?:_%c
 
 
 #: The path field's value when it cannot be read apart from its context, unquoted.
-_UNREADABLE = UNREADABLE_LOG_FIELD[1:-1]
+_UNREADABLE = UNREADABLE_LOG_VALUE
+_UNREADABLE_FIELD = f'"{UNREADABLE_LOG_VALUE}"'
 
 
 def _unescaped(text: str) -> str:
@@ -1436,6 +1437,7 @@ _BASELINE_SEEN = ("10.0.0.1", *_HOSTILE_SEEN, "2001:DB8:0:0:0:0:0:1")
 _QUOTE_CLOSING_SEEN = (
     ("/x password='hunter2 more words", "x'"),
     ('/x token="abc def ghi', 'q"'),
+    ("/x password='hunter2 more", "x' hunter2 more"),
 )
 
 
@@ -1460,9 +1462,11 @@ def _sink_lines(fmt: str, *args: object) -> list[str]:
 
 
 def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1") -> list[str]:
-    """The words of ``path`` that main's last handler hid on one of main's two WARNING lines and
-    that a sink of this branch's matching line prints, read with its escapes decoded. Main's lines
-    are its own two formats, with the seen address as main logged it."""
+    """The words of ``path`` that a sink of this branch's matching line prints in its path field,
+    escapes decoded, more often than main's last handler printed them in its path span, on one of
+    main's two WARNING lines. Main's lines are its own two formats, with the seen address as main
+    logged it. Main's path span is counted as its line less the seen text as one handler pair
+    writes it alone, so a seen text that repeats a path word does not hide that word's loss."""
     repeat = _new_ip_path_field(path)
     over = _new_ip_path_field(path, _bounded_address_text(seen))
     main_seen = scrub_log_argument(_bounded_address_text(seen))
@@ -1480,20 +1484,22 @@ def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1") -> list[str]:
     words = set(re.findall(r"[A-Za-z0-9]{3,}", path)) - set(
         re.findall(r"[A-Za-z0-9]+", _REPEAT_HEAD + _OVER_HEAD)
     )
+    seen_alone = _sink_lines("seen=%s", main_seen)[-1]
     shown = []
-    for main, ours in pairs:
+    for (main, ours), seen_written in zip(pairs, ("", seen_alone), strict=True):
+        fields = [_unescaped(_path_value(line)) for line in ours]
         for word in sorted(words):
-            if word not in main[-1] and any(word in _unescaped(_path_value(ln)) for ln in ours):
+            in_main_span = max(0, main[-1].count(word) - seen_written.count(word))
+            if any(field.count(word) > in_main_span for field in fields):
                 shown.append(word)
     return shown
 
 
 def _path_value(line: str) -> str:
-    """The value of a line's ``path`` field. Only that field is read: the seen address field of an
-    unparsed address is a digest under a key drawn per process, and could hold a path word."""
-    match = re.search(r' path="([^"]*)"|: path="([^"]*)"', line)
-    assert match, line
-    return match.group(1) if match.group(1) is not None else match.group(2)
+    """The value of a line's ``path`` field, read by ``_logged_fields``. Only that field is read:
+    the seen address field of an unparsed address is a digest under a key drawn per process, and
+    could hold a path word."""
+    return dict(_logged_fields(line.rstrip("\n")))["path"]
 
 
 @pytest.mark.parametrize(("path", "seen"), _QUOTE_CLOSING_SEEN)
@@ -1622,16 +1628,20 @@ def test_redact_log_value_follows_the_shipped_filter_chain(
 def test_a_rewritten_context_logs_a_placeholder() -> None:
     """RED when: a pass that rewrites the line's fixed context around the value leaves that context
     in the value; or a seen text a pass takes into the path is not caught; or an ordinary path
-    after a credential label's word logs as unreadable; or no context raises (BACKLOG #3770).
+    after a credential label's word logs as unreadable; or the placeholder passes its bound
+    (BACKLOG #3770).
     ``/x/password:`` before ``seen_ip=`` reads as a label whose value is the next field."""
-    from messagefoundry.logging_setup import UNREADABLE_LOG_FIELD, redact_log_value
+    from messagefoundry.logging_setup import redact_log_value
 
-    assert UNREADABLE_LOG_FIELD not in ('"<redacted>"', '"[redacted]"')
+    assert _UNREADABLE not in ("<redacted>", "[redacted]")
     assert redact_log_value("/x/password:", after=" seen_ip=0.0.0.0") is None
-    contexts = (("", " seen_ip=0.0.0.0"),)
-    assert redacted_log_field("/x/password:", 64, contexts=contexts) == UNREADABLE_LOG_FIELD
-    assert redacted_log_field("/a", 64, contexts=()) == '"/a"'
-    assert _new_ip_path_field("/x/password:", "10.0.0.1") == UNREADABLE_LOG_FIELD
+    after = " seen_ip=0.0.0.0"
+    assert redacted_log_field("/x/password:", 64, after=after) == _UNREADABLE_FIELD
+    assert redacted_log_field("/a", 64) == '"/a"'
+    # The placeholder is bounded like any value.
+    for limit in range(16, 24):
+        assert len(redacted_log_field("/x/password:", limit, after=after)) <= limit + 2
+    assert _new_ip_path_field("/x/password:", "10.0.0.1") == _UNREADABLE_FIELD
     assert _new_ip_path_field("/x/password:") == '"/x/password_u003A_"'
     assert _new_ip_path_field("/plain/path", "10.0.0.1") == '"/plain/path"'
     for seen in (None, "10.0.0.1", "DOE JANE hunter2"):

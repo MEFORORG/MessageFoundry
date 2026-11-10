@@ -104,7 +104,7 @@ __all__ = [
     "CredentialScrubFilter",
     "redact_log_value",
     "redacted_log_field",
-    "UNREADABLE_LOG_FIELD",
+    "UNREADABLE_LOG_VALUE",
     "SyslogForward",
     "ForwarderStatus",
     "FORWARD_LOSS_COUNTERS",
@@ -451,51 +451,54 @@ def redact_log_value(text: str, *, before: str = "", after: str = "") -> str | N
     return out[len(before) : len(out) - len(after)]
 
 
-#: The field :func:`redacted_log_field` logs when its value cannot be read apart from its context.
-#: Spelled apart from the two placeholders, so it does not read as a credential or PHI redaction,
-#: and only from characters the escape keeps, so no filter rewrites it.
-UNREADABLE_LOG_FIELD = '"unreadable-redacted"'
+#: What :func:`redacted_log_field` logs when its value cannot be read apart from its context,
+#: escaped and bounded like any value, so it logs as ``"unreadable-redacted"`` at every limit of
+#: 19 or more. Spelled apart from the two placeholders, so it does not read as a credential or PHI
+#: redaction. It is lowercase letters and a hyphen, which no shipped filter's pattern reads as a
+#: label, a date, a number or an HL7 run today; the escape keeping a character does not stop a
+#: filter reading it, so a respelling needs that check again (``tests/test_admin_new_ip.py`` logs
+#: it through two shipped handlers).
+UNREADABLE_LOG_VALUE = "unreadable-redacted"
 
 
 def redacted_log_field(
     text: str,
     limit: int,
     *,
-    contexts: tuple[tuple[str, str], ...] = (),
+    before: str = "",
+    after: str = "",
     checks: tuple[tuple[str, str], ...] = (),
 ) -> str:
     """``text`` as one ``key="value"`` field value of a log line: redacted by
-    :func:`redact_log_value` in each ``(before, after)`` of ``contexts``, or with no context when
-    there is none, then escaped and bounded by
-    :func:`~messagefoundry.controlchars.log_field_token` (BACKLOG #3770).
+    :func:`redact_log_value` in the line ``before`` + ``text`` + ``after``, then escaped and
+    bounded by :func:`~messagefoundry.controlchars.log_field_token` (BACKLOG #3770).
 
-    It is :data:`UNREADABLE_LOG_FIELD` when a pass rewrote a context, when two contexts read the
-    text differently, or when a ``(before, after)`` of ``checks`` does not read as ``before``, the
-    value and the first character of ``after``. A check is read only to compare, never logged, so
-    its ``after`` may be caller text: it is the line the value stood in, whose text a pass can
-    take into a value of ``text``. Readings stop at the first that fails.
+    It is :data:`UNREADABLE_LOG_VALUE`, escaped and bounded by ``limit``, when a pass rewrote
+    ``before`` or ``after``, or when a ``(before, after)`` of ``checks`` does not read as
+    ``before``, the value and the first character of ``after``. A
+    check is read only to compare, never logged, so its ``after`` may be caller text: it is the
+    line the value stood in, whose text a pass can take into a value of ``text``, or which can
+    make a pass hide more of ``text``. Each check is one more full reading. Readings stop at the
+    first that fails.
 
     The escape hides most of what the handler filters anchor on, so they read less inside the
-    field than in raw text; redacting first, in each line the caller names, is meant to hide what
+    field than in raw text; redacting first, in the lines the caller names, is meant to hide what
     the handlers would have hidden there. Each reading is of the raw text: a second reading of an
     already redacted value can miss what the same reading of the raw text hid. The placeholders
     the passes write are kept as they are, not escaped, so a search for ``<redacted>`` or
-    ``[redacted]`` still finds the line. The filters still run on the whole line afterwards and
-    may rewrite a run inside the field, never past its quotes.
+    ``[redacted]`` finds a value they wrote; an unreadable value carries neither, so a search for
+    redactions also needs :data:`UNREADABLE_LOG_VALUE`. The filters still run on the whole line
+    afterwards and may rewrite a run inside the field, never past its quotes.
 
     A log argument must never raise, as in :class:`RedactionFilter`: a failing pass gives a fixed
     placeholder rather than the value."""
     try:
-        (first_before, first_after), *rest = contexts or (("", ""),)
-        value = redact_log_value(text, before=first_before, after=first_after)
-        if value is None:
-            return UNREADABLE_LOG_FIELD
-        for before, after in rest:
-            if redact_log_value(text, before=before, after=after) != value:
-                return UNREADABLE_LOG_FIELD
-        for before, after in checks:
-            if not _shipped_reading(before + text + after).startswith(before + value + after[:1]):
-                return UNREADABLE_LOG_FIELD
+        value = redact_log_value(text, before=before, after=after)
+        if value is None or not all(
+            _shipped_reading(head + text + tail).startswith(f"{head}{value}{tail[:1]}")
+            for head, tail in checks
+        ):
+            return log_field_token(UNREADABLE_LOG_VALUE, limit)
         return log_field_token(value, limit, literals=(CREDENTIAL_PLACEHOLDER, PHI_PLACEHOLDER))
     except Exception as exc:  # noqa: BLE001 -- a log argument must never raise
         name = type(exc).__name__
