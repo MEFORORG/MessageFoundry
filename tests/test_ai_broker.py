@@ -353,6 +353,39 @@ async def test_ai_chat_misconfigured_broker_returns_503(engine: Engine) -> None:
     assert r.status_code == 503
 
 
+def _cold_opener_build_raises(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+    """Clear rest.py's cached shared opener and make its first-use build raise ``exc``."""
+    from messagefoundry.transports import rest
+
+    def refusing() -> urllib.request.OpenerDirector:
+        raise exc
+
+    monkeypatch.setattr(rest, "_shared_opener", None)
+    monkeypatch.setattr(rest, "_no_redirect_opener", refusing)
+
+
+def test_broker_reports_an_oserror_from_the_opener_build_as_its_own_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #2484: the shared opener is built on first use, inside the broker's constructor. An
+    # OSError from that build (a trust-store read, say) is a refusal of the broker, not a crash.
+    cause = OSError("synthetic: trust store unreadable")
+    _cold_opener_build_raises(monkeypatch, cause)
+    with pytest.raises(AiBrokerError, match="endpoint opener refused") as ei:
+        ai_broker_from_settings(_managed_ai())
+    assert ei.value.__cause__ is cause
+
+
+async def test_ai_chat_opener_build_oserror_returns_503(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cold_opener_build_raises(monkeypatch, OSError("synthetic: trust store unreadable"))
+    app = create_app(engine, ai_settings=_managed_ai(), allow_no_auth=True)
+    async with _client(app) as c:
+        r = await c.post("/ai/chat", json={"prompt": "hi"})
+    assert r.status_code == 503
+
+
 async def test_ai_chat_requires_ai_assist_permission(
     engine: Engine, stub_broker: list[str]
 ) -> None:
