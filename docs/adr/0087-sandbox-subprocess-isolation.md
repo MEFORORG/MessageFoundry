@@ -1,6 +1,6 @@
 # 0087 — Router/Handler subprocess isolation
 
-- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself. **Amended (2026-10-07).** The owner ruled to drop the worker's POSIX `RLIMIT_CPU` backstop, so CPU time is bounded only per call, by the wall cap, and `[sandbox].cpu_seconds` is gone (vault BACKLOG #3133 part 1). The Decision bullet that named the backstop is edited, the reasons are under "POSIX CPU limit dropped" below, and what the limit used to bound is a new residual. `RLIMIT_AS` is unchanged. **Amended (2026-10-11).** The owner ruled that `[sandbox].mem_mb` stays and changes meaning (vault BACKLOG #3133 part 2). On Linux it is now headroom above the loaded graph, enforced with `RLIMIT_DATA`, so address space a thread only reserves does not count. A call that runs out of memory is reported as the memory cap, and its worker is recycled. The reasons are under "Memory cap is headroom above the loaded graph" below; the Decision bullet that named `RLIMIT_AS` is edited. **Amended (2026-11-09).** The owner ruled that a frame found waiting before a request no longer fails that call: the worker is still dropped, and the message is retried once on a fresh worker (vault BACKLOG #3135 step 4). AC-10 and the residual on a compromised worker denying its own feed carry the amendment beside them, and every kill now records a cause, as ADR 0187 *Amendment B* says.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
+- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself. **Amended (2026-10-07).** The owner ruled to drop the worker's POSIX `RLIMIT_CPU` backstop, so CPU time is bounded only per call, by the wall cap, and `[sandbox].cpu_seconds` is gone (vault BACKLOG #3133 part 1). The Decision bullet that named the backstop is edited, the reasons are under "POSIX CPU limit dropped" below, and what the limit used to bound is a new residual. `RLIMIT_AS` is unchanged. **Amended (2026-10-11).** The owner ruled that `[sandbox].mem_mb` stays and changes meaning (vault BACKLOG #3133 part 2). On Linux it is now headroom above the loaded graph, enforced with `RLIMIT_DATA`, so address space a thread only reserves does not count. A call that runs out of memory is reported as the memory cap, and its worker is recycled. The reasons are under "Memory cap is headroom above the loaded graph" below; the Decision bullet that named `RLIMIT_AS` is edited. **Amended (2026-11-09).** The owner ruled that a frame found waiting before a request no longer fails that call: the worker is still dropped, and the message is retried once on a fresh worker (vault BACKLOG #3135 step 4). A length header over the frame cap now counts as a stray frame rather than a dead peer, so one left after an answer fails that call. AC-10 and the residual on a compromised worker denying its own feed carry the amendment beside them, and every kill now records a cause, as ADR 0187 *Amendment B* says.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
 - **Date:** 2026-07-10
 - **Related:** [ADR 0009](0009-run-scoped-context-providers.md) (RunContext providers) · [ADR 0010](0010-handler-callable-db-lookup.md) / [ADR 0043](0043-fhir-read-lookup.md) (`db_lookup`/`fhir_lookup`) · [ADR 0072](0072-traced-dryrun-mode.md) (tracer seam it composes with) · [ADR 0036](0036-windows-config-source-trust.md) / [ADR 0041](0041-load-path-attestation-and-change-attribution.md) (config-source trust) · CLAUDE.md §2 (reliability/purity, count-and-log) · CLAUDE.md §4 (layering) · BACKLOG #197 · ASVS 15.2.5 / `docs/security/ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17
 
@@ -42,9 +42,9 @@ in-process, byte-identically and with zero overhead.
 
 - **Approach (B) SUBPROCESS, stdlib-only.** `pipeline/sandbox.py` (`SandboxPolicy`, `SandboxSession`,
   `run_sandboxed`, `SandboxError`) + `pipeline/_sandbox_worker.py` (the child, launched with the
-  command line `messagefoundry.childenv.python_child_argv(WORKER_MODULE)` builds: this interpreter
-  with its isolation flags, started through `childenv`'s bootstrap script, which runs the worker
-  module as `python -m` would; it is not a bare `python -m` start). No new dependency. **RestrictedPython is
+  command line that `messagefoundry.childenv.python_child_argv` builds for
+  `messagefoundry.pipeline.sandbox.WORKER_MODULE`, not a bare `python -m`; that function's
+  docstring says what it adds). No new dependency. **RestrictedPython is
   rejected** — it is not hard isolation (it restricts an AST but shares the address space) and would
   add a dependency.
 - **Persistent per-inbound worker, never a per-message fork.** The child is spawned lazily on first
@@ -363,15 +363,19 @@ target, no `pickle` import left to mis-suppress:
   > checks run at fixed points. `_live_worker` checks, through `_drop_unsolicited`, before every
   > request, on every worker it hands out, a fresh one included. `_reject_unsolicited` checks once,
   > right after the call's answer is read. A frame left **after** an answer still fails the call
-  > closed when it is already queued at that second check. One that arrives later, on a worker
-  > still kept, is found by the next call's check before its request and costs that message a retry
-  > instead; one that arrives after that check is read as that call's answer, fails the
-  > request-answer binding, and dead-letters that message. A length header over the
-  > frame cap is new behaviour since #3135, not a carried-over rule. Before #3135 such a header read
-  > as a dead peer, so the worker was reaped and the answer stood, or the next message went to a
-  > respawn. It now counts as a stray frame at both checks: it fails the call closed after an
-  > answer, and before a request it drops the worker and retries the message. Every kill records a
-  > cause; ADR 0187 *Amendment B* says which kills write a WARNING.
+  > closed when it is queued by the time that second check runs. A frame that arrives later meets
+  > at least these outcomes. On a worker still kept, the next call's check before its request finds
+  > it, and that message is retried. One that arrives after that check is read in place of that
+  > call's answer, and dead-letters it unless it carries that call's request id, so in that window
+  > the later dispatch does not resolve as `mode=off` does, a case the SHALL above does not except.
+  > A worker that exits first takes the frame with it unexamined, since a respawn starts a fresh
+  > queue. A length header over the frame cap is new behaviour since #3135, not a carried-over
+  > rule. Before #3135 it read as a dead peer: at least, in the answer slot the call failed as a
+  > crash, after an answer the worker was reaped and the answer stood, and before a request the
+  > message went to a respawn. It now counts as a stray frame at both checks, failing the call
+  > closed after an answer and retrying the message before a request, and as an invalid frame in
+  > the answer slot. Every kill records a cause; ADR 0187 *Amendment B* says which kills write a
+  > WARNING.
   → `tests/test_sandbox.py::test_a_desynced_or_forged_response_is_rejected`,
   `tests/test_sandbox.py::test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`,
   `tests/test_sandbox.py::test_a_dead_peer_is_not_treated_as_a_forged_frame`,
