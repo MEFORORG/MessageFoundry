@@ -37,12 +37,21 @@
         one named; GIT_INDEX_FILE keeps the checkout but compares it against another index, which can
         make a dirty tree read clean. Checked once, and it THROWS, refusing the whole run, dry run
         included;
+      * no GIT_CONFIG or GIT_CONFIG_<anything> variable is set ($GIT_CONFIG_CARRIER_PATTERN in
+        worktree-gates.ps1 says which git reads, why GIT_CONFIG_GLOBAL is among them, and what it
+        does not cover): git config from the environment could steer every git gate below. Checked
+        once; it refuses every path rather than throwing, so in run-daily-prune.ps1 the core prune
+        still runs, under that config, and each path is logged REFUSED with the reason;
       * -IdleHours is a finite number not under worktree-gates.ps1's floor, and this clone's
         coordination root resolves (both checked once, for every path);
       * FIRST for each path, its root is not a junction or link, which every later gate and git would
-        read through, and can be read (a root that is not there is left to the gates below); nor is any
-        folder above it up to the .claude folder of its `.claude/worktrees/` segment, since a link
-        there would let the path-shape gate below accept a tree that lives elsewhere;
+        read through, and can be read (a root that is not there is left to the gates below); its own
+        .git entry is a plain file, not missing, a folder or a link, since every `git -C` gate reads
+        through it (which git dir that file names is not checked; git's own removal refuses a tree
+        whose git dir does not point back); nor is any folder above it up to the .claude folder of its
+        `.claude/worktrees/`
+        segment, since a link there would let the path-shape gate below accept a tree that lives
+        elsewhere;
       * the path has a `.claude/worktrees/` segment -- the only population this step is for;
       * it is not the primary checkout, not a worktree the caller runs from (-Protect), and does not
         contain one;
@@ -56,7 +65,10 @@
       * no rebase, am, cherry-pick, merge, revert or bisect is in progress in its own git dir;
       * every IGNORED entry git lists is a regenerable cache directory, by the list remove.ps1 -Path
         tolerates ($REGENERABLE_IGNORED_PATTERN in worktree-gates.ps1, which names them), and a plain
-        directory, so a .env, a *.db store or a build output beside them refuses the tree;
+        directory, so a .env, a *.db store or a build output beside them refuses the tree. One file is
+        tolerated too, by the owner's ruling of 2026-11-06: `.claude/seat.local.txt` at the tree's
+        root, as a plain file, not a folder or a link. scripts/security/scan-tokens.local.txt still
+        refuses;
       * a walk of the whole working tree, ignored directories included, finds no nested git checkout (an
         entry named .git), no link of any kind, and inside a cache directory no file named like data
         ($CACHE_DATA_NAME_PATTERN); a folder it cannot list refuses;
@@ -74,14 +86,17 @@
         .env, a nested clone, an edit, a per-worktree ref, a claim) would otherwise go with the tree.
         In order: the root check, since the next reads ask git through the root; the commit,
         allocation and claim checks (Get-OwnershipRefusal); the root check again and every check from
-        the flagged files through the walk (Get-ContentRefusal); and the fence. So
-        only the fence read sits between the content check and the removal, and nothing between the
-        fence and the removal. A refusal here reads "re-checked just before the removal". THE
+        the flagged files through the walk (Get-ContentRefusal); the fence; and the root check a third
+        time, with its .git check, as the last read before the removal, because the walk and the fence
+        are the slow reads. In this pass a root that is no longer there refuses too, since no gate
+        follows the last root check. So only the fence read and that root check sit between the
+        content check and the removal. A refusal here reads "re-checked just before the removal". THE
         RESIDUAL, at least: a write into the tree while the late fence is being read, and a claim, an
         allocation or a per-worktree ref written while the late content check or fence is being read,
         are not seen. The content check is the slow read (a whole-tree walk), so that is the longer
         window; it was put after the ownership reads so that the tree's own contents, the commonest
-        late write, get the shorter one.
+        late write, get the shorter one. A root, a folder above it or its .git swapped for a link
+        between the last root check and the removal itself is not seen either.
     Every gate is the shared copy in worktree-gates.ps1 or occupancy.ps1 where one exists. The claim and
     allocation readers list through Test-PresentOrThrow and Get-EntriesOrThrow, the readers remove.ps1
     uses (both now in worktree-gates.ps1), and a registry directory reads as absent only while the
@@ -93,8 +108,10 @@
     is read as a record, like any other. The
     record parsing follows remove.ps1's rules, cannot-tell refusing, without sharing its code.
     THE END STATE IS READ FAIL-CLOSED: only a tree git no longer lists, whose directory is confirmed
-    absent under a folder that is there, is REMOVED. A directory that is present or cannot be read is
-    ORPHANED, for a human.
+    gone by the rule prune-merged.ps1's orphan ledger uses (Test-ConfirmedGoneOrThrow in
+    worktree-gates.ps1: not found, and the nearest folder above it that is there lists without it),
+    here with that folder required to be its own parent and a plain directory, is REMOVED. A
+    directory that is present or cannot be confirmed gone is ORPHANED, for a human.
 
     WHAT THESE DO NOT SEE, said rather than implied. The fence reads the directory a session was
     LAUNCHED in, and a subagent under `isolation: worktree` is recorded under its parent's directory, so
@@ -109,8 +126,8 @@
     one is not read beyond the walk's denylist: a data file there under any other name goes with it.
     A PROCESS OUTSIDE CLAUDE that holds files in the tree (a python.exe from its .venv, an engine started
     there) is not looked for: git deletes what it can, fails on the held file, and the row ends ORPHANED
-    for a human. A tree a killed run left half-deleted reads REFUSED (prunable or not clean) on later
-    nights rather than raising the code.
+    for a human. A tree a killed run left half-deleted reads REFUSED (its .git gone, prunable or not
+    clean) on later nights rather than raising the code.
     -Apply refuses inside Claude Code, here and in run-daily-prune.ps1.
     THE REMOVAL IS `git -C <primary> worktree remove <path>`, WITH NO --force, EVER. There is no switch
     to add one. git's own refusal on a locked or dirty tree is then a last fence this step keeps.
@@ -188,16 +205,23 @@ function Get-TreeClaimsDirs {
 
 # A tree root that is a junction or symlink: every gate below, and git, would read through it into a
 # directory somewhere else. A root that is not there is left to the gates after this one, which refuse
-# it with their own reason; a root that cannot be read refuses here.
+# it with their own reason, except with -Late, in the pass just before the removal, where nothing after
+# the last root check would; a root that cannot be read refuses here. So does a root whose own .git entry
+# is not a plain file.
 # The folders above it, up to and including the .claude folder of its `.claude/worktrees/` segment, are
 # held to the same rule: a link there would let the path-shape gate accept a tree that lives elsewhere.
-function Get-TreeRootRefusal([string]$Path) {
+function Get-TreeRootRefusal([string]$Path, [switch]$Late) {
     try {
         $item = Get-ItemOrThrow $Path 'its root'
-        if (-not $item) { return '' }
+        if (-not $item) { return $(if ($Late) { 'its root is no longer there' } else { '' }) }
         if ($item -isnot [System.IO.DirectoryInfo]) { return 'its root is not a directory' }
         if (-not (Test-PlainDirectoryItem $item)) { return "its root is a junction or link ($($item.LinkType)), which the gates and the removal would follow somewhere else" }
+        # Paths outside the population are refused by the next gate, with their own reason.
         if (-not (Test-ClaudeManagedPath $Path)) { return '' }
+        # A linked tree's .git is a file naming its git dir. Missing, a folder or a link, every
+        # `git -C <path>` gate would read another git dir, or the repository above the tree. Which git
+        # dir a plain .git file names is not checked here.
+        if (-not (Test-PlainFile (Join-Path $Path '.git') 'its .git entry')) { return 'its .git entry is not a plain file (missing, a folder or a link), so the git gates would read through it to another git dir' }
         # Up to the .claude folder whose child on this chain is `worktrees`; a chain that never reaches
         # one (a `..` the shape test did not see) refuses rather than passing at the drive root.
         $child = $item
@@ -377,7 +401,13 @@ function Invoke-FinishedWorktreeRemoval {
     # measurement says are in use, 0 turns the reading off, and NaN compares false both ways, so the
     # test is written to fail closed. prune-merged.ps1 runs on with a warning there; this does not.
     $allRefusal = ''
-    if (-not [double]::IsFinite($IdleHours) -or -not ($IdleHours -ge $IDLE_FLOOR_HOURS)) {
+    # A refusal of every path rather than a throw, so the runner's core prune before this step still
+    # runs and each path is logged with the reason.
+    $carriers = @(Get-GitConfigCarriers)
+    if ($carriers.Count -gt 0) {
+        $allRefusal = "$($carriers -join ', ') is set, so git config from the environment could steer every git reading of the tree; unset it and re-run"
+    }
+    elseif (-not [double]::IsFinite($IdleHours) -or -not ($IdleHours -ge $IDLE_FLOOR_HOURS)) {
         $allRefusal = "-IdleHours $IdleHours is not a number at or over the $IDLE_FLOOR_HOURS h floor, so idle cannot be established"
     }
     # This clone's shared coordination root names both registries; an error leaves claims and
@@ -419,14 +449,15 @@ function Invoke-FinishedWorktreeRemoval {
 
 # Whether the tree's directory is still there after the removal: 'present', 'absent', or 'unknown: <why>'.
 # FAIL CLOSED. Test-Path answers $false for a path it may not read, so it cannot say "gone". Absent is
-# only a not-found under a parent folder that is there (Test-PresentUnderParentOrThrow, the rule the
-# registries are read by), because an unreachable parent raises the same not-found.
+# only what Test-ConfirmedGoneOrThrow confirms, the rule prune-merged.ps1's orphan ledger is read by,
+# with -Plain, as the root check required of the folders above the tree, and -RequireParent, so a tree
+# whose parent folder is gone too is not confirmed gone here.
 # A directory git has just deleted can sit delete-pending for a moment while another process (an
 # indexer, an antivirus scan) still holds it, and answers access-denied until it goes; so an unreadable
 # reading is taken again a few times before it stands. Only 'unknown' is retried, never 'present'.
 function Get-EndStatePresence([string]$Path, [int]$Tries = 5, [int]$WaitMs = 400) {
     for ($i = 1; ; $i++) {
-        try { return $(if (Test-PresentUnderParentOrThrow $Path 'the removed tree') { 'present' } else { 'absent' }) }
+        try { return $(if (Test-ConfirmedGoneOrThrow $Path 'the removed tree' -Plain -RequireParent) { 'absent' } else { 'present' }) }
         catch {
             # The readers end their message "Nothing was removed.", which is false once git has run.
             if ($i -ge $Tries) { return "unknown: $($_.Exception.Message -replace '\s*Nothing was removed\.\s*$', '')" }
@@ -443,17 +474,15 @@ function Invoke-OneRemoval {
     # '' for a detached tree: the ledger's recovery recipe re-adds a BRANCH, and '(detached)' is not one.
     $branch = if ($wt -and -not $wt.Detached) { [string]$wt.Branch } else { '' }
 
-    # THE LATE PASS, IMMEDIATELY BEFORE THE REMOVAL. The first pass read the content before its
-    # ownership and fence reads, so a write in that window (an ignored .env, a nested clone, an edit, a
-    # per-worktree ref, a claim) would go with the tree. Ownership, then the root and content, then the
-    # fence, run again here, so only the fence read sits between the content check and the removal, and
-    # nothing between the fence and the removal. Any refusal leaves the row REFUSED.
-    # The root check first, as in the first pass: the ownership reads ask `git -C <path>` too.
-    $late = Get-TreeRootRefusal $path
+    # THE LATE PASS, IMMEDIATELY BEFORE THE REMOVAL, in the order the header gives and for its reasons.
+    # Any refusal leaves the row REFUSED.
+    $late = Get-TreeRootRefusal $path -Late
     if (-not $late) { $late = Get-OwnershipRefusal -Primary $Primary -Path $path -Branch $branch -OwnClaimsDir $OwnClaimsDir -AllocDir $AllocDir }
-    if (-not $late) { $late = Get-TreeRootRefusal $path }
+    if (-not $late) { $late = Get-TreeRootRefusal $path -Late }
     if (-not $late) { $late = Get-ContentRefusal -Path $path -IdleHours $IdleHours }
     if (-not $late) { $late = Get-FenceRefusal -Primary $Primary -Path $path }
+    # The root once more, as the last read before the removal: the walk and the fence are slow reads.
+    if (-not $late) { $late = Get-TreeRootRefusal $path -Late }
     if ($late) { $Row.Reason = "re-checked just before the removal: $late"; return }
 
     # The one removal. Plain `worktree remove`: no --force, so git refuses a locked tree or one holding a

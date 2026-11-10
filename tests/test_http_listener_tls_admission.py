@@ -8,6 +8,12 @@ event loop run every handshake with asyncio's 60 s default and applied ``source_
 peer opening sockets that never sent a ClientHello would have held each one for a minute outside
 both caps, and a peer the allowlist excludes would have been given a handshake first.
 
+Engine PR 2655 fixed that on the stdlib loop only. On every other loop, uvloop among them, the loop
+still ran the handshake, with the caps and the allowlist after it. Since then the listener runs the
+MLLP listener's own accept loop there (`_AcceptingServer`), so each test runs on both paths
+(`tls_path`): ``start_tls`` is the stdlib loop, and ``accept_loop`` forces the path every other
+loop takes, so it runs on every platform. The uvloop tests at the end run it on the real loop.
+
 Each test waits on an event under a generous deadline, and no real client has to beat a shortened
 bound, so a slow runner makes these slower, not red. The handshake bound is pinned far above every
 wait in the count tests, so only the cap or the allowlist can close the socket in time.
@@ -16,13 +22,18 @@ wait in the count tests, so only the cap or the allowlist can close the socket i
 from __future__ import annotations
 
 import asyncio
+import socket
 import ssl
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from messagefoundry.transports import http_listener as http_module
+from messagefoundry.transports import mllp as mllp_module
+from messagefoundry.transports.http_listener import HttpSource
 from messagefoundry.transports.receipt import IngressReceipt, receipt_handler
 from tests.test_mllp_tls import _close_raw, _closed_by_listener, _Events, _until
 from tests.test_tls_handshake_failures import _client_hello, _pinned_client, _plaintext_peer
@@ -38,6 +49,23 @@ class _Intake:
     async def __call__(self, raw: bytes) -> IngressReceipt:
         self.received.append(raw)
         return IngressReceipt.accepted(f"m{len(self.received)}")
+
+
+@pytest.fixture(params=["start_tls", "accept_loop"])
+def tls_path(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Both ways the listener admits a socket before its handshake: upgrading it with
+    ``start_tls`` on the stdlib loop, and `_AcceptingServer`, which every other loop gets, forced
+    here. Before the accept loop, the forced path was the loop's own handshake."""
+    if request.param == "accept_loop":
+        monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
+    return str(request.param)
+
+
+def _on_path(source: HttpSource, tls_path: str) -> None:
+    """Fail unless ``source`` started on ``tls_path``; ``uvloop`` is the accept loop, unforced."""
+    upgrades = tls_path == "start_tls"
+    assert source._upgrade_tls is upgrades
+    assert isinstance(source._server, mllp_module._AcceptingServer) is not upgrades
 
 
 async def _https_post(port: int, cert: str, *, client_key: Path | None = None) -> int | None:
@@ -63,20 +91,14 @@ async def _https_post(port: int, cert: str, *, client_key: Path | None = None) -
     return int(data.split(b" ", 2)[1]) if data else None
 
 
-@pytest.mark.parametrize("runner", ["listener", "loop"])
 async def test_a_socket_that_never_handshakes_is_closed_at_the_handshake_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tls_path: str
 ) -> None:
-    """Both paths carry the bound: ``listener`` is the stdlib loop, where the listener runs the
-    handshake; ``loop`` forces the path uvloop takes, where the loop runs it. Before #2479 neither
-    had one, so the read below hit its 5 s deadline.
-
-    Where the listener runs it, the socket was admitted first, so the bound must free both
-    counters, or a handful of silent sockets would lock a peer out. It counts as one failed
-    handshake, named with its peer. Where the loop runs it, an expired bound is not counted: a
-    known limit, stated in ``tls_handshake_failures``. Neither is ever a session."""
-    if runner == "loop":
-        monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
+    """Both paths carry the bound. Before #2479 neither had one, so the read below hit its 5 s
+    deadline. The socket was admitted first, so the bound must free both counters, or a handful of
+    silent sockets would lock a peer out. It counts as one failed handshake, named with its peer:
+    the listener runs or hands over the handshake itself on both paths, so it sees the bound fire.
+    Before the accept loop, the forced path counted nothing here. It is never a session."""
     monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 0.3)
     source, cert = _tls_source(tmp_path, max_connections_per_host=4)
     events = _Events()
@@ -84,22 +106,20 @@ async def test_a_socket_that_never_handshakes_is_closed_at_the_handshake_timeout
     intake = _Intake()
     await source.start(receipt_handler(intake))
     try:
+        _on_path(source, tls_path)
         reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
         try:
             await _closed_by_listener(reader, within=5.0)
         finally:
             await _close_raw(writer)
-        assert source._upgrade_tls is (runner == "listener")
         await _until(lambda: source._admission.active == 0, "the slot was not released")
         assert source._admission.per_host == {}
-        if runner == "listener":
-            await _until(lambda: source.tls_handshake_failures == 1, "the failure not counted")
-            (_kind, peer, reason) = events.seen[0]
-            assert peer == "127.0.0.1"
-            assert reason is not None and reason.startswith("1 failed handshake(s)")
-            assert events.kinds() == ["tls_handshake_failed"]
-        else:
-            assert events.kinds() == []
+        assert source._admission.handshaking == {}
+        await _until(lambda: source.tls_handshake_failures == 1, "the failure not counted")
+        (_kind, peer, reason) = events.seen[0]
+        assert peer == "127.0.0.1"
+        assert reason is not None and reason.startswith("1 failed handshake(s)")
+        assert events.kinds() == ["tls_handshake_failed"]
     finally:
         await asyncio.wait_for(source.stop(), timeout=10.0)
     # The same listener, restarted with the real bound, still serves a real TLS client. Restarted
@@ -107,6 +127,7 @@ async def test_a_socket_that_never_handshakes_is_closed_at_the_handshake_timeout
     monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 10.0)
     await source.start(receipt_handler(intake))
     try:
+        _on_path(source, tls_path)
         assert await _https_post(source.sockport, cert) == 202
     finally:
         await asyncio.wait_for(source.stop(), timeout=10.0)
@@ -122,7 +143,11 @@ async def test_a_socket_that_never_handshakes_is_closed_at_the_handshake_timeout
     ids=["max_connections", "max_connections_per_host"],
 )
 async def test_an_unhandshaken_socket_spends_a_connection_slot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caps: dict[str, int], reason: str | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caps: dict[str, int],
+    reason: str | None,
+    tls_path: str,
 ) -> None:
     monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
     source, _cert_path = _tls_source(tmp_path, **caps)
@@ -130,6 +155,7 @@ async def test_an_unhandshaken_socket_spends_a_connection_slot(
     source.on_connection_event = events
     await source.start(receipt_handler(_Intake()))
     try:
+        _on_path(source, tls_path)
         _r1, w1 = await asyncio.open_connection("127.0.0.1", source.sockport)
         w2: asyncio.StreamWriter | None = None
         try:
@@ -157,7 +183,7 @@ async def test_an_unhandshaken_socket_spends_a_connection_slot(
 
 
 async def test_a_peer_outside_the_allowlist_is_refused_before_any_tls_byte(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tls_path: str
 ) -> None:
     monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
     source, _cert_path = _tls_source(tmp_path, source_ip_allowlist=["10.0.0.1"])
@@ -165,6 +191,7 @@ async def test_a_peer_outside_the_allowlist_is_refused_before_any_tls_byte(
     source.on_connection_event = events
     await source.start(receipt_handler(_Intake()))
     try:
+        _on_path(source, tls_path)
         reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
         try:
             # Before the fix the loop answered this with a ServerHello, and the allowlist ran only
@@ -185,20 +212,24 @@ async def test_a_peer_outside_the_allowlist_is_refused_before_any_tls_byte(
 
 
 async def test_stop_closes_a_socket_still_in_its_handshake(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tls_path: str
 ) -> None:
     """The listener tracks a socket from its accept, so stop() closes one still in its handshake
-    at once. The bound is pinned far above the shutdown grace, so only stop() can close it."""
+    at once: on ``start_tls`` its writer is in ``_clients``, and under the accept loop its task is in
+    ``_handshakes``, which stop() cancels. The bound is pinned far above the shutdown grace, so only
+    stop() can close it."""
     monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
     source, _cert_path = _tls_source(tmp_path)
     await source.start(receipt_handler(_Intake()))
     stopped = False
     try:
+        _on_path(source, tls_path)
+        tracked = source._clients if tls_path == "start_tls" else source._handshakes
         reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
         try:
             # Before the fix the listener saw a socket only once the loop's handshake was done.
             await _until(
-                lambda: len(source._clients) == 1,
+                lambda: len(tracked) == 1 and source._admission.active == 1,
                 "a socket still in its TLS handshake is not tracked by the listener",
             )
             await asyncio.wait_for(source.stop(), timeout=http_module._CLIENT_SHUTDOWN_GRACE)
@@ -213,48 +244,180 @@ async def test_stop_closes_a_socket_still_in_its_handshake(
             await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
-async def test_a_handshake_finishing_after_stop_began_is_refused_unread(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("completed", [True, False], ids=["completed", "in_progress"])
+async def test_stop_aborts_a_handshake_that_completed_before_its_task_stepped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, completed: bool
 ) -> None:
-    """The 2026-10-02 residual, kept fixed on the new path: a handshake that completes once stop()
+    """Under the accept loop, a handshake can complete before its task steps, in either order
+    against stop(). The cancellation stop() sends then makes ``connect_accepted_socket`` close the
+    transport with the TLS close exchange, which a silent peer can hold open for asyncio's 30 s
+    default, so `_handshake_accepted` aborts it. The stand-in for ``connect_accepted_socket`` does
+    what asyncio's does: it connects the protocol once the handshake completes, and closes the
+    transport when cancelled. A handshake still in progress is the control: it has no transport to
+    abort, so it is only closed."""
+    monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
+    loop_class = type(asyncio.get_running_loop())
+    ends: list[str] = []
+
+    class _Transport(asyncio.Transport):
+        def abort(self) -> None:
+            ends.append("abort")
+
+        def close(self) -> None:
+            ends.append("close")
+
+    async def connect(
+        self: asyncio.AbstractEventLoop,
+        protocol_factory: Callable[[], asyncio.BaseProtocol],
+        sock: socket.socket,
+        **kwargs: object,
+    ) -> object:
+        transport = _Transport()
+        protocol = protocol_factory()
+        if completed:
+            protocol.connection_made(transport)
+        try:
+            await asyncio.get_running_loop().create_future()  # the task has not stepped yet
+        except asyncio.CancelledError:
+            transport.close()
+            sock.close()
+            raise
+        raise AssertionError("never resolved")
+
+    monkeypatch.setattr(loop_class, "connect_accepted_socket", connect)
+    source, _cert = _tls_source(tmp_path)
+    await source.start(receipt_handler(_Intake()))
+    stopped = False
+    try:
+        _on_path(source, "accept_loop")
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            await _until(lambda: len(source._handshakes) == 1, "the handshake never started")
+            await asyncio.wait_for(source.stop(), timeout=10.0)
+            stopped = True
+        finally:
+            await _close_raw(writer)
+    finally:
+        if not stopped:
+            await asyncio.wait_for(source.stop(), timeout=10.0)
+    assert ends == (["close", "abort"] if completed else ["close"])
+
+
+async def test_a_handshake_finishing_after_stop_began_is_refused_unread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tls_path: str
+) -> None:
+    """The 2026-10-02 residual, kept fixed on both paths: a handshake that completes once stop()
     has begun must not have its request read or handled. stop() is stood in for by setting the
-    flag as the handshake ends, so the interleaving is pinned without a timing race."""
+    flag as the handshake ends, so the interleaving is pinned without a timing race. Under the
+    accept loop the handshake ends just before `_handshake_accepted` hands the socket over."""
     source, cert = _tls_source(tmp_path)
     events = _Events()
     source.on_connection_event = events
     intake = _Intake()
-    real_start_tls = source._start_tls
+    ends: list[str] = []
 
-    async def finish_then_stop(
-        reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peer_host: str | None
-    ) -> bool:
-        ok = await real_start_tls(reader, writer, peer_host)
-        source._admission.stopping = True
-        return ok
+    def record_ends(transport: asyncio.BaseTransport) -> None:
+        if tls_path == "uvloop":
+            return  # uvloop's transport takes no attribute, so not there
+        real_abort = cast(asyncio.Transport, transport).abort
+        real_close = transport.close
 
-    monkeypatch.setattr(source, "_start_tls", finish_then_stop)
+        def abort() -> None:
+            ends.append("abort")
+            real_abort()
+
+        def close() -> None:
+            ends.append("close")
+            real_close()
+
+        monkeypatch.setattr(transport, "abort", abort)
+        monkeypatch.setattr(transport, "close", close)
+
+    if tls_path == "start_tls":
+        real_start_tls = source._start_tls
+
+        async def finish_then_stop(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peer_host: str | None
+        ) -> bool:
+            ok = await real_start_tls(reader, writer, peer_host)
+            source._admission.stopping = True
+            if ok:
+                record_ends(writer.transport)
+            return ok
+
+        monkeypatch.setattr(source, "_start_tls", finish_then_stop)
+    else:
+        real_on_client = source._on_client
+
+        async def stop_then_hand_over(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+            *,
+            slot: tuple[str | None, int] | None = None,
+        ) -> None:
+            assert slot is not None  # admitted before its handshake
+            source._admission.stopping = True
+            record_ends(writer.transport)
+            await real_on_client(reader, writer, slot=slot)
+
+        monkeypatch.setattr(source, "_on_client", stop_then_hand_over)
     await source.start(receipt_handler(intake))
     try:
+        _on_path(source, tls_path)
         assert await _https_post(source.sockport, cert) is None  # closed with no response
         await _until(lambda: source._admission.active == 0, "the slot was not released")
         assert intake.received == []
         assert "established" not in events.kinds()
+        if tls_path != "uvloop":
+            # Nothing was read or written, so on both paths the socket is aborted, with no close
+            # exchange a silent peer could hold open for asyncio's 30 s default (round-3 finding 2).
+            assert ends[:1] == ["abort"], ends
     finally:
         source._admission.stopping = False
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
-async def test_a_listener_running_its_own_handshake_does_not_count_twice(tmp_path: Path) -> None:
-    """``loop.start_tls`` builds its TLS object from the listener's own context, so a context an
-    earlier loop-run start() hooked would count each failure a second time. start() unhooks it on
-    the listener-run path, and ``_start_tls`` alone counts, with the peer."""
+async def test_a_connection_stays_tracked_until_its_last_event(
+    tmp_path: Path, tls_path: str
+) -> None:
+    """`_on_client` used to drop its task from ``_client_tasks`` early in its ``finally``, before
+    awaiting the close and emitting ``closed``, so a stop() in that window did not wait for it and
+    the event could land after a restart (round-3 finding 4). On both paths the task must still be
+    tracked when ``closed`` is emitted, and dropped once the call has ended."""
+    source, cert = _tls_source(tmp_path)
+    tracked_at_close: list[bool] = []
+
+    async def record(kind: str, peer_host: str | None, reason: str | None) -> None:
+        if kind == "closed":
+            tracked_at_close.append(asyncio.current_task() in source._client_tasks)
+
+    source.on_connection_event = record
+    await source.start(receipt_handler(_Intake()))
+    try:
+        _on_path(source, tls_path)
+        assert await _https_post(source.sockport, cert) == 202
+        await _until(lambda: tracked_at_close != [], "no closed event")
+        assert tracked_at_close == [True]
+        await _until(lambda: source._client_tasks == set(), "the task was never dropped")
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+async def test_a_listener_running_its_own_handshake_counts_each_failure_once(
+    tmp_path: Path, tls_path: str
+) -> None:
+    """The listener counts a failed handshake itself on both paths, with the peer. A context left
+    hooked (`HandshakeFailures.watch`) would count each failure a second time, with no peer, so
+    start() unhooks it on both paths. Before the accept loop, the forced path counted through that
+    hook alone, with no peer."""
     source, _cert_path = _tls_source(tmp_path)
     assert source._ssl is not None
-    source._tls_failures.watch(source._ssl)  # as a loop-run start() left it
+    source._tls_failures.watch(source._ssl)  # a hook start() must take off
     events = _Events()
     source.on_connection_event = events
     await source.start(receipt_handler(_Intake()))
     try:
+        _on_path(source, tls_path)
         assert source._ssl.sslobject_class is ssl.SSLObject
         await _plaintext_peer(source.sockport)
         await _until(lambda: source.tls_handshake_failures >= 1, "the failure was not counted")
@@ -266,17 +429,14 @@ async def test_a_listener_running_its_own_handshake_does_not_count_twice(tmp_pat
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
-@pytest.mark.parametrize("runner", ["listener", "loop"])
 @pytest.mark.parametrize(("subject", "status"), [("CN:127.0.0.1", 202), ("CN:other", 403)])
 async def test_mtls_subject_reads_the_certificate_after_either_handshake(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: str, subject: str, status: int
+    tmp_path: Path, tls_path: str, subject: str, status: int
 ) -> None:
-    """``mtls_subject`` reads the verified peer certificate from the writer. Where the listener
-    upgrades the socket itself, that writer's transport was swapped by ``start_tls``, so this pins
-    that the certificate is still there: a listed subject is served, and an unlisted one gets the
-    403. Either way the slot is given back."""
-    if runner == "loop":
-        monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
+    """``mtls_subject`` reads the verified peer certificate from the writer. On ``start_tls`` that
+    writer's transport was swapped by the upgrade, and under the accept loop the writer is built
+    by `_handshake_accepted`, so this pins that the certificate is there on both: a listed subject
+    is served, and an unlisted one gets the 403. Either way the slot is given back."""
     source, cert = _tls_source(
         tmp_path,
         tls_ca_file=str(tmp_path / "c.pem"),
@@ -288,7 +448,7 @@ async def test_mtls_subject_reads_the_certificate_after_either_handshake(
     intake = _Intake()
     await source.start(receipt_handler(intake))
     try:
-        assert source._upgrade_tls is (runner == "listener")
+        _on_path(source, tls_path)
         assert await _https_post(source.sockport, cert, client_key=tmp_path / "k.pem") == status
         await _until(lambda: source._admission.active == 0, "the slot was not released")
     finally:
@@ -296,34 +456,121 @@ async def test_mtls_subject_reads_the_certificate_after_either_handshake(
     assert intake.received == ([b"hi"] if status == 202 else [])
 
 
+async def test_a_socket_the_tls_layer_never_took_is_closed_and_its_slot_given_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under the accept loop, ``connect_accepted_socket`` can fail before its transport holds the
+    socket. That is no handshake failure, so it is not counted, and the socket is still the
+    listener's: the done callback closes it, and the slot comes back. A real client served next
+    is the control."""
+    monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
+    loop_class = type(asyncio.get_running_loop())
+    real_connect_accepted = loop_class.connect_accepted_socket
+    refused: list[bool] = []
+
+    async def refuse(self: asyncio.AbstractEventLoop, *args: object, **kwargs: object) -> object:
+        refused.append(True)
+        raise OSError("refused before the transport took the socket")
+
+    source, cert = _tls_source(tmp_path)
+    intake = _Intake()
+    monkeypatch.setattr(loop_class, "connect_accepted_socket", refuse)
+    await source.start(receipt_handler(intake))
+    try:
+        _on_path(source, "accept_loop")
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            await _closed_by_listener(reader, within=5.0)
+        finally:
+            await _close_raw(writer)
+        assert refused == [True]
+        await _until(lambda: source._admission.active == 0, "the slot was not released")
+        assert source._client_tasks == set() and not source._handshakes
+        assert source.tls_handshake_failures == 0
+        monkeypatch.setattr(loop_class, "connect_accepted_socket", real_connect_accepted)
+        assert await _https_post(source.sockport, cert) == 202
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+    assert intake.received == [b"hi"]
+
+
+# --- the accept loop on the real uvloop (BACKLOG #2479) -------------------------------------------
+#
+# The tests above run `_AcceptingServer` on the stdlib loop, forced. These run them on uvloop, the
+# loop it exists for, where nothing has to force it. Each skips where uvloop is not installed, so
+# they run on CI's Linux legs only.
+
+
+_Scenario = Callable[[Path, pytest.MonkeyPatch], Awaitable[None]]
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="uvloop does not run on Windows")
-def test_the_handshake_bound_on_uvloop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The real loop, not a stand-in for it. It skips where uvloop is not installed. uvloop keeps
-    the loop-level handshake, so the bound passed to ``start_server`` is what closes a socket that
-    never sends a ClientHello, and a real TLS client still gets a message through."""
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        pytest.param(
+            lambda p, m: test_a_socket_that_never_handshakes_is_closed_at_the_handshake_timeout(
+                p, m, "uvloop"
+            ),
+            id="handshake_bound",
+        ),
+        pytest.param(
+            lambda p, m: test_an_unhandshaken_socket_spends_a_connection_slot(
+                p, m, {"max_connections": 1}, None, "uvloop"
+            ),
+            id="max_connections",
+        ),
+        pytest.param(
+            lambda p, m: test_an_unhandshaken_socket_spends_a_connection_slot(
+                p,
+                m,
+                {"max_connections": 0, "max_connections_per_host": 1},
+                "max_connections_per_host",
+                "uvloop",
+            ),
+            id="max_connections_per_host",
+        ),
+        pytest.param(
+            lambda p, m: test_a_peer_outside_the_allowlist_is_refused_before_any_tls_byte(
+                p, m, "uvloop"
+            ),
+            id="allowlist",
+        ),
+        pytest.param(
+            lambda p, m: test_stop_closes_a_socket_still_in_its_handshake(p, m, "uvloop"),
+            id="stop",
+        ),
+        pytest.param(
+            lambda p, m: test_a_handshake_finishing_after_stop_began_is_refused_unread(
+                p, m, "uvloop"
+            ),
+            id="handshake_after_stop",
+        ),
+        pytest.param(
+            lambda p, _m: test_a_connection_stays_tracked_until_its_last_event(p, "uvloop"),
+            id="tracked_until_closed",
+        ),
+        pytest.param(
+            lambda p, _m: test_a_listener_running_its_own_handshake_counts_each_failure_once(
+                p, "uvloop"
+            ),
+            id="failure_counted_once",
+        ),
+        pytest.param(
+            lambda p, _m: test_mtls_subject_reads_the_certificate_after_either_handshake(
+                p, "uvloop", "CN:127.0.0.1", 202
+            ),
+            id="mtls_subject",
+        ),
+    ],
+)
+def test_admission_runs_before_the_handshake_on_uvloop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: _Scenario
+) -> None:
     uvloop = pytest.importorskip("uvloop")
-    monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 0.5)
 
-    async def scenario() -> None:
-        source, cert = _tls_source(tmp_path)
-        intake = _Intake()
-        await source.start(receipt_handler(intake))
-        try:
-            assert source._upgrade_tls is False
-            reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
-            try:
-                await _closed_by_listener(reader, within=5.0)
-            finally:
-                await _close_raw(writer)
-        finally:
-            await asyncio.wait_for(source.stop(), timeout=10.0)
-        # Restored first, so the real client never races the shortened bound.
-        monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 10.0)
-        await source.start(receipt_handler(intake))
-        try:
-            assert await _https_post(source.sockport, cert) == 202
-        finally:
-            await asyncio.wait_for(source.stop(), timeout=10.0)
-        assert intake.received == [b"hi"]
+    async def run() -> None:
+        assert http_module._upgrades_tls_itself(asyncio.get_running_loop()) is False
+        await scenario(tmp_path, monkeypatch)
 
-    asyncio.run(scenario(), loop_factory=uvloop.new_event_loop)
+    asyncio.run(run(), loop_factory=uvloop.new_event_loop)

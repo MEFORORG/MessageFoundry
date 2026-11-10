@@ -1133,3 +1133,56 @@ async def test_the_lifespan_control_loses_the_row_without_the_drain(
     assert await _rows_after_shutdown(db, _LOCK_NOTICE) == [], (
         "the row survived with the drain neutralised, so the other test does not measure it"
     )
+
+
+async def test_the_sign_in_lock_notice_reads_the_totp_verdict_its_escalation_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3948 finding 16: a later-cycle sign-in lock's escalation judges the TOTP, and the
+    notice reports THAT verdict rather than judging the cell again. Here the escalation's open
+    fails, as a Transit service that drops one request does, so it judged the TOTP unknown; a
+    second open would succeed. The notice says unknown, and the cell is opened once. RED when the
+    notice judges the start-of-request record on its own: it then reports a usable TOTP the lock's
+    length was not decided on, after a second open."""
+    from messagefoundry.store.crypto import CipherError
+
+    store, service, _notifier, row = await _harness(threshold=2)
+    try:
+        cell = await store.set_totp_secret(row.id, secret="JBSWY3DPEHPK3PXP", now=1.0)
+        assert await store.enable_totp(
+            row.id, expected_secret_cell=cell, recovery_code_hashes=[], now=1.0
+        )
+        user = await service._load_user(row.id)
+        assert user is not None and user.totp_enabled
+        real_open = store.open_totp_secret
+        opens: list[str] = []
+
+        def drops_the_first(user_id: str, stored: str | None) -> str | None:
+            opens.append(user_id)
+            if len(opens) == 1:
+                raise CipherError("synthetic: the cipher service dropped this request")
+            return real_open(user_id, stored)
+
+        monkeypatch.setattr(store, "open_totp_secret", drops_the_first)
+        start = 2_000_000.0
+        for i in range(2):  # the first lock: no escalation, so nothing is judged
+            await service._register_failure(user, start + i, counter="sign_in")
+        later = start + 10_000.0
+        await service._register_failure(user, later, counter="sign_in")
+        crossing = await service._register_failure(user, later + 1.0, counter="sign_in")
+        assert crossing.just_locked and crossing.cycles == 2, crossing
+        assert opens == [row.id], "the escalation did not judge the TOTP, so nothing is measured"
+        assert crossing.totp_state == "unknown"
+        notices: list[dict[str, Any]] = []
+
+        async def capture(*_args: Any, notice_detail: dict[str, Any], **_kw: Any) -> None:
+            notices.append(notice_detail)
+
+        monkeypatch.setattr(service, "_record_suspicious_login", capture)
+        await service._record_lock(user, "sign_in", crossing, client=None)
+        assert len(notices) == 1, notices
+        assert notices[0].get("totp_state") == "unknown", notices[0]
+        assert notices[0].get("combined_sign_in") is True
+        assert opens == [row.id], f"the notice opened the TOTP cell again: {opens}"
+    finally:
+        await _close(store, service)

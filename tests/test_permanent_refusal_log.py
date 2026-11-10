@@ -21,7 +21,7 @@ from typing import cast
 
 import pytest
 
-from messagefoundry.config.models import BatchConfig, ConnectorType, Destination, RetryPolicy
+from messagefoundry.config.models import BatchConfig, ConnectorType, RetryPolicy
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -34,7 +34,7 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner, _RefusalLog
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
 from messagefoundry.transports.base import ENCODING_CODE, DestinationConnector, NegativeAckError
 from messagefoundry.transports.framing import FRAMING_CODE, MULTIPLE_MESSAGES_CODE
-from messagefoundry.transports.mllp import MLLPDestination
+from tests._mllp_recorder import MllpRecorder, run_one_batch
 from tests._refusal_log_capture import TOKEN, until
 from tests._refusal_log_capture import assert_no_token as _assert_no_token
 
@@ -291,11 +291,7 @@ async def _run_one_batch(store: MessageStore, runner: RegistryRunner, bodies: li
         await store.enqueue_message(
             channel_id="c1", raw=body, deliveries=[(OUT, body)], now=100.0 + n
         )
-    head = await store.claim_next_fifo(OUT)
-    cfg = runner._batch[OUT]
-    assert head is not None and cfg is not None
-    await runner._process_delivery_batch(OUT, head, cfg)
-    return head.id
+    return await run_one_batch(runner, OUT)  # closes the connector wired on OUT
 
 
 async def test_a_permanently_refused_batch_logs_one_content_free_warning(
@@ -311,23 +307,6 @@ async def test_a_permanently_refused_batch_logs_one_content_free_warning(
     assert repr(OUT) in text and "a batch of 3" in text and head_id in text
     assert "NegativeAckError" in text and "code 'AR'" in text
     _assert_no_token(caplog.records)
-
-
-class _MllpRecorder(MLLPDestination):
-    """A real MLLP destination, so ``check_frame`` is the real one, whose send only records."""
-
-    def __init__(self, encoding: str = "utf-8") -> None:
-        super().__init__(
-            Destination(
-                name=OUT,
-                type=ConnectorType.MLLP,
-                settings={"host": "127.0.0.1", "port": 1, "encoding": encoding},
-            )
-        )
-        self.sent: list[str] = []
-
-    async def send(self, payload: str, *, metadata: object = None) -> None:
-        self.sent.append(payload)
 
 
 #: The reason each refused member's line gives, by its refusal's code.
@@ -358,7 +337,7 @@ async def test_a_refused_batch_member_logs_its_own_reason_content_free(
     # One refused member is dead-lettered alone. Its line shares the phrase and the throttle of the
     # other permanent-refusal lines, and names the reason its own refusal gives, and no other.
     caplog.set_level(logging.DEBUG, logger="messagefoundry")
-    rec = _MllpRecorder(encoding)
+    rec = MllpRecorder(OUT, encoding=encoding)
     runner = _batch_runner(store, rec)
     await _run_one_batch(store, runner, [_adt(1, name="DOE"), bad, _adt(3, name="DOE")])
 

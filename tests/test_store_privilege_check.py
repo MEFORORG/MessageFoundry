@@ -14,6 +14,7 @@ and ``tests/test_store_privilege_schema_split.py``).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -44,6 +45,7 @@ from messagefoundry.privilege_check import (
     EXIT_UNOBSERVABLE,
     HopState,
     exit_code_for,
+    render_text,
     settings_hops,
     store_hop,
 )
@@ -431,6 +433,36 @@ def test_store_hop_states_follow_the_report() -> None:
     assert store_hop(_sysadmin_report(), _mssql()).state is HopState.OVER_GRANTED
     assert store_hop(_unobservable_report(), _mssql()).state is HopState.UNOBSERVABLE
     assert store_hop(_clean_report(), _mssql()).state is HopState.CLEAN
+
+
+@pytest.mark.parametrize("over", [True, False])
+def test_the_store_hop_prints_a_control_in_the_principal_escaped_once(over: bool) -> None:
+    """BACKLOG #2891, PR 2390 note 5: the summary wrote the principal with ``!r``, whose ``\\x1b``
+    the terminal rule then doubled, so an ESC the name held printed as ``\\\\x1b``, text the name
+    spelled out. The log keeps ``repr``, since it prints the line as it is."""
+    base = _sysadmin_report() if over else _clean_report()
+    report = dataclasses.replace(base, principal="mefor\x1b[2Jsvc", database="Message\u202eFoundry")
+    shown = "\n".join(render_text([store_hop(report, _mssql())]))
+    assert "'mefor\\x1b[2Jsvc' on 'Message\\u202eFoundry'" in shown
+    assert "\\\\x1b" not in shown and "\\\\u202e" not in shown
+    assert "\x1b" not in shown and "\u202e" not in shown
+    # The other sinks keep repr for the principal and database.
+    assert "'mefor\\x1b[2Jsvc' on 'Message\\u202eFoundry'" in report.summary()
+
+
+def test_the_store_hop_prints_a_no_break_space_in_the_principal_as_an_escape() -> None:
+    """BACKLOG #2891: a no-break space in the principal printed as a blank, so the name read as
+    one spelled with an ASCII space; the shared rule now escapes a space separator."""
+    report = dataclasses.replace(_clean_report(), principal="mefor\u00a0svc")
+    shown = "\n".join(render_text([store_hop(report, _mssql())]))
+    assert "'mefor\\u00a0svc' on 'MessageFoundry'" in shown
+    assert "\u00a0" not in shown
+
+
+def test_the_store_hop_prints_a_domain_backslash_as_repr_printed_it() -> None:
+    """A ``DOMAIN\\user`` principal reads as it did under ``repr``."""
+    shown = "\n".join(render_text([store_hop(_clean_report(), _mssql())]))
+    assert "'CORP\\\\mefor-svc$' on 'MessageFoundry'" in shown
 
 
 def test_the_store_hop_names_the_grant_schema_management_selects() -> None:

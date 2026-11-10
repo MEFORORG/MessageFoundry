@@ -45,6 +45,7 @@ from messagefoundry.exception_origin import (
     ExceptionChainTooLong,
     exception_chain,
     raised_by_the_engine,
+    raised_through,
 )
 from messagefoundry.privilege_check import vault_admin_paths
 from messagefoundry.transports.bounded_read import TruncatedResponseError
@@ -184,8 +185,8 @@ def _why(exc: BaseException) -> str:
     #
     # A hop refusal keeps its text only when it is exactly the Vault hop's marked one, built from
     # fixed text (BACKLOG #3471), as `vault_failure_text` reads it. Any other `InsecureHopRefused`
-    # falls through to its type name: the base type promises no fixed text. `_ad_why` keeps the
-    # LDAPS guard's for the AD probe.
+    # falls through to its type name: the base type promises no fixed text. `_ad_why` gives the
+    # LDAPS guard's a fixed text for the AD probe, read from nothing in it.
     fail_closed = (KeyProviderError, SecretProviderError, LdapError)
     if isinstance(exc, fail_closed) or is_vault_hop_refusal(exc):
         return strip_control_chars(str(exc))
@@ -205,17 +206,43 @@ def _why(exc: BaseException) -> str:
 
 
 def _ad_why(exc: BaseException) -> str:
-    """:func:`_why` for the AD bind probe, which keeps an ``InsecureHopRefused``'s text whole.
+    """:func:`_why` for the AD bind probe, which names the LDAPS revocation guard's refusal.
 
-    On that probe one comes from building the LDAPS bind: the revocation guard of BACKLOG #2193,
-    whose text names the hop, the domain controller's host and the setting that clears it, and
-    reads no password. ``provision-admin`` and ``serve`` print the same refusal whole. The Vault
-    probe does not take this rule (BACKLOG #3471)."""
+    That guard (BACKLOG #2193) refuses with an ``InsecureHopRefused`` whose text names the hop,
+    the domain controller's host and the setting that clears it, and reads no password.
+    ``provision-admin`` and ``serve`` print the same refusal whole. Here it reads as
+    :data:`_AD_GUARD_REFUSAL`, a fixed text naming the guard and its setting, which reads nothing
+    from the error (the seventh hold on engine PR 2818): the class is tested with ``type``, never
+    ``isinstance``, which reads ``__class__``, and neither its text, arguments nor class name is
+    read. The traceback test runs guarded: if it raises, the refusal reads as the fixed text
+    ``InsecureHopRefused``, whatever its subclass.
+
+    The test is an ``InsecureHopRefused`` whose traceback passes through
+    ``auth.ldap._refuse_ad_revocation`` (:func:`raised_through`). So it accepts one raised by
+    anything that function calls, the guard and the TLS context factory included, not only the
+    guard's own. Any other ``InsecureHopRefused`` on this probe, at least one from resolving a
+    Vault-held bind password, takes :func:`_why`'s rule, as on the Vault probe (BACKLOG #3471,
+    #4883)."""
+    from messagefoundry.auth.ldap import _refuse_ad_revocation
     from messagefoundry.config.tls_policy import InsecureHopRefused
 
-    if isinstance(exc, InsecureHopRefused):
-        return strip_control_chars(str(exc))
-    return _why(exc)
+    if not issubclass(type(exc), InsecureHopRefused):
+        return _why(exc)
+    try:
+        through_the_guard = raised_through(exc, _refuse_ad_revocation.__code__)
+    except Exception:  # noqa: BLE001 -- a traceback that cannot be read is not the guard's
+        logger.warning("AD probe: a hop refusal's traceback could not be read; named by its type")
+        return "InsecureHopRefused"
+    return _AD_GUARD_REFUSAL if through_the_guard else _why(exc)
+
+
+#: What the AD probe says of a hop refusal raised through the LDAPS revocation guard
+#: (:func:`_ad_why`). Fixed: it reads nothing from the refusal.
+_AD_GUARD_REFUSAL = (
+    "InsecureHopRefused: the LDAPS bind to AD checks no certificate revocation and the posture "
+    "refuses it; set [auth].ad_tls_crl_file to a CRL from the CA that issues the domain "
+    "controller's certificate (the refusal serve prints names the host)"
+)
 
 
 def _strings(value: object) -> tuple[str, ...]:

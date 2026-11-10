@@ -58,6 +58,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
+from messagefoundry import file_lock
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
@@ -100,6 +101,7 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.gcm_bound import bounded_cipher
 from messagefoundry.store.schema_verify import SchemaMismatchError
+from messagefoundry.terminal_text import escape_for_terminal
 from messagefoundry.transports.file import (
     _FLAG_BACKUP_SEMANTICS,
     _FLAG_OPEN_REPARSE_POINT,
@@ -128,6 +130,7 @@ __all__ = [
     "RESTORE_NEEDS_A_DESTINATION",
     "run_restore",
     "run_restore_verify",
+    "join_before_checks",
 ]
 
 log = logging.getLogger(__name__)
@@ -858,7 +861,9 @@ class BackupRunner:
                 raise
             if isinstance(exc, BackupError):
                 # First, so the 200-character cut the failure record applies keeps the directory.
-                raise BackupError(exc.kind, f"{leftover}; the run failed: {exc}") from exc
+                raise BackupError(
+                    exc.kind, join_before_checks(leftover, "; ", f"the run failed: {exc}")
+                ) from exc
             exc.add_note(leftover)
             raise
 
@@ -876,7 +881,9 @@ class BackupRunner:
                 raise
             # The staging teardown failed too; that must not ride only in the log. It leads, so the
             # 200-character cut the failure record applies keeps the directory.
-            raise BackupError(exc.kind, f"{staging_leftover}; the run failed: {exc}") from exc
+            raise BackupError(
+                exc.kind, join_before_checks(staging_leftover, "; ", f"the run failed: {exc}")
+            ) from exc
 
         # keep-N prune runs only after that rename, so the candidate set contains this archive and
         # every earlier archive that also passed — and nothing that failed (AC-6).
@@ -953,10 +960,13 @@ class BackupRunner:
                 kept = self._keep_failed_archive(staging_path, archive_path)
                 raise BackupError(
                     "verify",
-                    f"restore-verify {verify.status}: "
-                    f"{verify.reason or 'archive did not verify'} "
-                    f"(kept for diagnosis as {kept.name}; it holds no retention slot, and nothing "
-                    "in the engine expires it)",
+                    join_before_checks(
+                        f"restore-verify {verify.status}: "
+                        f"{verify.reason or 'archive did not verify'}",
+                        " ",
+                        f"(kept for diagnosis as {kept.name}; it holds no retention slot, and "
+                        "nothing in the engine expires it)",
+                    ),
                 )
 
         # Only now does the archive earn the canonical name.
@@ -1108,12 +1118,16 @@ class BackupRunner:
             if isinstance(exc, BackupError):
                 # A refusal the build raised itself (vault BACKLOG #5220): the leftover leads for the
                 # same reason, and a note would not reach the audit row or the alert.
-                raise BackupError(exc.kind, f"{leftover}; the build failed: {exc}") from exc
+                raise BackupError(
+                    exc.kind, join_before_checks(leftover, "; ", f"the build failed: {exc}")
+                ) from exc
             if isinstance(exc, OSError | BackupCodecError):
                 # Named in the error itself, first, so the audit row and the alert carry it; a note
                 # would not survive the loop wrapping this into a BackupError.
                 kind = "write" if isinstance(exc, OSError) else "encrypt"
-                raise BackupError(kind, f"{leftover}; the build failed: {safe_exc(exc)}") from exc
+                raise BackupError(
+                    kind, join_before_checks(leftover, "; ", f"the build failed: {safe_exc(exc)}")
+                ) from exc
             exc.add_note(leftover)
             raise
         return (*built, work.release())
@@ -1977,7 +1991,11 @@ def _empty_files_in_place(staging: Path) -> list[str]:
       ``O_NOFOLLOW``; each file is opened with ``O_NOFOLLOW`` relative to its directory's descriptor.
     - Windows: :func:`_win_held_walk` holds each directory, and the ones above it, while it is checked,
       listed and emptied. Each file is opened as itself and checked (:func:`_open_unfollowed`), and
-      its final path must lie under ``staging``'s.
+      its final path must be its directory's joined with the name listed. A name Windows would open
+      as another object (:func:`_win_opens_another`) is reported.
+
+    A listed file that is gone from its name before it is opened is reported, never read as nothing to
+    empty: a rename leaves its bytes under another name.
 
     What this leaves open is listed once, in docs/PHI.md section 2's ``mefor-backup-*`` /
     ``mefor-verify-*`` staging row."""
@@ -1993,13 +2011,22 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 
     walked = False
     if sys.platform == "win32":
-        for dirpath, dirnames, filenames, inside in _win_held_walk(staging, unproven, _report):
+        for dirpath, dirnames, filenames, here in _win_held_walk(staging, unproven, _report):
             walked = True
-            # Never descend through a link or a junction, which `os.walk` follows even with
-            # `followlinks=False`.
-            dirnames[:] = [d for d in dirnames if not _is_dir_link(os.path.join(dirpath, d))]
+            kept: list[str] = []
+            for d in dirnames:
+                child = Path(dirpath) / d
+                # Screened first: a name Windows rewrites would have the link test below, and the
+                # walk, reach another directory.
+                if _win_opens_another(child):
+                    unproven.append(f"{d}/ {_REWRITTEN_DIR}")
+                # Never descend through a link or a junction, which `os.walk` follows even with
+                # `followlinks=False`.
+                elif not _is_dir_link(os.fspath(child)):
+                    kept.append(d)
+            dirnames[:] = kept
             for name in filenames:
-                _report(_truncate_unfollowed(Path(dirpath) / name, None, inside))
+                _report(_truncate_unfollowed(Path(dirpath) / name, None, here))
     else:
         for dirpath, _dirnames, filenames, dirfd in _walk(staging, onerror=_unlisted):
             walked = True
@@ -2014,6 +2041,37 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 #: What the fail-safe reports for something it reached through a link. Not named: it lives outside
 #: the staging directory, wherever the link pointed, and its name may be anyone's.
 _OUTSIDE_REASON = "an entry outside the directory (reached through a link, not truncated)"
+#: What the Windows fail-safe reports, after the name, for a file or a directory whose name
+#: :func:`_win_opens_another` flags.
+_REWRITTEN_FILE = "(a name Windows opens as another object, not truncated)"
+_REWRITTEN_DIR = "(a name Windows opens as another object, not walked)"
+#: What the fail-safe reports, after the name, for a listed file gone from its name before its open.
+_GONE_REASON = "(moved or removed before it was emptied, not truncated)"
+
+
+def _win_opens_another(path: Path) -> bool:
+    """Windows: whether an open of ``path`` by name would reach an object other than the one listed
+    as ``path.name`` (BACKLOG #2420).
+
+    Win32 rewrites a path before it opens it. At least it drops a trailing dot or space from a name,
+    so ``a.tar.`` opens ``a.tar`` or nothing, and it opens a reserved device name as the device. Of
+    ``NUL``, ``AUX``, ``COM1``, ``CONIN$`` and ``con.txt``, Windows 11 build 26300 rewrote only
+    ``NUL`` (measured), and the set differs by build, so this asks the OS's own rewrite
+    (``os.path.abspath``, which is ``GetFullPathNameW``) rather than keep a list. A name it changes
+    is reported: the open would reach some other object, and the listed file
+    would keep its bytes while the report called it empty. The final-path compare on the opened
+    handle backs this up (:func:`_open_unfollowed`)."""
+    # The trailing dot or space is tested as such too: `abspath` falls back to a pure-Python join that
+    # rewrites nothing if `GetFullPathNameW` raises, and this must not then pass the name.
+    if path.name.endswith((".", " ")):
+        return True
+    plain = os.path.join(os.path.abspath(path.parent), path.name)
+    return os.path.abspath(plain) != plain
+
+
+def _win_rewritten(path: Path) -> bool:
+    """:func:`_win_opens_another` on Windows; never on POSIX, which opens every name as itself."""
+    return sys.platform == "win32" and _win_opens_another(path)
 
 
 class _HardLinked(OSError):
@@ -2022,18 +2080,24 @@ class _HardLinked(OSError):
 
 
 class _Outside(OSError):
-    """Windows: the file opened as itself has a final path outside the staging directory, so it is
+    """Windows: the file opened as itself has a final path outside the directory listed, so it is
     not truncated and is reported as :data:`_OUTSIDE_REASON`. Never carries a name."""
 
 
-def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> str | None:
+def _truncate_unfollowed(entry: Path, dir_fd: int | None, here: str | None) -> str | None:
     """Truncate ``entry`` if it is a regular file with one link, checked on the handle that truncates
     it. ``None`` when it was emptied or holds nothing to empty, else what to report.
 
-    ``dir_fd`` is its directory's descriptor on POSIX; ``inside`` is the staging directory's final
-    path on Windows, as :func:`_win_held_walk` yields it. The ``lstat`` first only skips a link or a
-    hard link without opening it; the check that decides is the one on the open handle."""
+    ``dir_fd`` is its directory's descriptor on POSIX; ``here`` is that directory's final path on
+    Windows, as :func:`_win_held_walk` yields it. The ``lstat`` first only skips a link or a hard
+    link without opening it; the check that decides is the one on the open handle.
+
+    A name that is gone at the ``lstat`` or the open is reported, not read as nothing to empty: it
+    was listed, so it was renamed or removed since, and a rename leaves the file full under a name
+    this walk may never list (BACKLOG #2420)."""
     name = entry.name
+    if _win_rewritten(entry):
+        return f"{name} {_REWRITTEN_FILE}"
     try:
         if dir_fd is not None:
             st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -2045,7 +2109,7 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
         else:
             st = os.lstat(entry)
     except FileNotFoundError:
-        return None
+        return f"{name} {_GONE_REASON}"
     except OSError:
         return name
     # A directory here is one the walk took for a file because reading its type raised, so nothing
@@ -2064,9 +2128,9 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
     if st.st_nlink > 1:
         return f"{name} (hard-linked, not truncated)"
     try:
-        fd = _open_unfollowed(entry, dir_fd, inside)
+        fd = _open_unfollowed(entry, dir_fd, here)
     except FileNotFoundError:
-        return None
+        return f"{name} {_GONE_REASON}"
     except OSError as exc:
         return _not_truncated(name, exc)
     try:
@@ -2095,9 +2159,9 @@ def _not_truncated(name: str, exc: OSError) -> str:
     return name
 
 
-def _open_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> int:
+def _open_unfollowed(entry: Path, dir_fd: int | None, here: str | None) -> int:
     """Open ``entry`` for writing without following a link at its last component, and return a
-    descriptor. A test seam. ``dir_fd`` and ``inside`` are as :func:`_truncate_unfollowed` takes
+    descriptor. A test seam. ``dir_fd`` and ``here`` are as :func:`_truncate_unfollowed` takes
     them.
 
     POSIX opens ``entry.name`` relative to ``dir_fd`` (``entry`` itself without one) with
@@ -2108,13 +2172,16 @@ def _open_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> int
     Windows opens ``entry`` through ``transports/file.py``'s :func:`_win_open_file`, the file
     connector's own open: as itself, refusing a link or junction there (``_Unconfined``), and
     refusing a reopen that reaches another file (``_Replaced``). Before a filter is let serve the
-    file, the file opened as itself must have a final path under ``inside`` (``_Outside``) and pass
-    :func:`_vet_for_truncate`, so a file reached outside the directory, through a directory turned
-    into a junction in place, is never served by its filter (BACKLOG #4992).
+    file, the file opened as itself must have a final path under ``here``, the directory listed
+    (``_Outside``), and equal to ``here`` joined with the name listed (``_Replaced``), and pass
+    :func:`_vet_for_truncate`. So a file reached outside the directory, through a directory turned
+    into a junction in place, is never served by its filter (BACKLOG #4992), and a name Windows
+    rewrote on the way to the open is never truncated as another file (BACKLOG #2420), the exact
+    compare ``transports/file.py``'s ``_open_confined`` makes.
 
     A name that is gone once the file was opened as itself, as when it is renamed away before the
-    reopen, raises ``_Replaced``, not ``FileNotFoundError``: the caller reads that as nothing to
-    empty, and the file still holds its bytes under another name."""
+    reopen, raises ``_Replaced``, not ``FileNotFoundError``, so the caller reports it as changed
+    rather than as gone before its open."""
     if sys.platform == "win32":
         # GENERIC_READ | GENERIC_WRITE, what `open(..., "r+b")` asked for before.
         access = 0x80000000 | 0x40000000
@@ -2122,8 +2189,12 @@ def _open_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> int
 
         def vet(fd: int) -> None:
             opened.append(True)
-            if inside is not None and not _win_final_path(_os_handle(fd)).startswith(inside):
-                raise _Outside("outside the directory")
+            if here is not None:
+                final = _win_final_path(_os_handle(fd))
+                if not final.startswith(here):
+                    raise _Outside("outside the directory")
+                if final != here + os.path.normcase(entry.name):
+                    raise _Replaced("not the name listed")
             _vet_for_truncate(fd)
 
         try:
@@ -2209,8 +2280,10 @@ def _win_held_walk(
     staging: Path, unproven: list[str], report: Callable[[str | None], None]
 ) -> Iterator[tuple[str, list[str], list[str], str]]:
     """Windows: walk ``staging`` top down, as ``os.walk`` does, yielding ``(dirpath, dirnames,
-    filenames, inside)`` for each directory, where ``inside`` is ``staging``'s final path with a
-    trailing separator, for a prefix test. A caller that prunes ``dirnames`` in place prunes the walk.
+    filenames, here)`` for each directory, where ``here`` is that directory's final path with a
+    trailing separator, for the compare :func:`_open_unfollowed` makes. Below ``staging`` it must
+    equal ``staging``'s final path joined with the names walked (BACKLOG #2420). A caller that prunes
+    ``dirnames`` in place prunes the walk.
 
     Each directory is HELD by :func:`_win_hold_dirs`, with every directory between it and
     ``staging``, and ``staging`` itself: opened as themselves, refused if one names another path, and
@@ -2224,7 +2297,8 @@ def _win_held_walk(
     A directory that cannot be opened or listed is added to ``unproven`` by its own name, never
     ``staging``'s, and its error is logged as itself (:func:`_win_unlisted`). One that is a link, a
     junction or no directory, or whose final path lies outside ``staging``, is passed to ``report``
-    as :data:`_OUTSIDE_REASON`, without a name. Neither is descended into."""
+    as :data:`_OUTSIDE_REASON`, without a name; one inside it at another path than the one walked is
+    reported by its name. None of them is descended into."""
     held_root = _win_hold_root(staging, unproven)
     if held_root is None:
         return
@@ -2233,9 +2307,10 @@ def _win_held_walk(
         stack = [staging]
         while stack:
             where = stack.pop()
-            held = _win_hold_below(staging, where, inside, unproven, report)
-            if held is None:
+            below = _win_hold_below(staging, where, inside, unproven, report)
+            if below is None:
                 continue
+            held, here = below
             try:
                 try:
                     with os.scandir(where) as listing:
@@ -2250,7 +2325,7 @@ def _win_held_walk(
                     (dirnames if entry.is_dir(follow_symlinks=False) else filenames).append(
                         entry.name
                     )
-                yield os.fspath(where), dirnames, filenames, inside
+                yield os.fspath(where), dirnames, filenames, here
                 stack.extend(where / name for name in reversed(dirnames))
             finally:
                 _win_release(held)
@@ -2260,7 +2335,13 @@ def _win_held_walk(
 
 def _win_hold_root(staging: Path, unproven: list[str]) -> tuple[list[int], str] | None:
     """Hold ``staging`` itself and return its handle with its final path, or ``None`` once what
-    stopped it is reported. A link or a junction there is never walked."""
+    stopped it is reported. A link or a junction there is never walked, nor a name Windows would
+    open as another directory (:func:`_win_opens_another`), as a planted ``mefor-backup-x.`` would
+    open ``mefor-backup-x``, nor a held directory whose final path does not end in ``staging``'s
+    name, the backstop the walk below it keeps too (BACKLOG #2420)."""
+    if _win_opens_another(staging):
+        unproven.append(f"{staging.name}/ {_REWRITTEN_DIR}")
+        return None
     try:
         root = _win_hold_dirs(staging.parent, (staging.name,))
     except _Unconfined:
@@ -2275,11 +2356,16 @@ def _win_hold_root(staging: Path, unproven: list[str]) -> tuple[list[int], str] 
         _win_unlisted(unproven, staging, exc)
         return None
     try:
-        return root, _win_final_path(root[0]).rstrip("\\") + "\\"
+        final = _win_final_path(root[0]).rstrip("\\")
     except OSError as exc:
         _win_release(root)
         _win_unlisted(unproven, staging, exc, final_path=True)
         return None
+    if os.path.basename(final) != os.path.normcase(staging.name):
+        _win_release(root)
+        unproven.append(f"{staging.name}/ (changed while being emptied, not walked)")
+        return None
+    return root, final + "\\"
 
 
 def _win_hold_below(
@@ -2288,11 +2374,13 @@ def _win_hold_below(
     inside: str,
     unproven: list[str],
     report: Callable[[str | None], None],
-) -> list[int] | None:
-    """Hold every directory from below ``staging`` down to ``where`` and return their handles, or
-    ``None`` once what refused it is reported. ``staging`` itself is held by the caller."""
+) -> tuple[list[int], str] | None:
+    """Hold every directory from below ``staging`` down to ``where`` and return their handles with
+    ``where``'s final path, ending in a separator, or ``None`` once what refused it is reported.
+    ``staging`` itself is held by the caller, and ``inside`` is its final path."""
+    parts = where.relative_to(staging).parts
     try:
-        held = _win_hold_dirs(staging, where.relative_to(staging).parts)
+        held = _win_hold_dirs(staging, parts)
     except _Unconfined:
         report(_OUTSIDE_REASON)
         return None
@@ -2300,18 +2388,209 @@ def _win_hold_below(
         _win_unlisted(unproven, where, exc)
         return None
     if not held:  # `staging` itself, checked by _win_hold_root
-        return held
+        return held, inside
     try:
-        outside = not (_win_final_path(held[-1]).rstrip("\\") + "\\").startswith(inside)
+        here = _win_final_path(held[-1]).rstrip("\\") + "\\"
     except OSError as exc:
         _win_release(held)
         _win_unlisted(unproven, where, exc, final_path=True)
         return None
-    if outside:
+    if not here.startswith(inside):
         _win_release(held)
         report(_OUTSIDE_REASON)
         return None
-    return held
+    if here != inside + os.path.normcase(os.sep.join(parts)) + "\\":
+        # Inside, but not at the path walked: a rewritten name the screen missed, or a directory
+        # turned into a junction to another one inside (BACKLOG #2420). Nothing in it is emptied
+        # under names that may be another directory's; this line reports it instead.
+        _win_release(held)
+        unproven.append(f"{where.name}/ (changed while being emptied, not walked)")
+        return None
+    return held, here
+
+
+def _win_verbatim(path: Path) -> str:
+    """``path`` behind Win32's verbatim prefix (``\\\\?\\``, or ``\\\\?\\UNC\\`` for a share), which
+    has Windows open each name exactly as written. Its parent is resolved as the engine resolves it."""
+    plain = os.path.join(os.path.abspath(path.parent), path.name)
+    if plain.startswith(("\\\\?\\", "\\\\.\\")):
+        return "\\\\?\\" + plain[4:]
+    if plain.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + plain[2:]
+    return "\\\\?\\" + plain
+
+
+def _rewritten_staging_refusal(staging: Path) -> str | None:
+    """What the teardown reports, untouched, for a staging directory whose name Windows would open as
+    another directory (:func:`_win_rewritten`), or whose screen faulted; ``None`` for any other.
+    Never raises: the teardown runs from ``_Staging.release`` after a verdict, or while an error is
+    in flight, and must replace neither. A fault is read as a name not to touch.
+
+    The ban on the plain path comes before any path. So the first 200 characters a failure record
+    keeps hold it, whatever the path's length, where this sentence leads the error or follows only
+    a passing verify's bare ``the archive verified, but``. A verify that gives a reason of its own,
+    a failed one or a config-only pass, puts that reason first, and it can push the ban, or its
+    ``without the \\\\?\\ prefix``, past the cut. The cut rarely keeps the path. The ERROR log line
+    holds the whole text, but after redaction, which can rewrite a path in it, hence the
+    instruction to run no command when a path shows a redaction marker. Those markers are at
+    least ``<redacted>``, which ``CredentialScrubFilter`` and ``CredentialQueryScrubFilter`` write
+    (``secretscrub.CREDENTIAL_PLACEHOLDER``); ``[redacted]``, which ``RedactionFilter``, and
+    ``safe_exc`` on the failure record and alert, write (``redaction._REDACTED``); and
+    ``[REDACTED]``, which the support bundle writes over its copy of the log
+    (``support/redact.py``). The text names the first two and covers the third as "any other
+    redaction marker", since a log line that already holds ``[REDACTED]`` takes
+    ``redact_log_line``'s whole-line credential pass, and engine prose must not choose that.
+
+    It names the directory by its verbatim path only, as a PowerShell single-quoted literal
+    (:func:`_ps_literal`, through :func:`_ps_path`), whose closing quote shows a trailing space
+    and in which nothing expands,
+    names any trailing dot or space in words, and names ``Remove-Item -LiteralPath`` and
+    ``Test-Path -LiteralPath`` on that literal as the only removal and its check. The check is a
+    two-step control: the same ``Test-Path`` command prints ``True`` before the removal and
+    ``False`` after, since a ``False`` before it cannot tell a command that names nothing from a
+    directory that is gone or cannot be read. The command ends this text, after ``_CHECKS_LEAD``,
+    and every character of the text passes ``str.isprintable``, which :func:`redact` requires
+    before its encoded-HL7 pass (:func:`join_before_checks` says why that binds). A path holding a
+    character that does not, a line break among them, is named by :func:`_ps_path`'s exact
+    expression, which spells that character as ``[char]0x....``. Text that names no command, the
+    fault's detail and the fallback's names, is escaped (``escape_for_terminal``). A caller that
+    adds to a
+    message holding this text adds before the checks, through :func:`join_before_checks`. At least
+    the run's and the build's errors, ``_verify_and_publish``'s, and ``pipeline/dr.py``'s
+    ``KEY_MISMATCH`` and failed restore-verify aborts do; its errored and timed-out aborts carry no
+    refusal at all. With two refusals in one message both checks end it, joined by `` ; ``, so the
+    text points at the check on this same path, not at the last one. The ``Remove-Item`` command
+    is set off by a colon before it and a `` ;`` after it, and text follows it. No ``cmd.exe``
+    form is given: interactive ``cmd.exe`` expands ``%VAR%`` even inside double quotes. A screen
+    fault's detail comes before the commands and after the verbatim path, since it can carry the
+    plain path.
+
+    Measured on Windows 11 build 26300, with synthetic files: a removal by the plain path, by
+    ``rd /s /q`` or ``Remove-Item -Recurse``, removes the OTHER directory and leaves this one, and
+    reports nothing. The printed ``Remove-Item`` command, run from a script in Windows PowerShell
+    5.1 and in PowerShell 7 on a name ending in ``%PATH%`` and a space, removed only this
+    directory, rewritten names inside it included, and left the other; the printed ``Test-Path``
+    command, taken from after ``_CHECKS_LEAD``, read ``True`` before it and ``False`` after, and
+    two checks joined by `` ; `` and run as one line printed one value each. The same held for
+    names holding U+2028 and U+00A0, spelled by :func:`_ps_path`'s ``[char]`` expression. With no other directory there, that check read ``True``
+    where the same check by the plain path read ``False``; with a file in it held open, the removal
+    printed its errors and the check still read ``True``. On an existing path it could not read,
+    ``Test-Path`` printed ``False`` and an access-denied error, even with ``-ErrorAction Stop``,
+    hence "and no error" (BACKLOG #2420)."""
+    fault = ""
+    try:
+        if not _win_rewritten(staging):
+            return None
+        why = "Windows opens that path as another directory"
+    except Exception as exc:  # never raise over the verdict or the error in flight
+        why = "whether that path reaches another directory could not be checked"
+        fault = f" (the engine's screen of its name failed: {safe_exc(exc)})"
+    ban = (
+        "a plaintext staging directory was not removed or emptied; never remove it by its plain "
+        f"path, without the \\\\?\\ prefix, since {why}"
+    )
+    trailing = staging.name[len(staging.name.rstrip(". ")) :]
+    ends = (
+        ", whose name ends in "
+        + " then ".join("a dot" if c == "." else "a space" for c in trailing)
+        if trailing
+        else ""
+    )
+    fault = escape_for_terminal(fault, single_line=True)
+    try:
+        literal = _ps_path(_win_verbatim(staging))
+    except Exception as exc:  # never raise over the verdict or the error in flight
+        # No command: one assembled by hand from a name and a parent is the mistake this prevents.
+        return (
+            f"{ban}; it is named {_ps_path(staging.name)}{ends}, in "
+            f"{_ps_path(str(staging.parent))}, and since its verbatim path could not be formed, "
+            f"no removal can be named for it here; leave it in place{fault} (forming the path "
+            f"failed: {escape_for_terminal(safe_exc(exc), single_line=True)})"
+        )
+    return (
+        f"{ban}; it is {literal}{ends}{fault}; a path here that shows <redacted>, [redacted] "
+        "or any other redaction marker was rewritten by redaction and is not the "
+        "directory's path, so run no command here; otherwise, in PowerShell, not cmd.exe, first "
+        "run the Test-Path command on this same path that ends this message, and only that "
+        "command; it must print True, and a False means that command does not reach this "
+        "directory, whether it is gone, cannot be read or is named wrong, so run nothing more; "
+        "only after a True, remove it only with this command: Remove-Item -LiteralPath "
+        f"{literal} -Recurse -Force ; then run that Test-Path command again, which must print "
+        f"False and no error{_CHECKS_LEAD}{_TEST_PATH} {literal}"
+    )
+
+
+#: The check :func:`_rewritten_staging_refusal` names, last in its text and in any message holding it.
+_TEST_PATH = "Test-Path -LiteralPath"
+#: What sets the checks off at the end of a message, ahead of the first.
+_CHECKS_LEAD = "; to check, in PowerShell: "
+#: Each character PowerShell reads as a single quote, which :func:`_ps_literal` doubles.
+_PS_QUOTES = "'\u2018\u2019\u201a\u201b"
+_PS_LITERAL = f"'(?:[^{_PS_QUOTES}]|" + "|".join(re.escape(q * 2) for q in _PS_QUOTES) + ")*+'"
+_PS_PART = rf"(?:{_PS_LITERAL}|\[char\]0x[0-9A-F]{{4}})"
+#: One check as :func:`_rewritten_staging_refusal` writes it, on a :func:`_ps_path` path.
+_CHECK = rf"{re.escape(_TEST_PATH)} (?:{_PS_LITERAL}|\({_PS_PART}(?: \+ {_PS_PART})*+\))"
+#: The checks that end a message, from the first lead after which nothing else follows. The search
+#: takes the leftmost such lead, so one inside a path is not taken for it. A Windows name cannot
+#: hold the lead, whose colon NTFS refuses, but the split does not rest on that. Every unbounded
+#: repetition here is possessive. The ReDoS gate's pin for this file, in
+#: tests/test_security_static.py, says what checks that and why possessive keeps the matches.
+_CHECKS_AT_END = re.compile(rf"{re.escape(_CHECKS_LEAD)}({_CHECK}(?: ; {_CHECK})*+)\Z")
+
+
+def _split_checks(text: str) -> tuple[str, str]:
+    """``text`` without the checks that end it, and those checks; ``(text, "")`` when none do."""
+    found = _CHECKS_AT_END.search(text)
+    return (text, "") if found is None else (text[: found.start()], found.group(1))
+
+
+def join_before_checks(text: str, sep: str, more: str) -> str:
+    """``text``, ``sep`` and ``more``, with the ``Test-Path`` checks either ends in moved to the end
+    of the whole, after ``_CHECKS_LEAD`` and joined by `` ; ``, so no text this joins follows a
+    check. The message needs no line break for that, which matters: :func:`redact` skips its
+    encoded-HL7 pass on a whole text that fails ``str.isprintable``, and a line break fails it."""
+    head, checks = _split_checks(text)
+    more_head, more_checks = _split_checks(more)
+    joined = f"{head}{sep}{more_head}"
+    every = " ; ".join(c for c in (checks, more_checks) if c)
+    return f"{joined}{_CHECKS_LEAD}{every}" if every else joined
+
+
+def _ps_literal(text: str) -> str:
+    """``text`` as a PowerShell single-quoted string literal: nothing in it expands, and each
+    character PowerShell reads as a single quote is doubled, the escape PowerShell's own
+    ``EscapeSingleQuotedStringContent`` applies."""
+    for quote in _PS_QUOTES:
+        text = text.replace(quote, quote * 2)
+    return f"'{text}'"
+
+
+def _ps_path(text: str) -> str:
+    """``text`` as an exact PowerShell expression whose own characters all pass
+    ``str.isprintable``: :func:`_ps_literal` where ``text`` does, and otherwise a parenthesised
+    concatenation of literals with each other UTF-16 code unit spelled ``[char]0x....``, since a
+    message that holds the raw character turns off :func:`redact`'s encoded-HL7 pass."""
+    if text.isprintable():
+        return _ps_literal(text)
+    parts = ["''"]
+    run = ""
+    for char in text:
+        if char.isprintable():
+            run += char
+            continue
+        if run:
+            parts.append(_ps_literal(run))
+            run = ""
+        # surrogatepass: a Windows name can hold an unpaired UTF-16 unit, which Python keeps as a
+        # lone surrogate and strict encoding refuses; passed through, it is that same unit.
+        units = char.encode("utf-16-le", errors="surrogatepass")
+        parts.extend(
+            f"[char]0x{int.from_bytes(units[i : i + 2], 'little'):04X}"
+            for i in range(0, len(units), 2)
+        )
+    if run:
+        parts.append(_ps_literal(run))
+    return "(" + " + ".join(parts) + ")"
 
 
 def _discard_verify_staging(staging: Path) -> str | None:
@@ -2329,7 +2608,10 @@ def _discard_verify_staging(staging: Path) -> str | None:
     Truncation rather than an overwrite with zeros: on an SSD or a copy-on-write volume an overwrite
     lands on new blocks and proves nothing, so the promise that can be kept is that the FILE no
     longer holds the plaintext. The blocks it freed still do until reused, and only full-disk
-    encryption on the staging volume covers them (docs/PHI.md section 10)."""
+    encryption on the staging volume covers them (docs/PHI.md section 10).
+
+    Its caller, :func:`_teardown_staging`, screens first for a name Windows would open as another
+    directory, and never hands one here."""
     unproven: list[str] = []
     try:
         if _remove_tree(staging):
@@ -2414,51 +2696,11 @@ _HELD_MARKER_NAME = ".lock-held"
 _LOCK_UNSUPPORTED = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP})
 
 
-def _lock_exclusive(fd: int, *, wait: bool) -> bool:
-    """Take an exclusive OS lock on ``fd``. ``True`` when held. With ``wait`` False, ``False`` means
-    another handle holds it. The OS drops the lock when the process dies, which is what lets a crashed
-    run's directory be told apart from a live one.
-
-    ``flock`` on POSIX, not ``lockf``: a ``lockf`` lock belongs to the process, so a second handle in
-    the same process would not conflict, and a live run could not be told apart from a dead one by an
-    engine that shares its process. ``msvcrt.locking`` on Windows is per handle already."""
-    if sys.platform == "win32":
-        import msvcrt
-
-        os.lseek(fd, 0, os.SEEK_SET)
-        try:
-            msvcrt.locking(fd, msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK, 1)
-        except OSError as exc:
-            # A held range refuses with EACCES, or EDEADLOCK, the CRT's other contention code (the
-            # same reading as `api/tls.py`). Anything else is a real fault and propagates.
-            if wait or exc.errno not in (errno.EACCES, errno.EDEADLOCK):
-                raise
-            return False
-        return True
-    import fcntl
-
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        if wait:
-            raise
-        return False
-    return True
-
-
 def _unlock_and_close(fd: int) -> None:
     """Drop the lock and close the handle. Never raises."""
     # A failed unlock is harmless: closing the handle below drops the lock anyway.
     with contextlib.suppress(OSError):
-        if sys.platform == "win32":
-            import msvcrt
-
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        file_lock.unlock(fd)
     with contextlib.suppress(OSError):
         os.close(fd)
 
@@ -2511,7 +2753,18 @@ def _teardown_staging(path: Path) -> str | None:
     A refused removal can take the lock file and marker with it, because ``rmtree`` removes entries in
     listing order and on NTFS the dot-names list first. Left like that, the directory would hold
     plaintext and no proof, and every later sweep would skip it. Nobody holds the lock now, so the
-    files are all the proof needs."""
+    files are all the proof needs.
+
+    On Windows a directory whose name Windows would open as another (:func:`_win_opens_another`) is
+    not removed, emptied or re-marked at all, nor one whose screen faulted: its removal by path
+    would remove that other directory and then find the name gone, and so report it clean while it
+    keeps its files, and its marks would land in the other directory (BACKLOG #2420). The engine
+    never names a staging directory that way, so one reaches here only from a sweep of a shared
+    root. It is screened once, here, and reported by :func:`_rewritten_staging_refusal`."""
+    refusal = _rewritten_staging_refusal(path)
+    if refusal is not None:
+        log.error("DR staging: %s", refusal)
+        return refusal
     leftover = _discard_verify_staging(path)
     if os.path.lexists(path):
         # `_O_NONBLOCK` too, as the fail-safe's own opens: a FIFO planted at either name would
@@ -2744,7 +2997,7 @@ def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
         _remove_tree(path)
         raise
     try:
-        _lock_exclusive(fd, wait=True)
+        file_lock.lock_exclusive(fd, wait=True)
     except OSError as exc:
         if exc.errno not in _LOCK_UNSUPPORTED:
             _unlock_and_close(fd)
@@ -3350,7 +3603,7 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
             )
             continue
         try:
-            if not _lock_exclusive(fd, wait=False):
+            if not file_lock.lock_exclusive(fd, wait=False):
                 continue  # a live run holds it
             if not os.path.lexists(path / _HELD_MARKER_NAME):
                 continue  # locked by nobody, but no marker: not proven abandoned

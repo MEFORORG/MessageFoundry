@@ -164,7 +164,8 @@ def test_security_symbols_are_what_the_console_actually_imports(surface: Any) ->
     ``GET /ui/sso`` (BACKLOG #2454). ``RepeatedCredentialError`` and ``record_repeated_credential``
     joined when the session-cookie read took the same rule (BACKLOG #2454).
     ``ConfigWriteNotRecorded`` joined when the console's flag route took the audit refusal by type
-    (BACKLOG #3811)."""
+    (BACKLOG #3811). ``record_ws_gate`` joined with the WebSocket accept gate (vault
+    BACKLOG #2955)."""
     assert surface.security_symbols == (
         "ConfigWriteNotRecorded",
         "RepeatedCredentialError",
@@ -180,6 +181,7 @@ def test_security_symbols_are_what_the_console_actually_imports(surface: Any) ->
         "pending_credential_deadline_for",
         "public_route",
         "record_repeated_credential",
+        "record_ws_gate",
     )
 
 
@@ -210,11 +212,15 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
     saves' console routes bind and their continuations mint.
 
     BACKLOG #3374 added ``OidcStepUpFlow``, the live step-up flow the ``/ui/oidc`` callback reads
-    to charge a step-up return to the staged user's ceremony budget."""
+    to charge a step-up return to the staged user's ceremony budget.
+
+    ADR 0207 (vault BACKLOG #2609) added ``EnrolmentCodeRefused``, which the TOTP confirm form
+    answers on itself, and the two enrolment-code actions the user page's lanes bind."""
     assert surface.auth_service_symbols == (
         "AuthService",
         "DirectoryRefusal",
         "Elevation",
+        "EnrolmentCodeRefused",
         "FEDERATED_BINDING_CHANGED",
         "LoginOutcome",
         "MfaStatus",
@@ -223,6 +229,8 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
         "OidcStepUpFlow",
         "PasskeyProof",
         "RolesGained",
+        "STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_ISSUE",
+        "STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_REVOKE",
         "STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY",
         "STEP_UP_ACTION_ADMIN_RESET_MFA",
         "STEP_UP_ACTION_ADMIN_RESET_PASSWORD",

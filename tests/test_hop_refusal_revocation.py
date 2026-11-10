@@ -651,9 +651,18 @@ def test_the_store_crl_closes_its_own_gate_on_the_default_path(bare_crl: str) ->
 def test_the_default_path_refuses_a_crl_bundle_that_adds_a_trust_anchor(crl_bundle: str) -> None:
     """The #1890 refusal reaches the default path too. A CA+CRL bundle in the CRL slot would add its CA
     as a trust anchor beside the system store, and that must refuse rather than widen trust."""
-    with pytest.raises(ValueError, match=r"not already in this hop's trust store") as exc:
+    with pytest.raises(ValueError) as exc:
         _build_ssl(_pg(ssl_crl_file=crl_bundle))
     assert "[store].ssl_crl_file" in str(exc.value)
+    # The open's refusal text is fixed (engine PR 2818's seventh hold) and, since the eighth hold,
+    # raised after its handler has exited: the builder's error is on neither chain link.
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
+    # The control: the builder itself, unwrapped, refuses for the trust-anchor reason, so the open's
+    # fixed refusal above is this check's and not some other failure's.
+    from messagefoundry.store.postgres import _verifying_context
+
+    with pytest.raises(ValueError, match="not already in this hop's trust store"):
+        _verifying_context(_pg(ssl_crl_file=crl_bundle))
 
 
 def test_the_store_crl_is_refused_on_a_hop_that_verifies_nothing(bare_crl: str) -> None:
