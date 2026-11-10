@@ -518,6 +518,7 @@ def test_a_cut_tail_against_an_expected_prefix_is_a_break_with_no_key() -> None:
     ok, message = cut
     assert not ok and not cut.key_unavailable, message
     assert AUDIT_PREFIX_BREAK_MARKER in (message or ""), message
+    assert cut.prefix_break and not intact.prefix_break, cut  # what the engine routes on
 
 
 def test_a_range_rows_link_is_checked_with_no_key() -> None:

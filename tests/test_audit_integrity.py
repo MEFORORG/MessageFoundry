@@ -1530,8 +1530,6 @@ def test_prefix_break_marker_appears_in_a_real_prefix_failure() -> None:
     ok, msg = audit_prefix_verdict((3, "a" * 64), None, 2)
     assert ok is False
     assert msg is not None and AUDIT_PREFIX_BREAK_MARKER in msg
-    # And it must NOT match the other verdict, or the discriminator calls everything a truncation.
-    assert AUDIT_PREFIX_BREAK_MARKER not in "audit chain broken at seq=4, row id=4"
 
 
 async def test_startup_anchor_passes_when_the_log_only_grew(tmp_path: Path) -> None:
@@ -1619,17 +1617,23 @@ async def test_the_walk_sets_prefix_break_on_a_cut_tail_and_never_on_a_break(
     tmp_path: Path,
 ) -> None:
     """The flag the engine classifies on comes from the comparator, not from the message (vault
-    BACKLOG #3054, item 11). A cut tail sets it; a clean anchored walk does not; an edited row WITH a
-    cut tail does not either, because a break outranks it and the comparator never runs."""
+    BACKLOG #3054, item 11). A cut tail sets it; the exact seal over the same cut does not; an
+    edited row WITH a cut tail does not either, because a break outranks it."""
     db = tmp_path / "flag.db"
     await _aseed_audit_rows(db, 5)
     anchor = await _aread_anchor(db)
-    clean = await _averify_with_prefix(db, anchor)
-    assert clean[0] and not clean.prefix_break, clean
+    assert (await _averify_with_prefix(db, anchor))[0]  # precondition: the anchor fits
 
     await _atruncate_audit_tail(db, keep=2)
     cut = await _averify_with_prefix(db, anchor)
     assert not cut[0] and cut.prefix_break, cut
+    # Control: the exact seal sees the same cut, and it is not the prefix comparator.
+    store = await MessageStore.open(db)
+    try:
+        sealed = await store.verify_audit_chain(expected_anchor=parse_audit_anchor(anchor))
+    finally:
+        await store.close()
+    assert not sealed[0] and not sealed.prefix_break, sealed
 
     edited = tmp_path / "edited.db"
     await _aseed_audit_rows(edited, 4)
