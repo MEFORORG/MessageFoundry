@@ -668,7 +668,8 @@ scrub it passes. The [PHI.md logging
 inventory](PHI.md#logging-inventory-1611--1623) says what alert text can leave the box: at least
 its rows for the `[alerts]` webhook and SMTP transports (rows 10 and 11), and the
 `LoggingAlertSink` fallback (row 13), whose lines fold into the general application log (row 1)
-and so go wherever that log goes; at least rows 1 and 14 name those routes. Its `alert_instance`
+and so go wherever that log goes: at least the off-box forwarder and its spool (rows 4 and 19),
+`GET /logs/tail` (row 1) and a support bundle (row 14). Its `alert_instance`
 row (row 8) says what an instance holds.
 
 ### Common problems

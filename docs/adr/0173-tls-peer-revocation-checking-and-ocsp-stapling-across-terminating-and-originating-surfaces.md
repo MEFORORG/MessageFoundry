@@ -1121,19 +1121,20 @@ this table as a count of verifying hops.** Per SDS-3.6, it is "at least these".
 
 The counts paragraph above names the alert SMTP hop and the alert webhook among its seven. The webhook is now guarded; the SMTP hop is guarded only when it carries a login, and the hop with no login is declined, not guarded. The AI broker, also among the seven, is guarded too, as the next note says. This note does not re-check the paragraph's other counts.
 
+**Note 2026-10-30: the AI broker endpoint is guarded by attestation (BACKLOG #2193 slice (e), owner ruling 2026-10-27, on the §12 pattern).** The AI broker row of the table above says how. The ruling, as the batch 453 Manager recorded it under the owner's delegation: the webhook and the AI broker "get attestation-pair guards on the ADR 0173 section 12 pattern". So the lever is a settings pair, `[ai].endpoint_revocation_attested` with `[ai].endpoint_revocation_attested_reason`, refused at load unless the two travel together; the hop refuses under enforce unless it is set; an unknown posture counts as enforcing; `security_loosenings()` names a set pair with its reason; and no CRL lever is built. Four facts the row does not carry. The broker is built per request, so the refusal comes at `POST /ai/chat`, answered 503, and not at start; `messagefoundry check` builds no broker and has no leg for this pair. Each crossing line is written once per process for each endpoint host. `MEFOR_TLS_REVOCATION_ATTESTED` does not cross this hop under an enforcing or unknown posture (BACKLOG #299). A later CRL lever could start at the context the guard already reads, but it would need a context of its own: the shared opener is never handed a CRL. The counts paragraph above names the AI broker as one of its seven hops; it no longer needs a guard. The alert webhook and the alert and security-notice SMTP hop with a login are guarded too, as the note above says; that SMTP hop with no login is declined there. This note does not re-check the paragraph's other counts.
+
 **Note 2026-11-10: the SMTP decline does not rest on an alert body being PHI-free, and an alert
-body is not PHI-free in the shipped code (BACKLOG #5021).** The decline above rests on no
-credential crossing the hop. What a body carries is in the [PHI.md logging
-inventory](../PHI.md#logging-inventory-1611--1623): its row for the `[alerts]` SMTP transport (row
-11) and its row for the security-event notifier (row 12). The owner ruled on 2026-11-09 (decision
-record `d20261110T081839838-3120c4`) that the decline stands, and that the fix for the body is one
-key allowlist that every off-box alert passes through. That allowlist is not built in the shipped
+body is not PHI-free in the shipped code (BACKLOG #5021).** The decline in the 2026-10-30 note on
+slices (c) and (d) rests on no credential crossing the hop. What a body carries is in the [PHI.md
+logging inventory](../PHI.md#logging-inventory-1611--1623): its row for the `[alerts]` SMTP
+transport (row 11) and its row for the security-event notifier (row 12). The owner ruled on
+2026-11-09 (decision record `d20261110T081839838-3120c4`, whose id is stamped in UTC) that the
+decline stands, and that the fix for the body is one key allowlist that every off-box alert
+passes through. That allowlist is not built in the shipped
 code; it is the off-box alert key allowlist row, unallocated. By the same ruling, an alert
 exemption whose stated reason was a PHI-free body is to be re-checked against that allowlist once
 it is built, at least [ADR 0029](0029-email-smtp-destination.md)'s ungated alert sender domain and
 the `[alerts]` sinks sitting outside `[egress]` ([DEPLOYMENT.md](../DEPLOYMENT.md)).
-
-**Note 2026-10-30: the AI broker endpoint is guarded by attestation (BACKLOG #2193 slice (e), owner ruling 2026-10-27, on the §12 pattern).** The AI broker row of the table above says how. The ruling, as the batch 453 Manager recorded it under the owner's delegation: the webhook and the AI broker "get attestation-pair guards on the ADR 0173 section 12 pattern". So the lever is a settings pair, `[ai].endpoint_revocation_attested` with `[ai].endpoint_revocation_attested_reason`, refused at load unless the two travel together; the hop refuses under enforce unless it is set; an unknown posture counts as enforcing; `security_loosenings()` names a set pair with its reason; and no CRL lever is built. Four facts the row does not carry. The broker is built per request, so the refusal comes at `POST /ai/chat`, answered 503, and not at start; `messagefoundry check` builds no broker and has no leg for this pair. Each crossing line is written once per process for each endpoint host. `MEFOR_TLS_REVOCATION_ATTESTED` does not cross this hop under an enforcing or unknown posture (BACKLOG #299). A later CRL lever could start at the context the guard already reads, but it would need a context of its own: the shared opener is never handed a CRL. The counts paragraph above names the AI broker as one of its seven hops; it no longer needs a guard. The alert webhook and the alert and security-notice SMTP hop with a login are guarded too, as the note above says; that SMTP hop with no login is declined there. This note does not re-check the paragraph's other counts.
 
 **Note 2026-10-04: the hops outside the reads, graded by name (BACKLOG #2194).** Read at engine
 `76355472a`. This note grades the hops the list above left ungraded. It builds no guard, documents

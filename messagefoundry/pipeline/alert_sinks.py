@@ -571,10 +571,10 @@ def _refuse_alert_smtp_revocation(
 
     **A hop with no login takes no guard**, by the same ruling, recorded in ADR 0173: it carries no
     credential. The decline does not rest on what the body holds, and an alert body is not PHI-free
-    in the shipped code: ADR 0173's note of 2026-11-10 says what crosses and records the owner
-    ruling that this decline stands. A hop with ``use_tls`` or ``tls_verify`` off
-    builds no verifying context, and a login over one is refused at load and again at each send,
-    so there is nothing for this guard to judge.
+    in the shipped code: the docs/PHI.md logging-inventory rows 11 and 12 say what crosses, and
+    ADR 0173's note of 2026-11-10 records the owner ruling that this decline stands. A hop with
+    ``use_tls`` or ``tls_verify`` off builds no verifying context, and a login over one is refused
+    at load and again at each send, so there is nothing for this guard to judge.
 
     It reads no allowlist. Both callers refuse a relay off ``[alerts].smtp_allowed_hosts`` before
     they call this (BACKLOG #5088), with or without a login, so every relay judged here is one the

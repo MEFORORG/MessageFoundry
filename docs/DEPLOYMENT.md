@@ -936,9 +936,9 @@ does not resolve to a listed `host:port` makes the config **fail at load / reloa
 and SMTP transports, rows 10 and 11), and keep their **own** host allow-lists —
 `[alerts].webhook_allowed_hosts` and `[alerts].smtp_allowed_hosts`. Populate those separately; an
 `[egress].allowed_http` entry does nothing for a webhook alert. *(Note 2026-11-10, BACKLOG #5021:
-this exemption was stated beside the premise that the alert sinks carry no PHI. That premise is
-false in the shipped code, and the exemption is to be re-checked against the off-box alert key
-allowlist once it is built, by the owner ruling recorded in [ADR
+this exemption was stated beside "carry no PHI bodies", read as the alert sinks carrying no PHI.
+That reading is false in the shipped code, and the exemption is to be re-checked against the
+off-box alert key allowlist once it is built, by the owner ruling recorded in [ADR
 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s
 note of 2026-11-10.)*
 
@@ -1173,7 +1173,7 @@ on the shipped posture.
 |---|---|
 | **SQL Server store hop** | `[store].encrypt` defaults **true** and `[store].trust_server_certificate` defaults **false** — and SQL Server is a documented production store. The PostgreSQL store hop *is* gated; its SQL Server twin is not |
 | **`dialect='sqlserver'` DATABASE destination** | `Encrypt=yes` / `TrustServerCertificate=false` defaults |
-| **`[alerts]` SMTP sink** and the **per-user security-event notifier**, **with no `email_username`** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. With no login the hop sends no credential, so it takes no revocation guard by the owner ruling of 2026-10-27, recorded in ADR 0173. That decline does not rest on what the body holds, and an alert body is not PHI-free in the shipped code: [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s note of 2026-11-10 says what crosses and records the owner ruling that the decline stands. With a login it is gated (above). Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead, for a hop with no login. Beside `email_username` either deviation is refused at settings load, with no escape (vault BACKLOG #3533) |
+| **`[alerts]` SMTP sink** and the **per-user security-event notifier**, **with no `email_username`** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. With no login the hop sends no credential, so it takes no revocation guard by the owner ruling of 2026-10-27, recorded in ADR 0173. That decline does not rest on what the body holds, and an alert body is not PHI-free in the shipped code: the [PHI.md logging inventory](PHI.md#logging-inventory-1611--1623) rows 11 and 12 say what crosses, and [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s note of 2026-11-10 records the owner ruling that the decline stands. With a login it is gated (above). Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead, for a hop with no login. Beside `email_username` either deviation is refused at settings load, with no escape (vault BACKLOG #3533) |
 
 For every hop in that table, revocation is exactly what the ASVS row above calls *delegated* — **your
 PKI's or your egress proxy's job, written into your runbook**. The engine will not make you say so, and
