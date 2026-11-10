@@ -581,6 +581,32 @@ async def test_runner_refills_ON_DEMAND_without_waiting_out_the_interval(
         await store.close()
 
 
+async def test_a_runner_stopped_after_the_store_closed_neither_settles_nor_keeps_running(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #3191: engine.stop() leaves the runner refilling for a graph that did not stop,
+    and stops it once the store's close has settled. It then unhooks and ends without a second
+    settlement against the closed store."""
+    store, cipher = await _keyed_store(tmp_path / "after-close.db")
+    runner = GcmInvocationRunner(store, alert_sink=_RecordingSink(), interval_seconds=600.0)  # type: ignore[arg-type]
+    runner.start()
+    task = runner._task
+    assert task is not None
+    await asyncio.sleep(0)
+    await store.close()
+    settled: list[bool] = []
+
+    async def _checkpoint(*, settle: bool = False) -> int | None:
+        settled.append(settle)
+        return None
+
+    store.checkpoint_cipher_invocations = _checkpoint  # type: ignore[method-assign]
+    await runner.stop(settle=False)
+    assert task.done() and runner._task is None
+    assert settled == []
+    assert cipher._refill_hook is None
+
+
 async def test_runner_is_a_noop_on_a_keyless_store(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "runner_plain.db")
     try:

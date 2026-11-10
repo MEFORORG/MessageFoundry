@@ -860,12 +860,13 @@ async def test_a_supervisor_that_ignores_its_cancel_is_cut_and_the_stop_goes_on(
 
 
 def _gcm_runner(calls: list[str]) -> Any:
-    """A stand-in for the AES-GCM invocation runner whose stop, the settlement, is recorded."""
+    """A stand-in for the AES-GCM invocation runner whose stop is recorded, with or without its
+    settlement."""
 
-    async def _settle() -> None:
-        calls.append("gcm settled")
+    async def _stop(*, settle: bool = True) -> None:
+        calls.append("gcm settled" if settle else "gcm stopped unsettled")
 
-    return SimpleNamespace(stop=_settle)
+    return SimpleNamespace(stop=_stop)
 
 
 async def test_a_hung_graph_stop_is_cut_and_the_later_steps_still_run(
@@ -902,8 +903,10 @@ async def test_a_hung_graph_stop_is_cut_and_the_later_steps_still_run(
         began = time.monotonic()
         await asyncio.wait_for(engine.stop(budget_seconds=budget), _WAIT_S)
         elapsed = time.monotonic() - began
-    # No clear says a graph that may still be serving has gone.
-    assert calls == ["graph stop", "config drain", "close"]
+    # No clear says a graph that may still be serving has gone, and the AES-GCM runner keeps
+    # refilling for its workers until the store's close has settled the bound.
+    assert calls == ["graph stop", "config drain", "close", "gcm stopped unsettled"]
+    assert engine._gcm_invocation_runner is None
     assert elapsed < budget, f"engine.stop() took {elapsed:.2f}s"
     messages = [r.getMessage() for r in caplog.records]
     assert any("the graph's stop did not finish within" in m for m in messages), messages

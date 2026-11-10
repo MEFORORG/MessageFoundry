@@ -3904,7 +3904,8 @@ class Engine:
         close takes past its floor. A cut leaves what that step was stopping to run beside the later
         steps until the process exits, a claimed row stays INFLIGHT for ``reset_stale_inflight`` at
         the next start, and a step that raises no longer skips the store's close. A graph that did
-        not stop keeps its intake gate, raises no graph-stopped clear and keeps its cluster lease
+        not stop keeps its intake gate, raises no graph-stopped clear and keeps its cluster lease,
+        and its AES-GCM invocation runner keeps refilling until the store's close settles the bound
         (:meth:`_graph_left_running`).
 
         Without a budget every step runs to completion, in order, with its fixed waits, and the
@@ -4027,7 +4028,9 @@ class Engine:
 
     def _graph_left_running(self) -> bool:
         """Whether the graph's stop was cut, or failed, leaving listeners or workers that may be live
-        (BACKLOG #3191). The later steps then leave alone what would say the graph has gone."""
+        (BACKLOG #3191). The later steps then leave alone what would say the graph has gone, and
+        what those workers' encrypts still need: the AES-GCM runner is stopped only after the
+        store's close has settled the bound (:meth:`_close_store_at_stop`)."""
         runner = self._registry_runner
         return runner is not None and runner.has_residual_state
 
@@ -4046,9 +4049,11 @@ class Engine:
         left_running = self._graph_left_running()
         if left_running:
             log.error(
-                "engine stop: the graph did not stop, so the intake gate stays as it is, no "
-                "graph-stopped clear is raised, and the AES-GCM invocation bound is left for the "
-                "store's close to settle; its claimed rows recover at the next start"
+                "engine stop: the graph did not stop, so the intake gate stays as it is and no "
+                "graph-stopped clear is raised%s; its claimed rows recover at the next start",
+                ""
+                if self._gcm_invocation_runner is None
+                else ", and the AES-GCM invocation bound is left for the store's close to settle",
             )
         else:
             # After the graph, so the listeners are already closed when the monitor opens the gate
@@ -4079,7 +4084,7 @@ class Engine:
         # silently under-count every write performed during the shutdown drain. A cut here leaves the
         # settlement to the store's own close, which settles too. So does a graph left running, whose
         # workers may still encrypt: its runner keeps refilling the reserve ahead of their spend until
-        # that close, so an unclean exit in between can still only over-count (ASVS 11.3.4).
+        # that close (ASVS 11.3.4).
         if self._gcm_invocation_runner is not None and not left_running:
             await self._gcm_invocation_runner.stop()
             self._gcm_invocation_runner = None
@@ -4135,4 +4140,12 @@ class Engine:
             await drain(_within(bound, _ALERT_STATE_DRAIN_SECONDS))
 
     async def _close_store_at_stop(self, _bound: float) -> None:
-        await self.store.close()
+        try:
+            await self.store.close()
+        finally:
+            # A runner the after-graph step left to a graph that did not stop, or that a cut
+            # skipped, must not outlive the store it checkpoints. The close settles, so it stops
+            # without settling again.
+            if self._gcm_invocation_runner is not None:
+                await self._gcm_invocation_runner.stop(settle=False)
+                self._gcm_invocation_runner = None

@@ -116,11 +116,13 @@ class GcmInvocationRunner:
             bound.set_refill_hook(_wake)
         self._task = asyncio.create_task(self._run())
 
-    async def stop(self) -> None:
+    async def stop(self, *, settle: bool = True) -> None:
         """Unhook the refill signal, signal the loop, await its exit, then SETTLE — squaring the key's
         persisted total with what this process actually spent, so a shutdown neither loses invocations
         the key performed nor permanently burns the unspent remainder of its reserved block. (The store's
-        own ``close()`` settles too; both are idempotent, since a settlement zeroes the reserve.)"""
+        own ``close()`` settles too; both are idempotent, since a settlement zeroes the reserve.)
+        ``settle=False`` skips the settlement, for a store whose close already settled (BACKLOG
+        #3191)."""
         bound = self._bound()
         if bound is not None:
             bound.set_refill_hook(None)
@@ -133,6 +135,8 @@ class GcmInvocationRunner:
                 await task
             except asyncio.CancelledError:
                 pass
+        if not settle:
+            return
         try:
             await self._store.checkpoint_cipher_invocations(settle=True)
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
