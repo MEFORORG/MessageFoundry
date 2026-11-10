@@ -771,3 +771,18 @@ def test_a_surrogate_bearing_id_pages_rather_than_raising() -> None:
 
     strict = hashlib.sha256(part(b"user") + part("u-\u00e9".encode())).hexdigest()
     assert seal_row_digest("user", "U-\u00c9") == strict
+
+
+def test_a_held_refusal_keeps_its_whole_id_out_of_the_repr() -> None:
+    """A session's held refusal carries the whole token hash for the digest; neither the refusal's
+    repr nor its outcome's carries it, so a stray ``%r`` or a traceback of locals logs none."""
+    from messagefoundry.store.row_seal import SealPager
+    from messagefoundry.store.store import RevokeSealOutcome, _RevokeSealRefusal
+
+    whole = "ab" * 32
+    refusal = _RevokeSealRefusal(True, "session", whole, 2, 3)
+    outcome = RevokeSealOutcome(SealPager())
+    outcome.refusals.append(refusal)
+    assert refusal.ident == whole
+    assert whole not in repr(refusal)
+    assert whole not in repr(outcome)

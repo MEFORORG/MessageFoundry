@@ -1524,7 +1524,8 @@ class _RevokeSealRefusal:
 
     unverifiable: bool
     kind: str
-    ident: str
+    # Out of the repr: for a session this is the whole token hash, which no log line may carry.
+    ident: str = field(repr=False)
     stored_version: int = 0
     probe_version: int = 0
 
