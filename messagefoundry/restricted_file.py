@@ -163,8 +163,8 @@ def custody_account_problem(sid: str | None) -> str | None:
     if sid in _CUSTODY_REFUSED_SIDS:
         return (
             f"{describe_sid(sid)} is an account many services share or the operating system's "
-            "own, and a key custody file is kept for an account the engine alone runs as (a "
-            "virtual service account, S-1-5-80-...)"
+            "own, and a key custody file is kept for an account the engine alone runs as, such "
+            "as a virtual service account (S-1-5-80-...)"
         )
     return None
 
@@ -215,8 +215,8 @@ def handoff_grantee_problem(sid: str, kind_of: Callable[[str], int | None]) -> s
     what = "no account" if kind is None else _SID_TYPE_NAMES.get(kind, f"an account of kind {kind}")
     return (
         f"Windows maps {describe_sid(sid)} to {what}, not to one account, and a handoff is granted "
-        "to the one account the service runs as: a user account, or a virtual service account "
-        "(S-1-5-80-...)"
+        "to the one account the service runs as, such as a user account or a virtual service "
+        "account (S-1-5-80-...)"
     )
 
 
@@ -1309,10 +1309,12 @@ def write_restricted_file(
     ``NT SERVICE\\MessageFoundry``, or a SID, with or without a leading ``*``.
 
     ``owner`` (Windows only) is the account the file is created owned by, in the call that creates
-    it, named as ``read_grants`` are, and read back through the creating handle before a byte is
-    written. A token that may not make that account an owner, or a file that reads back owned by
-    anyone else, raises :class:`RestrictedFileError`. Left out, the owner is the creating token's
-    default.
+    it, and read back through the creating handle before a byte is written. It is a SID, with or
+    without a leading ``*``, or the name of ONE account: a name that resolves to a group or an
+    alias is refused, as for a read grant, so a group such as Administrators is named by its SID.
+    An application package or a broad group is refused as an owner, as it is as a read grant. A
+    token that may not make that account an owner, or a file that reads back owned by anyone else,
+    raises :class:`RestrictedFileError`. Left out, the owner is the creating token's default.
 
     ``creator_access`` (Windows only to turn off) gives the creating account full control. With it
     off the list is SYSTEM and Administrators with full control and each read grant with read, and
@@ -1427,7 +1429,11 @@ def _create_restricted(
     if not creator_access:
         raise RestrictedFileError("a file without its creator's access is made on Windows only")
     if owner is not None:
-        raise RestrictedFileError("a file owned by another account is made on Windows only")
+        # Refused even when it names this account: POSIX takes no owner at create (#6674 item 6).
+        raise RestrictedFileError(
+            "an owner is named for a new file on Windows only; on POSIX the account that creates "
+            "a file owns it"
+        )
     if local_volume_only and sys.platform != "linux":
         raise RestrictedFileError(
             "a file system is checked before a key file is written on Linux and Windows only"
@@ -1534,6 +1540,18 @@ def _create_restricted_windows(
                 "hold, and a key file cannot be granted to it. Name the one account the engine "
                 "runs as"
             )
+    # An owner holds READ_CONTROL and WRITE_DAC whatever the list says, so it could grant itself
+    # read: the owner gets the screens a read grant gets (vault BACKLOG #6674 item 1).
+    if owner_sid is not None and (_is_package_sid(owner_sid) or _is_broad_group(owner_sid)):
+        what = (
+            "an application package"
+            if _is_package_sid(owner_sid)
+            else f"{describe_sid(owner_sid)}, a group many accounts hold"
+        )
+        raise RestrictedFileError(
+            f"{path} was not created: {owner!r} is {what}, and a key file cannot be owned by it, "
+            "because a file's owner may rewrite its access list"
+        )
     expected = _expected_access(
         probes.self_sid, read_sids, creator_access=creator_access, read_delete=read_delete
     )

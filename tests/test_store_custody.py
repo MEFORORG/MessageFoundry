@@ -993,16 +993,17 @@ def _engine_sid() -> str:
 
 
 def _is_elevated() -> bool:
-    if sys.platform != "win32":
-        return False
-    import ctypes
-
-    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    # The production pre-check itself, so a test skips exactly where write_handoff_file refuses
+    # up front (vault BACKLOG #6674 item 5), never on a second API's answer to a nearby question.
+    return sys.platform == "win32" and restricted_file._administrators_enabled()
 
 
-#: The handoff is written owned by Administrators, which only an elevated administrator or SYSTEM may
-#: make a file's owner, so a test that writes one needs that token. The hosted Windows legs run
-#: elevated; off-admin, :func:`test_windows_a_handoff_is_refused_up_front_off_admin` runs instead.
+#: The handoff is written owned by Administrators, which a token may make a file's owner where it
+#: holds that group enabled, as at least an elevated administrator's and SYSTEM's do, or holds the
+#: restore privilege enabled. So a test that writes one with its real owner needs such a token. The
+#: hosted Windows legs run elevated; off-admin,
+#: :func:`test_windows_a_handoff_is_refused_up_front_off_admin` runs instead, and the tests that
+#: swap in an owner every token may assign (:func:`_owned_by_this_account`) run on every leg.
 elevated_only = pytest.mark.skipif(
     not _is_elevated(),
     reason="writing a handoff needs an elevated administrator, as provision-admin",
@@ -1048,6 +1049,49 @@ def test_windows_a_create_refused_its_owner_is_a_custody_refusal(
     assert isinstance(excinfo.value.__cause__, RestrictedFileError)
     assert not path.exists()
     assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@windows_only
+def test_windows_a_create_refused_its_owner_is_a_custody_refusal_on_every_leg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dpapi_scopes: list[bool]
+) -> None:
+    # Vault BACKLOG #6674 item 2: the test above skips on the elevated hosted legs, so this one asks
+    # for an owner no token there may assign either (one service's SID, without the restore
+    # privilege enabled). Windows refuses it at the create on every leg, and custody translates it.
+    monkeypatch.setattr(restricted_file, "_administrators_enabled", lambda: True)
+    real = restricted_file.write_restricted_file
+
+    # Not _owned_by_this_account: the owner swapped in here is one no token may assign.
+    def _unassignable_owner(path: Path, data: bytes, **kwargs: object) -> None:
+        assert kwargs.pop("owner") == _ADMINS  # what custody asked for
+        real(path, data, owner=f"*{_SERVICE}", **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(restricted_file, "write_restricted_file", _unassignable_owner)
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="may not make") as excinfo:
+        custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
+    assert isinstance(excinfo.value.__cause__, restricted_file._OwnerRefused)
+    assert dpapi_scopes == [True]  # it got as far as protecting the blob, then the create refused
+    assert not path.exists()
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@windows_only
+def test_windows_a_shared_service_account_refusal_survives_the_log_scrubber(
+    tmp_path: Path,
+) -> None:
+    # Vault BACKLOG #6674 item 4: the typed name, an all-capitals run, is not repeated in the
+    # refusal; the account is named as describe_sid renders it, which the scrubber leaves readable.
+    from messagefoundry.redaction import redact
+
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="many services share") as excinfo:
+        custody.write_handoff_file(path, _blob(), service_account="NT AUTHORITY\\LOCAL SERVICE")
+    text = str(excinfo.value)
+    assert "S-1-5-19" in text
+    assert "LOCAL SERVICE" not in text
+    assert redact(text) == text
+    assert not path.exists()
 
 
 @windows_only
@@ -1162,10 +1206,46 @@ def test_windows_an_engine_on_a_shared_account_reads_no_handoff(
 @windows_only
 @elevated_only
 def test_windows_a_handoff_made_for_this_account_round_trips(tmp_path: Path) -> None:
+    from messagefoundry.store import store as store_mod
+
     path = tmp_path / "handoff.key"
     me = _engine_sid()
     # enforcing=False: the account may be a domain one on a dev box; the rule is the wiring's test.
     custody.write_handoff_file(path, _blob(), service_account=f"*{me}", enforcing=False)
+    assert _aces(path) == {(0, _FULL, _SYSTEM), (0, _FULL, _ADMINS), (0, _READ_DELETE, me)}
+    parsed = store_mod._parse_sddl_dacl(store_mod._read_dacl_sddl(path, owner=True) or "")
+    assert parsed is not None and parsed.owner == _ADMINS
+    assert custody.read_handoff_file(path) == _blob()
+    assert custody.consume_handoff_file(path, lambda blob: None) == _blob()
+    assert not path.exists()
+
+
+def _owned_by_this_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make :func:`custody.write_handoff_file` create its file owned by this process's account, an
+    owner every token may assign, in place of Administrators, which only some may. The read accepts
+    the service as an owner, and a handoff made for this account names it as the service."""
+    monkeypatch.setattr(restricted_file, "_administrators_enabled", lambda: True)
+    real = restricted_file.write_restricted_file
+    me = _engine_sid()
+
+    def _write(path: Path, data: bytes, **kwargs: object) -> None:
+        assert kwargs.pop("owner") == _ADMINS
+        real(path, data, owner=f"*{me}", **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(restricted_file, "write_restricted_file", _write)
+
+
+@windows_only
+def test_windows_a_handoff_made_for_this_account_round_trips_on_every_leg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dpapi_scopes: list[bool]
+) -> None:
+    # Vault BACKLOG #6674 item 5: the test above skips off-admin, which left read_handoff_file and
+    # the handoff's machine scope unexercised there. Owned by this account, it runs on every leg.
+    _owned_by_this_account(monkeypatch)
+    path = tmp_path / "handoff.key"
+    me = _engine_sid()
+    custody.write_handoff_file(path, _blob(), service_account=f"*{me}", enforcing=False)
+    assert dpapi_scopes == [True]  # machine scope, so the service account can open it
     assert _aces(path) == {(0, _FULL, _SYSTEM), (0, _FULL, _ADMINS), (0, _READ_DELETE, me)}
     assert custody.read_handoff_file(path) == _blob()
     assert custody.consume_handoff_file(path, lambda blob: None) == _blob()
@@ -1179,20 +1259,6 @@ def _os_handle(fd: int) -> int:
     import msvcrt
 
     return msvcrt.get_osfhandle(fd)
-
-
-@windows_only
-@pytest.mark.skipif(
-    not _is_elevated(), reason="needs an elevated administrator, as provision-admin"
-)
-def test_windows_an_elevated_handoff_is_owned_by_administrators_and_reads(tmp_path: Path) -> None:
-    from messagefoundry.store import store as store_mod
-
-    path = tmp_path / "handoff.key"
-    custody.write_handoff_file(path, _blob(), service_account=f"*{_engine_sid()}", enforcing=False)
-    parsed = store_mod._parse_sddl_dacl(store_mod._read_dacl_sddl(path, owner=True) or "")
-    assert parsed is not None and parsed.owner == _ADMINS
-    assert custody.read_handoff_file(path) == _blob()
 
 
 @windows_only
@@ -1247,8 +1313,6 @@ def test_windows_a_key_file_widened_to_a_package_after_creation_is_refused(
 @windows_only
 @elevated_only
 def test_windows_a_blob_of_the_other_scope_is_refused(tmp_path: Path) -> None:
-    from messagefoundry.secrets_dpapi import dpapi_protect
-
     # Each file's own list names the engine's account differently (read for the handoff, full
     # control for the host file), so a file renamed to the other's path is refused on its list.
     handoff = tmp_path / "handoff.key"
@@ -1259,7 +1323,14 @@ def test_windows_a_blob_of_the_other_scope_is_refused(tmp_path: Path) -> None:
     custody.write_host_file(host, _blob())
     with pytest.raises(CustodyError, match="beyond the key file's own"):
         custody.read_handoff_file(host)
-    # Behind the list, the scope is checked too.
+
+
+@windows_only
+def test_windows_a_blob_of_the_other_scope_is_refused_behind_the_list() -> None:
+    # Behind the list, the scope is checked too. Split from the test above, which needs an elevated
+    # token to write the handoff, so this runs off-admin as well (vault BACKLOG #6674 item 5).
+    from messagefoundry.secrets_dpapi import dpapi_protect
+
     machine = dpapi_protect(_blob().serialize(), machine_scope=True)
     with pytest.raises(CustodyError, match="not a user-scope DPAPI blob"):
         custody.unprotect_host_blob(machine)
