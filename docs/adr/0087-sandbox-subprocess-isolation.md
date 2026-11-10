@@ -411,8 +411,8 @@ target, no `pickle` import left to mis-suppress:
   > bullet, the `mode=isolated` lookup case, the forged answer that carries the id, the boot leg
   > of the over-cap bullet, and the pointer to the owner acceptances.
   >
-  > **Owner acceptances 2026-11-10.** The owner accepted two cases as recorded deviations from the
-  > SHALL above, each until a fix narrows or closes it. The fixes are to be added as steps on vault
+  > **Owner acceptances 2026-11-10.** The owner accepted two cases as recorded deviations, each
+  > until a fix narrows or closes it. The fixes are to be added as steps on vault
   > BACKLOG #3135 (ledger ruling R2).
   >
   > - **Record d20261110T144543956-d8f55a:** a stray frame that arrives after a call's check before
