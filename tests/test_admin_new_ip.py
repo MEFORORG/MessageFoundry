@@ -320,7 +320,7 @@ _FORGING_PATHS = (
     "/x;pwd={abc",
     "/x/password={a",
     "/MEFOR_X=abc",
-    "/plain/path-with.dots_and_underscores",
+    "/plain/path-with.dots-and-hyphens",
     "/x:colon",
     "/x%20password:",
     "/a&" + "b" * 300,
@@ -328,6 +328,10 @@ _FORGING_PATHS = (
     "/a|b c|d",
     "/a%7Cb c%7Cd",
     "/x 19-01-01",
+    "/é12-34-5678",
+    "/ꄣ-45-6789",
+    "/" + "19800101é/" * 30,
+    "/" + "x" * 230 + "/19800505" + "9" * 50,
     "/u" + "\U0001f600" * 300,
     "/u" + "x" * 5000,
 )
@@ -402,6 +406,7 @@ async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings() -> None
     finally:
         for handler in handlers:
             logger.removeHandler(handler)
+            handler.close()
         logger.setLevel(level)
         await store.close()
     first, second = ([ln for ln in s.getvalue().splitlines() if ln] for s in streams)
@@ -409,11 +414,15 @@ async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings() -> None
     assert first == second
     lines = first
     assert len(lines) == 2 * len(cases)
-    for i, (_, want, _) in enumerate(cases):
+    for i, (_, want, path) in enumerate(cases):
         repeat, over = (_logged_fields(line) for line in lines[2 * i : 2 * i + 2])
         assert [key for key, _ in over] == ["seen_ip", "path"], lines[2 * i + 1]
         assert [key for key, _ in repeat] == ["path"], lines[2 * i]
-        assert over[1] == repeat[0], lines[2 * i : 2 * i + 2]
+        # The handler filters rewrite nothing inside the field: not a manufactured date or SSN
+        # across an escape, and so not past the bound either.
+        assert (
+            over[1] == repeat[0] == ("path", redacted_log_field(path, _NEW_IP_LOG_FIELD_MAX)[1:-1])
+        )
         logged_ip = over[0][1]
         if want is None:
             assert re.fullmatch("unparsed-sha256-[0-9a-f]{16}", logged_ip), lines[2 * i + 1]
@@ -421,18 +430,18 @@ async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings() -> None
             assert logged_ip.startswith(want), lines[2 * i + 1]
         assert len(over[1][1]) <= _NEW_IP_LOG_FIELD_MAX
     assert "SECRETVALUE" not in "\n".join(lines)
-    plain = _FORGING_PATHS.index("/plain/path-with.dots_and_underscores")
+    plain = _FORGING_PATHS.index("/plain/path-with.dots-and-hyphens")
     assert _logged_fields(lines[2 * plain + 1]) == [
         ("seen_ip", f"10.9.9.{plain}"),
         ("path", _FORGING_PATHS[plain]),
     ]
     # Placeholders keep their spelling, so a search for them finds the line.
     token_line = lines[2 * _FORGING_PATHS.index("/x code=SECRETVALUE") + 1]
-    assert _logged_fields(token_line)[1][1] == "/x%u0020code%u003D<redacted>"
+    assert _logged_fields(token_line)[1][1] == "/x_u0020_code_u003D_<redacted>"
     hl7_line = lines[2 * _FORGING_PATHS.index("/a|b|c") + 1]
     assert _logged_fields(hl7_line)[1][1] == "[redacted]"
     longest = _FORGING_PATHS.index("/u" + "x" * 5000)
-    assert "%%crc32x" in _logged_fields(lines[2 * longest + 1])[1][1]
+    assert "_%crc32x" in _logged_fields(lines[2 * longest + 1])[1][1]
 
 
 async def test_alternating_new_addresses_audit_once_each() -> None:
@@ -1301,11 +1310,26 @@ def test_a_redaction_that_raises_logs_a_placeholder_not_an_exception(
         raise RuntimeError(text)
 
     monkeypatch.setattr(logging_setup, "redact_log_value", _boom)
+    monkeypatch.setattr(logging_setup, "_UNLOGGABLE_REPORTED", set())
     with caplog.at_level(logging.ERROR, logger="messagefoundry.logging_setup"):
         got = redacted_log_field("/users/SECRETVALUE", _NEW_IP_LOG_FIELD_MAX)
-    assert got == '"[unloggable: RuntimeError]"'
+    assert got == '"unloggable-RuntimeError"'
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert errors and all("RuntimeError" in m and "SECRETVALUE" not in m for m in errors)
+
+
+def test_an_unparsed_address_logs_a_keyed_digest() -> None:
+    """RED when: the past-cap line logs a plain digest of an unparsed address, so a low-entropy
+    name or password a client put in a forwarded header is recovered by hashing guesses (BACKLOG
+    #3770)."""
+    import hashlib
+
+    for text in ("DOE JANE", "password=hunter2", "fe80::1%eth0"):
+        field = _address_log_field(text)
+        plain = hashlib.sha256(text.encode()).hexdigest()[:16]
+        assert plain not in field, text
+        assert re.fullmatch(r'"(?:unparsed|fe80::1-zone)-sha256-[0-9a-f]{16}"', field), field
+        assert field == _address_log_field(text)
 
 
 def test_redact_log_value_follows_the_shipped_filter_chain() -> None:
@@ -1347,7 +1371,7 @@ def test_a_cut_checksum_is_never_read_as_a_date() -> None:
         hits = 0
         for n in range(20000):
             token = redacted_log_field(f"/users/{'a' * 300}{n}", _NEW_IP_LOG_FIELD_MAX)
-            if not re.search(r"%%crc32x(?:19|20)[0-9]{6}\"", token):
+            if not re.search(r"_%crc32x(?:19|20)[0-9]{6}\"", token):
                 continue
             hits += 1
             logger.warning("path=%s", token)
@@ -1356,3 +1380,5 @@ def test_a_cut_checksum_is_never_read_as_a_date() -> None:
     finally:
         for handler in handlers:
             logger.removeHandler(handler)
+            handler.close()
+        logger.propagate = True

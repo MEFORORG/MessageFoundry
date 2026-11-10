@@ -601,13 +601,11 @@ def _client_limiter_key(client: str | None) -> str:
     return _host_key(client) if client else "unknown"
 
 
-def _address_digest(address: str) -> str:
-    """The SHA-256 hex digest of ``address``, the one that both the bounded address text and the
-    past-cap log field carry, so the log's 16 digits prefix the audit row's 64.
-
-    surrogatepass, so a lone surrogate cannot make the digest raise; the encoding is injective, so
-    distinct text still gives distinct digests. A dedupe key, not a credential, so a plain digest."""
-    return hashlib.sha256(address.encode("utf-8", "surrogatepass")).hexdigest()
+#: The per-process key of the digest the past-cap log line gives an address that does not parse
+#: (BACKLOG #3770). Keyed, because that text is caller-supplied and unredacted: a plain digest of a
+#: low-entropy value, a name or a password a client put in a forwarded header, could be recovered
+#: from the general log by hashing guesses. Lines of one process still compare by it.
+_ADDRESS_LOG_KEY = secrets.token_urlsafe(16).encode("ascii")
 
 
 def _bounded_address_text(address: str) -> str:
@@ -619,7 +617,9 @@ def _bounded_address_text(address: str) -> str:
     known-address record and :meth:`AuthService._same_host` compare by it."""
     if len(address) <= _NEW_IP_TEXT_MAX:
         return address
-    digest = _address_digest(address)
+    # surrogatepass, so a lone surrogate cannot make the digest raise; the encoding is injective, so
+    # distinct text still gives distinct digests. A dedupe key, not a credential, so a plain digest.
+    digest = hashlib.sha256(address.encode("utf-8", "surrogatepass")).hexdigest()
     # The prefix is only a reading aid, so a lone surrogate in it becomes "?" (one character each),
     # and the result can be stored. Text within the bound is returned as it is, as on main.
     prefix = address[:_NEW_IP_TEXT_PREFIX].encode("utf-8", "replace").decode("utf-8")
@@ -627,10 +627,10 @@ def _bounded_address_text(address: str) -> str:
 
 
 def _address_log_field(address: str) -> str:
-    """``address`` as a quoted log field value that carries none of its caller-supplied text
-    (BACKLOG #3770): the canonical form of an IP address, or ``unparsed-sha256-`` and 16 hex digits
-    of the SHA-256 of the whole text when it does not parse. A zone id is text, so an address with
-    one logs its canonical address, ``-zone-sha256-`` and the digest of the whole text.
+    """``address`` as a quoted log field value that never carries its raw text (BACKLOG #3770): the
+    canonical form of an IP address, or ``unparsed-sha256-`` and 16 hex digits of a SHA-256 of the
+    whole text, keyed by :data:`_ADDRESS_LOG_KEY`, when it does not parse. A zone id is text, so an
+    address with one logs its canonical address, ``-zone-sha256-`` and that digest.
 
     The canonical form holds only hex digits, ``.`` and ``:``, which spell no credential label, HL7
     separator, date or name a handler filter reads, so the field cannot close, merge or erase
@@ -643,7 +643,8 @@ def _address_log_field(address: str) -> str:
         parsed = None
     if parsed is not None and not getattr(parsed, "scope_id", None):
         return f'"{parsed}"'
-    digest = _address_digest(address)[:16]
+    keyed = _ADDRESS_LOG_KEY + address.encode("utf-8", "surrogatepass")
+    digest = hashlib.sha256(keyed).hexdigest()[:16]
     if parsed is None:
         return f'"unparsed-sha256-{digest}"'
     return f'"{ipaddress.IPv6Address(int(parsed))}-zone-sha256-{digest}"'

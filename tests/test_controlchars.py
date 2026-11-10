@@ -455,13 +455,13 @@ def test_log_field_token_is_quote_free_ascii_and_reverses(text: str) -> None:
     body = token[1:-1]
     assert token == f'"{body}"'
     assert body.isascii() and body.isprintable()
-    assert re.fullmatch(r"(?:[A-Za-z0-9._/-]|%u[0-9A-F]{4})*", body)
+    assert re.fullmatch(r"(?:[A-Za-z0-9./-]|_u[0-9A-F]{4}_)*", body)
     assert _unit_unescape(body) == text
 
 
 def _unit_unescape(body: str) -> str:
-    """The ``%uXXXX`` decode, as JavaScript's ``unescape`` reads it."""
-    units = re.sub(r"%u([0-9A-F]{4})", lambda m: chr(int(m.group(1), 16)), body)
+    """The ``_uXXXX_`` decode."""
+    units = re.sub(r"_u([0-9A-F]{4})_", lambda m: chr(int(m.group(1), 16)), body)
     return units.encode("utf-16-be", "surrogatepass").decode("utf-16-be", "surrogatepass")
 
 
@@ -485,11 +485,11 @@ def test_log_field_token_keeps_a_literal_whole_and_refuses_an_unsafe_one() -> No
     or a cut splits one; or a literal holding a quote or a space is accepted (BACKLOG #3770)."""
     literals = ("<redacted>", "[redacted]")
     assert log_field_token("/a b<redacted>[redacted]", 256, literals=literals) == (
-        '"/a%u0020b<redacted>[redacted]"'
+        '"/a_u0020_b<redacted>[redacted]"'
     )
     cut = log_field_token("x" * 230 + "<redacted>" * 3, 256, literals=literals)[1:-1]
     assert len(cut) <= 256
-    assert cut.partition("%%crc32x")[0] == "x" * 230 + "<redacted>"
+    assert cut.partition("_%crc32x")[0] == "x" * 230 + "<redacted>"
     for bad in ('"', "a b", "a:b", ""):
         with pytest.raises(ValueError):
             log_field_token("x", 256, literals=(bad,))
@@ -501,9 +501,9 @@ def test_log_field_token_is_bounded_after_its_escape(text: str) -> None:
     twelve times the limit, or a cut lands inside an escape."""
     body = log_field_token(text, 256)[1:-1]
     assert len(body) <= 256
-    head, _, checksum = body.partition("%%crc32x")
+    head, _, checksum = body.partition("_%crc32x")
     assert re.fullmatch(r"[0-9a-f]{8}", checksum)
-    assert re.fullmatch(r"(?:[^%]|%u[0-9A-F]{4})*", head)
+    assert re.fullmatch(r"(?:[^_%]|_u[0-9A-F]{4}_)*", head)
     # Whole characters only, so the head holds no half of a surrogate pair.
     _unit_unescape(head).encode("utf-8", "strict")
     assert len(log_field_token("a" * 255 + "=", 256)) - 2 <= 256
@@ -511,7 +511,7 @@ def test_log_field_token_is_bounded_after_its_escape(text: str) -> None:
 
 def test_log_field_token_keeps_two_long_texts_with_one_head_apart() -> None:
     assert log_field_token("a" * 300 + "1", 256) != log_field_token("a" * 300 + "2", 256)
-    assert "%%" not in log_field_token("a" * 256, 256)
+    assert "_%" not in log_field_token("a" * 256, 256)
 
 
 def test_log_field_token_refuses_a_limit_with_no_room_for_its_mark() -> None:

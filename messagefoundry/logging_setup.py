@@ -426,12 +426,20 @@ def redacted_log_field(text: str, limit: int) -> str:
             redact_log_value(text), limit, literals=(CREDENTIAL_PLACEHOLDER, PHI_PLACEHOLDER)
         )
     except Exception as exc:  # noqa: BLE001 -- a log argument must never raise
-        # Reported by type only: the message and traceback may carry the value.
-        logging.getLogger(__name__).error(
-            "a log field could not be redacted (%s); it logs as a placeholder",
-            type(exc).__name__,
-        )
-        return f'"[unloggable: {type(exc).__name__}]"'
+        name = type(exc).__name__
+        # Reported by type only, since the message and traceback may carry the value, and once per
+        # type, since a replayed request reaches this on every call.
+        if name not in _UNLOGGABLE_REPORTED:
+            _UNLOGGABLE_REPORTED.add(name)
+            logging.getLogger(__name__).error(
+                "a log field could not be redacted (%s); it logs as a placeholder", name
+            )
+        # No space or ":": a type name is an identifier, so this holds nothing that ends a field.
+        return f'"unloggable-{name}"'
+
+
+#: The exception types :func:`redacted_log_field` has reported, so each is reported once.
+_UNLOGGABLE_REPORTED: set[str] = set()
 
 
 class CredentialQueryScrubFilter(logging.Filter):

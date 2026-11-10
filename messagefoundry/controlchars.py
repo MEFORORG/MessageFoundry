@@ -49,7 +49,7 @@ escape, not on the predicate:
   * QUOTE -- one ``key=value`` field of a log line, :func:`log_field_token`. ESCAPE keeps a
     value on one line but leaves its spaces, quotes and ``=`` alone, so a value logged before
     another field can still write a field of its own. QUOTE writes everything but a safe alphabet
-    as ``%uXXXX`` and wraps the result in quotes, so the value holds no space, quote, ``:`` or ``=``
+    as ``_uXXXX_`` and wraps the result in quotes, so the value holds no space, quote, ``:`` or ``=``
     with which to end its field or write another, nor any separator a handler filter's match needs
     to reach past its quotes (BACKLOG #3770). A filter may still rewrite a run of kept characters
     inside the field, a date for example. :func:`quote_log_text` is a separate JSON-quoted form for text printed to a terminal, such as a check line, which no handler filter reads; a
@@ -348,22 +348,24 @@ def quote_log_text(text: str) -> str:
     return scrub_log_argument(json.dumps(text))
 
 
-#: The characters :func:`log_field_token` writes as they are: letters, digits and ``-._/``
+#: The characters :func:`log_field_token` writes as they are: letters, digits and ``-./``
 #: (BACKLOG #3770). Every other character is escaped, at least the space and every other
-#: whitespace, both quotes, the backslash, ``:``, ``=``, ``;``, ``,``, ``#``, ``%``, ``|``, ``^``,
-#: ``&``, ``~``, ``<``, ``{``, ``(`` and ``[``. So the value holds nothing with which to end its field
-#: or start one, and no separator a shipped handler filter's match needs to run past the closing
-#: quote: no credential label can reach its ``:`` or ``=``, no HL7 run its separator, no name run
-#: its space. A filter can still match a run of kept characters, a date of digits, ``-`` and ``/``
-#: for one, and rewrites it as ``[redacted]`` inside the field. ``:`` goes too,
-#: because a kept ``password:`` let the credential scrub take the closing quote and the next key.
-_LOG_FIELD_KEPT = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._/")
+#: whitespace, both quotes, the backslash, ``_``, ``:``, ``=``, ``;``, ``,``, ``#``, ``%``, ``|``,
+#: ``^``, ``&``, ``~``, ``<``, ``{``, ``(`` and ``[``. So the value holds nothing with which to end its
+#: field or start one, and no separator a shipped handler filter's match needs to run past the
+#: closing quote: no credential label can reach its ``:`` or ``=``, no HL7 run its separator, no
+#: name run its space. A filter can still match a run of kept characters, a date of digits, ``-``
+#: and ``/`` for one, and rewrite it as ``[redacted]`` inside the field. ``:`` goes too, because a
+#: kept ``password:`` let the credential scrub take the closing quote and the next key; ``_`` goes
+#: because it starts and ends every escape.
+_LOG_FIELD_KEPT = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-./")
 
 #: What :func:`log_field_token` puts in place of the cut tail of a token over its bound. It starts
-#: with "%%", which the escape never writes, so a bounded token cannot read as a kept one, and it
-#: holds no HL7 separator, so a cut head cannot gain one. It ends in a letter, so no word boundary
-#: comes before the checksum digits and the date pass cannot read eight of them as a date.
-_LOG_FIELD_CUT_MARK = "%%crc32x"
+#: with "_%", which neither the escape nor a kept run writes, so a bounded token cannot read as a
+#: kept one, and it holds no HL7 separator, so a cut head cannot gain one. Both its ends are word
+#: characters, so it gives the date pass no word boundary: not after a cut head's digits, and not
+#: before the checksum's.
+_LOG_FIELD_CUT_MARK = "_%crc32x"
 _LOG_FIELD_CUT_LENGTH = len(_LOG_FIELD_CUT_MARK) + 8
 
 #: What a literal :func:`log_field_token` keeps whole may hold: the kept alphabet and the
@@ -372,15 +374,17 @@ _LOG_FIELD_LITERAL = _LOG_FIELD_KEPT | frozenset("<>[]")
 
 
 def _unit_escape(ch: str) -> str:
-    """``ch`` itself when kept, else one ``%uXXXX`` per UTF-16 code unit, the form JavaScript's
-    ``unescape`` reads. Not ``%XX``: a ``%`` and two hex digits is where the credential scrub starts
-    a label (``secretscrub._LABEL_START``) and how the HL7 pass spells an encoded separator
-    (``redaction._ENCODED_SEPARATOR``), so ``%20password`` read as a label and ``%7C`` as a
-    separator. After ``%`` this always writes ``u``, which is not a hex digit."""
+    """``ch`` itself when kept, else one ``_uXXXX_`` per UTF-16 code unit, four upper-case hex
+    digits between ``_u`` and ``_``. Not ``%XX``: a ``%`` and two hex digits is where the credential
+    scrub starts a label (``secretscrub._LABEL_START``) and how the HL7 pass spells an encoded
+    separator (``redaction._ENCODED_SEPARATOR``), so ``%20password`` read as a label and ``%7C`` as
+    a separator. An escape starts and ends in ``_``, a word character that is not a digit, so it
+    gives the date and SSN passes no word boundary and no digit to join to a kept one: ``%u00E9``
+    before ``12-34-5678`` read as an SSN, and ``%`` after a kept date as its end."""
     if ch in _LOG_FIELD_KEPT:
         return ch
     units = ch.encode("utf-16-be", "surrogatepass")
-    return "".join(f"%u{units[i]:02X}{units[i + 1]:02X}" for i in range(0, len(units), 2))
+    return "".join(f"_u{units[i]:02X}{units[i + 1]:02X}_" for i in range(0, len(units), 2))
 
 
 def log_field_token(text: str, limit: int, *, literals: tuple[str, ...] = ()) -> str:
@@ -389,8 +393,8 @@ def log_field_token(text: str, limit: int, *, literals: tuple[str, ...] = ()) ->
     filters, however many handlers run them in turn (BACKLOG #3770).
 
     Every character outside :data:`_LOG_FIELD_KEPT` is written by :func:`_unit_escape`, so the token
-    holds no space, quote, backslash or separator, and a ``%uXXXX`` decode gives ``text`` back,
-    except that a lone surrogate pair decodes to the character it would spell. Each
+    holds no space, quote, backslash or separator, and an ``_uXXXX_`` decode gives ``text`` back,
+    except that two lone surrogates that spell a pair decode to its character. Each
     occurrence of a string in ``literals`` is kept whole instead, which is how the redaction
     placeholders stay searchable as themselves; a literal may hold only :data:`_LOG_FIELD_LITERAL`.
     A text that already holds a placeholder's spelling therefore logs it as it is, so a value can
