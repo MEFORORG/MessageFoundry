@@ -193,7 +193,11 @@ async def test_a_counted_store_whose_salt_is_a_readable_foreign_object_gets_the_
         assert await _counts_under_a_dek(db) is True
 
 
-_VIRTUAL_TABLES = "SELECT name FROM sqlite_master WHERE sql LIKE 'CREATE VIRTUAL TABLE%'"
+#: Every table with a flag saying whether it is virtual, so one walk both counts the tables it saw
+#: and finds the virtual ones (a virtual table's ``type`` is ``table`` too).
+_TABLES_FLAGGED_VIRTUAL = (
+    "SELECT name, sql LIKE 'CREATE VIRTUAL TABLE%' FROM sqlite_master WHERE type = 'table'"
+)
 
 
 async def test_the_expected_shape_holds_no_virtual_table() -> None:
@@ -203,21 +207,24 @@ async def test_the_expected_shape_holds_no_virtual_table() -> None:
         db.row_factory = aiosqlite.Row
         await db.executescript(_SCHEMA)
         await MessageStore._migrate(db)
-        async with db.execute(_VIRTUAL_TABLES) as cur:
-            virtual = [tuple(r) for r in await cur.fetchall()]
-        async with db.execute("SELECT count(*) FROM sqlite_master WHERE type = 'table'") as cur:
-            row = await cur.fetchone()
-    assert row is not None and row[0] > 0  # positive control: the scratch schema was built
+        async with db.execute(_TABLES_FLAGGED_VIRTUAL) as cur:
+            tables = [tuple(r) for r in await cur.fetchall()]
+    # Positive control: the walk saw the built schema (40 tables when this floor was set), so the
+    # absence below cannot pass on an empty walk.
+    assert len(tables) >= 30, f"the scratch schema holds only {len(tables)} tables"
+    virtual = [name for name, is_virtual in tables if is_virtual]
     assert virtual == []
 
 
 @_NEEDS_FTS5
 async def test_the_virtual_table_probe_finds_one() -> None:
-    # Negative control for the pin above: the same query does find a virtual table when one exists.
+    # Negative control for the pin above: the same query does flag a virtual table when one exists,
+    # and only that one (fts5's shadow tables are ordinary tables).
     async with _connected(":memory:") as db:
         await db.execute("CREATE VIRTUAL TABLE probe USING fts5(a)")
-        async with db.execute(_VIRTUAL_TABLES) as cur:
-            assert [tuple(r) for r in await cur.fetchall()] == [("probe",)]
+        async with db.execute(_TABLES_FLAGGED_VIRTUAL) as cur:
+            rows = [tuple(r) for r in await cur.fetchall()]
+    assert [name for name, is_virtual in rows if is_virtual] == ["probe"]
 
 
 # --- BACKLOG #6720 ---------------------------------------------------------------------------------

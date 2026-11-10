@@ -521,11 +521,14 @@ def test_every_process_symbol_load_is_reviewed_and_named() -> None:
         f"CDLL(None) calls by module changed: {found}. Review each, register it in "
         "_REVIEWED_PROCESS_SYMBOL_LOADS and name it in docs/DANGEROUS-FUNCTIONALITY.md section 5."
     )
+    # The package walk must have seen the sites, or the naming check below runs over nothing. Two
+    # modules carry a ``CDLL(None)`` call today; the equality above already pins which.
+    assert len(found) >= 2, f"the package walk found too few CDLL(None) modules: {found}"
     holds = _section(_doc_text(), 5).partition("**What holds them.**")[2]
     assert "`CDLL(None)`" in holds
     unnamed = sorted(
         rel
-        for rel in _REVIEWED_PROCESS_SYMBOL_LOADS
+        for rel in found
         if f"`{rel}`" not in holds and f"`{rel.removesuffix('.py')}." not in holds
     )
     assert not unnamed, f"CDLL(None) sites not named under 'What holds them': {unnamed}"
