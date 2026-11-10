@@ -13,15 +13,18 @@ the one it read. The race tests below fail on the code before the fix: the delet
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import errno
 import logging
 import os
 import pickle
 import shutil
+import stat
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, get_args
 
 import pytest
@@ -264,9 +267,7 @@ def _root_gone(path: Path, **_: Any) -> Any:
 
 
 def _dangling(path: Path, **_: Any) -> Any:
-    """A pair lock whose open fails ``ENOENT`` while the uploads root is there, as Windows, which
-    has no ``O_NOFOLLOW``, fails it for a link planted at the lock path whose target's directory is
-    missing."""
+    """A pair lock whose open fails ``ENOENT`` while the uploads root is there."""
     lock = lock_path_for(path)
     assert lock.parent.is_dir()
     raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(lock))
@@ -456,8 +457,8 @@ def test_a_first_lock_check_that_fails_stops_the_reseal_before_any_decrypt(
 def test_a_root_gone_at_the_first_lock_check_is_root_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The root went after the listing, before the first lock check: the pass reports the missing
-    root (BACKLOG #4940) and reads no file, rather than calling every body lost."""
+    """The root went at the first lock check: the pass reports the missing root (BACKLOG #4940)
+    and decrypts no file, rather than calling every body lost."""
     root = tmp_path / "uploads"
     old, new = generate_key(), generate_key()
     _seed(root, old)
@@ -467,6 +468,57 @@ def test_a_root_gone_at_the_first_lock_check_is_root_missing(
     assert not root.exists()
     assert result.root_missing and result.incomplete
     assert (result.skipped, result.body_lost, reads) == (0, 0, [])
+
+
+def test_a_root_replaced_by_a_file_at_the_first_lock_check_is_root_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A root replaced by a regular file at the first lock check fails the lock's open with
+    ``ENOTDIR`` on POSIX. That reads "gone", as a missing root does, so the pass reports the
+    missing root (BACKLOG #4940), not every half skipped. The errno is raised by hand so the case
+    runs on Windows too, which reports the same event as ``ENOENT``."""
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    _seed(root, old)
+    _seed(root, old)
+
+    def _replaced(path: Path, **_: Any) -> Any:
+        lock = lock_path_for(path)
+        shutil.rmtree(lock.parent)
+        lock.parent.write_bytes(b"")
+        raise NotADirectoryError(errno.ENOTDIR, "Not a directory", str(lock))
+
+    monkeypatch.setattr(uploads_mod, "edit_lock", _replaced)
+    reads = _record_decrypts(monkeypatch)
+    result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert root.is_file()
+    assert result.root_missing and result.incomplete
+    assert (result.skipped, result.body_lost, reads) == (0, 0, [])
+    not_a_dir = NotADirectoryError(errno.ENOTDIR, "Not a directory")
+    assert uploads_mod._pair_lock_failure(not_a_dir, root) == "gone"
+    assert uploads_mod._pair_lock_failure(not_a_dir, tmp_path) == "failed"
+
+
+def test_a_root_gone_right_after_the_listing_is_root_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The root went after the listing and before the first half was read, so no lock check runs:
+    the pass still reports the missing root (BACKLOG #4940), not every upload skipped or lost."""
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    _seed(root, old)
+    _seed(root, old)
+    real = UploadStore._walk_sidecars
+
+    def _walk(self: UploadStore) -> Any:
+        listed = list(real(self))
+        shutil.rmtree(root)
+        return iter(listed)
+
+    monkeypatch.setattr(UploadStore, "_walk_sidecars", _walk)
+    result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert result.root_missing and result.incomplete
+    assert (result.skipped, result.body_lost) == (0, 0)
 
 
 def _root_gone_answers(monkeypatch: pytest.MonkeyPatch, *answers: bool) -> list[bool]:
@@ -562,6 +614,150 @@ def test_a_lock_path_missing_under_a_root_still_there_is_a_refusal(
     assert len(errors) == 1, caplog.text
     assert "if it is not a regular file, remove it" in errors[0].getMessage()
     assert LOCK_FILE_NAME in errors[0].getMessage()
+
+
+def _count_lock_opens(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The name of every path the pair lock is taken for, in order, through the real lock."""
+    opened: list[str] = []
+
+    def _lock(path: Path, **kwargs: Any) -> Any:
+        opened.append(path.name)
+        return edit_lock(path, **kwargs)
+
+    monkeypatch.setattr(uploads_mod, "edit_lock", _lock)
+    monkeypatch.setattr(uploads_mod, "_unlocked_logged", set())
+    return opened
+
+
+def _assert_a_planted_link_refusal(
+    root: Path, key: str, caplog: pytest.LogCaptureFixture, opened: list[str], fids: list[str]
+) -> None:
+    """The re-seal skips every half that needs a write, and an engine removal goes on unlocked with
+    the refusal's one ERROR and its remove-it advice. Neither opens the lock."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = asyncio.run(_store(root, generate_key(), key).reseal_to_active())
+    assert result.skipped == len(fids) and result.incomplete and result.resealed == 0
+    assert "the uploads pair lock could not be taken" in caplog.text, caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert _store(root, key)._discard_cancelled_sync(fids[0]) is True
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, caplog.text
+    assert "if it is not a regular file, remove it" in errors[0].getMessage()
+    assert "is a link" in errors[0].getMessage()
+    assert opened == []
+
+
+def test_a_link_planted_at_the_lock_path_is_refused_and_never_followed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Windows has no ``O_NOFOLLOW``, so ``edit_lock`` would follow a link planted at the lock path
+    and create its target. The pair lock checks the path first: a link is a refusal, the lock is
+    never opened, and the target is not created."""
+    root = tmp_path / "uploads"
+    key = generate_key()
+    fids = [_seed(root, key), _seed(root, key)]
+    target = tmp_path / "elsewhere.lock"
+    try:
+        (root / LOCK_FILE_NAME).symlink_to(target)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks cannot be created here: {exc}")
+    opened = _count_lock_opens(monkeypatch)
+    _assert_a_planted_link_refusal(root, key, caplog, opened, fids)
+    assert not target.exists()
+    assert (root / LOCK_FILE_NAME).is_symlink()
+
+
+@pytest.mark.parametrize(
+    ("tag", "refused"),
+    [(0xA0000003, True), (0x9000001A, False)],
+    ids=["junction", "cloud-files-placeholder"],
+)
+def test_a_reparse_point_at_the_lock_path_is_refused_only_when_it_names_another_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tag: int,
+    refused: bool,
+) -> None:
+    """On Windows a junction is no symlink to ``S_ISLNK``; its reparse attribute and name-surrogate
+    tag refuse it the same way. A placeholder whose tag names no other path is a lock file like any
+    other. Faked by ``lstat``, so it runs on every platform."""
+    root = tmp_path / "uploads"
+    key = generate_key()
+    fids = [_seed(root, key), _seed(root, key)]
+    real = Path.lstat
+
+    def _lstat(self: Path) -> Any:
+        if self.name == LOCK_FILE_NAME:
+            return SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o600,
+                st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+                st_reparse_tag=tag,
+            )
+        return real(self)
+
+    monkeypatch.setattr(Path, "lstat", _lstat)
+    opened = _count_lock_opens(monkeypatch)
+    if refused:
+        _assert_a_planted_link_refusal(root, key, caplog, opened, fids)
+        assert not (root / LOCK_FILE_NAME).exists()
+        return
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = asyncio.run(_store(root, generate_key(), key).reseal_to_active())
+        assert _store(root, key)._discard_cancelled_sync(fids[0]) is True
+    assert result.resealed == 2 * len(fids) and not result.incomplete
+    assert opened, opened  # the lock was opened and taken, never refused
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
+
+
+def test_a_rotate_key_with_nothing_to_write_creates_no_lock_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pairs that are all under the active key need no write, so the pass never takes the lock. A
+    lock file a no-op run created as root would refuse every later engine removal its lock."""
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    _seed(root, old)
+    _seed(root, old)
+    store = _store(root, new, old)
+    # The first pass puts every half under the active marker, taking the lock to write them.
+    assert asyncio.run(store.reseal_to_active()).resealed == 4
+    (root / LOCK_FILE_NAME).unlink()
+    opened = _count_lock_opens(monkeypatch)
+    result = asyncio.run(store.reseal_to_active())
+    assert (result.resealed, result.skipped) == (0, 0) and not result.incomplete
+    assert opened == []
+    assert not (root / LOCK_FILE_NAME).exists()
+
+
+def test_a_lock_check_that_raised_is_not_read_as_success_later(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception from the lock attempt other than ``_PairLockFailed`` propagates and leaves the
+    check unmade, so a later call tries the lock again rather than reading no failure as success."""
+    attempts: list[str] = []
+
+    @contextlib.contextmanager
+    def _raises(path: Path, **_: Any) -> Iterator[None]:
+        attempts.append("raised")
+        raise RuntimeError("not a lock failure")
+        yield  # pragma: no cover
+
+    @contextlib.contextmanager
+    def _refused_lock(path: Path, **_: Any) -> Iterator[None]:
+        attempts.append("refused")
+        raise uploads_mod._PairLockFailed("refused", PermissionError(errno.EACCES, "denied"))
+        yield  # pragma: no cover
+
+    gate = uploads_mod._ResealLockCheck(tmp_path / LOCK_FILE_NAME)
+    monkeypatch.setattr(uploads_mod, "_pair_lock", _raises)
+    with pytest.raises(RuntimeError):
+        gate.check()
+    monkeypatch.setattr(uploads_mod, "_pair_lock", _refused_lock)
+    assert gate.check() == "refused"
+    assert gate.check() == "refused"
+    assert attempts == ["raised", "refused"]
 
 
 def test_a_refusal_that_comes_back_after_the_lock_was_taken_is_an_error_again(

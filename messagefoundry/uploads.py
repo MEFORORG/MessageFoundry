@@ -46,7 +46,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from stat import S_ISLNK, S_ISREG
+from stat import FILE_ATTRIBUTE_REPARSE_POINT, S_ISLNK, S_ISREG
 from typing import Any, Literal, NamedTuple, Protocol
 
 from messagefoundry.config.atomic_edit import _REFUSED, LOCK_FILE_NAME, edit_lock, lock_path_for
@@ -659,14 +659,14 @@ class ResealResult:
     #: removes it by hand. A symlink is not counted here: its target may be under the prior key, so
     #: it is a skip.
     not_regular: int = 0
-    #: True when the uploads root could not be listed, as when it is missing or is not a directory,
-    #: so the pass read nothing (BACKLOG #4940). An unmounted volume and a directory never created
-    #: both look like this, and the pass cannot tell them apart: read as zero uploads, an unmounted
-    #: volume's uploads would stay under the prior key while the run reported success.
-    #: ``rotate-key`` refuses such a root before it writes anything, so this is the backstop for one
-    #: that goes away mid-run. It is not a skip: ``rotate-key`` aborts on it before its audit roll.
-    #: A root it can list is never missing, empty or not; what that leaves uncaught is in
-    #: docs/PHI.md, at the ``rotate-key`` passage.
+    #: True when the uploads root could not be listed, as when it is missing or is not a directory
+    #: (BACKLOG #4940). ``rotate-key`` refuses such a root before it writes anything, so this is a
+    #: backstop. A root that stays listable is not missing, so an empty mount point over a volume
+    #: that is not mounted reads as no uploads; docs/PHI.md's ``rotate-key`` passage, under "It
+    #: refuses only a path it cannot list", names at least the cases it leaves uncaught. Also True
+    #: when a non-empty listing is followed by a root that is no directory, at the check right after
+    #: the listing or at the pass's first pair-lock check. It is not a skip: ``rotate-key`` aborts
+    #: on it before its audit roll.
     root_missing: bool = False
 
     @property
@@ -2165,20 +2165,13 @@ class UploadStore:
                 exc.strerror or type(exc).__name__,
             )
             return ResealResult(root_missing=True)
-        blocked: _PairLockFailure | None = None
-        if pairs:
-            try:
-                # Once, before any file is decrypted. Finding a lock it cannot take per half would
-                # decrypt and re-encrypt each upload first, then wait out the lock for each write.
-                # So whatever the cause, every half that needs a write is a skip, the run fails and
-                # nothing is written; a half already under the active key needs none, and is not one.
-                with _pair_lock(self._root / LOCK_FILE_NAME, for_reseal=True):
-                    pass
-            except _PairLockFailed as failed:
-                blocked = failed.kind
-                if blocked == "gone":
-                    # The root went after the listing: the BACKLOG #4940 outcome, not N lost bodies.
-                    return ResealResult(root_missing=True)
+        if pairs and not os.path.isdir(self._root):
+            # The root went after the listing: the BACKLOG #4940 outcome, not N lost bodies.
+            _log.warning(
+                "uploads root %s is gone after it was listed; no uploaded file was read", self._root
+            )
+            return ResealResult(root_missing=True)
+        gate = _ResealLockCheck(self._root / LOCK_FILE_NAME)
         resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = 0
         for fid, _sidecar in pairs:
             try:
@@ -2194,10 +2187,14 @@ class UploadStore:
             # _encrypt_blob). Body FIRST, as save() writes it: the sidecar is the listing key, and a
             # keyed store refuses a plaintext value (BACKLOG #1169). Sealing the sidecar first would
             # let an interrupted pass list an upload whose body is still refused.
-            body = self._reseal_half(cipher, fid, blob_path, "body", blocked=blocked)
+            body = self._reseal_half(cipher, fid, blob_path, "body", gate=gate)
             meta = self._reseal_half(
-                cipher, fid, meta_path, "meta", over=(body, blob_path), blocked=blocked
+                cipher, fid, meta_path, "meta", over=(body, blob_path), gate=gate
             )
+            if gate.root_gone():
+                # The root went before the lock check, which runs before the pass's first write, so
+                # nothing was written: the BACKLOG #4940 outcome, as above. _pair_lock logged it.
+                return ResealResult(root_missing=True)
             resealed += (body in _WRITTEN) + (meta in _WRITTEN)
             # Once per pair, whichever half failed. A skipped pair counts in sealed_plaintext too
             # when it had a plaintext half sealed (BACKLOG #3240): its sidecar may be sealed
@@ -2242,7 +2239,7 @@ class UploadStore:
         kind: Literal["body", "meta"],
         *,
         over: tuple[_Half, Path] | None = None,
-        blocked: _PairLockFailure | None = None,
+        gate: _ResealLockCheck,
     ) -> _Half:
         """Re-seal one half of upload ``fid`` and say what became of it. A sidecar passes ``over``,
         the body half's result and its path, because a plaintext sidecar is sealed only over a body
@@ -2258,10 +2255,10 @@ class UploadStore:
         **The write never re-creates a removed file (BACKLOG #3181 item 5).** ``rotate-key`` refuses
         a held store only on SQLite, so an engine on a server store can delete an upload while this
         runs, and a plain replace brought the sidecar back. The replace now happens under
-        :func:`_pair_lock`, only while the path is still the file this ``lstat`` saw. ``blocked``
-        names why the pass's first pair-lock check failed: the lock was busy, refused or timed
-        out, or taking it failed (a root gone at that check ends the pass first). With it, a half
-        that needs a write is a skip before it is decrypted. A write that finds the uploads root
+        :func:`_pair_lock`, only while the path is still the file this ``lstat`` saw. ``gate`` is the
+        pass's one pair-lock check, made at the first half that needs a write. When it failed (the
+        lock was busy, refused or timed out, taking it failed, or the root was gone), each half that
+        needs a write is a skip before it is decrypted. A write that finds the uploads root
         gone, or the lock not to be had, is a skip too."""
         try:
             info = path.lstat()
@@ -2341,6 +2338,11 @@ class UploadStore:
             if body is _Half.SKIPPED:
                 _log.warning("uploaded file %s (meta): left unsealed, its body was not", fid)
                 return _Half.SKIPPED
+        blocked = gate.check()
+        if blocked == "gone":
+            # Not a skip: the pass ends as root_missing once this pair is done, and _pair_lock
+            # logged the gone directory.
+            return _Half.SKIPPED
         if blocked is not None:
             _log.warning(
                 "uploaded file %s (%s): skipped, nothing is written: %s",
@@ -3293,10 +3295,11 @@ _NOT_A_FILE = _not_a_file_errnos(sys.platform)
 
 
 def _root_gone(exc: OSError, root: Path) -> bool:
-    """Whether ``exc`` is a ``FileNotFoundError`` from a missing uploads root ``root``, and not
-    from something missing under a root still there. ``os.path.isdir`` follows links, so a root
-    that is a link to a missing target is gone too."""
-    return isinstance(exc, FileNotFoundError) and not os.path.isdir(root)
+    """Whether ``exc`` is a ``FileNotFoundError`` or ``NotADirectoryError`` while the uploads root
+    ``root`` is no directory, as when it is missing or was replaced by a file, and not one from
+    under a root still there. ``os.path.isdir`` follows links, so a root that is a link to a
+    missing target is gone too."""
+    return isinstance(exc, FileNotFoundError | NotADirectoryError) and not os.path.isdir(root)
 
 
 def _lock_name(path: Path) -> str:
@@ -3306,18 +3309,19 @@ def _lock_name(path: Path) -> str:
 
 def _pair_lock_failure(exc: OSError, root: Path) -> _PairLockFailure:
     """Why :func:`_pair_lock` could not take the lock in the uploads root ``root``. ``busy``:
-    another holder kept it past the wait. ``gone``: the root is missing (:func:`_root_gone`).
+    another holder kept it past the wait. ``gone``: a ``FileNotFoundError`` or
+    ``NotADirectoryError`` while the root is no directory (:func:`_root_gone`).
     ``timeout``: the OS timed out (``ETIMEDOUT``), as a network file system can. ``refused``:
     the file system refused this account (``atomic_edit._REFUSED``), such as a lock file another
-    account owns; ``edit_lock`` also raises ``busy_error`` for a lock path planted as a link,
-    chained from the ``ELOOP``, and that is one too, as is what ``_NOT_A_FILE`` names, and a
-    ``FileNotFoundError`` while ``root`` is there, as Windows gives for a link planted at the lock
-    path whose target's directory is missing. ``failed``: any other error, such as ``EIO`` or
-    ``ESTALE`` from a network file system."""
+    account owns; a ``_PairLockBusy`` with a cause is one too, as is what ``_NOT_A_FILE`` names,
+    and a ``FileNotFoundError`` while ``root`` is there. ``failed``: any other error, such as
+    ``EIO`` or ``ESTALE`` from a network file system."""
     if isinstance(exc, _PairLockBusy):
         return "refused" if exc.__cause__ is not None else "busy"
+    if _root_gone(exc, root):
+        return "gone"
     if isinstance(exc, FileNotFoundError):
-        return "gone" if _root_gone(exc, root) else "refused"
+        return "refused"
     if isinstance(exc, TimeoutError):
         return "timeout"
     if exc.errno in _REFUSED or exc.errno in _NOT_A_FILE:
@@ -3335,6 +3339,36 @@ class _PairLockFailed(Exception):
         super().__init__(kind, cause)
         self.kind: _PairLockFailure = kind
         self.cause = cause
+
+
+class _ResealLockCheck:
+    """The re-seal pass's one pair-lock check in the uploads root, made at the first half that
+    needs a write and remembered for the rest of the pass. Finding a lock it cannot take per half
+    would decrypt and re-encrypt each upload first, then wait out the lock for each write, so once
+    it fails every half that needs a write is a skip and nothing is written. A pass in which every
+    half is already current takes no lock."""
+
+    def __init__(self, lock: Path) -> None:
+        self._lock = lock
+        self._checked = False
+        self.failure: _PairLockFailure | None = None
+
+    def root_gone(self) -> bool:
+        """Whether the check ran and found the uploads root gone."""
+        return self.failure == "gone"
+
+    def check(self) -> _PairLockFailure | None:
+        """Take and release the lock the first time, and return why that failed, or None."""
+        if not self._checked:
+            # Marked checked only once the attempt ends in a lock taken or a _PairLockFailed. Any
+            # other exception propagates and leaves it unchecked, so it never reads as success.
+            try:
+                with _pair_lock(self._lock, for_reseal=True):
+                    pass
+            except _PairLockFailed as failed:
+                self.failure = failed.kind
+            self._checked = True
+        return self.failure
 
 
 #: What a busy pair lock tells the ``rotate-key`` operator to do.
@@ -3390,6 +3424,7 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
     stops every write; at a half's write, that half is a skip."""
     with contextlib.ExitStack() as held:
         try:
+            _refuse_a_planted_link(lock_path_for(path))
             held.enter_context(
                 edit_lock(path, busy_error=_PairLockBusy, timeout=_PAIR_LOCK_TIMEOUT_SECONDS)
             )
@@ -3457,6 +3492,36 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
         yield
 
 
+#: The reparse-tag bit of a Windows reparse point that names another path, such as a symbolic
+#: link or a junction (``IO_REPARSE_TAG_NAME_SURROGATE``), as ``pipeline/dr_backup.py`` tests it. A
+#: cloud-files, dedup or tiering placeholder lacks it and names no other path.
+_NAME_SURROGATE_TAG = 0x20000000
+
+
+def _refuse_a_planted_link(lock: Path) -> None:
+    """Refuse the pair lock file ``lock`` before ``edit_lock`` opens it when it is a symbolic link
+    or a name-surrogate reparse point: raises :class:`_PairLockBusy` chained from an
+    ``ELOOP``, the shape ``edit_lock`` gives a link its ``O_NOFOLLOW`` open refuses, so
+    :func:`_pair_lock_failure` reads it as a refusal. Windows has no ``O_NOFOLLOW``, so there
+    ``edit_lock`` follows a planted link and creates or locks its target. A link planted after this
+    ``lstat`` and before that open is still followed there. A missing lock path is left to
+    ``edit_lock``; any other ``lstat`` error is raised as it is."""
+    try:
+        info = lock.lstat()
+    except FileNotFoundError:
+        return  # edit_lock creates it, or fails and _pair_lock classifies and logs why
+    # Any other lstat error propagates, so _pair_lock classifies and logs it as it would the open's,
+    # and no open follows a path this could not check.
+    reparse = getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT
+    if S_ISLNK(info.st_mode) or (
+        reparse and getattr(info, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG
+    ):
+        loop = OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(lock))
+        raise _PairLockBusy(
+            f"{lock} is a link; the uploads pair lock is not taken through it -- remove it"
+        ) from loop
+
+
 class _ChangedUnderReseal(Exception):
     """The file a re-seal read was removed (``gone``) or replaced before its write, so nothing was
     written (BACKLOG #3181 item 5)."""
@@ -3486,8 +3551,8 @@ def _replace_if_unchanged(tmp: Path, path: Path, seen: os.stat_result) -> None:
     with _pair_lock(path, for_reseal=True):
         try:
             now = path.lstat()
-        except FileNotFoundError:
-            raise _ChangedUnderReseal(gone=True) from None
+        except FileNotFoundError as exc:
+            raise _ChangedUnderReseal(gone=True) from exc
         if not _same_file(now, seen):
             raise _ChangedUnderReseal(gone=False)
         os.replace(tmp, path)
