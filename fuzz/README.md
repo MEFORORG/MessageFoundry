@@ -272,9 +272,9 @@ the carve-out in `_binary_carriage` came out with them. Both reproducers stay on
 `binary_carriage` seeds, so the fix cannot quietly regress.
 
 The short-MSH-2 body is still accepted by `Peek.parse` and `Message.parse`. ADR 0054 is the source
-of record for what the parse refuses. This change refuses the body in the readers; whether to
-refuse it at parse instead, so it is NAKed, is the decision BACKLOG #2873's first closing step
-asks for, and this change does not make it. Such a body can still be ACKed `AA`, at least below the streaming threshold when no
+of record for what the parse refuses. The readers refuse the body; whether to refuse it at parse
+instead, so it is NAKed, is the decision BACKLOG #2873's first closing step asks for, and it is
+not made. Such a body can still be ACKed `AA`, at least below the streaming threshold when no
 other ingress check refuses it. Over the threshold, a body with an OBX reaches the ingress document
 detach, where `iter_obx_documents` refuses it as `UnreadableDelimitersError` with an `ERROR` row and
 a refusal from the listener, `AR` over MLLP (BACKLOG #5099).
