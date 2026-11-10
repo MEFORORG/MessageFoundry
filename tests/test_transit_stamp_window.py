@@ -14,6 +14,9 @@ which propagates as before.
 Decision d20261109T200352805-599b24 (item 1) widens it: once armed, ANY exception revokes the
 stamped hash, shielded from a cancel. The success audit row's ``CipherError`` is answered too; every
 other exception (Forged, Unverifiable, any other ``CipherError``, a cancel, a defect) is re-raised.
+
+Decision d20261110T004920629-fb8ff6 (Q4) arms the window before the first stamp's write, so the
+control above no longer holds: the first stamp's own refusal revokes too.
 """
 
 from __future__ import annotations
@@ -142,19 +145,29 @@ async def test_verify_mfa_after_its_stamp_answers_session_lost(
         await store.close()
 
 
-async def test_a_refusal_before_any_stamp_landed_propagates_as_before(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "commit_landed", [True, False], ids=["commit_landed", "commit_never_landed"]
+)
+async def test_the_first_stamps_own_refusal_revokes_the_hash(
+    monkeypatch: pytest.MonkeyPatch, commit_landed: bool
 ) -> None:
-    """Control: the first stamp itself refused, so no stamp landed and the window is not armed."""
+    """Decision d20261110T004920629-fb8ff6, Q4: the window is armed before the first stamp's
+    write, so a write that raised, whether or not its commit landed first, revokes the hash and
+    answers session_lost. Revoking where it never landed is the accepted availability cost."""
     store, service = await _service()
     try:
         token, secret, t1 = await _pre_mfa(service, monkeypatch)
-        monkeypatch.setattr(
-            store, "mark_session_mfa_verified", _raising(TransitSealUnavailableError())
-        )
-        with pytest.raises(TransitSealUnavailableError):
-            await service.verify_mfa(token, totp.totp(secret, now=t1))
-        assert await store.list_audit(action="auth.session_rotation_failed") == []
+        stamp = store.mark_session_mfa_verified
+
+        async def ambiguous(*args: Any, **kwargs: Any) -> Any:
+            if commit_landed:
+                await stamp(*args, **kwargs)
+            raise OSError("synthetic: the connection dropped before the commit's ack")
+
+        monkeypatch.setattr(store, "mark_session_mfa_verified", ambiguous)
+        lost = await service.verify_mfa(token, totp.totp(secret, now=t1))
+        assert lost.session_lost and lost.token is None
+        await _assert_lost(store, service, token, ceremony="mfa_verify", reason="store_error")
     finally:
         await store.close()
 

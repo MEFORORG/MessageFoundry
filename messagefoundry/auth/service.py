@@ -3196,8 +3196,9 @@ class _StampOutcome:
 class _StampWindow:
     """One ceremony's window from its first session stamp to its rotation (decided by the Manager
     under the Owner's standing instruction of 2026-10-22, ADR 0217, widening "Revoke both"). See
-    :meth:`AuthService._stamp_to_rotation`. ``stamped`` is the hash the first stamp that landed
-    wrote to, which arms the window; ``closed`` is set once the rotation begins, which owns its
+    :meth:`AuthService._stamp_to_rotation`. ``stamped`` is the hash the first stamp writes to,
+    set before that write runs (decision d20261110T004920629-fb8ff6, Q4), which arms the window;
+    ``closed`` is set once the rotation begins, which owns its
     own refusals; ``lost`` says the window caught a refusal and answered for the ceremony.
     ``audit_refused`` is the ``CipherError`` the window's own success audit row raised
     (:meth:`AuthService._window_audit`), the one ``CipherError`` it answers for.
@@ -10822,9 +10823,15 @@ class AuthService:
         whose next steps record a success must check it and end closed; the others reach a rotation
         that fails closed on the same row.
 
-        A stamp that lands arms the ceremony's open :class:`_StampWindow`, if it has one and the
-        rotation has not begun (:meth:`_stamp_to_rotation`)."""
+        The stamp arms the ceremony's open :class:`_StampWindow`, if it has one and the rotation has
+        not begun (:meth:`_stamp_to_rotation`), BEFORE its write (decision
+        d20261110T004920629-fb8ff6 on ADR 0217, Q4): a write whose commit landed and then raised
+        is ambiguous, so it still revokes. The cost is availability only: a write that raised
+        before its commit landed revokes a session whose stamp never landed."""
         outcome = _StampOutcome()
+        window = _STAMP_WINDOW.get()
+        if window is not None and not window.closed and window.stamped is None:
+            window.stamped = token_hash
         try:
             yield outcome
         except RowSealError:
@@ -10835,10 +10842,6 @@ class AuthService:
             # seal, so no success is recorded, but ended quietly, as the loader ends one.
             outcome.refused = True
             await self._session_seal_failed(token_hash, key_changed=True)
-        else:
-            window = _STAMP_WINDOW.get()
-            if window is not None and not window.closed and window.stamped is None:
-                window.stamped = token_hash
 
     @asynccontextmanager
     async def _stamp_to_rotation(
@@ -10849,15 +10852,17 @@ class AuthService:
 
         Between the stamp and the rotation a ceremony makes more store calls, sealed under Transit,
         at least a second stamp, ``record_login_success``, a factor-binding check and an audit row.
-        Once a stamp has landed, ANY exception before the rotation revokes the stamped hash, best
+        Once the first stamp's write begins (decision d20261110T004920629-fb8ff6, Q4: armed before
+        the write, so an ambiguous commit still revokes), ANY exception before the rotation
+        revokes the stamped hash, best
         effort and shielded from a cancel (decision d20261109T200352805-599b24 on ADR 0217, item
         1). Two kinds are then answered: a refusal :func:`_rotation_store_errors` names, and the
         ``CipherError`` of the window's own success audit row (:meth:`_window_audit`). For those the
         ``auth.session_rotation_failed`` row is written as :meth:`_elevated_hash` writes it and the
         exception is suppressed with ``lost`` set, so the ceremony answers ``session_lost``. Every
         other exception, at least Forged, Unverifiable, a cancel and a code defect, is re-raised
-        after the revoke. Before any stamp landed, or once the rotation began, nothing is revoked
-        here and the exception propagates as before."""
+        after the revoke. Before the first stamp's write, or once the rotation began, nothing is
+        revoked here and the exception propagates as before."""
         window = _StampWindow()
         reset = _STAMP_WINDOW.set(window)
         try:

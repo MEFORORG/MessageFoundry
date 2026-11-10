@@ -241,6 +241,15 @@ revoke for it. `_rotate_session_hash` now does: `TransitSealUnverifiableError` a
 shielded from a cancel as the window's revoke is, then propagates. The re-key wrote nothing, so
 there is no new hash to revoke.
 
+**The window is armed before the first stamp's write, decided 2026-11-10 (decision
+d20261110T004920629-fb8ff6, Q4).** This replaces "armed when a `_sealed_stamp` lands" above. A
+stamp write whose commit landed and that then raised, a connection dropped before the commit's
+acknowledgement for example, is ambiguous, so `_sealed_stamp` now arms the window before the
+write runs, and any exception the write raises reaches the armed window. It may revoke a session
+whose stamp never landed; the decision accepts that cost, which is availability only. A Forged or
+retired-key refusal of the stamp is still handled inside `_sealed_stamp` and ends the session
+there.
+
 ## Context
 
 Engine `main` seals identity and authorization rows (sessions, users with their role grants, custom
