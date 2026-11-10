@@ -468,45 +468,32 @@ def redacted_log_field(
     after: str = "",
     checks: tuple[tuple[str, str], ...] = (),
 ) -> str:
-    """``text`` as one ``key="value"`` field value of a log line: redacted by
-    :func:`redact_log_value` in the line ``before`` + ``text`` + ``after``, then escaped and
-    bounded by :func:`~messagefoundry.controlchars.log_field_token` (BACKLOG #3770).
+    """``text`` as one ``key="value"`` field value of a log line (BACKLOG #3770): ``text`` as
+    :func:`redact_log_value` reads it in the line ``before`` + ``text`` + ``after``, escaped and
+    bounded by :func:`~messagefoundry.controlchars.log_field_token`; or
+    :data:`UNREADABLE_LOG_VALUE`, escaped and bounded by ``limit``; or ``unloggable-`` and an
+    exception type when a reading raises, since a log argument must never raise. A ``checks``
+    pair is read only to compare with, never logged, so its text never reaches the field. The
+    placeholders the passes write are kept as they are, not escaped, so a search for
+    ``<redacted>`` or ``[redacted]`` finds a value they wrote; a search for redactions also
+    needs :data:`UNREADABLE_LOG_VALUE`, which a limit under 19 cuts.
 
-    It is :data:`UNREADABLE_LOG_VALUE`, escaped and bounded by ``limit``, in at least these
-    cases, stated here once for callers to link to:
+    It is :data:`UNREADABLE_LOG_VALUE` in at least these measured cases, stated here once for
+    callers to link to; ``tests/test_admin_new_ip.py`` pins each. All but the first are read
+    through the new-address WARNING, whose check pair puts ``seen_ip=`` and the seen address
+    after the path:
 
-    - a pass rewrote ``before`` or ``after``;
-    - for a ``(before, after)`` of ``checks``, the line ``before`` + ``text`` + ``after`` does not
-      read as ``before``, the value, and ``after`` either as it was or as the same passes write
-      it alone. A check is read only to compare, never logged, so its ``after`` may be caller
-      text: it is the line the value stood in. The value read there differs at least when a
-      pass took text of ``after`` into ``text``; when ``after`` made a pass hide more of
-      ``text``; and when ``after`` turned a pass off for the whole line, a credential shape or a
-      no-break space in it for example, so the line hides less of ``text``. The reading also
-      fails when the line writes ``after`` neither as it was nor as it is written alone. That
-      happens at least when ``text`` ends in a credential label that takes ``after`` as its
-      value; and when ``text`` turns a pass off for the whole line, a no-break space or a
-      credential shape for example, and ``after`` holds a raw encoded run beside another
-      rewritten shape (a tab, a date, a name). A pass rewriting ``after`` alike in both
-      readings, a date or a tab in it for example, fails nothing; nor does a line that leaves
-      ``after`` exactly as it was.
-
-    Each check is one more full reading, and one of ``after`` alone unless that reading is
-    exactly ``before``, the value and ``after`` as it was. Readings stop at the first check that
-    fails.
-
-    The escape hides most of what the handler filters anchor on, so they read less inside the
-    field than in raw text; redacting first, in the lines the caller names, is meant to hide what
-    the handlers would have hidden there. Each reading is of the raw text: a second reading of an
-    already redacted value can miss what the same reading of the raw text hid. The placeholders
-    the passes write are kept as they are, not escaped, so a search for ``<redacted>`` or
-    ``[redacted]`` finds a value they wrote; an unreadable value carries neither, so a search for
-    redactions also needs :data:`UNREADABLE_LOG_VALUE`, which a limit under 19 cuts. The filters
-    still run on the whole line afterwards and may rewrite a run inside the field, never past its
-    quotes.
-
-    A log argument must never raise, as in :class:`RedactionFilter`: a failing pass gives a fixed
-    placeholder rather than the value."""
+    - a pass rewrote ``before`` or ``after``, as ``/x/password:`` with ``after`` set to
+      ``" seen_ip=0.0.0.0"``;
+    - a path ending in a credential label, ``/x/password:`` or
+      ``/api/auth/bearer``;
+    - a path that opens a quoted credential value which the seen address closes, as
+      ``/x password='hunter2 more words`` with ``x'``;
+    - a path a pass rewrote, ``/api/x a%7Cb%7Cc``, with a seen address holding a credential shape
+      or a no-break space, ``code=SECRETVALUE`` or ``10.0.0.1`` and a no-break space;
+    - a path holding a no-break space or a credential shape, ``/x code=SECRETVALUE`` for one,
+      with a seen address holding an encoded HL7 run beside a tab, a date or a name, as
+      ``a%7Cb%7Cc`` and a tab, ``a%7Cb%7Cc 1980-01-01`` or ``a%7Cb%7Cc DOE JANE``."""
     try:
         value = redact_log_value(text, before=before, after=after)
         if value is None or not all(_reads_as(value, head, text, tail) for head, tail in checks):

@@ -1401,6 +1401,28 @@ _CONTROL_HL7_PATHS = tuple(
     for sep in ("%5E", "%7C", "%7E", "%26")
 )
 
+# What these tests check of ``_new_ip_path_field`` (BACKLOG #3770), kept here rather than in its
+# docstring, which states only the guarantee.
+#
+# - No path word main hid prints in the path field more often than in main's path span, as the
+#   strict baseline ``_hides_no_less_than_main`` counts it. Its words are ASCII letter and digit
+#   runs of three or more, so a shorter or non-ASCII token is not counted. It can report a false
+#   red for a path whose word main printed, paired with a seen text whose tail main wrote a third
+#   way; ``_KNOWN_FALSE_RED`` pins two such paths, not the whole class. It runs over the paths main
+#   hid, each with every ``_BASELINE_SEEN`` text; the quote-closing, control-character and
+#   raw-in-line vectors, each with one seen text; and a seeded corpus, each path with one. Only the
+#   raw-in-line vectors reach the check's raw-tail form.
+# - An ordinary path stays readable with each ``_REWRITTEN_SEEN`` text, and the two raw-in-line
+#   paths stay readable with the encoded HL7 seen text their line leaves raw.
+# - Over a seeded corpus, a path the repeat line reads blanks on the past-cap line only where main's
+#   own past-cap line was not the repeat value or main's repeat-line span, then the seen text raw
+#   or as written alone. Its seen texts hold no encoded run beside a tab, which blanks a path
+#   while main wrote that form; so it bounds the blanking only for the seen texts it reads.
+# - Not tested, at least: a third handler; a Unicode space separator before an encoded HL7 name,
+#   which the pre-#3770 lines printed too; a seen text no vector names; and a pass that, in the
+#   past-cap line, hides the end of the path and writes that end back, followed by exactly
+#   ``seen_ip=`` and the seen text, as it was or as the passes write it alone.
+
 #: Paths whose words main's last shipped handler hid on at least one of main's two WARNING lines.
 #: The first five put a label, a date or a name after a tab, with a value split by an escaped line
 #: break. The next three are the review's: a tab before a credential label glued on by a ``%XX``
@@ -1575,7 +1597,9 @@ def test_the_strict_baseline_reports_a_known_false_red(path: str) -> None:
 @pytest.mark.parametrize(("path", "seen"), _QUOTE_CLOSING_SEEN)
 def test_a_seen_address_that_closes_a_quote_hides_the_path(path: str, seen: str) -> None:
     """RED when: the past-cap line's path field prints words of the path that main's past-cap line
-    hid only because the seen text after the path closed a quote the path opened (BACKLOG #3770)."""
+    hid only because the seen text after the path closed a quote the path opened; or such a path
+    stops logging the placeholder, a case ``redacted_log_field`` lists (BACKLOG #3770)."""
+    assert _new_ip_path_field(path, _bounded_address_text(seen)) == _UNREADABLE_FIELD, (path, seen)
     assert not _hides_no_less_than_main(path, seen), (path, seen)
 
 
@@ -1722,11 +1746,10 @@ def test_a_rewritten_context_logs_a_placeholder() -> None:
     assert _new_ip_path_field("/x/password:") == '"/x/password_u003A_"'
     assert _new_ip_path_field("/plain/path", "10.0.0.1") == '"/plain/path"'
     assert _new_ip_path_field("/api/auth/bearer") == '"/api/auth/bearer"'
-    # The bearer label takes ``seen_ip=`` as its value in the past-cap line, so that line may log
-    # the placeholder; it is allowed, not required, and never another value.
+    # The bearer label takes ``seen_ip=`` as its value in the past-cap line, a case
+    # ``redacted_log_field`` lists.
     for seen in ("10.0.0.1", "DOE JANE hunter2"):
-        field = _new_ip_path_field("/api/auth/bearer", seen)
-        assert field in ('"/api/auth/bearer"', _UNREADABLE_FIELD), (seen, field)
+        assert _new_ip_path_field("/api/auth/bearer", seen) == _UNREADABLE_FIELD, seen
 
 
 #: Seen texts the past-cap reading rewrites on their own: a date, a name, an MRN or an HL7 run a
@@ -1790,10 +1813,10 @@ def test_a_seen_text_that_turns_a_pass_off_blanks_a_path_that_pass_rewrote(seen:
 def test_a_raw_run_beside_another_rewritten_shape_blanks_a_switch_off_path(
     path: str, seen: str
 ) -> None:
-    """RED when: the case ``redacted_log_field`` and ``_new_ip_path_field`` name, a path that turns
+    """RED when: the case ``redacted_log_field`` lists, a path that turns
     a pass off for its whole line with a seen text holding a raw encoded run beside a tab, a date
     or a name, stops logging the placeholder (BACKLOG #3770). It fails closed; a change that makes
-    it readable must also change both docstrings, and still pass the hides-no-less tests."""
+    it readable must also change that docstring, and still pass the hides-no-less tests."""
     assert _new_ip_path_field(path, _bounded_address_text(seen)) == _UNREADABLE_FIELD
     assert _new_ip_path_field(path) != _UNREADABLE_FIELD
 

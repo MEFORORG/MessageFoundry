@@ -536,41 +536,11 @@ _NEW_IP_OVER_CAP_HEAD = (
 
 
 def _new_ip_path_field(path: str, seen_text: str | None = None) -> str:
-    """The path field of a new-address WARNING (BACKLOG #3770): redacted by the shipped handler
-    filters in the pre-#3770 repeat line, ``path=%s``, with nothing after the path, which no shipped
-    filter can read as a credential value; then escaped and bounded
-    (``logging_setup.redacted_log_field``). With ``seen_text``, the past-cap line's, the path is
-    read once more, in the pre-#3770 past-cap line with ``seen_ip=`` and that text after it, only
-    to compare, and that tail is read once on its own unless that reading is exactly the head, the
-    value and the tail as it was: those at most two readings are what the past-cap line costs
-    beyond the repeat line.
-
-    When it logs ``logging_setup.UNREADABLE_LOG_VALUE`` instead is stated once, in
-    ``logging_setup.redacted_log_field``; on the past-cap line that can include a path ending in a
-    credential label, ``/api/auth/bearer`` for one, whose label takes ``seen_ip=`` as its value.
-    The field holds only the path's own text, and the two lines log the one value, that
-    placeholder, or ``unloggable-`` and an exception type when a reading raises.
-
-    What the tests check of it is in ``tests/test_admin_new_ip.py``. No word of a path that the
-    last of two shipped handlers hid in the pre-#3770 lines prints in the path field more often
-    than it did there, as the strict baseline ``_hides_no_less_than_main`` counts main's path
-    span; it can report a false red, which ``_KNOWN_FALSE_RED`` pins, and its docstring names
-    what it does not cover. That holds over the paths main hid, each read with each of five seen
-    addresses; over quote-closing, control-character and raw-in-line vectors, each read with one
-    seen address; and over a seeded corpus, each path read with one. An ordinary path stays
-    readable with each named seen text a pass rewrites.
-    Two paths that turn a pass off for the whole line, one with a no-break space and one with a
-    credential shape, stay readable with an encoded HL7 seen text that line leaves raw. Over a
-    seeded corpus, a path the repeat line reads blanks on the past-cap line only where main's
-    own past-cap line, written by two shipped handlers, was not the repeat value or main's own
-    repeat-line path span, followed by the seen text raw or as written alone; that bounds the
-    blanking by those forms, not by what main hid. A path that turns a pass off for the whole line
-    still blanks, at least, with a seen text that holds a raw encoded run beside another
-    rewritten shape (a tab, a date, a name). Not tested, at least: a third handler; a Unicode
-    space separator before an encoded HL7 name, which the pre-#3770 lines printed too; a seen
-    text no vector names; and a pass that, in the past-cap line, hides the end of the path and
-    writes that end back, followed by exactly ``seen_ip=`` and the seen text, as it was or as the
-    passes write it alone."""
+    """The path field of a new-address WARNING (BACKLOG #3770). On both lines it holds the path
+    as the shipped handler filters read it in the pre-#3770 repeat line, escaped and bounded, or
+    a placeholder; never seen-address text. With ``seen_text``, the past-cap line's, that
+    reading is compared with the pre-#3770 past-cap line; when the field is the placeholder is
+    stated in ``logging_setup.redacted_log_field``."""
     checks = (
         ()
         if seen_text is None
