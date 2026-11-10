@@ -351,14 +351,26 @@ def digest_handler_from_settings(
     no-auth request)."""
     if not http_digest_selected(s):
         return None
+    # The declarations are read strictly: a non-bool flag raises HttpAuthError naming the connection
+    # (vault BACKLOG #2232), and the mirrored connection name heads each refusal below.
+    _, (_, _, accept_conn), _ = hop_declarations_from_settings(s, HttpAuthError)
+    # BACKLOG #5529 limb 2: urllib lets a request header override the Digest handler's own
+    # Authorization, so a static credential beside Digest is what would cross. One refusal here
+    # covers REST, SOAP and FHIR. It names the settings, never a value.
+    extra = s.get("headers")
+    static = [name for name in ("bearer_token", "basic_user", "basic_password") if s.get(name)]
+    if isinstance(extra, Mapping) and any(str(k).lower() == "authorization" for k in extra):
+        static.append("an Authorization entry in headers")
+    if static:
+        raise HttpAuthError(
+            f"{hop_name_prefix(accept_conn)}a static credential ({', '.join(static)}) cannot ride beside "
+            "HTTP Digest: it would replace the Digest response on the wire; configure exactly one"
+        )
     scheme = urllib.parse.urlsplit(url).scheme.lower()
     # The digest response is a credential, so an off-box cleartext hop is refused with no escape
     # (``refuse_cleartext_credential_hop``, vault BACKLOG #3533 item 4). It raises
     # ``InsecureHopRefused``; re-raise as ``HttpAuthError`` to keep this seam's error contract (both are
-    # ``ValueError``s, so the loader surfaces either identically). The declarations are still read
-    # strictly: a non-bool flag raises HttpAuthError naming the connection (vault BACKLOG #2232), and
-    # the mirrored connection name heads the refusal.
-    _, (_, _, accept_conn), _ = hop_declarations_from_settings(s, HttpAuthError)
+    # ``ValueError``s, so the loader surfaces either identically).
     try:
         refuse_cleartext_credential_hop(
             scheme,
@@ -484,7 +496,9 @@ def with_http_digest(
         ))
 
     ``user`` / ``password`` may be :func:`~messagefoundry.config.wiring.env` references. Mutually exclusive
-    with a bearer provider (SMART / OAuth2-CC); refused over cleartext ``http`` to a host off this
+    with a bearer provider (SMART / OAuth2-CC), with a static ``bearer_token``, ``basic_user`` or
+    ``basic_password``, with an ``Authorization`` entry in ``headers`` (#5529), and on REST with
+    ``ech_egress``; refused over cleartext ``http`` to a host off this
     machine, with no escape (vault BACKLOG #3533 item 4). Mutates ``spec`` in place and returns it."""
     _require_http_spec(spec, "HTTP Digest")
     spec.settings.update(

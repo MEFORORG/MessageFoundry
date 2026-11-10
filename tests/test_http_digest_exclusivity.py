@@ -2,6 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #5529: HTTP Digest either runs as configured or the connection does not build.
 
+Limb 2: a static ``bearer_token``, Basic pair or ``Authorization`` header rode beside Digest on
+REST, SOAP and FHIR. urllib lets a request header override the Digest handler's own, so the static
+credential is what would have crossed. Refused once, in ``digest_handler_from_settings``.
+
 Limb 3 (also #2707 closing step 1): ``ech_egress`` replaced the opener that held the Digest
 handler, so a REST connection built and delivered with no Digest auth. The handler cannot simply
 ride the ECH opener: its password manager is keyed on the destination URL, while the ECH request
@@ -15,7 +19,7 @@ import urllib.request
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.wiring import Rest
+from messagefoundry.config.wiring import FHIR, Rest, Soap
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.http_auth import with_http_digest
 from messagefoundry.transports.rest import HttpAuthError, RestDestination
@@ -65,3 +69,57 @@ def test_control_ech_without_digest_builds() -> None:
     dest = _build(ConnectorType.REST, settings)
     assert isinstance(dest, RestDestination)
     assert dest._ech_sidecar is not None
+
+
+# --- limb 2: a static credential beside Digest ------------------------------------------------
+
+
+_FACTORIES = {
+    ConnectorType.REST: Rest,
+    ConnectorType.SOAP: Soap,
+    ConnectorType.FHIR: FHIR,
+}
+
+_STATIC: dict[str, dict[str, object]] = {
+    "basic-pair": {"basic_user": "svc", "basic_password": _PW},
+    "basic-user-only": {"basic_user": "svc"},
+    "bearer": {"bearer_token": _PW},
+    "header": {"headers": {"authorization": f"Basic {_PW}"}},
+}
+
+
+def _digest_spec(ctype: ConnectorType, **extra: object) -> dict[str, object]:
+    settings = with_http_digest(
+        _FACTORIES[ctype](url=URL, **extra),  # type: ignore[operator]
+        user="u",
+        password=_PW,
+    ).settings
+    return settings
+
+
+@pytest.mark.parametrize("static", list(_STATIC), ids=list(_STATIC))
+@pytest.mark.parametrize("ctype", list(_FACTORIES), ids=[c.value for c in _FACTORIES])
+def test_a_static_credential_beside_digest_is_refused(ctype: ConnectorType, static: str) -> None:
+    # SOAP refuses a half Basic pair before it reads Digest (#5526), with that refusal's own words.
+    half_soap = ctype is ConnectorType.SOAP and static == "basic-user-only"
+    expected = "must be set together" if half_soap else "beside HTTP Digest"
+    with pytest.raises(HttpAuthError, match=expected) as ei:
+        _build(ctype, _digest_spec(ctype, **_STATIC[static]))
+    assert _PW not in str(ei.value)
+
+
+@pytest.mark.parametrize("ctype", list(_FACTORIES), ids=[c.value for c in _FACTORIES])
+def test_control_digest_alone_builds_on_each_http_connector(ctype: ConnectorType) -> None:
+    assert _has_digest(_build(ctype, _digest_spec(ctype)))
+
+
+@pytest.mark.parametrize("ctype", list(_FACTORIES), ids=[c.value for c in _FACTORIES])
+def test_control_basic_without_digest_builds(ctype: ConnectorType) -> None:
+    settings = _FACTORIES[ctype](url=URL, basic_user="svc", basic_password=_PW).settings  # type: ignore[operator]
+    assert not _has_digest(_build(ctype, settings))
+
+
+def test_control_a_non_auth_static_header_beside_digest_builds() -> None:
+    assert _has_digest(
+        _build(ConnectorType.REST, _digest_spec(ConnectorType.REST, headers={"X-Trace": "1"}))
+    )
