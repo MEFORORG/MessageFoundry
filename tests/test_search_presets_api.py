@@ -469,3 +469,34 @@ async def test_a_recreated_username_does_not_inherit_the_departed_operators_pres
         # ...and the layered compose, which is the route that returns the PHI-shaped criteria.
         layered = await c.get("/search/layered", params={"presets": pid}, headers=h2)
         assert layered.status_code == 404, layered.text
+
+
+async def test_a_lone_field_value_is_refused_not_saved_unread(engine: Engine) -> None:
+    """BACKLOG #6700: create_search_preset ran make_spec only beside content or field_path, so a
+    criteria holding only field_value was saved and never applied. Control: beside a field path it
+    saves, and an all-whitespace content beside a field path audits as a field-path needle."""
+    pytest.importorskip("psutil")
+    import json
+
+    from messagefoundry.api import create_app
+
+    service = await _user(engine, Role.OPERATOR, "op")
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        lone = await c.post(
+            "/search/presets", json={"name": "n", "criteria": {"field_value": "MRN999"}}, headers=h
+        )
+        assert lone.status_code == 400, lone.text
+        assert "field_value needs an HL7 field path" in lone.json()["detail"]
+        ok = await c.post(
+            "/search/presets",
+            json={
+                "name": "p",
+                "criteria": {"content": "   ", "field_path": "PID-3", "field_value": "MRN999"},
+            },
+            headers=h,
+        )
+        assert ok.status_code == 200, ok.text
+    rows = await engine.store.list_audit(action="preset.create")
+    assert [json.loads(r["detail"])["needle_shape"] for r in rows] == ["field_path"]

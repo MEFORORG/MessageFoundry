@@ -86,12 +86,12 @@ def test_a_field_value_alone_is_refused_by_name() -> None:
 
 
 def test_a_target_outside_the_enum_is_a_content_search_error() -> None:
-    raw = make_spec(content="x", field_path=None, field_value=None, target="raw")  # type: ignore[arg-type]
+    raw = make_spec(content="x", field_path=None, field_value=None, target="raw")
     assert (
         raw.target is SearchTarget.RAW
     )  # a plain string is normalized, so .value works downstream
     with pytest.raises(ContentSearchError, match="target"):
-        make_spec(content="x", field_path=None, field_value=None, target="nope")  # type: ignore[arg-type]
+        make_spec(content="x", field_path=None, field_value=None, target="nope")
 
 
 def test_a_blank_field_value_beside_content_is_still_accepted() -> None:

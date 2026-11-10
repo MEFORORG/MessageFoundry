@@ -110,7 +110,7 @@ def make_spec(
     content: str | None,
     field_path: str | None,
     field_value: str | None,
-    target: SearchTarget = SearchTarget.BOTH,
+    target: SearchTarget | str = SearchTarget.BOTH,
     scan_limit: int = DEFAULT_SCAN_LIMIT,
 ) -> SearchSpec:
     """Validate a content-search request into a :class:`SearchSpec`.
@@ -119,7 +119,9 @@ def make_spec(
     a ``field_value`` beside a substring or with no field path (it would otherwise be dropped unread),
     a malformed HL7 field path, a ``target`` outside :class:`SearchTarget`, or a ``scan_limit`` that
     is not an ``int`` (a ``bool`` is refused too). A value of only whitespace counts as not sent; any
-    other needle is kept exactly as given, because leading or trailing spaces narrow a contains-match. ``scan_limit`` is clamped into ``[1, MAX_SCAN_LIMIT]``."""
+    other needle is kept exactly as given, because leading or trailing spaces narrow a contains-match.
+    ``target`` may be the enum or its string value. ``scan_limit`` is clamped into
+    ``[1, MAX_SCAN_LIMIT]``."""
     limit = max(1, min(_require_int(scan_limit), MAX_SCAN_LIMIT))
     try:
         target = SearchTarget(target)

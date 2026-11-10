@@ -527,7 +527,6 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.content_search import (
     ContentSearchError,
     SearchSpec,
-    SearchTarget,
     make_spec,
 )
 from messagefoundry.store.crypto import audit_body_digests
@@ -3760,7 +3759,11 @@ def _needle_shape(needle: str) -> str:
     An operator's needle may itself be PHI — an MRN, a patient name (ADR 0046 §4/AC-6). The audit must
     record *that a content search ran and roughly what kind of term*, never the term verbatim. We emit
     only a structural class (all-digits / alphanumeric / has-separators / other) — not the characters —
-    so even a 9-digit MRN logs as ``digits`` with a length, never the number itself."""
+    so even a 9-digit MRN logs as ``digits`` with a length, never the number itself.
+
+    The shape is read with the padding removed: ``make_spec`` keeps a needle's spaces (BACKLOG #6700),
+    and a pasted `` 123456789`` is still an MRN-shaped lookup, so it must audit as ``digits``."""
+    needle = needle.strip()
     if needle.isdigit():
         return "digits"
     if needle.isalnum():
@@ -3860,7 +3863,7 @@ def _compose_preset_layers(
             content=(needle.get("content") or None),
             field_path=(needle.get("field_path") or None),
             field_value=(needle.get("field_value") or None),
-            target=SearchTarget(needle.get("target") or "both"),
+            target=needle.get("target") or "both",
         )
     except (ContentSearchError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -7462,7 +7465,7 @@ def create_app(
                 content=content,
                 field_path=field_path,
                 field_value=field_value,
-                target=SearchTarget(target),
+                target=target,
                 scan_limit=scan_limit,
             )
         except ContentSearchError as exc:
@@ -7762,7 +7765,7 @@ def create_app(
                 content=content,
                 field_path=field_path,
                 field_value=field_value,
-                target=SearchTarget(target),
+                target=target,
                 scan_limit=scan_limit,
             )
         except ContentSearchError as exc:
@@ -9044,13 +9047,14 @@ def create_app(
         enforce_phi_read_pacing(request, identity)  # bulk decrypt+split behind a step-up gate
         us = _require_upload_store(request)
         spec: SearchSpec | None = None
-        if content or field_path:
+        # A lone field_value reaches make_spec too, so it is refused rather than dropped (#6700).
+        if content or field_path or field_value:
             try:
                 spec = make_spec(
                     content=content,
                     field_path=field_path,
                     field_value=field_value,
-                    target=SearchTarget(target),
+                    target=target,
                 )
             except ContentSearchError as exc:
                 raise HTTPException(400, str(exc)) from exc
@@ -9383,17 +9387,21 @@ def create_app(
         needle is rejected up front (make_spec) so a bad preset can't be saved."""
         crit = body.criteria
         needle_shape: str | None = None
-        if crit.content or crit.field_path:
+        # A lone field_value reaches make_spec too, so it is refused rather than saved unread (#6700).
+        if crit.content or crit.field_path or crit.field_value:
             try:
-                make_spec(
+                spec = make_spec(
                     content=crit.content,
                     field_path=crit.field_path,
                     field_value=crit.field_value,
-                    target=SearchTarget(crit.target),
+                    target=crit.target,
                 )
             except ContentSearchError as exc:
                 raise HTTPException(400, str(exc)) from exc
-            needle_shape = _needle_shape(crit.content) if crit.content else "field_path"
+            # From the spec, not the raw criteria: an all-whitespace content is not the needle.
+            needle_shape = (
+                _needle_shape(spec.substring) if spec.substring is not None else "field_path"
+            )
         effective_id, replaced = await engine.store.upsert_search_preset(
             preset_id=uuid4().hex,
             # BACKLOG #1225: the OWNER KEY is the immutable Identity.user_id, never the reassignable
