@@ -11,7 +11,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   `<DataDir>-secrets` (or `-SecretsDir`), restricted to SYSTEM, Administrators and the service
   account, and adds `MEFOR_SECRETS_DIRECTORY` to the service's NSSM environment, keeping the
   entries already there. It refuses a directory it cannot restrict, one below a junction, one
-  another service names, and one it adopts that holds files. The directory starts empty; the
+  another service names, and an existing directory the service does not already name. The directory starts empty; the
   engine reads it as before, refusing it
   when a broad group can reach it. `uninstall-service.ps1` names it and leaves it. See the secrets
   directory bullet in [SERVICE.md](docs/SERVICE.md). (`BACKLOG #2595`)

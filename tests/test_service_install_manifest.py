@@ -1778,10 +1778,6 @@ def test_the_acl_calls_never_receive_the_literal_localsystem(tmp_path: Path) -> 
                 f"{fn} at line {call['line']} takes the nssm ObjectName value rather than the "
                 f"ACL-grant account; the two must stay separate: {call['text']}"
             )
-            # The secrets directory's preflight lock, on a directory it adopts, names no account at
-            # all: it runs before the account resolves, and grants SYSTEM and Administrators only.
-            if fn == "Set-SecretsDirAcl" and "-Account" not in call["text"]:
-                continue
             assert "$ServiceAccount" in call["text"], (
                 f"{fn} at line {call['line']} must take $ServiceAccount, which is EMPTY for the "
                 f"LocalSystem opt-out: {call['text']}"
@@ -1821,10 +1817,7 @@ def test_all_three_acl_sites_are_still_wired(tmp_path: Path) -> None:
     facts = _preflight_facts(tmp_path)
     for fn in _ACL_CALLS:
         calls = [c for c in facts["commands"] if _named(c, fn)]
-        # The secrets directory is locked twice: admin-only when the preflight adopts it, then with
-        # the account's read once the account resolves.
-        expected = 2 if fn == "Set-SecretsDirAcl" else 1
-        assert len(calls) == expected, f"expected {expected} {fn} call(s), found {len(calls)}"
+        assert len(calls) == 1, f"expected exactly one {fn} call, found {len(calls)}"
 
 
 # --- the ACLs are written AFTER the run-as account is set (BACKLOG #1699, S4 ordering, #224) ---------
@@ -1887,10 +1880,6 @@ def _acl_order_problems(facts: dict) -> list[str]:
             f" Set-ServiceAccount at line {last['line']}, or of the outermost if statement around it"
             for c in calls
             if c["start"] < last["outerIfEnd"]
-            # The secrets directory's preflight lock on a directory it adopts names no account, so
-            # it has nothing to wait for (vault BACKLOG #2595 slice C). Its call with the account
-            # is held to the rule like the rest.
-            and not (_named(c, "Set-SecretsDirAcl") and "-Account" not in c["text"])
         ]
     return problems
 
@@ -2864,8 +2853,8 @@ def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -
     data = _sole_call(facts, "Set-SecureDataDirAcl")
     locks = [c for c in facts["commands"] if c["name"] == "Set-SecretsDirAcl"]
     assert all("-Path $SecretsDir" in c["text"] for c in locks), locks
-    lock = next(c for c in locks if "-Account $ServiceAccount" in c["text"])
-    early = next(c for c in locks if "-Account" not in c["text"])
+    lock = _sole_call(facts, "Set-SecretsDirAcl")
+    assert "-Account $ServiceAccount" in lock["text"], lock["text"]
     assert lock["start"] > data["start"], "the secrets directory is restricted before the data dir"
     named = _sole_call(facts, "Set-ServiceEnvironmentValue")
     assert "MEFOR_SECRETS_DIRECTORY" in named["text"] and "$SecretsDir" in named["text"]
@@ -2895,9 +2884,7 @@ def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -
         if c["name"] == "Get-ReparsePointAncestor" and "-Path $SecretsDir" in c["text"]
     )
     sharers = _sole_call(facts, "Get-OtherServiceNamingPath")
-    held = [c for c in facts["commands"] if c["name"] == "Get-SecretsDirHeldProblem"]
-    assert len(held) == 2, held  # at preflight, and again once the directory is restricted
-    empty = max(held, key=lambda c: c["start"])
+    empty = _sole_call(facts, "Get-SecretsDirHeldProblem")
     registered = min(
         c["start"]
         for c in facts["commands"]
@@ -2906,10 +2893,13 @@ def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -
     assert check["start"] < junction["start"] < sharers["start"] < creates["start"] < registered, (
         "the secrets directory must be judged and made before the service registration changes"
     )
-    # The empty re-check follows the lock, both before the registration.
-    assert creates["start"] < early["start"] < empty["start"] < registered, (
-        "the adopted directory must be locked, then found empty, before the registration changes"
+    # The empty check follows the restricted create, both before the registration.
+    assert creates["start"] < empty["start"] < registered, (
+        "the made directory must be found empty before the registration changes"
     )
+    # An existing directory the service does not name is refused, never adopted: the preflight
+    # says so, and no lockdown runs before the account's.
+    assert "it already exists and the service does not name it" in _script_text()
     holds = next(a for a in facts["assignments"] if a["lhs"] == "SecretsHolds")["rhsText"]
     for other in ("$DataDir", "$LogDir", "$DbPath", "$Config", "$NssmDir", "$AppDirectory"):
         assert other in holds, other
@@ -3029,8 +3019,8 @@ def test_a_secrets_directory_another_service_names_is_found(tmp_path: Path) -> N
     """Get-OtherServiceNamingPath, against a services key built under HKCU: a second service whose
     NSSM environment names the same directory (another case, a trailing backslash), the same one
     through '..' and forward slashes, a folder inside it, or a folder around it is returned; the
-    installing service itself, a sibling whose name only starts the same, a relative value, and a
-    service naming another directory are not."""
+    installing service itself, a sibling whose name only starts the same, and a service naming
+    another directory are not."""
     assert _SCRIPT is not None
     root = f"HKCU:\\Software\\MeforTest-{uuid.uuid4().hex[:8]}"
     body = rf"""
@@ -3042,7 +3032,6 @@ def test_a_secrets_directory_another_service_names_is_found(tmp_path: Path) -> N
                      @('Inside', 'MEFOR_SECRETS_DIRECTORY=C:\PD\MF-secrets\sub'),
                      @('Around', 'MEFOR_SECRETS_DIRECTORY=C:\PD'),
                      @('Sibling', 'MEFOR_SECRETS_DIRECTORY=C:\PD\MF-secrets-two'),
-                     @('Relative', 'MEFOR_SECRETS_DIRECTORY=PD\MF-secrets'),
                      @('Other', 'MEFOR_SECRETS_DIRECTORY=C:\PD\elsewhere'))) {{
       $k = New-Item -Path (Join-Path $root "$($s[0])\Parameters") -Force
       Set-ItemProperty -LiteralPath $k.PSPath -Name AppEnvironmentExtra -Type MultiString `
@@ -3076,9 +3065,10 @@ def test_a_secrets_directory_another_service_names_is_found(tmp_path: Path) -> N
 
 @_windows_only
 def test_the_secrets_directory_refuses_residue_and_held_files(tmp_path: Path) -> None:
-    """Two refusals, each where a warning used to be. Set-SecretsDirAcl throws when an entry for
-    another account is left after the removals: icacls is shadowed so /remove:g does nothing, the
-    way a removal that fails would. Get-SecretsDirHeldProblem names a file the directory holds.
+    """Refusals where a warning used to be. Set-SecretsDirAcl throws when an entry for another
+    account is left after the removals: icacls is shadowed so /remove:g does nothing, the way a
+    removal that fails would. It throws too when the account's read is missing at the end: the
+    shadow drops the account's /grant. Get-SecretsDirHeldProblem names a file the directory holds.
     The controls: the same directory with nothing in it reads clean, and the
     residue named is the one the setup granted."""
     assert _SCRIPT is not None
@@ -3089,17 +3079,27 @@ def test_the_secrets_directory_refuses_residue_and_held_files(tmp_path: Path) ->
     empty.mkdir()
     residue = tmp_path / "residue"
     residue.mkdir()
+    noread = tmp_path / "noread"
+    noread.mkdir()
     body = rf"""
   & icacls.exe {_psq(str(residue))} /grant '*S-1-5-32-551:(OI)RX' | Out-Null
   function icacls {{
-    if ($args -contains '/remove:g') {{ $global:LASTEXITCODE = 0; return }}
+    if ($global:dropRemove -and $args -contains '/remove:g') {{ $global:LASTEXITCODE = 0; return }}
+    if ($global:dropGrant -and $args -contains '/grant') {{ $global:LASTEXITCODE = 0; return }}
     & icacls.exe @args
   }}
+  $global:dropRemove = $true
   $res = ''
   try {{ Set-SecretsDirAcl -Path {_psq(str(residue))} }} catch {{ $res = $_.Exception.Message }}
+  $global:dropRemove = $false
+  $global:dropGrant = $true
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $noread = ''
+  try {{ Set-SecretsDirAcl -Path {_psq(str(noread))} -Account $me }} catch {{ $noread = $_.Exception.Message }}
   $heldMsg = Get-SecretsDirHeldProblem -Path {_psq(str(held))}
   $emptyMsg = Get-SecretsDirHeldProblem -Path {_psq(str(empty))}
-  [pscustomobject]@{{ res = $res; held = $heldMsg; empty = $emptyMsg }} | ConvertTo-Json -Compress
+  [pscustomobject]@{{ res = $res; noread = $noread; held = $heldMsg; empty = $emptyMsg }} |
+    ConvertTo-Json -Compress
 """
     try:
         got = json.loads(
@@ -3122,10 +3122,15 @@ def test_the_secrets_directory_refuses_residue_and_held_files(tmp_path: Path) ->
         )
     finally:
         me = subprocess.run(["whoami"], capture_output=True, text=True).stdout.strip()
-        subprocess.run(
-            ["icacls", str(residue), "/inheritance:e", "/grant", f"{me}:(OI)(CI)F"],
-            capture_output=True,
-        )
+        for locked in (residue, noread):
+            subprocess.run(
+                ["icacls", str(locked), "/inheritance:e", "/grant", f"{me}:(OI)(CI)F"],
+                capture_output=True,
+            )
     assert "still grants access" in got["res"] and "Backup Operators" in got["res"], got
+    assert "holds no read" in got["noread"], got
+    assert "holds no read" not in got["res"], (
+        f"CONTROL FAILED: no -Account, yet a read check: {got}"
+    )
     assert "MEFOR_PLANTED" in got["held"], got
     assert got["empty"] == "", f"CONTROL FAILED: an empty directory was refused: {got}"

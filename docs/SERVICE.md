@@ -675,8 +675,9 @@ environment.
   moved file keeps its old access list. Each run makes Administrators the
   owner and removes every grant there but SYSTEM's, Administrators' and the service account's,
   whose own grant it keeps, and refuses when any is left or the account holds no read. It refuses
-  an existing directory it would adopt for the first time while that holds files, before and after
-  restricting it, or while its owner is not Administrators or SYSTEM. A refusal
+  an existing directory the service does not already name, since restricting a folder someone else
+  made does not shut them out, and one the service names whose owner is no longer Administrators
+  or SYSTEM. A refusal
   after the service is registered sets the service to Disabled. A folder above the directory that the installer
   creates is administrator-only; one that already existed is yours to restrict, since the engine
   does not read it. `uninstall-service.ps1` leaves the directory and its files, names them, and

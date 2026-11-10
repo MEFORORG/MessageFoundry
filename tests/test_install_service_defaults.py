@@ -699,9 +699,7 @@ def test_a_path_nssm_expands_is_refused_with_percent_before_anything_acts() -> N
         "{ Assert-NoNssmExpansion $stored }"
     )
     assert text.index("$NssmDir = Resolve-AbsolutePath $NssmDir") < check
-    assert (
-        text.index("$SecretsDir = ConvertTo-NormalPath (Resolve-AbsolutePath $SecretsDir)") < check
-    )
+    assert text.index("$normal = ConvertTo-NormalPath (Resolve-AbsolutePath $SecretsDir)") < check
     assert text.index("$PythonExe = Get-EngineInterpreter") < check
     assert check < text.index("$NssmPath = Resolve-Nssm")
 
