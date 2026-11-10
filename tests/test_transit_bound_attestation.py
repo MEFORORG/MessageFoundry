@@ -594,7 +594,8 @@ def test_a_pinned_400_not_read_as_a_version_refusal_is_labelled_unconfirmed(
     assert isinstance(refused, AuditKeyVersionUnverifiedError)
     assert str(refused) == (
         "the Transit audit MAC pinned to key version 3 got HTTP 400 that was not read as a "
-        "version refusal, so the version could not be confirmed"
+        "version refusal, so the version could not be confirmed; the key may not hold it, or its "
+        "policy may retire it"
     )
     assert _KEY_NAME not in str(refused)  # the walk puts this text in the tamper alert
 
