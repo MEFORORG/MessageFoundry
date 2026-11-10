@@ -63,7 +63,7 @@ Two [CLAUDE.md](../../CLAUDE.md) invariants bound the design and **must not** be
   longer says this, and the quoted claim was false: some events carry free-text detail. The
   [PHI.md logging inventory](../PHI.md#logging-inventory-1611--1623) rows for the `[alerts]`
   transports say what an event carries, and PHI.md's `alert_instance.reason` at-rest row grades the
-  stored reason **Possibly** PHI.)*
+  stored reason **Possibly** PHI at PL-2, so that column is not plain metadata.)*
 
 ## Decision
 

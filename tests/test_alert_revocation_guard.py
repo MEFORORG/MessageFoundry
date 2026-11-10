@@ -226,7 +226,7 @@ def test_an_attested_login_whose_crl_reaches_its_context_records_no_crossing(
 
 def test_an_smtp_hop_with_no_login_takes_no_guard() -> None:
     # The decline recorded in ADR 0173: no credential crosses. It does not rest on the body being
-    # PHI-free (the _refuse_alert_smtp_revocation docstring says why).
+    # PHI-free (see the _refuse_alert_smtp_revocation docstring).
     with _guard_log() as log:
         _email(ENFORCING, username=None, password=None)
         _notifier(ENFORCING, username=None, password=None)

@@ -570,10 +570,10 @@ def _refuse_alert_smtp_revocation(
     guards that hop, with ``[tls].crl_file`` or the ``[alerts]`` attestation pair as the levers.
 
     **A hop with no login takes no guard**, by the same ruling, recorded in ADR 0173: it carries no
-    credential. It does not rest on the body being PHI-free, which it is not today: the docs/PHI.md
-    logging-inventory rows for the ``[alerts]`` SMTP transport and the security-event notifier (rows
-    11 and 12) say what crosses. The owner ruled on 2026-11-09, in a Manager's session, that this
-    decline stands and that the fix for the body is one key allowlist every off-box alert passes
+    credential. The decline does not rest on what the body holds. An alert body is not PHI-free
+    today: the docs/PHI.md logging-inventory row for the ``[alerts]`` SMTP transport (row 11) says
+    what crosses, and the row for the security-event notifier (row 12) what a notice carries. The
+    owner ruled on 2026-11-09, in the session of Manager 30df8519, that this decline stands and that the fix for the body is one key allowlist every off-box alert passes
     through, which is not built yet. A hop with ``use_tls`` or ``tls_verify`` off
     builds no verifying context, and a login over one is refused at load and again at each send,
     so there is nothing for this guard to judge.
