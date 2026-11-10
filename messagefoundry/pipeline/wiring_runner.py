@@ -289,10 +289,18 @@ type _LaneFault = Literal["credential", "configuration"]
 
 
 def _batch_member(outbox_id: str | None) -> str:
-    """The suffix that names the batch member a fault came from, by its outbox id and never its
-    content, in the refusal lines' own form, so one search finds both (vault BACKLOG #5100); empty
-    when the fault is the whole batch's."""
+    """The log and alert suffix that names the batch member a fault came from, by its outbox id and
+    never its content, in the refusal lines' own form, so one search finds both (vault BACKLOG
+    #5100); empty when the fault is the whole batch's."""
     return f"; batch member {outbox_id}" if outbox_id is not None else ""
+
+
+def _member_error(error: str, outbox_id: str | None) -> str:
+    """``error`` as a batch's stored ``last_error``, the member a fault came from named FIRST. The
+    store bounds a ``last_error`` at 200 characters and keeps the head, so a suffix after a long
+    error would be the part it cut (vault BACKLOG #5100). ``error`` alone when the fault is the
+    whole batch's."""
+    return f"batch member {outbox_id}: {error}" if outbox_id is not None else error
 
 
 type _RefusedMember = tuple[str, str, NegativeAckError]
@@ -10299,10 +10307,10 @@ class RegistryRunner:
             # a DeliveryError (caught below → the whole batch re-pends), so the peer never sees a handle.
             # A store read fault is a _StoreReadFault and re-pends the same way (vault BACKLOG #2756).
             # A member whose own payload breaks the re-attach (a permanent NegativeAckError, vault
-            # BACKLOG #2809) is refused alone, as the frame split below refuses one. Kept local until
+            # BACKLOG #2809) is refused alone, as the frame check below refuses one. Kept local until
             # every member has hydrated, so a fault that sends the whole batch to an arm below takes
             # that member with it rather than leaving it in two dispositions. A refusal that is not
-            # permanent, or one that must stop the lane, is the whole batch's, as in the frame split.
+            # permanent, or one that must stop the lane, is the whole batch's, as in the frame check.
             # Any other fault takes the whole batch to its arm below: a DeliveryError or a
             # _StoreReadFault re-pends it, and any other, such as a stored CR (ADR 0105), goes to
             # the internal-error arm. Each arm names the member by its outbox id (vault BACKLOG
@@ -10318,6 +10326,7 @@ class RegistryRunner:
                     unhydratable.append(self._refuse_alone_or_raise(it.id, exc))
                 else:
                     hydrated_items.append(it)
+            current = None
             # ADR 0205 rule 1, per member: one member the frame cannot carry, or that holds more
             # than one message (ADR 0209), is dead-lettered alone and the rest batch, rather than
             # all N dying on one envelope offset. It runs before the shadow branch below, so a
@@ -10335,6 +10344,7 @@ class RegistryRunner:
                         members.append(payload)
                     else:
                         unframeable.append(refusal)
+                current = None
             else:
                 kept, members = hydrated_items, list[Message | str](hydrated)
             # Assigned only once both loops are done, so a fault in either leaves it empty and its
@@ -10344,16 +10354,15 @@ class RegistryRunner:
             ids = [it.id for it in kept]
             if kept:
                 first = kept[0]  # the envelope's head is the first member that survived
-                current = first.id  # a non-HL7 head faults here, and it is this member's
+                # The head's own fields: a non-HL7 head faults here, and it is this member's.
+                current = first.id
                 control_id = Message.parse(first.payload).control_id or first.id  # stable
-                # encode_batch frames every member at once and can fault on any of them, so no one
-                # member is identifiable; the send is the whole envelope's. Neither names one.
+                timestamp = _hl7_batch_timestamp(first.created_at)
+                # encode_batch parses the HYDRATED head for the separators and normalizes every
+                # member, in one call, so a fault inside it cannot be told apart by member; the
+                # send is the whole envelope's. Neither names one.
                 current = None
-                envelope = encode_batch(
-                    members,
-                    control_id=control_id,
-                    timestamp=_hl7_batch_timestamp(first.created_at),
-                )
+                envelope = encode_batch(members, control_id=control_id, timestamp=timestamp)
                 if not self._simulate.get(name, False):  # shadow suppresses the real egress
                     await connector.send(envelope)
         except NegativeAckError as exc:
@@ -10389,7 +10398,7 @@ class RegistryRunner:
                 )
             else:
                 failed = await self._mark_batch_failed_and_arm(
-                    name, ids, f"{safe_exc(exc)}{_batch_member(current)}", retry
+                    name, ids, _member_error(safe_exc(exc), current), retry
                 )
                 retry_until = failed.retry_at
                 self._note_retry_exhausted(name, exc, failed, batch=True)
@@ -10397,24 +10406,26 @@ class RegistryRunner:
         except _StoreReadFault as exc:
             # Vault BACKLOG #2756, the batch twin of the single-row arm: nothing was sent, so all N
             # re-pend on the retry policy's backoff rather than dead-lettering through the
-            # internal-error arm below.
-            member = _batch_member(current)
-            failed = await self._mark_batch_failed_and_arm(name, ids, f"{exc}{member}", retry)
+            # internal-error arm below. The member named is the one whose read was running when
+            # the store faulted, which says where, not that the member caused it.
+            failed = await self._mark_batch_failed_and_arm(
+                name, ids, _member_error(str(exc), current), retry
+            )
             retry_until = failed.retry_at
-            self._note_store_read_fault(name, exc, len(ids), failed, member=member)
+            self._note_store_read_fault(name, exc, len(ids), failed, member=_batch_member(current))
             self._note_retry_exhausted(name, _EngineCause.STORE_READ, failed, batch=True)
             await self._delivery_failure_alert_checks(name)
         except DeliveryError as exc:
             failed = await self._mark_batch_failed_and_arm(
-                name, ids, f"{safe_exc(exc)}{_batch_member(current)}", retry
+                name, ids, _member_error(safe_exc(exc), current), retry
             )
             retry_until = failed.retry_at
             self._note_retry_exhausted(name, exc, failed, batch=True)
             await self._delivery_failure_alert_checks(name)
-            # The member whose re-attach raised it; a send's fault is the envelope's, which its
-            # head stands for, as it did before members were named.
-            blamed = current if current is not None else (ids[0] if ids else head.id)
-            self._note_lane_unhealthy(name, blamed, exc)
+            # The member whose re-attach raised it; otherwise the send raised it, which only
+            # happens with a member kept, and the envelope's head stands for it, as it did before
+            # members were named.
+            self._note_lane_unhealthy(name, current if current is not None else ids[0], exc)
         except Exception as exc:
             # A framing error (unparseable/non-HL7 head) or an internal/code error — NOT the partner's
             # fault. The per-connection policy decides: STOP halts the lane and alerts, and
@@ -10441,7 +10452,9 @@ class RegistryRunner:
                     member,
                 )
                 failed = await self.store.mark_batch_failed(
-                    ids, f"internal error (connection stopped): {safe_exc(exc)}{member}", retry
+                    ids,
+                    _member_error(f"internal error (connection stopped): {safe_exc(exc)}", current),
+                    retry,
                 )
                 _note_stop_dead_letter("delivery worker", name, failed, head.stage)
                 self._alert_sink.connection_stopped(
@@ -10457,7 +10470,9 @@ class RegistryRunner:
                 type(exc).__name__,
                 member,
             )
-            await self.store.dead_letter_batch(ids, f"internal error: {safe_exc(exc)}{member}")
+            await self.store.dead_letter_batch(
+                ids, _member_error(f"internal error: {safe_exc(exc)}", current)
+            )
         else:
             if ids:  # nothing was sent when every member was refused
                 self._note_lane_healthy(name)
@@ -10487,7 +10502,7 @@ class RegistryRunner:
 
     def _refuse_alone_or_raise(self, outbox_id: str, exc: NegativeAckError) -> _RefusedMember:
         """The ``(id, error, refusal)`` of a batch member refused alone, by the re-attach or the
-        frame split, which share this one rule (vault BACKLOG #5100). A refusal that is not
+        frame check, which share this one rule (vault BACKLOG #5100). A refusal that is not
         permanent, or one that must stop the lane, is the whole batch's, so it is re-raised for
         the batch's own arm, as a send would raise it."""
         if not exc.permanent or self._lane_stopping_fault(exc) is not None:
@@ -10498,7 +10513,7 @@ class RegistryRunner:
 
     async def _dead_letter_refused(self, name: str, refused: Sequence[_RefusedMember]) -> None:
         """Dead-letter each batch member :meth:`_check_member_frame` or the batch re-attach
-        refused, alone, then log it. The line used to be written in the split, before any write, so
+        refused, alone, then log it. The line used to be written in the frame check, before any write, so
         a member a later refusal sent back with the whole batch was logged as dead-lettered when it
         was not. It goes through the same throttle as the other permanent-refusal lines (BACKLOG
         #3043). Its reason

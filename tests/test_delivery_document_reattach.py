@@ -773,7 +773,8 @@ async def test_a_batch_member_with_a_stored_cr_takes_the_whole_batch_to_the_poli
     # Every member's error names the corrupt member by its outbox id, and only that one, so an
     # operator can find it among the clean siblings it took along (vault BACKLOG #5100).
     named = f"; batch member {await _outbox_id(store, mid_bad)}"
-    assert all(err.endswith(named) for _, err in rows)
+    stored = f"batch member {await _outbox_id(store, mid_bad)}: "
+    assert all(err.startswith(stored) for _, err in rows)
     assert await _outbox_id(store, mid_a) not in rows[0][1]
     if policy is InternalErrorPolicy.STOP:
         assert outcome is _ItemOutcome.STOPPED
@@ -784,7 +785,7 @@ async def test_a_batch_member_with_a_stored_cr_takes_the_whole_batch_to_the_poli
         assert outcome is not _ItemOutcome.STOPPED
         assert sink.stopped == []
         assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 2
-        assert all(err.startswith("internal error: ValueError") for _, err in rows)
+        assert all(err.startswith(f"{stored}internal error: ValueError") for _, err in rows)
 
 
 async def test_a_stored_cr_in_the_middle_member_names_the_middle_member(
@@ -802,7 +803,7 @@ async def test_a_stored_cr_in_the_middle_member_names_the_middle_member(
     assert col.deliveries == []
     rows = await _rows(store, mids)
     assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 3
-    assert all(err.endswith(f"; batch member {ids[1]}") for _, err in rows)
+    assert all(err.startswith(f"batch member {ids[1]}: internal error:") for _, err in rows)
     assert not any(ids[0] in err or ids[2] in err for _, err in rows)
 
 
@@ -846,11 +847,34 @@ async def test_a_retryable_fault_in_the_middle_members_reattach_names_that_membe
     named = f"; batch member {ids[1]}"
     rows = await _rows(store, mids)
     assert [status for status, _ in rows] == [OutboxStatus.PENDING.value] * 3
-    assert all(err.endswith(named) for _, err in rows)
+    assert all(err.startswith(f"batch member {ids[1]}: ") for _, err in rows)
     assert blamed == ([ids[1]] if blames else [])
     if logs:
-        lines = [r.getMessage() for r in caplog.records if "before sending" in r.getMessage()]
-        assert lines and all(named in line for line in lines)
+        # The store-fault line's own text, not the retry-cap line, which also says "before sending".
+        assert any(f"row(s){named};" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_long_error_still_names_the_member(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Vault BACKLOG #5100: the store bounds last_error at 200 characters and keeps the head, so the
+    # member is named first; a suffix after a long error was the part the cut dropped.
+    mids, ids = await _enqueue(store, _three("FAULT"))
+    runner, _ = _batch_runner(store, _Collector())
+    real = runner._hydrate_payload
+
+    async def _hydrate(payload: str, message_id: str) -> str:
+        if "FAULT" in payload:
+            raise DeliveryError("document re-attach failed: " + "x" * 400)
+        return await real(payload, message_id)
+
+    monkeypatch.setattr(runner, "_hydrate_payload", _hydrate)
+
+    await _run_batch(runner, store)
+
+    rows = await _rows(store, mids)
+    assert all(err.startswith(f"batch member {ids[1]}: DeliveryError") for _, err in rows)
+    assert all(len(err) < 300 for _, err in rows)  # the cut ran, and the id survived it
 
 
 async def test_a_non_hl7_head_names_the_head(store: MessageStore) -> None:
@@ -865,7 +889,7 @@ async def test_a_non_hl7_head_names_the_head(store: MessageStore) -> None:
     assert col.deliveries == []
     rows = await _rows(store, mids)
     assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 2
-    assert all(err.endswith(f"; batch member {ids[0]}") for _, err in rows)
+    assert all(err.startswith(f"batch member {ids[0]}: internal error:") for _, err in rows)
 
 
 async def test_an_encode_batch_fault_names_no_member(
@@ -963,11 +987,10 @@ async def test_an_internal_error_in_a_members_frame_check_names_that_member(
     await _run_batch(runner, store)
 
     assert col.deliveries == []
-    named = f"; batch member {await _outbox_id(store, mids[1])}"
-    rows = [row for m in mids for row in await _outbox_rows(store, m)]
+    named = f"batch member {await _outbox_id(store, mids[1])}: internal error: ValueError"
+    rows = await _rows(store, mids)
     assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 2
-    assert all(err.startswith("internal error: ValueError") for _, err in rows)
-    assert all(err.endswith(named) for _, err in rows)
+    assert all(err.startswith(named) for _, err in rows)
 
 
 def _credential_fault() -> NegativeAckError:
