@@ -2069,8 +2069,14 @@ def test_a_reap_that_is_not_a_kill_records_nothing_and_does_not_warn(
     caplog.set_level(logging.INFO, logger=sandbox_mod.log.name)
     try:
         session._spawn("transform")
+        proc = session._proc
+        assert proc is not None
+        # Dead for real, as a crash leaves it: a queued EOF from a RUNNING worker is a kill (see
+        # test_a_queued_eof_from_a_running_worker_is_a_recorded_kill).
+        proc.kill()
+        proc.wait(timeout=10)
         session._responses.put(_EOF)
-        session._reject_unsolicited(session._proc, "before", "transform")
+        session._reject_unsolicited(proc, "before", "transform")
         assert session._proc is None
         session._kill(None, KillCause.CRASH, "transform")  # no worker: nothing to kill
         assert session.last_kill_cause is None
@@ -2217,8 +2223,8 @@ def test_a_queued_over_cap_header_kills_as_an_unsolicited_write(
     graph: tuple[Registry, str], when: str
 ) -> None:
     """Between dispatches the same header is a stray write from a worker that may be alive, so it
-    kills the worker as an unsolicited write, where a queued EOF only reaps a dead one with no
-    cause."""
+    kills the worker as an unsolicited write. The reader stopped at the header, so it can answer
+    nothing: the call carries on, an answer in hand stands, as it did when it read as EOF."""
     registry, config_dir = graph
     session = _session(config_dir)
     try:
@@ -2226,10 +2232,64 @@ def test_a_queued_over_cap_header_kills_as_an_unsolicited_write(
         proc = session._proc
         assert proc is not None
         session._responses.put(_OVERSIZE)
-        assert session._drop_unsolicited(proc, when, "transform") is True
+        session._reject_unsolicited(proc, when, "transform")  # must NOT raise
         assert session._proc is None
         assert proc.poll() is not None
         assert session.last_kill_cause is sandbox_mod._UNSOLICITED[when]
+    finally:
+        session.close()
+
+
+def test_a_queued_eof_from_a_running_worker_is_a_recorded_kill(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """EOF on fd 1 says every holder closed it, not that the worker exited. A worker still running
+    after the grace is killed with a recorded cause and a WARNING, never reaped silently; the call
+    still carries on (vault BACKLOG #3135, finding 2).
+
+    FALSIFICATION: reap on every queued EOF again and ``last_kill_cause`` stays ``None``."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        proc = session._proc
+        assert proc is not None
+        session._responses.put(_EOF)  # the worker is alive: only its pipe "closed"
+        session._reject_unsolicited(proc, "after", "transform")  # must NOT raise
+        assert session._proc is None
+        assert proc.poll() is not None
+        assert session.last_kill_cause is KillCause.STDOUT_CLOSED
+        assert [r.args for r in _kill_warnings(caplog)] == [("IB_T", "transform", "stdout_closed")]
+    finally:
+        session.close()
+
+
+def test_a_respawn_after_a_queued_eof_is_checked_for_a_stray_frame(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker spawned after a leftover EOF is checked like any fresh worker: a stray frame
+    waiting on it kills it and the call goes to one more fresh worker, rather than read the stray
+    as its answer."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        expected = _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert session._proc is not None
+        session._responses.put(_EOF)
+        real_spawn = session._spawn
+        spawned: list[int] = []
+
+        def _spawn_with_a_stray(phase: str = "spawn") -> None:
+            real_spawn(phase)
+            spawned.append(session._generation)
+            if len(spawned) == 1:
+                session._responses.put(b"{}")  # any frame body is a stray here
+
+        monkeypatch.setattr(session, "_spawn", _spawn_with_a_stray)
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert len(spawned) == 2
+        assert session.last_kill_cause is KillCause.UNSOLICITED_BEFORE
     finally:
         session.close()
 

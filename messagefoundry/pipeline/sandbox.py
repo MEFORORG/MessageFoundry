@@ -240,6 +240,9 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     UNSOLICITED_BEFORE = "unsolicited_before"
     #: A frame no request asked for was waiting after a dispatch's answer.
     UNSOLICITED_AFTER = "unsolicited_after"
+    #: The worker closed its response pipe and was still running: EOF on fd 1 says every holder
+    #: closed it, not that the worker exited (see :func:`_running_after_eof`).
+    STDOUT_CLOSED = "stdout_closed"
     #: The session was closed with a live worker, at engine stop or when a reload replaced it. An
     #: orderly stop, not a fault, so it logs at INFO rather than WARNING.
     SHUTDOWN = "shutdown"
@@ -601,6 +604,28 @@ class _StderrRelay:
         )
 
 
+#: How long a worker whose response pipe reached EOF gets to exit before it counts as still running.
+_EOF_EXIT_GRACE_SECONDS: Final = 0.5
+
+#: How many workers :meth:`SandboxSession._live_worker` checks before it fails the call.
+_LIVE_WORKER_TRIES: Final = 3
+
+
+def _running_after_eof(proc: subprocess.Popen[bytes]) -> bool:
+    """Whether a worker whose response pipe reached EOF is still running once
+    :data:`_EOF_EXIT_GRACE_SECONDS` have passed, so that reaping it is a
+    :attr:`KillCause.STDOUT_CLOSED` kill rather than the reap of a dead peer.
+
+    EOF says every holder of fd 1 closed it, which a crash does and a running worker that closed
+    its own fd 1 also does. Only the exit tells the two apart, and a crashing worker's exit may
+    trail its pipe's close by a moment, hence the grace (vault BACKLOG #3135)."""
+    try:
+        proc.wait(timeout=_EOF_EXIT_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        return True
+    return False
+
+
 def _unsolicited_error(when: str) -> SandboxError:
     return SandboxError(
         f"sandbox worker wrote an unsolicited response frame {when} a dispatch — "
@@ -644,9 +669,10 @@ def _read_exact(stream: Any, n: int) -> bytes | None:
 
 
 def _read_frame_bytes(stream: Any) -> bytes | None:
-    """Read one length-prefixed frame **body**, or ``None`` on EOF / a dead peer.
+    """Read one length-prefixed frame **body**, or ``None`` on EOF / a dead peer. The child's
+    reader; the parent's reader thread runs :func:`_read_frame_or_oversize` instead.
 
-    Deliberately does **no** decoding: on the parent this runs on the daemon reader thread, whose
+    Deliberately does **no** decoding, and neither does that one: the parent's reader thread's
     ``except`` catches only ``OSError`` — a rejection raised there would kill the reader silently and
     the dispatch would HANG to the wall cap instead of failing closed. Decoding happens on the
     dispatch thread, inside its existing ``try``."""
@@ -828,8 +854,8 @@ class SandboxSession:
         self._lock = threading.Lock()
         self._closed = False
         # Why this session last killed its worker, or ``None`` before the first kill, and how many
-        # kills it has made per cause (vault BACKLOG #3135). A pooled worker or a per-lane kill
-        # budget reads them.
+        # kills it has made per cause (vault BACKLOG #3135). Nothing in the engine reads them yet:
+        # a per-lane kill budget would, and it is unbuilt.
         self.last_kill_cause: KillCause | None = None
         self.kill_counts: collections.Counter[KillCause] = collections.Counter()
         # The [egress] lists whose empty-list refusal this session has logged.
@@ -971,7 +997,8 @@ class SandboxSession:
                 f"sandbox worker did not start within {self.policy.startup_seconds}s"
             ) from None
         if frame is _EOF:
-            self._kill(proc, KillCause.BOOT_EXIT, phase)
+            cause = KillCause.STDOUT_CLOSED if _running_after_eof(proc) else KillCause.BOOT_EXIT
+            self._kill(proc, cause, phase)
             raise SandboxError("sandbox worker exited during bootstrap")
         try:
             if frame is _OVERSIZE:
@@ -1032,7 +1059,7 @@ class SandboxSession:
 
     def _reader_loop(self, stdout: Any, sink: queue.Queue[Any]) -> None:
         """Drain the child's stdout into ``sink`` — **framing only**, never decoding (see
-        :func:`_read_frame_bytes`). Runs on a daemon thread; a fresh queue per spawn means a stale
+        :func:`_read_frame_or_oversize`). Runs on a daemon thread; a fresh queue per spawn means a stale
         reader's writes are harmlessly ignored."""
         try:
             while True:
@@ -1166,16 +1193,24 @@ class SandboxSession:
         self, proc: subprocess.Popen[bytes] | None, when: str, phase: str
     ) -> bool:
         """:meth:`_reject_unsolicited`'s check without the raise: True when a stray FRAME killed
-        the worker (an over-cap length header counts as one), False when nothing was waiting or a
-        queued EOF only reaped a dead one."""
+        the worker. False when nothing was waiting, or when what was waiting can answer nothing: a
+        queued EOF, which reaps the worker (a kill only if it is still running), or an over-cap
+        length header, which kills it."""
         try:
             stray = self._responses.get_nowait()
         except queue.Empty:
             return False
         if stray is _EOF:
-            self._reap(proc)  # the peer is already gone
+            if proc is not None and _running_after_eof(proc):
+                self._kill(proc, KillCause.STDOUT_CLOSED, phase)
+            else:
+                self._reap(proc)  # the peer is already gone
             return False
-        # An over-cap length header is a stray write too, from a worker that may still be alive.
+        if stray is _OVERSIZE:
+            # A stray write from a worker that may still be alive, but the reader stopped at the
+            # header, so it can never be read as an answer: kill, and let the call carry on.
+            self._kill(proc, _UNSOLICITED[when], phase)
+            return False
         self._kill(proc, _UNSOLICITED[when], phase)
         return True
 
@@ -1189,23 +1224,24 @@ class SandboxSession:
         than dead-letter this message on a peer that merely died.
 
         A leftover FRAME kills the worker, and this message, which never reached it, is retried
-        once on a fresh worker (owner ruling 2026-11-09, vault BACKLOG #3135 step 4). The fresh
-        worker is checked the same way, and a stray frame there too raises, so the retry happens at
-        most once per dispatch."""
-        retried = False
-        while True:
+        once on a fresh worker (owner ruling 2026-11-09, vault BACKLOG #3135 step 4). Every fresh
+        worker is checked the same way, the one spawned after a leftover EOF included, and a second
+        stray frame raises, so the retry happens at most once per dispatch. The spawns are bounded
+        too: a worker that keeps closing its pipe before its request fails the call."""
+        stray_seen = False
+        for _ in range(_LIVE_WORKER_TRIES):
             if self._proc is None or self._proc.poll() is not None:
                 self._spawn(phase)
-            if not self._drop_unsolicited(self._proc, "before", phase):
-                break
-            if retried:
-                raise _unsolicited_error("before")
-            retried = True
-        if self._proc is None:
-            self._spawn(phase)
-        proc = self._proc
-        assert proc is not None
-        return proc
+            if self._drop_unsolicited(self._proc, "before", phase):
+                if stray_seen:
+                    raise _unsolicited_error("before")
+                stray_seen = True
+            elif self._proc is not None:
+                return self._proc
+        raise SandboxError(
+            f"sandbox worker for inbound {self._inbound!r} closed its pipe before its request on "
+            f"each of {_LIVE_WORKER_TRIES} tries"
+        )
 
     # -- the lookup broker (mode=isolated, ADR 0147) ----------------------------
 
@@ -1234,7 +1270,8 @@ class SandboxSession:
                     f"sandbox {phase} {name!r} exceeded the {self.policy.wall_seconds}s wall cap"
                 ) from None
             if frame is _EOF:
-                self._kill(proc, KillCause.CRASH, phase)
+                cause = KillCause.STDOUT_CLOSED if _running_after_eof(proc) else KillCause.CRASH
+                self._kill(proc, cause, phase)
                 served = expected_seq - 1
                 after = f", after {served} brokered lookup(s)" if served else ""
                 raise SandboxError(f"sandbox worker crashed while running {phase} {name!r}{after}")
